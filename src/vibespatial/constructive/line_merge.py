@@ -225,6 +225,7 @@ def _line_merge_gpu(
             (d_coord_counts, d_coord_offsets),
             (d_part_counts, d_part_offsets),
         ],
+        reason="line-merge output totals allocation fence",
     )
 
     if total_coords == 0:
@@ -448,3 +449,36 @@ def line_merge_owned(
         selected=ExecutionMode.CPU,
     )
     return result
+
+
+def line_merge_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    directed: bool = False,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = line_merge_owned(
+        owned,
+        directed=directed,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="line_merge",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )

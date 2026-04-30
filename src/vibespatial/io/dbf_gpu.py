@@ -388,7 +388,10 @@ def _extract_character_field(
     d_data_id = id(d_data)
     if d_data_id not in _dbf_host_cache:
         _dbf_host_cache.clear()  # only cache one file at a time
-        _dbf_host_cache[d_data_id] = cp.asnumpy(d_data)
+        _dbf_host_cache[d_data_id] = get_cuda_runtime().copy_device_to_host(
+            d_data,
+            reason="dbf character-field byte payload host export",
+        )
     h_data = _dbf_host_cache[d_data_id]
 
     # Compute field start offset within each record
@@ -611,7 +614,14 @@ def dbf_result_to_dataframe(result: DbfGpuResult, *, include_deleted: bool = Fal
             host_cols[name] = col.data
 
     # Single bulk transfer outside the loop.
-    host_transferred = {name: cp.asnumpy(arr) for name, arr in device_cols.items()}
+    runtime = get_cuda_runtime()
+    host_transferred = {
+        name: runtime.copy_device_to_host(
+            arr,
+            reason=f"dbf column {name} host export",
+        )
+        for name, arr in device_cols.items()
+    }
 
     # --- Build data dict from host arrays ---
     data = {}
@@ -627,7 +637,10 @@ def dbf_result_to_dataframe(result: DbfGpuResult, *, include_deleted: bool = Fal
     df = pd.DataFrame(data)
 
     if not include_deleted and result.n_records > 0:
-        active = cp.asnumpy(result.active_mask).astype(bool)
+        active = runtime.copy_device_to_host(
+            result.active_mask,
+            reason="dbf active-row mask host export",
+        ).astype(bool)
         df = df.loc[active].reset_index(drop=True)
 
     return df

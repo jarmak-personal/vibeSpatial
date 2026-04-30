@@ -49,7 +49,11 @@ from vibespatial.predicates.binary import (
 )
 from vibespatial.runtime import ExecutionMode, get_requested_mode
 from vibespatial.runtime.dispatch import record_dispatch_event
-from vibespatial.runtime.fallbacks import record_fallback_event
+from vibespatial.runtime.fallbacks import (
+    StrictNativeFallbackError,
+    record_fallback_event,
+    strict_native_mode_enabled,
+)
 from vibespatial.runtime.provenance import (
     ProvenanceTag,
     attempt_provenance_rewrite,
@@ -72,6 +76,13 @@ if typing.TYPE_CHECKING:
 from vibeproj import Transformer as _VibeTransformer
 
 logger = logging.getLogger(__name__)
+
+
+def _native_strict_dispatch_mode() -> ExecutionMode:
+    requested = get_requested_mode()
+    if requested is ExecutionMode.AUTO and strict_native_mode_enabled():
+        return ExecutionMode.GPU
+    return requested
 
 
 if HAS_PYPROJ:
@@ -135,12 +146,40 @@ _TAG_TO_GEOM_TYPE_NAME: dict[int, str] = {
 
 def _geom_type_from_tags(owned: OwnedGeometryArray) -> np.ndarray:
     """Vectorised geom_type lookup from owned tags -- no Shapely call."""
+    single_type = _single_family_geom_type_if_no_nulls(owned)
+    if single_type is not None:
+        return np.full(owned.row_count, single_type, dtype=object)
     tags = owned.tags
     result = np.empty(len(tags), dtype=object)
     for tag_value, name in _TAG_TO_GEOM_TYPE_NAME.items():
         result[tags == tag_value] = name
     result[tags == NULL_TAG] = None
     return result
+
+
+def _single_family_geom_type_if_no_nulls(owned: OwnedGeometryArray) -> str | None:
+    families = getattr(owned, "families", {})
+    if len(families) != 1:
+        return None
+    family, host_buffer = next(iter(families.items()))
+    row_count = getattr(host_buffer, "row_count", None)
+    device_state = getattr(owned, "device_state", None)
+    if device_state is not None:
+        device_buffer = device_state.families.get(family)
+        if device_buffer is not None:
+            offsets = getattr(device_buffer, "geometry_offsets", None)
+            if offsets is not None:
+                row_count = int(offsets.size) - 1
+    if int(row_count or 0) != int(owned.row_count):
+        return None
+    return {
+        GeometryFamily.POINT: "Point",
+        GeometryFamily.LINESTRING: "LineString",
+        GeometryFamily.POLYGON: "Polygon",
+        GeometryFamily.MULTIPOINT: "MultiPoint",
+        GeometryFamily.MULTILINESTRING: "MultiLineString",
+        GeometryFamily.MULTIPOLYGON: "MultiPolygon",
+    }.get(family)
 
 
 def _to_owned_via_wkb(data: np.ndarray) -> OwnedGeometryArray:
@@ -654,10 +693,12 @@ class GeometryArray(ExtensionArray):
 
     def __init__(self, data, crs: Any | None = None):
         _source_provenance: ProvenanceTag | None = None
+        _source_readonly = False
         if isinstance(data, self.__class__):
             if not crs:
                 crs = data.crs
             _source_provenance = data._provenance
+            _source_readonly = bool(getattr(data, "_readonly", False))
             data = data._data
         elif hasattr(data, "_data") and hasattr(data, "dtype") and hasattr(data.dtype, "name") and data.dtype.name == "device_geometry":
             # Accept DeviceGeometryArray by extracting its Shapely cache
@@ -682,6 +723,7 @@ class GeometryArray(ExtensionArray):
         self._owned_flat_sindex = None
         self._owned_spatial_input_supported: bool | None = None
         self._provenance: ProvenanceTag | None = _source_provenance
+        self._readonly = _source_readonly
 
     @classmethod
     def from_owned(cls, owned: OwnedGeometryArray, crs=None) -> GeometryArray:
@@ -695,6 +737,7 @@ class GeometryArray(ExtensionArray):
         obj._owned_flat_sindex = None
         obj._owned_spatial_input_supported = None
         obj._provenance = None
+        obj._readonly = False
         return obj
 
     @property
@@ -817,6 +860,7 @@ class GeometryArray(ExtensionArray):
             result._owned_flat_sindex = self._owned_flat_sindex
             result._owned_spatial_input_supported = self._owned_spatial_input_supported
             result._provenance = self._provenance
+            result._readonly = self._readonly
             return result
 
         # array-like, slice
@@ -829,11 +873,17 @@ class GeometryArray(ExtensionArray):
         if self._owned is not None and isinstance(idx, np.ndarray):
             int_indices = np.flatnonzero(idx) if idx.dtype == bool else idx
             subset_owned = self._owned.take(int_indices)
-            return GeometryArray.from_owned(subset_owned, crs=self.crs)
+            result = GeometryArray.from_owned(subset_owned, crs=self.crs)
+            result._readonly = self._readonly
+            return result
 
-        return GeometryArray(self._data[idx], crs=self.crs)
+        result = GeometryArray(self._data[idx], crs=self.crs)
+        result._readonly = self._readonly
+        return result
 
     def __setitem__(self, key, value):
+        if self._readonly:
+            raise ValueError("Cannot modify read-only array")
         # validate and convert IntegerArray/BooleanArray
         # keys to numpy array, pass-through non-array-like indexers
         key = pd.api.indexers.check_array_indexer(self, key)
@@ -913,6 +963,7 @@ class GeometryArray(ExtensionArray):
             self._owned_flat_sindex = None
             self._owned_spatial_input_supported = None
             self._provenance = None
+            self._readonly = False
         else:
             if "data" in state:
                 state["_shapely_data"] = state.pop("data")
@@ -925,6 +976,7 @@ class GeometryArray(ExtensionArray):
             state.setdefault("_owned_flat_sindex", None)
             state.setdefault("_owned_spatial_input_supported", None)
             state.setdefault("_provenance", None)
+            state.setdefault("_readonly", False)
             self.__dict__.update(state)
 
     def to_owned(self) -> OwnedGeometryArray:
@@ -2029,8 +2081,30 @@ class GeometryArray(ExtensionArray):
 
             if other_owned is not None:
                 try:
-                    return relate_de9im(self._owned, other_owned)
-                except Exception:
+                    if other_owned.row_count == 1 and self._owned.row_count != 1:
+                        from vibespatial.predicates.binary import _broadcast_right_owned
+
+                        other_owned = _broadcast_right_owned(
+                            other_owned,
+                            self._owned.row_count,
+                        )
+                    return relate_de9im(
+                        self._owned,
+                        other_owned,
+                        dispatch_mode=_native_strict_dispatch_mode(),
+                    )
+                except StrictNativeFallbackError:
+                    raise
+                except Exception as exc:
+                    record_fallback_event(
+                        surface="geopandas.array.relate",
+                        reason="native relate wrapper failed; falling back to Shapely",
+                        detail=str(exc),
+                        requested=_native_strict_dispatch_mode(),
+                        selected=ExecutionMode.CPU,
+                        pipeline="predicate/relate",
+                        d2h_transfer=True,
+                    )
                     logger.debug(
                         "GPU relate_de9im failed, falling back to Shapely",
                         exc_info=True,
@@ -2053,8 +2127,47 @@ class GeometryArray(ExtensionArray):
 
             if other_owned is not None:
                 try:
-                    return relate_pattern_match(self._owned, other_owned, pattern)
-                except Exception:
+                    if other_owned.row_count == 1 and self._owned.row_count != 1:
+                        from vibespatial.predicates.binary import _broadcast_right_owned
+
+                        other_owned = _broadcast_right_owned(
+                            other_owned,
+                            self._owned.row_count,
+                        )
+                    return relate_pattern_match(
+                        self._owned,
+                        other_owned,
+                        pattern,
+                        dispatch_mode=_native_strict_dispatch_mode(),
+                    )
+                except StrictNativeFallbackError:
+                    raise
+                except ValueError as exc:
+                    if "DE-9IM pattern" in str(exc) or "Invalid character" in str(exc):
+                        raise
+                    record_fallback_event(
+                        surface="geopandas.array.relate_pattern",
+                        reason="native relate_pattern wrapper failed; falling back to Shapely",
+                        detail=str(exc),
+                        requested=_native_strict_dispatch_mode(),
+                        selected=ExecutionMode.CPU,
+                        pipeline="predicate/relate_pattern",
+                        d2h_transfer=True,
+                    )
+                    logger.debug(
+                        "GPU relate_pattern_match failed, falling back to Shapely",
+                        exc_info=True,
+                    )
+                except Exception as exc:
+                    record_fallback_event(
+                        surface="geopandas.array.relate_pattern",
+                        reason="native relate_pattern wrapper failed; falling back to Shapely",
+                        detail=str(exc),
+                        requested=_native_strict_dispatch_mode(),
+                        selected=ExecutionMode.CPU,
+                        pipeline="predicate/relate_pattern",
+                        d2h_transfer=True,
+                    )
                     logger.debug(
                         "GPU relate_pattern_match failed, falling back to Shapely",
                         exc_info=True,
@@ -2151,6 +2264,7 @@ class GeometryArray(ExtensionArray):
                 unary_union_gpu_owned,
                 union_all_gpu_owned,
             )
+            from vibespatial.runtime.residency import Residency
 
             dispatch = {
                 "union_all": union_all_gpu_owned,
@@ -2161,13 +2275,35 @@ class GeometryArray(ExtensionArray):
             fn = dispatch.get(op)
             if fn is None:
                 return None
+            kwargs.setdefault("dispatch_mode", _native_strict_dispatch_mode())
             result_owned = fn(self._owned, **kwargs)
             if result_owned is not None:
                 result_geoms = owned_to_shapely(result_owned)
                 if result_geoms.size > 0:
                     return result_geoms[0]
-        except Exception:
-            pass
+            record_fallback_event(
+                surface=f"geopandas.array.{op}",
+                reason="native global reduction returned no result; falling back to Shapely",
+                detail=f"rows={len(self)}",
+                requested=kwargs["dispatch_mode"],
+                selected=ExecutionMode.CPU,
+                pipeline=f"constructive/{op}",
+                d2h_transfer=getattr(self._owned, "residency", None) is Residency.DEVICE,
+            )
+        except StrictNativeFallbackError:
+            raise
+        except Exception as exc:
+            from vibespatial.runtime.residency import Residency
+
+            record_fallback_event(
+                surface=f"geopandas.array.{op}",
+                reason="native global reduction failed; falling back to Shapely",
+                detail=f"rows={len(self)}, error={type(exc).__name__}",
+                requested=_native_strict_dispatch_mode(),
+                selected=ExecutionMode.CPU,
+                pipeline=f"constructive/{op}",
+                d2h_transfer=getattr(self._owned, "residency", None) is Residency.DEVICE,
+            )
         return None
 
     #
@@ -2625,6 +2761,7 @@ class GeometryArray(ExtensionArray):
             if self._owned is not None:
                 result._owned = self._owned
         result._provenance = self._provenance
+        result._readonly = False
         return result
 
     def take(self, indices, allow_fill: bool = False, fill_value=None) -> GeometryArray:
@@ -2657,6 +2794,10 @@ class GeometryArray(ExtensionArray):
                     if cp is not None:
                         result_owned = self._owned.device_take(
                             cp.asarray(idx_arr, dtype=cp.int64),
+                            host_indices_for_sizing=np.asarray(
+                                idx_arr,
+                                dtype=np.int64,
+                            ),
                         )
                     else:
                         result_owned = self._owned.take(idx_arr)
@@ -2716,6 +2857,9 @@ class GeometryArray(ExtensionArray):
 
         if not mask.any():
             return new_values
+
+        if self._readonly and not copy:
+            raise ValueError("Cannot modify read-only array")
 
         if limit is not None and limit < len(self):
             modify = mask.cumsum() > limit
@@ -3145,9 +3289,31 @@ class GeometryArray(ExtensionArray):
         -------
         values : numpy array
         """
+        if self._owned is not None:
+            from vibespatial.runtime.materialization import (
+                NativeExportBoundary,
+                record_native_export_boundary,
+            )
+
+            record_native_export_boundary(NativeExportBoundary(
+                surface="vibespatial.api.GeometryArray.__array__",
+                operation="geometryarray_to_numpy",
+                target="numpy",
+                reason="native GeometryArray exported through NumPy array protocol",
+                detail=(
+                    "residency="
+                    f"{getattr(getattr(self._owned, 'residency', None), 'value', 'unknown')}"
+                ),
+                row_count=self._owned.row_count,
+                d2h_transfer=self._owned.device_state is not None,
+            ))
         if copy and (dtype is None or dtype == np.dtype("object")):
             return self._data.copy()
-        return self._data
+        result = self._data
+        if self._readonly:
+            result = result.view()
+            result.flags.writeable = False
+        return result
 
     def _binop(self, other, op):
         def convert_values(param):

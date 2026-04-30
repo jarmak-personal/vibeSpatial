@@ -239,6 +239,78 @@ def test_gpu_byte_classify_point_fast_path_ignores_escaped_geometry_text(monkeyp
     )
 
 
+@needs_gpu
+def test_geojson_compact_point_scalar_fence_is_runtime_observable() -> None:
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    fc = _make_feature_collection([
+        _make_point_feature([0.5, 1.5], {"id": 1}),
+        _make_point_feature([2.5, 3.5], {"id": 2}),
+    ])
+    payload = json.dumps(fc).encode("utf-8")
+
+    reset_d2h_transfer_count()
+    batch = read_geojson_owned(payload, prefer="gpu-byte-classify", track_properties=False)
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert batch.geometry.device_state is not None
+    assert "geojson compact point validity scalar fence" in reasons
+
+
+@needs_gpu
+def test_geojson_generic_scalar_fences_are_runtime_observable() -> None:
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    fc = _make_feature_collection([
+        _make_point_feature([0.5, 1.5], {"id": 1}),
+        _make_linestring_feature([[2.5, 3.5], [4.5, 5.5]], {"id": 2}),
+    ])
+    payload = json.dumps(fc).encode("utf-8")
+
+    reset_d2h_transfer_count()
+    batch = read_geojson_owned(payload, prefer="gpu-byte-classify", track_properties=False)
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert batch.geometry.device_state is not None
+    assert "geojson unsupported geometry-count scalar fence" in reasons
+    assert "geojson geometry family-domain scalar fence" in reasons
+
+
+@needs_gpu
+def test_geojson_generic_point_validity_scalar_fence_is_runtime_observable(
+    monkeypatch,
+) -> None:
+    import vibespatial.io.geojson_gpu as io_geojson_gpu
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    fc = _make_feature_collection([
+        _make_point_feature([0.5, 1.5], {"id": 1}),
+        _make_point_feature([2.5, 3.5], {"id": 2}),
+    ])
+    payload = json.dumps(fc).encode("utf-8")
+    monkeypatch.setattr(
+        io_geojson_gpu,
+        "_try_parse_compact_point_geometries",
+        lambda *_args, **_kwargs: None,
+    )
+
+    reset_d2h_transfer_count()
+    batch = read_geojson_owned(payload, prefer="gpu-byte-classify", track_properties=False)
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert batch.geometry.device_state is not None
+    assert "geojson point coordinate validity scalar fence" in reasons
+
+
 # ---------------------------------------------------------------------------
 # Test 2: Quote-state — property containing "coordinates": as text
 # ---------------------------------------------------------------------------

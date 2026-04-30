@@ -21,6 +21,7 @@ from vibespatial.cuda._runtime import (
     DeviceArray,
     compile_kernel_group,
     count_scatter_total,
+    count_scatter_totals,
     get_cuda_runtime,
 )
 from vibespatial.kernels.owned_take import (
@@ -52,6 +53,22 @@ def _owned_take_kernels():
     )
 
 
+def _device_family_row_count(buffer: DeviceFamilyGeometryBuffer) -> int:
+    return max(int(buffer.geometry_offsets.size) - 1, 0)
+
+
+def _owned_device_bool_scalar(value, *, reason: str) -> bool:
+    """Read a device scalar through the runtime so profiles see the fence."""
+    if cp is not None and (
+        hasattr(value, "__cuda_array_interface__")
+        or type(value).__module__.startswith("cupy")
+    ):
+        d_value = cp.asarray(value).reshape(1)
+        host = get_cuda_runtime().copy_device_to_host(d_value, reason=reason)
+        return bool(np.asarray(host).reshape(-1)[0])
+    return bool(value)
+
+
 def unique_tag_pairs(
     left_tags: np.ndarray,
     right_tags: np.ndarray,
@@ -81,7 +98,10 @@ def unique_tag_pairs(
         packed = left * np.int16(domain) + right
         present = cp.zeros(domain * domain, dtype=cp.bool_)
         present[packed] = True
-        host_present = cp.asnumpy(present)
+        host_present = get_cuda_runtime().copy_device_to_host(
+            present,
+            reason="owned geometry family-pair domain summary scalar fence",
+        )
         return [
             (int(index // domain), int(index % domain))
             for index in np.flatnonzero(host_present)
@@ -396,9 +416,18 @@ class OwnedGeometryArray:
                 "for lazy materialisation"
             )
         runtime = get_cuda_runtime()
-        self._validity = runtime.copy_device_to_host(self.device_state.validity)
-        self._tags = runtime.copy_device_to_host(self.device_state.tags)
-        self._family_row_offsets = runtime.copy_device_to_host(self.device_state.family_row_offsets)
+        self._validity = runtime.copy_device_to_host(
+            self.device_state.validity,
+            reason="owned geometry host metadata validity boundary",
+        )
+        self._tags = runtime.copy_device_to_host(
+            self.device_state.tags,
+            reason="owned geometry host metadata family-tag boundary",
+        )
+        self._family_row_offsets = runtime.copy_device_to_host(
+            self.device_state.family_row_offsets,
+            reason="owned geometry host metadata family-row-offset boundary",
+        )
 
     def _ensure_host_family_structure(self, family: GeometryFamily) -> None:
         """Materialize host-side structural arrays for one family without x/y."""
@@ -429,27 +458,42 @@ class OwnedGeometryArray:
 
         runtime = get_cuda_runtime()
         geometry_offsets = (
-            runtime.copy_device_to_host(device_buffer.geometry_offsets)
+            runtime.copy_device_to_host(
+                device_buffer.geometry_offsets,
+                reason=f"owned geometry {family.value} structure geometry-offset boundary",
+            )
             if need_geometry_offsets
             else buffer.geometry_offsets
         )
         empty_mask = (
-            runtime.copy_device_to_host(device_buffer.empty_mask)
+            runtime.copy_device_to_host(
+                device_buffer.empty_mask,
+                reason=f"owned geometry {family.value} structure empty-mask boundary",
+            )
             if need_empty_mask
             else buffer.empty_mask
         )
         part_offsets = (
-            runtime.copy_device_to_host(device_buffer.part_offsets)
+            runtime.copy_device_to_host(
+                device_buffer.part_offsets,
+                reason=f"owned geometry {family.value} structure part-offset boundary",
+            )
             if need_part_offsets
             else buffer.part_offsets
         )
         ring_offsets = (
-            runtime.copy_device_to_host(device_buffer.ring_offsets)
+            runtime.copy_device_to_host(
+                device_buffer.ring_offsets,
+                reason=f"owned geometry {family.value} structure ring-offset boundary",
+            )
             if need_ring_offsets
             else buffer.ring_offsets
         )
         bounds = (
-            runtime.copy_device_to_host(device_buffer.bounds)
+            runtime.copy_device_to_host(
+                device_buffer.bounds,
+                reason=f"owned geometry {family.value} structure bounds boundary",
+            )
             if need_bounds
             else buffer.bounds
         )
@@ -824,11 +868,26 @@ class OwnedGeometryArray:
         self._record(DiagnosticKind.CACHE, "cached per-geometry bounds", visible=False)
         self._cached_shared_geoarrow_view = None
         runtime = get_cuda_runtime() if self.device_state is not None else None
-        if self.device_state is not None:
-            validity = runtime.copy_device_to_host(self.device_state.validity)
-            tags = runtime.copy_device_to_host(self.device_state.tags)
+        if (
+            self._validity is not None
+            and self._tags is not None
+            and self._family_row_offsets is not None
+        ):
+            validity = self._validity
+            tags = self._tags
+            family_row_offsets = self._family_row_offsets
+        elif self.device_state is not None:
+            validity = runtime.copy_device_to_host(
+                self.device_state.validity,
+                reason="owned geometry cache-bounds validity boundary",
+            )
+            tags = runtime.copy_device_to_host(
+                self.device_state.tags,
+                reason="owned geometry cache-bounds family-tag boundary",
+            )
             family_row_offsets = runtime.copy_device_to_host(
-                self.device_state.family_row_offsets
+                self.device_state.family_row_offsets,
+                reason="owned geometry cache-bounds family-row-offset boundary",
             )
         else:
             validity = self.validity
@@ -987,27 +1046,66 @@ class OwnedGeometryArray:
                 self._resolve()
         if self.device_state is None:
             return
-        if all(buffer.host_materialized for buffer in self.families.values()):
+
+        def _needs_host_materialization(
+            family: GeometryFamily,
+            buffer: FamilyGeometryBuffer,
+        ) -> bool:
+            if not buffer.host_materialized:
+                return True
+            device_buffer = self.device_state.families.get(family)
+            if device_buffer is None:
+                return False
+            if int(device_buffer.x.size) > 0 and (
+                int(buffer.x.size) == 0 or int(buffer.y.size) == 0
+            ):
+                return True
+            if int(device_buffer.geometry_offsets.size) > 0 and int(
+                buffer.geometry_offsets.size
+            ) == 0:
+                return True
+            if int(device_buffer.empty_mask.size) > 0 and int(buffer.empty_mask.size) == 0:
+                return True
+            if device_buffer.part_offsets is not None and buffer.part_offsets is None:
+                return True
+            return device_buffer.ring_offsets is not None and buffer.ring_offsets is None
+
+        if not any(
+            _needs_host_materialization(family, buffer)
+            for family, buffer in self.families.items()
+        ):
             return
         runtime = get_cuda_runtime()
         total_bytes = 0
         t0 = perf_counter()
         for family, buffer in tuple(self.families.items()):
-            if buffer.host_materialized:
+            if not _needs_host_materialization(family, buffer):
                 continue
             device_buffer = self.device_state.families[family]
-            x = runtime.copy_device_to_host(device_buffer.x)
-            y = runtime.copy_device_to_host(device_buffer.y)
+            x = runtime.copy_device_to_host(
+                device_buffer.x,
+                reason=f"owned geometry {family.value} coordinate-x materialization boundary",
+            )
+            y = runtime.copy_device_to_host(
+                device_buffer.y,
+                reason=f"owned geometry {family.value} coordinate-y materialization boundary",
+            )
             total_bytes += x.nbytes + y.nbytes
             geometry_offsets = (
                 buffer.geometry_offsets
                 if buffer.geometry_offsets.size
-                else runtime.copy_device_to_host(device_buffer.geometry_offsets)
+                else runtime.copy_device_to_host(
+                    device_buffer.geometry_offsets,
+                    reason=f"owned geometry {family.value} geometry-offset materialization boundary",
+                )
             )
             empty_mask = (
                 buffer.empty_mask
                 if buffer.empty_mask.size
-                else runtime.copy_device_to_host(device_buffer.empty_mask)
+                else runtime.copy_device_to_host(
+                    device_buffer.empty_mask,
+                    reason=f"owned geometry {family.value} empty-mask materialization boundary",
+                )
             )
             if not buffer.geometry_offsets.size:
                 total_bytes += geometry_offsets.nbytes
@@ -1015,15 +1113,24 @@ class OwnedGeometryArray:
                 total_bytes += empty_mask.nbytes
             part_offsets = buffer.part_offsets
             if part_offsets is None and device_buffer.part_offsets is not None:
-                part_offsets = runtime.copy_device_to_host(device_buffer.part_offsets)
+                part_offsets = runtime.copy_device_to_host(
+                    device_buffer.part_offsets,
+                    reason=f"owned geometry {family.value} part-offset materialization boundary",
+                )
                 total_bytes += part_offsets.nbytes
             ring_offsets = buffer.ring_offsets
             if ring_offsets is None and device_buffer.ring_offsets is not None:
-                ring_offsets = runtime.copy_device_to_host(device_buffer.ring_offsets)
+                ring_offsets = runtime.copy_device_to_host(
+                    device_buffer.ring_offsets,
+                    reason=f"owned geometry {family.value} ring-offset materialization boundary",
+                )
                 total_bytes += ring_offsets.nbytes
             bounds = buffer.bounds
             if bounds is None and device_buffer.bounds is not None:
-                bounds = runtime.copy_device_to_host(device_buffer.bounds)
+                bounds = runtime.copy_device_to_host(
+                    device_buffer.bounds,
+                    reason=f"owned geometry {family.value} bounds materialization boundary",
+                )
                 total_bytes += bounds.nbytes
             self.families[family] = FamilyGeometryBuffer(
                 family=buffer.family,
@@ -1184,12 +1291,14 @@ class OwnedGeometryArray:
             for family in all_family_keys:
                 if family not in ds.families:
                     continue
+                d_buf = ds.families[family]
+                family_row_count = _device_family_row_count(d_buf)
+                if family_row_count == 0:
+                    continue
                 family_tag = FAMILY_TAGS[family]
                 # Boolean mask for rows belonging to this family in this chunk
                 chunk_tags = ds.tags
                 family_mask = chunk_tags == family_tag
-                if not bool(cp.any(family_mask)):
-                    continue
 
                 shift = family_cumulative[family]
                 src_offsets = ds.family_row_offsets[family_mask]
@@ -1200,9 +1309,6 @@ class OwnedGeometryArray:
                     src_offsets + shift
                 )
 
-                # Count family rows: number of rows in device family buffer
-                d_buf = ds.families[family]
-                family_row_count = int(d_buf.geometry_offsets.size) - 1 if d_buf.geometry_offsets.size > 0 else 0
                 family_cumulative[family] += family_row_count
             row_cursor += n
 
@@ -1316,6 +1422,34 @@ class OwnedGeometryArray:
             cp is not None
             and hasattr(indices, "__cuda_array_interface__")
         )
+        host_indices_for_sizing = None
+        indices_for_device_take = indices
+        if not _indices_on_device:
+            host_indices = np.asarray(indices)
+            if host_indices.dtype == bool:
+                if (
+                    int(host_indices.size) == self.row_count
+                    and bool(np.all(host_indices))
+                ):
+                    return self
+                host_indices_for_sizing = np.flatnonzero(host_indices).astype(
+                    np.int64,
+                    copy=False,
+                )
+                indices_for_device_take = host_indices_for_sizing
+            else:
+                host_indices = host_indices.astype(np.int64, copy=False)
+                if (
+                    int(host_indices.size) == self.row_count
+                    and bool(
+                        np.array_equal(
+                            host_indices,
+                            np.arange(self.row_count, dtype=np.int64),
+                        )
+                    )
+                ):
+                    return self
+                host_indices_for_sizing = host_indices
         if (
             cp is not None
             and (
@@ -1323,7 +1457,10 @@ class OwnedGeometryArray:
                 or _indices_on_device
             )
         ):
-            return self.device_take(indices)
+            return self.device_take(
+                indices_for_device_take,
+                host_indices_for_sizing=host_indices_for_sizing,
+            )
 
         if hasattr(indices, 'dtype') and indices.dtype == bool:
             indices = np.flatnonzero(indices)
@@ -1410,7 +1547,12 @@ class OwnedGeometryArray:
         result._record(DiagnosticKind.CREATED, f"subset {indices.size} rows via take", visible=False)
         return result
 
-    def device_take(self, indices) -> OwnedGeometryArray:
+    def device_take(
+        self,
+        indices,
+        *,
+        host_indices_for_sizing: np.ndarray | None = None,
+    ) -> OwnedGeometryArray:
         """Device-side take — all gathering stays on GPU.
 
         Accepts numpy or CuPy indices/mask.  Returns a DEVICE-resident
@@ -1426,7 +1568,81 @@ class OwnedGeometryArray:
 
         # Accept numpy or CuPy indices — skip H→D upload when indices
         # are already on device (Phase 3: vibeSpatial-p23.3).
-        if hasattr(indices, "__cuda_array_interface__"):
+        indices_on_device = hasattr(indices, "__cuda_array_interface__")
+        host_indices_for_device_sizing = None
+        host_indices_for_metadata = None
+        if host_indices_for_sizing is not None:
+            host_indices = np.asarray(host_indices_for_sizing)
+            if host_indices.dtype == bool:
+                host_indices = np.flatnonzero(host_indices)
+            host_indices_candidate = host_indices.astype(np.int64, copy=False)
+            host_indices_for_device_sizing = host_indices_candidate
+            index_count = (
+                int(indices.size)
+                if hasattr(indices, "size")
+                else int(np.asarray(indices).size)
+            )
+            if int(host_indices_candidate.size) != index_count:
+                raise ValueError(
+                    "host_indices_for_sizing must match device_take index count"
+                )
+            if (
+                self._validity is not None
+                and self._tags is not None
+                and self._family_row_offsets is not None
+            ):
+                host_indices_for_metadata = host_indices_candidate
+        if (
+            host_indices_for_metadata is None
+            and not indices_on_device
+            and self._validity is not None
+            and self._tags is not None
+            and self._family_row_offsets is not None
+        ):
+            host_indices = np.asarray(indices)
+            if host_indices.dtype == bool:
+                host_indices = np.flatnonzero(host_indices)
+            host_indices_for_device_sizing = host_indices.astype(np.int64, copy=False)
+            host_indices_for_metadata = host_indices_for_device_sizing
+        host_metadata = None
+        if host_indices_for_metadata is not None:
+            host_validity = np.ascontiguousarray(
+                self._validity[host_indices_for_metadata],
+                dtype=np.bool_,
+            )
+            host_tags = np.ascontiguousarray(
+                self._tags[host_indices_for_metadata],
+                dtype=np.int8,
+            )
+            host_family_row_offsets = np.full(host_tags.size, -1, dtype=np.int32)
+            for family, tag in FAMILY_TAGS.items():
+                if family not in self.families:
+                    continue
+                family_mask = host_tags == np.int8(tag)
+                if family_mask.any():
+                    host_family_row_offsets[family_mask] = np.arange(
+                        int(family_mask.sum()),
+                        dtype=np.int32,
+                    )
+            host_metadata = (
+                host_validity,
+                host_tags,
+                np.ascontiguousarray(host_family_row_offsets, dtype=np.int32),
+            )
+
+        def _attach_host_metadata(result: OwnedGeometryArray) -> OwnedGeometryArray:
+            if host_metadata is None or result.is_indexed_view:
+                return result
+            host_validity, host_tags, host_family_row_offsets = host_metadata
+            if result._validity is None:
+                result._validity = host_validity
+            if result._tags is None:
+                result._tags = host_tags
+            if result._family_row_offsets is None:
+                result._family_row_offsets = host_family_row_offsets
+            return result
+
+        if indices_on_device:
             d_indices = indices
         else:
             d_indices = cp.asarray(indices)
@@ -1446,30 +1662,55 @@ class OwnedGeometryArray:
             d_sample = d_indices[cp.linspace(0, total - 1, sample_size, dtype=cp.int64)]
             approx_unique = int(cp.unique(d_sample).size)
             if approx_unique / sample_size >= self._INDEXED_VIEW_RATIO_THRESHOLD:
-                return self._propagate_cached_validity_mask(
-                    self._physical_device_take(d_indices),
-                    d_indices,
+                return _attach_host_metadata(
+                    self._propagate_cached_validity_mask(
+                        self._physical_device_take(
+                            d_indices,
+                            host_indices_for_sizing=host_indices_for_device_sizing,
+                        ),
+                        d_indices,
+                    )
                 )
             d_unique_indices, d_inverse = cp.unique(d_indices, return_inverse=True)
             unique_count = int(d_unique_indices.size)
             if unique_count / max(total, 1) < self._INDEXED_VIEW_RATIO_THRESHOLD:
                 # Physical take of only the unique rows (on device)
-                physical_base = self._physical_device_take(d_unique_indices)
+                host_unique_indices = (
+                    np.unique(host_indices_for_device_sizing)
+                    if host_indices_for_device_sizing is not None
+                    else None
+                )
+                physical_base = self._physical_device_take(
+                    d_unique_indices,
+                    host_indices_for_sizing=host_unique_indices,
+                )
                 # Pass the CuPy inverse map directly -- no D2H transfer.
                 # _indexed_view detects the CuPy array and expands metadata
                 # on device, keeping the entire path GPU-resident.
-                return self._propagate_cached_validity_mask(
-                    OwnedGeometryArray._indexed_view(physical_base, d_inverse),
-                    d_indices,
+                return _attach_host_metadata(
+                    self._propagate_cached_validity_mask(
+                        OwnedGeometryArray._indexed_view(physical_base, d_inverse),
+                        d_indices,
+                    )
                 )
 
         # --- Physical copy path ---
-        return self._propagate_cached_validity_mask(
-            self._physical_device_take(d_indices),
-            d_indices,
+        return _attach_host_metadata(
+            self._propagate_cached_validity_mask(
+                self._physical_device_take(
+                    d_indices,
+                    host_indices_for_sizing=host_indices_for_device_sizing,
+                ),
+                d_indices,
+            )
         )
 
-    def _physical_device_take(self, d_indices) -> OwnedGeometryArray:
+    def _physical_device_take(
+        self,
+        d_indices,
+        *,
+        host_indices_for_sizing: np.ndarray | None = None,
+    ) -> OwnedGeometryArray:
         """Perform a physical (non-virtual) device-side take."""
         d_state = self._ensure_device_state()
 
@@ -1485,34 +1726,74 @@ class OwnedGeometryArray:
             family, device_buffer = next(iter(d_state.families.items()))
             family_tag = np.int8(FAMILY_TAGS[family])
             host_family = self.families.get(family)
+            homogeneous_host_metadata = (
+                self._tags is not None
+                and int(self._tags.size) == self.row_count
+                and self._family_row_offsets is not None
+                and int(self._family_row_offsets.size) == self.row_count
+                and bool(np.all(self._tags == family_tag))
+            )
             single_family_all_rows = (
                 host_family is not None
                 and int(host_family.row_count) == self.row_count
-            )
-            if n_indices == 0 or single_family_all_rows or bool(cp.all(d_new_tags == family_tag)):
+            ) or homogeneous_host_metadata
+            if n_indices == 0 or single_family_all_rows:
+                selected_tags_are_family = True
+            elif host_indices_for_sizing is not None and self._tags is not None:
+                selected_tags_are_family = bool(
+                    np.all(self._tags[host_indices_for_sizing] == family_tag)
+                )
+            else:
+                selected_tags_are_family = _owned_device_bool_scalar(
+                    cp.all(d_new_tags == family_tag),
+                    reason="owned geometry device-take single-family tag-domain scalar fence",
+                )
+            if selected_tags_are_family:
                 source_family_rows = d_state.family_row_offsets[d_indices].astype(
                     cp.int64, copy=False,
                 )
-                if (
-                    not single_family_all_rows
-                    and int(source_family_rows.size)
-                    and not bool(
-                        cp.all(source_family_rows >= 0)
-                    )
-                ):
+                source_family_rows_valid = True
+                if not single_family_all_rows and int(source_family_rows.size):
+                    if (
+                        host_indices_for_sizing is not None
+                        and self._family_row_offsets is not None
+                    ):
+                        source_family_rows_valid = bool(
+                            np.all(self._family_row_offsets[host_indices_for_sizing] >= 0)
+                        )
+                    else:
+                        source_family_rows_valid = _owned_device_bool_scalar(
+                            cp.all(source_family_rows >= 0),
+                            reason="owned geometry device-take family-row-domain scalar fence",
+                        )
+                if not source_family_rows_valid:
                     return self._physical_device_take_mixed(
                         d_state,
                         d_indices,
                         d_new_validity,
                         d_new_tags,
                         n_indices,
+                        host_indices_for_sizing=host_indices_for_sizing,
                     )
                 d_new_family_row_offsets = cp.arange(n_indices, dtype=cp.int32)
+                host_family_rows = None
+                if host_indices_for_sizing is not None:
+                    if self._family_row_offsets is not None:
+                        host_family_rows = np.asarray(
+                            self._family_row_offsets[host_indices_for_sizing],
+                            dtype=np.int64,
+                        )
+                    elif single_family_all_rows:
+                        host_family_rows = np.asarray(
+                            host_indices_for_sizing,
+                            dtype=np.int64,
+                        )
                 new_device_families[family] = _device_take_family_buffer(
                     device_buffer,
                     family,
                     source_family_rows,
                     self.families.get(family),
+                    host_family_rows=host_family_rows,
                 )
                 schema = get_geometry_buffer_schema(family)
                 new_host_families[family] = FamilyGeometryBuffer(
@@ -1552,6 +1833,7 @@ class OwnedGeometryArray:
             d_new_validity,
             d_new_tags,
             n_indices,
+            host_indices_for_sizing=host_indices_for_sizing,
         )
 
     def _physical_device_take_mixed(
@@ -1561,25 +1843,54 @@ class OwnedGeometryArray:
         d_new_validity,
         d_new_tags,
         n_indices: int,
+        *,
+        host_indices_for_sizing: np.ndarray | None = None,
     ) -> OwnedGeometryArray:
         """Device-side gather for mixed/null layouts."""
         d_new_family_row_offsets = cp.full(n_indices, -1, dtype=cp.int32)
         new_device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
         new_host_families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
+        host_tags_for_sizing = None
+        host_family_rows_for_sizing = None
+        if (
+            host_indices_for_sizing is not None
+            and self._tags is not None
+            and self._family_row_offsets is not None
+        ):
+            host_tags_for_sizing = np.asarray(self._tags[host_indices_for_sizing])
+            host_family_rows_for_sizing = np.asarray(
+                self._family_row_offsets[host_indices_for_sizing],
+                dtype=np.int64,
+            )
 
         for family, device_buffer in d_state.families.items():
             family_mask = d_new_tags == FAMILY_TAGS[family]
-            if not bool(cp.any(family_mask)):
+            if host_tags_for_sizing is not None:
+                host_family_mask = host_tags_for_sizing == np.int8(FAMILY_TAGS[family])
+                family_has_rows = bool(np.any(host_family_mask))
+                family_positions = cp.flatnonzero(family_mask).astype(cp.int64, copy=False)
+            else:
+                host_family_mask = None
+                family_positions = cp.flatnonzero(family_mask).astype(cp.int64, copy=False)
+                family_has_rows = int(family_positions.size) > 0
+            if not family_has_rows:
                 continue
-            source_family_rows = d_state.family_row_offsets[d_indices[family_mask]]
-            d_new_family_row_offsets[family_mask] = cp.arange(
+            source_family_rows = d_state.family_row_offsets[d_indices[family_positions]]
+            d_new_family_row_offsets[family_positions] = cp.arange(
                 int(source_family_rows.size), dtype=cp.int32,
             )
+            host_family_rows = None
+            if host_family_mask is not None and host_family_rows_for_sizing is not None:
+                host_family_rows = np.asarray(
+                    host_family_rows_for_sizing[host_family_mask],
+                    dtype=np.int64,
+                )
             new_device_families[family] = _device_take_family_buffer(
                 device_buffer,
                 family,
                 source_family_rows,
                 self.families.get(family),
+                host_family_rows=host_family_rows,
             )
             # Host placeholder — _ensure_host_state will copy from device on demand
             schema = get_geometry_buffer_schema(family)
@@ -1619,8 +1930,24 @@ class OwnedGeometryArray:
 
     def to_shapely(self) -> list[object | None]:
         from vibespatial.geometry.host_bridge import owned_to_shapely
+        from vibespatial.runtime.materialization import (
+            NativeExportBoundary,
+            record_native_export_boundary,
+        )
 
-        return list(owned_to_shapely(self))
+        result = list(owned_to_shapely(self))
+        record_native_export_boundary(NativeExportBoundary(
+            surface="vibespatial.geometry.owned.OwnedGeometryArray.to_shapely",
+            operation="owned_geometry_to_shapely",
+            target="shapely",
+            reason="owned geometry exported to Shapely compatibility objects",
+            detail=(
+                f"residency={getattr(getattr(self, 'residency', None), 'value', 'unknown')}"
+            ),
+            row_count=self.row_count,
+            d2h_transfer=self.device_state is not None,
+        ))
+        return result
 
     def to_wkb(self, *, hex: bool = False) -> list[bytes | str | None]:
         from vibespatial.io.wkb import encode_wkb_owned
@@ -1849,6 +2176,46 @@ def _concat_device_offset_arrays(
     return cp.concatenate(parts).astype(cp.int32)
 
 
+def _concat_device_xy_by_counts(
+    buffers: list[DeviceFamilyGeometryBuffer],
+    coord_counts: list[int],
+) -> tuple[DeviceArray, DeviceArray]:
+    if not any(coord_counts):
+        return cp.empty(0, dtype=cp.float64), cp.empty(0, dtype=cp.float64)
+    return (
+        cp.concatenate([
+            buffer.x[:count]
+            for buffer, count in zip(buffers, coord_counts, strict=True)
+            if count > 0
+        ]),
+        cp.concatenate([
+            buffer.y[:count]
+            for buffer, count in zip(buffers, coord_counts, strict=True)
+            if count > 0
+        ]),
+    )
+
+
+def _concat_xy_by_counts(
+    buffers: list[FamilyGeometryBuffer],
+    coord_counts: list[int],
+) -> tuple[np.ndarray, np.ndarray]:
+    if not any(coord_counts):
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+    return (
+        np.concatenate([
+            buffer.x[:count]
+            for buffer, count in zip(buffers, coord_counts, strict=True)
+            if count > 0
+        ]),
+        np.concatenate([
+            buffer.y[:count]
+            for buffer, count in zip(buffers, coord_counts, strict=True)
+            if count > 0
+        ]),
+    )
+
+
 def _concat_device_family_buffers(
     family: GeometryFamily,
     buffers: list[DeviceFamilyGeometryBuffer],
@@ -1866,8 +2233,6 @@ def _concat_device_family_buffers(
     if total_rows == 0:
         return buffers[0]
 
-    new_x = cp.concatenate([b.x for b in buffers]) if any(b.x.size for b in buffers) else cp.empty(0, dtype=cp.float64)
-    new_y = cp.concatenate([b.y for b in buffers]) if any(b.y.size for b in buffers) else cp.empty(0, dtype=cp.float64)
     new_empty_mask = cp.concatenate([b.empty_mask for b in buffers])
 
     # Bounds: concatenate if all have bounds, otherwise drop.
@@ -1879,6 +2244,7 @@ def _concat_device_family_buffers(
     if family in (GeometryFamily.POINT, GeometryFamily.LINESTRING, GeometryFamily.MULTIPOINT):
         # Single level of offsets: geometry_offsets -> coords
         coord_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_x, new_y = _concat_device_xy_by_counts(buffers, coord_counts)
         new_geom_offsets = _concat_device_offset_arrays(
             [b.geometry_offsets for b in buffers],
             coord_counts,
@@ -1896,6 +2262,7 @@ def _concat_device_family_buffers(
         # Two levels: geometry_offsets -> ring_offsets -> coords
         ring_counts = [int(b.ring_offsets[-1]) if b.ring_offsets.size > 0 else 0 for b in buffers]
         geom_ring_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_x, new_y = _concat_device_xy_by_counts(buffers, ring_counts)
         new_ring_offsets = _concat_device_offset_arrays(
             [b.ring_offsets for b in buffers],
             ring_counts,
@@ -1918,6 +2285,7 @@ def _concat_device_family_buffers(
         # Two levels: geometry_offsets -> part_offsets -> coords
         coord_counts = [int(b.part_offsets[-1]) if b.part_offsets.size > 0 else 0 for b in buffers]
         geom_part_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_x, new_y = _concat_device_xy_by_counts(buffers, coord_counts)
         new_part_offsets = _concat_device_offset_arrays(
             [b.part_offsets for b in buffers],
             coord_counts,
@@ -1941,6 +2309,7 @@ def _concat_device_family_buffers(
         ring_coord_counts = [int(b.ring_offsets[-1]) if b.ring_offsets.size > 0 else 0 for b in buffers]
         part_ring_counts = [int(b.part_offsets[-1]) if b.part_offsets.size > 0 else 0 for b in buffers]
         geom_part_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_x, new_y = _concat_device_xy_by_counts(buffers, ring_coord_counts)
         new_ring_offsets = _concat_device_offset_arrays(
             [b.ring_offsets for b in buffers],
             ring_coord_counts,
@@ -1982,8 +2351,6 @@ def _concat_family_buffers(
     schema = buffers[0].schema
     total_rows = sum(b.row_count for b in buffers)
 
-    new_x = np.concatenate([b.x for b in buffers]) if total_rows > 0 else np.empty(0, dtype=np.float64)
-    new_y = np.concatenate([b.y for b in buffers]) if total_rows > 0 else np.empty(0, dtype=np.float64)
     new_empty_mask = np.concatenate([b.empty_mask for b in buffers])
 
     # Bounds: concatenate if all have bounds, otherwise drop.
@@ -1995,6 +2362,7 @@ def _concat_family_buffers(
     if family in (GeometryFamily.POINT, GeometryFamily.LINESTRING, GeometryFamily.MULTIPOINT):
         # Single level of offsets: geometry_offsets -> coords
         coord_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_x, new_y = _concat_xy_by_counts(buffers, coord_counts)
         new_geom_offsets = _concat_offset_arrays(
             [b.geometry_offsets for b in buffers],
             coord_counts,
@@ -2014,6 +2382,7 @@ def _concat_family_buffers(
         # Two levels: geometry_offsets -> ring_offsets -> coords
         ring_counts = [int(b.ring_offsets[-1]) if b.ring_offsets.size > 0 else 0 for b in buffers]
         geom_ring_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_x, new_y = _concat_xy_by_counts(buffers, ring_counts)
         new_ring_offsets = _concat_offset_arrays(
             [b.ring_offsets for b in buffers],
             ring_counts,
@@ -2038,6 +2407,7 @@ def _concat_family_buffers(
         # Two levels: geometry_offsets -> part_offsets -> coords
         coord_counts = [int(b.part_offsets[-1]) if b.part_offsets.size > 0 else 0 for b in buffers]
         geom_part_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_x, new_y = _concat_xy_by_counts(buffers, coord_counts)
         new_part_offsets = _concat_offset_arrays(
             [b.part_offsets for b in buffers],
             coord_counts,
@@ -2063,6 +2433,7 @@ def _concat_family_buffers(
         ring_coord_counts = [int(b.ring_offsets[-1]) if b.ring_offsets.size > 0 else 0 for b in buffers]
         part_ring_counts = [int(b.part_offsets[-1]) if b.part_offsets.size > 0 else 0 for b in buffers]
         geom_part_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_x, new_y = _concat_xy_by_counts(buffers, ring_coord_counts)
         new_ring_offsets = _concat_offset_arrays(
             [b.ring_offsets for b in buffers],
             ring_coord_counts,
@@ -2115,7 +2486,12 @@ def _device_gather_offset_slices(
     if n > 0:
         cp.cumsum(lengths, out=new_offsets[1:])
     total_length = (
-        count_scatter_total(get_cuda_runtime(), lengths, new_offsets[:-1])
+        count_scatter_total(
+            get_cuda_runtime(),
+            lengths,
+            new_offsets[:-1],
+            reason="owned geometry offset-slice allocation fence",
+        )
         if n > 0
         else 0
     )
@@ -2144,9 +2520,343 @@ def _device_gather_offset_slices(
     return gathered, new_offsets
 
 
+@dataclass(frozen=True)
+class _DeviceTakeFamilySizePlan:
+    first_level_count: int | None = None
+    second_level_count: int | None = None
+    coord_count: int | None = None
+
+
+def _host_offset_slice_total(
+    offsets: np.ndarray | None,
+    rows: np.ndarray | None,
+) -> int | None:
+    if offsets is None or rows is None:
+        return None
+    host_offsets = np.asarray(offsets, dtype=np.int64)
+    host_rows = np.asarray(rows, dtype=np.int64)
+    if host_rows.size == 0:
+        return 0
+    if host_offsets.size == 0:
+        return None
+    if int(host_rows.min()) < 0 or int(host_rows.max()) + 1 >= host_offsets.size:
+        return None
+    starts = host_offsets[host_rows]
+    ends = host_offsets[host_rows + 1]
+    if bool(np.any(ends < starts)):
+        return None
+    return int(np.sum(ends - starts, dtype=np.int64))
+
+
+def _host_nested_offset_total(
+    outer_offsets: np.ndarray | None,
+    inner_offsets: np.ndarray | None,
+    rows: np.ndarray | None,
+) -> int | None:
+    if outer_offsets is None or inner_offsets is None or rows is None:
+        return None
+    outer = np.asarray(outer_offsets, dtype=np.int64)
+    inner = np.asarray(inner_offsets, dtype=np.int64)
+    host_rows = np.asarray(rows, dtype=np.int64)
+    if host_rows.size == 0:
+        return 0
+    if outer.size == 0 or inner.size == 0:
+        return None
+    if int(host_rows.min()) < 0 or int(host_rows.max()) + 1 >= outer.size:
+        return None
+    outer_starts = outer[host_rows]
+    outer_ends = outer[host_rows + 1]
+    if bool(np.any(outer_ends < outer_starts)):
+        return None
+    if int(outer_starts.min(initial=0)) < 0 or int(outer_ends.max(initial=0)) >= inner.size:
+        return None
+    inner_starts = inner[outer_starts]
+    inner_ends = inner[outer_ends]
+    if bool(np.any(inner_ends < inner_starts)):
+        return None
+    return int(np.sum(inner_ends - inner_starts, dtype=np.int64))
+
+
+def _host_three_level_offset_total(
+    outer_offsets: np.ndarray | None,
+    middle_offsets: np.ndarray | None,
+    inner_offsets: np.ndarray | None,
+    rows: np.ndarray | None,
+) -> int | None:
+    if (
+        outer_offsets is None
+        or middle_offsets is None
+        or inner_offsets is None
+        or rows is None
+    ):
+        return None
+    outer = np.asarray(outer_offsets, dtype=np.int64)
+    middle = np.asarray(middle_offsets, dtype=np.int64)
+    inner = np.asarray(inner_offsets, dtype=np.int64)
+    host_rows = np.asarray(rows, dtype=np.int64)
+    if host_rows.size == 0:
+        return 0
+    if outer.size == 0 or middle.size == 0 or inner.size == 0:
+        return None
+    if int(host_rows.min()) < 0 or int(host_rows.max()) + 1 >= outer.size:
+        return None
+    outer_starts = outer[host_rows]
+    outer_ends = outer[host_rows + 1]
+    if bool(np.any(outer_ends < outer_starts)):
+        return None
+    if int(outer_starts.min(initial=0)) < 0 or int(outer_ends.max(initial=0)) >= middle.size:
+        return None
+    middle_starts = middle[outer_starts]
+    middle_ends = middle[outer_ends]
+    if bool(np.any(middle_ends < middle_starts)):
+        return None
+    if int(middle_starts.min(initial=0)) < 0 or int(middle_ends.max(initial=0)) >= inner.size:
+        return None
+    inner_starts = inner[middle_starts]
+    inner_ends = inner[middle_ends]
+    if bool(np.any(inner_ends < inner_starts)):
+        return None
+    return int(np.sum(inner_ends - inner_starts, dtype=np.int64))
+
+
+def _host_device_take_family_size_plan(
+    family: GeometryFamily,
+    host_buffer: FamilyGeometryBuffer | None,
+    host_family_rows: np.ndarray | None,
+) -> _DeviceTakeFamilySizePlan:
+    if host_buffer is None or host_family_rows is None:
+        return _DeviceTakeFamilySizePlan()
+    if host_buffer.geometry_offsets.size == 0:
+        return _DeviceTakeFamilySizePlan()
+
+    if family in (
+        GeometryFamily.POINT,
+        GeometryFamily.LINESTRING,
+        GeometryFamily.MULTIPOINT,
+    ):
+        return _DeviceTakeFamilySizePlan(
+            coord_count=_host_offset_slice_total(
+                host_buffer.geometry_offsets,
+                host_family_rows,
+            )
+        )
+
+    if family is GeometryFamily.POLYGON:
+        return _DeviceTakeFamilySizePlan(
+            first_level_count=_host_offset_slice_total(
+                host_buffer.geometry_offsets,
+                host_family_rows,
+            ),
+            coord_count=_host_nested_offset_total(
+                host_buffer.geometry_offsets,
+                host_buffer.ring_offsets,
+                host_family_rows,
+            ),
+        )
+
+    if family is GeometryFamily.MULTILINESTRING:
+        return _DeviceTakeFamilySizePlan(
+            first_level_count=_host_offset_slice_total(
+                host_buffer.geometry_offsets,
+                host_family_rows,
+            ),
+            coord_count=_host_nested_offset_total(
+                host_buffer.geometry_offsets,
+                host_buffer.part_offsets,
+                host_family_rows,
+            ),
+        )
+
+    if family is GeometryFamily.MULTIPOLYGON:
+        return _DeviceTakeFamilySizePlan(
+            first_level_count=_host_offset_slice_total(
+                host_buffer.geometry_offsets,
+                host_family_rows,
+            ),
+            second_level_count=_host_nested_offset_total(
+                host_buffer.geometry_offsets,
+                host_buffer.part_offsets,
+                host_family_rows,
+            ),
+            coord_count=_host_three_level_offset_total(
+                host_buffer.geometry_offsets,
+                host_buffer.part_offsets,
+                host_buffer.ring_offsets,
+                host_family_rows,
+            ),
+        )
+
+    return _DeviceTakeFamilySizePlan()
+
+
+def _device_count_scatter_pair(device_counts: DeviceArray) -> tuple[DeviceArray, DeviceArray]:
+    n = int(device_counts.size)
+    offsets = cp.empty(n + 1, dtype=cp.int32)
+    offsets[0] = 0
+    if n:
+        cp.cumsum(device_counts.astype(cp.int32, copy=False), out=offsets[1:])
+    return device_counts.astype(cp.int32, copy=False), offsets[:-1]
+
+
+def _merge_size_plans(
+    host_plan: _DeviceTakeFamilySizePlan,
+    device_plan: _DeviceTakeFamilySizePlan,
+) -> _DeviceTakeFamilySizePlan:
+    return _DeviceTakeFamilySizePlan(
+        first_level_count=(
+            host_plan.first_level_count
+            if host_plan.first_level_count is not None
+            else device_plan.first_level_count
+        ),
+        second_level_count=(
+            host_plan.second_level_count
+            if host_plan.second_level_count is not None
+            else device_plan.second_level_count
+        ),
+        coord_count=(
+            host_plan.coord_count
+            if host_plan.coord_count is not None
+            else device_plan.coord_count
+        ),
+    )
+
+
+def _device_take_family_size_plan_from_device(
+    family: GeometryFamily,
+    device_buffer: DeviceFamilyGeometryBuffer,
+    family_rows: DeviceArray,
+) -> _DeviceTakeFamilySizePlan:
+    row_count = int(family_rows.size)
+    if row_count == 0:
+        return _DeviceTakeFamilySizePlan(
+            first_level_count=0,
+            second_level_count=0,
+            coord_count=0,
+        )
+
+    if family is GeometryFamily.POLYGON and device_buffer.ring_offsets is not None:
+        dense_width = device_buffer.dense_single_ring_width
+        if dense_width is not None:
+            return _DeviceTakeFamilySizePlan(
+                first_level_count=row_count,
+                coord_count=row_count * int(dense_width),
+            )
+        geom_starts = device_buffer.geometry_offsets[family_rows]
+        geom_ends = device_buffer.geometry_offsets[family_rows + 1]
+        ring_counts = (geom_ends - geom_starts).astype(cp.int32, copy=False)
+        coord_counts = (
+            device_buffer.ring_offsets[geom_ends]
+            - device_buffer.ring_offsets[geom_starts]
+        ).astype(cp.int32, copy=False)
+        ring_total, coord_total = count_scatter_totals(
+            get_cuda_runtime(),
+            [
+                _device_count_scatter_pair(ring_counts),
+                _device_count_scatter_pair(coord_counts),
+            ],
+            reason="owned geometry device-take nested slice-size allocation fence",
+        )
+        return _DeviceTakeFamilySizePlan(
+            first_level_count=ring_total,
+            coord_count=coord_total,
+        )
+
+    if (
+        family is GeometryFamily.MULTILINESTRING
+        and device_buffer.part_offsets is not None
+    ):
+        geom_starts = device_buffer.geometry_offsets[family_rows]
+        geom_ends = device_buffer.geometry_offsets[family_rows + 1]
+        part_counts = (geom_ends - geom_starts).astype(cp.int32, copy=False)
+        coord_counts = (
+            device_buffer.part_offsets[geom_ends]
+            - device_buffer.part_offsets[geom_starts]
+        ).astype(cp.int32, copy=False)
+        part_total, coord_total = count_scatter_totals(
+            get_cuda_runtime(),
+            [
+                _device_count_scatter_pair(part_counts),
+                _device_count_scatter_pair(coord_counts),
+            ],
+            reason="owned geometry device-take nested slice-size allocation fence",
+        )
+        return _DeviceTakeFamilySizePlan(
+            first_level_count=part_total,
+            coord_count=coord_total,
+        )
+
+    if (
+        family is GeometryFamily.MULTIPOLYGON
+        and device_buffer.part_offsets is not None
+        and device_buffer.ring_offsets is not None
+    ):
+        geom_starts = device_buffer.geometry_offsets[family_rows]
+        geom_ends = device_buffer.geometry_offsets[family_rows + 1]
+        part_counts = (geom_ends - geom_starts).astype(cp.int32, copy=False)
+        part_starts = device_buffer.part_offsets[geom_starts]
+        part_ends = device_buffer.part_offsets[geom_ends]
+        ring_counts = (part_ends - part_starts).astype(cp.int32, copy=False)
+        coord_counts = (
+            device_buffer.ring_offsets[part_ends]
+            - device_buffer.ring_offsets[part_starts]
+        ).astype(cp.int32, copy=False)
+        part_total, ring_total, coord_total = count_scatter_totals(
+            get_cuda_runtime(),
+            [
+                _device_count_scatter_pair(part_counts),
+                _device_count_scatter_pair(ring_counts),
+                _device_count_scatter_pair(coord_counts),
+            ],
+            reason="owned geometry device-take nested slice-size allocation fence",
+        )
+        return _DeviceTakeFamilySizePlan(
+            first_level_count=part_total,
+            second_level_count=ring_total,
+            coord_count=coord_total,
+        )
+
+    return _DeviceTakeFamilySizePlan()
+
+
+def _complete_device_take_family_size_plan(
+    family: GeometryFamily,
+    device_buffer: DeviceFamilyGeometryBuffer,
+    family_rows: DeviceArray,
+    host_buffer: FamilyGeometryBuffer | None,
+    host_family_rows: np.ndarray | None,
+) -> _DeviceTakeFamilySizePlan:
+    host_plan = _host_device_take_family_size_plan(
+        family,
+        host_buffer,
+        host_family_rows,
+    )
+    if family is GeometryFamily.POLYGON:
+        if host_plan.first_level_count is not None and host_plan.coord_count is not None:
+            return host_plan
+    elif family is GeometryFamily.MULTILINESTRING:
+        if host_plan.first_level_count is not None and host_plan.coord_count is not None:
+            return host_plan
+    elif family is GeometryFamily.MULTIPOLYGON:
+        if (
+            host_plan.first_level_count is not None
+            and host_plan.second_level_count is not None
+            and host_plan.coord_count is not None
+        ):
+            return host_plan
+    else:
+        return host_plan
+
+    return _merge_size_plans(
+        host_plan,
+        _device_take_family_size_plan_from_device(family, device_buffer, family_rows),
+    )
+
+
 def _device_slice_plan(
     offsets: DeviceArray,
     rows: DeviceArray,
+    *,
+    precomputed_total: int | None = None,
 ) -> tuple[DeviceArray, DeviceArray, DeviceArray, int]:
     """Build starts, lengths, output offsets, and total length for row spans."""
     rows = cp.asarray(rows)
@@ -2162,10 +2872,15 @@ def _device_slice_plan(
     ends = offsets[rows + 1].astype(cp.int32, copy=False)
     lengths = (ends - starts).astype(cp.int32, copy=False)
     cp.cumsum(lengths, out=new_offsets[1:])
-    total_length = count_scatter_total(
-        get_cuda_runtime(),
-        lengths,
-        new_offsets[:-1],
+    total_length = (
+        int(precomputed_total)
+        if precomputed_total is not None
+        else count_scatter_total(
+            get_cuda_runtime(),
+            lengths,
+            new_offsets[:-1],
+            reason="owned geometry device-take slice-size allocation fence",
+        )
     )
     return starts, lengths, new_offsets, total_length
 
@@ -2173,6 +2888,8 @@ def _device_slice_plan(
 def _device_gather_offset_index_ranges(
     offsets: DeviceArray,
     rows: DeviceArray,
+    *,
+    precomputed_total: int | None = None,
 ) -> tuple[DeviceArray, DeviceArray]:
     """Gather integer index ranges described by offset rows.
 
@@ -2180,7 +2897,11 @@ def _device_gather_offset_index_ranges(
     with :func:`_device_gather_offset_slices`, but avoids materializing the
     source arange and the per-output ``searchsorted`` mapping.
     """
-    starts, lengths, new_offsets, total_length = _device_slice_plan(offsets, rows)
+    starts, lengths, new_offsets, total_length = _device_slice_plan(
+        offsets,
+        rows,
+        precomputed_total=precomputed_total,
+    )
     if total_length == 0:
         return cp.empty(0, dtype=cp.int32), new_offsets
 
@@ -2220,9 +2941,15 @@ def _device_gather_xy_offset_slices(
     y: DeviceArray,
     offsets: DeviceArray,
     rows: DeviceArray,
+    *,
+    precomputed_total: int | None = None,
 ) -> tuple[DeviceArray, DeviceArray, DeviceArray]:
     """Gather separated x/y coordinate spans without AoS temporaries."""
-    starts, lengths, new_offsets, total_length = _device_slice_plan(offsets, rows)
+    starts, lengths, new_offsets, total_length = _device_slice_plan(
+        offsets,
+        rows,
+        precomputed_total=precomputed_total,
+    )
     if total_length == 0:
         return (
             cp.empty(0, dtype=cp.float64),
@@ -2361,12 +3088,19 @@ def _device_take_family_buffer(
     family: GeometryFamily,
     family_rows: DeviceArray,
     host_buffer: FamilyGeometryBuffer | None = None,
+    *,
+    host_family_rows: np.ndarray | None = None,
 ) -> DeviceFamilyGeometryBuffer:
     """Device-side extract of *family_rows* from a DeviceFamilyGeometryBuffer.
 
     GPU equivalent of :func:`_take_family_buffer` — all offset gathering uses
     :func:`_device_gather_offset_slices` instead of the serial host loop.
     """
+    host_size_plan = _host_device_take_family_size_plan(
+        family,
+        host_buffer,
+        host_family_rows,
+    )
     new_empty_mask = device_buffer.empty_mask[family_rows]
     new_bounds = device_buffer.bounds[family_rows] if device_buffer.bounds is not None else None
 
@@ -2393,6 +3127,7 @@ def _device_take_family_buffer(
             device_buffer.y,
             device_buffer.geometry_offsets,
             family_rows,
+            precomputed_total=host_size_plan.coord_count,
         )
         return DeviceFamilyGeometryBuffer(
             family=family, x=new_x, y=new_y,
@@ -2410,15 +3145,24 @@ def _device_take_family_buffer(
                 family_rows,
                 width=dense_width,
             )
+        size_plan = _complete_device_take_family_size_plan(
+            family,
+            device_buffer,
+            family_rows,
+            host_buffer,
+            host_family_rows,
+        )
         ring_indices, new_geom_offsets = _device_gather_offset_index_ranges(
             device_buffer.geometry_offsets,
             family_rows,
+            precomputed_total=size_plan.first_level_count,
         )
         new_x, new_y, new_ring_offsets = _device_gather_xy_offset_slices(
             device_buffer.x,
             device_buffer.y,
             device_buffer.ring_offsets,
             ring_indices,
+            precomputed_total=size_plan.coord_count,
         )
         return DeviceFamilyGeometryBuffer(
             family=family, x=new_x, y=new_y,
@@ -2427,15 +3171,24 @@ def _device_take_family_buffer(
         )
 
     if family is GeometryFamily.MULTILINESTRING:
+        size_plan = _complete_device_take_family_size_plan(
+            family,
+            device_buffer,
+            family_rows,
+            host_buffer,
+            host_family_rows,
+        )
         part_indices, new_geom_offsets = _device_gather_offset_index_ranges(
             device_buffer.geometry_offsets,
             family_rows,
+            precomputed_total=size_plan.first_level_count,
         )
         new_x, new_y, new_part_offsets = _device_gather_xy_offset_slices(
             device_buffer.x,
             device_buffer.y,
             device_buffer.part_offsets,
             part_indices,
+            precomputed_total=size_plan.coord_count,
         )
         return DeviceFamilyGeometryBuffer(
             family=family, x=new_x, y=new_y,
@@ -2444,19 +3197,29 @@ def _device_take_family_buffer(
         )
 
     if family is GeometryFamily.MULTIPOLYGON:
+        size_plan = _complete_device_take_family_size_plan(
+            family,
+            device_buffer,
+            family_rows,
+            host_buffer,
+            host_family_rows,
+        )
         part_indices, new_geom_offsets = _device_gather_offset_index_ranges(
             device_buffer.geometry_offsets,
             family_rows,
+            precomputed_total=size_plan.first_level_count,
         )
         ring_indices, new_part_offsets = _device_gather_offset_index_ranges(
             device_buffer.part_offsets,
             part_indices,
+            precomputed_total=size_plan.second_level_count,
         )
         new_x, new_y, new_ring_offsets = _device_gather_xy_offset_slices(
             device_buffer.x,
             device_buffer.y,
             device_buffer.ring_offsets,
             ring_indices,
+            precomputed_total=size_plan.coord_count,
         )
         return DeviceFamilyGeometryBuffer(
             family=family, x=new_x, y=new_y,
@@ -3267,6 +4030,15 @@ def concatenate_owned_arrays(arrays: list[OwnedGeometryArray]) -> OwnedGeometryA
         return arrays[0]
     if (
         arrays
+        and cp is not None
+        and all(
+            array.residency is Residency.DEVICE and array.device_state is not None
+            for array in arrays
+        )
+    ):
+        return OwnedGeometryArray.concat(arrays)
+    if (
+        arrays
         and all(array.residency is Residency.DEVICE for array in arrays)
         and all(set(array.families) == {GeometryFamily.POINT} for array in arrays)
         and all(array.device_state is not None for array in arrays)
@@ -3336,6 +4108,9 @@ def concatenate_owned_arrays(arrays: list[OwnedGeometryArray]) -> OwnedGeometryA
             current += int(offsets[-1])
         return np.concatenate(parts).astype(np.int32, copy=False)
 
+    for array in arrays:
+        array._ensure_host_state()
+
     validity = np.concatenate([array.validity for array in arrays])
     tags = np.concatenate([array.tags for array in arrays]).astype(np.int8, copy=False)
     family_row_offsets = np.full(validity.size, -1, dtype=np.int32)
@@ -3381,7 +4156,7 @@ def concatenate_owned_arrays(arrays: list[OwnedGeometryArray]) -> OwnedGeometryA
         tags=tags,
         family_row_offsets=family_row_offsets,
         families=families,
-        residency=arrays[0].residency,
+        residency=Residency.HOST,
     )
     result._record(
         DiagnosticKind.CREATED,
@@ -3400,6 +4175,9 @@ def device_concat_owned_scatter(
     if cp is None:  # pragma: no cover - exercised only on CPU-only installs
         raise RuntimeError("CuPy is required for device scatter assembly")
 
+    host_indices = None
+    if not hasattr(indices, "__cuda_array_interface__"):
+        host_indices = np.asarray(indices, dtype=np.int64)
     indices = cp.asarray(indices, dtype=cp.int64)
     n_out = base.row_count
     if int(indices.size) != replacement.row_count:
@@ -3424,6 +4202,175 @@ def device_concat_owned_scatter(
     out_family_row_offsets = cp.full(n_out, -1, dtype=cp.int32)
     out_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
 
+    host_out_validity = None
+    host_out_tags = None
+    host_out_family_row_offsets = None
+    host_is_replacement = None
+    host_inv_map = None
+    if (
+        host_indices is not None
+        and base._validity is not None
+        and base._tags is not None
+        and base._family_row_offsets is not None
+        and replacement._validity is not None
+        and replacement._tags is not None
+        and replacement._family_row_offsets is not None
+    ):
+        host_out_validity = np.asarray(base._validity, dtype=np.bool_).copy()
+        host_out_tags = np.asarray(base._tags, dtype=np.int8).copy()
+        host_out_validity[host_indices] = np.asarray(
+            replacement._validity,
+            dtype=np.bool_,
+        )
+        host_out_tags[host_indices] = np.asarray(replacement._tags, dtype=np.int8)
+        host_is_replacement = np.zeros(n_out, dtype=bool)
+        host_is_replacement[host_indices] = True
+        host_inv_map = np.full(n_out, -1, dtype=np.int64)
+        host_inv_map[host_indices] = np.arange(replacement.row_count, dtype=np.int64)
+        host_out_family_row_offsets = np.full(n_out, -1, dtype=np.int32)
+
+    same_single_family = (
+        n_out > 0
+        and len(base_state.families) == 1
+        and len(replacement_state.families) == 1
+        and set(base_state.families) == set(replacement_state.families)
+    )
+    if same_single_family:
+        family = next(iter(base_state.families))
+        base_device_buffer = base_state.families[family]
+        replacement_device_buffer = replacement_state.families[family]
+        base_family_covers_all_rows = (
+            int(base_device_buffer.geometry_offsets.size) - 1 == int(base.row_count)
+        )
+        replacement_family_covers_all_rows = (
+            int(replacement_device_buffer.geometry_offsets.size) - 1
+            == int(replacement.row_count)
+        )
+
+    if same_single_family and base_family_covers_all_rows and replacement_family_covers_all_rows:
+        family_buffers: list[DeviceFamilyGeometryBuffer] = []
+        base_family_count = 0
+
+        base_global = cp.flatnonzero(~is_replacement).astype(cp.int64, copy=False)
+        if int(base_global.size) > 0:
+            base_rows = cp.asarray(
+                base_state.family_row_offsets[base_global],
+                dtype=cp.int64,
+            )
+            base_taken = _device_take_family_buffer(
+                base_state.families[family],
+                family,
+                base_rows,
+                base.families.get(family),
+                host_family_rows=(
+                    None
+                    if host_is_replacement is None or base._family_row_offsets is None
+                    else np.asarray(
+                        base._family_row_offsets[
+                            np.flatnonzero(~host_is_replacement).astype(
+                                np.int64,
+                                copy=False,
+                            )
+                        ],
+                        dtype=np.int64,
+                    )
+                ),
+            )
+            family_buffers.append(base_taken)
+            base_family_count = int(base_taken.geometry_offsets.size) - 1
+            out_family_row_offsets[base_global] = cp.arange(
+                base_family_count,
+                dtype=cp.int32,
+            )
+            if (
+                host_out_family_row_offsets is not None
+                and host_is_replacement is not None
+            ):
+                host_base_global = np.flatnonzero(~host_is_replacement).astype(
+                    np.int64,
+                    copy=False,
+                )
+                host_out_family_row_offsets[host_base_global] = np.arange(
+                    base_family_count,
+                    dtype=np.int32,
+                )
+
+        repl_global = cp.flatnonzero(is_replacement).astype(cp.int64, copy=False)
+        if int(repl_global.size) > 0:
+            repl_local = inv_map[repl_global]
+            repl_rows = cp.asarray(
+                replacement_state.family_row_offsets[repl_local],
+                dtype=cp.int64,
+            )
+            repl_taken = _device_take_family_buffer(
+                replacement_state.families[family],
+                family,
+                repl_rows,
+                replacement.families.get(family),
+                host_family_rows=(
+                    None
+                    if (
+                        host_is_replacement is None
+                        or host_inv_map is None
+                        or replacement._family_row_offsets is None
+                    )
+                    else np.asarray(
+                        replacement._family_row_offsets[
+                            host_inv_map[
+                                np.flatnonzero(host_is_replacement).astype(
+                                    np.int64,
+                                    copy=False,
+                                )
+                            ]
+                        ],
+                        dtype=np.int64,
+                    )
+                ),
+            )
+            family_buffers.append(repl_taken)
+            repl_family_count = int(repl_taken.geometry_offsets.size) - 1
+            out_family_row_offsets[repl_global] = cp.arange(
+                base_family_count,
+                base_family_count + repl_family_count,
+                dtype=cp.int32,
+            )
+            if (
+                host_out_family_row_offsets is not None
+                and host_is_replacement is not None
+            ):
+                host_repl_global = np.flatnonzero(host_is_replacement).astype(
+                    np.int64,
+                    copy=False,
+                )
+                host_out_family_row_offsets[host_repl_global] = np.arange(
+                    base_family_count,
+                    base_family_count + repl_family_count,
+                    dtype=np.int32,
+                )
+
+        result = build_device_resident_owned(
+            device_families={family: _concat_device_family_buffers(family, family_buffers)},
+            row_count=n_out,
+            tags=out_tags,
+            validity=out_validity,
+            family_row_offsets=out_family_row_offsets,
+            execution_mode="gpu",
+        )
+        if (
+            host_out_validity is not None
+            and host_out_tags is not None
+            and host_out_family_row_offsets is not None
+        ):
+            result._validity = host_out_validity
+            result._tags = host_out_tags
+            result._family_row_offsets = host_out_family_row_offsets
+        result._record(
+            DiagnosticKind.CREATED,
+            f"device scatter {replacement.row_count} replacement rows into {base.row_count}-row homogeneous base",
+            visible=False,
+        )
+        return result
+
     all_families = set(base_state.families) | set(replacement_state.families)
     for family in sorted(all_families, key=lambda item: FAMILY_TAGS[item]):
         family_global_indices = cp.flatnonzero(out_tags == FAMILY_TAGS[family]).astype(
@@ -3437,35 +4384,103 @@ def device_concat_owned_scatter(
         base_family_count = 0
         repl_family_count = 0
 
-        if family in base_state.families and bool(cp.any(~family_is_replacement)):
-            base_global = family_global_indices[~family_is_replacement]
+        if family in base_state.families:
+            if host_out_tags is not None and host_is_replacement is not None:
+                host_base_global = np.flatnonzero(
+                    (host_out_tags == np.int8(FAMILY_TAGS[family]))
+                    & ~host_is_replacement
+                ).astype(np.int64, copy=False)
+                family_has_base_rows = bool(host_base_global.size)
+                base_global = family_global_indices[~family_is_replacement]
+            else:
+                host_base_global = None
+                base_global = family_global_indices[~family_is_replacement]
+                family_has_base_rows = int(base_global.size) > 0
+        else:
+            host_base_global = None
+            base_global = cp.empty(0, dtype=cp.int64)
+            family_has_base_rows = False
+
+        if family_has_base_rows:
             base_rows = cp.asarray(
                 base_state.family_row_offsets[base_global], dtype=cp.int64,
             )
+            host_base_rows = None
+            if (
+                host_out_tags is not None
+                and host_is_replacement is not None
+                and base._family_row_offsets is not None
+            ):
+                if host_base_global is None:
+                    host_base_global = np.flatnonzero(
+                        (host_out_tags == np.int8(FAMILY_TAGS[family]))
+                        & ~host_is_replacement
+                    ).astype(np.int64, copy=False)
+                host_base_rows = np.asarray(base._family_row_offsets[host_base_global], dtype=np.int64)
             base_taken = _device_take_family_buffer(
-            base_state.families[family],
-            family,
-            base_rows,
-            base.families.get(family),
-        )
+                base_state.families[family],
+                family,
+                base_rows,
+                base.families.get(family),
+                host_family_rows=host_base_rows,
+            )
             family_buffers.append(base_taken)
             base_family_count = int(base_taken.geometry_offsets.size) - 1
             out_family_row_offsets[base_global] = cp.arange(
                 base_family_count, dtype=cp.int32,
             )
+            if host_out_family_row_offsets is not None and host_base_rows is not None:
+                host_out_family_row_offsets[host_base_global] = np.arange(
+                    base_family_count,
+                    dtype=np.int32,
+                )
 
-        if family in replacement_state.families and bool(cp.any(family_is_replacement)):
-            repl_global = family_global_indices[family_is_replacement]
+        if family in replacement_state.families:
+            if host_out_tags is not None and host_is_replacement is not None:
+                host_repl_global = np.flatnonzero(
+                    (host_out_tags == np.int8(FAMILY_TAGS[family]))
+                    & host_is_replacement
+                ).astype(np.int64, copy=False)
+                family_has_replacement_rows = bool(host_repl_global.size)
+                repl_global = family_global_indices[family_is_replacement]
+            else:
+                host_repl_global = None
+                repl_global = family_global_indices[family_is_replacement]
+                family_has_replacement_rows = int(repl_global.size) > 0
+        else:
+            host_repl_global = None
+            repl_global = cp.empty(0, dtype=cp.int64)
+            family_has_replacement_rows = False
+
+        if family_has_replacement_rows:
             repl_local = inv_map[repl_global]
             repl_rows = cp.asarray(
                 replacement_state.family_row_offsets[repl_local], dtype=cp.int64,
             )
+            host_repl_rows = None
+            if (
+                host_out_tags is not None
+                and host_is_replacement is not None
+                and host_inv_map is not None
+                and replacement._family_row_offsets is not None
+            ):
+                if host_repl_global is None:
+                    host_repl_global = np.flatnonzero(
+                        (host_out_tags == np.int8(FAMILY_TAGS[family]))
+                        & host_is_replacement
+                    ).astype(np.int64, copy=False)
+                host_repl_local = host_inv_map[host_repl_global]
+                host_repl_rows = np.asarray(
+                    replacement._family_row_offsets[host_repl_local],
+                    dtype=np.int64,
+                )
             repl_taken = _device_take_family_buffer(
-            replacement_state.families[family],
-            family,
-            repl_rows,
-            replacement.families.get(family),
-        )
+                replacement_state.families[family],
+                family,
+                repl_rows,
+                replacement.families.get(family),
+                host_family_rows=host_repl_rows,
+            )
             family_buffers.append(repl_taken)
             repl_family_count = int(repl_taken.geometry_offsets.size) - 1
             out_family_row_offsets[repl_global] = cp.arange(
@@ -3473,6 +4488,12 @@ def device_concat_owned_scatter(
                 base_family_count + repl_family_count,
                 dtype=cp.int32,
             )
+            if host_out_family_row_offsets is not None and host_repl_rows is not None:
+                host_out_family_row_offsets[host_repl_global] = np.arange(
+                    base_family_count,
+                    base_family_count + repl_family_count,
+                    dtype=np.int32,
+                )
 
         if family_buffers:
             out_families[family] = _concat_device_family_buffers(
@@ -3488,6 +4509,14 @@ def device_concat_owned_scatter(
         family_row_offsets=out_family_row_offsets,
         execution_mode="gpu",
     )
+    if (
+        host_out_validity is not None
+        and host_out_tags is not None
+        and host_out_family_row_offsets is not None
+    ):
+        result._validity = host_out_validity
+        result._tags = host_out_tags
+        result._family_row_offsets = host_out_family_row_offsets
     result._record(
         DiagnosticKind.CREATED,
         f"device scatter {replacement.row_count} replacement rows into {base.row_count}-row base",

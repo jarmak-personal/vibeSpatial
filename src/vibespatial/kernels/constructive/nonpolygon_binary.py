@@ -330,7 +330,12 @@ def point_point_union(
 
     runtime = get_cuda_runtime()
     d_offsets = exclusive_sum(d_counts, synchronize=False)
-    total_coords = count_scatter_total(runtime, d_counts, d_offsets)
+    total_coords = count_scatter_total(
+        runtime,
+        d_counts,
+        d_offsets,
+        reason="point-point constructive coordinate allocation fence",
+    )
 
     if total_coords == 0:
         d_empty_validity = cp.zeros(n, dtype=cp.bool_)
@@ -460,7 +465,12 @@ def point_point_symmetric_difference(
 
     runtime = get_cuda_runtime()
     d_offsets = exclusive_sum(d_counts, synchronize=False)
-    total_coords = count_scatter_total(runtime, d_counts, d_offsets)
+    total_coords = count_scatter_total(
+        runtime,
+        d_counts,
+        d_offsets,
+        reason="point-point difference coordinate allocation fence",
+    )
 
     # Validity: row is valid if it has any output points
     d_has_output = d_counts > 0
@@ -701,7 +711,12 @@ def _linestring_polygon_constructive(
         runtime.launch(kernels["linestring_polygon_count"], grid=grid, block=block, params=count_params)
 
         d_offsets = exclusive_sum(d_counts, synchronize=False)
-        total_verts = count_scatter_total(runtime, d_counts, d_offsets)
+        total_verts = count_scatter_total(
+            runtime,
+            d_counts,
+            d_offsets,
+            reason="linestring-polygon constructive vertex allocation fence",
+        )
 
         if total_verts == 0:
             d_empty_validity = cp.zeros(n, dtype=cp.bool_)
@@ -864,6 +879,7 @@ def _linestring_polygon_constructive(
             (d_coord_counts, d_coord_offsets),
             (d_part_counts, d_part_offsets),
         ],
+        reason="linestring-polygon difference totals allocation fence",
     )
 
     d_coord_counts_cp = cp.asarray(d_coord_counts)
@@ -1104,7 +1120,12 @@ def linestring_linestring_intersection(
     )
 
     d_offsets = exclusive_sum(d_counts, synchronize=False)
-    total_points = count_scatter_total(runtime, d_counts, d_offsets)
+    total_points = count_scatter_total(
+        runtime,
+        d_counts,
+        d_offsets,
+        reason="linestring-linestring intersection point allocation fence",
+    )
 
     if total_points == 0:
         d_empty_validity = cp.zeros(n, dtype=cp.bool_)

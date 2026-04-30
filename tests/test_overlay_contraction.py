@@ -16,6 +16,7 @@ from vibespatial.overlay.contraction import (
 )
 
 contract_module = importlib.import_module("vibespatial.overlay.contract")
+reconstruct_module = importlib.import_module("vibespatial.overlay.contraction_reconstruct")
 DATA_ROOT = Path(__file__).resolve().parents[1] / "tests" / "upstream" / "geopandas" / "tests" / "data"
 LEFT_NYBB = DATA_ROOT / "nybb_16a.zip"
 RIGHT_NYBB = DATA_ROOT / "overlay" / "nybb_qgis" / "polydf2.shp"
@@ -101,6 +102,11 @@ def test_overlay_contraction_gpu_path_bypasses_host_helper(
         "_contract_overlay_microcells_host",
         lambda *args, **kwargs: pytest.fail("GPU contraction should not need the host helper on simple rectangles"),
     )
+    monkeypatch.setattr(
+        reconstruct_module,
+        "_walk_boundary_rings",
+        lambda *args, **kwargs: pytest.fail("GPU contraction should not export microcell edges to host"),
+    )
 
     left = from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)])
     right = from_shapely_geometries([box(1.0, 0.0, 3.0, 2.0)])
@@ -108,3 +114,34 @@ def test_overlay_contraction_gpu_path_bypasses_host_helper(
     result = overlay_contraction_owned(left, right, operation="intersection")
 
     assert shapely.equals(result.to_shapely()[0], box(1.0, 0.0, 2.0, 2.0))
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [
+        ("intersection", box(1.0, 0.0, 2.0, 2.0)),
+        ("union", box(0.0, 0.0, 3.0, 2.0)),
+        ("difference", box(0.0, 0.0, 1.0, 2.0)),
+    ],
+)
+def test_overlay_contraction_reconstruction_uses_device_grouped_microcell_union(
+    operation,
+    expected,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    monkeypatch.setattr(
+        reconstruct_module,
+        "_walk_boundary_rings",
+        lambda *args, **kwargs: pytest.fail("selected microcells should reduce on device"),
+    )
+
+    left = from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)])
+    right = from_shapely_geometries([box(1.0, 0.0, 3.0, 2.0)])
+
+    result = overlay_contraction_owned(left, right, operation=operation)
+
+    assert shapely.equals(result.to_shapely()[0], expected)

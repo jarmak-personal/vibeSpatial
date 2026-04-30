@@ -144,9 +144,9 @@ def test_line_merge_batches_output_size_scalar_fence(monkeypatch: pytest.MonkeyP
     calls: list[int] = []
     original = line_merge_mod.count_scatter_totals
 
-    def _record_count_scatter_totals(runtime, count_offset_pairs):
+    def _record_count_scatter_totals(runtime, count_offset_pairs, *, reason=None):
         calls.append(len(count_offset_pairs))
-        return original(runtime, count_offset_pairs)
+        return original(runtime, count_offset_pairs, reason=reason)
 
     monkeypatch.setattr(
         line_merge_mod,

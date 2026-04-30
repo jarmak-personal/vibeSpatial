@@ -66,11 +66,23 @@ def multipoint_polygon_intersection(
     if total_points == 0:
         return _empty_multipoint_output(n)
 
-    h_mp_offsets = runtime.copy_device_to_host(d_mp_offsets)
-    h_both_valid = runtime.copy_device_to_host(d_both_valid)
+    h_mp_offsets = runtime.copy_device_to_host(
+        d_mp_offsets,
+        reason="multipoint-polygon intersection multipoint offsets host export",
+    )
+    h_both_valid = runtime.copy_device_to_host(
+        d_both_valid,
+        reason="multipoint-polygon intersection paired-validity host export",
+    )
 
-    h_mp_x = runtime.copy_device_to_host(mp_buf.x)
-    h_mp_y = runtime.copy_device_to_host(mp_buf.y)
+    h_mp_x = runtime.copy_device_to_host(
+        mp_buf.x,
+        reason="multipoint-polygon intersection multipoint x-coordinate host export",
+    )
+    h_mp_y = runtime.copy_device_to_host(
+        mp_buf.y,
+        reason="multipoint-polygon intersection multipoint y-coordinate host export",
+    )
     poly_shapely = polygons.to_shapely()
 
     point_geoms = []
@@ -91,7 +103,10 @@ def multipoint_polygon_intersection(
     poly_oga = from_shapely_geometries(poly_geoms)
     pip_mask = point_in_polygon(pt_oga, poly_oga, _return_device=True)
     if hasattr(pip_mask, "__cuda_array_interface__"):
-        h_pip = runtime.copy_device_to_host(pip_mask)
+        h_pip = runtime.copy_device_to_host(
+            pip_mask,
+            reason="multipoint-polygon intersection point-in-polygon mask host export",
+        )
     else:
         h_pip = np.asarray(pip_mask, dtype=bool)
 
@@ -149,12 +164,27 @@ def multipoint_polygon_difference(
     if total_points == 0:
         return _empty_multipoint_output(n)
 
-    h_mp_offsets = runtime.copy_device_to_host(d_mp_offsets)
-    h_mp_valid = runtime.copy_device_to_host(d_mp_valid)
-    h_both_valid = runtime.copy_device_to_host(d_both_valid)
+    h_mp_offsets = runtime.copy_device_to_host(
+        d_mp_offsets,
+        reason="multipoint-polygon difference multipoint offsets host export",
+    )
+    h_mp_valid = runtime.copy_device_to_host(
+        d_mp_valid,
+        reason="multipoint-polygon difference multipoint validity host export",
+    )
+    h_both_valid = runtime.copy_device_to_host(
+        d_both_valid,
+        reason="multipoint-polygon difference paired-validity host export",
+    )
 
-    h_mp_x = runtime.copy_device_to_host(mp_buf.x)
-    h_mp_y = runtime.copy_device_to_host(mp_buf.y)
+    h_mp_x = runtime.copy_device_to_host(
+        mp_buf.x,
+        reason="multipoint-polygon difference multipoint x-coordinate host export",
+    )
+    h_mp_y = runtime.copy_device_to_host(
+        mp_buf.y,
+        reason="multipoint-polygon difference multipoint y-coordinate host export",
+    )
     poly_shapely = polygons.to_shapely()
 
     point_geoms = []
@@ -175,7 +205,10 @@ def multipoint_polygon_difference(
     poly_oga = from_shapely_geometries(poly_geoms)
     pip_mask = point_in_polygon(pt_oga, poly_oga, _return_device=True)
     if hasattr(pip_mask, "__cuda_array_interface__"):
-        h_pip = runtime.copy_device_to_host(pip_mask)
+        h_pip = runtime.copy_device_to_host(
+            pip_mask,
+            reason="multipoint-polygon difference point-in-polygon mask host export",
+        )
     else:
         h_pip = np.asarray(pip_mask, dtype=bool)
 

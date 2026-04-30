@@ -30,6 +30,8 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.residency import Residency
 
+from ._host_boundary import overlay_device_to_host, overlay_int_scalar
+
 try:
     import cupy as cp
 except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
@@ -212,8 +214,18 @@ def _containment_bypass_gpu(
             | (d_lb[:, 1] > d_corr_bounds[3])  # L.ymin > R.ymax
         )
 
-    n_bbox_candidates = int(cp.sum(d_bbox_inside))
-    n_bbox_disjoint = int(cp.sum(d_bbox_disjoint)) if d_bbox_disjoint is not None else 0
+    n_bbox_candidates = overlay_int_scalar(
+        cp.count_nonzero(d_bbox_inside),
+        reason="overlay containment-bypass bbox-contained count scalar fence",
+    )
+    n_bbox_disjoint = (
+        overlay_int_scalar(
+            cp.count_nonzero(d_bbox_disjoint),
+            reason="overlay containment-bypass bbox-disjoint count scalar fence",
+        )
+        if d_bbox_disjoint is not None
+        else 0
+    )
 
     if n_bbox_candidates == 0 and n_bbox_disjoint == 0:
         d_remainder_mask = cp.ones(n_left, dtype=cp.bool_)
@@ -248,7 +260,10 @@ def _containment_bypass_gpu(
                 continue
             tag_val = FAMILY_TAGS[left_family]
             d_family_mask = d_cand_tags == tag_val
-            n_family = int(cp.sum(d_family_mask))
+            n_family = overlay_int_scalar(
+                cp.count_nonzero(d_family_mask),
+                reason=f"overlay containment-bypass {left_family.value} candidate count scalar fence",
+            )
             if n_family == 0:
                 continue
 
@@ -395,7 +410,10 @@ def _containment_bypass_gpu(
     d_contained_rows: cp.ndarray | None = None  # type: ignore[name-defined]
     if d_cand_result is not None and d_bbox_indices is not None:
         d_cand_all_inside = d_cand_result == 1
-        n_contained = int(cp.sum(d_cand_all_inside))
+        n_contained = overlay_int_scalar(
+            cp.count_nonzero(d_cand_all_inside),
+            reason="overlay containment-bypass contained-row count scalar fence",
+        )
         if n_contained > 0:
             d_contained_cand_indices = cp.flatnonzero(d_cand_all_inside)
             d_contained_rows = d_bbox_indices[d_contained_cand_indices].astype(cp.int64)
@@ -415,7 +433,6 @@ def _containment_bypass_gpu(
         bypass_oga = left.take(d_contained_rows)
         d_remainder_mask = cp.ones(n_left, dtype=cp.bool_)
         d_remainder_mask[d_contained_rows] = False
-        n_remainder = int(cp.sum(d_remainder_mask))
         n_bypassed = n_contained
 
     elif how == "difference":
@@ -442,11 +459,20 @@ def _containment_bypass_gpu(
         else:
             bypass_oga = None  # all bypassed rows were contained (empty result)
 
-        n_remainder = int(cp.sum(d_remainder_mask))
+        n_remainder = overlay_int_scalar(
+            cp.count_nonzero(d_remainder_mask),
+            reason="overlay containment-bypass difference-remainder count scalar fence",
+        )
 
     else:
         # Should not reach here due to gate above.
         return None, None
+
+    if how == "intersection":
+        n_remainder = overlay_int_scalar(
+            cp.count_nonzero(d_remainder_mask),
+            reason="overlay containment-bypass intersection-remainder count scalar fence",
+        )
 
     record_dispatch_event(
         surface="geopandas.spatial_overlay",
@@ -513,6 +539,19 @@ def _is_clip_polygon_sh_eligible(
 
     if right.row_count != 1:
         return False, 0
+    try:
+        from vibespatial.overlay.assemble import _axis_aligned_box_bounds_device
+
+        if _axis_aligned_box_bounds_device(right) is not None:
+            # Device-proven rectangles are convex single-ring clip polygons.
+            # Include the closing coordinate because the SH kernel budget uses
+            # the raw exterior-ring count.
+            return True, 5
+    except Exception:
+        logger.debug(
+            "device rectangle clip eligibility proof failed; trying host classifier",
+            exc_info=True,
+        )
 
     # Must be Polygon family (not MultiPolygon). Only small structural arrays
     # are needed here; keep coordinate buffers lazy.
@@ -817,4 +856,8 @@ def _batch_point_in_ring_gpu(
     runtime.launch(kernel, grid=grid, block=block, params=params)
 
     # --- Download results ---
-    return np.asarray(runtime.copy_device_to_host(d_results), dtype=np.int32)
+    return overlay_device_to_host(
+        d_results,
+        reason="overlay bypass batch point-in-ring result export",
+        dtype=np.int32,
+    )

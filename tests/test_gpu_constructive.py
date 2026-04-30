@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import Point, Polygon
+from shapely.geometry import LineString, MultiLineString, Point, Polygon
 
 from vibespatial import ExecutionMode, clip_by_rect_owned, from_shapely_geometries, has_gpu_runtime
 from vibespatial.constructive.boundary import boundary_owned
@@ -226,6 +226,7 @@ def test_boundary_gpu_mixed_polygon_ring_counts_preserves_row_types() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
 
+    from vibespatial.runtime.execution_trace import assert_no_transfers
     from vibespatial.runtime.residency import Residency
 
     single_ring = Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)])
@@ -235,7 +236,8 @@ def test_boundary_gpu_mixed_polygon_ring_counts_preserves_row_types() -> None:
     )
     owned = from_shapely_geometries([single_ring, with_hole], residency=Residency.DEVICE)
 
-    result = boundary_owned(owned, dispatch_mode=ExecutionMode.GPU)
+    with assert_no_transfers():
+        result = boundary_owned(owned, dispatch_mode=ExecutionMode.GPU)
     geometries = result.to_shapely()
 
     assert result.residency is Residency.DEVICE
@@ -243,6 +245,33 @@ def test_boundary_gpu_mixed_polygon_ring_counts_preserves_row_types() -> None:
     assert geometries[1].geom_type == "MultiLineString"
     assert bool(shapely.equals(geometries[0], single_ring.boundary))
     assert bool(shapely.equals(geometries[1], with_hole.boundary))
+
+
+@pytest.mark.gpu
+def test_boundary_gpu_empty_lineal_rows_stay_device_resident() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.runtime.execution_trace import assert_no_transfers
+    from vibespatial.runtime.residency import Residency
+
+    geoms = [
+        LineString(),
+        LineString([(0, 0), (1, 1)]),
+        MultiLineString([]),
+        MultiLineString([[(2, 2), (3, 3)]]),
+    ]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+
+    with assert_no_transfers():
+        result = boundary_owned(owned, dispatch_mode=ExecutionMode.GPU)
+
+    assert result.residency is Residency.DEVICE
+    assert result._validity is None
+    assert result._tags is None
+    assert result._family_row_offsets is None
+    actual = result.to_shapely()
+    _assert_geometries_equal(actual, [geom.boundary for geom in geoms])
 
 
 @pytest.mark.gpu

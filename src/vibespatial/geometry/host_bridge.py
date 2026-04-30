@@ -30,6 +30,10 @@ def _empty_geometry_for_family(family: GeometryFamily):
     }[family]
 
 
+def _xy_view(buffer: FamilyGeometryBuffer, coord_count: int) -> np.ndarray:
+    return np.column_stack((buffer.x[:coord_count], buffer.y[:coord_count]))
+
+
 def materialize_family_row(buffer: FamilyGeometryBuffer, row_index: int):
     if bool(buffer.empty_mask[row_index]):
         return _empty_geometry_for_family(buffer.family)
@@ -184,9 +188,10 @@ def _materialize_full_linestring_family(buffer: FamilyGeometryBuffer) -> np.ndar
     if nonempty_positions.size == 0:
         return result
     line_sizes = np.diff(buffer.geometry_offsets)[nonempty_positions]
+    coord_count = int(buffer.geometry_offsets[-1])
     result[nonempty_positions] = np.asarray(
         shapely.linestrings(
-            np.column_stack((buffer.x, buffer.y)),
+            _xy_view(buffer, coord_count),
             indices=np.repeat(np.arange(nonempty_positions.size, dtype=np.int32), line_sizes),
         ),
         dtype=object,
@@ -234,9 +239,10 @@ def _materialize_full_multipoint_family(buffer: FamilyGeometryBuffer) -> np.ndar
     if nonempty_positions.size == 0:
         return result
     point_sizes = np.diff(buffer.geometry_offsets)[nonempty_positions]
+    coord_count = int(buffer.geometry_offsets[-1])
     result[nonempty_positions] = np.asarray(
         shapely.multipoints(
-            np.column_stack((buffer.x, buffer.y)),
+            _xy_view(buffer, coord_count),
             indices=np.repeat(np.arange(nonempty_positions.size, dtype=np.int32), point_sizes),
         ),
         dtype=object,
@@ -292,8 +298,9 @@ def _materialize_full_polygon_family(buffer: FamilyGeometryBuffer) -> np.ndarray
     if nonempty_positions.size == 0:
         return result
     ring_counts = np.diff(buffer.geometry_offsets)[nonempty_positions]
+    coord_count = int(buffer.ring_offsets[-1])
     rings = shapely.linearrings(
-        np.column_stack((buffer.x, buffer.y)),
+        _xy_view(buffer, coord_count),
         indices=np.repeat(
             np.arange(buffer.ring_offsets.size - 1, dtype=np.int32),
             np.diff(buffer.ring_offsets),
@@ -356,8 +363,9 @@ def _materialize_full_multilinestring_family(buffer: FamilyGeometryBuffer) -> np
     nonempty_positions = np.flatnonzero(~empty_mask)
     if nonempty_positions.size == 0:
         return result
+    coord_count = int(buffer.part_offsets[-1])
     lines = shapely.linestrings(
-        np.column_stack((buffer.x, buffer.y)),
+        _xy_view(buffer, coord_count),
         indices=np.repeat(
             np.arange(buffer.part_offsets.size - 1, dtype=np.int32),
             np.diff(buffer.part_offsets),
@@ -429,8 +437,9 @@ def _materialize_full_multipolygon_family(buffer: FamilyGeometryBuffer) -> np.nd
     nonempty_positions = np.flatnonzero(~empty_mask)
     if nonempty_positions.size == 0:
         return result
+    coord_count = int(buffer.ring_offsets[-1])
     rings = shapely.linearrings(
-        np.column_stack((buffer.x, buffer.y)),
+        _xy_view(buffer, coord_count),
         indices=np.repeat(
             np.arange(buffer.ring_offsets.size - 1, dtype=np.int32),
             np.diff(buffer.ring_offsets),

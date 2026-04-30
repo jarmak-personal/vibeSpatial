@@ -43,8 +43,10 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import StrictNativeFallbackError, record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
+from vibespatial.runtime.residency import Residency
 
 logger = logging.getLogger(__name__)
 
@@ -398,8 +400,22 @@ def simplify_owned(
         _precision_plan = selection.precision_plan
         try:
             result = _simplify_gpu(owned, tolerance)
-        except Exception:
+        except StrictNativeFallbackError:
+            raise
+        except Exception as exc:
             logger.warning("GPU simplify failed, falling back to CPU", exc_info=True)
+            record_fallback_event(
+                surface="geopandas.array.simplify",
+                reason="GPU simplify failed",
+                detail=(
+                    f"rows={row_count}, tolerance={tolerance}, "
+                    f"precision={_precision_plan.compute_precision.value}, "
+                    f"error={type(exc).__name__}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.CPU,
+                d2h_transfer=owned.residency is Residency.DEVICE,
+            )
         else:
             record_dispatch_event(
                 surface="geopandas.array.simplify",
@@ -423,3 +439,38 @@ def simplify_owned(
         selected=ExecutionMode.CPU,
     )
     return result
+
+
+def simplify_native_tabular_result(
+    owned: OwnedGeometryArray,
+    tolerance: float,
+    *,
+    preserve_topology: bool = True,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = simplify_owned(
+        owned,
+        tolerance,
+        preserve_topology=preserve_topology,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="simplify",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )

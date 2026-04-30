@@ -858,8 +858,8 @@ class TestOwnedStructure:
         d_bytes = _to_device_bytes(wkt)
         owned = read_wkt_gpu(d_bytes)
 
-        buf = owned.families[GeometryFamily.LINESTRING]
-        offsets = buf.geometry_offsets
+        buf = owned.device_state.families[GeometryFamily.LINESTRING]
+        offsets = cp.asnumpy(buf.geometry_offsets)
         # First linestring: 2 coords, second: 3 coords
         assert offsets[0] == 0
         assert offsets[1] == 2
@@ -874,14 +874,14 @@ class TestOwnedStructure:
         d_bytes = _to_device_bytes(wkt)
         owned = read_wkt_gpu(d_bytes)
 
-        buf = owned.families[GeometryFamily.POLYGON]
+        buf = owned.device_state.families[GeometryFamily.POLYGON]
         # geometry_offsets: [0, 2] -- 1 polygon with 2 rings
-        geom_offsets = buf.geometry_offsets
+        geom_offsets = cp.asnumpy(buf.geometry_offsets)
         assert geom_offsets[0] == 0
         assert geom_offsets[1] == 2
 
         # ring_offsets: [0, 5, 10] -- ring 0 has 5 coords, ring 1 has 5 coords
-        ring_offsets = buf.ring_offsets
+        ring_offsets = cp.asnumpy(buf.ring_offsets)
         assert ring_offsets is not None
         assert ring_offsets[0] == 0
         assert ring_offsets[1] == 5

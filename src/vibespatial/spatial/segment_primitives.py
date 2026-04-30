@@ -33,6 +33,7 @@ from vibespatial.cuda._runtime import (  # noqa: E402
     DeviceArray,
     compile_kernel_group,
     count_scatter_total,
+    count_scatter_totals,
     get_cuda_runtime,
     maybe_trim_pool_memory,
 )
@@ -75,6 +76,16 @@ _FAMILY_LINESTRING = FAMILY_TAGS[GeometryFamily.LINESTRING]
 _FAMILY_POLYGON = FAMILY_TAGS[GeometryFamily.POLYGON]
 _FAMILY_MULTILINESTRING = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
 _FAMILY_MULTIPOLYGON = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
+
+
+def _segment_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
+    return np.asarray(get_cuda_runtime().copy_device_to_host(device_array, reason=reason))
+
+
+def _segment_int_scalar(value: object, *, reason: str) -> int:
+    import cupy as cp
+
+    return int(_segment_device_to_host(cp.asarray(value).reshape(1), reason=reason)[0])
 
 
 # ---------------------------------------------------------------------------
@@ -187,46 +198,88 @@ class SegmentIntersectionResult:
             return
         runtime = get_cuda_runtime()
         self._left_rows = np.asarray(
-            runtime.copy_device_to_host(ds.left_rows), dtype=np.int32,
+            runtime.copy_device_to_host(
+                ds.left_rows,
+                reason="segment intersections left-row host export",
+            ), dtype=np.int32,
         )
         self._left_segments = np.asarray(
-            runtime.copy_device_to_host(ds.left_segments), dtype=np.int32,
+            runtime.copy_device_to_host(
+                ds.left_segments,
+                reason="segment intersections left-segment host export",
+            ), dtype=np.int32,
         )
         self._left_lookup = np.asarray(
-            runtime.copy_device_to_host(ds.left_lookup), dtype=np.int32,
+            runtime.copy_device_to_host(
+                ds.left_lookup,
+                reason="segment intersections left-lookup host export",
+            ), dtype=np.int32,
         )
         self._right_rows = np.asarray(
-            runtime.copy_device_to_host(ds.right_rows), dtype=np.int32,
+            runtime.copy_device_to_host(
+                ds.right_rows,
+                reason="segment intersections right-row host export",
+            ), dtype=np.int32,
         )
         self._right_segments = np.asarray(
-            runtime.copy_device_to_host(ds.right_segments), dtype=np.int32,
+            runtime.copy_device_to_host(
+                ds.right_segments,
+                reason="segment intersections right-segment host export",
+            ), dtype=np.int32,
         )
         self._right_lookup = np.asarray(
-            runtime.copy_device_to_host(ds.right_lookup), dtype=np.int32,
+            runtime.copy_device_to_host(
+                ds.right_lookup,
+                reason="segment intersections right-lookup host export",
+            ), dtype=np.int32,
         )
         self._kinds = np.asarray(
-            runtime.copy_device_to_host(ds.kinds), dtype=np.int8,
+            runtime.copy_device_to_host(
+                ds.kinds,
+                reason="segment intersections kind-code host export",
+            ), dtype=np.int8,
         )
         self._point_x = np.asarray(
-            runtime.copy_device_to_host(ds.point_x), dtype=np.float64,
+            runtime.copy_device_to_host(
+                ds.point_x,
+                reason="segment intersections point-x host export",
+            ), dtype=np.float64,
         )
         self._point_y = np.asarray(
-            runtime.copy_device_to_host(ds.point_y), dtype=np.float64,
+            runtime.copy_device_to_host(
+                ds.point_y,
+                reason="segment intersections point-y host export",
+            ), dtype=np.float64,
         )
         self._overlap_x0 = np.asarray(
-            runtime.copy_device_to_host(ds.overlap_x0), dtype=np.float64,
+            runtime.copy_device_to_host(
+                ds.overlap_x0,
+                reason="segment intersections overlap-x0 host export",
+            ), dtype=np.float64,
         )
         self._overlap_y0 = np.asarray(
-            runtime.copy_device_to_host(ds.overlap_y0), dtype=np.float64,
+            runtime.copy_device_to_host(
+                ds.overlap_y0,
+                reason="segment intersections overlap-y0 host export",
+            ), dtype=np.float64,
         )
         self._overlap_x1 = np.asarray(
-            runtime.copy_device_to_host(ds.overlap_x1), dtype=np.float64,
+            runtime.copy_device_to_host(
+                ds.overlap_x1,
+                reason="segment intersections overlap-x1 host export",
+            ), dtype=np.float64,
         )
         self._overlap_y1 = np.asarray(
-            runtime.copy_device_to_host(ds.overlap_y1), dtype=np.float64,
+            runtime.copy_device_to_host(
+                ds.overlap_y1,
+                reason="segment intersections overlap-y1 host export",
+            ), dtype=np.float64,
         )
         self._ambiguous_rows = np.asarray(
-            runtime.copy_device_to_host(ds.ambiguous_rows), dtype=np.int32,
+            runtime.copy_device_to_host(
+                ds.ambiguous_rows,
+                reason="segment intersections ambiguous-row host export",
+            ), dtype=np.int32,
         )
 
     @property
@@ -434,6 +487,208 @@ def _same_row_candidate_kernels():
         _SAME_ROW_CANDIDATE_KERNEL_NAMES,
     )
 
+
+@dataclass
+class _PendingSegmentFamily:
+    family: GeometryFamily
+    buffer: DeviceArray
+    valid_rows: DeviceArray
+    empty_mask: DeviceArray
+    geometry_offsets: DeviceArray
+    part_offsets: DeviceArray
+    ring_offsets: DeviceArray
+    segment_counts: DeviceArray | None
+    segment_offsets: DeviceArray
+    row_count: int
+    total_segments: int | None
+
+
+def _host_segment_total_for_family(
+    geometry_array: OwnedGeometryArray,
+    family: GeometryFamily,
+    expected_rows: int,
+) -> int | None:
+    """Return a host-proven segment total when structural offsets are present.
+
+    Device-resident owned arrays often still carry host routing metadata and
+    structural offsets from ingestion or an admitted host-known take.  Segment
+    extraction needs device per-row counts for scatter offsets, but allocation
+    only needs the family total.  Reusing already-known offsets avoids a scalar
+    D2H fence without changing the device execution shape.
+    """
+    validity = geometry_array._validity
+    tags = geometry_array._tags
+    family_row_offsets = geometry_array._family_row_offsets
+    buffer = geometry_array.families.get(family)
+    if (
+        validity is None
+        or tags is None
+        or family_row_offsets is None
+        or buffer is None
+        or buffer.geometry_offsets.size == 0
+        or buffer.empty_mask.size == 0
+    ):
+        return None
+    row_count = geometry_array.row_count
+    if (
+        int(validity.size) != row_count
+        or int(tags.size) != row_count
+        or int(family_row_offsets.size) != row_count
+    ):
+        return None
+
+    family_mask = np.asarray(validity, dtype=bool) & (
+        np.asarray(tags, dtype=np.int8) == np.int8(FAMILY_TAGS[family])
+    )
+    if int(np.count_nonzero(family_mask)) != int(expected_rows):
+        return None
+    if expected_rows == 0:
+        return 0
+
+    family_rows = np.asarray(family_row_offsets[family_mask], dtype=np.int64)
+    if family_rows.size == 0:
+        return 0
+    if int(family_rows.min(initial=0)) < 0:
+        return None
+    max_row = int(family_rows.max(initial=-1))
+    if max_row + 1 >= int(buffer.geometry_offsets.size):
+        return None
+    if max_row >= int(buffer.empty_mask.size):
+        return None
+
+    active_rows = family_rows[~np.asarray(buffer.empty_mask[family_rows], dtype=bool)]
+    if active_rows.size == 0:
+        return 0
+
+    geom_offsets = np.asarray(buffer.geometry_offsets, dtype=np.int64)
+
+    if family is GeometryFamily.LINESTRING:
+        lengths = geom_offsets[active_rows + 1] - geom_offsets[active_rows]
+        return int(np.maximum(lengths - 1, 0).sum())
+
+    if family is GeometryFamily.POLYGON:
+        ring_offsets = buffer.ring_offsets
+        if ring_offsets is None or ring_offsets.size == 0:
+            return None
+        return _host_nested_segment_total(
+            geom_offsets,
+            np.asarray(ring_offsets, dtype=np.int64),
+            active_rows,
+        )
+
+    if family is GeometryFamily.MULTILINESTRING:
+        part_offsets = buffer.part_offsets
+        if part_offsets is None or part_offsets.size == 0:
+            return None
+        return _host_nested_segment_total(
+            geom_offsets,
+            np.asarray(part_offsets, dtype=np.int64),
+            active_rows,
+        )
+
+    if family is GeometryFamily.MULTIPOLYGON:
+        part_offsets = buffer.part_offsets
+        ring_offsets = buffer.ring_offsets
+        if (
+            part_offsets is None
+            or part_offsets.size == 0
+            or ring_offsets is None
+            or ring_offsets.size == 0
+        ):
+            return None
+        return _host_multipolygon_segment_total(
+            geom_offsets,
+            np.asarray(part_offsets, dtype=np.int64),
+            np.asarray(ring_offsets, dtype=np.int64),
+            active_rows,
+        )
+
+    return None
+
+
+def _host_nested_segment_total(
+    geometry_offsets: np.ndarray,
+    leaf_offsets: np.ndarray,
+    rows: np.ndarray,
+) -> int | None:
+    starts = geometry_offsets[rows]
+    ends = geometry_offsets[rows + 1]
+    if starts.size == 0:
+        return 0
+    if int(starts.min(initial=0)) < 0 or int(ends.max(initial=0)) >= int(leaf_offsets.size):
+        return None
+    leaf_segment_counts = np.maximum(np.diff(leaf_offsets) - 1, 0)
+    prefix = np.empty(leaf_segment_counts.size + 1, dtype=np.int64)
+    prefix[0] = 0
+    np.cumsum(leaf_segment_counts, out=prefix[1:])
+    return int((prefix[ends] - prefix[starts]).sum())
+
+
+def _host_multipolygon_segment_total(
+    geometry_offsets: np.ndarray,
+    part_offsets: np.ndarray,
+    ring_offsets: np.ndarray,
+    rows: np.ndarray,
+) -> int | None:
+    part_starts = geometry_offsets[rows]
+    part_ends = geometry_offsets[rows + 1]
+    if part_starts.size == 0:
+        return 0
+    if (
+        int(part_starts.min(initial=0)) < 0
+        or int(part_ends.max(initial=0)) >= int(part_offsets.size)
+    ):
+        return None
+    if int(part_offsets.min(initial=0)) < 0 or int(part_offsets.max(initial=0)) >= int(ring_offsets.size):
+        return None
+
+    ring_segment_counts = np.maximum(np.diff(ring_offsets) - 1, 0)
+    ring_prefix = np.empty(ring_segment_counts.size + 1, dtype=np.int64)
+    ring_prefix[0] = 0
+    np.cumsum(ring_segment_counts, out=ring_prefix[1:])
+
+    part_segment_counts = ring_prefix[part_offsets[1:]] - ring_prefix[part_offsets[:-1]]
+    part_prefix = np.empty(part_segment_counts.size + 1, dtype=np.int64)
+    part_prefix[0] = 0
+    np.cumsum(part_segment_counts, out=part_prefix[1:])
+    return int((part_prefix[part_ends] - part_prefix[part_starts]).sum())
+
+
+def _device_structural_segment_total_for_family(
+    family: GeometryFamily,
+    buffer,
+) -> int | None:
+    """Return segment totals proved by device buffer shape metadata.
+
+    Nested geometry buffers do not need to inspect offset values to know total
+    segment cardinality: non-empty leaves are stored as coordinate spans and
+    empty rows contribute no leaves.  Therefore total segments are total
+    coordinates minus total line/ring leaves.  Both array sizes are host-known
+    allocation metadata, not device scalar reads.
+    """
+    coord_count = int(buffer.x.size)
+
+    if family is GeometryFamily.POLYGON and buffer.ring_offsets is not None:
+        ring_count = int(buffer.ring_offsets.size) - 1
+        if ring_count >= 0 and coord_count >= ring_count:
+            return coord_count - ring_count
+        return None
+
+    if family is GeometryFamily.MULTILINESTRING and buffer.part_offsets is not None:
+        part_count = int(buffer.part_offsets.size) - 1
+        if part_count >= 0 and coord_count >= part_count:
+            return coord_count - part_count
+        return None
+
+    if family is GeometryFamily.MULTIPOLYGON and buffer.ring_offsets is not None:
+        ring_count = int(buffer.ring_offsets.size) - 1
+        if ring_count >= 0 and coord_count >= ring_count:
+            return coord_count - ring_count
+        return None
+
+    return None
+
+
 # Kernel 1 dispatch: GPU Segment Extraction
 # ---------------------------------------------------------------------------
 
@@ -500,6 +755,7 @@ def _extract_segments_gpu(
     all_x1 = []
     all_y1 = []
     total_segments = 0
+    pending_families: list[_PendingSegmentFamily] = []
 
     for family_enum, family_tag in [
         (GeometryFamily.LINESTRING, _FAMILY_LINESTRING),
@@ -567,8 +823,64 @@ def _extract_segments_gpu(
 
             # Step 2: Exclusive prefix sum for write offsets
             d_seg_offsets = exclusive_sum(d_seg_counts, synchronize=False)
-            fam_total = count_scatter_total(runtime, d_seg_counts, d_seg_offsets)
+            fam_total = _host_segment_total_for_family(
+                geometry_array,
+                family_enum,
+                n_fam,
+            )
+            if fam_total is None:
+                fam_total = _device_structural_segment_total_for_family(
+                    family_enum,
+                    d_buf,
+                )
 
+        pending_families.append(
+            _PendingSegmentFamily(
+                family=family_enum,
+                buffer=d_buf,
+                valid_rows=d_fam_valid,
+                empty_mask=d_fam_empty,
+                geometry_offsets=d_geom_off,
+                part_offsets=d_part_off,
+                ring_offsets=d_ring_off,
+                segment_counts=d_seg_counts,
+                segment_offsets=d_seg_offsets,
+                row_count=n_fam,
+                total_segments=fam_total,
+            )
+        )
+
+    counted_families = [
+        pending
+        for pending in pending_families
+        if pending.total_segments is None and pending.segment_counts is not None
+    ]
+    if counted_families:
+        totals = count_scatter_totals(
+            runtime,
+            [
+                (pending.segment_counts, pending.segment_offsets)
+                for pending in counted_families
+                if pending.segment_counts is not None
+            ],
+            reason="segment extraction total-segments allocation fence",
+        )
+        for pending, fam_total in zip(counted_families, totals, strict=True):
+            pending.total_segments = int(fam_total)
+
+    ptr = runtime.pointer
+    for pending in pending_families:
+        family_enum = pending.family
+        d_buf = pending.buffer
+        d_fam_valid = pending.valid_rows
+        d_fam_empty = pending.empty_mask
+        d_geom_off = pending.geometry_offsets
+        d_part_off = pending.part_offsets
+        d_ring_off = pending.ring_offsets
+        d_seg_counts = pending.segment_counts
+        d_seg_offsets = pending.segment_offsets
+        n_fam = pending.row_count
+        fam_total = int(pending.total_segments or 0)
         if fam_total == 0:
             runtime.free(d_fam_valid)
             runtime.free(d_fam_empty)
@@ -693,6 +1005,7 @@ _MIN_BATCH_PAIRS = 1 * 1024 * 1024
 
 
 _MAX_BATCH_PAIRS_CAP = 8 * 1024 * 1024  # 8M pairs hard cap (~960 MB peak)
+_BOUNDED_CAPACITY_SCATTER_MAX_PAIRS = 1 * 1024 * 1024
 _SAME_ROW_WARP_MAX_RIGHT_SEGMENTS_PER_ROW = 2048
 
 
@@ -724,6 +1037,21 @@ def _compute_max_batch_pairs() -> int:
     max_pairs = usable_bytes // _BYTES_PER_RAW_PAIR
 
     return min(max(max_pairs, _MIN_BATCH_PAIRS), _MAX_BATCH_PAIRS_CAP)
+
+
+def _bounded_candidate_capacity(*dimensions: int) -> int | None:
+    """Return a host-known candidate capacity when bounded scatter is admissible."""
+    capacity = 1
+    for dimension in dimensions:
+        dimension = int(dimension)
+        if dimension <= 0:
+            return 0
+        capacity *= dimension
+        if capacity > _BOUNDED_CAPACITY_SCATTER_MAX_PAIRS:
+            return None
+    if capacity > _compute_max_batch_pairs():
+        return None
+    return capacity
 
 
 def _segment_row_spans(row_indices):
@@ -760,8 +1088,17 @@ def _generate_candidates_gpu_same_row_warp(
     if left_row_ids.size == 0 or right_row_ids.size == 0:
         return None
 
-    max_left_span = int(cp.max(left_row_ends - left_row_starts).item())
-    max_right_span = int(cp.max(right_row_ends - right_row_starts).item())
+    d_span_summary = cp.empty(4, dtype=cp.int32)
+    d_span_summary[0] = cp.max(left_row_ends - left_row_starts)
+    d_span_summary[1] = cp.max(right_row_ends - right_row_starts)
+    d_span_summary[2] = cp.max(left_row_ids)
+    d_span_summary[3] = cp.max(right_row_ids)
+    span_summary = _segment_device_to_host(
+        d_span_summary,
+        reason="segment same-row span summary scalar fence",
+    )
+    max_left_span = int(span_summary[0])
+    max_right_span = int(span_summary[1])
     if max_right_span > _SAME_ROW_WARP_MAX_RIGHT_SEGMENTS_PER_ROW:
         if _allow_swap and max_left_span <= _SAME_ROW_WARP_MAX_RIGHT_SEGMENTS_PER_ROW:
             swapped = _generate_candidates_gpu_same_row_warp(
@@ -782,7 +1119,7 @@ def _generate_candidates_gpu_same_row_warp(
             )
         return None
 
-    max_row_id = int(max(cp.max(left_row_ids).item(), cp.max(right_row_ids).item()))
+    max_row_id = int(max(span_summary[2], span_summary[3]))
     d_right_row_starts = cp.full(max_row_id + 1, -1, dtype=cp.int32)
     d_right_row_ends = cp.full(max_row_id + 1, -1, dtype=cp.int32)
     d_right_row_starts[right_row_ids] = right_row_starts
@@ -837,7 +1174,16 @@ def _generate_candidates_gpu_same_row_warp(
 
     d_counts64 = d_counts.astype(cp.int64, copy=False)
     d_offsets = exclusive_sum(d_counts64, synchronize=False)
-    total_candidates = count_scatter_total(runtime, d_counts64, d_offsets)
+    bounded_capacity = _bounded_candidate_capacity(n_left, max_right_span)
+    if bounded_capacity is None:
+        total_candidates = count_scatter_total(
+            runtime,
+            d_counts64,
+            d_offsets,
+            reason="segment same-row candidate total allocation fence",
+        )
+    else:
+        total_candidates = int(bounded_capacity)
     if total_candidates == 0:
         empty_d = runtime.allocate((0,), np.int32)
         return DeviceSegmentIntersectionCandidates(
@@ -850,8 +1196,12 @@ def _generate_candidates_gpu_same_row_warp(
             count=0,
         )
 
-    d_left_lookup = cp.empty(total_candidates, dtype=cp.int32)
-    d_right_lookup = cp.empty(total_candidates, dtype=cp.int32)
+    if bounded_capacity is None:
+        d_left_lookup = cp.empty(total_candidates, dtype=cp.int32)
+        d_right_lookup = cp.empty(total_candidates, dtype=cp.int32)
+    else:
+        d_left_lookup = cp.full(total_candidates, -1, dtype=cp.int32)
+        d_right_lookup = cp.full(total_candidates, -1, dtype=cp.int32)
 
     scatter_kernel = kernels["scatter_same_row_overlap_candidates"]
     scatter_grid, scatter_block = runtime.launch_config(scatter_kernel, total_threads)
@@ -896,6 +1246,22 @@ def _generate_candidates_gpu_same_row_warp(
             ),
         ),
     )
+    if bounded_capacity is not None:
+        live_compact = compact_indices((d_left_lookup >= 0).astype(cp.uint8))
+        if live_compact.count == 0:
+            empty_d = runtime.allocate((0,), np.int32)
+            return DeviceSegmentIntersectionCandidates(
+                left_rows=empty_d,
+                left_segments=empty_d,
+                left_lookup=runtime.allocate((0,), np.int32),
+                right_rows=empty_d,
+                right_segments=empty_d,
+                right_lookup=runtime.allocate((0,), np.int32),
+                count=0,
+            )
+        live = live_compact.values
+        d_left_lookup = d_left_lookup[live]
+        d_right_lookup = d_right_lookup[live]
 
     out_left_rows = left.row_indices[d_left_lookup]
     out_left_segs = left.segment_indices[d_left_lookup]
@@ -1005,8 +1371,14 @@ def _main_sweep_scatter_and_filter(
 
     # Single bulk transfer of the small boundaries + offset-values arrays.
     runtime.synchronize()
-    h_boundaries = cp.asnumpy(d_boundaries)
-    h_boundary_offsets = cp.asnumpy(d_boundary_offsets)
+    h_boundaries = runtime.copy_device_to_host(
+        d_boundaries,
+        reason="segment candidate batch-boundary host export",
+    )
+    h_boundary_offsets = runtime.copy_device_to_host(
+        d_boundary_offsets,
+        reason="segment candidate batch-boundary-offset host export",
+    )
 
     # Process each batch, keeping filtered results on device.  Filtered
     # output is a small fraction of raw candidates (typically 5-20% after
@@ -1074,6 +1446,247 @@ def _main_sweep_scatter_and_filter(
     )
 
 
+def _main_sweep_capacity_scatter_and_filter(
+    *,
+    runtime,
+    left: DeviceSegmentTable,
+    right: DeviceSegmentTable,
+    range_start,
+    range_end,
+    sorted_right_idx,
+    left_minx,
+    left_maxx,
+    left_miny,
+    left_maxy,
+    right_minx,
+    right_maxx,
+    right_miny,
+    right_maxy,
+    left_rows_all,
+    right_rows_all,
+    require_same_row: bool,
+    outlier_mask_bool,
+):
+    """Scatter sweep candidates in host-sized fixed-capacity batches.
+
+    Physical shape: segment candidate-refine.  The batch capacity is
+    `left_batch_size * right.count`, so allocation sizing is proved from host
+    table cardinalities rather than a device scalar sum.  Each row writes only
+    its binary-search range, then sentinel slots are compacted on device.
+    """
+    import cupy as cp
+
+    max_batch_pairs = _compute_max_batch_pairs()
+    right_capacity = int(right.count)
+    if right_capacity <= 0 or right_capacity > max_batch_pairs:
+        return None
+
+    left_batch_size = max(1, max_batch_pairs // right_capacity)
+    result_left_parts: list = []
+    result_right_parts: list = []
+    for left_start in range(0, int(left.count), int(left_batch_size)):
+        left_end = min(left_start + left_batch_size, int(left.count))
+        batch_left, batch_right = _scatter_and_filter_capacity_single(
+            runtime=runtime,
+            left=left,
+            right=right,
+            range_start=range_start,
+            range_end=range_end,
+            sorted_right_idx=sorted_right_idx,
+            left_minx=left_minx,
+            left_maxx=left_maxx,
+            left_miny=left_miny,
+            left_maxy=left_maxy,
+            right_minx=right_minx,
+            right_maxx=right_maxx,
+            right_miny=right_miny,
+            right_maxy=right_maxy,
+            left_rows_all=left_rows_all,
+            right_rows_all=right_rows_all,
+            require_same_row=require_same_row,
+            outlier_mask_bool=outlier_mask_bool,
+            left_start=left_start,
+            left_end=left_end,
+            right_capacity=right_capacity,
+        )
+        if batch_left.size > 0:
+            result_left_parts.append(batch_left)
+            result_right_parts.append(batch_right)
+
+    if not result_left_parts:
+        return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
+    if len(result_left_parts) == 1:
+        return result_left_parts[0], result_right_parts[0]
+    return (
+        cp.concatenate(result_left_parts),
+        cp.concatenate(result_right_parts),
+    )
+
+
+def _filter_scattered_candidate_pairs(
+    *,
+    left: DeviceSegmentTable,
+    right: DeviceSegmentTable,
+    d_left_pair,
+    d_right_pair,
+    left_minx,
+    left_maxx,
+    left_miny,
+    left_maxy,
+    right_minx,
+    right_maxx,
+    right_miny,
+    right_maxy,
+    left_rows_all,
+    right_rows_all,
+    require_same_row: bool,
+    outlier_mask_bool,
+):
+    import cupy as cp
+
+    d_lminx = left_minx[d_left_pair]
+    d_lmaxx = left_maxx[d_left_pair]
+    d_lminy = left_miny[d_left_pair]
+    d_lmaxy = left_maxy[d_left_pair]
+    d_rminx = right_minx[d_right_pair]
+    d_rmaxx = right_maxx[d_right_pair]
+    d_rminy = right_miny[d_right_pair]
+    d_rmaxy = right_maxy[d_right_pair]
+
+    main_overlap = (
+        (d_lminx <= d_rmaxx) & (d_lmaxx >= d_rminx) &
+        (d_lminy <= d_rmaxy) & (d_lmaxy >= d_rminy)
+    )
+    if require_same_row:
+        try:
+            main_overlap &= left_rows_all[d_left_pair] == right_rows_all[d_right_pair]
+        except Exception as exc:
+            left_pair_max = (
+                _segment_int_scalar(
+                    cp.max(d_left_pair),
+                    reason="segment same-row debug left-pair-max scalar fence",
+                )
+                if int(d_left_pair.size)
+                else -1
+            )
+            right_pair_max = (
+                _segment_int_scalar(
+                    cp.max(d_right_pair),
+                    reason="segment same-row debug right-pair-max scalar fence",
+                )
+                if int(d_right_pair.size)
+                else -1
+            )
+            raise RuntimeError(
+                "same-row main candidate filter failed: "
+                f"left_rows={int(left_rows_all.size)}, "
+                f"right_rows={int(right_rows_all.size)}, "
+                f"left_pair_count={int(d_left_pair.size)}, "
+                f"right_pair_count={int(d_right_pair.size)}, "
+                f"left_pair_max={left_pair_max}, "
+                f"right_pair_max={right_pair_max}"
+            ) from exc
+    del d_lminx, d_lmaxx, d_lminy, d_lmaxy
+    del d_rminx, d_rmaxx, d_rminy, d_rmaxy
+
+    if outlier_mask_bool is not None:
+        main_overlap &= ~outlier_mask_bool[d_right_pair]
+    main_compact = compact_indices(main_overlap.astype(cp.uint8))
+    if main_compact.count > 0:
+        main_keep = main_compact.values
+        return d_left_pair[main_keep], d_right_pair[main_keep]
+    return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
+
+
+def _scatter_and_filter_capacity_single(
+    *,
+    runtime,
+    left: DeviceSegmentTable,
+    right: DeviceSegmentTable,
+    range_start,
+    range_end,
+    sorted_right_idx,
+    left_minx,
+    left_maxx,
+    left_miny,
+    left_maxy,
+    right_minx,
+    right_maxx,
+    right_miny,
+    right_maxy,
+    left_rows_all,
+    right_rows_all,
+    require_same_row: bool,
+    outlier_mask_bool,
+    left_start: int,
+    left_end: int,
+    right_capacity: int,
+):
+    import cupy as cp
+
+    batch_size = int(left_end) - int(left_start)
+    if batch_size <= 0 or right_capacity <= 0:
+        return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
+
+    capacity = batch_size * int(right_capacity)
+    d_left_pair = cp.full(capacity, -1, dtype=cp.int32)
+    d_right_pair = cp.full(capacity, -1, dtype=cp.int32)
+    scatter_fn = _candidate_scatter_kernels()["scatter_candidate_pairs_capacity_batch"]
+    ptr = runtime.pointer
+    d_range_start_i32 = cp.asarray(range_start, dtype=cp.int32)
+    d_range_end_i32 = cp.asarray(range_end, dtype=cp.int32)
+    grid, block = runtime.launch_config(scatter_fn, batch_size)
+    runtime.launch(
+        scatter_fn,
+        grid=grid,
+        block=block,
+        params=(
+            (
+                ptr(d_range_start_i32),
+                ptr(d_range_end_i32),
+                ptr(sorted_right_idx),
+                ptr(d_left_pair),
+                ptr(d_right_pair),
+                int(left_start),
+                int(batch_size),
+                int(right_capacity),
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+    live_compact = compact_indices((d_left_pair >= 0).astype(cp.uint8))
+    if live_compact.count == 0:
+        return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
+    live = live_compact.values
+    return _filter_scattered_candidate_pairs(
+        left=left,
+        right=right,
+        d_left_pair=d_left_pair[live],
+        d_right_pair=d_right_pair[live],
+        left_minx=left_minx,
+        left_maxx=left_maxx,
+        left_miny=left_miny,
+        left_maxy=left_maxy,
+        right_minx=right_minx,
+        right_maxx=right_maxx,
+        right_miny=right_miny,
+        right_maxy=right_maxy,
+        left_rows_all=left_rows_all,
+        right_rows_all=right_rows_all,
+        require_same_row=require_same_row,
+        outlier_mask_bool=outlier_mask_bool,
+    )
+
+
 def _scatter_and_filter_single(
     *,
     runtime,
@@ -1099,6 +1712,7 @@ def _scatter_and_filter_single(
     left_end: int,
     offset_base: int,
     batch_raw_count: int,
+    capacity_upper_bound: bool = False,
 ):
     """Scatter candidate pairs for left segments [left_start, left_end)
     and apply MBR overlap filter.  Returns (filtered_left, filtered_right).
@@ -1109,9 +1723,15 @@ def _scatter_and_filter_single(
     import cupy as cp
 
     batch_size = left_end - left_start
+    if batch_raw_count <= 0:
+        return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
 
-    d_left_pair = runtime.allocate((batch_raw_count,), np.int32)
-    d_right_pair = runtime.allocate((batch_raw_count,), np.int32)
+    if capacity_upper_bound:
+        d_left_pair = cp.full(batch_raw_count, -1, dtype=cp.int32)
+        d_right_pair = cp.full(batch_raw_count, -1, dtype=cp.int32)
+    else:
+        d_left_pair = runtime.allocate((batch_raw_count,), np.int32)
+        d_right_pair = runtime.allocate((batch_raw_count,), np.int32)
 
     scatter_kernels = _candidate_scatter_kernels()
     ptr = runtime.pointer
@@ -1153,54 +1773,32 @@ def _scatter_and_filter_single(
             ),
         )
 
-    # Full MBR overlap filter on device
-    d_lminx = left_minx[d_left_pair]
-    d_lmaxx = left_maxx[d_left_pair]
-    d_lminy = left_miny[d_left_pair]
-    d_lmaxy = left_maxy[d_left_pair]
-    d_rminx = right_minx[d_right_pair]
-    d_rmaxx = right_maxx[d_right_pair]
-    d_rminy = right_miny[d_right_pair]
-    d_rmaxy = right_maxy[d_right_pair]
+    if capacity_upper_bound:
+        live_compact = compact_indices((d_left_pair >= 0).astype(cp.uint8))
+        if live_compact.count == 0:
+            return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
+        live = live_compact.values
+        d_left_pair = d_left_pair[live]
+        d_right_pair = d_right_pair[live]
 
-    main_overlap = (
-        (d_lminx <= d_rmaxx) & (d_lmaxx >= d_rminx) &
-        (d_lminy <= d_rmaxy) & (d_lmaxy >= d_rminy)
+    return _filter_scattered_candidate_pairs(
+        left=left,
+        right=right,
+        d_left_pair=d_left_pair,
+        d_right_pair=d_right_pair,
+        left_minx=left_minx,
+        left_maxx=left_maxx,
+        left_miny=left_miny,
+        left_maxy=left_maxy,
+        right_minx=right_minx,
+        right_maxx=right_maxx,
+        right_miny=right_miny,
+        right_maxy=right_maxy,
+        left_rows_all=left_rows_all,
+        right_rows_all=right_rows_all,
+        require_same_row=require_same_row,
+        outlier_mask_bool=outlier_mask_bool,
     )
-    if require_same_row:
-        try:
-            main_overlap &= left_rows_all[d_left_pair] == right_rows_all[d_right_pair]
-        except Exception as exc:
-            import cupy as cp
-
-            left_pair_max = int(cp.max(d_left_pair).item()) if int(d_left_pair.size) else -1
-            right_pair_max = int(cp.max(d_right_pair).item()) if int(d_right_pair.size) else -1
-            raise RuntimeError(
-                "same-row main candidate filter failed: "
-                f"left_rows={int(left_rows_all.size)}, "
-                f"right_rows={int(right_rows_all.size)}, "
-                f"left_pair_count={int(d_left_pair.size)}, "
-                f"right_pair_count={int(d_right_pair.size)}, "
-                f"left_pair_max={left_pair_max}, "
-                f"right_pair_max={right_pair_max}"
-            ) from exc
-    # Free gathered bounds immediately — they dominate per-batch memory
-    # (8 × batch_raw_count × 8 bytes) and are no longer needed.
-    del d_lminx, d_lmaxx, d_lminy, d_lmaxy
-    del d_rminx, d_rmaxx, d_rminy, d_rmaxy
-    # Exclude outlier right segments from main results to prevent
-    # duplicates with the outlier pass.  Outlier rights will be
-    # handled exclusively by the brute-force MBR pass below.
-    if outlier_mask_bool is not None:
-        main_overlap &= ~outlier_mask_bool[d_right_pair]
-    main_overlap_u8 = main_overlap.astype(cp.uint8)
-    del main_overlap
-
-    main_compact = compact_indices(main_overlap_u8)
-    if main_compact.count > 0:
-        main_keep = main_compact.values
-        return d_left_pair[main_keep], d_right_pair[main_keep]
-    return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
 
 
 def _generate_candidates_gpu(
@@ -1301,20 +1899,12 @@ def _generate_candidates_gpu(
             p95_idx = int(right.count * 95) // 100  # floor index
             partitioned_hw = cp.partition(right_half_w, p95_idx)
             d_p95_hw = partitioned_hw[p95_idx]       # CuPy scalar on device
-            d_max_hw = cp.max(right_half_w)          # CuPy scalar on device
-
-            # If P95 == max, all segments fit within the P95 window.
-            # Materializes a single Python bool (one scalar D2H -- necessary
-            # for control flow, not in a loop).
-            has_outliers = bool(d_max_hw > d_p95_hw)
             d_search_hw = d_p95_hw
 
-            # Pre-compute outlier boolean mask on device for later use
-            # in both main-sweep dedup and outlier pass.
-            if has_outliers:
-                outlier_mask_bool = right_half_w > d_search_hw
-            else:
-                outlier_mask_bool = None
+            # Keep outlier admission on device.  A no-outlier workload compacts
+            # to zero later without a host scalar branch here.
+            has_outliers = True
+            outlier_mask_bool = right_half_w > d_search_hw
 
     # --- Main sweep: binary search using P95 (or max) half-width ---
     with hotpath_stage("segment.candidates.binary_search", category="filter"):
@@ -1334,31 +1924,13 @@ def _generate_candidates_gpu(
         d_cand_counts = cp.maximum(d_cand_counts, 0)  # clamp negatives
 
         d_cand_offsets = exclusive_sum(d_cand_counts, synchronize=False)
-        total_raw_candidates = count_scatter_total(runtime, d_cand_counts, d_cand_offsets)
-
-    # Guard: if total raw candidates exceed what the GPU can classify
-    # (each surviving pair requires ~49 bytes of output arrays), raise early
-    # instead of crashing mid-way through batched scatter.
-    try:
-        free_bytes, _ = cp.cuda.Device().mem_info
-    except Exception:
-        free_bytes = 8 * 1024**3  # conservative 8 GB
-    # 49 bytes per pair for classification output + 8 bytes for candidate indices
-    max_feasible_pairs = free_bytes // 57
-    if total_raw_candidates > max_feasible_pairs:
-        raise MemoryError(
-            f"Segment intersection candidate count ({total_raw_candidates:,}) exceeds "
-            f"GPU memory capacity ({free_bytes / 1e9:.1f} GB free, max ~{max_feasible_pairs:,} "
-            f"feasible pairs). Reduce input scale or use CPU dispatch."
-        )
-
-    if total_raw_candidates > 0:
-        with hotpath_stage("segment.candidates.main_sweep_filter", category="filter"):
-            main_final_left, main_final_right = _main_sweep_scatter_and_filter(
+        bounded_capacity = _bounded_candidate_capacity(left.count, right.count)
+        capacity_batch_used = False
+        if bounded_capacity is None:
+            capacity_batch_result = _main_sweep_capacity_scatter_and_filter(
                 runtime=runtime,
                 left=left,
                 right=right,
-                d_cand_offsets=d_cand_offsets,
                 range_start=range_start,
                 range_end=range_end,
                 sorted_right_idx=sorted_right_idx,
@@ -1374,8 +1946,92 @@ def _generate_candidates_gpu(
                 right_rows_all=right_rows_all,
                 require_same_row=require_same_row,
                 outlier_mask_bool=outlier_mask_bool,
-                total_raw_candidates=total_raw_candidates,
             )
+            if capacity_batch_result is None:
+                total_raw_candidates = count_scatter_total(
+                    runtime,
+                    d_cand_counts,
+                    d_cand_offsets,
+                    reason="segment candidate total allocation fence",
+                )
+            else:
+                main_final_left, main_final_right = capacity_batch_result
+                total_raw_candidates = int(main_final_left.size)
+                capacity_batch_used = True
+        else:
+            total_raw_candidates = int(bounded_capacity)
+
+    if bounded_capacity is None and not capacity_batch_used:
+        # Guard: if total raw candidates exceed what the GPU can classify
+        # (each surviving pair requires ~49 bytes of output arrays), raise early
+        # instead of crashing mid-way through batched scatter.
+        try:
+            free_bytes, _ = cp.cuda.Device().mem_info
+        except Exception:
+            free_bytes = 8 * 1024**3  # conservative 8 GB
+        # 49 bytes per pair for classification output + 8 bytes for candidate indices
+        max_feasible_pairs = free_bytes // 57
+        if total_raw_candidates > max_feasible_pairs:
+            raise MemoryError(
+                f"Segment intersection candidate count ({total_raw_candidates:,}) exceeds "
+                f"GPU memory capacity ({free_bytes / 1e9:.1f} GB free, max ~{max_feasible_pairs:,} "
+                f"feasible pairs). Reduce input scale or use CPU dispatch."
+            )
+
+    if capacity_batch_used:
+        pass
+    elif total_raw_candidates > 0:
+        with hotpath_stage("segment.candidates.main_sweep_filter", category="filter"):
+            if bounded_capacity is None:
+                main_final_left, main_final_right = _main_sweep_scatter_and_filter(
+                    runtime=runtime,
+                    left=left,
+                    right=right,
+                    d_cand_offsets=d_cand_offsets,
+                    range_start=range_start,
+                    range_end=range_end,
+                    sorted_right_idx=sorted_right_idx,
+                    left_minx=left_minx,
+                    left_maxx=left_maxx,
+                    left_miny=left_miny,
+                    left_maxy=left_maxy,
+                    right_minx=right_minx,
+                    right_maxx=right_maxx,
+                    right_miny=right_miny,
+                    right_maxy=right_maxy,
+                    left_rows_all=left_rows_all,
+                    right_rows_all=right_rows_all,
+                    require_same_row=require_same_row,
+                    outlier_mask_bool=outlier_mask_bool,
+                    total_raw_candidates=total_raw_candidates,
+                )
+            else:
+                main_final_left, main_final_right = _scatter_and_filter_single(
+                    runtime=runtime,
+                    left=left,
+                    right=right,
+                    d_cand_offsets=d_cand_offsets,
+                    range_start=range_start,
+                    range_end=range_end,
+                    sorted_right_idx=sorted_right_idx,
+                    left_minx=left_minx,
+                    left_maxx=left_maxx,
+                    left_miny=left_miny,
+                    left_maxy=left_maxy,
+                    right_minx=right_minx,
+                    right_maxx=right_maxx,
+                    right_miny=right_miny,
+                    right_maxy=right_maxy,
+                    left_rows_all=left_rows_all,
+                    right_rows_all=right_rows_all,
+                    require_same_row=require_same_row,
+                    outlier_mask_bool=outlier_mask_bool,
+                    left_start=0,
+                    left_end=left.count,
+                    offset_base=0,
+                    batch_raw_count=total_raw_candidates,
+                    capacity_upper_bound=True,
+                )
     else:
         main_final_left = cp.empty(0, dtype=cp.int32)
         main_final_right = cp.empty(0, dtype=cp.int32)
@@ -1558,6 +2214,7 @@ def _append_segments_for_span(
 
 def extract_segments(geometry_array: OwnedGeometryArray) -> SegmentTable:
     """Extract segments from geometry array on CPU (legacy path)."""
+    geometry_array._ensure_host_state()
     row_indices: list[int] = []
     part_indices: list[int] = []
     ring_indices: list[int] = []

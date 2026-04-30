@@ -85,6 +85,10 @@ request_nvrtc_warmup([
 ])
 
 
+def _runtime_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
+    return get_cuda_runtime().copy_device_to_host(device_array, reason=reason)
+
+
 # ---------------------------------------------------------------------------
 # Helpers: shoelace signed area and segment intersection (CPU)
 # ---------------------------------------------------------------------------
@@ -819,7 +823,13 @@ def _build_is_exterior_for_validity(d_buf, family):
     return d_is_exterior
 
 
-def _reduce_ring_valid_to_geom(d_ring_valid, d_geometry_offsets, geom_count):
+def _reduce_ring_valid_to_geom(
+    d_ring_valid,
+    d_geometry_offsets,
+    geom_count,
+    *,
+    reason: str = "constructive validity ring-to-geometry result host export",
+):
     """Reduce per-ring validity to per-geometry using vectorized cumsum.
 
     A geometry is valid iff ALL its rings are valid.  Uses the cumsum trick:
@@ -857,7 +867,7 @@ def _reduce_ring_valid_to_geom(d_ring_valid, d_geometry_offsets, geom_count):
         d_invalid_counts = d_end_sums - d_start_sums
         d_result[d_ne_indices] = (d_invalid_counts == 0)
 
-    return cp.asnumpy(d_result)
+    return _runtime_device_to_host(d_result, reason=reason)
 
 
 def _reduce_span_simple_to_geom(d_span_simple, d_geometry_offsets, geom_count):
@@ -868,7 +878,12 @@ def _reduce_span_simple_to_geom(d_span_simple, d_geometry_offsets, geom_count):
 
     Returns a host np.ndarray of bool (length geom_count).
     """
-    return _reduce_ring_valid_to_geom(d_span_simple, d_geometry_offsets, geom_count)
+    return _reduce_ring_valid_to_geom(
+        d_span_simple,
+        d_geometry_offsets,
+        geom_count,
+        reason="constructive simplicity span-to-geometry result host export",
+    )
 
 
 def _build_hole_and_exterior_indices(d_buf, family):
@@ -1032,11 +1047,19 @@ def _is_valid_gpu_multipoints(d_buf, result, global_rows):
 
 def _is_valid_gpu_linestrings(d_buf, family_rows, result, global_rows):
     """LineString validity via CuPy offset arithmetic (Tier 2)."""
+    d_valid = _is_valid_gpu_linestrings_device(d_buf, family_rows)
+    result[global_rows] = _runtime_device_to_host(
+        d_valid,
+        reason="constructive validity linestring result host export",
+    )
+
+
+def _is_valid_gpu_linestrings_device(d_buf, family_rows):
+    """Return device LineString validity for family rows."""
     d_family_rows = cp.asarray(family_rows)
     d_counts = d_buf.geometry_offsets[d_family_rows + 1] - d_buf.geometry_offsets[d_family_rows]
     # Valid if empty (0 coords) or >= 2 coords
-    d_valid = (d_counts == 0) | (d_counts >= 2)
-    result[global_rows] = cp.asnumpy(d_valid)
+    return (d_counts == 0) | (d_counts >= 2)
 
 
 def _is_valid_gpu_multilinestrings(d_buf, family_rows, result, global_rows):
@@ -1045,6 +1068,15 @@ def _is_valid_gpu_multilinestrings(d_buf, family_rows, result, global_rows):
     Uses CuPy vectorized per-part coord count, then reduces per-geometry
     with the cumsum trick.
     """
+    d_result = _is_valid_gpu_multilinestrings_device(d_buf, family_rows)
+    result[global_rows] = _runtime_device_to_host(
+        d_result,
+        reason="constructive validity multilinestring result host export",
+    )
+
+
+def _is_valid_gpu_multilinestrings_device(d_buf, family_rows):
+    """Return device MultiLineString validity for family rows."""
     geom_count = int(family_rows.shape[0])
     d_family_rows = cp.asarray(family_rows)
 
@@ -1065,8 +1097,7 @@ def _is_valid_gpu_multilinestrings(d_buf, family_rows, result, global_rows):
 
     total_parts = int(d_buf.part_offsets.shape[0]) - 1
     if total_parts == 0:
-        result[global_rows] = True
-        return
+        return cp.ones(geom_count, dtype=cp.bool_)
 
     d_invalid = (1 - d_part_valid_int)
     d_cumsum = cp.cumsum(d_invalid)
@@ -1089,7 +1120,7 @@ def _is_valid_gpu_multilinestrings(d_buf, family_rows, result, global_rows):
         d_invalid_counts = d_end_sums - d_start_sums
         d_result[d_ne_indices] = (d_invalid_counts == 0)
 
-    result[global_rows] = cp.asnumpy(d_result)
+    return d_result
 
 
 def _launch_ring_pair_interaction_kernel(runtime, d_buf, d_poly_ring_starts,
@@ -1143,11 +1174,28 @@ def _is_valid_gpu_polygons(
     4. Ring-pair interaction (no crossing, overlap, or multi-touch)
        via ring_pair_interaction
     """
+    d_result = _is_valid_gpu_polygons_device(
+        d_buf,
+        family_rows,
+        exact_collinearity=exact_collinearity,
+    )
+    result[global_rows] = _runtime_device_to_host(
+        d_result,
+        reason="constructive validity polygon result host export",
+    )
+
+
+def _is_valid_gpu_polygons_device(
+    d_buf,
+    family_rows,
+    *,
+    exact_collinearity: bool = False,
+):
+    """Return device Polygon validity for family rows."""
     runtime = get_cuda_runtime()
     ring_count = int(d_buf.ring_offsets.shape[0]) - 1
     if ring_count == 0:
-        result[global_rows] = True
-        return
+        return cp.ones(int(family_rows.shape[0]), dtype=cp.bool_)
 
     # Step 1: structural ring validity (closure, min coords)
     kernels = compile_kernel_group(
@@ -1246,8 +1294,7 @@ def _is_valid_gpu_polygons(
             d_rpi_cp = cp.asarray(d_rpi_valid)
             d_result &= d_rpi_cp[d_family_rows].astype(cp.bool_)
 
-        # Single D->H transfer at the end
-        result[global_rows] = cp.asnumpy(d_result)
+        return d_result
     finally:
         # LIFO deallocation order for pool coalescing
         if d_rpi_valid is not None:
@@ -1276,11 +1323,28 @@ def _is_valid_gpu_multipolygons(
     4. Ring-pair interaction (no crossing, overlap, or multi-touch)
        via ring_pair_interaction
     """
+    d_result = _is_valid_gpu_multipolygons_device(
+        d_buf,
+        family_rows,
+        exact_collinearity=exact_collinearity,
+    )
+    result[global_rows] = _runtime_device_to_host(
+        d_result,
+        reason="constructive validity multipolygon result host export",
+    )
+
+
+def _is_valid_gpu_multipolygons_device(
+    d_buf,
+    family_rows,
+    *,
+    exact_collinearity: bool = False,
+):
+    """Return device MultiPolygon validity for family rows."""
     runtime = get_cuda_runtime()
     ring_count = int(d_buf.ring_offsets.shape[0]) - 1
     if ring_count == 0:
-        result[global_rows] = True
-        return
+        return cp.ones(int(family_rows.shape[0]), dtype=cp.bool_)
 
     # Step 1: structural ring validity (closure, min coords)
     kernels = compile_kernel_group(
@@ -1407,8 +1471,7 @@ def _is_valid_gpu_multipolygons(
             # AND on device
             d_result &= d_rpi_result
 
-        # Single D->H transfer at the end
-        result[global_rows] = cp.asnumpy(d_result)
+        return d_result
     finally:
         # LIFO deallocation order for pool coalescing
         if d_rpi_valid is not None:
@@ -1492,7 +1555,10 @@ def _is_simple_gpu_linestrings(d_buf, family_rows, result, global_rows):
     try:
         d_family_rows = cp.asarray(family_rows)
         d_span_result_cp = cp.asarray(d_span_result)
-        h_result = cp.asnumpy(d_span_result_cp[d_family_rows]).astype(bool)
+        h_result = _runtime_device_to_host(
+            d_span_result_cp[d_family_rows],
+            reason="constructive simplicity linestring result host export",
+        ).astype(bool)
         result[global_rows] = h_result
     finally:
         runtime.free(d_span_result)
@@ -1542,7 +1608,10 @@ def _is_simple_gpu_polygons(d_buf, family_rows, result, global_rows):
             d_invalid_counts = d_end_sums - d_start_sums
             d_result[d_ne_indices] = (d_invalid_counts == 0)
 
-        result[global_rows] = cp.asnumpy(d_result)
+        result[global_rows] = _runtime_device_to_host(
+            d_result,
+            reason="constructive simplicity polygon result host export",
+        )
     finally:
         runtime.free(d_span_result)
 
@@ -1589,7 +1658,10 @@ def _is_simple_gpu_multilinestrings(d_buf, family_rows, result, global_rows):
             d_invalid_counts = d_end_sums - d_start_sums
             d_result[d_ne_indices] = (d_invalid_counts == 0)
 
-        result[global_rows] = cp.asnumpy(d_result)
+        result[global_rows] = _runtime_device_to_host(
+            d_result,
+            reason="constructive simplicity multilinestring result host export",
+        )
     finally:
         runtime.free(d_span_result)
 
@@ -1641,7 +1713,10 @@ def _is_simple_gpu_multipolygons(d_buf, family_rows, result, global_rows):
             d_invalid_counts = d_end_sums - d_start_sums
             d_result[d_ne_indices] = (d_invalid_counts == 0)
 
-        result[global_rows] = cp.asnumpy(d_result)
+        result[global_rows] = _runtime_device_to_host(
+            d_result,
+            reason="constructive simplicity multipolygon result host export",
+        )
     finally:
         runtime.free(d_span_result)
 
@@ -1756,6 +1831,94 @@ def _is_simple_cpu(owned: OwnedGeometryArray) -> np.ndarray:
     return result
 
 
+def _validity_gpu_device_values(
+    owned: OwnedGeometryArray,
+    *,
+    exact_collinearity: bool = False,
+):
+    """Compute public validity flags as a device-resident boolean vector.
+
+    Physical shape: row-aligned predicate reduction over family row offsets,
+    rings, and segment-pair checks.  This is the private NativeExpression path;
+    public ``is_valid`` still performs an explicit terminal host export.
+    """
+    if cp is None:  # pragma: no cover - guarded by GPU tests
+        raise RuntimeError("CuPy is required for device-resident validity")
+
+    device_state = owned._ensure_device_state()
+    d_source_validity = cp.asarray(device_state.validity, dtype=cp.bool_)
+    d_result = d_source_validity.copy()
+    d_tags = cp.asarray(device_state.tags)
+    d_family_row_offsets = cp.asarray(device_state.family_row_offsets)
+
+    for family, d_buf in device_state.families.items():
+        global_rows = cp.flatnonzero(
+            (d_tags == FAMILY_TAGS[family]) & d_source_validity,
+        ).astype(cp.int64, copy=False)
+        if int(global_rows.size) == 0:
+            continue
+        family_rows = d_family_row_offsets[global_rows].astype(cp.int64, copy=False)
+
+        if family in (GeometryFamily.POINT, GeometryFamily.MULTIPOINT):
+            d_result[global_rows] = True
+        elif family is GeometryFamily.LINESTRING:
+            d_result[global_rows] = _is_valid_gpu_linestrings_device(
+                d_buf,
+                family_rows,
+            )
+        elif family is GeometryFamily.MULTILINESTRING:
+            d_result[global_rows] = _is_valid_gpu_multilinestrings_device(
+                d_buf,
+                family_rows,
+            )
+        elif family is GeometryFamily.POLYGON:
+            d_result[global_rows] = _is_valid_gpu_polygons_device(
+                d_buf,
+                family_rows,
+                exact_collinearity=exact_collinearity,
+            )
+        elif family is GeometryFamily.MULTIPOLYGON:
+            d_result[global_rows] = _is_valid_gpu_multipolygons_device(
+                d_buf,
+                family_rows,
+                exact_collinearity=exact_collinearity,
+            )
+        else:  # pragma: no cover - GeometryFamily is currently exhaustive.
+            raise RuntimeError(f"unsupported geometry family for validity expression: {family}")
+
+    return d_result
+
+
+def validity_expression_owned(
+    owned: OwnedGeometryArray,
+    *,
+    source_token: str | None = None,
+    exact_collinearity: bool = False,
+):
+    """Return public validity as a private device ``NativeExpression``.
+
+    The input carrier is device-resident ``OwnedGeometryArray`` metadata and
+    family buffers.  The output carrier is a row-aligned boolean
+    ``NativeExpression`` consumed by rowsets/grouped reducers, avoiding public
+    boolean Series materialization before a sanctioned native consumer.
+    """
+    from vibespatial.api._native_expression import NativeExpression
+
+    values = _validity_gpu_device_values(
+        owned,
+        exact_collinearity=exact_collinearity,
+    )
+    return NativeExpression(
+        operation="geometry.is_valid",
+        values=values,
+        source_token=source_token,
+        source_row_count=owned.row_count,
+        dtype="bool",
+        precision="fp64",
+        null_policy="nan-false",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1811,7 +1974,10 @@ def is_valid_owned(
         index_map = owned._index_map
         if base_cached is not None and index_map is not None:
             if hasattr(index_map, "get"):
-                index_map = index_map.get()
+                index_map = _runtime_device_to_host(
+                    index_map,
+                    reason="is_valid indexed view cache index map export",
+                )
             cached_result = np.asarray(
                 base_cached[np.asarray(index_map, dtype=np.int64)],
                 dtype=bool,

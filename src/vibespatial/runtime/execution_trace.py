@@ -35,6 +35,7 @@ class TraceTransfer:
     item_count: int = 0
     bytes_transferred: int = 0
     elapsed_seconds: float = 0.0
+    terminal_export: bool = False
 
 
 @dataclass
@@ -74,7 +75,11 @@ class ExecutionTraceContext:
         self.transfers.append(transfer)
         prev = self.transfers[-2] if len(self.transfers) >= 2 else None
 
-        if transfer.direction == "d2h" and self._last_gpu_step is not None:
+        if (
+            transfer.direction == "d2h"
+            and self._last_gpu_step is not None
+            and not transfer.terminal_export
+        ):
             _trace_warn(
                 f"[vibeSpatial] D->H transfer in '{self.pipeline}': "
                 f"{transfer.reason} "
@@ -83,7 +88,7 @@ class ExecutionTraceContext:
             )
 
         # Ping-pong: D->H followed by H->D (or vice versa)
-        if prev is not None:
+        if prev is not None and not transfer.terminal_export:
             if prev.direction == "d2h" and transfer.direction == "h2d":
                 _trace_warn(
                     f"[vibeSpatial] H/D ping-pong in '{self.pipeline}': "
@@ -185,6 +190,7 @@ def notify_transfer(
     item_count: int = 0,
     bytes_transferred: int = 0,
     elapsed_seconds: float = 0.0,
+    terminal_export: bool = False,
 ) -> None:
     ctx = get_active_trace()
     if ctx is None:
@@ -197,6 +203,7 @@ def notify_transfer(
         item_count=int(item_count),
         bytes_transferred=int(bytes_transferred),
         elapsed_seconds=max(float(elapsed_seconds), 0.0),
+        terminal_export=terminal_export,
     ))
 
 

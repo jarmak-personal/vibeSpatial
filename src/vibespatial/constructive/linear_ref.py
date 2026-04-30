@@ -488,9 +488,14 @@ def _project_gpu(
         ),
     )
     grid, block = runtime.launch_config(kernel, row_count)
-    runtime.launch(kernel, grid=grid, block=block, params=params)
-
-    return cp.asnumpy(d_out_dist)
+    try:
+        runtime.launch(kernel, grid=grid, block=block, params=params)
+        return runtime.copy_device_to_host(
+            d_out_dist,
+            reason="linear-reference project distance result host export",
+        )
+    finally:
+        runtime.free(d_out_dist)
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +617,39 @@ def interpolate_owned(
     # Build Point OwnedGeometryArray from CPU results
     from vibespatial.constructive.point import point_owned_from_xy
     return point_owned_from_xy(out_x, out_y)
+
+
+def interpolate_native_tabular_result(
+    owned: OwnedGeometryArray,
+    distance: float | np.ndarray,
+    normalized: bool = False,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = interpolate_owned(
+        owned,
+        distance,
+        normalized=normalized,
+        dispatch_mode=dispatch_mode,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="interpolate",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )
 
 
 # ---------------------------------------------------------------------------

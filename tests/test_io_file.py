@@ -30,6 +30,7 @@ from vibespatial.api._native_results import (
     _concat_native_tabular_results,
     _spatial_to_native_tabular_result,
 )
+from vibespatial.api._native_state import get_native_state
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.io.file import (
@@ -37,6 +38,7 @@ from vibespatial.io.file import (
     _materialize_native_file_read_result,
     _native_file_result_from_owned,
     _native_geojson_result_from_gpu_result,
+    _prepare_native_payload_for_file,
     _pyogrio_arrow_wkb_to_native_tabular_result,
     _read_osm_pbf_pyogrio_layer_public,
     _resolve_named_file_source_path,
@@ -143,6 +145,21 @@ def test_geojson_gpu_adapter_failure_records_explicit_fallback(monkeypatch, tmp_
     assert fallbacks
     assert fallbacks[-1].surface == "geopandas.read_file"
     assert "geojson-gpu-boom" in fallbacks[-1].detail
+
+
+def test_missing_geojson_declines_gpu_without_fallback_event(tmp_path) -> None:
+    path = tmp_path / "missing.geojson"
+
+    geopandas.clear_fallback_events()
+    with pytest.raises((FileNotFoundError, OSError, RuntimeError)):
+        geopandas.read_file(path)
+    fallbacks = [
+        event
+        for event in geopandas.get_fallback_events(clear=True)
+        if event.surface == "geopandas.read_file" and event.pipeline == "io/read_file"
+    ]
+
+    assert not fallbacks
 
 
 @pytest.mark.gpu
@@ -279,6 +296,98 @@ def test_public_explicit_pyogrio_geojson_json_string_keeps_native_gpu_path(
     assert events[-1].implementation == "geojson_gpu_byte_classify_adapter"
     assert "explicit_engine=pyogrio" in events[-1].detail
     assert "source=memory" in events[-1].detail
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_read_file_geojson_mask_keeps_native_arrow_wkb_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.geojson"
+    path.write_text("")
+    table = pa.table({"geometry": [Point(0, 0).wkb, Point(1, 1).wkb], "id": [1, 2]})
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    read_arrow_calls: list[dict[str, object]] = []
+    mask_series = geopandas.GeoSeries([box(-0.25, -0.25, 0.25, 0.25)], crs="EPSG:4326")
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr("pyogrio.read_info", lambda *_args, **_kwargs: {"crs": "EPSG:4326"})
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: read_arrow_calls.append(_kwargs) or (
+            {"geometry_name": "geometry", "crs": "EPSG:4326", "geometry_type": "Point"},
+            table,
+        ),
+    )
+    monkeypatch.setattr("vibespatial.io.arrow.decode_wkb_arrow_array_owned", lambda _column: owned)
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("masked GeoJSON reads should stay on the native Arrow/WKB boundary")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(path, mask=mask_series)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result["id"].tolist() == [1, 2]
+    assert read_arrow_calls
+    assert read_arrow_calls[-1]["datetime_as_string"] is True
+    assert read_arrow_calls[-1]["mask"].bounds == pytest.approx(mask_series.iloc[0].bounds)
+    assert events
+    assert events[-1].implementation == "geojson_pyogrio_arrow_gpu_wkb"
+    assert "request=mask" in events[-1].detail
+    assert "compat_override=1" not in events[-1].detail
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_read_vector_file_native_geojson_mask_returns_native_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.geojson"
+    path.write_text("")
+    table = pa.table({"geometry": [Point(0, 0).wkb], "value": [10]})
+    owned = from_shapely_geometries([Point(0, 0)])
+    read_arrow_calls: list[dict[str, object]] = []
+    mask_series = geopandas.GeoSeries([box(-0.25, -0.25, 0.25, 0.25)], crs="EPSG:4326")
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr("pyogrio.read_info", lambda *_args, **_kwargs: {"crs": "EPSG:4326"})
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: read_arrow_calls.append(_kwargs) or (
+            {"geometry_name": "geometry", "crs": "EPSG:4326", "geometry_type": "Point"},
+            table,
+        ),
+    )
+    monkeypatch.setattr("vibespatial.io.arrow.decode_wkb_arrow_array_owned", lambda _column: owned)
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("masked native GeoJSON reads should not materialize a GeoDataFrame")
+        ),
+    )
+
+    payload = read_vector_file_native(path, mask=mask_series)
+
+    assert isinstance(payload, NativeTabularResult)
+    assert payload.geometry.owned is owned
+    assert payload.attributes["value"].tolist() == [10]
+    assert read_arrow_calls
+    assert read_arrow_calls[-1]["datetime_as_string"] is False
+    assert read_arrow_calls[-1]["mask"].bounds == pytest.approx(mask_series.iloc[0].bounds)
 
 
 @pytest.mark.gpu
@@ -1844,12 +1953,51 @@ def test_pyogrio_native_write_uses_write_arrow_not_write_dataframe(monkeypatch, 
     monkeypatch.setattr(pyogrio, "write_dataframe", fail_write_dataframe)
     monkeypatch.setattr(pyogrio, "write_arrow", capture_write_arrow)
 
+    geopandas.clear_materialization_events()
     write_vector_file(payload, path, driver="GeoJSON", engine="pyogrio")
+    materializations = geopandas.get_materialization_events(clear=True)
     result = geopandas.read_file(path, engine="pyogrio")
+    export_events = [
+        event for event in materializations if event.operation == "native_tabular_to_file"
+    ]
 
     assert arrow_calls == 1
+    assert len(export_events) == 1
+    assert "native_export_target=file" in export_events[0].detail
+    assert "driver=GeoJSON" in export_events[0].detail
+    assert "rows=2" in export_events[0].detail
     assert result["value"].tolist() == [10, 20]
     assert result.geometry.iloc[1].equals(Point(1, 1))
+
+
+def test_native_file_write_index_reset_stays_deferred_until_terminal_arrow_export() -> None:
+    index = pd.Index(["left", "right"], name="row_id")
+    loaded = False
+
+    def load_attributes():
+        nonlocal loaded
+        loaded = True
+        return pd.DataFrame({"value": [10, 20]}, index=index)
+
+    attributes = NativeAttributeTable.from_loader(
+        load_attributes,
+        index_override=index,
+        columns=("value",),
+    )
+    payload = _native_file_result_from_owned(
+        from_shapely_geometries([Point(0, 0), Point(1, 1)]),
+        attributes=attributes,
+        crs="EPSG:4326",
+    )
+
+    prepared = _prepare_native_payload_for_file(payload, index=True)
+
+    assert not loaded
+    assert tuple(prepared.attributes.columns) == ("row_id", "value")
+    assert prepared.column_order == ("row_id", "value", "geometry")
+    exported = prepared.attributes.to_arrow(index=False)
+    assert loaded
+    assert exported.column_names == ["row_id", "value"]
 
 
 @pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
@@ -1909,16 +2057,24 @@ def test_public_device_pyogrio_to_file_uses_native_arrow_sink(monkeypatch, tmp_p
 
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
+    geopandas.clear_materialization_events()
     frame.to_file(path, driver="GeoJSON", engine="pyogrio")
     events = geopandas.get_dispatch_events(clear=True)
     fallbacks = geopandas.get_fallback_events(clear=True)
+    materializations = geopandas.get_materialization_events(clear=True)
     result = geopandas.read_file(path, engine="pyogrio")
 
     write_events = [event for event in events if event.operation == "to_file"]
+    export_events = [
+        event for event in materializations if event.operation == "geodataframe_to_file"
+    ]
     assert arrow_calls == 1
     assert write_events
     assert write_events[-1].selected.value == "gpu"
     assert "native_arrow_sink=1" in write_events[-1].detail
+    assert len(export_events) == 1
+    assert "native_export_target=file" in export_events[0].detail
+    assert "rows=2" in export_events[0].detail
     assert not fallbacks
     assert result["value"].tolist() == [10, 20]
     assert result.geometry.iloc[1].equals(Point(1, 1))
@@ -3028,6 +3184,47 @@ def test_materialize_native_file_read_result_parses_mixed_offset_strings_to_utc(
     result = _materialize_native_file_read_result(_FakePayload())
 
     assert str(result["date"].dtype) == "datetime64[ms, UTC]"
+
+
+def test_materialize_native_file_read_result_refreshes_state_after_datetime_rewrite() -> None:
+    payload = _native_file_result_from_owned(
+        from_shapely_geometries([Point(0, 0), Point(1, 1)]),
+        crs="EPSG:4326",
+        attributes=pd.DataFrame(
+            {
+                "date": [
+                    "2014-08-26 10:01:23.040001+02:00",
+                    "2019-03-07 17:31:43.118999+01:00",
+                ]
+            }
+        ),
+    )
+
+    result = _materialize_native_file_read_result(payload)
+    state = get_native_state(result)
+
+    assert str(result["date"].dtype) == "datetime64[ms, UTC]"
+    assert state is not None
+    assert str(state.attributes.to_pandas(copy=False)["date"].dtype) == "datetime64[ms, UTC]"
+
+
+def test_materialize_lazy_geojson_properties_attaches_valid_native_state() -> None:
+    class _FakeGpuResult:
+        def __init__(self) -> None:
+            self.owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+            self.n_features = 2
+
+        def properties_loader(self):
+            return lambda: [{"id": 1, "value": 10}, {"id": 2, "value": 20}]
+
+    payload = _native_geojson_result_from_gpu_result(_FakeGpuResult())
+    result = _materialize_native_file_read_result(payload)
+    state = get_native_state(result)
+
+    assert tuple(result.columns) == ("id", "value", "geometry")
+    assert state is not None
+    assert state.column_order == tuple(result.columns)
+    assert state.attributes.to_pandas(copy=False)["value"].tolist() == [10, 20]
 
 
 @pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")

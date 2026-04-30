@@ -164,31 +164,25 @@ def _build_linestring_oga(
     n = len(validity)
     d_validity = cp.asarray(validity, dtype=cp.bool_)
     valid_mask = d_validity & cp.isfinite(out_ax) & cp.isfinite(out_bx)
-    n_valid = int(valid_mask.sum().item())
 
-    if n_valid == 0:
-        return _empty_linestring_oga(n)
+    # Build a row-aligned LineString buffer so output assembly does not need a
+    # dynamic valid-row count from the device. Invalid rows are unreferenced by
+    # routing metadata and remain null at the OwnedGeometryArray level.
+    ls_x = cp.empty(n * 2, dtype=cp.float64)
+    ls_y = cp.empty(n * 2, dtype=cp.float64)
+    ls_x[0::2] = out_ax
+    ls_x[1::2] = out_bx
+    ls_y[0::2] = out_ay
+    ls_y[1::2] = out_by
 
-    # Build LineString buffers: each valid row contributes 2 coordinates
-    # Interleave: x = [ax0, bx0, ax1, bx1, ...], y = [ay0, by0, ay1, by1, ...]
-    valid_idx = cp.flatnonzero(valid_mask)
-
-    ls_x = cp.empty(n_valid * 2, dtype=cp.float64)
-    ls_y = cp.empty(n_valid * 2, dtype=cp.float64)
-    ls_x[0::2] = out_ax[valid_idx]
-    ls_x[1::2] = out_bx[valid_idx]
-    ls_y[0::2] = out_ay[valid_idx]
-    ls_y[1::2] = out_by[valid_idx]
-
-    # geometry_offsets: [0, 2, 4, 6, ...] for valid rows
-    ls_geom_offsets = cp.arange(n_valid + 1, dtype=cp.int32) * 2
-
-    # Build OGA routing arrays
-    tags = cp.full(n, -1, dtype=cp.int8)
-    tags[valid_mask] = FAMILY_TAGS[GeometryFamily.LINESTRING]
-
-    family_row_offsets = cp.full(n, -1, dtype=cp.int32)
-    family_row_offsets[valid_idx] = cp.arange(n_valid, dtype=cp.int32)
+    ls_geom_offsets = cp.arange(n + 1, dtype=cp.int32) * 2
+    family_rows = cp.arange(n, dtype=cp.int32)
+    tags = cp.where(
+        valid_mask,
+        FAMILY_TAGS[GeometryFamily.LINESTRING],
+        -1,
+    ).astype(cp.int8)
+    family_row_offsets = cp.where(valid_mask, family_rows, -1).astype(cp.int32)
 
     return build_device_resident_owned(
         device_families={
@@ -197,7 +191,7 @@ def _build_linestring_oga(
                 x=ls_x,
                 y=ls_y,
                 geometry_offsets=ls_geom_offsets,
-                empty_mask=cp.zeros(n_valid, dtype=cp.bool_),
+                empty_mask=~valid_mask,
             ),
         },
         row_count=n,

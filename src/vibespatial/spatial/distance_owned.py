@@ -98,13 +98,14 @@ def distance_owned(
 
     if selection.selected is ExecutionMode.GPU:
         try:
-            result = _distance_gpu(left, right, precision)
+            compute_precision = selection.precision_plan.compute_precision
+            result = _distance_gpu(left, right, compute_precision)
             record_dispatch_event(
                 surface="distance_owned",
                 operation="distance",
                 implementation="distance_owned_gpu",
                 reason="element-wise distance via owned GPU kernels",
-                detail=f"rows={n}, precision={precision.value if hasattr(precision, 'value') else precision}, workload={workload.value}",
+                detail=f"rows={n}, precision={compute_precision.value}, workload={workload.value}",
                 selected=ExecutionMode.GPU,
             )
             return result
@@ -117,6 +118,64 @@ def distance_owned(
             )
 
     return _distance_cpu(left, right)
+
+
+def distance_expression_owned(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    source_token: str | None = None,
+    operation: str = "geometry.distance",
+):
+    """Return row-aligned distances as a private device expression.
+
+    Physical shape: aligned pairwise or broadcast-right row result, with
+    family-specific point/segment kernels doing coordinate-level work and
+    device scatter reducing subgroup results back to public row positions.
+    Unsupported family pairs decline instead of exporting host distances.
+    """
+    from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
+
+    requested_mode = (
+        dispatch_mode
+        if isinstance(dispatch_mode, ExecutionMode)
+        else ExecutionMode(dispatch_mode)
+    )
+    if isinstance(precision, str):
+        precision = PrecisionMode(precision)
+
+    n = left.row_count
+    workload = detect_workload_shape(n, right.row_count)
+    if workload is WorkloadShape.BROADCAST_RIGHT:
+        right = tile_single_row(right, n)
+
+    selection = plan_dispatch_selection(
+        kernel_name="geometry_distance",
+        kernel_class=KernelClass.METRIC,
+        row_count=n,
+        requested_mode=requested_mode,
+        current_residency=combined_residency(left, right),
+    )
+    if selection.selected is not ExecutionMode.GPU:
+        return None
+
+    values = _distance_gpu_device(left, right, selection.precision_plan.compute_precision)
+    if values is None:
+        return None
+
+    from vibespatial.api._native_expression import NativeExpression
+
+    return NativeExpression(
+        operation=operation,
+        values=values,
+        source_token=source_token,
+        source_row_count=n,
+        dtype=str(getattr(values, "dtype", "float64")),
+        precision="fp64",
+        null_policy="nan-false",
+    )
 
 
 def dwithin_owned(
@@ -237,6 +296,15 @@ def _distance_gpu(
     existing distance kernel per group.  Geometry data stays device-resident;
     only small index sub-arrays and per-group result sub-arrays are transferred.
     """
+    d_result = _distance_gpu_device(left, right, precision)
+    if d_result is not None:
+        runtime = get_cuda_runtime()
+        host_result = runtime.copy_device_to_host(
+            d_result,
+            reason="elementwise distance result host export",
+        )
+        return np.asarray(host_result, dtype=np.float64)
+
     from .nearest import (
         _compute_multipoint_distances_gpu,
         _launch_point_point_distance_kernel,
@@ -307,7 +375,11 @@ def _distance_gpu(
                     left, right, d_idx, d_idx, d_sub_dist, sub_count,
                 )
                 sub_distances = np.empty(sub_count, dtype=np.float64)
-                runtime.copy_device_to_host(d_sub_dist, sub_distances)
+                runtime.copy_device_to_host(
+                    d_sub_dist,
+                    sub_distances,
+                    reason="elementwise point-point distance result host export",
+                )
                 result[sub_idx] = sub_distances
                 ok = True
             finally:
@@ -323,7 +395,11 @@ def _distance_gpu(
                 )
                 if ok:
                     sub_distances = np.empty(sub_count, dtype=np.float64)
-                    runtime.copy_device_to_host(d_sub_dist, sub_distances)
+                    runtime.copy_device_to_host(
+                        d_sub_dist,
+                        sub_distances,
+                        reason="elementwise point-to-family distance result host export",
+                    )
                     result[sub_idx] = sub_distances
             finally:
                 runtime.free(d_sub_dist)
@@ -338,7 +414,11 @@ def _distance_gpu(
                 )
                 if ok:
                     sub_distances = np.empty(sub_count, dtype=np.float64)
-                    runtime.copy_device_to_host(d_sub_dist, sub_distances)
+                    runtime.copy_device_to_host(
+                        d_sub_dist,
+                        sub_distances,
+                        reason="elementwise family-to-point distance result host export",
+                    )
                     result[sub_idx] = sub_distances
             finally:
                 runtime.free(d_sub_dist)
@@ -376,7 +456,11 @@ def _distance_gpu(
                 )
                 if ok:
                     sub_distances = np.empty(sub_count, dtype=np.float64)
-                    runtime.copy_device_to_host(d_sub_dist, sub_distances)
+                    runtime.copy_device_to_host(
+                        d_sub_dist,
+                        sub_distances,
+                        reason="elementwise segment-family distance result host export",
+                    )
                     result[sub_idx] = sub_distances
             finally:
                 runtime.free(d_sub_dist)
@@ -394,6 +478,122 @@ def _distance_gpu(
             result[sub_idx] = np.asarray(sub_dists, dtype=np.float64)
 
     return result
+
+
+def _distance_gpu_device(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    precision: PrecisionMode,
+):
+    """Device-resident element-wise distance for fully admitted family pairs."""
+    import cupy as cp
+
+    from .nearest import _launch_point_point_distance_kernel
+    from .point_distance import compute_point_distance_gpu
+    from .segment_distance import compute_segment_distance_gpu
+
+    n = left.row_count
+    runtime = get_cuda_runtime()
+
+    left_tags = left.tags
+    right_tags = right.tags
+    both_valid = left.validity & right.validity
+    valid_idx = np.flatnonzero(both_valid).astype(np.int32, copy=False)
+    valid_left_tags = left_tags[valid_idx]
+    valid_right_tags = right_tags[valid_idx]
+
+    PT = GeometryFamily.POINT
+    MP = GeometryFamily.MULTIPOINT
+    groups = []
+    for lt, rt in unique_tag_pairs(valid_left_tags, valid_right_tags):
+        lf = TAG_FAMILIES.get(lt)
+        rf = TAG_FAMILIES.get(rt)
+        if lf is None or rf is None or lf == MP or rf == MP:
+            return None
+        groups.append((lt, rt, lf, rf))
+
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="distance_owned: left geometry for native distance expression",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="distance_owned: right geometry for native distance expression",
+    )
+
+    d_result = cp.full(n, cp.nan, dtype=cp.float64)
+    if valid_idx.size == 0:
+        return d_result
+
+    for lt, rt, lf, rf in groups:
+        sub_mask = (valid_left_tags == lt) & (valid_right_tags == rt)
+        sub_idx = np.ascontiguousarray(
+            valid_idx[np.flatnonzero(sub_mask)],
+            dtype=np.int32,
+        )
+        sub_count = int(sub_idx.size)
+        if sub_count == 0:
+            continue
+
+        d_idx = runtime.from_host(sub_idx)
+        d_sub_dist = runtime.allocate((sub_count,), np.float64)
+        ok = False
+        try:
+            if lf == PT and rf == PT:
+                _launch_point_point_distance_kernel(
+                    left,
+                    right,
+                    d_idx,
+                    d_idx,
+                    d_sub_dist,
+                    sub_count,
+                )
+                ok = True
+            elif lf == PT and rf in _POINT_DISTANCE_FAMILIES:
+                ok = compute_point_distance_gpu(
+                    left,
+                    right,
+                    d_idx,
+                    d_idx,
+                    d_sub_dist,
+                    sub_count,
+                    tree_family=rf,
+                    compute_precision=precision,
+                )
+            elif rf == PT and lf in _POINT_DISTANCE_FAMILIES:
+                ok = compute_point_distance_gpu(
+                    right,
+                    left,
+                    d_idx,
+                    d_idx,
+                    d_sub_dist,
+                    sub_count,
+                    tree_family=lf,
+                    compute_precision=precision,
+                )
+            elif lf in _SEGMENT_FAMILIES and rf in _SEGMENT_FAMILIES:
+                ok = compute_segment_distance_gpu(
+                    left,
+                    right,
+                    d_idx,
+                    d_idx,
+                    d_sub_dist,
+                    sub_count,
+                    query_family=lf,
+                    tree_family=rf,
+                )
+
+            if not ok:
+                return None
+            d_result[d_idx] = d_sub_dist
+            runtime.synchronize()
+        finally:
+            runtime.free(d_sub_dist)
+            runtime.free(d_idx)
+
+    return d_result
 
 
 # ---------------------------------------------------------------------------

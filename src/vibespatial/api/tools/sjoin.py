@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 
 from vibespatial.api import GeoDataFrame
 from vibespatial.api._native_results import (
@@ -6,16 +7,23 @@ from vibespatial.api._native_results import (
     RelationJoinExportResult,
     RelationJoinResult,
 )
+from vibespatial.api._native_state import get_native_state
 from vibespatial.api.geometry_array import _check_crs, _crs_mismatch_warn
 from vibespatial.api.tools._pair_cache import cache_intersection_pairs
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import record_fallback_event
+from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.provenance import (
     _r1_preconditions_met,
     provenance_rewrites_enabled,
     record_rewrite_event,
 )
+from vibespatial.runtime.residency import Residency
+from vibespatial.spatial.indexing import build_flat_spatial_index
 from vibespatial.spatial.query import (
+    SpatialQueryExecution,
     build_owned_spatial_index,
     query_spatial_index,
     supports_owned_spatial_input,
@@ -161,6 +169,7 @@ def sjoin(
         lsuffix,
         rsuffix,
         on_attribute=on_attribute,
+        return_device=True,
     )
     # Use the actual execution mode from the query engine when available.
     if query_execution is not None:
@@ -171,11 +180,7 @@ def sjoin(
         surface="geopandas.tools.sjoin",
         operation="sjoin",
         implementation=query_implementation,
-        reason=(
-            "repo-owned spatial query assembled candidate pairs for sjoin"
-            if query_implementation == "owned_spatial_query"
-            else "Shapely STRtree remains the current host query path for this sjoin surface"
-        ),
+        reason=_sjoin_dispatch_reason(query_implementation),
         detail=f"how={how}, predicate={predicate}, rows_left={len(left_df)}, rows_right={len(right_df)}",
         selected=sjoin_selected,
     )
@@ -311,6 +316,123 @@ def _basic_checks(left_df, right_df, how, lsuffix, rsuffix, on_attribute=None, a
                 )
 
 
+def _sjoin_dispatch_reason(query_implementation: str) -> str:
+    if query_implementation == "native_spatial_index":
+        return "NativeSpatialIndex produced relation pairs for sjoin"
+    if query_implementation == "owned_spatial_query":
+        return "repo-owned spatial query assembled candidate pairs for sjoin"
+    return "Shapely STRtree remains the current host query path for this sjoin surface"
+
+
+def _query_with_native_spatial_index(
+    left_df,
+    right_df,
+    predicate,
+    distance,
+    *,
+    return_device: bool = False,
+):
+    """Run sjoin through attached NativeFrameState -> NativeSpatialIndex.
+
+    Physical shape: candidate/predicate pair generation over a reusable native
+    index.  Native input carriers are the attached left/right
+    ``NativeFrameState`` objects and a transient ``NativeSpatialIndex`` over the
+    right frame.  The native output carrier is ``NativeRelation``; public sjoin
+    callers receive the same index-pair contract after the explicit export
+    boundary.
+    """
+    if predicate not in {
+        None,
+        "contains",
+        "contains_properly",
+        "covered_by",
+        "covers",
+        "crosses",
+        "dwithin",
+        "intersects",
+        "overlaps",
+        "touches",
+        "within",
+    }:
+        return None
+
+    left_state = get_native_state(left_df)
+    right_state = get_native_state(right_df)
+    if left_state is None or right_state is None:
+        return None
+
+    left_owned = getattr(left_state.geometry, "owned", None)
+    right_owned = getattr(right_state.geometry, "owned", None)
+    if left_owned is None or right_owned is None:
+        return None
+
+    native_index = _native_spatial_index_for_sjoin_right(
+        right_df,
+        right_state,
+        right_owned,
+    )
+    relation, execution = native_index.query_relation(
+        left_state,
+        predicate=predicate,
+        sort=False,
+        distance=distance,
+        query_token=left_state.lineage_token,
+        return_device=return_device,
+        return_metadata=True,
+    )
+    return (relation.left_indices, relation.right_indices), execution
+
+
+def _native_spatial_index_for_sjoin_right(right_df, right_state, right_owned):
+    """Return reusable native index state for right-side sjoin geometry.
+
+    Physical shape: reusable spatial-index execution state feeding relation
+    consume.  Native input carriers are the right ``NativeFrameState`` and, when
+    already valid, the cached public ``SpatialIndex``/``FlatSpatialIndex``.  The
+    native output carrier is ``NativeSpatialIndex`` with the right lineage token.
+    """
+    geometry_values = getattr(getattr(right_df, "geometry", None), "values", None)
+    cached_public_sindex = getattr(geometry_values, "_sindex", None)
+    if (
+        cached_public_sindex is not None
+        and hasattr(cached_public_sindex, "query_relation")
+        and getattr(geometry_values, "_owned", None) is right_owned
+    ):
+        return cached_public_sindex._native_spatial_index_for_query(
+            source_token=right_state.lineage_token,
+        )
+
+    flat_index = getattr(geometry_values, "_owned_flat_sindex", None)
+    if (
+        flat_index is not None
+        and getattr(flat_index, "geometry_array", None) is right_owned
+        and hasattr(flat_index, "to_native_spatial_index")
+    ):
+        return flat_index.to_native_spatial_index(
+            source_token=right_state.lineage_token,
+        )
+
+    selection = plan_dispatch_selection(
+        kernel_name="flat_index_build",
+        kernel_class=KernelClass.COARSE,
+        row_count=right_state.row_count,
+        requested_mode=ExecutionMode.AUTO,
+        gpu_available=has_gpu_runtime(),
+        current_residency=(
+            Residency.DEVICE
+            if right_owned.residency is Residency.DEVICE
+            else Residency.HOST
+        ),
+    )
+    flat_index = build_flat_spatial_index(
+        right_owned,
+        runtime_selection=selection.runtime_selection,
+    )
+    return flat_index.to_native_spatial_index(
+        source_token=right_state.lineage_token,
+    )
+
+
 def _query_with_owned_spatial_index(
     left_df,
     right_df,
@@ -327,6 +449,22 @@ def _query_with_owned_spatial_index(
     """
     tree_geometry = right_df.geometry
     query_geometry = left_df.geometry
+    tree_positions = None
+    query_positions = None
+
+    def _non_empty_positions(geometry) -> np.ndarray:
+        import shapely
+
+        values = getattr(geometry, "values", geometry)
+        data = np.asarray(getattr(values, "_data", values), dtype=object)
+        if data.size == 0:
+            return np.empty(0, dtype=np.intp)
+        non_null = np.asarray([geom is not None for geom in data], dtype=bool)
+        non_empty = np.zeros(data.size, dtype=bool)
+        if np.any(non_null):
+            non_empty[non_null] = ~np.asarray(shapely.is_empty(data[non_null]), dtype=bool)
+        return np.flatnonzero(non_empty).astype(np.intp, copy=False)
+
     if hasattr(tree_geometry, "values") and hasattr(tree_geometry.values, "supports_owned_spatial_input"):
         tree_supported = tree_geometry.values.supports_owned_spatial_input()
     else:
@@ -335,6 +473,34 @@ def _query_with_owned_spatial_index(
         query_supported = query_geometry.values.supports_owned_spatial_input()
     else:
         query_supported = supports_owned_spatial_input(query_geometry)
+    if not tree_supported or not query_supported:
+        tree_positions = _non_empty_positions(tree_geometry)
+        query_positions = _non_empty_positions(query_geometry)
+        if tree_positions.size == 0 or query_positions.size == 0:
+            empty = np.asarray([], dtype=np.intp)
+            execution = SpatialQueryExecution(
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.CPU,
+                implementation="owned_empty_geometry_filter",
+                reason="empty geometries were filtered before owned spatial query",
+            )
+            return (empty, empty), execution
+        if tree_positions.size != len(tree_geometry):
+            tree_geometry = tree_geometry.iloc[tree_positions]
+        else:
+            tree_positions = None
+        if query_positions.size != len(query_geometry):
+            query_geometry = query_geometry.iloc[query_positions]
+        else:
+            query_positions = None
+        if hasattr(tree_geometry, "values") and hasattr(tree_geometry.values, "supports_owned_spatial_input"):
+            tree_supported = tree_geometry.values.supports_owned_spatial_input()
+        else:
+            tree_supported = supports_owned_spatial_input(tree_geometry)
+        if hasattr(query_geometry, "values") and hasattr(query_geometry.values, "supports_owned_spatial_input"):
+            query_supported = query_geometry.values.supports_owned_spatial_input()
+        else:
+            query_supported = supports_owned_spatial_input(query_geometry)
     if not tree_supported or not query_supported:
         return None
     if predicate not in {
@@ -380,11 +546,260 @@ def _query_with_owned_spatial_index(
         return_device=return_device,
     )
     if hasattr(indices, "d_left_idx") and hasattr(indices, "d_right_idx"):
-        return (indices.d_left_idx, indices.d_right_idx), execution
+        left_idx = indices.d_left_idx
+        right_idx = indices.d_right_idx
+        if query_positions is not None or tree_positions is not None:
+            import cupy as cp
+
+            if query_positions is not None:
+                left_idx = cp.asarray(query_positions, dtype=left_idx.dtype)[left_idx]
+            if tree_positions is not None:
+                right_idx = cp.asarray(tree_positions, dtype=right_idx.dtype)[right_idx]
+        return (left_idx, right_idx), execution
     if indices.ndim == 1:
         empty = np.asarray([], dtype=np.intp)
-        return (empty, indices.astype(np.intp, copy=False)), execution
-    return (indices[0].astype(np.intp, copy=False), indices[1].astype(np.intp, copy=False)), execution
+        right_idx = indices.astype(np.intp, copy=False)
+        if tree_positions is not None:
+            right_idx = tree_positions[right_idx]
+        return (empty, right_idx), execution
+    left_idx = indices[0].astype(np.intp, copy=False)
+    right_idx = indices[1].astype(np.intp, copy=False)
+    if query_positions is not None:
+        left_idx = query_positions[left_idx]
+    if tree_positions is not None:
+        right_idx = tree_positions[right_idx]
+    return (left_idx, right_idx), execution
+
+
+def _is_device_array(values) -> bool:
+    return hasattr(values, "__cuda_array_interface__")
+
+
+def _is_pylibcudf_column(values) -> bool:
+    type_ = type(values)
+    return bool(
+        type_.__module__.startswith("pylibcudf.")
+        and type_.__name__ == "Column"
+        and hasattr(values, "size")
+        and hasattr(values, "type")
+    )
+
+
+def _is_admitted_on_attribute_arrow_type(dtype) -> bool:
+    import pyarrow as pa
+
+    return bool(
+        pa.types.is_integer(dtype)
+        or pa.types.is_floating(dtype)
+        or pa.types.is_boolean(dtype)
+        or pa.types.is_string(dtype)
+        or pa.types.is_large_string(dtype)
+        or pa.types.is_dictionary(dtype)
+        or pa.types.is_temporal(dtype)
+    )
+
+
+def _device_columns_from_native_attributes(attributes, on_attribute):
+    from vibespatial.api._native_result_core import NativeAttributeTable
+
+    try:
+        table = NativeAttributeTable.from_value(attributes)
+    except TypeError:
+        return None
+    if table.device_table is None or not hasattr(table.device_table, "columns"):
+        return None
+
+    requested = tuple(dict.fromkeys(on_attribute))
+    column_positions = {name: index for index, name in enumerate(tuple(table.columns))}
+    if len(column_positions) != len(tuple(table.columns)) or any(
+        column not in column_positions for column in requested
+    ):
+        return None
+
+    policies = table.device_column_policies(requested)
+    if any(
+        (policy := policies.get(column)) is None
+        or not policy.can_project_take
+        or int(policy.null_count) != 0
+        for column in requested
+    ):
+        return None
+
+    source_columns = table.device_table.columns()
+    return {
+        column: source_columns[column_positions[column]]
+        for column in requested
+    }
+
+
+def _device_columns_from_public_frame(frame, on_attribute):
+    requested = tuple(dict.fromkeys(on_attribute))
+    try:
+        import pyarrow as pa
+        import pylibcudf as plc
+    except ModuleNotFoundError:
+        return None
+
+    arrays = []
+    for column in requested:
+        if column not in frame:
+            return None
+        series = frame[column]
+        if not isinstance(series, pd.Series):
+            return None
+        if series.hasnans:
+            return None
+        try:
+            arrow_array = pa.array(series, from_pandas=True)
+        except (pa.ArrowException, TypeError, ValueError):
+            return None
+        if arrow_array.null_count != 0 or not _is_admitted_on_attribute_arrow_type(
+            arrow_array.type
+        ):
+            return None
+        arrays.append(arrow_array)
+
+    physical_names = [f"__vibespatial_on_attribute_{index}" for index in range(len(arrays))]
+    try:
+        device_table = plc.Table.from_arrow(
+            pa.Table.from_arrays(arrays, names=physical_names)
+        )
+    except (TypeError, ValueError):
+        return None
+    source_columns = device_table.columns()
+    return {
+        column: source_columns[index]
+        for index, column in enumerate(requested)
+    }
+
+
+def _shared_attribute_device_columns(frame, state, on_attribute):
+    if state is not None:
+        columns = _device_columns_from_native_attributes(
+            state.attributes,
+            on_attribute,
+        )
+        if columns is not None:
+            return columns
+    return _device_columns_from_public_frame(frame, on_attribute)
+
+
+def _native_shared_attribute_columns(
+    left_df,
+    right_df,
+    on_attribute,
+    *,
+    require_device: bool,
+):
+    """Return admitted native attribute columns for a shared-attribute join."""
+    if not on_attribute:
+        return None
+    left_state = get_native_state(left_df)
+    right_state = get_native_state(right_df)
+    if left_state is None or right_state is None:
+        if require_device:
+            left_columns = _device_columns_from_public_frame(left_df, on_attribute)
+            right_columns = _device_columns_from_public_frame(right_df, on_attribute)
+            if left_columns is not None and right_columns is not None:
+                return left_columns, right_columns
+        return None
+
+    if require_device:
+        left_columns = _shared_attribute_device_columns(
+            left_df,
+            left_state,
+            on_attribute,
+        )
+        right_columns = _shared_attribute_device_columns(
+            right_df,
+            right_state,
+            on_attribute,
+        )
+        if left_columns is None or right_columns is None:
+            return None
+        if (
+            any(not _is_pylibcudf_column(values) for values in left_columns.values())
+            or any(not _is_pylibcudf_column(values) for values in right_columns.values())
+        ):
+            return None
+        return left_columns, right_columns
+
+    from vibespatial.api._native_result_core import NativeAttributeTable
+
+    left_columns = NativeAttributeTable.from_value(
+        left_state.attributes
+    ).numeric_column_arrays(on_attribute)
+    right_columns = NativeAttributeTable.from_value(
+        right_state.attributes
+    ).numeric_column_arrays(on_attribute)
+    if left_columns is None or right_columns is None:
+        return None
+    return left_columns, right_columns
+
+
+def _filter_relation_by_native_shared_attributes(
+    relation,
+    left_df,
+    right_df,
+    on_attribute,
+    *,
+    require_device: bool,
+    attribute_columns=None,
+):
+    columns = attribute_columns
+    if columns is None:
+        columns = _native_shared_attribute_columns(
+            left_df,
+            right_df,
+            on_attribute,
+            require_device=require_device,
+        )
+    if columns is None:
+        return None
+    if require_device and (
+        not _is_device_array(relation.left_indices)
+        or not _is_device_array(relation.right_indices)
+        or (
+            relation.distances is not None
+            and not _is_device_array(relation.distances)
+        )
+    ):
+        return None
+    left_columns, right_columns = columns
+    try:
+        return relation.filter_by_equal_columns(left_columns, right_columns)
+    except ValueError:
+        return None
+
+
+def _filter_indices_by_native_shared_attributes(
+    left_df,
+    right_df,
+    left_indices,
+    right_indices,
+    on_attribute,
+    *,
+    attribute_columns=None,
+):
+    from vibespatial.api._native_relation import NativeRelation
+
+    relation = NativeRelation(
+        left_indices=left_indices,
+        right_indices=right_indices,
+        left_row_count=len(left_df),
+        right_row_count=len(right_df),
+    )
+    filtered = _filter_relation_by_native_shared_attributes(
+        relation,
+        left_df,
+        right_df,
+        on_attribute,
+        require_device=True,
+        attribute_columns=attribute_columns,
+    )
+    if filtered is None:
+        return None
+    return filtered.left_indices, filtered.right_indices
 
 
 def _geom_predicate_query(
@@ -462,56 +877,120 @@ def _geom_predicate_query(
             left_df, distance = left_rewrite
             predicate = "dwithin"
 
-    # Always try owned spatial query first for all join types, not just
-    # outer.  The owned engine handles 'within' directly so we pass the
-    # current predicate (which may have been rewritten by R2 above).
-    owned_result = _query_with_owned_spatial_index(
+    # Prefer attached native frame/index state when both sides have a valid
+    # NativeFrameState.  Otherwise, keep the older owned spatial-query path.
+    native_attribute_columns = None
+    if on_attribute and return_device:
+        native_attribute_columns = _native_shared_attribute_columns(
+            left_df,
+            right_df,
+            on_attribute,
+            require_device=True,
+        )
+        if native_attribute_columns is None:
+            record_fallback_event(
+                surface="geopandas.sjoin",
+                requested=ExecutionMode.GPU,
+                selected=ExecutionMode.CPU,
+                reason=(
+                    "native on_attribute filtering requires all-valid "
+                    "device-compatible columns"
+                ),
+                detail=f"on_attribute={on_attribute!r}",
+                pipeline="spatial_join/native_on_attribute",
+                d2h_transfer=True,
+            )
+    query_return_device = return_device and (
+        not on_attribute or native_attribute_columns is not None
+    )
+    native_result = _query_with_native_spatial_index(
         left_df,
         right_df,
         predicate,
         distance,
-        return_device=return_device,
+        return_device=query_return_device,
     )
-    if owned_result is not None:
-        (l_idx, r_idx), owned_execution = owned_result
-        query_implementation = "owned_spatial_query"
-        query_execution = owned_execution
+    if native_result is not None:
+        (l_idx, r_idx), native_execution = native_result
+        query_implementation = "native_spatial_index"
+        query_execution = native_execution
     else:
-        query_execution = None
-        # Owned path unavailable – fall back to sindex.query.
-        if predicate == "within":
-            # within is implemented as the inverse of contains
-            # contains is a faster predicate
-            # see discussion at https://github.com/geopandas/geopandas/pull/1421
-            predicate = "contains"
-            sindex = left_df.sindex
-            input_geoms = right_df.geometry
-        else:
-            sindex = right_df.sindex
-            input_geoms = left_df.geometry
-
-        if sindex:
-            l_idx, r_idx = sindex.query(
-                input_geoms, predicate=predicate, sort=False, distance=distance
-            )
-            query_implementation = "strtree_host"
-        else:
-            l_idx, r_idx = np.array([], dtype=np.intp), np.array([], dtype=np.intp)
+        # Always try owned spatial query before STRtree for all join types, not
+        # just outer.  The owned engine handles 'within' directly so we pass the
+        # current predicate (which may have been rewritten by R2 above).
+        owned_result = _query_with_owned_spatial_index(
+            left_df,
+            right_df,
+            predicate,
+            distance,
+            return_device=query_return_device,
+        )
+        if owned_result is not None:
+            (l_idx, r_idx), owned_execution = owned_result
             query_implementation = "owned_spatial_query"
+            query_execution = owned_execution
+        else:
+            query_execution = None
+            # Owned path unavailable – fall back to sindex.query.
+            if predicate == "within":
+                # within is implemented as the inverse of contains
+                # contains is a faster predicate
+                # see discussion at https://github.com/geopandas/geopandas/pull/1421
+                predicate = "contains"
+                sindex = left_df.sindex
+                input_geoms = right_df.geometry
+            else:
+                sindex = right_df.sindex
+                input_geoms = left_df.geometry
 
-        if original_predicate == "within" and query_implementation != "owned_spatial_query":
-            # within is implemented as the inverse of contains
-            # flip back the results
-            r_idx, l_idx = l_idx, r_idx
-            indexer = np.lexsort((r_idx, l_idx))
-            l_idx = l_idx[indexer]
-            r_idx = r_idx[indexer]
+            if sindex:
+                l_idx, r_idx = sindex.query(
+                    input_geoms, predicate=predicate, sort=False, distance=distance
+                )
+                query_implementation = "strtree_host"
+            else:
+                l_idx, r_idx = np.array([], dtype=np.intp), np.array([], dtype=np.intp)
+                query_implementation = "owned_spatial_query"
+
+            if (
+                original_predicate == "within"
+                and query_implementation != "owned_spatial_query"
+            ):
+                # within is implemented as the inverse of contains
+                # flip back the results
+                r_idx, l_idx = l_idx, r_idx
+                indexer = np.lexsort((r_idx, l_idx))
+                l_idx = l_idx[indexer]
+                r_idx = r_idx[indexer]
 
     if on_attribute:
-        for attr in on_attribute:
-            (l_idx, r_idx), _ = _filter_shared_attribute(
-                left_df, right_df, l_idx, r_idx, attr
+        filtered_indices = None
+        if native_attribute_columns is not None:
+            filtered_indices = _filter_indices_by_native_shared_attributes(
+                left_df,
+                right_df,
+                l_idx,
+                r_idx,
+                on_attribute,
+                attribute_columns=native_attribute_columns,
             )
+        if filtered_indices is not None:
+            l_idx, r_idx = filtered_indices
+        else:
+            if native_attribute_columns is not None and return_device:
+                record_fallback_event(
+                    surface="geopandas.sjoin",
+                    requested=ExecutionMode.GPU,
+                    selected=ExecutionMode.CPU,
+                    reason="native on_attribute relation filtering failed",
+                    detail=f"on_attribute={on_attribute!r}",
+                    pipeline="spatial_join/native_on_attribute",
+                    d2h_transfer=True,
+                )
+            for attr in on_attribute:
+                (l_idx, r_idx), _ = _filter_shared_attribute(
+                    left_df, right_df, l_idx, r_idx, attr
+                )
 
     return (l_idx, r_idx), query_implementation, query_execution
 
@@ -623,6 +1102,121 @@ def _nearest_query(
     return (l_idx, r_idx), distances, nearest_selected
 
 
+def _stable_sort_nearest_pairs_by_left(left_indices, right_indices, distances):
+    """Preserve GeoPandas right-nearest ordering without host materialization."""
+    if hasattr(left_indices, "__cuda_array_interface__"):
+        import cupy as cp
+
+        order = cp.argsort(left_indices, kind="stable")
+    else:
+        order = np.argsort(left_indices, kind="stable")
+    left_indices = left_indices[order]
+    right_indices = right_indices[order]
+    if distances is not None:
+        distances = distances[order]
+    return left_indices, right_indices, distances
+
+
+def _nearest_native_relation_result(
+    left_df: GeoDataFrame,
+    right_df: GeoDataFrame,
+    max_distance: float,
+    how: str,
+    exclusive: bool,
+    *,
+    on_attribute: list | None = None,
+):
+    """Build an admitted nearest ``NativeRelation`` without public pair export."""
+    use_left_as_sindex = how == "right"
+    sindex = left_df.sindex if use_left_as_sindex else right_df.sindex
+    if not sindex or not hasattr(sindex, "nearest_relation"):
+        return None, ExecutionMode.CPU
+
+    left_state = get_native_state(left_df)
+    right_state = get_native_state(right_df)
+    if on_attribute and _native_shared_attribute_columns(
+        left_df,
+        right_df,
+        on_attribute,
+        require_device=True,
+    ) is None:
+        return None, ExecutionMode.CPU
+
+    query_geometry = right_df.geometry if use_left_as_sindex else left_df.geometry
+    source_state = left_state if use_left_as_sindex else right_state
+    query_state = right_state if use_left_as_sindex else left_state
+    source_df = left_df if use_left_as_sindex else right_df
+    query_df = right_df if use_left_as_sindex else left_df
+    native_relation, selected = sindex.nearest_relation(
+        query_geometry,
+        return_all=True,
+        max_distance=max_distance,
+        exclusive=exclusive,
+        source_token=(
+            source_state.lineage_token
+            if source_state is not None
+            else f"gdf:{id(source_df)}"
+        ),
+        query_token=(
+            query_state.lineage_token
+            if query_state is not None
+            else f"gdf:{id(query_df)}"
+        ),
+        query_row_count=query_state.row_count if query_state is not None else len(query_df),
+    )
+    if native_relation is None:
+        return None, selected
+
+    left_indices = native_relation.left_indices
+    right_indices = native_relation.right_indices
+    distances = native_relation.distances
+    if use_left_as_sindex:
+        left_indices, right_indices, distances = _stable_sort_nearest_pairs_by_left(
+            native_relation.right_indices,
+            native_relation.left_indices,
+            native_relation.distances,
+        )
+
+    from vibespatial.api._native_relation import NativeRelation
+
+    relation = NativeRelation(
+        left_indices=left_indices,
+        right_indices=right_indices,
+        left_token=left_state.lineage_token if left_state is not None else None,
+        right_token=right_state.lineage_token if right_state is not None else None,
+        predicate="nearest",
+        distances=distances,
+        left_row_count=left_state.row_count if left_state is not None else len(left_df),
+        right_row_count=(
+            right_state.row_count if right_state is not None else len(right_df)
+        ),
+        sorted_by_left=use_left_as_sindex
+        or bool(getattr(native_relation, "sorted_by_left", False)),
+    )
+    if on_attribute:
+        filtered_relation = _filter_relation_by_native_shared_attributes(
+            relation,
+            left_df,
+            right_df,
+            on_attribute,
+            require_device=True,
+        )
+        if filtered_relation is None:
+            return None, ExecutionMode.CPU
+        relation = filtered_relation
+
+    return (
+        RelationJoinResult(
+            RelationIndexResult(
+                relation.left_indices,
+                relation.right_indices,
+            ),
+            distances=relation.distances,
+        ),
+        selected,
+    )
+
+
 def _filter_shared_attribute(left_df, right_df, l_idx, r_idx, attribute):
     """Return the indices for the left and right dataframe that share the same entry
     in the attribute column.
@@ -649,6 +1243,17 @@ def _sjoin_nearest_relation_result(
     on_attribute: list | None = None,
 ):
     """Build the native nearest-join relation result before host export."""
+    native_result, selected = _nearest_native_relation_result(
+        left_df,
+        right_df,
+        max_distance,
+        how,
+        exclusive,
+        on_attribute=on_attribute,
+    )
+    if native_result is not None:
+        return native_result, selected
+
     indices, distances, nearest_selected = _nearest_query(
         left_df,
         right_df,

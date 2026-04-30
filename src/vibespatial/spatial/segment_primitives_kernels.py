@@ -688,9 +688,42 @@ scatter_candidate_pairs_batch(
         ++write_pos;
     }
 }
+
+// Fixed-capacity batch variant: each left segment owns right_capacity slots.
+// Unused slots remain sentinel-filled by the caller and are compacted on device.
+// This avoids a scalar total-count fence for large-but-bounded sweep batches.
+extern "C" __global__ void __launch_bounds__(256, 4)
+scatter_candidate_pairs_capacity_batch(
+    const int* __restrict__ range_start,
+    const int* __restrict__ range_end,
+    const int* __restrict__ sorted_right_idx,
+    int* __restrict__ out_left,
+    int* __restrict__ out_right,
+    const int left_start,
+    const int batch_size,
+    const int right_capacity
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= batch_size) return;
+
+    const int i = left_start + tid;
+    const int rs = range_start[i];
+    const int re = range_end[i];
+    int write_pos = tid * right_capacity;
+
+    for (int j = rs; j < re; ++j) {
+        out_left[write_pos] = i;
+        out_right[write_pos] = sorted_right_idx[j];
+        ++write_pos;
+    }
+}
 """
 
-_CANDIDATE_SCATTER_KERNEL_NAMES = ("scatter_candidate_pairs", "scatter_candidate_pairs_batch")
+_CANDIDATE_SCATTER_KERNEL_NAMES = (
+    "scatter_candidate_pairs",
+    "scatter_candidate_pairs_batch",
+    "scatter_candidate_pairs_capacity_batch",
+)
 
 
 # ---------------------------------------------------------------------------

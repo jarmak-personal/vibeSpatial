@@ -44,6 +44,35 @@ def test_gpu_split_events_and_atomic_edges_for_proper_cross() -> None:
 
 
 @pytest.mark.gpu
+def test_gpu_atomic_edges_derive_pair_count_from_split_event_cardinality() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    left = from_shapely_geometries([LineString([(0, 0), (4, 4)])])
+    right = from_shapely_geometries([LineString([(0, 4), (4, 0)])])
+    split_events = build_gpu_split_events(left, right, dispatch_mode=ExecutionMode.GPU)
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    atomic_edges = build_gpu_atomic_edges(split_events)
+    events = get_d2h_transfer_events(clear=True)
+
+    expected_pairs = (
+        split_events.count
+        - split_events.left_segment_count
+        - split_events.right_segment_count
+    )
+    assert atomic_edges.count == expected_pairs * 2
+    assert "overlay split atomic-edge pair-count allocation fence" not in {
+        event.reason for event in events
+    }
+
+
+@pytest.mark.gpu
 def test_gpu_split_events_and_atomic_edges_for_touch_and_overlap() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")

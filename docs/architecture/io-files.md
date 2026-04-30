@@ -102,7 +102,7 @@ keeping GPU-native formats primary and legacy formats explicit.
   a native result is available. Public device-backed GeoJSON, Shapefile,
   GeoPackage, and FlatGeobuf writes now use the same native Arrow/WKB sink and
   force device WKB encode so small exports do not fall through the generic host
-  encoder threshold.
+  encoder threshold; named-index writes defer reset-index columns to that sink.
 - Public CPU-backed `GeoDataFrame.to_file(..., engine="pyogrio")` stays on
   `pyogrio.write_dataframe(...)` for compatibility-sensitive cases such as
   append mode, timezone-preserving datetime fields, unsupported metadata
@@ -148,7 +148,7 @@ keeping GPU-native formats primary and legacy formats explicit.
   family now keep `mask` and safe `layer` filters on the shared native Arrow/WKB boundary whenever
   the request stays native-compatible; invalid `bbox` plus `mask` fails before dispatch accounting.
   The public boundary asks pyogrio for datetime strings so naive datetime fields and timezone-aware
-  roundtrips survive without forced UTC Arrow timestamps. Unsupported public geometry families such
+  roundtrips survive without forced UTC Arrow timestamps, and compatibility datetime rewrites refresh attached `NativeFrameState`. Unsupported public geometry families such
   as `Point Z` and `Unknown` still route through explicit compatibility.
 - Repo-owned GeoJSON ingest now also has an internal staged owned path:
   - `auto` now has two explicit objectives:

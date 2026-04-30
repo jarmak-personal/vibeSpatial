@@ -6,6 +6,9 @@ without D->H transfers between steps.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
 import shapely
@@ -16,8 +19,55 @@ from vibespatial.geometry.owned import (
     from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.fallbacks import StrictNativeFallbackError
 from vibespatial.runtime.residency import Residency
 from vibespatial.testing import strict_native_environment
+
+
+def test_convex_hull_gpu_has_no_raw_cupy_scalar_syncs() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "src" / "vibespatial" / "constructive" / "convex_hull.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+
+    def _contains_device_scalar_reduction(node: ast.AST) -> bool:
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"any", "all"}
+        ):
+            return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "cp"
+            and node.func.attr in {"any", "all", "sum", "count_nonzero", "max", "min"}
+        ):
+            return True
+        return any(
+            _contains_device_scalar_reduction(child)
+            for child in ast.iter_child_nodes(node)
+        )
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "item":
+            offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}: .item()")
+        if (
+            isinstance(func, ast.Name)
+            and func.id in {"bool", "int", "float"}
+            and node.args
+            and _contains_device_scalar_reduction(node.args[0])
+        ):
+            offenders.append(
+                f"{path.relative_to(repo_root)}:{node.lineno}: {func.id}(device scalar)"
+            )
+
+    assert offenders == []
+
 
 # ---------------------------------------------------------------------------
 # Phase 1: Device-resident builder
@@ -430,6 +480,39 @@ class TestSimplify:
         geoms = result.to_shapely()
         assert shapely.get_num_coordinates(geoms[0]) == 3
 
+    def test_simplify_strict_native_gpu_failure_is_not_swallowed(self, monkeypatch):
+        """Strict-native simplify failures must not continue to CPU simplify."""
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+        import vibespatial
+        from vibespatial.constructive import simplify as simplify_module
+        from vibespatial.runtime.fallbacks import STRICT_NATIVE_ENV_VAR
+
+        monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+        def _fail_gpu(*_args, **_kwargs):
+            raise RuntimeError("forced simplify failure")
+
+        monkeypatch.setattr(simplify_module, "_simplify_gpu", _fail_gpu)
+        owned = from_shapely_geometries(
+            [shapely.LineString([(0, 0), (0.5, 0.01), (1, 0)])],
+            residency=Residency.DEVICE,
+        )
+        vibespatial.clear_fallback_events()
+
+        with pytest.raises(StrictNativeFallbackError, match=r"geopandas\.array\.simplify"):
+            simplify_module.simplify_owned(
+                owned,
+                tolerance=0.1,
+                dispatch_mode=ExecutionMode.GPU,
+            )
+
+        events = vibespatial.get_fallback_events(clear=True)
+        assert events
+        assert events[-1].surface == "geopandas.array.simplify"
+        assert events[-1].reason == "GPU simplify failed"
+        assert events[-1].d2h_transfer is True
+
 
 class TestConvexHull:
     """Tests for convex hull computation."""
@@ -524,6 +607,26 @@ class TestConvexHull:
         expected = shapely.convex_hull(mp)
         assert result.residency == Residency.DEVICE
         assert shapely.normalize(got).equals_exact(shapely.normalize(expected), 1e-7)
+
+    def test_convex_hull_strict_native_gpu_failure_is_not_swallowed(self, monkeypatch):
+        """Strict-native convex_hull failures must not continue to CPU hull."""
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+        from vibespatial.constructive import convex_hull as convex_hull_module
+
+        def _fail_gpu(*_args, **_kwargs):
+            raise RuntimeError("forced convex hull failure")
+
+        monkeypatch.setattr(convex_hull_module, "_convex_hull_gpu", _fail_gpu)
+        owned = from_shapely_geometries(
+            [Polygon([(0, 0), (10, 0), (5, 10)])],
+            residency=Residency.DEVICE,
+        )
+        with strict_native_environment(), pytest.raises(
+            StrictNativeFallbackError,
+            match=r"geopandas\.array\.convex_hull",
+        ):
+            convex_hull_module.convex_hull_owned(owned, dispatch_mode=ExecutionMode.GPU)
 
 
 class TestValidity:
@@ -707,7 +810,12 @@ class TestZeroCopyChains:
         assert len(geoms) == 5000
 
     def test_segmentize_simplify_reverse(self):
-        """segmentize -> simplify -> reverse stays on device (LineString)."""
+        """segmentize -> simplify -> reverse keeps geometry on device.
+
+        Segmentize has a dynamic output-coordinate count, so it admits one
+        named scalar allocation fence.  The chain must not materialize
+        coordinates or row metadata.
+        """
         from vibespatial.api.geometry_array import GeometryArray
         from vibespatial.runtime.execution_trace import assert_no_transfers
 
@@ -724,10 +832,19 @@ class TestZeroCopyChains:
         owned = from_shapely_geometries(lines, residency=Residency.DEVICE)
         ga = GeometryArray.from_owned(owned)
 
-        with assert_no_transfers():
+        with assert_no_transfers(allow_directions=frozenset({"d2h"})) as trace:
             seg = ga.segmentize(5.0)
             simp = seg.simplify(2.0)
             rev = simp.reverse()
+
+        d2h = [transfer for transfer in trace.transfers if transfer.direction == "d2h"]
+        assert [(transfer.trigger, transfer.reason) for transfer in d2h] == [
+            (
+                "cuda-runtime-copy-async",
+                "segmentize output-coordinate allocation fence",
+            )
+        ]
+        assert sum(transfer.bytes_transferred for transfer in d2h) <= 8
 
         assert rev._owned is not None
         assert rev._owned.residency == Residency.DEVICE

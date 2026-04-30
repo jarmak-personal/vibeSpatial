@@ -93,6 +93,37 @@ def normalize_owned(
     return _normalize_cpu(owned)
 
 
+def normalize_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = normalize_owned(
+        owned,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="normalize",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )
+
+
 @register_kernel_variant(
     "normalize",
     "gpu-cuda-python",
@@ -244,8 +275,14 @@ def _normalize_polygon_family_gpu(
         grid, block = runtime.launch_config(kernels["normalize_ring_rotate"], total_rings)
         runtime.launch(kernels["normalize_ring_rotate"], grid=grid, block=block, params=params)
 
-        x_out = runtime.copy_device_to_host(d_x_out)
-        y_out = runtime.copy_device_to_host(d_y_out)
+        x_out = runtime.copy_device_to_host(
+            d_x_out,
+            reason=f"normalize {buf.family.value} x-coordinate host export",
+        )
+        y_out = runtime.copy_device_to_host(
+            d_y_out,
+            reason=f"normalize {buf.family.value} y-coordinate host export",
+        )
     finally:
         if needs_free:
             for d in (d_x, d_y, d_ring_offsets):
@@ -322,8 +359,14 @@ def _normalize_linestring_family_gpu(
         grid, block = runtime.launch_config(kernels["normalize_linestring_reverse"], row_count)
         runtime.launch(kernels["normalize_linestring_reverse"], grid=grid, block=block, params=params)
 
-        x_out = runtime.copy_device_to_host(d_x)
-        y_out = runtime.copy_device_to_host(d_y)
+        x_out = runtime.copy_device_to_host(
+            d_x,
+            reason=f"normalize {family.value} x-coordinate host export",
+        )
+        y_out = runtime.copy_device_to_host(
+            d_y,
+            reason=f"normalize {family.value} y-coordinate host export",
+        )
     finally:
         runtime.free(d_x)
         runtime.free(d_y)

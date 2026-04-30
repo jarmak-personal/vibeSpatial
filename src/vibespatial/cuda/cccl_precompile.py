@@ -1436,6 +1436,7 @@ _NVRTC_CONSUMER_MODULES: tuple[str, ...] = (
     "vibespatial.constructive.measurement",
     "vibespatial.constructive.centroid",
     "vibespatial.constructive.clip_rect",
+    "vibespatial.constructive.union_all",
     "vibespatial.kernels.constructive.polygon_rect_intersection",
     "vibespatial.constructive.validity",
     "vibespatial.io.gpu_parse.structural",

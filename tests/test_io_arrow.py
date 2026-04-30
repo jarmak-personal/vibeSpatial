@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import sys
 import types
 from io import BytesIO
@@ -51,6 +52,7 @@ from vibespatial import (
     select_row_groups,
     write_geoparquet,
 )
+from vibespatial.api._native_metadata import NativeGeometryMetadata
 from vibespatial.api._native_results import (
     GeometryNativeResult,
     NativeAttributeTable,
@@ -58,6 +60,7 @@ from vibespatial.api._native_results import (
     native_attribute_table_from_arrow_table,
     to_native_tabular_result,
 )
+from vibespatial.api._native_rowset import NativeRowSet
 from vibespatial.api._native_state import get_native_state
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.geometry_array import to_wkb as array_to_wkb
@@ -65,9 +68,40 @@ from vibespatial.api.testing import assert_geodataframe_equal
 from vibespatial.constructive.point import clip_points_rect_owned
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.device_array import DeviceGeometryArray
-from vibespatial.geometry.owned import FAMILY_TAGS, DiagnosticKind, from_shapely_geometries
+from vibespatial.geometry.owned import (
+    FAMILY_TAGS,
+    DeviceFamilyGeometryBuffer,
+    DiagnosticKind,
+    build_device_resident_owned,
+    from_shapely_geometries,
+)
 from vibespatial.io.wkb import encode_owned_wkb_device
 from vibespatial.runtime.residency import Residency, TransferTrigger
+
+
+def test_geoarrow_wkb_osm_d2h_exports_are_runtime_accounted() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    paths = (
+        repo_root / "src" / "vibespatial" / "io" / "geoarrow.py",
+        repo_root / "src" / "vibespatial" / "io" / "wkb.py",
+        repo_root / "src" / "vibespatial" / "io" / "osm_gpu.py",
+    )
+    offenders: list[str] = []
+    for path in paths:
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr == "asnumpy":
+                offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+            if func.attr == "copy_device_to_host" and not any(
+                keyword.arg == "reason" for keyword in node.keywords
+            ):
+                offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+    assert offenders == []
 
 
 def _diagnostic_totals(*values) -> tuple[int, int]:
@@ -105,6 +139,36 @@ def _diagnostic_totals(*values) -> tuple[int, int]:
     return transfer_count, materialization_count
 
 
+def _device_only_point_owned(validity: np.ndarray):
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    runtime = get_cuda_runtime()
+    family = GeometryFamily.POINT
+    validity = np.asarray(validity, dtype=np.bool_)
+    point_count = int(np.count_nonzero(validity))
+    family_rows = np.zeros(validity.size, dtype=np.int32)
+    family_rows[validity] = np.arange(point_count, dtype=np.int32)
+
+    return build_device_resident_owned(
+        device_families={
+            family: DeviceFamilyGeometryBuffer(
+                family=family,
+                x=runtime.from_host(np.arange(point_count, dtype=np.float64)),
+                y=runtime.from_host(np.arange(point_count, dtype=np.float64) + 10.0),
+                geometry_offsets=runtime.from_host(np.arange(point_count + 1, dtype=np.int32)),
+                empty_mask=runtime.from_host(np.zeros(point_count, dtype=np.bool_)),
+            )
+        },
+        row_count=int(validity.size),
+        tags=cp.asarray(np.full(validity.size, FAMILY_TAGS[family], dtype=np.int8)),
+        validity=cp.asarray(validity),
+        family_row_offsets=cp.asarray(family_rows),
+        execution_mode="gpu",
+    )
+
+
 def _take_dga_frame(frame, indices: np.ndarray):
     indices = np.asarray(indices, dtype=np.intp)
     geometry_name = frame.geometry.name
@@ -125,12 +189,17 @@ def _take_dga_frame(frame, indices: np.ndarray):
 def test_owned_geoarrow_bridge_roundtrips_and_is_observable() -> None:
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
+    geopandas.clear_materialization_events()
     owned = from_shapely_geometries([Point(0, 0), None, Polygon()])
 
     view = encode_owned_geoarrow(owned)
     roundtripped = decode_owned_geoarrow(view)
     events = geopandas.get_dispatch_events(clear=True)
     fallbacks = geopandas.get_fallback_events(clear=True)
+    materializations = geopandas.get_materialization_events(clear=True)
+    export_events = [
+        event for event in materializations if event.operation == "owned_geometry_to_geoarrow"
+    ]
 
     assert roundtripped.to_shapely()[0].equals(Point(0, 0))
     assert roundtripped.to_shapely()[1] is None
@@ -139,6 +208,9 @@ def test_owned_geoarrow_bridge_roundtrips_and_is_observable() -> None:
         "vibespatial.io.geoarrow",
         "vibespatial.io.geoarrow",
     ]
+    assert len(export_events) == 1
+    assert "native_export_target=geoarrow" in export_events[0].detail
+    assert "rows=3" in export_events[0].detail
     assert fallbacks == []
     assert roundtripped.geoarrow_backed is True
     assert roundtripped.shares_geoarrow_memory is True
@@ -182,19 +254,32 @@ def test_from_geoarrow_auto_normalizes_misaligned_buffers() -> None:
 def test_wkb_bridge_roundtrips_and_records_explicit_fallback() -> None:
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
+    geopandas.clear_materialization_events()
     source = from_shapely_geometries([Point(1, 2), Point(3, 4)])
 
     encoded = encode_wkb_owned(source)
     decoded = decode_wkb_owned(encoded)
     events = geopandas.get_dispatch_events(clear=True)
     fallbacks = geopandas.get_fallback_events(clear=True)
+    materializations = geopandas.get_materialization_events(clear=True)
+    export_events = [
+        event for event in materializations if event.operation == "owned_geometry_to_wkb"
+    ]
 
     assert decoded.to_shapely()[0].equals(Point(1, 2))
     assert decoded.to_shapely()[1].equals(Point(3, 4))
+    payload = to_native_tabular_result(
+        GeometryNativeResult.from_owned(decoded, crs="EPSG:4326")
+    )
+    assert isinstance(payload.geometry_metadata, NativeGeometryMetadata)
+    assert payload.geometry_metadata.row_count == 2
     assert [event.surface for event in events[-2:]] == [
         "vibespatial.io.wkb",
         "vibespatial.io.wkb",
     ]
+    assert len(export_events) == 1
+    assert "native_export_target=wkb" in export_events[0].detail
+    assert "rows=2" in export_events[0].detail
     assert fallbacks == []
 
 
@@ -267,6 +352,8 @@ def test_native_tabular_to_arrow_supports_geometry_only_payload() -> None:
     payload = to_native_tabular_result(GeometryNativeResult.from_owned(owned, crs="EPSG:4326"))
 
     assert payload is not None
+    assert isinstance(payload.geometry_metadata, NativeGeometryMetadata)
+    assert payload.geometry_metadata.row_count == 2
 
     table = pa.table(payload.to_arrow(geometry_encoding="WKB"))
     roundtrip = geopandas.GeoDataFrame.from_arrow(table)
@@ -301,6 +388,38 @@ def test_geodataframe_from_arrow_wkb_keeps_device_geometry_when_runtime_availabl
     assert events[-1].selected == ("gpu" if has_gpu_runtime() else "cpu")
 
 
+@pytest.mark.parametrize("geometry_encoding", ["WKB", "geoarrow"])
+def test_geodataframe_from_arrow_native_import_attaches_state_for_consumers(
+    geometry_encoding: str,
+) -> None:
+    source = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2, 3],
+            "geometry": geopandas.GeoSeries(
+                [Point(0, 0), Point(1, 1), Point(2, 2)],
+                crs="EPSG:4326",
+            ),
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+
+    table = pa.table(source.to_arrow(geometry_encoding=geometry_encoding))
+    result = geopandas.GeoDataFrame.from_arrow(table)
+    state = get_native_state(result)
+
+    assert state is not None
+    assert state.column_order == ("value", "geometry")
+    assert isinstance(state.geometry_metadata(), NativeGeometryMetadata)
+    expression = state.attribute_expression("value")
+    assert expression is not None
+    rowset = expression.greater_than(1)
+    filtered = state.take(rowset, preserve_index=False)
+    assert filtered.to_native_tabular_result().attributes.to_pandas()[
+        "value"
+    ].tolist() == [2, 3]
+
+
 def test_geoseries_from_arrow_wkb_keeps_device_geometry_when_runtime_available() -> None:
     geopandas.clear_dispatch_events()
     source = geopandas.GeoSeries([Point(0, 0), Point(1, 1)], crs="EPSG:4326")
@@ -315,6 +434,34 @@ def test_geoseries_from_arrow_wkb_keeps_device_geometry_when_runtime_available()
     assert events[-1].surface == "geopandas.geoseries.from_arrow"
     assert events[-1].implementation == "native_owned_geoarrow_import"
     assert events[-1].selected == ("gpu" if has_gpu_runtime() else "cpu")
+
+
+@pytest.mark.parametrize("geometry_encoding", ["WKB", "geoarrow"])
+def test_geoseries_from_arrow_native_import_attaches_state_for_consumers(
+    geometry_encoding: str,
+) -> None:
+    source = geopandas.GeoSeries(
+        [Point(0, 0), Point(1, 1), Point(2, 2)],
+        crs="EPSG:4326",
+        name="geometry",
+    )
+
+    result = geopandas.GeoSeries.from_arrow(
+        source.to_arrow(geometry_encoding=geometry_encoding)
+    )
+    state = get_native_state(result)
+
+    assert state is not None
+    assert state.column_order == ("geometry",)
+    assert isinstance(state.geometry_metadata(), NativeGeometryMetadata)
+    rowset = NativeRowSet.from_positions(
+        np.asarray([1], dtype=np.int64),
+        source_token=state.lineage_token,
+        source_row_count=state.row_count,
+    )
+    taken = state.take(rowset, preserve_index=False)
+    assert taken.row_count == 1
+    assert isinstance(taken.geometry_metadata(), NativeGeometryMetadata)
 
 
 def test_geoseries_from_arrow_wkb_explicit_crs_keeps_native_path() -> None:
@@ -428,6 +575,112 @@ def test_native_tabular_to_arrow_wkb_owned_skips_geoseries_materialization(
     assert len(table) == 2
 
 
+def test_native_tabular_to_arrow_geoarrow_owned_skips_geoseries_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    payload = to_native_tabular_result(GeometryNativeResult.from_owned(owned, crs="EPSG:4326"))
+
+    monkeypatch.setattr(
+        GeometryNativeResult,
+        "to_geoseries",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("GeoArrow export should encode owned native geometry directly")
+        ),
+    )
+
+    table = pa.table(payload.to_arrow(geometry_encoding="geoarrow"))
+
+    assert table.column_names == ["geometry"]
+    assert len(table) == 2
+    assert table.schema.field("geometry").metadata[b"ARROW:extension:name"] == b"geoarrow.point"
+
+
+def test_native_tabular_to_arrow_owned_records_terminal_export_boundary() -> None:
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    payload = to_native_tabular_result(GeometryNativeResult.from_owned(owned, crs="EPSG:4326"))
+
+    geopandas.clear_materialization_events()
+    table = pa.table(payload.to_arrow(geometry_encoding="geoarrow"))
+    materializations = geopandas.get_materialization_events(clear=True)
+    export_events = [
+        event for event in materializations if event.operation == "native_tabular_to_arrow"
+    ]
+
+    assert table.column_names == ["geometry"]
+    assert len(export_events) == 1
+    assert export_events[0].surface == "vibespatial.api.NativeTabularResult.to_arrow"
+    assert "native_export_target=arrow" in export_events[0].detail
+    assert "rows=2" in export_events[0].detail
+    assert "geometry_encoding=geoarrow" in export_events[0].detail
+    assert export_events[0].d2h_transfer is False
+
+
+def test_low_level_native_tabular_to_arrow_records_terminal_export_boundary() -> None:
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    payload = to_native_tabular_result(GeometryNativeResult.from_owned(owned, crs="EPSG:4326"))
+
+    geopandas.clear_materialization_events()
+    table, encoding = io_geoarrow.native_tabular_to_arrow(payload, geometry_encoding="geoarrow")
+    materializations = geopandas.get_materialization_events(clear=True)
+    export_events = [
+        event for event in materializations if event.operation == "native_tabular_to_arrow"
+    ]
+
+    assert table.column_names == ["geometry"]
+    assert encoding == {"geometry": "point"}
+    assert len(export_events) == 1
+    assert export_events[0].surface == "vibespatial.native_tabular.to_arrow"
+    assert "native_export_target=arrow" in export_events[0].detail
+    assert "rows=2" in export_events[0].detail
+    assert "encoding=geoarrow" in export_events[0].detail
+
+
+def test_native_tabular_geoarrow_device_encode_failure_is_observable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    owned.residency = Residency.DEVICE
+    payload = to_native_tabular_result(GeometryNativeResult.from_owned(owned, crs="EPSG:4326"))
+
+    def fail_device_encode(*_args, **_kwargs):
+        raise RuntimeError("test device encoder miss")
+
+    monkeypatch.setattr(io_geoarrow, "_encode_owned_geoarrow_array_device", fail_device_encode)
+    geopandas.clear_fallback_events()
+
+    table = pa.table(payload.to_arrow(geometry_encoding="geoarrow"))
+    fallbacks = geopandas.get_fallback_events(clear=True)
+
+    assert table.schema.field("geometry").metadata[b"ARROW:extension:name"] == b"geoarrow.point"
+    assert any(
+        event.surface == "vibespatial.native_tabular.to_arrow"
+        and "device GeoArrow encode failed" in event.reason
+        and "test device encoder miss" in event.detail
+        for event in fallbacks
+    )
+
+
+def test_native_tabular_geoarrow_device_encode_failure_raises_in_strict_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.runtime.fallbacks import StrictNativeFallbackError
+    from vibespatial.testing import strict_native_environment
+
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    owned.residency = Residency.DEVICE
+    payload = to_native_tabular_result(GeometryNativeResult.from_owned(owned, crs="EPSG:4326"))
+
+    def fail_device_encode(*_args, **_kwargs):
+        raise RuntimeError("test device encoder miss")
+
+    monkeypatch.setattr(io_geoarrow, "_encode_owned_geoarrow_array_device", fail_device_encode)
+
+    with pytest.raises(StrictNativeFallbackError):
+        with strict_native_environment():
+            payload.to_arrow(geometry_encoding="geoarrow")
+
+
 def test_native_tabular_to_arrow_wkb_owned_records_gpu_dispatch() -> None:
     if not has_gpu_runtime():
         return
@@ -448,6 +701,50 @@ def test_native_tabular_to_arrow_wkb_owned_records_gpu_dispatch() -> None:
         and event.selected == "gpu"
         for event in dispatches
     )
+
+
+def test_wkb_decode_device_pipeline_has_no_raw_cupy_scalar_syncs() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "src" / "vibespatial" / "kernels" / "core" / "wkb_decode.py"
+    source = path.read_text()
+    tree = ast.parse(source, filename=str(path))
+    failures: list[str] = []
+    device_scalar_tokens = (
+        "geometry_offsets[",
+        "coord_offsets[",
+        "ring_count_offsets[",
+        "total_coords_per[",
+        "total_rings_per[",
+        "total_parts_per[",
+        "dense",
+    )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "item":
+            failures.append(f"raw .item() at line {node.lineno}")
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "asnumpy"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "cp"
+        ):
+            failures.append(f"raw cp.asnumpy at line {node.lineno}")
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "get"
+            and not node.args
+            and not node.keywords
+        ):
+            failures.append(f"raw zero-argument .get() at line {node.lineno}")
+        if isinstance(func, ast.Name) and func.id in {"bool", "int", "float"} and node.args:
+            segment = ast.get_source_segment(source, node.args[0]) or ""
+            if any(token in segment for token in device_scalar_tokens):
+                failures.append(f"raw {func.id}(device scalar) at line {node.lineno}")
+
+    assert failures == []
 
 
 def test_decode_wkb_owned_large_native_list_uses_direct_device_pipeline(monkeypatch) -> None:
@@ -1097,6 +1394,38 @@ def test_read_geoparquet_attaches_private_native_state(tmp_path, monkeypatch) ->
 
     def _fail_geodataframe_export(*_args, **_kwargs):
         raise AssertionError("native-backed read result should export Arrow from private state")
+
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.geodataframe_to_arrow",
+        _fail_geodataframe_export,
+    )
+
+    table = pa.table(result.to_arrow())
+    assert table.num_rows == 2
+    assert "geometry" in table.column_names
+
+
+def test_read_feather_attaches_private_native_state(tmp_path, monkeypatch) -> None:
+    source = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2],
+            "geometry": [Point(0, 0), Point(1, 1)],
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "native_state_read.feather"
+    source.to_feather(path)
+
+    result = geopandas.read_feather(path)
+    state = get_native_state(result)
+
+    assert state is not None
+    assert state.row_count == 2
+    assert state.column_order == ("value", "geometry")
+
+    def _fail_geodataframe_export(*_args, **_kwargs):
+        raise AssertionError("native-backed Feather read should export Arrow from private state")
 
     monkeypatch.setattr(
         "vibespatial.io.arrow.geodataframe_to_arrow",
@@ -1894,12 +2223,14 @@ def test_encode_owned_geoarrow_array_roundtrips_polygon_family() -> None:
     assert restored.to_shapely()[0].equals(polygon)
 
 
-def test_geoseries_to_arrow_mixed_family_records_explicit_fallback() -> None:
+def test_geoseries_to_arrow_mixed_family_uses_owned_wkb_bridge_without_fallback() -> None:
     geopandas.clear_fallback_events()
+    geopandas.clear_dispatch_events()
     series = geopandas.GeoSeries([Point(0, 0), Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])])
 
     arrow_array = io_arrow.geoseries_to_arrow(series, geometry_encoding="geoarrow")
     fallbacks = geopandas.get_fallback_events(clear=True)
+    dispatches = geopandas.get_dispatch_events(clear=True)
     schema_capsule, _ = arrow_array.__arrow_c_array__()
     import pyarrow as pa
 
@@ -1907,7 +2238,144 @@ def test_geoseries_to_arrow_mixed_family_records_explicit_fallback() -> None:
 
     assert arrow_array is not None
     assert field.metadata[b"ARROW:extension:name"] == b"geoarrow.wkb"
-    assert any("geometry mix" in event.reason or "geometry mix" in event.detail for event in fallbacks)
+    assert fallbacks == []
+    assert any(
+        event.surface == "geopandas.geoseries.to_arrow"
+        and event.implementation == "owned_wkb_compatibility_bridge"
+        for event in dispatches
+    )
+
+
+def test_geoseries_to_arrow_mixed_family_owned_wkb_bridge_succeeds_in_strict_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.testing import strict_native_environment
+
+    def _fail_construct_wkb_array(*_args, **_kwargs):
+        raise AssertionError("mixed-family GeoArrow export should use the repo-owned WKB bridge")
+
+    monkeypatch.setattr(api_geoarrow, "construct_wkb_array", _fail_construct_wkb_array)
+    geopandas.clear_fallback_events()
+    series = geopandas.GeoSeries([Point(0, 0), Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])])
+
+    with strict_native_environment():
+        arrow_array = io_arrow.geoseries_to_arrow(series, geometry_encoding="geoarrow")
+
+    schema_capsule, _ = arrow_array.__arrow_c_array__()
+    field = pa.Field._import_from_c_capsule(schema_capsule)
+
+    assert field.metadata[b"ARROW:extension:name"] == b"geoarrow.wkb"
+    assert geopandas.get_fallback_events(clear=True) == []
+
+
+def test_geodataframe_to_arrow_mixed_family_uses_owned_wkb_bridge_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fail_construct_wkb_array(*_args, **_kwargs):
+        raise AssertionError("mixed-family GeoDataFrame Arrow export should use the repo-owned WKB bridge")
+
+    monkeypatch.setattr(api_geoarrow, "construct_wkb_array", _fail_construct_wkb_array)
+    geopandas.clear_fallback_events()
+    geopandas.clear_dispatch_events()
+    gdf = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2],
+            "geometry": [Point(0, 0), Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])],
+        },
+        geometry="geometry",
+    )
+
+    arrow_table = io_arrow.geodataframe_to_arrow(gdf, geometry_encoding="geoarrow")
+    table = pa.table(arrow_table)
+    dispatches = geopandas.get_dispatch_events(clear=True)
+
+    assert table.schema.field("geometry").metadata[b"ARROW:extension:name"] == b"geoarrow.wkb"
+    assert geopandas.get_fallback_events(clear=True) == []
+    assert any(
+        event.surface == "geopandas.geodataframe.to_arrow"
+        and event.implementation == "owned_wkb_compatibility_bridge"
+        for event in dispatches
+    )
+
+
+def test_public_geoseries_to_arrow_mixed_family_preserves_geopandas_error() -> None:
+    series = geopandas.GeoSeries([Point(0, 0), Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])])
+
+    geopandas.clear_fallback_events()
+    geopandas.clear_materialization_events()
+    with pytest.raises(ValueError, match="Geometry type combination is not supported"):
+        series.to_arrow(geometry_encoding="geoarrow")
+    materializations = geopandas.get_materialization_events(clear=True)
+
+    assert geopandas.get_fallback_events(clear=True) == []
+    assert not any(event.operation == "geoseries_to_arrow" for event in materializations)
+
+
+def test_public_geodataframe_to_arrow_mixed_family_preserves_geopandas_error() -> None:
+    gdf = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2],
+            "geometry": [Point(0, 0), Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])],
+        },
+        geometry="geometry",
+    )
+
+    geopandas.clear_fallback_events()
+    geopandas.clear_materialization_events()
+    with pytest.raises(ValueError, match="Geometry type combination is not supported"):
+        gdf.to_arrow(geometry_encoding="geoarrow")
+    materializations = geopandas.get_materialization_events(clear=True)
+
+    assert geopandas.get_fallback_events(clear=True) == []
+    assert not any(event.operation == "geodataframe_to_arrow" for event in materializations)
+
+
+def test_public_geodataframe_to_arrow_host_include_z_succeeds_in_strict_native() -> None:
+    from vibespatial.testing import strict_native_environment
+
+    gdf = geopandas.GeoDataFrame({"geometry": [Point(0, 0)]}, geometry="geometry")
+
+    geopandas.clear_fallback_events()
+    with strict_native_environment():
+        table = pa.table(gdf.to_arrow(geometry_encoding="geoarrow", include_z=True))
+
+    assert table.num_rows == 1
+    assert geopandas.get_fallback_events(clear=True) == []
+
+
+def test_native_tabular_to_arrow_mixed_geoarrow_uses_wkb_bridge_without_geoseries_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned = from_shapely_geometries(
+        [Point(0, 0), Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])]
+    )
+    payload = to_native_tabular_result(GeometryNativeResult.from_owned(owned, crs="EPSG:4326"))
+
+    monkeypatch.setattr(
+        GeometryNativeResult,
+        "to_geoseries",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("mixed-family native tabular Arrow export should use owned WKB")
+        ),
+    )
+    geopandas.clear_fallback_events()
+    geopandas.clear_dispatch_events()
+
+    table, geometry_encoding = io_geoarrow.native_tabular_to_arrow(
+        payload,
+        geometry_encoding="geoarrow",
+    )
+    table = pa.table(table)
+    dispatches = geopandas.get_dispatch_events(clear=True)
+
+    assert table.schema.field("geometry").metadata[b"ARROW:extension:name"] == b"geoarrow.wkb"
+    assert geometry_encoding == {"geometry": "WKB"}
+    assert geopandas.get_fallback_events(clear=True) == []
+    assert any(
+        event.surface == "vibespatial.native_tabular.to_arrow"
+        and event.implementation == "native_wkb_compatibility_bridge"
+        for event in dispatches
+    )
 
 
 def test_geoseries_to_arrow_device_mixed_family_uses_native_wkb_bridge_without_host_materialization(
@@ -2005,6 +2473,30 @@ def test_geoseries_to_arrow_uses_native_point_geoarrow_fast_path() -> None:
     assert geopandas.get_fallback_events(clear=True) == []
 
 
+def test_geoseries_to_arrow_host_owned_geoarrow_fast_path_avoids_public_array_materialization(
+    monkeypatch,
+) -> None:
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    series = geopandas.GeoSeries(
+        GeometryArray.from_owned(owned, crs="EPSG:4326"),
+        crs="EPSG:4326",
+    )
+    original_asarray = io_geoarrow.np.asarray
+
+    def _spy_asarray(value, *args, **kwargs):
+        if isinstance(value, GeometryArray):
+            raise AssertionError("host-owned GeoArrow export should use owned buffers directly")
+        return original_asarray(value, *args, **kwargs)
+
+    monkeypatch.setattr(io_geoarrow.np, "asarray", _spy_asarray)
+
+    arrow_array = io_arrow.geoseries_to_arrow(series, geometry_encoding="geoarrow")
+    schema_capsule, _array_capsule = arrow_array.__arrow_c_array__()
+    field = pa.Field._import_from_c_capsule(schema_capsule)
+
+    assert field.metadata[b"ARROW:extension:name"] == b"geoarrow.point"
+
+
 def test_geoseries_to_arrow_point_fast_path_preserves_empty_point_rows() -> None:
     geopandas.clear_fallback_events()
     series = geopandas.GeoSeries([Point(0, 0), Point(), None, Point(2, 2)])
@@ -2045,6 +2537,55 @@ def test_geodataframe_to_arrow_uses_native_point_geoarrow_fast_path() -> None:
     assert "compatibility_writer=1" in dispatches[-1].detail
     assert "reason=host_arrow_export" in dispatches[-1].detail
     assert geopandas.get_fallback_events(clear=True) == []
+
+
+def test_geoseries_to_arrow_owned_records_terminal_export_boundary() -> None:
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    series = geopandas.GeoSeries(
+        GeometryArray.from_owned(owned, crs="EPSG:4326"),
+        crs="EPSG:4326",
+    )
+
+    geopandas.clear_materialization_events()
+    arrow_array = io_arrow.geoseries_to_arrow(series, geometry_encoding="geoarrow")
+    materializations = geopandas.get_materialization_events(clear=True)
+    export_events = [
+        event for event in materializations if event.operation == "geoseries_to_arrow"
+    ]
+
+    assert arrow_array is not None
+    assert len(export_events) == 1
+    assert export_events[0].surface == "geopandas.geoseries.to_arrow"
+    assert "native_export_target=arrow" in export_events[0].detail
+    assert "rows=2" in export_events[0].detail
+    assert "encoding=geoarrow" in export_events[0].detail
+
+
+def test_geodataframe_to_arrow_owned_records_terminal_export_boundary() -> None:
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    geometry = geopandas.GeoSeries(
+        GeometryArray.from_owned(owned, crs="EPSG:4326"),
+        crs="EPSG:4326",
+    )
+    gdf = geopandas.GeoDataFrame(
+        {"value": [1, 2], "geometry": geometry},
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+
+    geopandas.clear_materialization_events()
+    table = pa.table(io_arrow.geodataframe_to_arrow(gdf, geometry_encoding="geoarrow"))
+    materializations = geopandas.get_materialization_events(clear=True)
+    export_events = [
+        event for event in materializations if event.operation == "geodataframe_to_arrow"
+    ]
+
+    assert table.column_names == ["value", "geometry"]
+    assert len(export_events) == 1
+    assert export_events[0].surface == "geopandas.geodataframe.to_arrow"
+    assert "native_export_target=arrow" in export_events[0].detail
+    assert "rows=2" in export_events[0].detail
+    assert "encoding=geoarrow" in export_events[0].detail
 
 
 def test_device_geoseries_to_arrow_geoarrow_records_gpu_dispatch() -> None:
@@ -2088,6 +2629,33 @@ def test_device_geodataframe_to_arrow_geoarrow_records_gpu_dispatch() -> None:
         and "compatibility_writer=1" not in event.detail
         for event in dispatches
     )
+
+
+def test_owned_geoarrow_family_gate_uses_family_keys_without_host_metadata() -> None:
+    if not has_gpu_runtime():
+        return
+
+    owned = from_shapely_geometries(
+        [Point(0, 0), MultiPoint([(1, 1), (2, 2)])],
+        residency=Residency.DEVICE,
+    )
+    owned._validity = None
+    owned._tags = None
+    owned._family_row_offsets = None
+
+    family_set = io_geoarrow._owned_geoarrow_family_set(owned)
+    reason = io_geoarrow._owned_geoarrow_fast_path_reason_from_owned(
+        owned,
+        include_z=False,
+    )
+    fallback_reason = io_geoarrow._device_geoarrow_constructor_fallback_reason(owned)
+
+    assert family_set == {GeometryFamily.POINT, GeometryFamily.MULTIPOINT}
+    assert reason is None
+    assert fallback_reason is None
+    assert owned._validity is None
+    assert owned._tags is None
+    assert owned._family_row_offsets is None
 
 
 def test_geodataframe_to_arrow_device_geoarrow_records_fallback_before_host_materialization(
@@ -2171,6 +2739,65 @@ def test_geodataframe_to_arrow_device_supported_single_multi_mix_avoids_fallback
     )
     assert geopandas.get_fallback_events(clear=True) == []
     assert mat_events == []
+
+
+@pytest.mark.parametrize(
+    ("geometries", "extension_name"),
+    [
+        (
+            [Point(0, 0), MultiPoint([(1, 1), (2, 2)])],
+            "geoarrow.multipoint",
+        ),
+        (
+            [
+                LineString([(0, 0), (1, 1)]),
+                MultiLineString([[(2, 2), (3, 3)], [(4, 4), (5, 5)]]),
+            ],
+            "geoarrow.multilinestring",
+        ),
+        (
+            [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+                MultiPolygon([Polygon([(2, 0), (3, 0), (3, 1), (2, 0)])]),
+            ],
+            "geoarrow.multipolygon",
+        ),
+    ],
+)
+def test_geodataframe_to_arrow_device_supported_single_multi_mixes_avoid_geoarrow_export_d2h(
+    geometries,
+    extension_name,
+) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    geopandas.clear_fallback_events()
+    geopandas.clear_dispatch_events()
+    gdf, owned = _make_device_dga_gdf(geometries)
+    owned._validity = None
+    owned._tags = None
+    owned._family_row_offsets = None
+
+    reset_d2h_transfer_count()
+    arrow_table = io_arrow.geodataframe_to_arrow(gdf, geometry_encoding="geoarrow")
+    table = pa.table(arrow_table)
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    dispatches = geopandas.get_dispatch_events(clear=True)
+
+    assert table.schema.field("geometry").metadata[b"ARROW:extension:name"] == extension_name.encode()
+    assert not any(reason.startswith("geoarrow export") for reason in reasons)
+    assert any(
+        event.surface == "geopandas.geodataframe.to_arrow"
+        and event.implementation == "native_geoarrow_device_export"
+        and event.selected == "gpu"
+        for event in dispatches
+    )
+    assert geopandas.get_fallback_events(clear=True) == []
 
 
 def test_geodataframe_to_arrow_device_supported_single_multi_mix_succeeds_in_strict_native() -> None:
@@ -2602,6 +3229,9 @@ def test_read_geoparquet_native_chunked_preserves_secondary_geometry_and_index(t
     assert payload.provenance.backend == "pyarrow"
     assert payload.provenance.chunk_rows == 1
     assert payload.attributes.index.name == "iso"
+    assert isinstance(payload.geometry_metadata, NativeGeometryMetadata)
+    assert payload.geometry_metadata.row_count == 3
+    assert payload.geometry_metadata.total_bounds == (0.0, 0.0, 2.0, 2.0)
 
     materialized = payload.to_geodataframe()
 
@@ -2642,6 +3272,9 @@ def test_read_geoparquet_native_does_not_eager_authoritative_host_view(
 
     assert isinstance(payload, NativeTabularResult)
     assert payload.geometry.row_count == 2
+    assert isinstance(payload.geometry_metadata, NativeGeometryMetadata)
+    assert payload.geometry_metadata.row_count == 2
+    assert payload.geometry_metadata.total_bounds == (0.0, 0.0, 1.0, 1.0)
     assert list(payload.attributes.to_pandas(copy=False)["value"]) == [1, 2]
 
 
@@ -3785,6 +4418,139 @@ def test_read_parquet_pylibcudf_keeps_device_geometry_unmaterialized(tmp_path) -
     assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.MATERIALIZATION] == []
 
 
+def test_read_parquet_pylibcudf_wkb_scalar_fences_are_runtime_observable(
+    tmp_path,
+) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    gdf = geopandas.GeoDataFrame(
+        {
+            "geometry": [
+                LineString([(0, 0), (1, 1), (2, 1)]),
+                LineString([(3, 0), (4, 1)]),
+            ],
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "observable_wkb_scalar_fences.parquet"
+
+    write_geoparquet(gdf, path, geometry_encoding="WKB")
+    reset_d2h_transfer_count()
+    result = geopandas.read_parquet(path)
+    events = get_d2h_transfer_events(clear=True)
+    reasons = [event.reason for event in events]
+
+    assert len(result) == 2
+    assert result.geometry.iloc[0].equals(gdf.geometry.iloc[0])
+    assert "pylibcudf WKB header native-count scalar fence" in reasons
+    assert any(
+        reason.startswith("pylibcudf WKB linestring")
+        for reason in reasons
+    )
+
+
+def test_read_parquet_pylibcudf_geoarrow_polygon_uses_child_sizes_without_d2h(
+    tmp_path,
+) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    polygons = [
+        Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+        Polygon([(3, 0), (5, 0), (5, 2), (3, 0)]),
+    ]
+    gdf = geopandas.GeoDataFrame({"geometry": polygons}, geometry="geometry")
+    path = tmp_path / "observable_geoarrow_scalar_fences.parquet"
+
+    write_geoparquet(gdf, path, geometry_encoding="geoarrow")
+    reset_d2h_transfer_count()
+    result = geopandas.read_parquet(path)
+    events = get_d2h_transfer_events(clear=True)
+    reasons = [event.reason for event in events]
+
+    assert len(result) == 2
+    assert result.geometry.iloc[0].equals(polygons[0])
+    assert not any(reason.startswith("pylibcudf GeoArrow polygon") for reason in reasons)
+    assert "pylibcudf GeoArrow polygon ring-count scalar fence" not in reasons
+    assert "pylibcudf GeoArrow polygon coord-count scalar fence" not in reasons
+    assert "pylibcudf GeoArrow dense-ring coord-count scalar fence" not in reasons
+    assert "pylibcudf GeoArrow child-count scalar fence" not in reasons
+    assert "pylibcudf geometry validity-count scalar fence" not in reasons
+
+
+def test_device_geoarrow_homogeneous_family_uses_structure_without_d2h() -> None:
+    if not has_gpu_runtime():
+        return
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_stats,
+        reset_d2h_transfer_count,
+    )
+
+    owned = _device_only_point_owned(np.asarray([True, False], dtype=np.bool_))
+
+    reset_d2h_transfer_count()
+    family = io_wkb._homogeneous_family(owned)
+    transfer_count, transfer_bytes = get_d2h_transfer_stats()
+
+    assert family is GeometryFamily.POINT
+    assert transfer_count == 0
+    assert transfer_bytes == 0
+
+
+def test_device_geometry_encode_validity_uses_structure_without_count_d2h() -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_stats,
+        reset_d2h_transfer_count,
+    )
+
+    owned = _device_only_point_owned(np.asarray([True, False], dtype=np.bool_))
+
+    reset_d2h_transfer_count()
+    mask, null_count = io_wkb._device_validity_gpumask(owned)
+    transfer_count, transfer_bytes = get_d2h_transfer_stats()
+
+    assert mask is not None
+    assert null_count == 1
+    assert transfer_count == 0
+    assert transfer_bytes == 0
+
+
+def test_device_geoarrow_point_empty_check_uses_structure_without_d2h() -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_stats,
+        reset_d2h_transfer_count,
+    )
+
+    owned = _device_only_point_owned(np.asarray([True, True], dtype=np.bool_))
+
+    reset_d2h_transfer_count()
+    _column, encoding_name = io_wkb._encode_owned_geoarrow_column_device(owned)
+    transfer_count, transfer_bytes = get_d2h_transfer_stats()
+
+    assert encoding_name == "point"
+    assert transfer_count == 0
+    assert transfer_bytes == 0
+
+
 def test_decode_arrow_geoparquet_table_to_owned_handles_unnamed_single_geometry_column() -> None:
     owned = from_shapely_geometries(
         [
@@ -4006,6 +4772,58 @@ def test_write_geoparquet_device_geoarrow_preserves_empty_point_rows(tmp_path) -
     assert not arrow_table.schema.field("geometry").type.equals(pa.binary())
     assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.TRANSFER] == []
     assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.MATERIALIZATION] == []
+
+
+@pytest.mark.parametrize(
+    ("geometries", "extension_name"),
+    [
+        (
+            [Point(0, 0), MultiPoint([(1, 1), (2, 2)])],
+            "geoarrow.multipoint",
+        ),
+        (
+            [
+                LineString([(0, 0), (1, 1)]),
+                MultiLineString([[(2, 2), (3, 3)], [(4, 4), (5, 5)]]),
+            ],
+            "geoarrow.multilinestring",
+        ),
+        (
+            [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+                MultiPolygon([Polygon([(2, 0), (3, 0), (3, 1), (2, 0)])]),
+            ],
+            "geoarrow.multipolygon",
+        ),
+    ],
+)
+def test_write_geoparquet_device_geoarrow_single_multi_mix_outputs_true_geoarrow(
+    tmp_path,
+    geometries,
+    extension_name,
+) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    geopandas.clear_fallback_events()
+    gdf, owned = _make_device_dga_gdf(geometries)
+    owned._validity = None
+    owned._tags = None
+    owned._family_row_offsets = None
+    path = tmp_path / f"device_{extension_name.replace('.', '_')}.parquet"
+
+    write_geoparquet(gdf, path, geometry_encoding="geoarrow")
+    arrow_table = pq.read_table(path)
+    field = arrow_table.schema.field("geometry")
+
+    assert field.metadata[b"ARROW:extension:name"] == extension_name.encode()
+    assert not field.type.equals(pa.binary())
+    assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.TRANSFER] == []
+    assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.MATERIALIZATION] == []
+    assert geopandas.get_fallback_events(clear=True) == []
 
 
 def test_write_geoparquet_device_geoarrow_geometry_only_has_no_transfer_or_materialization(tmp_path) -> None:

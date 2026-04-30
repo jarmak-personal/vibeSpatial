@@ -7,6 +7,8 @@ geometry property functions.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -38,6 +40,30 @@ from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 # ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
+
+
+def test_constructive_metric_property_d2h_exports_are_runtime_accounted() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    paths = (
+        repo_root / "src" / "vibespatial" / "constructive" / "measurement.py",
+        repo_root / "src" / "vibespatial" / "constructive" / "properties.py",
+    )
+    offenders: list[str] = []
+    for path in paths:
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr in {"asnumpy", "get", "item"}:
+                offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+            if func.attr == "copy_device_to_host" and not any(
+                keyword.arg == "reason" for keyword in node.keywords
+            ):
+                offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+    assert offenders == []
 
 
 def _make_owned_with_device_state(geoms):
@@ -280,6 +306,43 @@ class TestGetGeometry:
         assert result._validity is None
         assert result._tags is None
         assert result._family_row_offsets is None
+
+    @pytest.mark.gpu
+    def test_gpu_get_geometry_scalar_fences_are_operation_named(self):
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+        from vibespatial.runtime.residency import Residency
+
+        p1 = Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)])
+        p2 = Polygon([(2, 2), (3, 2), (3, 3), (2, 3), (2, 2)])
+        geoms = [
+            MultiPoint([(0, 0), (1, 1), (2, 2)]),
+            MultiLineString([[(0, 0), (1, 1)], [(2, 2), (3, 3), (4, 4)]]),
+            MultiPolygon([p1, p2]),
+            Polygon([(4, 4), (6, 4), (6, 6), (4, 6), (4, 4)]),
+            LineString([(10, 10), (11, 11), (12, 10)]),
+        ]
+        owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+
+        reset_d2h_transfer_count()
+        get_d2h_transfer_events(clear=True)
+        result = get_geometry_owned(owned, 0, dispatch_mode=ExecutionMode.GPU)
+        events = get_d2h_transfer_events(clear=True)
+
+        assert result.residency is Residency.DEVICE
+        reasons = [event.reason for event in events]
+        assert reasons
+        assert all(reason.startswith("constructive get-geometry ") for reason in reasons)
+        assert "constructive get-geometry multipoint valid-count scalar fence" in reasons
+        assert "constructive get-geometry multilinestring valid-count scalar fence" in reasons
+        assert "constructive get-geometry multipolygon valid-count scalar fence" in reasons
+        assert "constructive get-geometry simple coordinate-count scalar fence" in reasons
+        assert not any("CudaRuntime.copy_device_to_host" in reason for reason in reasons)
 
     def test_multi_types(self):
         geoms = [

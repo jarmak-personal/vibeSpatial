@@ -94,6 +94,14 @@ if cp is not None:
     ])
 
 
+def _has_host_routing_metadata(geometry_array: OwnedGeometryArray) -> bool:
+    return (
+        getattr(geometry_array, "_validity", None) is not None
+        and getattr(geometry_array, "_tags", None) is not None
+        and getattr(geometry_array, "_family_row_offsets", None) is not None
+    )
+
+
 def _bounds_kernels(compute_type: str = "double"):
     source = _format_bounds_kernel_source(compute_type)
     runtime = get_cuda_runtime()
@@ -321,12 +329,16 @@ def _compute_geometry_bounds_gpu_impl(
     state = geometry_array._ensure_device_state()
     if state.row_bounds is not None:
         if materialize_host:
-            cached_bounds = assemble_cached_bounds(geometry_array)
-            if cached_bounds is not None:
-                return cached_bounds
-        if materialize_host:
-            bounds = runtime.copy_device_to_host(state.row_bounds)
-            geometry_array.cache_bounds(bounds)
+            if _has_host_routing_metadata(geometry_array):
+                cached_bounds = assemble_cached_bounds(geometry_array)
+                if cached_bounds is not None:
+                    return cached_bounds
+            bounds = runtime.copy_device_to_host(
+                state.row_bounds,
+                reason="geometry analysis cached row-bounds host export",
+            )
+            if _has_host_routing_metadata(geometry_array):
+                geometry_array.cache_bounds(bounds)
             return bounds
         return cp.asarray(state.row_bounds)
     temp_bounds: list[tuple[GeometryFamily, DeviceFamilyGeometryBuffer, object]] = []
@@ -396,7 +408,10 @@ def _compute_geometry_bounds_gpu_impl(
             )
             if materialize_host:
                 runtime.synchronize()
-                bounds = runtime.copy_device_to_host(out_bounds)
+                bounds = runtime.copy_device_to_host(
+                    out_bounds,
+                    reason="geometry analysis mixed row-bounds host export",
+                )
         except Exception:
             runtime.free(out_bounds)
             raise
@@ -406,7 +421,8 @@ def _compute_geometry_bounds_gpu_impl(
         for family, _, device_bounds in temp_bounds:
             geometry_array.cache_device_bounds(family, device_bounds)
         if materialize_host:
-            geometry_array.cache_bounds(bounds)
+            if _has_host_routing_metadata(geometry_array):
+                geometry_array.cache_bounds(bounds)
             return bounds
         return cp.asarray(out_bounds)
     except Exception:

@@ -8,17 +8,19 @@ from vibespatial.geometry.owned import (
     DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
+    seed_homogeneous_host_metadata,
 )
 from vibespatial.kernels.constructive.segmented_union import segmented_union_all
 from vibespatial.overlay.contract import OverlayMicrocellComponents
 from vibespatial.overlay.host_fallback import (
-    _build_overlay_output_rows,
     _face_sample_point,
     _point_in_ring,
     _signed_area_and_centroid,
 )
 from vibespatial.overlay.microcells import OverlayMicrocellLabels
-from vibespatial.runtime import ExecutionMode, RuntimeSelection
+from vibespatial.runtime import ExecutionMode
+
+from ._host_boundary import overlay_device_to_host
 
 try:
     import cupy as cp
@@ -171,7 +173,7 @@ def _build_microcell_polygon_rows(coalesced) -> OwnedGeometryArray:
             cp.maximum(cp.maximum(y_lower_left, y_lower_right), cp.maximum(y_upper_left, y_upper_right)),
         )
     )
-    return build_device_resident_owned(
+    result = build_device_resident_owned(
         device_families={
             GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
                 family=GeometryFamily.POLYGON,
@@ -189,6 +191,31 @@ def _build_microcell_polygon_rows(coalesced) -> OwnedGeometryArray:
         family_row_offsets=d_family_row_offsets,
         execution_mode="gpu",
     )
+    seed_homogeneous_host_metadata(result, GeometryFamily.POLYGON)
+    return result
+
+
+def _microcell_group_offsets_host(
+    selected_row_indices,
+    *,
+    row_count: int,
+    total_cells: int,
+) -> np.ndarray:
+    """Build CSR group offsets for sorted selected microcell rows."""
+    if row_count <= 0:
+        return np.zeros(1, dtype=np.int64)
+    if row_count == 1:
+        return np.asarray([0, int(total_cells)], dtype=np.int64)
+    selected_rows = overlay_device_to_host(
+        selected_row_indices,
+        reason="overlay contraction selected-row group-offset metadata",
+        dtype=np.int64,
+    )
+    group_counts = np.bincount(selected_rows, minlength=row_count).astype(
+        np.int64,
+        copy=False,
+    )
+    return np.concatenate(([0], np.cumsum(group_counts, dtype=np.int64)))
 
 
 def _walk_boundary_rings(coalesced) -> dict[int, list[list[np.ndarray]]]:
@@ -258,15 +285,51 @@ def _walk_boundary_rings(coalesced) -> dict[int, list[list[np.ndarray]]]:
     if int(keep_indices.size) == 0:
         return {}
 
-    row_h = cp.asnumpy(sorted_row[keep_indices]).astype(np.int64, copy=False)
-    sx_h = cp.asnumpy(sorted_sx[keep_indices]).astype(np.float64, copy=False)
-    sy_h = cp.asnumpy(sorted_sy[keep_indices]).astype(np.float64, copy=False)
-    tx_h = cp.asnumpy(sorted_tx[keep_indices]).astype(np.float64, copy=False)
-    ty_h = cp.asnumpy(sorted_ty[keep_indices]).astype(np.float64, copy=False)
-    sx_bits_h = cp.asnumpy(sorted_sx_bits[keep_indices]).astype(np.uint64, copy=False)
-    sy_bits_h = cp.asnumpy(sorted_sy_bits[keep_indices]).astype(np.uint64, copy=False)
-    tx_bits_h = cp.asnumpy(sorted_tx_bits[keep_indices]).astype(np.uint64, copy=False)
-    ty_bits_h = cp.asnumpy(sorted_ty_bits[keep_indices]).astype(np.uint64, copy=False)
+    row_h = overlay_device_to_host(
+        sorted_row[keep_indices],
+        reason="overlay contraction boundary-walk row metadata",
+        dtype=np.int64,
+    )
+    sx_h = overlay_device_to_host(
+        sorted_sx[keep_indices],
+        reason="overlay contraction boundary-walk source-x metadata",
+        dtype=np.float64,
+    )
+    sy_h = overlay_device_to_host(
+        sorted_sy[keep_indices],
+        reason="overlay contraction boundary-walk source-y metadata",
+        dtype=np.float64,
+    )
+    tx_h = overlay_device_to_host(
+        sorted_tx[keep_indices],
+        reason="overlay contraction boundary-walk target-x metadata",
+        dtype=np.float64,
+    )
+    ty_h = overlay_device_to_host(
+        sorted_ty[keep_indices],
+        reason="overlay contraction boundary-walk target-y metadata",
+        dtype=np.float64,
+    )
+    sx_bits_h = overlay_device_to_host(
+        sorted_sx_bits[keep_indices],
+        reason="overlay contraction boundary-walk source-x bits metadata",
+        dtype=np.uint64,
+    )
+    sy_bits_h = overlay_device_to_host(
+        sorted_sy_bits[keep_indices],
+        reason="overlay contraction boundary-walk source-y bits metadata",
+        dtype=np.uint64,
+    )
+    tx_bits_h = overlay_device_to_host(
+        sorted_tx_bits[keep_indices],
+        reason="overlay contraction boundary-walk target-x bits metadata",
+        dtype=np.uint64,
+    )
+    ty_bits_h = overlay_device_to_host(
+        sorted_ty_bits[keep_indices],
+        reason="overlay contraction boundary-walk target-y bits metadata",
+        dtype=np.uint64,
+    )
 
     start_map: dict[tuple[int, int, int], list[int]] = {}
     for edge_index, (row, sxb, syb) in enumerate(zip(row_h, sx_bits_h, sy_bits_h, strict=False)):
@@ -390,15 +453,17 @@ def reconstruct_overlay_from_microcells(
     band_row_count = labels.bands.row_count if row_count is None else int(row_count)
     mask = _select_microcell_mask(labels, operation)
     selected_ids = cp.flatnonzero(mask.astype(cp.bool_, copy=False)).astype(cp.int64, copy=False)
-    if components is not None and int(selected_ids.size) > 0:
-        comp_ids = cp.asarray(components.component_ids, dtype=cp.int64)[selected_ids]
+    comp_ids = None
+    if int(selected_ids.size) > 0:
         row_ids = cp.asarray(labels.bands.row_indices, dtype=cp.int64)[selected_ids]
         interval_ids = cp.asarray(labels.bands.interval_indices, dtype=cp.int64)[selected_ids]
-        order = cp.lexsort(cp.stack((interval_ids, comp_ids, row_ids)))
+        if components is not None:
+            comp_ids = cp.asarray(components.component_ids, dtype=cp.int64)[selected_ids]
+            order = cp.lexsort(cp.stack((interval_ids, comp_ids, row_ids)))
+            comp_ids = comp_ids[order]
+        else:
+            order = cp.lexsort(cp.stack((interval_ids, row_ids)))
         selected_ids = selected_ids[order]
-        comp_ids = comp_ids[order]
-    else:
-        comp_ids = None
     coalesced = _coalesce_selected_microcells(labels, selected_ids, component_ids=comp_ids)
     cell_rows = _build_microcell_polygon_rows(coalesced)
     if band_row_count == 0:
@@ -413,21 +478,11 @@ def reconstruct_overlay_from_microcells(
             dispatch_mode=dispatch_mode,
         )
 
-    if components is not None and "component_ids" in coalesced:
-        row_polygons = _walk_boundary_rings(coalesced)
-        return _build_overlay_output_rows(
-            row_polygons,
-            RuntimeSelection(
-                requested=ExecutionMode.GPU,
-                selected=ExecutionMode.CPU,
-                reason="contraction boundary ring assembly",
-            ),
-        )
-
-    else:
-        selected_rows = cp.asnumpy(selected_row_indices)  # zcopy:ok(group offsets are tiny row metadata for segmented union grouping)
-        group_counts = np.bincount(selected_rows, minlength=band_row_count).astype(np.int64, copy=False)
-        group_offsets = np.concatenate(([0], np.cumsum(group_counts, dtype=np.int64)))
+    group_offsets = _microcell_group_offsets_host(
+        selected_row_indices,
+        row_count=band_row_count,
+        total_cells=int(cell_rows.row_count),
+    )
     return segmented_union_all(
         cell_rows,
         group_offsets,

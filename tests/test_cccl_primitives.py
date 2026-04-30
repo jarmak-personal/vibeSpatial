@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -36,6 +38,22 @@ def _cupy():
     import cupy as cp
 
     return cp
+
+
+def test_cccl_primitives_have_no_raw_device_scalar_item_syncs() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "src" / "vibespatial" / "cuda" / "cccl_primitives.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    failures: list[str] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "item":
+            failures.append(f"raw .item() at line {node.lineno}")
+
+    assert failures == []
 
 
 def test_compact_indices_matches_flatnonzero() -> None:

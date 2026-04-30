@@ -215,9 +215,10 @@ def query_spatial_index(
             )
             # Short-circuit: keep indices on device when caller wants device
             # results (ZCOPY001: avoid D->H->D ping-pong in regular-grid path).
+            # Scalar private callers still need relation-pair shape internally;
+            # the public scalar 1D index array is formed only at export.
             if (
                 return_device
-                and not scalar
                 and output_format == "indices"
                 and isinstance(regular_grid_box_pairs, _DeviceCandidates)
             ):
@@ -339,7 +340,11 @@ def query_spatial_index(
             regular_grid_box_bounds = shapely_bounds_array(query_values)
     else:
         regular_grid_box_bounds = None
-        if query_owned is not None:
+        if (
+            query_owned is not None
+            and getattr(flat_index, "regular_grid", None) is not None
+            and predicate in (None, "intersects")
+        ):
             regular_grid_box_bounds = _extract_box_query_bounds_from_owned("intersects", query_owned)
 
     regular_grid_box_pairs = _query_regular_grid_rect_box_index(
@@ -356,9 +361,10 @@ def query_spatial_index(
         )
         # Short-circuit: keep indices on device when caller wants device
         # results (ZCOPY001: avoid D->H->D ping-pong in regular-grid path).
+        # Scalar private callers still receive relation-pair shape; public
+        # scalar output is an explicit terminal export.
         if (
             return_device
-            and not scalar
             and output_format == "indices"
             and isinstance(regular_grid_box_pairs, _DeviceCandidates)
         ):
@@ -411,9 +417,10 @@ def query_spatial_index(
         )
         # Short-circuit: keep indices on device when caller wants device
         # results (ZCOPY001: avoid D->H->D ping-pong in regular-grid path).
+        # Scalar private callers still receive relation-pair shape; public
+        # scalar output is an explicit terminal export.
         if (
             return_device
-            and not scalar
             and output_format == "indices"
             and isinstance(fast_pairs, _DeviceCandidates)
         ):
@@ -452,12 +459,19 @@ def query_spatial_index(
         )
         return (formatted, execution) if return_metadata else formatted
 
-    point_box_pairs = _query_point_tree_box_index(
-        tree_owned,
-        predicate=predicate,
-        query_row_count=query_owned.row_count,
-        box_bounds=_extract_box_query_bounds_from_owned(predicate, query_owned),
+    point_box_pairs = None
+    point_tree_box_supported = (
+        GeometryFamily.POINT in tree_owned.families
+        and len(tree_owned.families) == 1
+        and _point_box_predicate_mode(predicate) is not None
     )
+    if point_tree_box_supported:
+        point_box_pairs = _query_point_tree_box_index(
+            tree_owned,
+            predicate=predicate,
+            query_row_count=query_owned.row_count,
+            box_bounds=_extract_box_query_bounds_from_owned(predicate, query_owned),
+        )
     if point_box_pairs is not None:
         execution = SpatialQueryExecution(
             requested=ExecutionMode.AUTO,
@@ -786,11 +800,11 @@ def query_spatial_index(
 
     # Phase 2 zero-copy: when caller requests device-resident index arrays
     # (e.g., overlay with both sides owned-backed), keep refined indices on
-    # device to feed directly into device_take() — eliminates H->D re-upload.
-    # Only applies to non-scalar "indices" format with GPU execution.
+    # device to feed directly into native relation/rowset consumers.  Scalar
+    # private callers still use relation-pair shape here; the public scalar
+    # 1D array is formed by the terminal export boundary.
     if (
         return_device
-        and not scalar
         and output_format == "indices"
         and execution.selected is ExecutionMode.GPU
         and not device_indices_materialized_from_gpu

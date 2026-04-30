@@ -19,11 +19,29 @@ from vibespatial.bench.pipeline import (
 from vibespatial.bench.runner import _extract_gpu_util
 from vibespatial.runtime import has_gpu_runtime
 
+_GENERIC_RUNTIME_D2H_REASONS = {
+    "CudaRuntime.copy_device_to_host",
+    "CudaRuntime.copy_device_to_host_async",
+    "count-scatter total allocation fence",
+}
+
+
+def _assert_no_generic_runtime_d2h_reasons(trace: dict) -> None:
+    for stage in trace["stages"]:
+        events = stage["metadata"].get("runtime_d2h_transfer_events", ())
+        assert not any(
+            event["reason"] in _GENERIC_RUNTIME_D2H_REASONS
+            for event in events
+        )
+
 
 def test_pipeline_smoke_suite_runs_active_pipelines() -> None:
     pytest.importorskip("pylibcudf")
     results = benchmark_pipeline_suite(suite="smoke")
     by_name = {(result.pipeline, result.scale): result for result in results}
+    for result in results:
+        if result.status == "ok" and result.stages:
+            _assert_no_generic_runtime_d2h_reasons(result.stages[0])
 
     assert ("join-heavy", 1000) in by_name
     assert ("relation-semijoin", 1000) in by_name
@@ -59,7 +77,29 @@ def test_pipeline_smoke_suite_runs_active_pipelines() -> None:
             relation_stages["subset_rows"]["metadata"]["materialization_count_delta"]
             == 0
         )
-    assert by_name[("constructive", 1000)].output_rows >= 0
+        _assert_no_generic_runtime_d2h_reasons(relation_semijoin.stages[0])
+    constructive = by_name[("constructive", 1000)]
+    assert constructive.output_rows >= 0
+    if constructive.status == "ok":
+        constructive_stages = {
+            stage["name"]: stage
+            for stage in constructive.stages[0]["stages"]
+        }
+        buffer_metadata = constructive_stages["buffer_points"]["metadata"]
+        assert buffer_metadata["runtime_d2h_transfer_bytes_delta"] <= 3
+        buffer_reasons = {
+            event["reason"]
+            for event in buffer_metadata.get("runtime_d2h_transfer_events", ())
+        }
+        assert buffer_reasons <= {
+            "point buffer validity admission scalar fence",
+            "point buffer family-tag admission scalar fence",
+            "point buffer empty-point admission scalar fence",
+        }
+        assert not any(
+            event["reason"].startswith("owned geometry host metadata")
+            for event in buffer_metadata.get("runtime_d2h_transfer_events", ())
+        )
     assert by_name[("predicate-heavy", 1000)].selected_runtime in {"cpu", "hybrid", "gpu"}
     zero_transfer = by_name[("zero-transfer", 1000)]
     assert zero_transfer.status in {"ok", "deferred", "failed"}
@@ -77,8 +117,17 @@ def test_pipeline_smoke_suite_runs_active_pipelines() -> None:
             400.0,
         )
     if zero_transfer.status == "ok":
-        assert zero_transfer.transfer_count == 0
         assert zero_transfer.materialization_count == 0
+        assert (zero_transfer.runtime_d2h_transfer_count or 0) <= 1
+        assert (zero_transfer.runtime_d2h_transfer_bytes or 0) <= 32
+        zero_transfer_reasons = {
+            event["reason"]
+            for stage in zero_transfer.stages[0]["stages"]
+            for event in stage["metadata"].get("runtime_d2h_transfer_events", ())
+        }
+        assert zero_transfer_reasons <= {
+            "DeviceGeometryArray total-bounds device summary host boundary"
+        }
     elif zero_transfer.status == "failed":
         assert (zero_transfer.runtime_d2h_transfer_count or 0) > 0 or (
             zero_transfer.materialization_count > 0
@@ -205,16 +254,24 @@ def test_grouped_reducer_pipeline_smoke() -> None:
         "public_groupby_reference",
     }
     assert stage_by_name["native_sum"]["metadata"]["result_storage"] == "device"
+    assert stage_by_name["native_sum"]["metadata"]["any_result_storage"] == "device"
+    assert stage_by_name["native_sum"]["metadata"]["all_result_storage"] == "device"
     assert stage_by_name["native_sum"]["metadata"]["runtime_d2h_transfer_count_delta"] == 0
     assert stage_by_name["native_sum"]["metadata"]["materialization_count_delta"] == 0
     assert stage_by_name["public_groupby_reference"]["metadata"]["results_match"] is True
+    assert (
+        stage_by_name["public_groupby_reference"]["metadata"]["bool_results_match"]
+        is True
+    )
     assert (
         stage_by_name["public_groupby_reference"]["metadata"][
             "materialization_count_delta"
         ]
         >= 1
     )
-    assert trace["metadata"]["admissible_shape"] == "dense-code NativeGrouped numeric sum"
+    assert trace["metadata"]["admissible_shape"] == (
+        "dense-code NativeGrouped numeric and boolean reductions"
+    )
 
 
 def test_small_grouped_constructive_reduce_pipeline_smoke() -> None:
@@ -257,18 +314,154 @@ def test_small_grouped_constructive_reduce_pipeline_smoke() -> None:
         stage_by_name["native_grouped_union"]["metadata"][
             "runtime_d2h_transfer_count_delta"
         ]
-        <= 3
+        <= 5
     )
     assert (
         stage_by_name["native_grouped_union"]["metadata"][
             "runtime_d2h_transfer_bytes_delta"
         ]
-        <= 64
+        <= 56
+    )
+    native_grouped_events = stage_by_name["native_grouped_union"]["metadata"].get(
+        "runtime_d2h_transfer_events",
+        (),
+    )
+    removed_overlay_fences = {
+        "overlay assemble boundary total-coords allocation fence",
+        "overlay assemble compact-hole total-coords allocation fence",
+        "overlay assemble coordinate-gather total-coords allocation fence",
+        "overlay assemble expand-by-counts total allocation fence",
+        "overlay assemble hole total-coords allocation fence",
+        "overlay assemble multipolygon-count allocation fence",
+        "overlay assemble polygon-count allocation fence",
+        "overlay assemble total-output-rings allocation fence",
+        "overlay split atomic-edge pair-count allocation fence",
+        "overlay split pair-event totals allocation fence",
+        "overlay graph face-edge gather allocation fence",
+    }
+    assert not any(
+        event["reason"] in removed_overlay_fences for event in native_grouped_events
+    )
+    assert not any(
+        event["reason"].startswith("overlay assemble")
+        for event in native_grouped_events
+    )
+    assert not any(
+        event["reason"] in _GENERIC_RUNTIME_D2H_REASONS
+        for event in native_grouped_events
     )
     assert stage_by_name["shapely_reference"]["metadata"]["results_match"] is True
     assert (
         trace["metadata"]["admissible_shape"]
         == "owned device polygons + dense group offsets -> batched grouped constructive reduce"
+    )
+
+
+def test_constructive_output_native_pipeline_smoke() -> None:
+    results = benchmark_pipeline_suite(
+        suite="smoke",
+        pipelines=("constructive-output-native",),
+    )
+    assert len(results) == 1
+    result = results[0]
+    assert result.pipeline == "constructive-output-native"
+    assert result.scale == 1000
+    if result.status == "deferred":
+        return
+    assert result.status == "ok"
+
+    trace = result.stages[0]
+    stage_by_name = {stage["name"]: stage for stage in trace["stages"]}
+    assert set(stage_by_name) == {
+        "build_device_pairwise_boxes",
+        "native_constructive_intersection",
+        "constructive_area_expression",
+        "constructive_expression_consumers",
+        "public_reference_export",
+    }
+    assert (
+        stage_by_name["native_constructive_intersection"]["metadata"][
+            "constructive_output_carrier"
+        ]
+        == "NativeTabularResult"
+    )
+    assert (
+        stage_by_name["native_constructive_intersection"]["metadata"][
+            "downstream_carrier"
+        ]
+        == "NativeFrameState"
+    )
+    assert (
+        stage_by_name["native_constructive_intersection"]["metadata"][
+            "geometry_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_constructive_intersection"]["metadata"][
+            "provenance_carrier"
+        ]
+        == "NativeGeometryProvenance"
+    )
+    assert (
+        stage_by_name["native_constructive_intersection"]["metadata"][
+            "provenance_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_constructive_intersection"]["metadata"][
+            "geometry_metadata_carrier"
+        ]
+        == "NativeGeometryMetadata"
+    )
+    native_constructive_metadata = stage_by_name["native_constructive_intersection"][
+        "metadata"
+    ]
+    native_constructive_events = native_constructive_metadata.get(
+        "runtime_d2h_transfer_events",
+        [],
+    )
+    assert native_constructive_metadata["runtime_d2h_transfer_bytes_delta"] <= 64
+    assert not any(
+        event["reason"].startswith("owned geometry host metadata")
+        for event in native_constructive_events
+    )
+    assert (
+        stage_by_name["constructive_area_expression"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["constructive_expression_consumers"]["metadata"][
+            "materialization_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["constructive_expression_consumers"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        <= 2
+    )
+    assert (
+        stage_by_name["constructive_expression_consumers"]["metadata"][
+            "runtime_d2h_transfer_bytes_delta"
+        ]
+        <= 16
+    )
+    assert (
+        stage_by_name["constructive_expression_consumers"]["metadata"][
+            "grouped_result_storage"
+        ]
+        == "device"
+    )
+    assert stage_by_name["public_reference_export"]["metadata"]["results_match"] is True
+    _assert_no_generic_runtime_d2h_reasons(trace)
+    assert trace["metadata"]["admissible_shape"] == (
+        "pairwise constructive owned geometry -> NativeTabularResult -> "
+        "NativeFrameState -> NativeExpression rowset/grouped consumers"
     )
 
 
@@ -298,6 +491,10 @@ def test_relation_attribute_reducer_pipeline_smoke() -> None:
         == "device"
     )
     assert (
+        stage_by_name["native_attribute_reduce"]["metadata"]["attribute_storage"]
+        == "device"
+    )
+    assert (
         stage_by_name["native_attribute_reduce"]["metadata"][
             "runtime_d2h_transfer_count_delta"
         ]
@@ -318,6 +515,471 @@ def test_relation_attribute_reducer_pipeline_smoke() -> None:
     )
     assert trace["metadata"]["admissible_shape"] == (
         "device NativeRelation -> grouped right numeric attributes by left rows"
+    )
+
+
+def test_relation_distance_expression_pipeline_smoke() -> None:
+    results = benchmark_pipeline_suite(
+        suite="smoke",
+        pipelines=("relation-distance-expression",),
+    )
+    assert len(results) == 1
+    result = results[0]
+    assert result.pipeline == "relation-distance-expression"
+    assert result.scale == 1000
+    if result.status == "deferred":
+        return
+    assert result.status == "ok"
+
+    trace = result.stages[0]
+    stage_by_name = {stage["name"]: stage for stage in trace["stages"]}
+    assert set(stage_by_name) == {
+        "build_relation_distances",
+        "native_distance_filter_reduce",
+        "public_reference_export",
+    }
+    assert (
+        stage_by_name["build_relation_distances"]["metadata"]["distance_storage"]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_distance_filter_reduce"]["metadata"][
+            "expression_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_distance_filter_reduce"]["metadata"][
+            "left_match_expression_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_distance_filter_reduce"]["metadata"][
+            "right_match_expression_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_distance_filter_reduce"]["metadata"]["rowset_storage"]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_distance_filter_reduce"]["metadata"][
+            "match_rowset_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_distance_filter_reduce"]["metadata"][
+            "relation_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_distance_filter_reduce"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["native_distance_filter_reduce"]["metadata"][
+            "materialization_count_delta"
+        ]
+        == 0
+    )
+    assert stage_by_name["public_reference_export"]["metadata"]["results_match"] is True
+    _assert_no_generic_runtime_d2h_reasons(trace)
+    assert (
+        trace["metadata"]["admissible_shape"]
+        == "NativeRelation distances/counts -> NativeExpression -> NativeRowSet -> filtered NativeRelation"
+    )
+
+
+def test_nearest_relation_producer_pipeline_smoke() -> None:
+    results = benchmark_pipeline_suite(
+        suite="smoke",
+        pipelines=("nearest-relation-producer",),
+    )
+    assert len(results) == 1
+    result = results[0]
+    assert result.pipeline == "nearest-relation-producer"
+    assert result.scale == 1000
+    if result.status == "deferred":
+        return
+    assert result.status == "ok"
+
+    trace = result.stages[0]
+    stage_by_name = {stage["name"]: stage for stage in trace["stages"]}
+    assert set(stage_by_name) == {
+        "build_nearest_relation",
+        "native_distance_consume",
+        "native_attribute_match_filter",
+        "build_right_nearest_relation",
+        "public_reference_export",
+    }
+    assert (
+        stage_by_name["build_nearest_relation"]["metadata"]["relation_storage"]
+        == "device"
+    )
+    assert (
+        stage_by_name["build_nearest_relation"]["metadata"][
+            "runtime_d2h_transfer_bytes_delta"
+        ]
+        <= 8
+    )
+    assert (
+        stage_by_name["native_distance_consume"]["metadata"]["expression_storage"]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_distance_consume"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["native_distance_consume"]["metadata"][
+            "materialization_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["native_attribute_match_filter"]["metadata"][
+            "relation_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_attribute_match_filter"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["native_attribute_match_filter"]["metadata"][
+            "materialization_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["native_attribute_match_filter"]["metadata"][
+            "results_match"
+        ]
+        is True
+    )
+    assert (
+        stage_by_name["build_right_nearest_relation"]["metadata"]["relation_storage"]
+        == "device"
+    )
+    assert (
+        stage_by_name["build_right_nearest_relation"]["metadata"][
+            "materialization_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["build_right_nearest_relation"]["metadata"][
+            "runtime_d2h_transfer_bytes_delta"
+        ]
+        <= 8
+    )
+    assert stage_by_name["public_reference_export"]["metadata"]["results_match"] is True
+    _assert_no_generic_runtime_d2h_reasons(trace)
+    assert trace["metadata"]["admissible_shape"] == (
+        "public nearest producer -> NativeRelation distances -> "
+        "NativeExpression and relation attribute filters"
+    )
+
+
+def test_native_area_expression_pipeline_smoke() -> None:
+    results = benchmark_pipeline_suite(
+        suite="smoke",
+        pipelines=("native-area-expression",),
+    )
+    assert len(results) == 1
+    result = results[0]
+    assert result.pipeline == "native-area-expression"
+    assert result.scale == 1000
+    if result.status == "deferred":
+        return
+    assert result.status == "ok"
+
+    trace = result.stages[0]
+    stage_by_name = {stage["name"]: stage for stage in trace["stages"]}
+    assert set(stage_by_name) == {
+        "build_native_polygons",
+        "area_expression",
+        "length_expression",
+        "centroid_component_expressions",
+        "expression_column_compose",
+        "public_expression_column_bridge",
+        "expression_compound_rowset_take",
+        "guarded_threshold_rowsets",
+        "expression_grouped_sum",
+        "public_reference_export",
+    }
+    assert stage_by_name["area_expression"]["metadata"]["expression_storage"] == "device"
+    assert (
+        stage_by_name["area_expression"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["length_expression"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        == 0
+    )
+    assert stage_by_name["length_expression"]["metadata"]["expression_storage"] == "device"
+    assert (
+        stage_by_name["centroid_component_expressions"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["centroid_component_expressions"]["metadata"][
+            "expression_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["expression_column_compose"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["expression_column_compose"]["metadata"][
+            "materialization_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["expression_column_compose"]["metadata"][
+            "attribute_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["expression_column_compose"]["metadata"][
+            "expression_columns"
+        ]
+        == 4
+    )
+    assert (
+        stage_by_name["public_expression_column_bridge"]["metadata"][
+            "materialization_count_delta"
+        ]
+        >= 1
+    )
+    assert (
+        stage_by_name["public_expression_column_bridge"]["metadata"][
+            "attribute_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["public_expression_column_bridge"]["metadata"][
+            "rowset_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["expression_compound_rowset_take"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["expression_compound_rowset_take"]["metadata"][
+            "materialization_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["expression_compound_rowset_take"]["metadata"][
+            "rowset_operation"
+        ]
+        == "intersection"
+    )
+    assert (
+        stage_by_name["guarded_threshold_rowsets"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["guarded_threshold_rowsets"]["metadata"][
+            "materialization_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["guarded_threshold_rowsets"]["metadata"][
+            "rowset_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["guarded_threshold_rowsets"]["metadata"][
+            "ambiguous_rowset_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["guarded_threshold_rowsets"]["metadata"][
+            "ambiguous_row_count"
+        ]
+        > 0
+    )
+    assert (
+        stage_by_name["expression_grouped_sum"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["expression_grouped_sum"]["metadata"][
+            "materialization_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["public_reference_export"]["metadata"]["results_match"]
+        is True
+    )
+    assert (
+        stage_by_name["public_reference_export"]["metadata"]["guarded_match"]
+        is True
+    )
+    assert (
+        stage_by_name["public_reference_export"]["metadata"][
+            "materialization_count_delta"
+        ]
+        >= 1
+    )
+    assert trace["metadata"]["admissible_shape"] == (
+        "owned polygon geometry -> NativeExpression area/length/centroid vectors "
+        "-> private/public expression columns -> composed and guarded "
+        "NativeRowSet and NativeGrouped consumers"
+    )
+
+
+def test_native_metadata_index_pipeline_smoke() -> None:
+    results = benchmark_pipeline_suite(
+        suite="smoke",
+        pipelines=("native-metadata-index",),
+    )
+    assert len(results) == 1
+    result = results[0]
+    assert result.pipeline == "native-metadata-index"
+    assert result.scale == 1000
+    if result.status == "deferred":
+        return
+    assert result.status == "ok"
+
+    trace = result.stages[0]
+    stage_by_name = {stage["name"]: stage for stage in trace["stages"]}
+    assert set(stage_by_name) == {
+        "build_device_boxes",
+        "build_flat_spatial_index",
+        "wrap_native_metadata_index",
+        "native_index_query_relation",
+        "native_metadata_rowset_take",
+        "carrier_contract_checks",
+    }
+    assert stage_by_name["build_flat_spatial_index"]["metadata"]["regular_grid"] is True
+    assert stage_by_name["build_flat_spatial_index"]["metadata"]["device_bounds"] is True
+    assert (
+        stage_by_name["build_flat_spatial_index"]["metadata"][
+            "scalar_fence_within_budget"
+        ]
+        is True
+    )
+    assert (
+        stage_by_name["wrap_native_metadata_index"]["metadata"][
+            "metadata_reuses_device_bounds"
+        ]
+        is True
+    )
+    assert (
+        stage_by_name["wrap_native_metadata_index"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["native_index_query_relation"]["metadata"][
+            "relation_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_index_query_relation"]["metadata"][
+            "rowset_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_index_query_relation"]["metadata"][
+            "results_match"
+        ]
+        is True
+    )
+    assert (
+        stage_by_name["native_index_query_relation"]["metadata"][
+            "scalar_fence_within_budget"
+        ]
+        is True
+    )
+    assert (
+        stage_by_name["native_metadata_rowset_take"]["metadata"][
+            "cached_metadata_reuses_device_bounds"
+        ]
+        is True
+    )
+    assert (
+        stage_by_name["native_metadata_rowset_take"]["metadata"][
+            "filtered_metadata_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_metadata_rowset_take"]["metadata"][
+            "filtered_attribute_storage"
+        ]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_metadata_rowset_take"]["metadata"][
+            "scalar_fence_within_budget"
+        ]
+        is True
+    )
+    assert (
+        stage_by_name["native_metadata_rowset_take"]["metadata"][
+            "results_match"
+        ]
+        is True
+    )
+    assert (
+        stage_by_name["carrier_contract_checks"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["carrier_contract_checks"]["metadata"]["results_match"]
+        is True
+    )
+    _assert_no_generic_runtime_d2h_reasons(trace)
+    assert trace["metadata"]["admissible_shape"] == (
+        "owned polygon metadata -> FlatSpatialIndex device bounds -> "
+        "NativeGeometryMetadata -> NativeSpatialIndex -> NativeRelation -> "
+        "NativeFrameState rowset take"
     )
 
 

@@ -581,9 +581,9 @@ class TestPolyLineDecode:
         original_totals = runtime_module.count_scatter_totals
         original_with_transfer = runtime_module.count_scatter_total_with_transfer
 
-        def _record_totals(runtime, count_offset_pairs):
+        def _record_totals(runtime, count_offset_pairs, *, reason=None):
             calls["totals"].append(len(count_offset_pairs))
-            return original_totals(runtime, count_offset_pairs)
+            return original_totals(runtime, count_offset_pairs, reason=reason)
 
         def _record_with_transfer(*args, **kwargs):
             calls["with_transfer"].append(kwargs.get("precomputed_total"))

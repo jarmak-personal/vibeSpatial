@@ -266,3 +266,38 @@ def set_precision_owned(
         selected=ExecutionMode.CPU,
     )
     return result
+
+
+def set_precision_native_tabular_result(
+    owned: OwnedGeometryArray,
+    grid_size: float,
+    mode: str = "valid_output",
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = set_precision_owned(
+        owned,
+        grid_size,
+        mode=mode,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="set_precision",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )

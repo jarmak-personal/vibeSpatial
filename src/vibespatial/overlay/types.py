@@ -18,6 +18,12 @@ from vibespatial.cuda._runtime import DeviceArray, get_cuda_runtime
 from vibespatial.runtime import RuntimeSelection
 
 
+def _runtime_host_array(runtime, value, dtype, *, reason: str):
+    if value is None:
+        return None
+    return np.asarray(runtime.copy_device_to_host(value, reason=reason), dtype=dtype)
+
+
 @dataclass(frozen=True)
 class SplitEventDeviceState:
     source_segment_ids: DeviceArray
@@ -64,41 +70,65 @@ class SplitEventTable:
         if ds is None:
             return
         runtime = get_cuda_runtime()
-        self._source_segment_ids = np.asarray(
-            runtime.copy_device_to_host(ds.source_segment_ids), dtype=np.int32,
+        self._source_segment_ids = _runtime_host_array(
+            runtime,
+            ds.source_segment_ids,
+            np.int32,
+            reason="overlay split-event source-segment host export",
         )
-        self._t = np.asarray(
-            runtime.copy_device_to_host(ds.t), dtype=np.float64,
+        self._t = _runtime_host_array(
+            runtime,
+            ds.t,
+            np.float64,
+            reason="overlay split-event parameter host export",
         )
-        self._x = np.asarray(
-            runtime.copy_device_to_host(ds.x), dtype=np.float64,
+        self._x = _runtime_host_array(
+            runtime,
+            ds.x,
+            np.float64,
+            reason="overlay split-event x-coordinate host export",
         )
-        self._y = np.asarray(
-            runtime.copy_device_to_host(ds.y), dtype=np.float64,
+        self._y = _runtime_host_array(
+            runtime,
+            ds.y,
+            np.float64,
+            reason="overlay split-event y-coordinate host export",
         )
         if ds.source_side is not None:
-            self._source_side = np.asarray(
-                runtime.copy_device_to_host(ds.source_side), dtype=np.int8,
+            self._source_side = _runtime_host_array(
+                runtime,
+                ds.source_side,
+                np.int8,
+                reason="overlay split-event source-side host export",
             )
         else:
             # Derive from source_segment_ids + left_segment_count
             ids = self._source_segment_ids
             self._source_side = np.where(ids < self.left_segment_count, 1, 2).astype(np.int8)
         if ds.row_indices is not None:
-            self._row_indices = np.asarray(
-                runtime.copy_device_to_host(ds.row_indices), dtype=np.int32,
+            self._row_indices = _runtime_host_array(
+                runtime,
+                ds.row_indices,
+                np.int32,
+                reason="overlay split-event row-index host export",
             )
         else:
             self._row_indices = np.empty(0, dtype=np.int32)
         if ds.part_indices is not None:
-            self._part_indices = np.asarray(
-                runtime.copy_device_to_host(ds.part_indices), dtype=np.int32,
+            self._part_indices = _runtime_host_array(
+                runtime,
+                ds.part_indices,
+                np.int32,
+                reason="overlay split-event part-index host export",
             )
         else:
             self._part_indices = np.empty(0, dtype=np.int32)
         if ds.ring_indices is not None:
-            self._ring_indices = np.asarray(
-                runtime.copy_device_to_host(ds.ring_indices), dtype=np.int32,
+            self._ring_indices = _runtime_host_array(
+                runtime,
+                ds.ring_indices,
+                np.int32,
+                reason="overlay split-event ring-index host export",
             )
         else:
             self._ring_indices = np.empty(0, dtype=np.int32)
@@ -205,16 +235,42 @@ class AtomicEdgeTable:
         if ds is None:
             return
         runtime = get_cuda_runtime()
-        self._source_segment_ids = np.asarray(
-            runtime.copy_device_to_host(ds.source_segment_ids), dtype=np.int32,
+        self._source_segment_ids = _runtime_host_array(
+            runtime,
+            ds.source_segment_ids,
+            np.int32,
+            reason="overlay atomic-edge source-segment host export",
         )
-        self._direction = np.asarray(
-            runtime.copy_device_to_host(ds.direction), dtype=np.int8,
+        self._direction = _runtime_host_array(
+            runtime,
+            ds.direction,
+            np.int8,
+            reason="overlay atomic-edge direction host export",
         )
-        self._src_x = np.asarray(runtime.copy_device_to_host(ds.src_x), dtype=np.float64)
-        self._src_y = np.asarray(runtime.copy_device_to_host(ds.src_y), dtype=np.float64)
-        self._dst_x = np.asarray(runtime.copy_device_to_host(ds.dst_x), dtype=np.float64)
-        self._dst_y = np.asarray(runtime.copy_device_to_host(ds.dst_y), dtype=np.float64)
+        self._src_x = _runtime_host_array(
+            runtime,
+            ds.src_x,
+            np.float64,
+            reason="overlay atomic-edge source-x host export",
+        )
+        self._src_y = _runtime_host_array(
+            runtime,
+            ds.src_y,
+            np.float64,
+            reason="overlay atomic-edge source-y host export",
+        )
+        self._dst_x = _runtime_host_array(
+            runtime,
+            ds.dst_x,
+            np.float64,
+            reason="overlay atomic-edge target-x host export",
+        )
+        self._dst_y = _runtime_host_array(
+            runtime,
+            ds.dst_y,
+            np.float64,
+            reason="overlay atomic-edge target-y host export",
+        )
 
     @property
     def source_segment_ids(self) -> np.ndarray:
@@ -229,8 +285,11 @@ class AtomicEdgeTable:
             ds = self.device_state
             if ds is not None and ds.source_side is not None:
                 runtime = get_cuda_runtime()
-                self._source_side = np.asarray(
-                    runtime.copy_device_to_host(ds.source_side), dtype=np.int8,
+                self._source_side = _runtime_host_array(
+                    runtime,
+                    ds.source_side,
+                    np.int8,
+                    reason="overlay atomic-edge source-side host export",
                 )
             else:
                 # Derive from source_segment_ids + left_segment_count
@@ -244,8 +303,11 @@ class AtomicEdgeTable:
             ds = self.device_state
             if ds is not None and ds.row_indices is not None:
                 runtime = get_cuda_runtime()
-                self._row_indices = np.asarray(
-                    runtime.copy_device_to_host(ds.row_indices), dtype=np.int32,
+                self._row_indices = _runtime_host_array(
+                    runtime,
+                    ds.row_indices,
+                    np.int32,
+                    reason="overlay atomic-edge row-index host export",
                 )
             else:
                 return np.empty(0, dtype=np.int32)
@@ -257,8 +319,11 @@ class AtomicEdgeTable:
             ds = self.device_state
             if ds is not None and ds.part_indices is not None:
                 runtime = get_cuda_runtime()
-                self._part_indices = np.asarray(
-                    runtime.copy_device_to_host(ds.part_indices), dtype=np.int32,
+                self._part_indices = _runtime_host_array(
+                    runtime,
+                    ds.part_indices,
+                    np.int32,
+                    reason="overlay atomic-edge part-index host export",
                 )
             else:
                 return np.empty(0, dtype=np.int32)
@@ -270,8 +335,11 @@ class AtomicEdgeTable:
             ds = self.device_state
             if ds is not None and ds.ring_indices is not None:
                 runtime = get_cuda_runtime()
-                self._ring_indices = np.asarray(
-                    runtime.copy_device_to_host(ds.ring_indices), dtype=np.int32,
+                self._ring_indices = _runtime_host_array(
+                    runtime,
+                    ds.ring_indices,
+                    np.int32,
+                    reason="overlay atomic-edge ring-index host export",
                 )
             else:
                 return np.empty(0, dtype=np.int32)
@@ -378,23 +446,78 @@ class HalfEdgeGraph:
         if ds is None:
             return
         runtime = get_cuda_runtime()
-        def _to_host(arr):
-            return np.asarray(runtime.copy_device_to_host(arr), dtype=np.float64) if arr is not None else None
-
-        def _to_host_i32(arr):
-            return np.asarray(runtime.copy_device_to_host(arr), dtype=np.int32) if arr is not None else None
-        self._src_x = _to_host(ds.src_x)
-        self._src_y = _to_host(ds.src_y)
-        self._dst_x = _to_host(getattr(ds, 'dst_x', None))
-        self._dst_y = _to_host(getattr(ds, 'dst_y', None))
-        self._node_x = _to_host(ds.node_x)
-        self._node_y = _to_host(ds.node_y)
-        self._src_node_ids = _to_host_i32(ds.src_node_ids)
-        self._dst_node_ids = _to_host_i32(ds.dst_node_ids)
-        self._angle = _to_host(ds.angle)
-        self._sorted_edge_ids = _to_host_i32(ds.sorted_edge_ids)
-        self._edge_positions = _to_host_i32(ds.edge_positions)
-        self._next_edge_ids = _to_host_i32(ds.next_edge_ids)
+        self._src_x = _runtime_host_array(
+            runtime,
+            ds.src_x,
+            np.float64,
+            reason="overlay half-edge source-x host export",
+        )
+        self._src_y = _runtime_host_array(
+            runtime,
+            ds.src_y,
+            np.float64,
+            reason="overlay half-edge source-y host export",
+        )
+        self._dst_x = _runtime_host_array(
+            runtime,
+            getattr(ds, "dst_x", None),
+            np.float64,
+            reason="overlay half-edge target-x host export",
+        )
+        self._dst_y = _runtime_host_array(
+            runtime,
+            getattr(ds, "dst_y", None),
+            np.float64,
+            reason="overlay half-edge target-y host export",
+        )
+        self._node_x = _runtime_host_array(
+            runtime,
+            ds.node_x,
+            np.float64,
+            reason="overlay half-edge node-x host export",
+        )
+        self._node_y = _runtime_host_array(
+            runtime,
+            ds.node_y,
+            np.float64,
+            reason="overlay half-edge node-y host export",
+        )
+        self._src_node_ids = _runtime_host_array(
+            runtime,
+            ds.src_node_ids,
+            np.int32,
+            reason="overlay half-edge source-node host export",
+        )
+        self._dst_node_ids = _runtime_host_array(
+            runtime,
+            ds.dst_node_ids,
+            np.int32,
+            reason="overlay half-edge target-node host export",
+        )
+        self._angle = _runtime_host_array(
+            runtime,
+            ds.angle,
+            np.float64,
+            reason="overlay half-edge angle host export",
+        )
+        self._sorted_edge_ids = _runtime_host_array(
+            runtime,
+            ds.sorted_edge_ids,
+            np.int32,
+            reason="overlay half-edge sorted-edge host export",
+        )
+        self._edge_positions = _runtime_host_array(
+            runtime,
+            ds.edge_positions,
+            np.int32,
+            reason="overlay half-edge edge-position host export",
+        )
+        self._next_edge_ids = _runtime_host_array(
+            runtime,
+            ds.next_edge_ids,
+            np.int32,
+            reason="overlay half-edge next-edge host export",
+        )
 
     def _ensure_host_metadata(self) -> None:
         """Lazily copy per-edge metadata arrays from device to host on first access."""
@@ -404,16 +527,42 @@ class HalfEdgeGraph:
         if ds is None:
             return
         runtime = get_cuda_runtime()
-        def _to_host_i32(arr):
-            return np.asarray(runtime.copy_device_to_host(arr), dtype=np.int32) if arr is not None else None
-        def _to_host_i8(arr):
-            return np.asarray(runtime.copy_device_to_host(arr), dtype=np.int8) if arr is not None else None
-        self._source_segment_ids = _to_host_i32(ds.source_segment_ids)
-        self._source_side = _to_host_i8(ds.source_side)
-        self._row_indices = _to_host_i32(ds.row_indices)
-        self._part_indices = _to_host_i32(ds.part_indices)
-        self._ring_indices = _to_host_i32(ds.ring_indices)
-        self._direction = _to_host_i8(ds.direction)
+        self._source_segment_ids = _runtime_host_array(
+            runtime,
+            ds.source_segment_ids,
+            np.int32,
+            reason="overlay half-edge source-segment host export",
+        )
+        self._source_side = _runtime_host_array(
+            runtime,
+            ds.source_side,
+            np.int8,
+            reason="overlay half-edge source-side host export",
+        )
+        self._row_indices = _runtime_host_array(
+            runtime,
+            ds.row_indices,
+            np.int32,
+            reason="overlay half-edge row-index host export",
+        )
+        self._part_indices = _runtime_host_array(
+            runtime,
+            ds.part_indices,
+            np.int32,
+            reason="overlay half-edge part-index host export",
+        )
+        self._ring_indices = _runtime_host_array(
+            runtime,
+            ds.ring_indices,
+            np.int32,
+            reason="overlay half-edge ring-index host export",
+        )
+        self._direction = _runtime_host_array(
+            runtime,
+            ds.direction,
+            np.int8,
+            reason="overlay half-edge direction host export",
+        )
 
     @property
     def source_segment_ids(self) -> np.ndarray:
@@ -569,16 +718,54 @@ class OverlayFaceTable:
         if ds is None:
             return
         runtime = get_cuda_runtime()
-        def _h(arr, dt):
-            return np.asarray(runtime.copy_device_to_host(arr), dtype=dt) if arr is not None else None
-        self._face_offsets = _h(ds.face_offsets, np.int32)
-        self._face_edge_ids = _h(ds.face_edge_ids, np.int32)
-        self._bounded_mask = _h(ds.bounded_mask, np.int8)
-        self._signed_area = _h(ds.signed_area, np.float64)
-        self._centroid_x = _h(ds.centroid_x, np.float64)
-        self._centroid_y = _h(ds.centroid_y, np.float64)
-        self._left_covered = _h(ds.left_covered, np.int8)
-        self._right_covered = _h(ds.right_covered, np.int8)
+        self._face_offsets = _runtime_host_array(
+            runtime,
+            ds.face_offsets,
+            np.int32,
+            reason="overlay face-table face-offset host export",
+        )
+        self._face_edge_ids = _runtime_host_array(
+            runtime,
+            ds.face_edge_ids,
+            np.int32,
+            reason="overlay face-table face-edge host export",
+        )
+        self._bounded_mask = _runtime_host_array(
+            runtime,
+            ds.bounded_mask,
+            np.int8,
+            reason="overlay face-table bounded-mask host export",
+        )
+        self._signed_area = _runtime_host_array(
+            runtime,
+            ds.signed_area,
+            np.float64,
+            reason="overlay face-table signed-area host export",
+        )
+        self._centroid_x = _runtime_host_array(
+            runtime,
+            ds.centroid_x,
+            np.float64,
+            reason="overlay face-table centroid-x host export",
+        )
+        self._centroid_y = _runtime_host_array(
+            runtime,
+            ds.centroid_y,
+            np.float64,
+            reason="overlay face-table centroid-y host export",
+        )
+        self._left_covered = _runtime_host_array(
+            runtime,
+            ds.left_covered,
+            np.int8,
+            reason="overlay face-table left-coverage host export",
+        )
+        self._right_covered = _runtime_host_array(
+            runtime,
+            ds.right_covered,
+            np.int8,
+            reason="overlay face-table right-coverage host export",
+        )
 
     @property
     def face_offsets(self) -> np.ndarray:
@@ -616,7 +803,12 @@ class OverlayFaceTable:
             self._ensure_host()
         if self._left_covered is None and self.device_state is not None and self.device_state.left_covered is not None:
             runtime = get_cuda_runtime()
-            self._left_covered = np.asarray(runtime.copy_device_to_host(self.device_state.left_covered), dtype=np.int8)
+            self._left_covered = _runtime_host_array(
+                runtime,
+                self.device_state.left_covered,
+                np.int8,
+                reason="overlay face-table left-coverage host export",
+            )
         return self._left_covered  # type: ignore[return-value]
 
     @property
@@ -625,7 +817,12 @@ class OverlayFaceTable:
             self._ensure_host()
         if self._right_covered is None and self.device_state is not None and self.device_state.right_covered is not None:
             runtime = get_cuda_runtime()
-            self._right_covered = np.asarray(runtime.copy_device_to_host(self.device_state.right_covered), dtype=np.int8)
+            self._right_covered = _runtime_host_array(
+                runtime,
+                self.device_state.right_covered,
+                np.int8,
+                reason="overlay face-table right-coverage host export",
+            )
         return self._right_covered  # type: ignore[return-value]
 
     @property

@@ -66,6 +66,24 @@ def _owned_requires_host_transfer(owned: OwnedGeometryArray | None) -> bool:
     return any(not buffer.host_materialized for buffer in owned.families.values())
 
 
+def _single_family_geom_type_if_no_nulls(owned: OwnedGeometryArray) -> str | None:
+    families = getattr(owned, "families", {})
+    if len(families) != 1:
+        return None
+    family, host_buffer = next(iter(families.items()))
+    row_count = getattr(host_buffer, "row_count", None)
+    device_state = getattr(owned, "device_state", None)
+    if device_state is not None:
+        device_buffer = device_state.families.get(family)
+        if device_buffer is not None:
+            offsets = getattr(device_buffer, "geometry_offsets", None)
+            if offsets is not None:
+                row_count = int(offsets.size) - 1
+    if int(row_count or 0) != int(owned.row_count):
+        return None
+    return _TAG_TO_GEOM_TYPE_NAME.get(FAMILY_TAGS[family])
+
+
 def _record_shapely_fallback_event(
     *,
     surface: str,
@@ -260,9 +278,13 @@ class DeviceGeometryArray(ExtensionArray):
         Uses vectorized numpy indexing instead of per-element Python loop
         (VPAT001 compliance).
         """
+        single_type = _single_family_geom_type_if_no_nulls(self._owned)
+        if single_type is not None:
+            return np.full(len(self), single_type, dtype=object)
         if self._owned._tags is None and self._owned.device_state is not None:
             self._owned._tags = get_cuda_runtime().copy_device_to_host(
-                self._owned.device_state.tags
+                self._owned.device_state.tags,
+                reason="device geometry array geom-type tag host export",
             )
         tags = self._owned.tags
         result = np.empty(len(tags), dtype=object)
@@ -1740,6 +1762,14 @@ class DeviceGeometryArray(ExtensionArray):
                 idx += len(self)
             return self._materialize_row(idx)
 
+        if (
+            isinstance(idx, slice)
+            and idx.start is None
+            and idx.stop is None
+            and idx.step is None
+        ):
+            return self.view()
+
         # Slice or array-like
         idx = pd.api.indexers.check_array_indexer(self, idx)
         if isinstance(idx, slice):
@@ -1845,6 +1875,13 @@ class DeviceGeometryArray(ExtensionArray):
     ) -> DeviceGeometryArray:
         indices = np.asarray(indices, dtype=np.int64)
 
+        if (
+            not allow_fill
+            and int(indices.size) == len(self)
+            and bool(np.array_equal(indices, np.arange(len(self), dtype=np.int64)))
+        ):
+            return self.view()
+
         if allow_fill:
             # pandas convention: negative indices in allow_fill mode mean "fill"
             mask = indices < 0
@@ -1911,10 +1948,23 @@ class DeviceGeometryArray(ExtensionArray):
         for arr in to_concat:
             owned = getattr(arr, "_owned", None)
             if owned is None:
-                owned = from_shapely_geometries(
-                    np.asarray(arr, dtype=object).tolist(),
-                    residency=target_residency,
-                )
+                try:
+                    owned = from_shapely_geometries(
+                        np.asarray(arr, dtype=object).tolist(),
+                        residency=target_residency,
+                    )
+                except NotImplementedError:
+                    from vibespatial.api.geometry_array import GeometryArray
+
+                    data = np.concatenate(
+                        [np.asarray(ga, dtype=object) for ga in to_concat]
+                    )
+                    crs = None
+                    for ga in to_concat:
+                        if getattr(ga, "_crs", None) is not None:
+                            crs = ga._crs
+                            break
+                    return GeometryArray(data, crs=crs)
             elif owned.residency is not target_residency:
                 owned = owned.move_to(
                     target_residency,
@@ -1991,6 +2041,23 @@ class DeviceGeometryArray(ExtensionArray):
         )
 
     def __array__(self, dtype: Any = None, copy: Any = None) -> np.ndarray:
+        from vibespatial.runtime.materialization import (
+            NativeExportBoundary,
+            record_native_export_boundary,
+        )
+
+        record_native_export_boundary(NativeExportBoundary(
+            surface="vibespatial.geometry.DeviceGeometryArray.__array__",
+            operation="device_geometryarray_to_numpy",
+            target="numpy",
+            reason="device geometry array exported through NumPy array protocol",
+            detail=(
+                "residency="
+                f"{getattr(getattr(self._owned, 'residency', None), 'value', 'unknown')}"
+            ),
+            row_count=self._owned.row_count,
+            d2h_transfer=self._owned.device_state is not None,
+        ))
         cache = self._ensure_shapely_cache()
         if dtype is not None:
             return cache.astype(dtype)
@@ -2221,23 +2288,49 @@ def _host_view_family_buffer(owned: OwnedGeometryArray, family: GeometryFamily) 
     runtime = get_cuda_runtime()
     state = owned._ensure_device_state().families[family]
     return {
-        "x": runtime.copy_device_to_host(state.x),
-        "y": runtime.copy_device_to_host(state.y),
+        "x": runtime.copy_device_to_host(
+            state.x,
+            reason=f"device geometry array {family.value} x-coordinate host export",
+        ),
+        "y": runtime.copy_device_to_host(
+            state.y,
+            reason=f"device geometry array {family.value} y-coordinate host export",
+        ),
         "geometry_offsets": (
-            buf.geometry_offsets if buf.geometry_offsets.size else runtime.copy_device_to_host(state.geometry_offsets)
+            buf.geometry_offsets
+            if buf.geometry_offsets.size
+            else runtime.copy_device_to_host(
+                state.geometry_offsets,
+                reason=f"device geometry array {family.value} geometry-offset host export",
+            )
         ),
         "empty_mask": (
-            buf.empty_mask if buf.empty_mask.size else runtime.copy_device_to_host(state.empty_mask)
+            buf.empty_mask
+            if buf.empty_mask.size
+            else runtime.copy_device_to_host(
+                state.empty_mask,
+                reason=f"device geometry array {family.value} empty-mask host export",
+            )
         ),
         "part_offsets": (
             buf.part_offsets
             if buf.part_offsets is not None
-            else None if state.part_offsets is None else runtime.copy_device_to_host(state.part_offsets)
+            else None
+            if state.part_offsets is None
+            else runtime.copy_device_to_host(
+                state.part_offsets,
+                reason=f"device geometry array {family.value} part-offset host export",
+            )
         ),
         "ring_offsets": (
             buf.ring_offsets
             if buf.ring_offsets is not None
-            else None if state.ring_offsets is None else runtime.copy_device_to_host(state.ring_offsets)
+            else None
+            if state.ring_offsets is None
+            else runtime.copy_device_to_host(
+                state.ring_offsets,
+                reason=f"device geometry array {family.value} ring-offset host export",
+            )
         ),
     }
 
@@ -2488,7 +2581,10 @@ def _compute_total_bounds_from_owned_device(owned: OwnedGeometryArray) -> np.nda
     max_xy = cp.amax(cp.stack(maxs), axis=0)
     # Single D->H transfer for all 4 bounds (avoid 4 separate .item() syncs)
     bounds_device = cp.concatenate([min_xy, max_xy]).astype(cp.float64)
-    return cp.asnumpy(bounds_device)
+    return get_cuda_runtime().copy_device_to_host(
+        bounds_device,
+        reason="DeviceGeometryArray total-bounds device summary host boundary",
+    )
 
 
 def _compute_total_bounds_from_owned_host(owned: OwnedGeometryArray) -> np.ndarray:
@@ -2667,7 +2763,10 @@ def _dwithin_scalar(
         detail=f"rows={n}, candidates={cand_count}",
         selected=ExecutionMode.GPU,
     )
-    return cp.asnumpy(d_result)
+    return get_cuda_runtime().copy_device_to_host(
+        d_result,
+        reason="DeviceGeometryArray dwithin scalar result host boundary",
+    )
 
 
 def _ensure_device_row_bounds(owned: OwnedGeometryArray):

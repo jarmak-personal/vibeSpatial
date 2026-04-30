@@ -133,7 +133,12 @@ def _segmentize_family_gpu(runtime, device_buf, family, max_segment_length):
     d_offsets = exclusive_sum(d_counts, synchronize=False)
 
     # 4. Read total output size (single async pinned transfer)
-    total_out = count_scatter_total(runtime, d_counts, d_offsets)
+    total_out = count_scatter_total(
+        runtime,
+        d_counts,
+        d_offsets,
+        reason="segmentize output-coordinate allocation fence",
+    )
 
     if total_out == 0:
         # Degenerate: all spans empty.  Return a zero-coordinate buffer.
@@ -394,4 +399,35 @@ def segmentize_owned(
         family_row_offsets=owned.family_row_offsets.copy(),
         families=new_families,
         residency=Residency.HOST,
+    )
+
+
+def segmentize_native_tabular_result(
+    owned: OwnedGeometryArray,
+    max_segment_length: float,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = segmentize_owned(
+        owned,
+        max_segment_length,
+        dispatch_mode=dispatch_mode,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="segmentize",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
     )

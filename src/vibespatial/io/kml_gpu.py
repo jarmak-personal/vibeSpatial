@@ -95,6 +95,10 @@ except ModuleNotFoundError:  # pragma: no cover
 KERNEL_PARAM_I64 = ctypes.c_longlong
 
 
+def _kml_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
+    return get_cuda_runtime().copy_device_to_host(device_array, reason=reason)
+
+
 # ---------------------------------------------------------------------------
 # Geometry family constants (match GeometryFamily enum order)
 # ---------------------------------------------------------------------------
@@ -1429,7 +1433,10 @@ def _assemble_kml_mixed(
     if d_valid_tags.size == 0:
         return _build_empty_owned()
     unique_tags = cp.unique(d_valid_tags)
-    h_unique_tags = unique_tags.get()
+    h_unique_tags = _kml_device_to_host(
+        unique_tags,
+        reason="kml mixed family tag loop export",
+    )
 
     for tag_val in h_unique_tags:
         tag_int = int(tag_val)
@@ -1693,12 +1700,23 @@ def _extract_kml_attributes(
     if n_placemarks == 0:
         return None
 
+    runtime = get_cuda_runtime()
+
     # Single bulk D->H transfer of the full byte array.
-    h_bytes: bytes = cp.asnumpy(d_bytes).tobytes()
+    h_bytes: bytes = runtime.copy_device_to_host(
+        d_bytes,
+        reason="kml attribute byte payload host export",
+    ).tobytes()
 
     # Transfer Placemark boundaries to host (two small int64 arrays).
-    h_starts = cp.asnumpy(d_placemark_starts)
-    h_ends = cp.asnumpy(d_placemark_ends)
+    h_starts = runtime.copy_device_to_host(
+        d_placemark_starts,
+        reason="kml placemark-starts host export",
+    )
+    h_ends = runtime.copy_device_to_host(
+        d_placemark_ends,
+        reason="kml placemark-ends host export",
+    )
 
     # Tag pairs to search for: plain and namespace-prefixed
     tag_specs: list[tuple[str, list[tuple[bytes, bytes]]]] = [
@@ -1837,7 +1855,10 @@ def read_kml_gpu(d_bytes: cp.ndarray) -> KmlGpuResult:
 
     d_unique_tags = cp.unique(d_valid_tags)
     n_unique = d_unique_tags.shape[0]
-    h_unique_tags = d_unique_tags.get()
+    h_unique_tags = _kml_device_to_host(
+        d_unique_tags,
+        reason="kml family dispatch tag export",
+    )
 
     if n_unique == 1:
         # Homogeneous file

@@ -91,6 +91,10 @@ except ModuleNotFoundError:  # pragma: no cover
 KERNEL_PARAM_I64 = ctypes.c_longlong
 
 
+def _wkt_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
+    return get_cuda_runtime().copy_device_to_host(device_array, reason=reason)
+
+
 # ---------------------------------------------------------------------------
 # Kernel sources (Tier 1 NVRTC) -- integer-only byte classification,
 # no floating-point computation, so no PrecisionPlan needed.
@@ -974,7 +978,16 @@ def _assemble_wkt_homogeneous(
         # ring_base[i] = exclusive prefix sum of ring_counts -- gives the
         # index into the flat ring array where geometry i's rings start.
         d_ring_base_full = _device_compact_offsets(d_ring_counts)
-        total_rings = int(d_ring_base_full[-1].get()) if n_geoms > 0 else 0
+        total_rings = (
+            int(
+                _wkt_device_to_host(
+                    d_ring_base_full[-1:],
+                    reason="wkt polygon ring count scalar export",
+                )[0]
+            )
+            if n_geoms > 0
+            else 0
+        )
         # Pass the n-element prefix (without the terminal) as ring_base
         d_ring_base = d_ring_base_full[:-1]
         d_ring_coord_counts = _assign_ring_coords(
@@ -1006,7 +1019,16 @@ def _assemble_wkt_homogeneous(
         if family == GeometryFamily.MULTIPOLYGON:
             # Need ring offsets too
             d_ring_base_full = _device_compact_offsets(d_ring_counts)
-            total_rings = int(d_ring_base_full[-1].get()) if n_geoms > 0 else 0
+            total_rings = (
+                int(
+                    _wkt_device_to_host(
+                        d_ring_base_full[-1:],
+                        reason="wkt multipolygon ring count scalar export",
+                    )[0]
+                )
+                if n_geoms > 0
+                else 0
+            )
             d_ring_base = d_ring_base_full[:-1]
             d_ring_coord_counts = _assign_ring_coords(
                 d_is_num_start, d_depth, d_paren_starts, d_span_ends,
@@ -1089,7 +1111,10 @@ def _assemble_wkt_mixed(
     # Only process families that are present
     unique_tags = cp.unique(d_family_tags[d_family_tags >= 0])
     # Sync needed to read unique_tags on host for the loop
-    h_unique_tags = unique_tags.get()
+    h_unique_tags = _wkt_device_to_host(
+        unique_tags,
+        reason="wkt mixed family tag loop export",
+    )
 
     # Pre-compute 2D coordinate array for gather operations
     coords_2d = (
@@ -1318,7 +1343,10 @@ def read_wkt_gpu(d_bytes: cp.ndarray) -> OwnedGeometryArray:
     d_unique_tags = cp.unique(d_valid_tags)
     n_unique = d_unique_tags.shape[0]
     # Need to read n_unique to decide homogeneous vs mixed.  Single sync.
-    h_unique_tags = d_unique_tags.get()
+    h_unique_tags = _wkt_device_to_host(
+        d_unique_tags,
+        reason="wkt family dispatch tag export",
+    )
 
     if n_unique == 1:
         # Homogeneous file

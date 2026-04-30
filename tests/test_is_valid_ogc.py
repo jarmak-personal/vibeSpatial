@@ -11,6 +11,9 @@ Each test is parametrized across CPU and GPU dispatch modes.
 """
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
 import shapely
@@ -22,6 +25,31 @@ from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
 from vibespatial.runtime.residency import Residency
+
+
+def test_constructive_validity_metric_d2h_exports_are_runtime_accounted() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    paths = (
+        repo_root / "src" / "vibespatial" / "constructive" / "validity.py",
+        repo_root / "src" / "vibespatial" / "constructive" / "minimum_clearance.py",
+        repo_root / "src" / "vibespatial" / "constructive" / "minimum_bounding_circle.py",
+    )
+    offenders: list[str] = []
+    for path in paths:
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr == "asnumpy":
+                offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+            if func.attr == "copy_device_to_host" and not any(
+                keyword.arg == "reason" for keyword in node.keywords
+            ):
+                offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+    assert offenders == []
 
 
 def _build_owned(*geoms) -> tuple:

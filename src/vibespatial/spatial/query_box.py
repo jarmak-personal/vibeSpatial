@@ -36,6 +36,15 @@ from .query_types import _DeviceCandidates  # noqa: E402
 from .query_utils import _gpu_bounds_dispatch_mode  # noqa: E402
 
 
+def _device_scalar_bool(value, *, reason: str) -> bool:
+    runtime = get_cuda_runtime()
+    host = runtime.copy_device_to_host(
+        cp.asarray(value, dtype=cp.bool_).reshape(1),
+        reason=reason,
+    )
+    return bool(np.asarray(host).reshape(-1)[0])
+
+
 def _query_regular_grid_point_index(
     flat_index,
     query_owned: OwnedGeometryArray,
@@ -114,7 +123,16 @@ def _query_regular_grid_point_index(
         runtime.launch(kernel, grid=grid, block=block, params=params)
         device_counts_i32 = device_counts.astype(np.int32)
         device_offsets = exclusive_sum(device_counts_i32)
-        total_pairs = count_scatter_total(runtime, device_counts_i32, device_offsets) if query_owned.row_count else 0
+        total_pairs = (
+            count_scatter_total(
+                runtime,
+                device_counts_i32,
+                device_offsets,
+                reason="spatial query regular-grid point-pair allocation fence",
+            )
+            if query_owned.row_count
+            else 0
+        )
         if total_pairs == 0:
             return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
 
@@ -236,7 +254,16 @@ def _query_regular_grid_rect_box_index(
         )
 
         device_offsets = exclusive_sum(device_counts)
-        total_pairs = count_scatter_total(runtime, device_counts, device_offsets) if query_count > 0 else 0
+        total_pairs = (
+            count_scatter_total(
+                runtime,
+                device_counts,
+                device_offsets,
+                reason="spatial query regular-grid box-pair allocation fence",
+            )
+            if query_count > 0
+            else 0
+        )
         if total_pairs == 0:
             empty = np.empty(0, dtype=np.int32)
             return empty, empty
@@ -447,13 +474,19 @@ def _extract_owned_polygon_box_bounds(query_owned: OwnedGeometryArray) -> np.nda
 
         d_geom_starts = cp.asarray(polygon_state.geometry_offsets[:-1]).astype(cp.int32, copy=False)
         d_geom_ends = cp.asarray(polygon_state.geometry_offsets[1:]).astype(cp.int32, copy=False)
-        if not bool(cp.all((d_geom_ends - d_geom_starts) == 1)):
+        if not _device_scalar_bool(
+            cp.all((d_geom_ends - d_geom_starts) == 1),
+            reason="spatial query polygon-box single-ring scalar fence",
+        ):
             return None
 
         d_ring_offsets = cp.asarray(polygon_state.ring_offsets).astype(cp.int32, copy=False)
         d_coord_starts = d_ring_offsets[d_geom_starts]
         d_coord_ends = d_ring_offsets[d_geom_ends]
-        if not bool(cp.all((d_coord_ends - d_coord_starts) == 5)):
+        if not _device_scalar_bool(
+            cp.all((d_coord_ends - d_coord_starts) == 5),
+            reason="spatial query polygon-box coordinate-count scalar fence",
+        ):
             return None
 
         compute_geometry_bounds_device(query_owned)
@@ -480,13 +513,14 @@ def _extract_owned_polygon_box_bounds(query_owned: OwnedGeometryArray) -> np.nda
         y_at_min_or_max = (cp.abs(d_y - d_miny) <= d_tol_2d) | (cp.abs(d_y - d_maxy) <= d_tol_2d)
         edge_same_x = cp.abs(d_x[:, 1:] - d_x[:, :-1]) <= d_tol_2d
         edge_same_y = cp.abs(d_y[:, 1:] - d_y[:, :-1]) <= d_tol_2d
-        if not bool(
+        if not _device_scalar_bool(
             cp.all(
                 closed
                 & cp.all(x_at_min_or_max, axis=1)
                 & cp.all(y_at_min_or_max, axis=1)
                 & cp.all(cp.logical_xor(edge_same_x, edge_same_y), axis=1)
-            )
+            ),
+            reason="spatial query polygon-box axis-aligned scalar fence",
         ):
             return None
 
@@ -496,7 +530,10 @@ def _extract_owned_polygon_box_bounds(query_owned: OwnedGeometryArray) -> np.nda
         d_empty_mask = cp.asarray(polygon_state.empty_mask).astype(cp.bool_, copy=False)
         d_valid = d_valid & ~d_empty_mask[d_polygon_rows]
         d_bounds = cp.where(d_valid[:, None], d_bounds, cp.nan)
-        return cp.asnumpy(d_bounds)
+        return get_cuda_runtime().copy_device_to_host(
+            d_bounds,
+            reason="spatial query polygon-box bounds host export",
+        )
 
     # Structural checks above use only offsets (available on host even for
     # device-resident OGAs).  Coordinate verification needs x/y buffers;
@@ -651,7 +688,10 @@ def _query_point_tree_box_index(
             )
             runtime.launch(kernel, grid=grid, block=block, params=params)
             matched = compact_indices(device_mask).values
-            matched_host = runtime.copy_device_to_host(matched).astype(np.int32, copy=False)
+            matched_host = runtime.copy_device_to_host(
+                matched,
+                reason="spatial query point-box matched-row host export",
+            ).astype(np.int32, copy=False)
             if matched_host.size == 0:
                 continue
             left_out.append(np.full(matched_host.size, query_index, dtype=np.int32))

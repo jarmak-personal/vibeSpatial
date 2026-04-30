@@ -16,6 +16,9 @@ All assertions operate on host-side values obtained via ``cp.asnumpy()``.
 """
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -33,6 +36,35 @@ needs_gpu = pytest.mark.skipif(not HAS_GPU, reason="GPU not available")
 #   FeatureCollection{1} > features[2] > Feature{3} > properties{4}
 # Property keys and their colons are at depth 4.
 PROPERTY_DEPTH = 4
+
+
+def test_gpu_properties_has_no_raw_cupy_scalar_syncs() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "src" / "vibespatial" / "io" / "gpu_parse" / "properties.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "item":
+            offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}: .item()")
+            continue
+        if (
+            isinstance(func, ast.Name)
+            and func.id in {"bool", "int", "float"}
+            and node.args
+            and isinstance(node.args[0], ast.Call)
+            and isinstance(node.args[0].func, ast.Attribute)
+            and isinstance(node.args[0].func.value, ast.Name)
+            and node.args[0].func.value.id == "cp"
+        ):
+            offenders.append(
+                f"{path.relative_to(repo_root)}:{node.lineno}: {func.id}(cp.*)"
+            )
+
+    assert offenders == []
 
 
 # ---------------------------------------------------------------------------
@@ -910,6 +942,39 @@ class TestExtractGpuProperties:
             property_depth=PROPERTY_DEPTH,
         )
         assert result == {}
+
+    @needs_gpu
+    def test_mixed_numeric_boolean_count_fences_are_runtime_observable(self):
+        """Type-count branch gates should be named runtime D2H fences."""
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+        from vibespatial.io.gpu_parse.properties import extract_gpu_properties
+
+        data = _build_feature_collection(
+            _minimal_feature('{"score":1.5,"flag":true}'),
+            _minimal_feature('{"score":null,"flag":false}'),
+            _minimal_feature('{"score":2.5,"flag":null}'),
+        )
+        d_bytes, d_qp, d_depth = _structural_arrays(data)
+        d_feat_starts, d_feat_ends = _feature_boundaries(d_bytes, d_depth)
+
+        reset_d2h_transfer_count()
+        result = extract_gpu_properties(
+            d_bytes, d_feat_starts, d_feat_ends, d_qp, d_depth,
+            property_depth=PROPERTY_DEPTH,
+        )
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert "geojson properties numeric-value count scalar fence" in reasons
+        assert "geojson properties boolean-value count scalar fence" in reasons
+        np.testing.assert_allclose(
+            cp.asnumpy(result["score"]),
+            np.asarray([1.5, np.nan, 2.5]),
+            equal_nan=True,
+        )
+        assert cp.asnumpy(result["flag"]).tolist() == [1, 0, 0]
 
 
 # ===========================================================================

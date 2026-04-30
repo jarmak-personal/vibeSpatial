@@ -16,8 +16,13 @@ from vibespatial import (
     point_buffer_owned,
 )
 from vibespatial.api import GeoSeries
+from vibespatial.api._native_result_core import NativeGeometryProvenance
 from vibespatial.api.testing import assert_geoseries_equal
-from vibespatial.constructive.linestring import linestring_buffer_owned_array
+from vibespatial.constructive.linestring import (
+    linestring_buffer_native_tabular_result,
+    linestring_buffer_owned_array,
+)
+from vibespatial.constructive.polygon import polygon_buffer_native_tabular_result
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
@@ -177,6 +182,41 @@ def test_linestring_buffer_owned_gpu_matches_shapely_after_normalize() -> None:
             tolerance=1e-12,
         )
     )
+
+
+def test_buffer_native_tabular_results_cover_row_aligned_stroke_families() -> None:
+    line_owned = from_shapely_geometries([LineString([(0, 0), (4, 0)])])
+    polygon_owned = from_shapely_geometries([Polygon([(0, 0), (4, 0), (4, 4), (0, 0)])])
+
+    line_result = linestring_buffer_native_tabular_result(
+        line_owned,
+        1.0,
+        quad_segs=1,
+        dispatch_mode=ExecutionMode.CPU,
+        source_rows=np.asarray([3], dtype=np.int32),
+        source_tokens=("line-source",),
+    )
+    polygon_result = polygon_buffer_native_tabular_result(
+        polygon_owned,
+        0.5,
+        quad_segs=1,
+        dispatch_mode=ExecutionMode.CPU,
+        source_rows=np.asarray([5], dtype=np.int32),
+        source_tokens=("polygon-source",),
+    )
+
+    for result, source_row, token in (
+        (line_result, 3, "line-source"),
+        (polygon_result, 5, "polygon-source"),
+    ):
+        assert result.geometry.row_count == 1
+        assert result.column_order == ("geometry",)
+        assert isinstance(result.provenance, NativeGeometryProvenance)
+        assert result.provenance.operation == "buffer"
+        assert result.provenance.source_tokens == (token,)
+        assert result.provenance.source_rows.tolist() == [source_row]
+        assert result.geometry_metadata is not None
+        assert result.geometry_metadata.row_count == 1
 
 
 def test_linestring_buffer_owned_gpu_two_point_grid_segments_match_shapely() -> None:

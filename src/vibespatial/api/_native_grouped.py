@@ -9,8 +9,8 @@ import pandas as pd
 
 from vibespatial.api._native_rowset import NativeIndexPlan
 from vibespatial.runtime.materialization import (
-    MaterializationBoundary,
-    record_materialization_event,
+    NativeExportBoundary,
+    record_native_export_boundary,
 )
 
 
@@ -237,6 +237,12 @@ def _as_host_series(values: Any) -> pd.Series:
     return values if isinstance(values, pd.Series) else pd.Series(values)
 
 
+def _device_to_host(values: Any, *, reason: str) -> np.ndarray:
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    return get_cuda_runtime().copy_device_to_host(values, reason=reason)
+
+
 @dataclass(frozen=True)
 class NativeGroupedReduction:
     """Private grouped reducer result with an explicit pandas export boundary."""
@@ -262,19 +268,24 @@ class NativeGroupedReduction:
             series.name = name
             return series
         if self.is_device:
-            detail = f"groups={self.group_count}, bytes={int(self.values.nbytes)}"
-            record_materialization_event(
+            record_native_export_boundary(NativeExportBoundary(
                 surface="vibespatial.api.NativeGroupedReduction.to_pandas",
-                boundary=MaterializationBoundary.USER_EXPORT,
                 operation="grouped_reduction_to_pandas",
+                target="pandas-series",
                 reason="native grouped reduction exported to pandas Series",
-                detail=detail,
+                row_count=self.group_count,
+                byte_count=int(self.values.nbytes),
+                detail=f"reducer={self.reducer}",
                 d2h_transfer=True,
                 strict_disallowed=False,
+            ))
+            values = _device_to_host(
+                self.values,
+                reason=(
+                    "vibespatial.api.NativeGroupedReduction.to_pandas"
+                    "::grouped_reduction_to_pandas"
+                ),
             )
-            import cupy as cp
-
-            values = cp.asnumpy(self.values)
         else:
             values = np.asarray(self.values)
         if self.output_index_plan is not None and self.output_index_plan.index is not None:
@@ -304,7 +315,23 @@ class NativeGroupedAttributeReduction:
 
     def to_pandas(self) -> pd.DataFrame:
         data: dict[Any, Any] = {}
-        device_bytes = 0
+        device_bytes = sum(
+            int(reduction.values.nbytes)
+            for reduction in self.columns.values()
+            if reduction.is_device
+        )
+        if device_bytes:
+            record_native_export_boundary(NativeExportBoundary(
+                surface="vibespatial.api.NativeGroupedAttributeReduction.to_pandas",
+                operation="grouped_attribute_reduction_to_pandas",
+                target="pandas-dataframe",
+                reason="native grouped attribute reductions exported to pandas DataFrame",
+                row_count=self.group_count,
+                byte_count=device_bytes,
+                detail=f"columns={len(self.columns)}",
+                d2h_transfer=True,
+                strict_disallowed=False,
+            ))
         for name, reduction in self.columns.items():
             values = reduction.values
             if isinstance(values, pd.Series):
@@ -315,27 +342,37 @@ class NativeGroupedAttributeReduction:
                 data[name] = series
                 continue
             if reduction.is_device:
-                device_bytes += int(values.nbytes)
-                import cupy as cp
-
-                values = cp.asnumpy(values)
+                values = _device_to_host(
+                    values,
+                    reason=(
+                        "vibespatial.api.NativeGroupedAttributeReduction.to_pandas"
+                        "::grouped_attribute_reduction_to_pandas"
+                    ),
+                )
             else:
                 values = np.asarray(values)
             data[name] = values
-        if device_bytes:
-            record_materialization_event(
-                surface="vibespatial.api.NativeGroupedAttributeReduction.to_pandas",
-                boundary=MaterializationBoundary.USER_EXPORT,
-                operation="grouped_attribute_reduction_to_pandas",
-                reason="native grouped attribute reductions exported to pandas DataFrame",
-                detail=f"groups={self.group_count}, columns={len(self.columns)}, bytes={device_bytes}",
-                d2h_transfer=True,
-                strict_disallowed=False,
-            )
         return pd.DataFrame(data, index=self.index)
 
     def to_native_attribute_table(self):
         from vibespatial.api._native_result_core import NativeAttributeTable
+
+        if self.columns and all(reduction.is_device for reduction in self.columns.values()):
+            try:
+                import cupy as cp
+                import pylibcudf as plc
+            except ModuleNotFoundError:
+                pass
+            else:
+                device_columns = [
+                    plc.Column.from_cuda_array_interface(cp.asarray(reduction.values))
+                    for reduction in self.columns.values()
+                ]
+                return NativeAttributeTable(
+                    device_table=plc.Table(device_columns),
+                    index_override=self.index,
+                    column_override=tuple(self.columns),
+                )
 
         return NativeAttributeTable.from_loader(
             self.to_pandas,
@@ -419,9 +456,19 @@ class NativeGrouped:
     def reduce_numeric(self, values: Any, reducer: str) -> NativeGroupedReduction:
         """Reduce one all-valid numeric vector by dense group codes."""
         normalized = reducer.lower()
-        if normalized not in {"sum", "count", "mean", "min", "max", "first", "last"}:
+        if normalized not in {
+            "sum",
+            "count",
+            "mean",
+            "min",
+            "max",
+            "first",
+            "last",
+            "any",
+            "all",
+        }:
             raise ValueError(
-                "NativeGrouped numeric reducer must be sum, count, mean, min, max, first, or last"
+                "NativeGrouped numeric reducer must be sum, count, mean, min, max, first, last, any, or all"
             )
         if _array_size(values) != _array_size(self.group_codes):
             raise ValueError("NativeGrouped reducer values length must match group codes")
@@ -446,6 +493,22 @@ class NativeGrouped:
                 observed_values,
                 group_count=self.resolved_group_count,
             )
+        elif normalized in {"any", "all"}:
+            if not np.issubdtype(_normalized_dtype(values_array), np.bool_):
+                raise TypeError("NativeGrouped any/all reducers admit only bool values")
+            true_counts = _bincount_sum(
+                observed_codes,
+                observed_values,
+                group_count=self.resolved_group_count,
+            )
+            if normalized == "any":
+                reduced = true_counts > 0
+            else:
+                counts = _bincount_count(
+                    observed_codes,
+                    group_count=self.resolved_group_count,
+                )
+                reduced = true_counts == counts
         elif normalized in {"min", "max"}:
             group_ids = xp.asarray(self.group_ids, dtype=xp.int32)
             has_all_groups = _array_size(group_ids) == self.resolved_group_count
@@ -525,6 +588,26 @@ class NativeGrouped:
             group_count=self.resolved_group_count,
             output_index_plan=self.output_index_plan,
         )
+
+    def reduce_expression(self, expression: Any, reducer: str) -> NativeGroupedReduction:
+        """Reduce a private scalar expression without public Series materialization."""
+        from vibespatial.api._native_expression import NativeExpression
+
+        if not isinstance(expression, NativeExpression):
+            raise TypeError("NativeGrouped.reduce_expression expects NativeExpression")
+        if expression.source_row_count is not None and int(expression.source_row_count) != _array_size(
+            self.group_codes
+        ):
+            raise ValueError(
+                "NativeGrouped expression source row count must match group codes"
+            )
+        if (
+            expression.source_token is not None
+            and self.source_token is not None
+            and expression.source_token != self.source_token
+        ):
+            raise ValueError("NativeGrouped expression source token does not match")
+        return self.reduce_numeric(expression.values, reducer)
 
     def reduce_take(self, values: Any, reducer: str) -> NativeGroupedReduction:
         """Select first/last non-null host values by dense group codes."""

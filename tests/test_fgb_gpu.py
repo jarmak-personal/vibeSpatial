@@ -362,9 +362,9 @@ class TestPolygonDecodeGpu:
         calls = {"totals": []}
         original_totals = runtime_module.count_scatter_totals
 
-        def _record_totals(runtime, count_offset_pairs):
+        def _record_totals(runtime, count_offset_pairs, *, reason=None):
             calls["totals"].append(len(count_offset_pairs))
-            return original_totals(runtime, count_offset_pairs)
+            return original_totals(runtime, count_offset_pairs, reason=reason)
 
         monkeypatch.setattr(runtime_module, "count_scatter_totals", _record_totals)
 

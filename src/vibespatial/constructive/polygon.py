@@ -204,8 +204,14 @@ def _polygon_centroids_gpu(
                 family_results.append((global_rows, family_rows, d_cx, d_cy))
                 cx_cy_owned = True
             else:
-                family_cx = runtime.copy_device_to_host(d_cx)
-                family_cy = runtime.copy_device_to_host(d_cy)
+                family_cx = runtime.copy_device_to_host(
+                    d_cx,
+                    reason=f"polygon centroid {family_key.value} x-result host export",
+                )
+                family_cy = runtime.copy_device_to_host(
+                    d_cy,
+                    reason=f"polygon centroid {family_key.value} y-result host export",
+                )
 
                 # Scatter family results back to global row positions
                 cx[global_rows] = family_cx[family_rows]
@@ -358,6 +364,44 @@ def polygon_buffer_owned_array(
         polygons, radii, quad_segs=quad_segs,
         join_style=join_int, mitre_limit=mitre_limit,
     )
+
+
+def polygon_buffer_native_tabular_result(
+    polygons: OwnedGeometryArray,
+    distance: float | np.ndarray,
+    *,
+    quad_segs: int = 8,
+    join_style: str = "round",
+    mitre_limit: float = 5.0,
+    dispatch_mode: ExecutionMode = ExecutionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+):
+    """Return polygon-buffer output as a private native constructive carrier."""
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    buffered = polygon_buffer_owned_array(
+        polygons,
+        distance,
+        quad_segs=quad_segs,
+        join_style=join_style,
+        mitre_limit=mitre_limit,
+        dispatch_mode=dispatch_mode,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        buffered,
+        operation="buffer",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+    )
+
+
 def _build_polygon_buffers_gpu(
     polygons: OwnedGeometryArray,
     radii: np.ndarray,
@@ -480,7 +524,11 @@ def _build_polygon_buffers_gpu(
         # transfer runs on a dedicated stream, overlapping with the
         # scatter kernel on the null stream.
         total_verts, xfer_stream, pinned_counts = count_scatter_total_with_transfer(
-            runtime, device_ring_counts, device_ring_offsets,
+            runtime,
+            device_ring_counts,
+            device_ring_offsets,
+            total_reason="polygon buffer vertex allocation fence",
+            counts_transfer_reason="polygon buffer ring-count host transfer",
         )
 
         if total_verts == 0:

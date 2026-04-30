@@ -339,6 +339,37 @@ def affine_transform_owned(
     return result
 
 
+def affine_transform_native_tabular_result(
+    owned: OwnedGeometryArray,
+    matrix,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = affine_transform_owned(
+        owned,
+        matrix,
+        dispatch_mode=dispatch_mode,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="affine_transform",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )
+
+
 def translate_owned(
     owned: OwnedGeometryArray,
     xoff: float = 0.0,
@@ -350,6 +381,41 @@ def translate_owned(
     """Translate all geometries by (xoff, yoff)."""
     a, b, x, d, e, y = _translate_matrix(xoff, yoff, zoff)
     return affine_transform_owned(owned, [a, b, d, e, x, y], dispatch_mode=dispatch_mode)
+
+
+def translate_native_tabular_result(
+    owned: OwnedGeometryArray,
+    xoff: float = 0.0,
+    yoff: float = 0.0,
+    zoff: float = 0.0,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = translate_owned(
+        owned,
+        xoff=xoff,
+        yoff=yoff,
+        zoff=zoff,
+        dispatch_mode=dispatch_mode,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="translate",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )
 
 
 def rotate_owned(
@@ -383,6 +449,41 @@ def rotate_owned(
     return affine_transform_owned(owned, [a, b, d, e, xoff, yoff], dispatch_mode=dispatch_mode)
 
 
+def rotate_native_tabular_result(
+    owned: OwnedGeometryArray,
+    angle: float,
+    origin: str | tuple[float, float] = "center",
+    use_radians: bool = False,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = rotate_owned(
+        owned,
+        angle,
+        origin=origin,
+        use_radians=use_radians,
+        dispatch_mode=dispatch_mode,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="rotate",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )
+
+
 def scale_owned(
     owned: OwnedGeometryArray,
     xfact: float = 1.0,
@@ -409,6 +510,43 @@ def scale_owned(
     return affine_transform_owned(owned, [a, b, d, e, xoff, yoff], dispatch_mode=dispatch_mode)
 
 
+def scale_native_tabular_result(
+    owned: OwnedGeometryArray,
+    xfact: float = 1.0,
+    yfact: float = 1.0,
+    zfact: float = 1.0,
+    origin: str | tuple[float, float] = "center",
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = scale_owned(
+        owned,
+        xfact=xfact,
+        yfact=yfact,
+        zfact=zfact,
+        origin=origin,
+        dispatch_mode=dispatch_mode,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="scale",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )
+
+
 def skew_owned(
     owned: OwnedGeometryArray,
     xs: float = 0.0,
@@ -433,3 +571,40 @@ def skew_owned(
 
     a, b, xoff, d, e, yoff = _compose_around_origin((a, b, xoff, d, e, yoff), ox, oy)
     return affine_transform_owned(owned, [a, b, d, e, xoff, yoff], dispatch_mode=dispatch_mode)
+
+
+def skew_native_tabular_result(
+    owned: OwnedGeometryArray,
+    xs: float = 0.0,
+    ys: float = 0.0,
+    origin: str | tuple[float, float] = "center",
+    use_radians: bool = False,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = skew_owned(
+        owned,
+        xs=xs,
+        ys=ys,
+        origin=origin,
+        use_radians=use_radians,
+        dispatch_mode=dispatch_mode,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="skew",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )

@@ -4,12 +4,14 @@ from vibespatial.runtime.materialization import (
     MaterializationBoundary,
     MaterializationContext,
     MaterializationEvent,
+    NativeExportBoundary,
     StrictNativeMaterializationError,
     clear_materialization_events,
     current_materialization_context,
     get_materialization_events,
     materialization_context,
     record_materialization_event,
+    record_native_export_boundary,
 )
 from vibespatial.runtime.residency import combined_residency
 
@@ -26,10 +28,12 @@ __all__ = [  # noqa: F405
     "MaterializationBoundary",
     "MaterializationContext",
     "MaterializationEvent",
+    "NativeExportBoundary",
     "StrictNativeMaterializationError",
     "clear_materialization_events",
     "current_materialization_context",
     "get_materialization_events",
     "materialization_context",
     "record_materialization_event",
+    "record_native_export_boundary",
 ]

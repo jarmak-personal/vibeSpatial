@@ -5,7 +5,7 @@ Scope: Compact-invalid-row make_valid pipeline staging and repair-only-invalids 
 Read If: You are changing make_valid, validity checking, or topology repair pipelines.
 STOP IF: Your task already has the make_valid pipeline open and only needs local implementation detail.
 Source Of Truth: Make-valid pipeline architecture for compact-and-repair staging.
-Body Budget: 83/220 lines
+Body Budget: 85/220 lines
 Document: docs/architecture/make-valid.md
 
 Section Map (Body Lines)
@@ -19,7 +19,7 @@ Section Map (Body Lines)
 | 32-37 | Risks |
 | 38-55 | Decision |
 | 56-75 | Dispatch |
-| 76-83 | Performance Notes |
+| 76-85 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent
@@ -101,5 +101,7 @@ stages.
   rows is the right default for valid-heavy datasets.
 - This staging is directly compatible with CCCL-style `DeviceSelect` and scatter
   primitives.
+- GPU repair scalar fences are runtime-counted with make-valid-specific reasons
+  so they stay distinguishable from anonymous count-scatter helper copies.
 - The current host implementation already benefits from skipping repair work on
   valid rows.

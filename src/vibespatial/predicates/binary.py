@@ -40,6 +40,7 @@ from .point_relations import (
     POINT_LOCATION_BOUNDARY,
     POINT_LOCATION_INTERIOR,
     POINT_LOCATION_OUTSIDE,
+    _point_relation_to_predicate_array,
     classify_point_equals_gpu,
     classify_point_line_gpu,
     classify_point_region_gpu,
@@ -113,6 +114,20 @@ _DE9IM_PREDICATES = frozenset({
     "covers", "covered_by", "overlaps", "disjoint",
     "contains_properly",
 })
+_POINT_POINT_EQUAL_PREDICATES = frozenset({
+    "intersects",
+    "within",
+    "contains",
+    "covered_by",
+    "covers",
+    "contains_properly",
+    "equals",
+})
+_POINT_POINT_FALSE_PREDICATES = frozenset({
+    "touches",
+    "crosses",
+    "overlaps",
+})
 
 
 _SPECIAL_PREDICATES = frozenset({"equals", "equals_exact", "equals_identical"})
@@ -124,6 +139,26 @@ _OWNED_EXACT_GEOMETRY_TYPES = frozenset({
     "MultiLineString",
     "MultiPolygon",
 })
+
+
+def _runtime_device_to_host(
+    device_array: object,
+    *,
+    reason: str,
+    terminal_export: bool = False,
+) -> np.ndarray:
+    return get_cuda_runtime().copy_device_to_host(
+        device_array,
+        reason=reason,
+        terminal_export=terminal_export,
+    )
+
+
+def _runtime_bool_scalar(device_value: object, *, reason: str) -> bool:
+    import cupy as cp
+
+    host = _runtime_device_to_host(cp.asarray(device_value).reshape(1), reason=reason)
+    return bool(np.asarray(host).reshape(-1)[0])
 
 
 def supports_binary_predicate(name: str) -> bool:
@@ -678,6 +713,51 @@ def _evaluate_gpu_point_region_fast_path(
             robustness_plan=robustness_plan,
         )
 
+    if single_region_family is not None:
+        active_row_ids = np.flatnonzero(~null_mask).astype(np.int32, copy=False)
+        device_values = _evaluate_gpu_point_candidates_device(
+            predicate,
+            left,
+            right,
+            active_row_ids,
+        )
+        if device_values is not None:
+            exact_values = _runtime_device_to_host(
+                device_values,
+                reason=f"binary predicate point-region {predicate} result host export",
+                terminal_export=True,
+            ).astype(bool, copy=False)
+            result = _fill_output(
+                left.row_count,
+                null_behavior=null_behavior,
+                null_mask=null_mask,
+            )
+            if active_row_ids.size:
+                result[active_row_ids] = exact_values
+            if null_mask.any() and null_behavior is NullBehavior.FALSE:
+                result[null_mask] = False
+
+            precision_plan = select_precision_plan(
+                runtime_selection=runtime_selection,
+                kernel_class=KernelClass.PREDICATE,
+                requested=precision,
+            )
+            robustness_plan = select_robustness_plan(
+                kernel_class=KernelClass.PREDICATE,
+                precision_plan=precision_plan,
+            )
+            return BinaryPredicateResult(
+                predicate=predicate,
+                values=result,
+                row_count=left.row_count,
+                candidate_rows=active_row_ids,
+                coarse_true_rows=np.empty(0, dtype=np.int32),
+                coarse_false_rows=np.empty(0, dtype=np.int32),
+                runtime_selection=runtime_selection,
+                precision_plan=precision_plan,
+                robustness_plan=robustness_plan,
+            )
+
     points.move_to(
         Residency.DEVICE,
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
@@ -701,7 +781,13 @@ def _evaluate_gpu_point_region_fast_path(
     runtime = get_cuda_runtime()
     candidate_result = launch_point_region_candidate_rows(points, regions)
     try:
-        candidate_rows = runtime.copy_device_to_host(candidate_result.values).astype(np.int32, copy=False)
+        candidate_rows = runtime.copy_device_to_host(
+            candidate_result.values,
+            reason=(
+                "binary predicate point-region candidate-row "
+                f"{predicate} host export"
+            ),
+        ).astype(np.int32, copy=False)
     finally:
         runtime.free(candidate_result.values)
 
@@ -864,6 +950,45 @@ def _evaluate_gpu_point_candidates(
     return out
 
 
+def _evaluate_gpu_point_candidates_device(
+    predicate: str,
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    candidate_rows: np.ndarray,
+) -> object | None:
+    """Evaluate point-family candidate predicates into a device bool vector."""
+    if candidate_rows.size == 0:
+        import cupy as cp
+
+        return cp.empty(0, dtype=cp.bool_)
+    if not _candidate_pairs_supported(left, right, candidate_rows):
+        return None
+
+    import cupy as cp
+
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"{predicate} selected GPU execution for left geometry input",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"{predicate} selected GPU execution for right geometry input",
+    )
+
+    from .point_relations import classify_point_predicates_indexed_device
+
+    d_rows = cp.asarray(candidate_rows, dtype=cp.int32)
+    return classify_point_predicates_indexed_device(
+        predicate,
+        left,
+        right,
+        d_rows,
+        d_rows,
+    )
+
+
 def _evaluate_gpu_de9im_candidates(
     predicate: str,
     left: OwnedGeometryArray,
@@ -926,6 +1051,62 @@ def _evaluate_gpu_de9im_candidates(
             de9im_masks[sub_idx] = sub_result
 
     return evaluate_predicate_from_de9im(de9im_masks, predicate)
+
+
+def _evaluate_gpu_de9im_candidates_device(
+    predicate: str,
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    candidate_rows: np.ndarray,
+) -> object:
+    """Evaluate non-point candidate predicates into a device bool vector."""
+    import cupy as cp
+
+    if candidate_rows.size == 0:
+        return cp.empty(0, dtype=cp.bool_)
+
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"{predicate} DE-9IM GPU execution for left geometry input",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"{predicate} DE-9IM GPU execution for right geometry input",
+    )
+
+    from .polygon import compute_polygon_de9im_gpu
+
+    left_tags = left.tags[candidate_rows]
+    right_tags = right.tags[candidate_rows]
+    d_candidate_rows = cp.asarray(candidate_rows, dtype=cp.int32)
+    d_out = cp.zeros(candidate_rows.size, dtype=cp.bool_)
+
+    for lt, rt in unique_tag_pairs(left_tags, right_tags):
+        sub_mask = (left_tags == lt) & (right_tags == rt)
+        sub_idx = np.flatnonzero(sub_mask)
+        if sub_idx.size == 0:
+            continue
+        lf = TAG_FAMILIES[lt] if lt in TAG_FAMILIES else None
+        rf = TAG_FAMILIES[rt] if rt in TAG_FAMILIES else None
+        if lf is None or rf is None:
+            continue
+        d_sub_idx = cp.asarray(sub_idx, dtype=cp.int32)
+        d_sub_rows = d_candidate_rows[d_sub_idx]
+        d_masks = compute_polygon_de9im_gpu(
+            left,
+            right,
+            query_family=lf,
+            tree_family=rf,
+            d_left=d_sub_rows,
+            d_right=d_sub_rows,
+            return_device=True,
+        )
+        if d_masks is not None:
+            d_out[d_sub_idx] = _evaluate_de9im_device(d_masks, predicate)
+
+    return d_out
 
 
 def _evaluate_de9im_device(d_masks: object, predicate: str) -> object:
@@ -991,22 +1172,49 @@ def _evaluate_de9im_device(d_masks: object, predicate: str) -> object:
     return result
 
 
-def _fused_gpu_binary_predicate(
+def _contains_point_family(owned: OwnedGeometryArray) -> bool:
+    valid_tags = owned.tags[owned.validity]
+    if valid_tags.size == 0:
+        return False
+    return bool(np.any((valid_tags == _POINT_TAG) | (valid_tags == _MP_TAG)))
+
+
+def _all_valid_owned_pair(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+) -> bool:
+    return left.row_count == right.row_count and bool(
+        np.all(left.validity) and np.all(right.validity)
+    )
+
+
+def _owned_tag_pairs(left: OwnedGeometryArray, right: OwnedGeometryArray) -> list[tuple[int, int]]:
+    valid = left.validity & right.validity
+    if not bool(np.any(valid)):
+        return []
+    return unique_tag_pairs(left.tags[valid], right.tags[valid])
+
+
+def _fused_gpu_binary_predicate_device(
     predicate: str,
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
-) -> np.ndarray | None:
+) -> object | None:
     """Fused device-resident pipeline: bounds + coarse filter + DE-9IM.
 
-    Keeps all N-sized intermediaries on device (bounds, validity, bbox
-    mask, candidate indices).  Only downloads the small candidate-sized
-    result at the end.  Returns None if the fused path is not applicable
-    (non-GPU, mixed point/non-point, unsupported predicate).
+    Physical shape: row-aligned predicate expression backed by candidate-pair
+    DE-9IM refinement. N-sized intermediaries and candidate rows stay on
+    device; the caller decides whether to feed the bool vector to a native
+    consumer or export it to a public host array.
     """
     if predicate not in _DE9IM_PREDICATES:
         return None
     from vibespatial.runtime import has_gpu_runtime
     if not has_gpu_runtime():
+        return None
+    if left.row_count != right.row_count:
+        return None
+    if _contains_point_family(left) or _contains_point_family(right):
         return None
 
     # Ensure both arrays are on device with bounds computed.
@@ -1062,21 +1270,7 @@ def _fused_gpu_binary_predicate(
     # Extract candidate indices on device.
     d_cand_rows = cp.flatnonzero(d_cand_mask).astype(cp.int32)
     if d_cand_rows.size == 0:
-        return np.zeros(n, dtype=bool)
-
-    # Check all candidates are DE-9IM eligible (no points).
-    d_tags_l = cp.asarray(left_state.tags)
-    d_tags_r = cp.asarray(right_state.tags)
-    d_cand_ltags = d_tags_l[d_cand_rows]
-    d_cand_rtags = d_tags_r[d_cand_rows]
-    pt = np.int8(FAMILY_TAGS[GeometryFamily.POINT])
-    mpt = np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOINT])
-    has_points = bool(
-        cp.any((d_cand_ltags == pt) | (d_cand_ltags == mpt))
-        or cp.any((d_cand_rtags == pt) | (d_cand_rtags == mpt))
-    )
-    if has_points:
-        return None  # Fall back to the partitioned dispatch.
+        return cp.ones(n, dtype=cp.bool_) if predicate == "disjoint" else cp.zeros(n, dtype=cp.bool_)
 
     # DE-9IM kernel — pass device indices to avoid H2D re-upload.
     from .polygon import compute_polygon_de9im_gpu
@@ -1085,10 +1279,16 @@ def _fused_gpu_binary_predicate(
     # DE-9IM mask accumulator lives on device (Tier 2 — CuPy element-wise).
     d_de9im_masks = cp.zeros(cand_count, dtype=cp.uint16)
 
-    # Group by (left_family, right_family) tag pair — unique extraction
-    # and sub-masking stay on device; dispatch uses device arrays directly.
+    d_tags_l = cp.asarray(left_state.tags)
+    d_tags_r = cp.asarray(right_state.tags)
+    d_cand_ltags = d_tags_l[d_cand_rows]
+    d_cand_rtags = d_tags_r[d_cand_rows]
+
+    # Group by the tiny host family-tag domain, then form candidate subsets on
+    # device. This avoids a device scalar summary fence on the native
+    # expression path while preserving family-specific predicate kernels.
     d_group_refs: list[tuple] = []
-    for lt, rt in unique_tag_pairs(d_cand_ltags, d_cand_rtags):
+    for lt, rt in _owned_tag_pairs(left, right):
         lf = TAG_FAMILIES[lt] if lt in TAG_FAMILIES else None
         rf = TAG_FAMILIES[rt] if rt in TAG_FAMILIES else None
         if lf is None or rf is None:
@@ -1121,22 +1321,480 @@ def _fused_gpu_binary_predicate(
     # For DISJOINT: non-candidates (no bbox overlap) are True (definitely
     # disjoint).  Candidates get their exact DE-9IM result.
     is_disjoint = predicate == "disjoint"
-    out = np.ones(n, dtype=bool) if is_disjoint else np.zeros(n, dtype=bool)
-    out[cp.asnumpy(d_cand_rows)] = cp.asnumpy(d_cand_result)
+    out = cp.ones(n, dtype=cp.bool_) if is_disjoint else cp.zeros(n, dtype=cp.bool_)
+    out[d_cand_rows] = d_cand_result
     return out
 
 
-def _evaluate_binary_predicates_fused_gpu(
+def _fused_gpu_binary_predicate(
+    predicate: str,
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+) -> np.ndarray | None:
+    """Fused device-resident pipeline with a final public host export."""
+    d_out = _fused_gpu_binary_predicate_device(predicate, left, right)
+    if d_out is None:
+        return None
+    host_result = _runtime_device_to_host(
+        d_out,
+        reason=f"binary predicate exact {predicate} result host export",
+        terminal_export=True,
+    )
+    return np.asarray(host_result, dtype=bool)
+
+
+def _evaluate_gpu_point_pair_fast_path(
+    predicate: str,
+    *,
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    null_mask: np.ndarray,
+    null_behavior: NullBehavior,
+    runtime_selection: RuntimeSelection,
+    precision: PrecisionMode | str,
+) -> BinaryPredicateResult | None:
+    """Evaluate row-aligned point/point predicates without host bounds export."""
+    if predicate not in (
+        _POINT_POINT_EQUAL_PREDICATES
+        | _POINT_POINT_FALSE_PREDICATES
+        | {"disjoint"}
+    ):
+        return None
+    if left.row_count != right.row_count:
+        return None
+    from vibespatial.runtime import has_gpu_runtime
+
+    if not has_gpu_runtime():
+        return None
+
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"{predicate} selected GPU execution for left point input",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"{predicate} selected GPU execution for right point input",
+    )
+
+    left_state = left._ensure_device_state()
+    right_state = right._ensure_device_state()
+    if set(left_state.families) != {GeometryFamily.POINT}:
+        return None
+    if set(right_state.families) != {GeometryFamily.POINT}:
+        return None
+
+    import cupy as cp
+
+    left_points = left_state.families[GeometryFamily.POINT]
+    right_points = right_state.families[GeometryFamily.POINT]
+    left_rows = cp.asarray(left_state.family_row_offsets).astype(cp.int64, copy=False)
+    right_rows = cp.asarray(right_state.family_row_offsets).astype(cp.int64, copy=False)
+    safe_left_rows = cp.maximum(left_rows, 0)
+    safe_right_rows = cp.maximum(right_rows, 0)
+
+    d_valid = (
+        cp.asarray(left_state.validity, dtype=cp.bool_)
+        & cp.asarray(right_state.validity, dtype=cp.bool_)
+        & (left_rows >= 0)
+        & (right_rows >= 0)
+    )
+    d_non_empty = (
+        ~cp.asarray(left_points.empty_mask, dtype=cp.bool_)[safe_left_rows]
+        & ~cp.asarray(right_points.empty_mask, dtype=cp.bool_)[safe_right_rows]
+    )
+    if int(left_points.x.size) == 0 or int(right_points.x.size) == 0:
+        d_equal = cp.zeros(left.row_count, dtype=cp.bool_)
+    else:
+        left_coord_rows = cp.minimum(
+            left_points.geometry_offsets[safe_left_rows].astype(cp.int64, copy=False),
+            int(left_points.x.size) - 1,
+        )
+        right_coord_rows = cp.minimum(
+            right_points.geometry_offsets[safe_right_rows].astype(cp.int64, copy=False),
+            int(right_points.x.size) - 1,
+        )
+        d_equal = (
+            d_valid
+            & d_non_empty
+            & (left_points.x[left_coord_rows] == right_points.x[right_coord_rows])
+            & (left_points.y[left_coord_rows] == right_points.y[right_coord_rows])
+        )
+    if predicate == "disjoint":
+        d_values = d_valid & ~d_equal
+    elif predicate in _POINT_POINT_EQUAL_PREDICATES:
+        d_values = d_equal
+    else:
+        d_values = cp.zeros(left.row_count, dtype=cp.bool_)
+
+    host_values = _runtime_device_to_host(
+        d_values,
+        reason=f"binary predicate point-point {predicate} result host export",
+        terminal_export=True,
+    ).astype(bool, copy=False)
+    result = _fill_output(
+        left.row_count,
+        null_behavior=null_behavior,
+        null_mask=null_mask,
+    )
+    if null_behavior is NullBehavior.FALSE:
+        result[:] = host_values
+        if null_mask.any():
+            result[null_mask] = False
+    else:
+        non_null = ~null_mask
+        result[non_null] = host_values[non_null]
+
+    precision_plan = select_precision_plan(
+        runtime_selection=runtime_selection,
+        kernel_class=KernelClass.PREDICATE,
+        requested=precision,
+    )
+    robustness_plan = select_robustness_plan(
+        kernel_class=KernelClass.PREDICATE,
+        precision_plan=precision_plan,
+    )
+    return BinaryPredicateResult(
+        predicate=predicate,
+        values=result,
+        row_count=left.row_count,
+        candidate_rows=np.flatnonzero(host_values & ~null_mask).astype(
+            np.int32,
+            copy=False,
+        ),
+        coarse_true_rows=np.empty(0, dtype=np.int32),
+        coarse_false_rows=np.empty(0, dtype=np.int32),
+        runtime_selection=runtime_selection,
+        precision_plan=precision_plan,
+        robustness_plan=robustness_plan,
+    )
+
+
+def _evaluate_gpu_point_pair_device(
+    predicate: str,
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+) -> object | None:
+    """Evaluate row-aligned point/point predicates into a device bool vector.
+
+    Physical shape: aligned pairwise point rows. Work units are rows plus one
+    coordinate load per side. This is a Tier 2 CuPy element-wise native
+    expression path, so there is no public host export until a caller asks for
+    one.
+    """
+    if predicate not in (
+        _POINT_POINT_EQUAL_PREDICATES
+        | _POINT_POINT_FALSE_PREDICATES
+        | {"disjoint"}
+    ):
+        return None
+    if left.row_count != right.row_count:
+        return None
+    from vibespatial.runtime import has_gpu_runtime
+
+    if not has_gpu_runtime():
+        return None
+
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"{predicate} native expression left point input",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"{predicate} native expression right point input",
+    )
+
+    left_state = left._ensure_device_state()
+    right_state = right._ensure_device_state()
+    if set(left_state.families) != {GeometryFamily.POINT}:
+        return None
+    if set(right_state.families) != {GeometryFamily.POINT}:
+        return None
+
+    import cupy as cp
+
+    left_points = left_state.families[GeometryFamily.POINT]
+    right_points = right_state.families[GeometryFamily.POINT]
+    left_rows = cp.asarray(left_state.family_row_offsets).astype(cp.int64, copy=False)
+    right_rows = cp.asarray(right_state.family_row_offsets).astype(cp.int64, copy=False)
+    safe_left_rows = cp.maximum(left_rows, 0)
+    safe_right_rows = cp.maximum(right_rows, 0)
+
+    d_valid = (
+        cp.asarray(left_state.validity, dtype=cp.bool_)
+        & cp.asarray(right_state.validity, dtype=cp.bool_)
+        & (left_rows >= 0)
+        & (right_rows >= 0)
+    )
+    d_non_empty = (
+        ~cp.asarray(left_points.empty_mask, dtype=cp.bool_)[safe_left_rows]
+        & ~cp.asarray(right_points.empty_mask, dtype=cp.bool_)[safe_right_rows]
+    )
+    if int(left_points.x.size) == 0 or int(right_points.x.size) == 0:
+        d_equal = cp.zeros(left.row_count, dtype=cp.bool_)
+    else:
+        left_coord_rows = cp.minimum(
+            left_points.geometry_offsets[safe_left_rows].astype(cp.int64, copy=False),
+            int(left_points.x.size) - 1,
+        )
+        right_coord_rows = cp.minimum(
+            right_points.geometry_offsets[safe_right_rows].astype(cp.int64, copy=False),
+            int(right_points.x.size) - 1,
+        )
+        d_equal = (
+            d_valid
+            & d_non_empty
+            & (left_points.x[left_coord_rows] == right_points.x[right_coord_rows])
+            & (left_points.y[left_coord_rows] == right_points.y[right_coord_rows])
+        )
+    if predicate == "disjoint":
+        return d_valid & ~d_equal
+    if predicate in _POINT_POINT_EQUAL_PREDICATES:
+        return d_equal
+    return cp.zeros(left.row_count, dtype=cp.bool_)
+
+
+def _record_binary_predicate_expression_dispatch(
+    *,
+    predicate: str,
+    expression_operation: str,
+    row_count: int,
+    implementation: str,
+    workload_shape: str,
+) -> None:
+    record_dispatch_event(
+        surface="vibespatial.predicates.binary",
+        operation=predicate,
+        requested=ExecutionMode.GPU,
+        selected=ExecutionMode.GPU,
+        implementation=implementation,
+        reason="device-resident binary predicate expression",
+        detail=(
+            f"operation={expression_operation}; "
+            f"row_count={row_count}; "
+            f"workload_shape={workload_shape}; "
+            "carrier=NativeExpression"
+        ),
+    )
+
+
+def binary_predicate_expression(
+    predicate: str,
+    left: PredicateInput,
+    right: PredicateInput,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    source_token: str | None = None,
+    operation: str | None = None,
+):
+    """Return row-aligned binary predicate results as a private expression.
+
+    This is the Native* consumer path for admitted binary predicates. It keeps
+    the bool vector on device so sanctioned callers can lower directly to a
+    ``NativeRowSet`` instead of exporting a public bool Series.
+    """
+    requested_mode = (
+        dispatch_mode
+        if isinstance(dispatch_mode, ExecutionMode)
+        else ExecutionMode(dispatch_mode)
+    )
+    if requested_mode is not ExecutionMode.GPU:
+        return None
+    if predicate not in PREDICATE_SPECS:
+        raise ValueError(f"unsupported binary predicate: {predicate}") from None
+
+    _left_values, left_owned = _coerce_array(left, arg_name="left")
+    _right_values, right_owned = _coerce_array(right, arg_name="right")
+    if left_owned is None or right_owned is None:
+        return None
+    if not _all_valid_owned_pair(left_owned, right_owned):
+        return None
+
+    expression_operation = operation or f"binary_predicate.{predicate}"
+    point_pair_values = _evaluate_gpu_point_pair_device(
+        predicate,
+        left_owned,
+        right_owned,
+    )
+    if point_pair_values is not None:
+        from vibespatial.api._native_expression import NativeExpression
+
+        _record_binary_predicate_expression_dispatch(
+            predicate=predicate,
+            expression_operation=expression_operation,
+            row_count=left_owned.row_count,
+            implementation="native_point_pair_expression_gpu",
+            workload_shape="aligned_pairwise_point_point",
+        )
+        return NativeExpression(
+            operation=expression_operation,
+            values=point_pair_values,
+            source_token=source_token,
+            source_row_count=left_owned.row_count,
+            dtype=str(getattr(point_pair_values, "dtype", "bool")),
+            precision="predicate",
+        )
+
+    orientation = _uniform_point_region_orientation(left_owned, right_owned)
+    if orientation is not None:
+        point_on_left, single_region_family = orientation
+        point_region_boolean_predicate = (
+            predicate == "intersects"
+            or predicate == "disjoint"
+            or (point_on_left and predicate == "covered_by")
+            or ((not point_on_left) and predicate == "covers")
+        )
+        if point_region_boolean_predicate:
+            from vibespatial.kernels.predicates.point_in_polygon import (
+                point_in_polygon_expression,
+            )
+
+            points = left_owned if point_on_left else right_owned
+            regions = right_owned if point_on_left else left_owned
+            expression = point_in_polygon_expression(
+                points,
+                regions,
+                dispatch_mode=ExecutionMode.GPU,
+                precision=precision,
+                source_token=source_token,
+                operation=expression_operation,
+            )
+            if predicate != "disjoint":
+                return expression
+
+            import cupy as cp
+
+            values = ~cp.asarray(expression.values, dtype=cp.bool_)
+            from vibespatial.api._native_expression import NativeExpression
+
+            _record_binary_predicate_expression_dispatch(
+                predicate=predicate,
+                expression_operation=expression_operation,
+                row_count=left_owned.row_count,
+                implementation="native_point_region_pip_expression_gpu",
+                workload_shape="aligned_pairwise_point_region",
+            )
+            return NativeExpression(
+                operation=expression_operation,
+                values=values,
+                source_token=source_token,
+                source_row_count=left_owned.row_count,
+                dtype=str(getattr(values, "dtype", "bool")),
+                precision="predicate",
+            )
+
+        if single_region_family is not None:
+            import cupy as cp
+
+            points = left_owned if point_on_left else right_owned
+            regions = right_owned if point_on_left else left_owned
+            points.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason=f"{predicate} native expression point input",
+            )
+            regions.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason=f"{predicate} native expression region input",
+            )
+            row_ids = cp.arange(points.row_count, dtype=cp.int32)
+            relation = classify_point_region_gpu(
+                row_ids,
+                points,
+                regions,
+                region_family=single_region_family,
+                return_device=True,
+            )
+            values = _point_relation_to_predicate_array(
+                predicate,
+                relation,
+                point_on_left=point_on_left,
+            )
+            from vibespatial.api._native_expression import NativeExpression
+
+            _record_binary_predicate_expression_dispatch(
+                predicate=predicate,
+                expression_operation=expression_operation,
+                row_count=left_owned.row_count,
+                implementation="native_point_region_relation_expression_gpu",
+                workload_shape="aligned_pairwise_point_region",
+            )
+            return NativeExpression(
+                operation=expression_operation,
+                values=values,
+                source_token=source_token,
+                source_row_count=left_owned.row_count,
+                dtype=str(getattr(values, "dtype", "bool")),
+                precision="predicate",
+            )
+
+    row_ids = np.arange(left_owned.row_count, dtype=np.int32)
+    point_family_values = _evaluate_gpu_point_candidates_device(
+        predicate,
+        left_owned,
+        right_owned,
+        row_ids,
+    )
+    if point_family_values is not None:
+        from vibespatial.api._native_expression import NativeExpression
+
+        _record_binary_predicate_expression_dispatch(
+            predicate=predicate,
+            expression_operation=expression_operation,
+            row_count=left_owned.row_count,
+            implementation="native_point_family_indexed_expression_gpu",
+            workload_shape="aligned_pairwise_point_family",
+        )
+        return NativeExpression(
+            operation=expression_operation,
+            values=point_family_values,
+            source_token=source_token,
+            source_row_count=left_owned.row_count,
+            dtype=str(getattr(point_family_values, "dtype", "bool")),
+            precision="predicate",
+        )
+
+    values = _fused_gpu_binary_predicate_device(predicate, left_owned, right_owned)
+    if values is None:
+        return None
+
+    from vibespatial.api._native_expression import NativeExpression
+
+    _record_binary_predicate_expression_dispatch(
+        predicate=predicate,
+        expression_operation=expression_operation,
+        row_count=left_owned.row_count,
+        implementation="native_expression_gpu",
+        workload_shape="aligned_pairwise_de9im",
+    )
+    return NativeExpression(
+        operation=expression_operation,
+        values=values,
+        source_token=source_token,
+        source_row_count=left_owned.row_count,
+        dtype=str(getattr(values, "dtype", "bool")),
+        precision="predicate",
+    )
+
+
+def _fused_gpu_binary_predicates_device(
     predicates: Sequence[str],
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
-) -> dict[str, np.ndarray] | None:
-    """Evaluate multiple DE-9IM predicates with one exact GPU pass.
+) -> dict[str, object] | None:
+    """Evaluate multiple DE-9IM predicates with one device-resident exact pass.
 
     Mask-clip physical plans often need both ``intersects`` and
     ``covered_by`` for the same pairwise inputs.  Computing the DE-9IM mask
-    once and deriving both boolean predicates avoids duplicate polygon
-    relation kernels while keeping the public result as ordinary NumPy masks.
+    once and deriving multiple boolean vectors avoids duplicate polygon
+    relation kernels.  All candidate rows, DE-9IM masks, and full-size
+    predicate vectors stay on device so native callers can wrap them as
+    ``NativeExpression`` values.
     """
     predicate_names = tuple(dict.fromkeys(predicates))
     if not predicate_names or any(predicate not in _DE9IM_PREDICATES for predicate in predicate_names):
@@ -1146,22 +1804,6 @@ def _evaluate_binary_predicates_fused_gpu(
     from vibespatial.runtime import has_gpu_runtime
     if not has_gpu_runtime():
         return None
-
-    def _record_success() -> None:
-        detail = (
-            f"predicates={','.join(predicate_names)}; "
-            f"row_count={left.row_count}; workload_shape=vector_vector"
-        )
-        for predicate in predicate_names:
-            record_dispatch_event(
-                surface="vibespatial.predicates.binary",
-                operation=predicate,
-                requested=ExecutionMode.GPU,
-                selected=ExecutionMode.GPU,
-                implementation="fused_multi_predicate_gpu",
-                reason="device-resident DE-9IM multi-predicate evaluation",
-                detail=detail,
-            )
 
     left.move_to(
         Residency.DEVICE,
@@ -1203,12 +1845,14 @@ def _evaluate_binary_predicates_fused_gpu(
     )
     d_cand_rows = cp.flatnonzero(d_bbox_hit & d_valid).astype(cp.int32)
     if int(d_cand_rows.size) == 0:
-        outputs = {
-            predicate: np.ones(n, dtype=bool) if predicate == "disjoint" else np.zeros(n, dtype=bool)
+        return {
+            predicate: (
+                cp.ones(n, dtype=cp.bool_)
+                if predicate == "disjoint"
+                else cp.zeros(n, dtype=cp.bool_)
+            )
             for predicate in predicate_names
         }
-        _record_success()
-        return outputs
 
     d_tags_l = cp.asarray(left_state.tags)
     d_tags_r = cp.asarray(right_state.tags)
@@ -1218,7 +1862,7 @@ def _evaluate_binary_predicates_fused_gpu(
         FAMILY_TAGS[GeometryFamily.POINT],
         FAMILY_TAGS[GeometryFamily.MULTIPOINT],
     }
-    tag_pairs = unique_tag_pairs(d_cand_ltags, d_cand_rtags)
+    tag_pairs = _owned_tag_pairs(left, right)
     if any(lt in point_tags or rt in point_tags for lt, rt in tag_pairs):
         return None
 
@@ -1257,31 +1901,166 @@ def _evaluate_binary_predicates_fused_gpu(
         else:
             d_de9im_masks[d_sub_idx] = d_sub_result
 
-    d_predicate_results = [
-        _evaluate_de9im_device(d_de9im_masks, predicate)
+    d_predicate_results = {
+        predicate: _evaluate_de9im_device(d_de9im_masks, predicate)
         for predicate in predicate_names
-    ]
-    h_predicate_results = cp.asnumpy(cp.stack(d_predicate_results, axis=0))
-    cand_rows = cp.asnumpy(d_cand_rows)
-    outputs: dict[str, np.ndarray] = {}
-    for predicate_index, predicate in enumerate(predicate_names):
-        out = np.ones(n, dtype=bool) if predicate == "disjoint" else np.zeros(n, dtype=bool)
-        out[cand_rows] = h_predicate_results[predicate_index]
-        outputs[predicate] = out
-    _record_success()
+    }
+    outputs = {
+        predicate: (
+            cp.ones(n, dtype=cp.bool_)
+            if predicate == "disjoint"
+            else cp.zeros(n, dtype=cp.bool_)
+        )
+        for predicate in predicate_names
+    }
+    for predicate, d_values in d_predicate_results.items():
+        outputs[predicate][d_cand_rows] = d_values
     return outputs
 
 
-def _evaluate_covered_by_single_polygonal_mask_gpu(
+def binary_predicate_expressions(
+    predicates: Sequence[str],
+    left: PredicateInput,
+    right: PredicateInput,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    source_token: str | None = None,
+    operation_prefix: str = "binary_predicate",
+):
+    """Return multiple row-aligned predicate vectors as native expressions.
+
+    Physical shape: aligned pairwise predicate expression.  For all-DE-9IM,
+    non-point family pairs, one candidate/refine pass computes all requested
+    predicates and scatters full-size device vectors.  Other admitted native
+    shapes reuse the single-predicate expression producer per predicate.
+    """
+    requested_mode = (
+        dispatch_mode
+        if isinstance(dispatch_mode, ExecutionMode)
+        else ExecutionMode(dispatch_mode)
+    )
+    if requested_mode is not ExecutionMode.GPU:
+        return None
+    predicate_names = tuple(dict.fromkeys(predicates))
+    if not predicate_names:
+        return None
+    for predicate in predicate_names:
+        if predicate not in PREDICATE_SPECS:
+            raise ValueError(f"unsupported binary predicate: {predicate}") from None
+
+    _left_values, left_owned = _coerce_array(left, arg_name="left")
+    _right_values, right_owned = _coerce_array(right, arg_name="right")
+    if left_owned is None or right_owned is None:
+        return None
+    if not _all_valid_owned_pair(left_owned, right_owned):
+        return None
+
+    device_values = _fused_gpu_binary_predicates_device(
+        predicate_names,
+        left_owned,
+        right_owned,
+    )
+    if device_values is not None:
+        from vibespatial.api._native_expression import NativeExpression
+
+        expressions = {}
+        for predicate, values in device_values.items():
+            record_dispatch_event(
+                surface="vibespatial.predicates.binary",
+                operation=predicate,
+                requested=ExecutionMode.GPU,
+                selected=ExecutionMode.GPU,
+                implementation="fused_multi_predicate_expression_gpu",
+                reason="device-resident DE-9IM multi-predicate expressions",
+                detail=(
+                    f"operation={operation_prefix}.{predicate}; "
+                    f"row_count={left_owned.row_count}; "
+                    "carrier=NativeExpression"
+                ),
+            )
+            expressions[predicate] = NativeExpression(
+                operation=f"{operation_prefix}.{predicate}",
+                values=values,
+                source_token=source_token,
+                source_row_count=left_owned.row_count,
+                dtype=str(getattr(values, "dtype", "bool")),
+                precision="predicate",
+            )
+        return expressions
+
+    expressions = {}
+    for predicate in predicate_names:
+        expression = binary_predicate_expression(
+            predicate,
+            left_owned,
+            right_owned,
+            dispatch_mode=dispatch_mode,
+            precision=precision,
+            source_token=source_token,
+            operation=f"{operation_prefix}.{predicate}",
+        )
+        if expression is None:
+            return None
+        expressions[predicate] = expression
+    return expressions
+
+
+def _evaluate_binary_predicates_fused_gpu(
+    predicates: Sequence[str],
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+) -> dict[str, np.ndarray] | None:
+    """Evaluate multiple DE-9IM predicates with one exact GPU pass.
+
+    This is the public compatibility wrapper for the native multi-predicate
+    expression shape.  Device vectors are copied to host only as the terminal
+    public bool-mask export.
+    """
+    predicate_names = tuple(dict.fromkeys(predicates))
+    device_outputs = _fused_gpu_binary_predicates_device(predicate_names, left, right)
+    if device_outputs is None:
+        return None
+
+    import cupy as cp
+
+    h_predicate_results = _runtime_device_to_host(
+        cp.stack([device_outputs[predicate] for predicate in predicate_names], axis=0),
+        reason="binary predicate fused predicate-results host export",
+        terminal_export=True,
+    )
+    outputs: dict[str, np.ndarray] = {}
+    for predicate_index, predicate in enumerate(predicate_names):
+        outputs[predicate] = np.asarray(h_predicate_results[predicate_index], dtype=bool)
+    detail = (
+        f"predicates={','.join(predicate_names)}; "
+        f"row_count={left.row_count}; workload_shape=aligned_pairwise_de9im"
+    )
+    for predicate in predicate_names:
+        record_dispatch_event(
+            surface="vibespatial.predicates.binary",
+            operation=predicate,
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            implementation="fused_multi_predicate_gpu",
+            reason="device-resident DE-9IM multi-predicate evaluation",
+            detail=detail,
+        )
+    return outputs
+
+
+def _evaluate_covered_by_single_polygonal_mask_device(
     left: OwnedGeometryArray,
     mask: OwnedGeometryArray,
-) -> np.ndarray | None:
+) -> object | None:
     """Exact ``covered_by`` for many polygonal rows against one polygonal mask.
 
     This supports the mask-clip physical shape where a bbox-filtered polygon
     partition is frequently already fully covered by a dissolved polygonal
     mask. The kernel uses the convex-mask proof when legal and otherwise
-    falls through to exact polygon DE-9IM on device.
+    falls through to exact polygon DE-9IM on device.  The returned vector is
+    device-resident so native clip/overlay consumers can lower it to rowsets
+    without a public bool-mask export.
     """
     if mask.row_count != 1:
         return None
@@ -1327,7 +2106,20 @@ def _evaluate_covered_by_single_polygonal_mask_gpu(
     left_tags = cp.asarray(left_state.tags)
     d_valid = cp.asarray(left_state.validity)
     supported_tag_mask = cp.isin(left_tags, cp.asarray(tuple(active_tags), dtype=cp.int8))
-    if bool(cp.any((~supported_tag_mask) & d_valid)):
+    if left._tags is not None and left._validity is not None:
+        host_supported_tags = np.isin(
+            np.asarray(left._tags, dtype=np.int8),
+            np.asarray(tuple(active_tags), dtype=np.int8),
+        )
+        has_unsupported_valid = bool(
+            np.any((~host_supported_tags) & np.asarray(left._validity, dtype=np.bool_))
+        )
+    else:
+        has_unsupported_valid = _runtime_bool_scalar(
+            cp.any((~supported_tag_mask) & d_valid),
+            reason="binary predicate covered-by single-mask family-domain scalar fence",
+        )
+    if has_unsupported_valid:
         return None
 
     from .polygon import compute_polygonal_covered_by_single_mask_no_holes_gpu
@@ -1349,7 +2141,22 @@ def _evaluate_covered_by_single_polygonal_mask_gpu(
         if d_family_result is None:
             return None
         d_out[d_rows] = d_family_result
-    return cp.asnumpy(d_out).astype(bool, copy=False)
+    return d_out
+
+
+def _evaluate_covered_by_single_polygonal_mask_gpu(
+    left: OwnedGeometryArray,
+    mask: OwnedGeometryArray,
+) -> np.ndarray | None:
+    """Exact ``covered_by`` single-mask probe with a final host bool export."""
+    d_out = _evaluate_covered_by_single_polygonal_mask_device(left, mask)
+    if d_out is None:
+        return None
+    return _runtime_device_to_host(
+        d_out,
+        reason="binary predicate covered-by single-mask result host export",
+        terminal_export=True,
+    ).astype(bool, copy=False)
 
 
 def evaluate_binary_predicate(
@@ -1433,6 +2240,28 @@ def evaluate_binary_predicate(
             right_gpu_owned = _owned_from_values(right_values, owned=right_owned, scalar=False)
 
         if left_gpu_owned is not None and right_gpu_owned is not None:
+            point_pair_result = _evaluate_gpu_point_pair_fast_path(
+                predicate,
+                left=left_gpu_owned,
+                right=right_gpu_owned,
+                null_mask=null_mask,
+                null_behavior=normalized_null_behavior,
+                runtime_selection=runtime_selection,
+                precision=precision,
+            )
+            if point_pair_result is not None:
+                record_dispatch_event(
+                    surface="vibespatial.predicates.binary",
+                    operation=predicate,
+                    requested=requested_mode,
+                    selected=runtime_selection.selected,
+                    implementation="gpu_point_pair_fast_path",
+                    reason=runtime_selection.reason,
+                    detail=f"workload_shape={workload_shape.value}",
+                )
+                _record_runtime_selection(runtime_selection, (left_gpu_owned, right_gpu_owned))
+                return point_pair_result
+
             fast_path_result = _evaluate_gpu_point_region_fast_path(
                 predicate,
                 left=left_gpu_owned,
@@ -1624,17 +2453,38 @@ def evaluate_binary_predicate(
             if point_mask.any():
                 point_idx = np.flatnonzero(point_mask)
                 point_rows = candidate_rows[point_idx]
-                point_values = _evaluate_gpu_point_candidates(
+                point_device_values = _evaluate_gpu_point_candidates_device(
                     predicate, left_gpu_owned, right_gpu_owned, point_rows,
                 )
+                if point_device_values is None:
+                    point_values = _evaluate_gpu_point_candidates(
+                        predicate, left_gpu_owned, right_gpu_owned, point_rows,
+                    )
+                else:
+                    point_values = _runtime_device_to_host(
+                        point_device_values,
+                        reason=(
+                            "binary predicate point-candidate "
+                            f"{predicate} result host export"
+                        ),
+                        terminal_export=True,
+                    ).astype(bool, copy=False)
                 result[point_rows] = point_values
 
             if de9im_mask.any():
                 de9im_idx = np.flatnonzero(de9im_mask)
                 de9im_rows = candidate_rows[de9im_idx]
-                de9im_values = _evaluate_gpu_de9im_candidates(
+                de9im_device_values = _evaluate_gpu_de9im_candidates_device(
                     predicate, left_gpu_owned, right_gpu_owned, de9im_rows,
                 )
+                de9im_values = _runtime_device_to_host(
+                    de9im_device_values,
+                    reason=(
+                        "binary predicate de9im-candidate "
+                        f"{predicate} result host export"
+                    ),
+                    terminal_export=True,
+                ).astype(bool, copy=False)
                 result[de9im_rows] = de9im_values
         elif _is_broadcast:
             # CPU fallback for scalar-right or broadcast-right: recover

@@ -12,6 +12,9 @@ Verifies GPU and CPU paths against Shapely oracle, covering:
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
 import shapely
@@ -34,6 +37,58 @@ def _has_gpu():
 
 
 requires_gpu = pytest.mark.skipif(not _has_gpu(), reason="GPU not available")
+
+
+def test_segmented_union_has_no_raw_cupy_scalar_syncs() -> None:
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "vibespatial"
+        / "kernels"
+        / "constructive"
+        / "segmented_union.py"
+    )
+    tree = ast.parse(path.read_text(), filename=str(path))
+    failures: list[str] = []
+    cupy_reductions = {
+        "all",
+        "any",
+        "sum",
+        "count_nonzero",
+        "max",
+        "min",
+        "nanmax",
+        "nanmin",
+    }
+
+    def _contains_cupy_reduction(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == "cp"
+            and child.func.attr in cupy_reductions
+            for child in ast.walk(node)
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "item":
+                failures.append(f"raw .item() at line {node.lineno}")
+            continue
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"bool", "int", "float"}
+            and node.args
+        ):
+            continue
+        if _contains_cupy_reduction(node.args[0]):
+            failures.append(f"raw {node.func.id}(cp reduction) at line {node.lineno}")
+
+    assert failures == []
+
+
 def _shapely_segmented_union(geometries: list, group_offsets: np.ndarray) -> list:
     """Reference implementation using shapely.union_all per group."""
     n_groups = len(group_offsets) - 1
@@ -326,6 +381,24 @@ class TestSegmentedUnionGPU:
         result_geoms = result.to_shapely()
         assert len(result_geoms) == 1
         _assert_geom_equal(result_geoms[0], ref[0])
+
+    @requires_gpu
+    def test_serial_small_group_gpu_result_seeds_validity_cache(self):
+        """GPU: trusted serial grouped reductions should not re-run OGC scans."""
+        geoms = [
+            box(0, 0, 2, 1),
+            box(1, 0, 3, 1),
+            box(10, 0, 12, 1),
+            box(11, 0, 13, 1),
+        ]
+        owned = _make_owned(geoms, residency=Residency.DEVICE)
+        offsets = np.array([0, 2, 4], dtype=np.int64)
+
+        result = segmented_union_all(owned, offsets, dispatch_mode=ExecutionMode.GPU)
+
+        cached = getattr(result, "_cached_is_valid_mask", None)
+        assert cached is not None
+        assert cached.tolist() == [True, True]
 
     @requires_gpu
     def test_variable_group_sizes_gpu(self):

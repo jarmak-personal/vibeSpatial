@@ -716,6 +716,7 @@ def _decode_complex_gpu(
                 (d_ring_counts, d_ring_offsets_prefix),
                 (d_part_counts, d_part_offsets_prefix),
             ],
+            reason="flatgeobuf geometry totals allocation fence",
         )
     else:
         total_coords = 0

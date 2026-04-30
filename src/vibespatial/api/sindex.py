@@ -11,6 +11,10 @@ from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode, get_requested_mode
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
+from vibespatial.runtime.materialization import (
+    NativeExportBoundary,
+    record_native_export_boundary,
+)
 from vibespatial.spatial.query import (
     build_owned_spatial_index,
     nearest_spatial_index,
@@ -48,6 +52,9 @@ class SpatialIndex:
         # store geometries, including empty geometries for user access
         self.geometries = geometry.copy()
         self._geometry_array = geometry_array
+        self._native_spatial_index = None
+        self._native_spatial_index_source_token = None
+        self._native_spatial_index_flat_index_id = None
 
     @classmethod
     def _from_device_geometry_array(cls, device_geometry_array):
@@ -60,6 +67,9 @@ class SpatialIndex:
         obj._tree = None          # lazy — built on first STRtree-fallback query
         obj.geometries = None     # lazy — populated alongside _tree
         obj._geometry_array = device_geometry_array
+        obj._native_spatial_index = None
+        obj._native_spatial_index_source_token = None
+        obj._native_spatial_index_flat_index_id = None
         return obj
 
     def _ensure_strtree(self):
@@ -194,6 +204,9 @@ class SpatialIndex:
             of geometry. Required if ``predicate='dwithin'``.
         output_format : {"indices", "sparse", "dense"}, default "indices"
             Type of the output format representing the result of the query.
+            Private ``return_device=True`` callers must use ``"indices"``;
+            native consumers that need pair flow should use ``query_relation()``
+            because dense and sparse outputs are public compatibility exports.
 
         Returns
         -------
@@ -329,6 +342,13 @@ class SpatialIndex:
                 f"`predicate` must be one of {self.valid_query_predicates}"
             )
 
+        if return_device and output_format != "indices":
+            raise ValueError(
+                "return_device=True is only supported with output_format='indices'; "
+                "native consumers should use query_relation() instead of dense "
+                "or sparse public exports"
+            )
+
         # distance argument requirement of predicate `dwithin`
         # and only valid for predicate `dwithin`
         kwargs = {}
@@ -370,52 +390,61 @@ class SpatialIndex:
                 and self._supports_owned_query_input(raw_geometry)
             )
         ):
-            tree_owned, flat_index = self._owned_flat_sindex()
-            query_input = raw_geometry if raw_box_array_fast_path else self._owned_query_input(raw_geometry)
-            # Pass already-materialized Shapely arrays to avoid redundant
-            # to_shapely() in predicate refinement.  Only use arrays that
-            # are ALREADY cached — never trigger eager materialization here.
-            tree_shapely_arr = None
-            if self.geometries is not None:
-                tree_shapely_arr = np.asarray(self.geometries, dtype=object)
-            elif (
-                self._geometry_array is not None
-                and hasattr(self._geometry_array, "_shapely_cache")
-                and self._geometry_array._shapely_cache is not None
-            ):
-                tree_shapely_arr = self._geometry_array._shapely_cache
-            query_shapely_arr = None
-            if isinstance(raw_geometry, geoseries.GeoSeries):
-                ga = raw_geometry.values
-                if hasattr(ga, "_shapely_cache") and ga._shapely_cache is not None:
-                    query_shapely_arr = ga._shapely_cache
-            elif isinstance(raw_geometry, array.GeometryArray):
-                if hasattr(raw_geometry, "_shapely_cache") and raw_geometry._shapely_cache is not None:
-                    query_shapely_arr = raw_geometry._shapely_cache
-            indices, execution = query_spatial_index(
-                tree_owned,
-                flat_index,
-                query_input,
+            native_query = self._query_native_relation_for_public_output(
+                raw_geometry,
                 predicate=predicate,
                 sort=sort,
                 distance=distance,
                 output_format=output_format,
-                return_metadata=True,
                 return_device=return_device,
-                tree_shapely=tree_shapely_arr,
-                query_shapely=query_shapely_arr,
+                raw_box_array_fast_path=raw_box_array_fast_path,
                 precomputed_query_bounds=precomputed_query_bounds,
             )
-            record_dispatch_event(
-                surface="geopandas.sindex.query",
-                operation="query",
-                implementation=execution.implementation,
-                reason=execution.reason,
-                detail=f"predicate={predicate!r}, output_format={output_format!r}",
-                requested=execution.requested,
-                selected=execution.selected,
+            if native_query is not None:
+                output, execution = native_query
+                record_dispatch_event(
+                    surface="geopandas.sindex.query",
+                    operation="query",
+                    implementation="native_spatial_index",
+                    reason=(
+                        "NativeSpatialIndex produced relation pairs for "
+                        "public sindex.query export"
+                    ),
+                    detail=f"predicate={predicate!r}, output_format={output_format!r}",
+                    requested=execution.requested,
+                    selected=execution.selected,
+                )
+                self._record_public_spatial_export(
+                    surface="geopandas.sindex.query",
+                    operation="sindex_query",
+                    target=f"sindex-{output_format}",
+                    reason=(
+                        "NativeSpatialIndex relation pairs exported to public "
+                        "sindex.query result"
+                    ),
+                    output=output,
+                    detail=f"predicate={predicate!r}, output_format={output_format!r}",
+                )
+                return output
+            output = self._query_owned_public(
+                raw_geometry,
+                predicate=predicate,
+                sort=sort,
+                distance=distance,
+                output_format=output_format,
+                return_device=return_device,
+                raw_box_array_fast_path=raw_box_array_fast_path,
+                precomputed_query_bounds=precomputed_query_bounds,
             )
-            return indices
+            self._record_public_spatial_export(
+                surface="geopandas.sindex.query",
+                operation="sindex_query",
+                target=f"sindex-{output_format}",
+                reason="owned spatial query exported to public sindex.query result",
+                output=output,
+                detail=f"predicate={predicate!r}, output_format={output_format!r}",
+            )
+            return output
 
         self._ensure_strtree()
         geometry = self._as_geometry_array(raw_geometry)
@@ -477,6 +506,267 @@ class SpatialIndex:
         if self._geometry_array is not None and hasattr(self._geometry_array, "owned_flat_sindex"):
             return self._geometry_array.owned_flat_sindex()
         return build_owned_spatial_index(np.asarray(self.geometries, dtype=object))
+
+    def _native_spatial_index_for_query(self, *, source_token: str | None = None):
+        """Return cached ``NativeSpatialIndex`` state for this public sindex.
+
+        Physical shape: reusable spatial-index execution state.  Native input
+        carrier is the cached owned-backed ``FlatSpatialIndex``; native output
+        carrier is ``NativeSpatialIndex`` with source-lineage validation by
+        token.  Public callers still export through ``query()``.
+        """
+        _tree_owned, flat_index = self._owned_flat_sindex()
+        flat_index_id = id(flat_index)
+        if (
+            self._native_spatial_index is not None
+            and self._native_spatial_index_source_token == source_token
+            and self._native_spatial_index_flat_index_id == flat_index_id
+        ):
+            return self._native_spatial_index
+        native_index = flat_index.to_native_spatial_index(source_token=source_token)
+        self._native_spatial_index = native_index
+        self._native_spatial_index_source_token = source_token
+        self._native_spatial_index_flat_index_id = flat_index_id
+        return native_index
+
+    def query_relation(
+        self,
+        geometry,
+        *,
+        predicate=None,
+        sort=False,
+        distance=None,
+        source_token: str | None = None,
+        query_token: str | None = None,
+        query_row_count: int | None = None,
+        return_device: bool = True,
+        tree_shapely: np.ndarray | None = None,
+        query_shapely: np.ndarray | None = None,
+        precomputed_query_bounds: np.ndarray | None = None,
+    ):
+        """Query this spatial index as private native relation row flow.
+
+        Physical shape: candidate/predicate pair generation over cached
+        ``NativeSpatialIndex`` state.  Native input carriers are
+        ``NativeSpatialIndex`` plus owned/query geometry or ``NativeFrameState``;
+        the native output carrier is ``NativeRelation``.
+        """
+        native_index = self._native_spatial_index_for_query(
+            source_token=source_token,
+        )
+        if query_row_count is None:
+            query_row_count, _scalar = self._query_cardinality(geometry)
+        return native_index.query_relation(
+            geometry,
+            predicate=predicate,
+            sort=sort,
+            distance=distance,
+            query_token=query_token,
+            query_row_count=query_row_count,
+            return_device=return_device,
+            return_metadata=True,
+            tree_shapely=tree_shapely,
+            query_shapely=query_shapely,
+            precomputed_query_bounds=precomputed_query_bounds,
+        )
+
+    def _query_native_relation_for_public_output(
+        self,
+        raw_geometry,
+        *,
+        predicate,
+        sort,
+        distance,
+        output_format,
+        return_device: bool,
+        raw_box_array_fast_path: bool,
+        precomputed_query_bounds,
+    ):
+        if raw_geometry is None:
+            return None
+        if output_format not in {"indices", "sparse", "dense"}:
+            return None
+        if return_device:
+            # Internal device callers should use query_relation() directly.
+            # The public query() result shape is a NumPy compatibility export.
+            return None
+        query_input = (
+            raw_geometry
+            if raw_box_array_fast_path
+            else self._owned_query_input(raw_geometry)
+        )
+        query_row_count, scalar = self._query_cardinality(raw_geometry)
+        tree_shapely_arr, query_shapely_arr = self._cached_shapely_inputs(raw_geometry)
+        relation, execution = self.query_relation(
+            query_input,
+            predicate=predicate,
+            sort=sort,
+            distance=distance,
+            query_row_count=query_row_count,
+            return_device=True,
+            tree_shapely=tree_shapely_arr,
+            query_shapely=query_shapely_arr,
+            precomputed_query_bounds=precomputed_query_bounds,
+        )
+        indices = self._public_relation_indices_to_host(relation, scalar=scalar)
+        return (
+            self._format_public_relation_output(
+                indices,
+                output_format=output_format,
+                scalar=scalar,
+                query_row_count=query_row_count,
+                tree_row_count=relation.right_row_count,
+            ),
+            execution,
+        )
+
+    @staticmethod
+    def _public_relation_indices_to_host(relation, *, scalar: bool):
+        """Export native relation pairs at the public ``sindex.query`` boundary."""
+        from vibespatial.api._native_result_core import _host_array
+
+        right = _host_array(
+            relation.right_indices,
+            dtype=np.intp,
+            strict_disallowed=False,
+            surface="vibespatial.api.sindex.SpatialIndex._public_relation_indices_to_host",
+            operation="sindex_query_relation_indices_to_host",
+            reason="public sindex.query output needs NumPy index arrays",
+            detail="side=right",
+        )
+        if scalar:
+            return right
+        left = _host_array(
+            relation.left_indices,
+            dtype=np.intp,
+            strict_disallowed=False,
+            surface="vibespatial.api.sindex.SpatialIndex._public_relation_indices_to_host",
+            operation="sindex_query_relation_indices_to_host",
+            reason="public sindex.query output needs NumPy index arrays",
+            detail="side=left",
+        )
+        return np.vstack((left, right))
+
+    @staticmethod
+    def _format_public_relation_output(
+        indices,
+        *,
+        output_format: str,
+        scalar: bool,
+        query_row_count: int,
+        tree_row_count: int,
+    ):
+        if output_format == "indices":
+            return indices
+        if output_format == "sparse":
+            scipy = compat.import_optional_dependency("scipy")
+            if scalar:
+                return scipy.sparse.coo_array(
+                    (np.ones(len(indices), dtype=np.bool_), indices.reshape(1, -1)),
+                    shape=(tree_row_count,),
+                    dtype=np.bool_,
+                )
+            return scipy.sparse.coo_array(
+                (np.ones(len(indices[0]), dtype=np.bool_), indices[::-1]),
+                shape=(tree_row_count, query_row_count),
+                dtype=np.bool_,
+            )
+        if output_format == "dense":
+            if scalar:
+                dense = np.zeros(tree_row_count, dtype=bool)
+                dense[indices] = True
+                return dense
+            dense = np.zeros((tree_row_count, query_row_count), dtype=bool)
+            tree, other = indices[::-1]
+            dense[tree, other] = True
+            return dense
+        return None
+
+    def _query_owned_public(
+        self,
+        raw_geometry,
+        *,
+        predicate,
+        sort,
+        distance,
+        output_format,
+        return_device,
+        raw_box_array_fast_path,
+        precomputed_query_bounds,
+    ):
+        tree_owned, flat_index = self._owned_flat_sindex()
+        query_input = raw_geometry if raw_box_array_fast_path else self._owned_query_input(raw_geometry)
+        # Pass already-materialized Shapely arrays to avoid redundant
+        # to_shapely() in predicate refinement.  Only use arrays that
+        # are ALREADY cached — never trigger eager materialization here.
+        tree_shapely_arr, query_shapely_arr = self._cached_shapely_inputs(raw_geometry)
+        indices, execution = query_spatial_index(
+            tree_owned,
+            flat_index,
+            query_input,
+            predicate=predicate,
+            sort=sort,
+            distance=distance,
+            output_format=output_format,
+            return_metadata=True,
+            return_device=return_device,
+            tree_shapely=tree_shapely_arr,
+            query_shapely=query_shapely_arr,
+            precomputed_query_bounds=precomputed_query_bounds,
+        )
+        record_dispatch_event(
+            surface="geopandas.sindex.query",
+            operation="query",
+            implementation=execution.implementation,
+            reason=execution.reason,
+            detail=f"predicate={predicate!r}, output_format={output_format!r}",
+            requested=execution.requested,
+            selected=execution.selected,
+        )
+        return indices
+
+    def _cached_shapely_inputs(self, raw_geometry):
+        tree_shapely_arr = None
+        if self.geometries is not None:
+            tree_shapely_arr = np.asarray(self.geometries, dtype=object)
+        elif (
+            self._geometry_array is not None
+            and hasattr(self._geometry_array, "_shapely_cache")
+            and self._geometry_array._shapely_cache is not None
+        ):
+            tree_shapely_arr = self._geometry_array._shapely_cache
+        query_shapely_arr = None
+        if isinstance(raw_geometry, geoseries.GeoSeries):
+            ga = raw_geometry.values
+            if hasattr(ga, "_shapely_cache") and ga._shapely_cache is not None:
+                query_shapely_arr = ga._shapely_cache
+        elif isinstance(raw_geometry, array.GeometryArray):
+            if (
+                hasattr(raw_geometry, "_shapely_cache")
+                and raw_geometry._shapely_cache is not None
+            ):
+                query_shapely_arr = raw_geometry._shapely_cache
+        return tree_shapely_arr, query_shapely_arr
+
+    @staticmethod
+    def _query_cardinality(geometry) -> tuple[int, bool]:
+        if isinstance(geometry, BaseGeometry):
+            return 1, True
+        if isinstance(geometry, geoseries.GeoSeries):
+            return len(geometry), False
+        if isinstance(geometry, array.GeometryArray):
+            return len(geometry), False
+        if isinstance(geometry, OwnedGeometryArray):
+            return int(geometry.row_count), False
+        owned = getattr(geometry, "owned", None)
+        if owned is not None:
+            return int(owned.row_count), False
+        if "DeviceGeometryArray" in type(geometry).__name__ and hasattr(geometry, "to_owned"):
+            return int(geometry.to_owned().row_count), False
+        try:
+            return len(geometry), False
+        except TypeError:
+            return 1, True
 
     def _supports_owned_tree_input(self) -> bool:
         if self._geometry_array is not None and hasattr(self._geometry_array, "supports_owned_spatial_input"):
@@ -680,6 +970,48 @@ geometries}
                 if isinstance(query_input, BaseGeometry) or query_input is None:
                     query_input = [query_input] if query_input is not None else query_input
 
+            if tree_owned is not None and query_owned is not None:
+                relation, selected_mode = self.nearest_relation(
+                    raw_geometry,
+                    return_all=return_all,
+                    max_distance=max_distance,
+                    exclusive=exclusive,
+                    query_row_count=query_owned.row_count,
+                )
+                if relation is not None:
+                    result = self._format_public_nearest_relation_output(
+                        relation,
+                        return_distance=return_distance,
+                    )
+                    record_dispatch_event(
+                        surface="geopandas.sindex.nearest",
+                        operation="nearest",
+                        implementation="native_relation_export",
+                        reason=(
+                            "NativeRelation nearest pairs formatted as the "
+                            "public sindex.nearest export"
+                        ),
+                        detail=(
+                            f"max_distance={max_distance!r}, return_all={return_all}, "
+                            f"exclusive={exclusive}"
+                        ),
+                        selected=selected_mode,
+                    )
+                    self._record_public_spatial_export(
+                        surface="geopandas.sindex.nearest",
+                        operation="sindex_nearest",
+                        target="sindex-nearest",
+                        reason=(
+                            "NativeRelation nearest pairs exported to public "
+                            "sindex.nearest result"
+                        ),
+                        output=result,
+                        detail=f"return_distance={return_distance}",
+                    )
+                    if _return_execution_mode:
+                        return result, selected_mode
+                    return result
+
             result, impl = nearest_spatial_index(
                 tree_geoms,
                 query_input,
@@ -703,6 +1035,14 @@ geometries}
                 ),
                 detail=f"max_distance={max_distance!r}, return_all={return_all}, exclusive={exclusive}",
                 selected=selected_mode,
+            )
+            self._record_public_spatial_export(
+                surface="geopandas.sindex.nearest",
+                operation="sindex_nearest",
+                target="sindex-nearest",
+                reason="owned nearest query exported to public sindex.nearest result",
+                output=result,
+                detail=f"return_distance={return_distance}",
             )
             if _return_execution_mode:
                 return result, selected_mode
@@ -739,6 +1079,213 @@ geometries}
             indices, distances = result
             return indices, distances
         return result
+
+    def _has_native_geometry_backing(self) -> bool:
+        values = self._geometry_array
+        if values is None:
+            return False
+        if getattr(values, "_owned", None) is not None:
+            return True
+        if getattr(values, "owned", None) is not None:
+            return True
+        return "DeviceGeometryArray" in type(values).__name__
+
+    @staticmethod
+    def _public_spatial_export_shape(output) -> tuple[int | None, int | None]:
+        if isinstance(output, tuple):
+            row_count = None
+            byte_count = 0
+            for item in output:
+                item_rows, item_bytes = SpatialIndex._public_spatial_export_shape(item)
+                if row_count is None and item_rows is not None:
+                    row_count = item_rows
+                if item_bytes is not None:
+                    byte_count += item_bytes
+            return row_count, byte_count
+        nbytes = getattr(output, "nbytes", None)
+        if nbytes is not None:
+            byte_count = int(nbytes)
+        else:
+            byte_count = None
+        nnz = getattr(output, "nnz", None)
+        if nnz is not None:
+            return int(nnz), byte_count
+        shape = getattr(output, "shape", None)
+        if shape is not None:
+            if len(shape) == 2 and shape[0] == 2:
+                return int(shape[1]), byte_count
+            size = getattr(output, "size", None)
+            if size is not None:
+                return int(size), byte_count
+        try:
+            return len(output), byte_count
+        except TypeError:
+            return None, byte_count
+
+    def _record_public_spatial_export(
+        self,
+        *,
+        surface: str,
+        operation: str,
+        target: str,
+        reason: str,
+        output,
+        detail: str,
+    ) -> None:
+        if not self._has_native_geometry_backing():
+            return
+        row_count, byte_count = self._public_spatial_export_shape(output)
+        record_native_export_boundary(NativeExportBoundary(
+            surface=surface,
+            operation=operation,
+            target=target,
+            reason=reason,
+            row_count=row_count,
+            byte_count=byte_count,
+            detail=detail,
+            d2h_transfer=True,
+        ))
+
+    @staticmethod
+    def _format_public_nearest_relation_output(relation, *, return_distance: bool):
+        from vibespatial.api._native_result_core import _host_array
+
+        left = _host_array(
+            relation.left_indices,
+            dtype=np.intp,
+            strict_disallowed=False,
+            surface="vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output",
+            operation="nearest_relation_indices_to_host",
+            reason="public nearest query output needs NumPy index arrays",
+            detail="side=left",
+        )
+        right = _host_array(
+            relation.right_indices,
+            dtype=np.intp,
+            strict_disallowed=False,
+            surface="vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output",
+            operation="nearest_relation_indices_to_host",
+            reason="public nearest query output needs NumPy index arrays",
+            detail="side=right",
+        )
+        indices = np.vstack((left, right))
+        if not return_distance:
+            return indices
+        distances = _host_array(
+            relation.distances,
+            dtype=np.float64,
+            strict_disallowed=False,
+            surface="vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output",
+            operation="nearest_relation_distances_to_host",
+            reason="public nearest query output requested NumPy distances",
+        )
+        return indices, distances
+
+    def nearest_relation(
+        self,
+        geometry,
+        *,
+        return_all=True,
+        max_distance=None,
+        exclusive=False,
+        source_token: str | None = None,
+        query_token: str | None = None,
+        query_row_count: int | None = None,
+    ):
+        """Return nearest query output as private ``NativeRelation`` state.
+
+        Physical shape: nearest candidate/refine relation production.  Native
+        input carriers are owned query/tree geometry buffers; the native output
+        carrier is ``NativeRelation`` with device pair arrays and fp64 device
+        distances.  Public nearest callers still use ``nearest()`` and export
+        NumPy arrays at the compatibility boundary.
+        """
+        if not self._supports_owned_query_input(geometry):
+            return None, ExecutionMode.CPU
+
+        def _existing_or_owned(values):
+            if values is None:
+                return None
+            owned = getattr(values, "_owned", None)
+            if owned is not None:
+                return owned
+            if isinstance(values, OwnedGeometryArray):
+                return values
+            if hasattr(values, "to_owned"):
+                return values.to_owned()
+            return None
+
+        query_values_obj = None
+        if isinstance(geometry, geoseries.GeoSeries):
+            query_values_obj = geometry.values
+        elif isinstance(geometry, array.GeometryArray | OwnedGeometryArray):
+            query_values_obj = geometry
+        elif "DeviceGeometryArray" in type(geometry).__name__:
+            query_values_obj = geometry
+
+        tree_owned = _existing_or_owned(self._geometry_array)
+        query_owned = _existing_or_owned(query_values_obj)
+        if tree_owned is None or query_owned is None:
+            return None, ExecutionMode.CPU
+
+        result, impl = nearest_spatial_index(
+            None,
+            None,
+            tree_query_nearest=lambda *args, **kwargs: None,
+            return_all=return_all,
+            max_distance=max_distance,
+            return_distance=True,
+            exclusive=exclusive,
+            tree_owned=tree_owned,
+            query_owned=query_owned,
+            return_device=True,
+        )
+        selected_mode = ExecutionMode.GPU if "gpu" in impl else ExecutionMode.CPU
+        if result is None or selected_mode is not ExecutionMode.GPU:
+            return None, selected_mode
+
+        (left_indices, right_indices), distances = result
+        if not (
+            hasattr(left_indices, "__cuda_array_interface__")
+            and hasattr(right_indices, "__cuda_array_interface__")
+            and hasattr(distances, "__cuda_array_interface__")
+        ):
+            return None, selected_mode
+
+        if query_row_count is None:
+            query_row_count, _scalar = self._query_cardinality(geometry)
+
+        record_dispatch_event(
+            surface="geopandas.sindex.nearest",
+            operation="nearest_relation",
+            implementation=impl,
+            reason=(
+                "nearest query produced device NativeRelation pairs and "
+                "distance expression input"
+            ),
+            detail=(
+                f"max_distance={max_distance!r}, return_all={return_all}, "
+                f"exclusive={exclusive}"
+            ),
+            selected=selected_mode,
+        )
+
+        from vibespatial.api._native_relation import NativeRelation
+
+        return (
+            NativeRelation(
+                left_indices=left_indices,
+                right_indices=right_indices,
+                left_token=query_token,
+                right_token=source_token,
+                predicate="nearest",
+                distances=distances,
+                left_row_count=query_row_count,
+                right_row_count=tree_owned.row_count,
+                sorted_by_left=True,
+            ),
+            selected_mode,
+        )
 
     def intersection(self, coordinates):
         """Compatibility wrapper for rtree.index.Index.intersection,

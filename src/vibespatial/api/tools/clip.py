@@ -30,6 +30,7 @@ from vibespatial.api.geometry_array import (
 from vibespatial.api.geometry_array import (
     from_shapely as _geometryarray_from_shapely,
 )
+from vibespatial.cuda._runtime import get_cuda_runtime
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime._runtime import has_gpu_runtime
@@ -42,6 +43,129 @@ _POLYGON_MASK_RECT_VALIDATED_MIN_ROWS = 128
 _POLYGON_MASK_HOST_INTERSECTS_REPAIR_MAX_ROWS = 256
 _DEVICE_CLIP_GEOM_TYPES = POINT_GEOM_TYPES | LINE_GEOM_TYPES | POLYGON_GEOM_TYPES
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ClipFamilyMasks:
+    point: np.ndarray
+    line: np.ndarray
+    multiline: np.ndarray
+    simple_line: np.ndarray
+    polygon: np.ndarray
+    non_point: np.ndarray
+    generic: np.ndarray
+    all_point: bool
+    all_polygon: bool
+    all_polygonal: bool
+
+
+def _spatial_geometry(spatial):
+    return spatial.geometry if isinstance(spatial, GeoDataFrame) else spatial
+
+
+def _spatial_values(spatial):
+    return _spatial_geometry(spatial).values
+
+
+def _spatial_owned(spatial):
+    values = _spatial_values(spatial)
+    return getattr(values, "_owned", None) or getattr(values, "owned", None)
+
+
+def _clip_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
+    return np.asarray(get_cuda_runtime().copy_device_to_host(device_array, reason=reason))
+
+
+def _clip_bool_scalar(value: object, *, reason: str) -> bool:
+    import cupy as cp
+
+    return bool(_clip_device_to_host(cp.asarray(value).reshape(1), reason=reason)[0])
+
+
+def _spatial_total_bounds_private(spatial) -> np.ndarray:
+    """Return total bounds without recording a public bounds export."""
+    values = _spatial_values(spatial)
+    if isinstance(values, GeometryArray | DeviceGeometryArray) or getattr(values, "_owned", None) is not None:
+        return np.asarray(values.total_bounds, dtype=np.float64)
+    return np.asarray(_spatial_geometry(spatial).total_bounds, dtype=np.float64)
+
+
+def _owned_supported_clip_families(owned) -> bool:
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    supported = {
+        GeometryFamily.POINT,
+        GeometryFamily.MULTIPOINT,
+        GeometryFamily.LINESTRING,
+        GeometryFamily.MULTILINESTRING,
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+    }
+    return set(owned.families).issubset(supported)
+
+
+def _clip_family_masks(spatial) -> _ClipFamilyMasks:
+    """Return clip routing masks from private owned tags when available."""
+    owned = _spatial_owned(spatial)
+    if owned is not None:
+        from vibespatial.geometry.buffers import GeometryFamily
+        from vibespatial.geometry.owned import FAMILY_TAGS
+
+        tags = np.asarray(owned.tags)
+        row_count = int(tags.size)
+        point = tags == FAMILY_TAGS[GeometryFamily.POINT]
+        line = (
+            (tags == FAMILY_TAGS[GeometryFamily.LINESTRING])
+            | (tags == FAMILY_TAGS[GeometryFamily.MULTILINESTRING])
+        )
+        multiline = tags == FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
+        polygon = (
+            (tags == FAMILY_TAGS[GeometryFamily.POLYGON])
+            | (tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
+        )
+        simple_line = line & ~multiline
+        non_point = ~point
+        generic = non_point & ~(simple_line | multiline | polygon)
+        return _ClipFamilyMasks(
+            point=point,
+            line=line,
+            multiline=multiline,
+            simple_line=simple_line,
+            polygon=polygon,
+            non_point=non_point,
+            generic=generic,
+            all_point=bool(row_count == 0 or np.all(point)),
+            all_polygon=bool(
+                row_count > 0
+                and np.all(tags == FAMILY_TAGS[GeometryFamily.POLYGON])
+            ),
+            all_polygonal=bool(row_count == 0 or np.all(polygon)),
+        )
+
+    geom_types = _spatial_geometry(spatial).geom_type
+    point = np.asarray(geom_types == "Point", dtype=bool)
+    line = np.asarray(geom_types.isin(LINE_GEOM_TYPES), dtype=bool)
+    multiline = np.asarray(geom_types == "MultiLineString", dtype=bool)
+    polygon = np.asarray(geom_types.isin(POLYGON_GEOM_TYPES), dtype=bool)
+    simple_line = line & ~multiline
+    non_point = ~point
+    generic = non_point & ~(simple_line | multiline | polygon)
+    return _ClipFamilyMasks(
+        point=point,
+        line=line,
+        multiline=multiline,
+        simple_line=simple_line,
+        polygon=polygon,
+        non_point=non_point,
+        generic=generic,
+        all_point=bool(point.size == 0 or np.all(point)),
+        all_polygon=bool(point.size > 0 and np.all(np.asarray(geom_types == "Polygon", dtype=bool))),
+        all_polygonal=bool(polygon.size == 0 or np.all(polygon)),
+    )
+
+
+def _spatial_all_polygonal_private(spatial) -> bool:
+    return _clip_family_masks(spatial).all_polygonal
 
 
 def _maybe_seed_polygon_validity_cache(spatial) -> None:
@@ -136,7 +260,7 @@ def _bbox_candidate_rows_for_scalar_clip_mask(
     if isinstance(query_input, GeoDataFrame | GeoSeries):
         if len(query_input) != 1:
             return None
-        query_bounds = np.asarray(query_input.total_bounds, dtype=np.float64)
+        query_bounds = _spatial_total_bounds_private(query_input)
     elif isinstance(query_input, Polygon | MultiPolygon):
         query_bounds = np.asarray(query_input.bounds, dtype=np.float64)
     else:
@@ -208,13 +332,20 @@ def _bbox_candidate_rows_for_scalar_clip_mask(
                 & (d_bounds[:, 3] >= ymin)
             )
             d_rows = cp.flatnonzero(d_overlap_mask).astype(cp.int32, copy=False)
-            rows = cp.asnumpy(d_rows).astype(np.int32, copy=False)
+            runtime = get_cuda_runtime()
+            rows = runtime.copy_device_to_host(
+                d_rows,
+                reason="clip scalar-mask candidate rows host export",
+            ).astype(np.int32, copy=False)
             if rows.size <= 1:
                 return rows
             if sort:
                 order = np.argsort(np.asarray(gdf.index.take(rows)), kind="stable")
                 return rows[order].astype(np.int32, copy=False)
-            candidate_bounds = cp.asnumpy(d_bounds[d_rows]).reshape(-1, 4)
+            candidate_bounds = runtime.copy_device_to_host(
+                d_bounds[d_rows],
+                reason="clip scalar-mask candidate bounds host export",
+            ).reshape(-1, 4)
             order = np.lexsort(
                 (
                     rows,
@@ -245,7 +376,11 @@ def _bbox_candidate_rows_for_scalar_clip_mask(
     if len(gdf) > 50_000:
         return None
 
-    source_bounds = np.asarray(geometry.bounds, dtype=np.float64)
+    values = geometry.values
+    if isinstance(values, GeometryArray | DeviceGeometryArray) or getattr(values, "_owned", None) is not None:
+        source_bounds = np.asarray(values.bounds, dtype=np.float64)
+    else:
+        source_bounds = np.asarray(geometry.bounds, dtype=np.float64)
     if source_bounds.ndim != 2 or source_bounds.shape[1] != 4:
         return None
 
@@ -299,6 +434,9 @@ def _geometry_column_series(values, *, index, crs, name):
 def _clip_partition_supports_device_promotion(partition) -> bool:
     if not isinstance(partition, GeoDataFrame | GeoSeries):
         return False
+    owned = _spatial_owned(partition)
+    if owned is not None:
+        return _owned_supported_clip_families(owned)
     geom_types = partition.geom_type
     supported_mask = geom_types.isna() | geom_types.isin(_DEVICE_CLIP_GEOM_TYPES)
     return bool(np.asarray(supported_mask, dtype=bool).all())
@@ -360,7 +498,10 @@ def _take_spatial_rows(spatial, keep_mask):
         except ModuleNotFoundError:  # pragma: no cover - guarded by runtime
             cp = None
         if cp is not None:
-            taken_owned = owned.device_take(cp.asarray(keep_rows, dtype=cp.int64))
+            taken_owned = owned.device_take(
+                cp.asarray(keep_rows, dtype=cp.int64),
+                host_indices_for_sizing=np.asarray(keep_rows, dtype=np.int64),
+            )
         else:
             taken_owned = owned.take(keep_rows)
     else:
@@ -472,9 +613,10 @@ def _seed_rectangle_clip_validity_cache_if_safe(result_owned, source_values) -> 
             if device_bounds is None:
                 return
             xmin, ymin, xmax, ymax = device_bounds
-            valid_rectangles = bool(
-                ((xmax - xmin) > SPATIAL_EPSILON).all().item()
-                and ((ymax - ymin) > SPATIAL_EPSILON).all().item()
+            valid_rectangles = _clip_bool_scalar(
+                ((xmax - xmin) > SPATIAL_EPSILON).all()
+                & ((ymax - ymin) > SPATIAL_EPSILON).all(),
+                reason="clip rectangle source positive-span scalar fence",
             )
         except Exception:
             return
@@ -1366,11 +1508,13 @@ def _clip_validated_polygon_rect_mask_intersection_owned(
     boundary_overlap = getattr(fast_owned, "_polygon_rect_boundary_overlap", None)
     boundary_repair_mask = None
     if boundary_overlap is not None:
-        boundary_repair_mask = (
-            boundary_overlap.get()
-            if hasattr(boundary_overlap, "get")
-            else np.asarray(boundary_overlap, dtype=bool)
-        )
+        if hasattr(boundary_overlap, "get"):
+            boundary_repair_mask = get_cuda_runtime().copy_device_to_host(
+                boundary_overlap,
+                reason="clip polygon boundary-overlap repair mask export",
+            )
+        else:
+            boundary_repair_mask = np.asarray(boundary_overlap, dtype=bool)
         boundary_repair_mask = np.asarray(boundary_repair_mask, dtype=bool)
         if boundary_repair_mask.size != fast_owned.row_count:
             boundary_repair_mask = None
@@ -1399,8 +1543,14 @@ def _clip_validated_polygon_rect_mask_intersection_owned(
         return fast_owned
 
     d_repair_rows = cp.asarray(repair_rows, dtype=cp.int64)
-    repair_fast_owned = fast_owned.device_take(d_repair_rows)
-    repair_rect_owned = rect_owned.device_take(d_repair_rows)
+    repair_fast_owned = fast_owned.device_take(
+        d_repair_rows,
+        host_indices_for_sizing=np.asarray(repair_rows, dtype=np.int64),
+    )
+    repair_rect_owned = rect_owned.device_take(
+        d_repair_rows,
+        host_indices_for_sizing=np.asarray(repair_rows, dtype=np.int64),
+    )
     repair_owned = polygon_rect_split_boundary_components(
         repair_fast_owned,
         repair_rect_owned,
@@ -1880,7 +2030,13 @@ def _owned_nonempty_polygon_mask(owned) -> np.ndarray:
             )
             d_areas = _area_gpu_device_fp64(owned)
             d_keep = d_validity & d_polygonal_mask & cp.isfinite(d_areas) & (d_areas > 0.0)
-            return np.asarray(get_cuda_runtime().copy_device_to_host(d_keep), dtype=bool)
+            return np.asarray(
+                get_cuda_runtime().copy_device_to_host(
+                    d_keep,
+                    reason="clip keep-geometry-type polygonal positive-area mask host export",
+                ),
+                dtype=bool,
+            )
 
     from vibespatial.constructive.measurement import area_owned
 
@@ -2360,8 +2516,9 @@ def _clip_polygon_partition_with_polygon_mask(
     if has_gpu_runtime() and left_owned.residency is Residency.DEVICE:
         from vibespatial.geometry.owned import materialize_broadcast, tile_single_row
         from vibespatial.predicates.binary import (
-            _evaluate_binary_predicates_fused_gpu,
-            _evaluate_covered_by_single_polygonal_mask_gpu,
+            _evaluate_covered_by_single_polygonal_mask_device,
+            binary_predicate_expression,
+            binary_predicate_expressions,
             evaluate_binary_predicate,
         )
         from vibespatial.runtime import ExecutionMode
@@ -2377,7 +2534,10 @@ def _clip_polygon_partition_with_polygon_mask(
             if owned.residency is Residency.DEVICE:
                 import cupy as cp
 
-                return owned.device_take(cp.asarray(rows, dtype=cp.int64))
+                return owned.device_take(
+                    cp.asarray(rows, dtype=cp.int64),
+                    host_indices_for_sizing=np.asarray(rows, dtype=np.int64),
+                )
             return owned.take(rows)
 
         def _all_candidate_bounds_within_single_mask_bounds() -> bool:
@@ -2402,26 +2562,53 @@ def _clip_polygon_partition_with_polygon_mask(
                 & (left_bounds[:, 1] >= mask_bounds[1])
                 & (left_bounds[:, 3] <= mask_bounds[3])
             )
-            return bool(cp.all(within_bounds | ~left_valid))
+            return _clip_bool_scalar(
+                cp.all(within_bounds | ~left_valid),
+                reason="clip single-mask candidate bounds coverage scalar fence",
+            )
 
         inside_rows = np.asarray([], dtype=np.intp)
         exact_rows = np.asarray([], dtype=np.intp)
         if left_owned.row_count == 1 and not source_missing[0] and not strict_native:
             exact_rows = np.asarray([0], dtype=np.intp)
         else:
-            single_mask_covered_by = (
-                _evaluate_covered_by_single_polygonal_mask_gpu(left_owned, mask_owned)
+            d_single_mask_covered_by = (
+                _evaluate_covered_by_single_polygonal_mask_device(left_owned, mask_owned)
                 if _all_candidate_bounds_within_single_mask_bounds()
                 else None
             )
-            if single_mask_covered_by is not None:
-                covered_mask = np.asarray(single_mask_covered_by, dtype=bool)
-                valid_source_mask = ~source_missing
-                inside_rows = np.flatnonzero(valid_source_mask & covered_mask).astype(
-                    np.intp,
-                    copy=False,
+            if d_single_mask_covered_by is not None:
+                from vibespatial.api._native_expression import NativeExpression
+                from vibespatial.api._native_rowset import NativeRowSet
+
+                source_token = f"clip-polygon-single-mask:{id(left_owned)}"
+                covered_expression = NativeExpression(
+                    operation="clip.polygon_single_mask.covered_by",
+                    values=d_single_mask_covered_by,
+                    source_token=source_token,
+                    source_row_count=left_owned.row_count,
+                    dtype=str(getattr(d_single_mask_covered_by, "dtype", "bool")),
+                    precision="predicate",
                 )
-                remaining_rows = np.flatnonzero(valid_source_mask & ~covered_mask).astype(
+                source_rowset = NativeRowSet.from_positions(
+                    np.flatnonzero(~source_missing).astype(np.int64, copy=False),
+                    source_token=source_token,
+                    source_row_count=left_owned.row_count,
+                    ordered=True,
+                    unique=True,
+                )
+                inside_rowset = source_rowset.intersection(
+                    covered_expression.equal_to(True)
+                )
+                remaining_rowset = source_rowset.difference(inside_rowset)
+                inside_rows = inside_rowset.to_host_positions(
+                    surface="vibespatial.api.tools.clip.polygon_single_mask_inside_rows",
+                    strict_disallowed=False,
+                ).astype(np.intp, copy=False)
+                remaining_rows = remaining_rowset.to_host_positions(
+                    surface="vibespatial.api.tools.clip.polygon_single_mask_remaining_rows",
+                    strict_disallowed=False,
+                ).astype(
                     np.intp,
                     copy=False,
                 )
@@ -2434,16 +2621,37 @@ def _clip_polygon_partition_with_polygon_mask(
                             tile_single_row(mask_owned, remaining_owned.row_count),
                         )
                     )
-                    remaining_intersects = np.asarray(
-                        evaluate_binary_predicate(
-                            "intersects",
-                            remaining_owned,
-                            broadcast_remaining_mask,
-                            dispatch_mode=ExecutionMode.GPU,
-                        ).values,
-                        dtype=bool,
+                    remaining_intersects_expression = binary_predicate_expression(
+                        "intersects",
+                        remaining_owned,
+                        broadcast_remaining_mask,
+                        source_token=f"{source_token}:remaining",
+                        operation="clip.polygon_single_mask.remaining_intersects",
                     )
-                    exact_rows = remaining_rows[remaining_intersects]
+                    if remaining_intersects_expression is not None:
+                        exact_local_rows = (
+                            remaining_intersects_expression.equal_to(True)
+                            .to_host_positions(
+                                surface=(
+                                    "vibespatial.api.tools.clip."
+                                    "polygon_single_mask_exact_local_rows"
+                                ),
+                                strict_disallowed=False,
+                            )
+                            .astype(np.intp, copy=False)
+                        )
+                        exact_rows = remaining_rows[exact_local_rows]
+                    else:
+                        remaining_intersects = np.asarray(
+                            evaluate_binary_predicate(
+                                "intersects",
+                                remaining_owned,
+                                broadcast_remaining_mask,
+                                dispatch_mode=ExecutionMode.GPU,
+                            ).values,
+                            dtype=bool,
+                        )
+                        exact_rows = remaining_rows[remaining_intersects]
             else:
                 broadcast_all_mask = (
                     mask_owned
@@ -2452,23 +2660,39 @@ def _clip_polygon_partition_with_polygon_mask(
                         tile_single_row(mask_owned, left_owned.row_count),
                     )
                 )
-                fused_masks = _evaluate_binary_predicates_fused_gpu(
+                source_token = f"clip-polygon-mask:{id(left_owned)}"
+                predicate_expressions = binary_predicate_expressions(
                     ("intersects", "covered_by"),
                     left_owned,
                     broadcast_all_mask,
+                    source_token=source_token,
+                    operation_prefix="clip.polygon_mask",
                 )
-                if fused_masks is not None:
-                    intersects_mask = np.asarray(fused_masks["intersects"], dtype=bool)
-                    inside_mask = np.asarray(fused_masks["covered_by"], dtype=bool)
-                    hit_mask = ~source_missing & intersects_mask
-                    inside_rows = np.flatnonzero(hit_mask & inside_mask).astype(
-                        np.intp,
-                        copy=False,
-                    )
-                    exact_rows = np.flatnonzero(hit_mask & ~inside_mask).astype(
-                        np.intp,
-                        copy=False,
-                    )
+                if predicate_expressions is not None:
+                    hit_rowset = predicate_expressions["intersects"].equal_to(True)
+                    inside_rowset = predicate_expressions["covered_by"].equal_to(True)
+                    if source_missing.any():
+                        from vibespatial.api._native_rowset import NativeRowSet
+
+                        source_rowset = NativeRowSet.from_positions(
+                            np.flatnonzero(~source_missing).astype(np.int64, copy=False),
+                            source_token=source_token,
+                            source_row_count=left_owned.row_count,
+                            ordered=True,
+                            unique=True,
+                        )
+                        hit_rowset = hit_rowset.intersection(source_rowset)
+                        inside_rowset = inside_rowset.intersection(source_rowset)
+                    inside_rowset = hit_rowset.intersection(inside_rowset)
+                    exact_rowset = hit_rowset.difference(inside_rowset)
+                    inside_rows = inside_rowset.to_host_positions(
+                        surface="vibespatial.api.tools.clip.polygon_mask_inside_rows",
+                        strict_disallowed=False,
+                    ).astype(np.intp, copy=False)
+                    exact_rows = exact_rowset.to_host_positions(
+                        surface="vibespatial.api.tools.clip.polygon_mask_exact_rows",
+                        strict_disallowed=False,
+                    ).astype(np.intp, copy=False)
                 else:
                     intersects_mask = np.asarray(
                         evaluate_binary_predicate(
@@ -2507,6 +2731,9 @@ def _clip_polygon_partition_with_polygon_mask(
         exact_area_owned = None
         exact_area_values = None
         exact_positive_local = np.asarray([], dtype=bool)
+        cached_correction_local_rows = None
+        cached_correction_assembled = None
+        cached_correction_area_objects = None
 
         def _ensure_exact_area_values():
             nonlocal exact_area_values
@@ -2530,6 +2757,27 @@ def _clip_polygon_partition_with_polygon_mask(
             if values is None:
                 return np.asarray([], dtype=object)
             return np.asarray(values.take(local_rows), dtype=object)
+
+        def _cached_correction_objects_for_rows(local_rows: np.ndarray):
+            if (
+                cached_correction_local_rows is None
+                or cached_correction_assembled is None
+                or local_rows.size == 0
+            ):
+                return None, None
+            positions = np.searchsorted(cached_correction_local_rows, local_rows)
+            if (
+                positions.size != local_rows.size
+                or np.any(positions >= cached_correction_local_rows.size)
+                or np.any(cached_correction_local_rows[positions] != local_rows)
+            ):
+                return None, None
+            area_objects = (
+                None
+                if cached_correction_area_objects is None
+                else cached_correction_area_objects[positions]
+            )
+            return cached_correction_assembled[positions], area_objects
 
         if exact_rows.size > 0:
             exact_area_owned = _clip_polygon_area_intersection_owned(
@@ -2572,7 +2820,7 @@ def _clip_polygon_partition_with_polygon_mask(
                         exact_positive_local[positive_local_rows[collapsed_positive]] = False
                 boundary_local_rows = np.flatnonzero(~exact_positive_local).astype(np.intp, copy=False)
                 exact_area_objects = None
-                if keep_geom_type_only or exact_rows.size <= 128:
+                if keep_geom_type_only:
                     exact_area_objects = np.asarray(
                         _ensure_exact_area_values(),
                         dtype=object,
@@ -2616,34 +2864,86 @@ def _clip_polygon_partition_with_polygon_mask(
                         left_pairs,
                         repeated_mask,
                     )
-                    area_subset_objects = (
-                        exact_area_objects[correction_local_rows]
-                        if exact_area_objects is not None
-                        else _exact_area_objects_for_rows(correction_local_rows)
+                    contains_collection = any(
+                        geom is not None and getattr(geom, "geom_type", None) == "GeometryCollection"
+                        for geom in assembled_exact
                     )
-                    changed_mask = np.ones(correction_local_rows.size, dtype=bool)
-                    for row_index, (assembled_geom, area_geom) in enumerate(
-                        zip(assembled_exact, area_subset_objects, strict=True)
-                    ):
-                        if _clip_boundary_row_matches_area(assembled_geom, area_geom):
-                            changed_mask[row_index] = False
-                    changed_local_rows = correction_local_rows[changed_mask]
-                    if changed_local_rows.size > 0:
-                        changed_geoms = assembled_exact[changed_mask]
-                        contains_collection = any(
-                            geom is not None and getattr(geom, "geom_type", None) == "GeometryCollection"
-                            for geom in changed_geoms
+                    if exact_area_owned is not None and not contains_collection:
+                        replacement_owned = from_shapely_geometries(
+                            assembled_exact.tolist(),
+                            residency=exact_area_owned.residency,
                         )
-                        if contains_collection:
-                            if keep_geom_type_only:
-                                from vibespatial.api.tools.overlay import (
-                                    _strip_non_polygon_collection_parts,
-                                )
+                        exact_area_owned = concat_owned_scatter(
+                            exact_area_owned,
+                            replacement_owned,
+                            correction_local_rows,
+                        )
+                        exact_area_values = None
+                        exact_area_mutated = True
+                        cached_correction_local_rows = correction_local_rows
+                        cached_correction_assembled = assembled_exact
+                        cached_correction_area_objects = assembled_exact
+                    else:
+                        area_subset_objects = (
+                            exact_area_objects[correction_local_rows]
+                            if exact_area_objects is not None
+                            else _exact_area_objects_for_rows(correction_local_rows)
+                        )
+                        cached_correction_local_rows = correction_local_rows
+                        cached_correction_assembled = assembled_exact
+                        cached_correction_area_objects = area_subset_objects
+                        changed_mask = np.ones(correction_local_rows.size, dtype=bool)
+                        for row_index, (assembled_geom, area_geom) in enumerate(
+                            zip(assembled_exact, area_subset_objects, strict=True)
+                        ):
+                            if _clip_boundary_row_matches_area(assembled_geom, area_geom):
+                                changed_mask[row_index] = False
+                        changed_local_rows = correction_local_rows[changed_mask]
+                        if changed_local_rows.size > 0:
+                            changed_geoms = assembled_exact[changed_mask]
+                            contains_collection = any(
+                                geom is not None and getattr(geom, "geom_type", None) == "GeometryCollection"
+                                for geom in changed_geoms
+                            )
+                            if contains_collection:
+                                if keep_geom_type_only:
+                                    from vibespatial.api.tools.overlay import (
+                                        _strip_non_polygon_collection_parts,
+                                    )
 
+                                    replacement_owned = from_shapely_geometries(
+                                        _strip_non_polygon_collection_parts(
+                                            changed_geoms,
+                                        ).tolist(),
+                                        residency=exact_area_owned.residency,
+                                    )
+                                    exact_area_owned = concat_owned_scatter(
+                                        exact_area_owned,
+                                        replacement_owned,
+                                        changed_local_rows,
+                                    )
+                                    exact_area_values = _geometry_values_from_owned(
+                                        exact_area_owned,
+                                        crs=partition.crs,
+                                    )
+                                    exact_area_mutated = True
+                                else:
+                                    if exact_area_objects is None:
+                                        exact_area_objects = np.asarray(
+                                            _ensure_exact_area_values(),
+                                            dtype=object,
+                                        )
+                                    corrected_exact = exact_area_objects.copy()
+                                    corrected_exact[correction_local_rows] = assembled_exact
+                                    exact_area_owned = None
+                                    exact_area_values = _as_geometry_values(
+                                        corrected_exact,
+                                        crs=partition.crs,
+                                    )
+                                    exact_area_mutated = True
+                            else:
                                 replacement_owned = from_shapely_geometries(
-                                    _strip_non_polygon_collection_parts(
-                                        changed_geoms,
-                                    ).tolist(),
+                                    changed_geoms.tolist(),
                                     residency=exact_area_owned.residency,
                                 )
                                 exact_area_owned = concat_owned_scatter(
@@ -2651,37 +2951,8 @@ def _clip_polygon_partition_with_polygon_mask(
                                     replacement_owned,
                                     changed_local_rows,
                                 )
-                                exact_area_values = _geometry_values_from_owned(
-                                    exact_area_owned,
-                                    crs=partition.crs,
-                                )
+                                exact_area_values = None
                                 exact_area_mutated = True
-                            else:
-                                if exact_area_objects is None:
-                                    exact_area_objects = np.asarray(
-                                        _ensure_exact_area_values(),
-                                        dtype=object,
-                                    )
-                                corrected_exact = exact_area_objects.copy()
-                                corrected_exact[correction_local_rows] = assembled_exact
-                                exact_area_owned = None
-                                exact_area_values = _as_geometry_values(
-                                    corrected_exact,
-                                    crs=partition.crs,
-                                )
-                                exact_area_mutated = True
-                        else:
-                            replacement_owned = from_shapely_geometries(
-                                changed_geoms.tolist(),
-                                residency=exact_area_owned.residency,
-                            )
-                            exact_area_owned = concat_owned_scatter(
-                                exact_area_owned,
-                                replacement_owned,
-                                changed_local_rows,
-                            )
-                            exact_area_values = None
-                            exact_area_mutated = True
                 if exact_area_owned is not None:
                     if exact_area_mutated:
                         exact_positive_local = _owned_nonempty_polygon_mask(exact_area_owned)
@@ -2767,14 +3038,19 @@ def _clip_polygon_partition_with_polygon_mask(
                 return sparse_result.geometry_values
             return sparse_result
 
-        left_pairs = _take_geometry_object_values(source_values, boundary_rows)
-        area_objects = _exact_area_objects_for_rows(boundary_local_rows)
-        repeated_mask = np.empty(boundary_rows.size, dtype=object)
-        repeated_mask[:] = mask
-        assembled_boundary = _exact_polygon_clip_boundary_rows(
-            left_pairs,
-            repeated_mask,
+        assembled_boundary, area_objects = _cached_correction_objects_for_rows(
+            boundary_local_rows,
         )
+        if assembled_boundary is None:
+            left_pairs = _take_geometry_object_values(source_values, boundary_rows)
+            repeated_mask = np.empty(boundary_rows.size, dtype=object)
+            repeated_mask[:] = mask
+            assembled_boundary = _exact_polygon_clip_boundary_rows(
+                left_pairs,
+                repeated_mask,
+            )
+        if area_objects is None:
+            area_objects = _exact_area_objects_for_rows(boundary_local_rows)
 
         contains_collection = any(
             geom is not None and getattr(geom, "geom_type", None) == "GeometryCollection"
@@ -3085,7 +3361,10 @@ def _clip_homogeneous_polygon_candidates_native(
     ):
         candidate_owned = owned
     else:
-        candidate_owned = owned.device_take(cp.asarray(rows, dtype=cp.int64))
+        candidate_owned = owned.device_take(
+            cp.asarray(rows, dtype=cp.int64),
+            host_indices_for_sizing=np.asarray(rows, dtype=np.int64),
+        )
 
     candidate_values = DeviceGeometryArray._from_owned(candidate_owned, crs=geometry.crs)
     partition = _geometry_series_from_values(
@@ -3196,26 +3475,26 @@ def _clip_gdf_with_mask_native(
 
     gdf_sub = gdf.iloc[candidate_rows]
 
-    geom_types = gdf_sub.geom_type
-    point_mask = geom_types == "Point"
-    non_point_mask = ~point_mask
-    line_mask = geom_types.isin(LINE_GEOM_TYPES)
-    multiline_mask = geom_types == "MultiLineString"
-    simple_line_mask = line_mask & ~multiline_mask
-    polygon_mask = geom_types.isin(POLYGON_GEOM_TYPES)
-    generic_mask = non_point_mask & ~(simple_line_mask | multiline_mask | polygon_mask)
+    family_masks = _clip_family_masks(gdf_sub)
+    point_mask = family_masks.point
+    non_point_mask = family_masks.non_point
+    multiline_mask = family_masks.multiline
+    simple_line_mask = family_masks.simple_line
+    polygon_mask = family_masks.polygon
+    generic_mask = family_masks.generic
     rectangle_cleanup_safe = bool(
         rectangle_bounds is not None
         and (
             clipping_by_rectangle
-            or (len(gdf_sub) > 0 and (geom_types == "Polygon").all())
+            or family_masks.all_polygon
         )
     )
 
     def _clip_partition_values(partition, *, use_rect_fast_path=False):
+        partition_families = _clip_family_masks(partition)
         if (
             not clipping_by_rectangle
-            and (partition.geom_type == "Point").all()
+            and partition_families.all_point
         ):
             return _clip_point_partition_with_polygon_mask(
                 partition,
@@ -3224,7 +3503,7 @@ def _clip_gdf_with_mask_native(
         if (
             rectangle_bounds is not None
             and keep_geom_type
-            and partition.geom_type.isin(POLYGON_GEOM_TYPES).all()
+            and partition_families.all_polygonal
         ):
             return _clip_polygon_partition_with_rectangle_mask(
                 partition,
@@ -3233,12 +3512,12 @@ def _clip_gdf_with_mask_native(
             )
         if (
             rectangle_bounds is not None
-            and (partition.geom_type == "Polygon").all()
+            and partition_families.all_polygon
         ):
             return _clip_polygon_partition_with_rectangle_mask(partition, rectangle_bounds)
         if (
             rectangle_bounds is not None
-            and partition.geom_type.isin(POLYGON_GEOM_TYPES).all()
+            and partition_families.all_polygonal
         ):
             return _clip_complex_polygon_partition_with_rectangle_mask(
                 partition,
@@ -3246,7 +3525,7 @@ def _clip_gdf_with_mask_native(
             )
 
         if isinstance(partition, GeoDataFrame):
-            if not clipping_by_rectangle and partition.geom_type.isin(POLYGON_GEOM_TYPES).all():
+            if not clipping_by_rectangle and partition_families.all_polygonal:
                 return _clip_polygon_partition_with_polygon_mask(
                     partition,
                     mask,
@@ -3259,7 +3538,7 @@ def _clip_gdf_with_mask_native(
                 else partition.geometry.values.intersection(mask)
             )
 
-        if not clipping_by_rectangle and partition.geom_type.isin(POLYGON_GEOM_TYPES).all():
+        if not clipping_by_rectangle and partition_families.all_polygonal:
             return _clip_polygon_partition_with_polygon_mask(
                 partition,
                 mask,
@@ -3403,14 +3682,26 @@ def _clip_mask_covers_source_bounds_passthrough_native(
     if not _clip_mask_covers_source_bounds(mask, source_bounds):
         return None
 
-    geometry = source.geometry if isinstance(source, GeoDataFrame) else source
-    keep_mask = ~(
-        np.asarray(geometry.isna(), dtype=bool)
-        | np.asarray(geometry.is_empty, dtype=bool)
-    )
-    passthrough = _take_spatial_rows(source, keep_mask)
-    values = passthrough.geometry.values if isinstance(passthrough, GeoDataFrame) else passthrough.values
-    owned = getattr(values, "_owned", None)
+    keep_mask = _native_state_valid_nonempty_keep_mask(source)
+    if keep_mask is None:
+        geometry = source.geometry if isinstance(source, GeoDataFrame) else source
+        keep_mask = ~(
+            np.asarray(geometry.isna(), dtype=bool)
+            | np.asarray(geometry.is_empty, dtype=bool)
+        )
+
+    native_result = _native_state_passthrough_take(source, keep_mask)
+    if native_result is None:
+        passthrough = _take_spatial_rows(source, keep_mask)
+        values = (
+            passthrough.geometry.values
+            if isinstance(passthrough, GeoDataFrame)
+            else passthrough.values
+        )
+        owned = getattr(values, "_owned", None)
+        native_result = _spatial_to_native_tabular_result(passthrough)
+    else:
+        owned = getattr(native_result.geometry, "owned", None)
     selected = (
         ExecutionMode.GPU
         if owned is not None and owned.residency is Residency.DEVICE
@@ -3434,7 +3725,93 @@ def _clip_mask_covers_source_bounds_passthrough_native(
         requested=ExecutionMode.AUTO,
         selected=selected,
     )
-    return _spatial_to_native_tabular_result(passthrough)
+    return native_result
+
+
+def _native_state_valid_nonempty_keep_mask(source) -> np.ndarray | None:
+    from vibespatial.api._native_state import get_native_state
+    from vibespatial.geometry.owned import FAMILY_TAGS
+
+    state = get_native_state(source)
+    if state is None:
+        return None
+    owned = getattr(state.geometry, "owned", None)
+    if owned is None:
+        return None
+
+    if owned.residency is Residency.DEVICE and owned.device_state is not None:
+        if not has_gpu_runtime():
+            return None
+        try:
+            import cupy as cp
+        except ModuleNotFoundError:  # pragma: no cover - guarded by runtime
+            return None
+
+        device_state = owned.device_state
+        d_keep = cp.asarray(device_state.validity).astype(cp.bool_, copy=True)
+        d_tags = cp.asarray(device_state.tags)
+        d_family_row_offsets = cp.asarray(device_state.family_row_offsets)
+        for family, device_buffer in device_state.families.items():
+            d_family_rows = cp.flatnonzero(
+                d_keep & (d_tags == cp.int8(FAMILY_TAGS[family]))
+            ).astype(cp.int64, copy=False)
+            if int(d_family_rows.size) == 0:
+                continue
+            d_local_rows = d_family_row_offsets[d_family_rows]
+            d_keep[d_family_rows] &= ~cp.asarray(device_buffer.empty_mask)[
+                d_local_rows.astype(cp.int64, copy=False)
+            ].astype(cp.bool_, copy=False)
+        return _clip_device_to_host(
+            d_keep,
+            reason="clip mask-cover passthrough valid-nonempty row mask",
+        ).astype(bool, copy=False)
+
+    keep = np.asarray(owned.validity, dtype=bool).copy()
+    tags = np.asarray(owned.tags, dtype=np.int8)
+    family_row_offsets = np.asarray(owned.family_row_offsets, dtype=np.int64)
+    for family, buffer in owned.families.items():
+        family_rows = np.flatnonzero(keep & (tags == np.int8(FAMILY_TAGS[family])))
+        if family_rows.size == 0:
+            continue
+        local_rows = family_row_offsets[family_rows]
+        keep[family_rows] &= ~np.asarray(buffer.empty_mask, dtype=bool)[local_rows]
+    return keep
+
+
+def _native_state_passthrough_take(source, keep_mask: np.ndarray) -> NativeTabularResult | None:
+    from vibespatial.api._native_rowset import NativeRowSet
+    from vibespatial.api._native_state import get_native_state
+
+    state = get_native_state(source)
+    if state is None:
+        return None
+    keep_rows = np.flatnonzero(np.asarray(keep_mask, dtype=bool)).astype(
+        np.int64,
+        copy=False,
+    )
+    if keep_rows.size == state.row_count:
+        return state.to_native_tabular_result()
+
+    positions = keep_rows
+    if (
+        state.index_plan.kind in {"range", "device-labels"}
+        and getattr(state.attributes, "device_table", None) is not None
+        and has_gpu_runtime()
+    ):
+        try:
+            import cupy as cp
+
+            positions = cp.asarray(keep_rows, dtype=cp.int64)
+        except Exception:
+            positions = keep_rows
+    rowset = NativeRowSet.from_positions(
+        positions,
+        source_token=state.lineage_token,
+        source_row_count=state.row_count,
+        ordered=True,
+        unique=True,
+    )
+    return state.take(rowset, preserve_index=True).to_native_tabular_result()
 
 
 def _clip_native_tabular_to_spatial(
@@ -3487,7 +3864,10 @@ def _build_sparse_owned_clip_output(
             except ModuleNotFoundError:  # pragma: no cover - guarded by runtime
                 cp = None
             if cp is not None:
-                return owned.device_take(cp.asarray(rows, dtype=cp.int64))
+                return owned.device_take(
+                    cp.asarray(rows, dtype=cp.int64),
+                    host_indices_for_sizing=np.asarray(rows, dtype=np.int64),
+                )
         return owned.take(rows)
 
     row_parts = [
@@ -3608,7 +3988,7 @@ def evaluate_geopandas_clip_native(
             polygon_mask_bounds is None
             or (
                 strict_native_mode_enabled()
-                and bool(gdf.geom_type.isin(POLYGON_GEOM_TYPES).all())
+                and _spatial_all_polygonal_private(gdf)
             )
         )
     )
@@ -3625,12 +4005,12 @@ def evaluate_geopandas_clip_native(
             )
 
     if isinstance(mask, GeoDataFrame | GeoSeries):
-        box_mask = mask.total_bounds
+        box_mask = _spatial_total_bounds_private(mask)
     elif clipping_by_rectangle:
         box_mask = mask
     else:
         box_mask = mask.bounds if not mask.is_empty else (np.nan,) * 4
-    box_gdf = gdf.total_bounds
+    box_gdf = _spatial_total_bounds_private(gdf)
     if not (
         ((box_mask[0] <= box_gdf[2]) and (box_gdf[0] <= box_mask[2]))
         and ((box_mask[1] <= box_gdf[3]) and (box_gdf[1] <= box_mask[3]))

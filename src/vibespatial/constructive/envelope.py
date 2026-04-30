@@ -252,3 +252,33 @@ def envelope_owned(
         selected=ExecutionMode.CPU,
     )
     return result
+
+
+def envelope_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+):
+    """Return envelope output as a private native constructive carrier."""
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = envelope_owned(
+        owned,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="envelope",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+    )

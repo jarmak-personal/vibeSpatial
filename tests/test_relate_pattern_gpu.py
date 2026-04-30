@@ -26,8 +26,15 @@ from shapely.geometry import (
 )
 
 from vibespatial import ExecutionMode, has_gpu_runtime
+from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.predicates.relate import relate_pattern_match
+from vibespatial.runtime.fallbacks import (
+    STRICT_NATIVE_ENV_VAR,
+    StrictNativeFallbackError,
+    clear_fallback_events,
+    get_fallback_events,
+)
 
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
 
@@ -445,8 +452,6 @@ class TestPatternValidation:
 class TestGeometryArrayWiring:
     def test_relate_pattern_via_geometry_array(self):
         """GeometryArray.relate_pattern() dispatches through GPU path."""
-        from vibespatial.api.geometry_array import GeometryArray
-
         left_geoms = np.array([Point(1, 1), Point(2, 2)], dtype=object)
         right_geoms = np.array([Point(1, 1), Point(3, 3)], dtype=object)
         expected = shapely.relate_pattern(left_geoms, right_geoms, "0FFFFFFF2")
@@ -460,8 +465,6 @@ class TestGeometryArrayWiring:
 
     def test_relate_pattern_with_polygon(self):
         """GeometryArray.relate_pattern() with polygon pair."""
-        from vibespatial.api.geometry_array import GeometryArray
-
         poly = Polygon([(0, 0), (4, 0), (4, 4), (0, 4)])
         left_geoms = np.array([Point(2, 2), Point(5, 5)], dtype=object)
         right_geoms = np.array([poly, poly], dtype=object)
@@ -474,20 +477,34 @@ class TestGeometryArrayWiring:
         result = ga_left.relate_pattern(ga_right, "T*F**F***")
         np.testing.assert_array_equal(result, expected)
 
-    def test_scalar_broadcast_fallback(self):
-        """Scalar broadcast falls back to Shapely (row count mismatch)."""
-        from vibespatial.api.geometry_array import GeometryArray
-
+    def test_scalar_broadcast_stays_native_in_strict(self, monkeypatch):
+        """Scalar broadcast uses an owned native view before public export."""
         poly = Polygon([(0, 0), (4, 0), (4, 4), (0, 4)])
         left_geoms = np.array([Point(2, 2), Point(5, 5)], dtype=object)
         expected = shapely.relate_pattern(left_geoms, poly, "T*F**F***")
 
         ga_left = GeometryArray(left_geoms)
         ga_left.to_owned()
+        clear_fallback_events()
+        monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
 
-        # Scalar other triggers fallback to Shapely (1 vs 2 rows)
         result = ga_left.relate_pattern(poly, "T*F**F***")
+
         np.testing.assert_array_equal(result, expected)
+        assert get_fallback_events(clear=True) == []
+
+    def test_relate_pattern_strict_native_non_point_decline_is_not_swallowed(self, monkeypatch):
+        """Strict native must not be hidden by GeometryArray's Shapely fallback."""
+        left_geoms = np.array([Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])], dtype=object)
+        right_geoms = np.array([Polygon([(1, 1), (3, 1), (3, 3), (1, 3)])], dtype=object)
+
+        ga_left = GeometryArray(left_geoms)
+        ga_left.to_owned()
+        ga_right = GeometryArray(right_geoms)
+        monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+        with pytest.raises(StrictNativeFallbackError, match="non-point family"):
+            ga_left.relate_pattern(ga_right, "T********")
 
 
 # ---------------------------------------------------------------------------

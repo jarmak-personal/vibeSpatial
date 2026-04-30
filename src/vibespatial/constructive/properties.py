@@ -73,6 +73,22 @@ request_nvrtc_warmup([
 ])
 
 
+def _runtime_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
+    return get_cuda_runtime().copy_device_to_host(device_array, reason=reason)
+
+
+def _runtime_device_to_host_list(device_array: object, *, reason: str) -> list[Any]:
+    return _runtime_device_to_host(device_array, reason=reason).tolist()
+
+
+def _runtime_device_scalar_int(device_value: object, *, reason: str) -> int:
+    if cp is None:  # pragma: no cover - CPU-only installs do not call this path
+        return int(device_value)
+    d_value = cp.asarray(device_value).reshape(1)
+    host = _runtime_device_to_host(d_value, reason=reason)
+    return int(np.asarray(host).reshape(-1)[0])
+
+
 def _offset_diff_gpu(d_offsets, d_family_rows, result, global_rows, *, kernel_name="offset_diff"):
     """Launch the offset_diff NVRTC kernel and scatter results into *result*."""
     runtime = get_cuda_runtime()
@@ -90,7 +106,10 @@ def _offset_diff_gpu(d_offsets, d_family_rows, result, global_rows, *, kernel_na
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        result[global_rows] = runtime.copy_device_to_host(d_out)
+        result[global_rows] = runtime.copy_device_to_host(
+            d_out,
+            reason=f"constructive property {kernel_name} result host export",
+        )
     finally:
         runtime.free(d_out)
 
@@ -226,7 +245,10 @@ def _num_coords_polygon_gpu(d_buf, d_family_rows, result, global_rows):
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        result[global_rows] = runtime.copy_device_to_host(d_out)
+        result[global_rows] = runtime.copy_device_to_host(
+            d_out,
+            reason="constructive property polygon num-coordinates host export",
+        )
     finally:
         runtime.free(d_out)
 
@@ -248,7 +270,10 @@ def _num_coords_multilinestring_gpu(d_buf, d_family_rows, result, global_rows):
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        result[global_rows] = runtime.copy_device_to_host(d_out)
+        result[global_rows] = runtime.copy_device_to_host(
+            d_out,
+            reason="constructive property multilinestring num-coordinates host export",
+        )
     finally:
         runtime.free(d_out)
 
@@ -270,7 +295,10 @@ def _num_coords_multipolygon_gpu(d_buf, d_family_rows, result, global_rows):
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        result[global_rows] = runtime.copy_device_to_host(d_out)
+        result[global_rows] = runtime.copy_device_to_host(
+            d_out,
+            reason="constructive property multipolygon num-coordinates host export",
+        )
     finally:
         runtime.free(d_out)
 
@@ -410,8 +438,14 @@ def get_x_owned(owned: OwnedGeometryArray) -> np.ndarray:
         d_buf = owned.device_state.families[GeometryFamily.POINT]
         d_family_rows = cp.asarray(family_rows)
         d_coord_indices = d_buf.geometry_offsets[d_family_rows]
-        result[global_rows] = cp.asnumpy(d_buf.x[d_coord_indices])
-        d_empty = cp.asnumpy(d_buf.empty_mask[d_family_rows])
+        result[global_rows] = _runtime_device_to_host(
+            d_buf.x[d_coord_indices],
+            reason="constructive property point-x coordinate host export",
+        )
+        d_empty = _runtime_device_to_host(
+            d_buf.empty_mask[d_family_rows],
+            reason="constructive property point-x empty-mask host export",
+        )
         if np.any(d_empty):
             result[global_rows[d_empty]] = np.nan
         return result
@@ -461,8 +495,14 @@ def get_y_owned(owned: OwnedGeometryArray) -> np.ndarray:
         d_buf = owned.device_state.families[GeometryFamily.POINT]
         d_family_rows = cp.asarray(family_rows)
         d_coord_indices = d_buf.geometry_offsets[d_family_rows]
-        result[global_rows] = cp.asnumpy(d_buf.y[d_coord_indices])
-        d_empty = cp.asnumpy(d_buf.empty_mask[d_family_rows])
+        result[global_rows] = _runtime_device_to_host(
+            d_buf.y[d_coord_indices],
+            reason="constructive property point-y coordinate host export",
+        )
+        d_empty = _runtime_device_to_host(
+            d_buf.empty_mask[d_family_rows],
+            reason="constructive property point-y empty-mask host export",
+        )
         if np.any(d_empty):
             result[global_rows[d_empty]] = np.nan
         return result
@@ -561,7 +601,10 @@ def is_closed_owned(owned: OwnedGeometryArray) -> np.ndarray:
                     )
                 grid, block = runtime.launch_config(kernel, n)
                 runtime.launch(kernel, grid=grid, block=block, params=params)
-                h_out = runtime.copy_device_to_host(d_out)
+                h_out = runtime.copy_device_to_host(
+                    d_out,
+                    reason=f"constructive property {family.value} is-closed host export",
+                )
                 result[global_rows] = h_out.astype(bool)
             finally:
                 runtime.free(d_out)
@@ -731,8 +774,9 @@ def is_ring_owned(
                 try:
                     d_family_rows = cp.asarray(family_rows)
                     d_span_result_cp = cp.asarray(d_span_result)
-                    h_result = cp.asnumpy(
-                        d_span_result_cp[d_family_rows]
+                    h_result = _runtime_device_to_host(
+                        d_span_result_cp[d_family_rows],
+                        reason="constructive property is-ring simplicity host export",
                     ).astype(bool)
                     result[global_rows] = h_result
                 finally:
@@ -867,7 +911,10 @@ def is_ccw_owned(owned: OwnedGeometryArray) -> np.ndarray:
                     )
                 grid, block = runtime.launch_config(kernel, n)
                 runtime.launch(kernel, grid=grid, block=block, params=params)
-                h_out = runtime.copy_device_to_host(d_out)
+                h_out = runtime.copy_device_to_host(
+                    d_out,
+                    reason=f"constructive property {family.value} is-ccw host export",
+                )
                 result[global_rows] = h_out.astype(bool)
             finally:
                 runtime.free(d_out)
@@ -953,8 +1000,11 @@ def _get_geometry_multipoint_gpu(
 
     d_valid = (d_eff_index >= 0) & (d_eff_index < d_part_counts)
 
-    # Device-side early-exit check — avoid D2H transfer when all OOB
-    if int(d_valid.sum().item()) == 0:
+    valid_count = _runtime_device_scalar_int(
+        cp.sum(d_valid, dtype=cp.int64),
+        reason="constructive get-geometry multipoint valid-count scalar fence",
+    )
+    if valid_count == 0:
         d_empty_x = cp.empty(0, dtype=cp.float64)
         d_empty_y = cp.empty(0, dtype=cp.float64)
         d_empty_geom_offsets = cp.zeros(1, dtype=cp.int32)
@@ -968,7 +1018,7 @@ def _get_geometry_multipoint_gpu(
         ), d_valid
 
     d_valid_local = cp.flatnonzero(d_valid)
-    n_valid = int(d_valid_local.size)
+    n_valid = valid_count
 
     # Coordinate indices for valid rows
     d_coord_idx = d_starts[d_valid_local] + d_eff_index[d_valid_local]
@@ -1019,8 +1069,11 @@ def _get_geometry_multilinestring_gpu(
 
     d_valid = (d_eff_index >= 0) & (d_eff_index < d_part_counts)
 
-    # Device-side early-exit check — avoid D2H transfer when all OOB
-    if int(d_valid.sum().item()) == 0:
+    valid_count = _runtime_device_scalar_int(
+        cp.sum(d_valid, dtype=cp.int64),
+        reason="constructive get-geometry multilinestring valid-count scalar fence",
+    )
+    if valid_count == 0:
         d_empty_x = cp.empty(0, dtype=cp.float64)
         d_empty_y = cp.empty(0, dtype=cp.float64)
         d_empty_geom_offsets = cp.zeros(1, dtype=cp.int32)
@@ -1034,7 +1087,7 @@ def _get_geometry_multilinestring_gpu(
         ), d_valid
 
     d_valid_local = cp.flatnonzero(d_valid)
-    n_valid = int(d_valid_local.size)
+    n_valid = valid_count
 
     # Part index for each valid row
     d_part_idx = d_starts[d_valid_local] + d_eff_index[d_valid_local]
@@ -1048,8 +1101,10 @@ def _get_geometry_multilinestring_gpu(
     d_out_geom_offsets = cp.zeros(n_valid + 1, dtype=cp.int32)
     cp.cumsum(d_coord_lengths, out=d_out_geom_offsets[1:])
 
-    # Total coordinates
-    total_coords = int(d_out_geom_offsets[-1])
+    total_coords = _runtime_device_scalar_int(
+        d_out_geom_offsets[-1],
+        reason="constructive get-geometry multilinestring coordinate-count scalar fence",
+    )
 
     if total_coords == 0:
         d_out_x = cp.empty(0, dtype=cp.float64)
@@ -1062,7 +1117,10 @@ def _get_geometry_multilinestring_gpu(
         # Vectorized approach: create an index array mapping output position
         # to source position
         # CuPy repeat requires a Python list; transfer small offset array.
-        h_coord_lengths = cp.asnumpy(d_coord_lengths).tolist()
+        h_coord_lengths = _runtime_device_to_host_list(
+            d_coord_lengths,
+            reason="constructive get-geometry multilinestring coordinate lengths host export",
+        )
         d_row_ids = cp.repeat(cp.arange(n_valid, dtype=cp.int32), h_coord_lengths)
         d_local_offsets = cp.arange(total_coords, dtype=cp.int32) - d_out_geom_offsets[:-1][d_row_ids]
         d_src_indices = d_coord_starts[d_row_ids] + d_local_offsets
@@ -1111,8 +1169,11 @@ def _get_geometry_multipolygon_gpu(
 
     d_valid = (d_eff_index >= 0) & (d_eff_index < d_part_counts)
 
-    # Device-side early-exit check — avoid D2H transfer when all OOB
-    if int(d_valid.sum().item()) == 0:
+    valid_count = _runtime_device_scalar_int(
+        cp.sum(d_valid, dtype=cp.int64),
+        reason="constructive get-geometry multipolygon valid-count scalar fence",
+    )
+    if valid_count == 0:
         d_empty_x = cp.empty(0, dtype=cp.float64)
         d_empty_y = cp.empty(0, dtype=cp.float64)
         d_empty_geom_offsets = cp.zeros(1, dtype=cp.int32)
@@ -1128,7 +1189,7 @@ def _get_geometry_multipolygon_gpu(
         ), d_valid
 
     d_valid_local = cp.flatnonzero(d_valid)
-    n_valid = int(d_valid_local.size)
+    n_valid = valid_count
 
     # Polygon index for each valid row
     d_poly_idx = d_starts[d_valid_local] + d_eff_index[d_valid_local]
@@ -1141,7 +1202,10 @@ def _get_geometry_multipolygon_gpu(
     # Build output geometry_offsets (maps row -> ring index in output)
     d_out_geom_offsets = cp.zeros(n_valid + 1, dtype=cp.int32)
     cp.cumsum(d_ring_counts, out=d_out_geom_offsets[1:])
-    total_rings = int(d_out_geom_offsets[-1])
+    total_rings = _runtime_device_scalar_int(
+        d_out_geom_offsets[-1],
+        reason="constructive get-geometry multipolygon ring-count scalar fence",
+    )
 
     if total_rings == 0:
         d_empty_x = cp.empty(0, dtype=cp.float64)
@@ -1159,7 +1223,10 @@ def _get_geometry_multipolygon_gpu(
 
     # Build flat ring index array to gather source ring indices
     # CuPy repeat requires a Python list; transfer small offset arrays.
-    h_ring_counts = cp.asnumpy(d_ring_counts).tolist()
+    h_ring_counts = _runtime_device_to_host_list(
+        d_ring_counts,
+        reason="constructive get-geometry multipolygon ring counts host export",
+    )
     d_row_ids_ring = cp.repeat(cp.arange(n_valid, dtype=cp.int32), h_ring_counts)
     d_local_ring_offsets = cp.arange(total_rings, dtype=cp.int32) - d_out_geom_offsets[:-1][d_row_ids_ring]
     d_src_ring_indices = d_ring_starts[d_row_ids_ring] + d_local_ring_offsets
@@ -1172,14 +1239,23 @@ def _get_geometry_multipolygon_gpu(
     # Build output ring_offsets
     d_out_ring_offsets = cp.zeros(total_rings + 1, dtype=cp.int32)
     cp.cumsum(d_ring_coord_lengths, out=d_out_ring_offsets[1:])
-    total_coords = int(d_out_ring_offsets[-1])
+    total_coords = _runtime_device_scalar_int(
+        d_out_ring_offsets[-1],
+        reason="constructive get-geometry multipolygon coordinate-count scalar fence",
+    )
 
     if total_coords == 0:
         d_out_x = cp.empty(0, dtype=cp.float64)
         d_out_y = cp.empty(0, dtype=cp.float64)
     else:
         # Gather coordinates
-        h_ring_coord_lengths = cp.asnumpy(d_ring_coord_lengths).tolist()
+        h_ring_coord_lengths = _runtime_device_to_host_list(
+            d_ring_coord_lengths,
+            reason=(
+                "constructive get-geometry multipolygon ring-coordinate "
+                "lengths host export"
+            ),
+        )
         d_ring_ids = cp.repeat(cp.arange(total_rings, dtype=cp.int32), h_ring_coord_lengths)
         d_local_coord_offsets = cp.arange(total_coords, dtype=cp.int32) - d_out_ring_offsets[:-1][d_ring_ids]
         d_src_coord_indices = d_ring_coord_starts[d_ring_ids] + d_local_coord_offsets
@@ -1216,9 +1292,10 @@ def _pass_through_simple_gpu(
     eff_index = index
     if eff_index < 0:
         eff_index = 1 + eff_index  # length=1, so -1 -> 0, -2 -> -1 (invalid)
-    d_valid = cp.full(n, eff_index == 0, dtype=cp.bool_)
+    is_valid_index = eff_index == 0
+    d_valid = cp.full(n, is_valid_index, dtype=cp.bool_)
 
-    if int(d_valid.sum().item()) == 0:
+    if not is_valid_index:
         if family is GeometryFamily.POLYGON:
             return DeviceFamilyGeometryBuffer(
                 family=family,
@@ -1254,14 +1331,20 @@ def _pass_through_simple_gpu(
         # We need to re-gather both ring_offsets and coordinates.
         d_ring_offsets = device_buf.ring_offsets
 
-        total_rings = int(d_out_geom_offsets[-1])
+        total_rings = _runtime_device_scalar_int(
+            d_out_geom_offsets[-1],
+            reason="constructive get-geometry polygon ring-count scalar fence",
+        )
         if total_rings == 0:
             d_out_x = cp.empty(0, dtype=cp.float64)
             d_out_y = cp.empty(0, dtype=cp.float64)
             d_out_ring_offsets = cp.zeros(1, dtype=cp.int32)
         else:
             # CuPy repeat requires a Python list; transfer small offset array.
-            h_lengths = cp.asnumpy(d_lengths).tolist()
+            h_lengths = _runtime_device_to_host_list(
+                d_lengths,
+                reason="constructive get-geometry polygon ring lengths host export",
+            )
             # Gather source ring indices
             d_row_ids = cp.repeat(cp.arange(n, dtype=cp.int32), h_lengths)
             d_local_ring = cp.arange(total_rings, dtype=cp.int32) - d_out_geom_offsets[:-1][d_row_ids]
@@ -1273,13 +1356,22 @@ def _pass_through_simple_gpu(
 
             d_out_ring_offsets = cp.zeros(total_rings + 1, dtype=cp.int32)
             cp.cumsum(d_ring_coord_lengths, out=d_out_ring_offsets[1:])
-            total_coords = int(d_out_ring_offsets[-1])
+            total_coords = _runtime_device_scalar_int(
+                d_out_ring_offsets[-1],
+                reason="constructive get-geometry polygon coordinate-count scalar fence",
+            )
 
             if total_coords == 0:
                 d_out_x = cp.empty(0, dtype=cp.float64)
                 d_out_y = cp.empty(0, dtype=cp.float64)
             else:
-                h_ring_coord_lengths = cp.asnumpy(d_ring_coord_lengths).tolist()
+                h_ring_coord_lengths = _runtime_device_to_host_list(
+                    d_ring_coord_lengths,
+                    reason=(
+                        "constructive get-geometry polygon ring-coordinate "
+                        "lengths host export"
+                    ),
+                )
                 d_ring_ids = cp.repeat(cp.arange(total_rings, dtype=cp.int32), h_ring_coord_lengths)
                 d_local_coord = cp.arange(total_coords, dtype=cp.int32) - d_out_ring_offsets[:-1][d_ring_ids]
                 d_src_coord_idx = d_ring_coord_starts[d_ring_ids] + d_local_coord
@@ -1298,12 +1390,18 @@ def _pass_through_simple_gpu(
         ), d_valid
 
     # Point or LineString: geometry_offsets -> coordinate indices directly.
-    total_coords = int(d_out_geom_offsets[-1])
+    total_coords = _runtime_device_scalar_int(
+        d_out_geom_offsets[-1],
+        reason="constructive get-geometry simple coordinate-count scalar fence",
+    )
     if total_coords == 0:
         d_out_x = cp.empty(0, dtype=cp.float64)
         d_out_y = cp.empty(0, dtype=cp.float64)
     else:
-        h_lengths = cp.asnumpy(d_lengths).tolist()
+        h_lengths = _runtime_device_to_host_list(
+            d_lengths,
+            reason="constructive get-geometry simple coordinate lengths host export",
+        )
         d_row_ids = cp.repeat(cp.arange(n, dtype=cp.int32), h_lengths)
         d_local_offsets = cp.arange(total_coords, dtype=cp.int32) - d_out_geom_offsets[:-1][d_row_ids]
         d_src_indices = d_starts[d_row_ids] + d_local_offsets

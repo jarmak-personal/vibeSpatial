@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 
 from vibespatial.constructive.point_kernels import (
@@ -43,6 +45,14 @@ request_nvrtc_warmup([
 
 def _point_constructive_kernels():
     return compile_kernel_group("point-constructive", _POINT_CONSTRUCTIVE_KERNEL_SOURCE, _POINT_CONSTRUCTIVE_KERNEL_NAMES)
+
+
+def _device_bool_scalar(value, *, reason: str) -> bool:
+    import cupy as cp
+
+    scalar = cp.asarray(value).reshape(1)
+    host = get_cuda_runtime().copy_device_to_host(scalar, reason=reason)
+    return bool(np.asarray(host).reshape(-1)[0])
 
 
 def _point_rows_and_xy(points: OwnedGeometryArray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -177,6 +187,43 @@ def _empty_point_output() -> OwnedGeometryArray:
     )
 
 
+@lru_cache(maxsize=32)
+def _round_point_unit_circle(quad_segs: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return GEOS-compatible clockwise point-buffer unit-circle coordinates."""
+    n_arc = 4 * int(quad_segs)
+    angles = np.linspace(0.0, -2.0 * np.pi, num=n_arc, endpoint=False, dtype=np.float64)
+    unit_x = np.cos(angles)
+    unit_y = np.sin(angles)
+    q = int(quad_segs)
+    unit_x[0] = 1.0
+    unit_y[0] = 0.0
+    unit_x[q] = 0.0
+    unit_y[q] = -1.0
+    unit_x[2 * q] = -1.0
+    unit_y[2 * q] = 0.0
+    unit_x[3 * q] = 0.0
+    unit_y[3 * q] = 1.0
+    return (
+        np.ascontiguousarray(unit_x, dtype=np.float64),
+        np.ascontiguousarray(unit_y, dtype=np.float64),
+    )
+
+
+def _point_buffer_host_admission_checked(points: OwnedGeometryArray) -> bool:
+    if points._validity is None or points._tags is None or points._family_row_offsets is None:
+        return False
+    point_buffer = points.families.get(GeometryFamily.POINT)
+    if point_buffer is None or point_buffer.host_materialized is False:
+        return False
+    if not np.all(points._validity):
+        raise ValueError("point_buffer_owned_array requires non-null point rows only")
+    if np.any(points._tags != FAMILY_TAGS[GeometryFamily.POINT]):
+        raise ValueError("point_buffer_owned_array requires point-only rows")
+    if np.any(point_buffer.empty_mask):
+        raise ValueError("point_buffer_owned_array requires non-null, non-empty point rows only")
+    return True
+
+
 def _build_point_buffers_cpu(
     points: OwnedGeometryArray, radii: np.ndarray, *, quad_segs: int = 1,
 ) -> OwnedGeometryArray:
@@ -199,9 +246,7 @@ def _build_point_buffers_cpu(
     else:
         n_arc = 4 * quad_segs
         verts_per_ring = n_arc + 1
-        angles = np.linspace(0.0, -2.0 * np.pi, num=n_arc, endpoint=False, dtype=np.float64)
-        cos_a = np.cos(angles)
-        sin_a = np.sin(angles)
+        cos_a, sin_a = _round_point_unit_circle(quad_segs)
         out_x = np.empty(row_count * verts_per_ring, dtype=np.float64)
         out_y = np.empty(row_count * verts_per_ring, dtype=np.float64)
         for i in range(n_arc):
@@ -281,11 +326,21 @@ def _build_device_backed_polygon_output(
     device_y,
     *,
     row_count: int,
-    bounds: np.ndarray | None,
+    bounds,
     verts_per_ring: int = 5,
 ) -> OwnedGeometryArray:
     import cupy as cp
 
+    runtime = get_cuda_runtime()
+    bounds_is_device = hasattr(bounds, "__cuda_array_interface__")
+    device_bounds = (
+        bounds
+        if bounds_is_device
+        else None
+        if bounds is None
+        else runtime.from_host(bounds)
+    )
+    host_bounds = None if bounds_is_device else bounds
     d_geometry_offsets = cp.arange(row_count + 1, dtype=cp.int32)
     d_ring_offsets = cp.arange(
         0,
@@ -306,10 +361,9 @@ def _build_device_backed_polygon_output(
         geometry_offsets=np.empty(0, dtype=np.int32),
         empty_mask=np.empty(0, dtype=np.bool_),
         ring_offsets=None,
-        bounds=bounds,
+        bounds=host_bounds,
         host_materialized=False,
     )
-    runtime = get_cuda_runtime()
     result = build_device_resident_owned(
         device_families={
             GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
@@ -319,7 +373,7 @@ def _build_device_backed_polygon_output(
                 geometry_offsets=d_geometry_offsets,
                 empty_mask=d_empty_mask,
                 ring_offsets=d_ring_offsets,
-                bounds=None if bounds is None else runtime.from_host(bounds),
+                bounds=device_bounds,
                 dense_single_ring_width=verts_per_ring,
             )
         },
@@ -329,6 +383,8 @@ def _build_device_backed_polygon_output(
         family_row_offsets=d_family_row_offsets,
         execution_mode="gpu",
     )
+    if result.device_state is not None:
+        result.device_state.row_bounds = device_bounds
     result.families[GeometryFamily.POLYGON] = polygon_buffer
     return result
 
@@ -500,13 +556,6 @@ def point_buffer_owned_array(
     if GeometryFamily.POINT not in points.families or len(points.families) != 1:
         raise ValueError("point_buffer_owned_array requires a point-only OwnedGeometryArray")
 
-    point_buffer = points.families[GeometryFamily.POINT]
-    if not np.all(points.validity):
-        raise ValueError("point_buffer_owned_array requires non-null point rows only")
-    if np.any(points.tags != FAMILY_TAGS[GeometryFamily.POINT]):
-        raise ValueError("point_buffer_owned_array requires point-only rows")
-    if np.any(point_buffer.empty_mask):
-        raise ValueError("point_buffer_owned_array requires non-null, non-empty point rows only")
     radii = (
         np.full(points.row_count, float(distance), dtype=np.float64)
         if np.isscalar(distance)
@@ -523,8 +572,16 @@ def point_buffer_owned_array(
         current_residency=combined_residency(points),
     ).selected
     if selected_mode is not ExecutionMode.GPU:
+        point_buffer = points.families[GeometryFamily.POINT]
+        if not np.all(points.validity):
+            raise ValueError("point_buffer_owned_array requires non-null point rows only")
+        if np.any(points.tags != FAMILY_TAGS[GeometryFamily.POINT]):
+            raise ValueError("point_buffer_owned_array requires point-only rows")
+        if np.any(point_buffer.empty_mask):
+            raise ValueError("point_buffer_owned_array requires non-null, non-empty point rows only")
         return _build_point_buffers_cpu(points, radii, quad_segs=quad_segs)
 
+    host_admission_checked = _point_buffer_host_admission_checked(points)
     verts_per_ring = 4 * quad_segs + 1
     points.move_to(
         Residency.DEVICE,
@@ -532,12 +589,35 @@ def point_buffer_owned_array(
         reason="point_buffer_owned_array selected GPU execution",
     )
     runtime = get_cuda_runtime()
+    import cupy as cp
+
     state = points._ensure_device_state()
     point_buffer = state.families[GeometryFamily.POINT]
+    if not host_admission_checked:
+        if not _device_bool_scalar(
+            cp.all(state.validity),
+            reason="point buffer validity admission scalar fence",
+        ):
+            raise ValueError("point_buffer_owned_array requires non-null point rows only")
+        if not _device_bool_scalar(
+            cp.all(state.tags == FAMILY_TAGS[GeometryFamily.POINT]),
+            reason="point buffer family-tag admission scalar fence",
+        ):
+            raise ValueError("point_buffer_owned_array requires point-only rows")
+        if _device_bool_scalar(
+            cp.any(point_buffer.empty_mask),
+            reason="point buffer empty-point admission scalar fence",
+        ):
+            raise ValueError("point_buffer_owned_array requires non-null, non-empty point rows only")
     device_radii = runtime.from_host(radii)
+    device_unit_x = None
+    device_unit_y = None
+    if quad_segs != 1:
+        unit_x, unit_y = _round_point_unit_circle(quad_segs)
+        device_unit_x = runtime.from_host(unit_x)
+        device_unit_y = runtime.from_host(unit_y)
     device_x = runtime.allocate((points.row_count * verts_per_ring,), np.float64)
     device_y = runtime.allocate((points.row_count * verts_per_ring,), np.float64)
-    bounds = None
     success = False
     try:
         ptr = runtime.pointer
@@ -577,9 +657,10 @@ def point_buffer_owned_array(
                     ptr(point_buffer.x),
                     ptr(point_buffer.y),
                     ptr(device_radii),
+                    ptr(device_unit_x),
+                    ptr(device_unit_y),
                     ptr(device_x),
                     ptr(device_y),
-                    quad_segs,
                     verts_per_ring,
                     points.row_count,
                 ),
@@ -592,19 +673,28 @@ def point_buffer_owned_array(
                     KERNEL_PARAM_PTR,
                     KERNEL_PARAM_PTR,
                     KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
                     KERNEL_PARAM_I32,
                     KERNEL_PARAM_I32,
                 ),
             )
         grid, block = runtime.launch_config(kernel, points.row_count)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        host_point_buffer = points.families[GeometryFamily.POINT]
-        if host_point_buffer.host_materialized:
-            coord_rows = host_point_buffer.geometry_offsets[points.family_row_offsets]
-            point_x = host_point_buffer.x[coord_rows]
-            point_y = host_point_buffer.y[coord_rows]
-            bounds = np.column_stack((point_x - radii, point_y - radii, point_x + radii, point_y + radii))
+        coord_rows = cp.asarray(point_buffer.geometry_offsets)[
+            cp.asarray(state.family_row_offsets, dtype=cp.int64)
+        ].astype(cp.int64, copy=False)
+        point_x = cp.asarray(point_buffer.x)[coord_rows]
+        point_y = cp.asarray(point_buffer.y)[coord_rows]
+        d_radii = cp.asarray(device_radii)
+        bounds = cp.column_stack(
+            (
+                point_x - d_radii,
+                point_y - d_radii,
+                point_x + d_radii,
+                point_y + d_radii,
+            )
+        )
         success = True
         return _build_device_backed_polygon_output(
             device_x,
@@ -615,6 +705,40 @@ def point_buffer_owned_array(
         )
     finally:
         runtime.free(device_radii)
+        runtime.free(device_unit_x)
+        runtime.free(device_unit_y)
         if not success:
             runtime.free(device_x)
             runtime.free(device_y)
+
+
+def point_buffer_native_tabular_result(
+    points: OwnedGeometryArray,
+    distance: float | np.ndarray,
+    *,
+    quad_segs: int = 1,
+    dispatch_mode: ExecutionMode = ExecutionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+):
+    """Return point-buffer output as a private native constructive carrier."""
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    buffered = point_buffer_owned_array(
+        points,
+        distance,
+        quad_segs=quad_segs,
+        dispatch_mode=dispatch_mode,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        buffered,
+        operation="buffer",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+    )

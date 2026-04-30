@@ -84,7 +84,11 @@ def _pylibcudf_can_adopt_zero_copy(column) -> bool:
 def _device_narrow_offsets_int64_to_int32(offsets_int64):
     """Narrow int64 offsets to int32 on device via CuPy cast with overflow check."""
     import cupy as cp
-    max_val = int(cp.asnumpy(offsets_int64.max()))
+
+    max_val = _device_int_scalar(
+        offsets_int64.max(),
+        reason="pylibcudf GeoArrow offset max scalar fence",
+    )
     if max_val > np.iinfo(np.int32).max:
         raise OverflowError(f"GeoArrow offsets exceed int32 range (max={max_val})")
     return offsets_int64.astype(cp.int32)
@@ -122,13 +126,40 @@ def _device_compact_offsets(lengths):
     return compact_offsets
 
 
-def _device_child_selection_mask(offsets, parent_mask):
+def _device_scalar_to_host(value, *, reason: str):
+    """Copy one device scalar through runtime D2H accounting."""
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    runtime = get_cuda_runtime()
+    d_value = cp.ascontiguousarray(cp.asarray(value).reshape(1))
+    with runtime.stream_context() as stream:
+        host = runtime.copy_device_to_host_async(d_value, stream, reason=reason)
+    return np.asarray(host).reshape(-1)[0]
+
+
+def _device_int_scalar(value, *, reason: str) -> int:
+    return int(_device_scalar_to_host(value, reason=reason))
+
+
+def _device_bool_scalar(value, *, reason: str) -> bool:
+    return bool(_device_scalar_to_host(value, reason=reason))
+
+
+def _device_child_selection_mask(offsets, parent_mask, *, child_count: int | None = None):
     import cupy as cp
 
     lengths = offsets[1:] - offsets[:-1]
     selected_lengths = lengths[parent_mask]
     compact_offsets = _device_compact_offsets(selected_lengths)
-    child_count = int(cp.asnumpy(offsets[-1]))
+    if child_count is None:
+        child_count = _device_int_scalar(
+            offsets[-1],
+            reason="pylibcudf GeoArrow child-count scalar fence",
+        )
+    else:
+        child_count = int(child_count)
     if child_count == 0:
         return compact_offsets, cp.zeros(0, dtype=cp.bool_)
     starts = offsets[:-1][parent_mask]
@@ -148,9 +179,10 @@ def _device_select_true(mask):
 
 
 def _device_mask_count(mask) -> int:
-    import cupy as cp
-
-    return int(cp.asnumpy(mask.astype(cp.int32).sum()))
+    return _device_int_scalar(
+        mask.astype("int32").sum(),
+        reason="pylibcudf WKB device mask count scalar fence",
+    )
 
 def _pylibcudf_wkb_offsets(column):
     if column.num_children() != 1:
@@ -233,9 +265,18 @@ def _scan_pylibcudf_wkb_headers(column) -> DeviceWKBHeaderScan:
     fallback_mask = validity & ~native_mask
     return DeviceWKBHeaderScan(
         row_count=row_count,
-        valid_count=int(cp.asnumpy(validity.astype(cp.int32).sum())),
-        native_count=int(cp.asnumpy(native_mask.astype(cp.int32).sum())),
-        fallback_count=int(cp.asnumpy(fallback_mask.astype(cp.int32).sum())),
+        valid_count=_device_int_scalar(
+            validity.astype(cp.int32).sum(),
+            reason="pylibcudf WKB header valid-count scalar fence",
+        ),
+        native_count=_device_int_scalar(
+            native_mask.astype(cp.int32).sum(),
+            reason="pylibcudf WKB header native-count scalar fence",
+        ),
+        fallback_count=_device_int_scalar(
+            fallback_mask.astype(cp.int32).sum(),
+            reason="pylibcudf WKB header fallback-count scalar fence",
+        ),
         validity=validity,
         type_ids=type_ids,
         family_tags=family_tags,
@@ -257,6 +298,7 @@ def _build_device_single_family_owned(
     dense_single_ring_width: int | None = None,
     detail: str,
     all_valid: bool = False,
+    valid_count: int | None = None,
 ) -> OwnedGeometryArray:
     import cupy as cp
 
@@ -266,7 +308,13 @@ def _build_device_single_family_owned(
         tags_device = cp.full(row_count, np.int8(FAMILY_TAGS[family]), dtype=cp.int8)
         family_row_offsets_device = cp.arange(row_count, dtype=cp.int32)
     else:
-        valid_count = int(cp.count_nonzero(validity_device).item())
+        if valid_count is None:
+            valid_count = _device_int_scalar(
+                cp.count_nonzero(validity_device),
+                reason="pylibcudf geometry validity-count scalar fence",
+            )
+        else:
+            valid_count = int(valid_count)
         tags_device = cp.where(validity_device, np.int8(FAMILY_TAGS[family]), np.int8(-1)).astype(cp.int8)
         family_row_offsets_device = cp.full(row_count, -1, dtype=cp.int32)
         if valid_count:
@@ -321,7 +369,10 @@ def _device_dense_single_ring_width(
     if int(ring_offsets_device.size) != row_count + 1:
         return None
     if coord_count is None:
-        coord_count = int(cp.asnumpy(ring_offsets_device[row_count]))
+        coord_count = _device_int_scalar(
+            ring_offsets_device[row_count],
+            reason="pylibcudf GeoArrow dense-ring coord-count scalar fence",
+        )
     if coord_count <= 0 or coord_count % row_count != 0:
         return None
     candidate_width = int(coord_count // row_count)
@@ -331,7 +382,14 @@ def _device_dense_single_ring_width(
     geom_counts = geometry_offsets_device[1 : row_count + 1] - geometry_offsets_device[:row_count]
     ring_widths = ring_offsets_device[1 : row_count + 1] - ring_offsets_device[:row_count]
     dense = cp.all(geom_counts == 1) & cp.all(ring_widths == candidate_width)
-    return candidate_width if bool(cp.asnumpy(dense)) else None
+    return (
+        candidate_width
+        if _device_bool_scalar(
+            dense,
+            reason="pylibcudf GeoArrow dense-ring check scalar fence",
+        )
+        else None
+    )
 
 def _build_device_mixed_owned(
     *,
@@ -375,13 +433,19 @@ def _build_device_wkb_linestring_family(column, row_indexes):
     lengths = offsets[1:][row_indexes] - starts
     point_counts = _pylibcudf_unpack_le_uint32(payload, starts + 5).astype(cp.int32, copy=False)
     expected_lengths = 9 + (point_counts * 16)
-    if bool(cp.asnumpy(cp.any(lengths != expected_lengths))):
+    if _device_bool_scalar(
+        cp.any(lengths != expected_lengths),
+        reason="pylibcudf WKB linestring canonical-length scalar fence",
+    ):
         raise NotImplementedError(
             "pylibcudf device WKB linestring decode currently supports only canonical little-endian 2D records"
         )
 
     geometry_offsets_device = _device_compact_offsets(point_counts)
-    total_points = int(cp.asnumpy(geometry_offsets_device[-1]))
+    total_points = _device_int_scalar(
+        geometry_offsets_device[-1],
+        reason="pylibcudf WKB linestring total-point scalar fence",
+    )
     if total_points:
         coord_indexes = cp.arange(total_points, dtype=cp.int32)
         row_ids = cp.searchsorted(geometry_offsets_device[1:], coord_indexes, side="right")
@@ -416,7 +480,10 @@ def _build_device_wkb_polygon_family(column, row_indexes):
     # Read ring count per polygon (offset 5 in WKB record).
     ring_counts = _pylibcudf_unpack_le_uint32(payload, starts + 5).astype(cp.int32, copy=False)
     geometry_offsets_device = _device_compact_offsets(ring_counts)
-    total_rings = int(cp.asnumpy(geometry_offsets_device[-1]))
+    total_rings = _device_int_scalar(
+        geometry_offsets_device[-1],
+        reason="pylibcudf WKB polygon total-ring scalar fence",
+    )
 
     if total_rings == 0:
         return DeviceFamilyGeometryBuffer(
@@ -468,7 +535,14 @@ def _build_device_wkb_polygon_family(column, row_indexes):
 
     # Iterative ring position resolution — loops over max_rings which is
     # typically small (most polygons have 1-3 rings: exterior + holes).
-    max_rings = int(cp.asnumpy(ring_counts.max())) if n_rows else 0
+    max_rings = (
+        _device_int_scalar(
+            ring_counts.max(),
+            reason="pylibcudf WKB polygon max-ring scalar fence",
+        )
+        if n_rows
+        else 0
+    )
     ring_point_counts = cp.zeros(total_rings, dtype=cp.int32)
 
     # Initialize: ring 0 of each polygon starts at poly_ring0_starts.
@@ -494,11 +568,17 @@ def _build_device_wkb_polygon_family(column, row_indexes):
 
     # Build ring offsets (cumulative point counts per polygon).
     ring_offsets_device = _device_compact_offsets(ring_point_counts)
-    total_points = int(cp.asnumpy(ring_offsets_device[-1]))
+    total_points = _device_int_scalar(
+        ring_offsets_device[-1],
+        reason="pylibcudf WKB polygon total-point scalar fence",
+    )
     dense_single_ring_width = None
     if n_rows > 0 and total_rings == n_rows and total_points % n_rows == 0:
         candidate_width = total_points // n_rows
-        if candidate_width > 0 and bool(cp.asnumpy(cp.all(ring_point_counts == candidate_width))):
+        if candidate_width > 0 and _device_bool_scalar(
+            cp.all(ring_point_counts == candidate_width),
+            reason="pylibcudf WKB polygon dense-ring scalar fence",
+        ):
             dense_single_ring_width = int(candidate_width)
 
     if total_points:
@@ -536,7 +616,10 @@ def _build_device_wkb_multipoint_family(column, row_indexes):
     # Read part count per multipoint (offset 5 in WKB record).
     part_counts = _pylibcudf_unpack_le_uint32(payload, starts + 5).astype(cp.int32, copy=False)
     geometry_offsets_device = _device_compact_offsets(part_counts)
-    total_points = int(cp.asnumpy(geometry_offsets_device[-1]))
+    total_points = _device_int_scalar(
+        geometry_offsets_device[-1],
+        reason="pylibcudf WKB multipoint total-point scalar fence",
+    )
 
     if total_points:
         coord_indexes = cp.arange(total_points, dtype=cp.int32)
@@ -576,7 +659,10 @@ def _build_device_wkb_multilinestring_family(column, row_indexes):
     # Read part count per multilinestring (offset 5 in WKB record).
     part_counts = _pylibcudf_unpack_le_uint32(payload, starts + 5).astype(cp.int32, copy=False)
     geometry_offsets_device = _device_compact_offsets(part_counts)
-    total_parts = int(cp.asnumpy(geometry_offsets_device[-1]))
+    total_parts = _device_int_scalar(
+        geometry_offsets_device[-1],
+        reason="pylibcudf WKB multilinestring total-part scalar fence",
+    )
 
     if total_parts == 0:
         return DeviceFamilyGeometryBuffer(
@@ -591,7 +677,14 @@ def _build_device_wkb_multilinestring_family(column, row_indexes):
 
     # Iterative per-part-index scan (mirrors polygon ring scan pattern).
     # Each sub-linestring: header(5) + pt_count(4) + coords(n*16) = 9 + n*16 bytes.
-    max_parts = int(cp.asnumpy(part_counts.max())) if n_rows else 0
+    max_parts = (
+        _device_int_scalar(
+            part_counts.max(),
+            reason="pylibcudf WKB multilinestring max-part scalar fence",
+        )
+        if n_rows
+        else 0
+    )
     part_point_counts = cp.zeros(total_parts, dtype=cp.int32)
     part_byte_starts = cp.empty(total_parts, dtype=cp.int64)
 
@@ -616,7 +709,10 @@ def _build_device_wkb_multilinestring_family(column, row_indexes):
 
     # Build part offsets (cumulative point counts).
     part_offsets_device = _device_compact_offsets(part_point_counts)
-    total_points = int(cp.asnumpy(part_offsets_device[-1]))
+    total_points = _device_int_scalar(
+        part_offsets_device[-1],
+        reason="pylibcudf WKB multilinestring total-point scalar fence",
+    )
 
     if total_points:
         coord_indexes = cp.arange(total_points, dtype=cp.int32)
@@ -658,7 +754,10 @@ def _build_device_wkb_multipolygon_family(column, row_indexes):
     # Read polygon count per multipolygon (offset 5 in WKB record).
     polygon_counts = _pylibcudf_unpack_le_uint32(payload, starts + 5).astype(cp.int32, copy=False)
     geometry_offsets_device = _device_compact_offsets(polygon_counts)
-    total_polygons = int(cp.asnumpy(geometry_offsets_device[-1]))
+    total_polygons = _device_int_scalar(
+        geometry_offsets_device[-1],
+        reason="pylibcudf WKB multipolygon total-polygon scalar fence",
+    )
 
     if total_polygons == 0:
         return DeviceFamilyGeometryBuffer(
@@ -673,7 +772,14 @@ def _build_device_wkb_multipolygon_family(column, row_indexes):
         )
 
     # --- Outer loop: walk polygons within each multipolygon row ---
-    max_polygons = int(cp.asnumpy(polygon_counts.max())) if n_rows else 0
+    max_polygons = (
+        _device_int_scalar(
+            polygon_counts.max(),
+            reason="pylibcudf WKB multipolygon max-polygon scalar fence",
+        )
+        if n_rows
+        else 0
+    )
     poly_ring_counts = cp.zeros(total_polygons, dtype=cp.int32)
     poly_ring0_starts = cp.empty(total_polygons, dtype=cp.int64)
 
@@ -706,11 +812,14 @@ def _build_device_wkb_multipolygon_family(column, row_indexes):
         # We need to scan each ring's point_count to skip its coords.
         # Removed per-ring-index cp.asnumpy(has_ring.any()) D2H early-exit;
         # masked ops are no-ops for polygons with fewer rings.
-        # NOTE: int(.max()) still performs one D2H scalar read per polygon
-        # batch (unavoidable — Python needs a host int for range()).
+        # The per-polygon max-ring fence is explicit because Python needs a
+        # host loop bound for the variable-depth record walk.
         # has_poly guaranteed non-empty: outer loop bounded by max_polygons
         # (from .max()), so at least one row has polygon_counts == max_polygons.
-        max_rings_here = int(ring_counts_here.max())
+        max_rings_here = _device_int_scalar(
+            ring_counts_here.max(),
+            reason="pylibcudf WKB multipolygon per-polygon max-ring scalar fence",
+        )
         poly_cursors = current_positions[has_poly] + 9  # start of ring data
 
         for ring_idx in range(max_rings_here):
@@ -725,7 +834,10 @@ def _build_device_wkb_multipolygon_family(column, row_indexes):
 
     # --- Build part_offsets (polygon -> ring) ---
     part_offsets_device = _device_compact_offsets(poly_ring_counts)
-    total_rings = int(cp.asnumpy(part_offsets_device[-1]))
+    total_rings = _device_int_scalar(
+        part_offsets_device[-1],
+        reason="pylibcudf WKB multipolygon total-ring scalar fence",
+    )
 
     if total_rings == 0:
         return DeviceFamilyGeometryBuffer(
@@ -740,7 +852,14 @@ def _build_device_wkb_multipolygon_family(column, row_indexes):
         )
 
     # --- Inner loop: walk rings within each polygon ---
-    max_rings = int(cp.asnumpy(poly_ring_counts.max())) if total_polygons else 0
+    max_rings = (
+        _device_int_scalar(
+            poly_ring_counts.max(),
+            reason="pylibcudf WKB multipolygon max-ring scalar fence",
+        )
+        if total_polygons
+        else 0
+    )
     ring_point_counts = cp.zeros(total_rings, dtype=cp.int32)
     ring_byte_starts = cp.empty(total_rings, dtype=cp.int64)
 
@@ -766,7 +885,10 @@ def _build_device_wkb_multipolygon_family(column, row_indexes):
 
     # Build ring offsets (cumulative point counts).
     ring_offsets_device = _device_compact_offsets(ring_point_counts)
-    total_points = int(cp.asnumpy(ring_offsets_device[-1]))
+    total_points = _device_int_scalar(
+        ring_offsets_device[-1],
+        reason="pylibcudf WKB multipolygon total-point scalar fence",
+    )
 
     if total_points:
         coord_indexes = cp.arange(total_points, dtype=cp.int32)
@@ -918,9 +1040,10 @@ def _decode_pylibcudf_point_geoarrow_column_to_owned(column) -> OwnedGeometryArr
     import cupy as cp
 
     _require_pylibcudf_zero_offset(column, "point")
+    row_count = int(column.size())
+    valid_count = row_count - int(column.null_count())
 
     if _pylibcudf_can_adopt_zero_copy(column):
-        row_count = int(column.size())
         x_device, y_device = _pylibcudf_point_xy_children(column)
         x_device = x_device[:row_count]
         y_device = y_device[:row_count]
@@ -928,16 +1051,10 @@ def _decode_pylibcudf_point_geoarrow_column_to_owned(column) -> OwnedGeometryArr
         # Preserve partial-NaN point coordinates exactly as encoded. Only the
         # canonical NaN/NaN sentinel represents POINT EMPTY.
         empty_mask_device = cp.isnan(x_device) & cp.isnan(y_device)
-        has_empty = bool(empty_mask_device.any().item())
-        if has_empty:
-            nonempty = ~empty_mask_device
-            geometry_offsets_device = _device_compact_offsets(nonempty.astype(cp.int32))
-            x_payload = x_device[nonempty]
-            y_payload = y_device[nonempty]
-        else:
-            geometry_offsets_device = cp.arange(row_count + 1, dtype=cp.int32)
-            x_payload = x_device
-            y_payload = y_device
+        nonempty = ~empty_mask_device
+        geometry_offsets_device = _device_compact_offsets(nonempty.astype(cp.int32))
+        x_payload = x_device[nonempty]
+        y_payload = y_device[nonempty]
         owned = _build_device_single_family_owned(
             family=GeometryFamily.POINT,
             validity_device=validity_device,
@@ -945,12 +1062,9 @@ def _decode_pylibcudf_point_geoarrow_column_to_owned(column) -> OwnedGeometryArr
             y_device=y_payload,
             geometry_offsets_device=geometry_offsets_device,
             empty_mask_device=empty_mask_device,
-            detail="zero-copy adopted device-resident point buffers from pylibcudf GeoArrow column",
+            detail="created device-resident owned point buffers from pylibcudf GeoArrow column without host empty-mask probing",
             all_valid=True,
         )
-        owned.device_adopted = True
-        if owned.device_state is not None:
-            owned.device_state._column_refs = [column]
         return owned
 
     validity_device = _pylibcudf_validity_mask(column)
@@ -970,6 +1084,7 @@ def _decode_pylibcudf_point_geoarrow_column_to_owned(column) -> OwnedGeometryArr
         geometry_offsets_device=geometry_offsets_device,
         empty_mask_device=empty_mask_device,
         detail="created device-resident owned geometry array from pylibcudf GeoParquet point scan",
+        valid_count=valid_count,
     )
 
 
@@ -1097,12 +1212,14 @@ def _decode_pylibcudf_linestring_like_geoarrow_column_to_owned(column, family: G
     import cupy as cp
 
     _require_pylibcudf_zero_offset(column, family.value)
+    row_count = int(column.size())
+    child_column = column.child(1)
+    coord_count = int(child_column.size())
+    valid_count = row_count - int(column.null_count())
 
     if _pylibcudf_can_adopt_zero_copy(column):
-        row_count = int(column.size())
         geometry_offsets_device = _pylibcudf_list_offsets_adopt(column)
-        coord_count = int(cp.asnumpy(geometry_offsets_device[row_count]))
-        x_all, y_all = _pylibcudf_point_xy_children(column.child(1))
+        x_all, y_all = _pylibcudf_point_xy_children(child_column)
         x_device = x_all[:coord_count]
         y_device = y_all[:coord_count]
         geometry_offsets_device = geometry_offsets_device[:row_count + 1]
@@ -1127,8 +1244,9 @@ def _decode_pylibcudf_linestring_like_geoarrow_column_to_owned(column, family: G
     geometry_offsets_device, coord_mask = _device_child_selection_mask(
         _pylibcudf_list_offsets(column),
         validity_device,
+        child_count=coord_count,
     )
-    x_all, y_all = _pylibcudf_point_xy_children(column.child(1))
+    x_all, y_all = _pylibcudf_point_xy_children(child_column)
     return _build_device_single_family_owned(
         family=family,
         validity_device=validity_device,
@@ -1137,6 +1255,7 @@ def _decode_pylibcudf_linestring_like_geoarrow_column_to_owned(column, family: G
         geometry_offsets_device=geometry_offsets_device,
         empty_mask_device=(geometry_offsets_device[1:] - geometry_offsets_device[:-1]) == 0,
         detail=f"created device-resident owned geometry array from pylibcudf GeoParquet {family.value} scan",
+        valid_count=valid_count,
     )
 
 
@@ -1144,23 +1263,25 @@ def _decode_pylibcudf_polygon_geoarrow_column_to_owned(column) -> OwnedGeometryA
     import cupy as cp
 
     _require_pylibcudf_zero_offset(column, "polygon")
+    row_count = int(column.size())
+    ring_column = column.child(1)
+    ring_count = int(ring_column.size())
+    point_column = ring_column.child(1)
+    coord_count = int(point_column.size())
+    valid_count = row_count - int(column.null_count())
 
     if _pylibcudf_can_adopt_zero_copy(column):
-        row_count = int(column.size())
         geometry_offsets_device = _pylibcudf_list_offsets_adopt(column)
         geometry_offsets_device = geometry_offsets_device[:row_count + 1]
-        ring_column = column.child(1)
-        ring_count = int(cp.asnumpy(geometry_offsets_device[row_count]))
         ring_offsets_device = _pylibcudf_list_offsets_adopt(ring_column)
         ring_offsets_device = ring_offsets_device[:ring_count + 1]
-        coord_count = int(cp.asnumpy(ring_offsets_device[ring_count]))
         dense_width = _device_dense_single_ring_width(
             geometry_offsets_device,
             ring_offsets_device,
             row_count=row_count,
             coord_count=coord_count,
         )
-        x_all, y_all = _pylibcudf_point_xy_children(ring_column.child(1))
+        x_all, y_all = _pylibcudf_point_xy_children(point_column)
         x_device = x_all[:coord_count]
         y_device = y_all[:coord_count]
         validity_device = cp.ones(row_count, dtype=cp.bool_)
@@ -1186,24 +1307,14 @@ def _decode_pylibcudf_polygon_geoarrow_column_to_owned(column) -> OwnedGeometryA
     geometry_offsets_device, ring_parent_mask = _device_child_selection_mask(
         _pylibcudf_list_offsets(column),
         validity_device,
+        child_count=ring_count,
     )
-    ring_column = column.child(1)
     ring_offsets_device, coord_mask = _device_child_selection_mask(
         _pylibcudf_list_offsets(ring_column),
         ring_parent_mask,
+        child_count=coord_count,
     )
-    x_all, y_all = _pylibcudf_point_xy_children(ring_column.child(1))
-    coord_count = int(cp.asnumpy(ring_offsets_device[-1])) if int(ring_offsets_device.size) else 0
-    dense_width = (
-        _device_dense_single_ring_width(
-            geometry_offsets_device,
-            ring_offsets_device,
-            row_count=int(validity_device.size),
-            coord_count=coord_count,
-        )
-        if bool(cp.asnumpy(cp.all(validity_device)))
-        else None
-    )
+    x_all, y_all = _pylibcudf_point_xy_children(point_column)
     return _build_device_single_family_owned(
         family=GeometryFamily.POLYGON,
         validity_device=validity_device,
@@ -1212,8 +1323,9 @@ def _decode_pylibcudf_polygon_geoarrow_column_to_owned(column) -> OwnedGeometryA
         geometry_offsets_device=geometry_offsets_device,
         empty_mask_device=(geometry_offsets_device[1:] - geometry_offsets_device[:-1]) == 0,
         ring_offsets_device=ring_offsets_device,
-        dense_single_ring_width=dense_width,
+        dense_single_ring_width=None,
         detail="created device-resident owned geometry array from pylibcudf GeoParquet polygon scan",
+        valid_count=valid_count,
     )
 
 
@@ -1221,17 +1333,19 @@ def _decode_pylibcudf_multilinestring_geoarrow_column_to_owned(column) -> OwnedG
     import cupy as cp
 
     _require_pylibcudf_zero_offset(column, "multilinestring")
+    row_count = int(column.size())
+    part_column = column.child(1)
+    part_count = int(part_column.size())
+    point_column = part_column.child(1)
+    coord_count = int(point_column.size())
+    valid_count = row_count - int(column.null_count())
 
     if _pylibcudf_can_adopt_zero_copy(column):
-        row_count = int(column.size())
         geometry_offsets_device = _pylibcudf_list_offsets_adopt(column)
         geometry_offsets_device = geometry_offsets_device[:row_count + 1]
-        part_column = column.child(1)
-        part_count = int(cp.asnumpy(geometry_offsets_device[row_count]))
         part_offsets_device = _pylibcudf_list_offsets_adopt(part_column)
         part_offsets_device = part_offsets_device[:part_count + 1]
-        coord_count = int(cp.asnumpy(part_offsets_device[part_count]))
-        x_all, y_all = _pylibcudf_point_xy_children(part_column.child(1))
+        x_all, y_all = _pylibcudf_point_xy_children(point_column)
         x_device = x_all[:coord_count]
         y_device = y_all[:coord_count]
         validity_device = cp.ones(row_count, dtype=cp.bool_)
@@ -1256,13 +1370,14 @@ def _decode_pylibcudf_multilinestring_geoarrow_column_to_owned(column) -> OwnedG
     geometry_offsets_device, part_parent_mask = _device_child_selection_mask(
         _pylibcudf_list_offsets(column),
         validity_device,
+        child_count=part_count,
     )
-    part_column = column.child(1)
     part_offsets_device, coord_mask = _device_child_selection_mask(
         _pylibcudf_list_offsets(part_column),
         part_parent_mask,
+        child_count=coord_count,
     )
-    x_all, y_all = _pylibcudf_point_xy_children(part_column.child(1))
+    x_all, y_all = _pylibcudf_point_xy_children(point_column)
     return _build_device_single_family_owned(
         family=GeometryFamily.MULTILINESTRING,
         validity_device=validity_device,
@@ -1272,6 +1387,7 @@ def _decode_pylibcudf_multilinestring_geoarrow_column_to_owned(column) -> OwnedG
         empty_mask_device=(geometry_offsets_device[1:] - geometry_offsets_device[:-1]) == 0,
         part_offsets_device=part_offsets_device,
         detail="created device-resident owned geometry array from pylibcudf GeoParquet multilinestring scan",
+        valid_count=valid_count,
     )
 
 
@@ -1279,21 +1395,23 @@ def _decode_pylibcudf_multipolygon_geoarrow_column_to_owned(column) -> OwnedGeom
     import cupy as cp
 
     _require_pylibcudf_zero_offset(column, "multipolygon")
+    row_count = int(column.size())
+    polygon_column = column.child(1)
+    polygon_count = int(polygon_column.size())
+    ring_column = polygon_column.child(1)
+    ring_count = int(ring_column.size())
+    point_column = ring_column.child(1)
+    coord_count = int(point_column.size())
+    valid_count = row_count - int(column.null_count())
 
     if _pylibcudf_can_adopt_zero_copy(column):
-        row_count = int(column.size())
         geometry_offsets_device = _pylibcudf_list_offsets_adopt(column)
         geometry_offsets_device = geometry_offsets_device[:row_count + 1]
-        polygon_column = column.child(1)
-        polygon_count = int(cp.asnumpy(geometry_offsets_device[row_count]))
         part_offsets_device = _pylibcudf_list_offsets_adopt(polygon_column)
         part_offsets_device = part_offsets_device[:polygon_count + 1]
-        ring_column = polygon_column.child(1)
-        ring_count = int(cp.asnumpy(part_offsets_device[polygon_count]))
         ring_offsets_device = _pylibcudf_list_offsets_adopt(ring_column)
         ring_offsets_device = ring_offsets_device[:ring_count + 1]
-        coord_count = int(cp.asnumpy(ring_offsets_device[ring_count]))
-        x_all, y_all = _pylibcudf_point_xy_children(ring_column.child(1))
+        x_all, y_all = _pylibcudf_point_xy_children(point_column)
         x_device = x_all[:coord_count]
         y_device = y_all[:coord_count]
         validity_device = cp.ones(row_count, dtype=cp.bool_)
@@ -1319,18 +1437,19 @@ def _decode_pylibcudf_multipolygon_geoarrow_column_to_owned(column) -> OwnedGeom
     geometry_offsets_device, polygon_parent_mask = _device_child_selection_mask(
         _pylibcudf_list_offsets(column),
         validity_device,
+        child_count=polygon_count,
     )
-    polygon_column = column.child(1)
     part_offsets_device, ring_parent_mask = _device_child_selection_mask(
         _pylibcudf_list_offsets(polygon_column),
         polygon_parent_mask,
+        child_count=ring_count,
     )
-    ring_column = polygon_column.child(1)
     ring_offsets_device, coord_mask = _device_child_selection_mask(
         _pylibcudf_list_offsets(ring_column),
         ring_parent_mask,
+        child_count=coord_count,
     )
-    x_all, y_all = _pylibcudf_point_xy_children(ring_column.child(1))
+    x_all, y_all = _pylibcudf_point_xy_children(point_column)
     return _build_device_single_family_owned(
         family=GeometryFamily.MULTIPOLYGON,
         validity_device=validity_device,
@@ -1341,6 +1460,7 @@ def _decode_pylibcudf_multipolygon_geoarrow_column_to_owned(column) -> OwnedGeom
         part_offsets_device=part_offsets_device,
         ring_offsets_device=ring_offsets_device,
         detail="created device-resident owned geometry array from pylibcudf GeoParquet multipolygon scan",
+        valid_count=valid_count,
     )
 
 

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
 import shapely
@@ -19,6 +22,56 @@ except (ImportError, ModuleNotFoundError):
     _has_gpu = False
 
 requires_gpu = pytest.mark.skipif(not _has_gpu, reason="GPU not available")
+
+
+def test_polygon_rect_intersection_has_no_raw_cupy_scalar_syncs() -> None:
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "vibespatial"
+        / "kernels"
+        / "constructive"
+        / "polygon_rect_intersection.py"
+    )
+    tree = ast.parse(path.read_text(), filename=str(path))
+    failures: list[str] = []
+    cupy_reductions = {
+        "all",
+        "any",
+        "sum",
+        "count_nonzero",
+        "max",
+        "min",
+        "nanmax",
+        "nanmin",
+    }
+
+    def _contains_cupy_reduction(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == "cp"
+            and child.func.attr in cupy_reductions
+            for child in ast.walk(node)
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "item":
+                failures.append(f"raw .item() at line {node.lineno}")
+            continue
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"bool", "int", "float"}
+            and node.args
+        ):
+            continue
+        if _contains_cupy_reduction(node.args[0]):
+            failures.append(f"raw {node.func.id}(cp reduction) at line {node.lineno}")
+
+    assert failures == []
 
 
 def test_polygon_rect_intersection_can_handle_uses_host_probe_without_move_to(

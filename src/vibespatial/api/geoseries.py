@@ -19,6 +19,8 @@ from vibespatial.api.geo_base import (
     GeoPandasBase,
     _delegate_property,
     _is_geometry_like_dtype,
+    _record_native_display_export,
+    _record_native_public_export_boundary,
     is_geometry_type,
 )
 from vibespatial.api.geometry_array import (
@@ -75,6 +77,312 @@ def _geoseries_expanddim(data=None, *args, **kwargs):
     # with that then specialize.
     df = pd.DataFrame(data, *args, **kwargs)
     return _expanddim_logic(df)
+
+
+def _geoseries_accepts_native_state(result) -> bool:
+    return isinstance(result, Series) and _is_geometry_like_dtype(getattr(result, "dtype", None))
+
+
+def _geoseries_row_positions(key, row_count: int):
+    if isinstance(key, slice):
+        return np.arange(row_count, dtype=np.int64)[key], True
+    if isinstance(key, np.ndarray):
+        values = key
+    elif isinstance(key, pd.Index):
+        values = key.to_numpy()
+    elif pd.api.types.is_list_like(key) and not isinstance(key, (str, bytes)):
+        values = np.asarray(list(key))
+    else:
+        return None, False
+
+    if values.ndim != 1:
+        return None, False
+    if values.dtype == bool:
+        if values.shape[0] != row_count:
+            return None, False
+        return np.flatnonzero(values).astype(np.int64, copy=False), True
+    if not np.issubdtype(values.dtype, np.integer):
+        return None, False
+
+    positions = values.astype(np.int64, copy=False)
+    positions = np.where(positions < 0, positions + row_count, positions)
+    if np.any((positions < 0) | (positions >= row_count)):
+        return None, False
+    unique = positions.size == np.unique(positions).size
+    return positions, bool(unique)
+
+
+def _geoseries_positions_from_result_index(owner, result):
+    source_index = getattr(owner, "index", None)
+    result_index = getattr(result, "index", None)
+    if source_index is None or result_index is None or not source_index.is_unique:
+        return None
+    positions = source_index.get_indexer(result_index)
+    if positions.ndim != 1 or positions.shape[0] != len(result):
+        return None
+    if np.any(positions < 0):
+        return None
+    return positions.astype(np.int64, copy=False)
+
+
+def _geoseries_sort_index_positions(owner, result, *args, **kwargs):
+    source_index = getattr(owner, "index", None)
+    if source_index is None or result is None:
+        return None
+    values = pd.Series(
+        np.arange(len(owner), dtype=np.int64),
+        index=source_index,
+        copy=False,
+    )
+    sort_kwargs = dict(kwargs)
+    sort_kwargs.pop("inplace", None)
+    try:
+        sorted_values = values.sort_index(*args, **sort_kwargs)
+    except Exception:
+        return None
+    if sorted_values is None:
+        return None
+    positions = sorted_values.to_numpy(dtype=np.int64, copy=False)
+    if positions.ndim != 1 or int(positions.size) != len(result):
+        return None
+    if np.any(positions < 0) or np.any(positions >= len(owner)):
+        return None
+    if _geoseries_positions_match_result_index(owner, result, positions):
+        return positions.astype(np.int64, copy=False)
+    if result.index.equals(pd.RangeIndex(len(result))):
+        return positions.astype(np.int64, copy=False)
+    return None
+
+
+def _geoseries_indexes_equal_exact(left, right) -> bool:
+    if left is None or right is None:
+        return left is right
+    try:
+        if not left.equals(right):
+            return False
+    except Exception:
+        return False
+    return tuple(getattr(left, "names", (getattr(left, "name", None),))) == tuple(
+        getattr(right, "names", (getattr(right, "name", None),)),
+    )
+
+
+def _geoseries_positions_match_result_index(owner, result, positions) -> bool:
+    source_index = getattr(owner, "index", None)
+    result_index = getattr(result, "index", None)
+    if source_index is None or result_index is None or positions is None:
+        return False
+    try:
+        return _geoseries_indexes_equal_exact(source_index.take(positions), result_index)
+    except Exception:
+        return False
+
+
+def _geoseries_boolean_key_positions(owner, key):
+    source_index = getattr(owner, "index", None)
+    if isinstance(key, Series):
+        if source_index is None or not key.index.equals(source_index):
+            return None
+        values = key.to_numpy(dtype=bool, na_value=False)
+    elif isinstance(key, pd.Index):
+        if key.dtype != bool:
+            return None
+        values = key.to_numpy(dtype=bool, na_value=False)
+    elif isinstance(key, np.ndarray):
+        if key.dtype != bool:
+            return None
+        values = np.asarray(key, dtype=bool)
+    elif pd.api.types.is_list_like(key) and not isinstance(key, (str, bytes)):
+        values = np.asarray(list(key))
+        if values.dtype != bool:
+            return None
+    else:
+        return None
+    if values.ndim != 1 or values.shape[0] != len(owner):
+        return None
+    return np.flatnonzero(values).astype(np.int64, copy=False)
+
+
+def _geoseries_getitem_positions(owner, key, result):
+    positions = _geoseries_positions_from_result_index(owner, result)
+    if positions is not None:
+        return positions, bool(result.index.is_unique)
+
+    if isinstance(key, slice):
+        positions = np.arange(len(owner), dtype=np.int64)[key]
+        if _geoseries_positions_match_result_index(owner, result, positions):
+            unique = positions.size == np.unique(positions).size
+            return positions, bool(unique)
+        return None, False
+
+    positions = _geoseries_boolean_key_positions(owner, key)
+    if positions is not None and _geoseries_positions_match_result_index(
+        owner,
+        result,
+        positions,
+    ):
+        return positions, True
+
+    return None, False
+
+
+def _attach_native_state_to_geoseries_result(owner, result, state) -> None:
+    if state is None or not _geoseries_accepts_native_state(result):
+        return
+    if len(result) != state.row_count:
+        return
+    if not _geoseries_indexes_equal_exact(result.index, owner.index):
+        return
+
+    from vibespatial.api._native_result_core import GeometryNativeResult
+    from vibespatial.api._native_state import attach_native_state
+
+    geometry = GeometryNativeResult.from_geoseries(result)
+    attach_native_state(result, state.with_geometry_result(geometry))
+
+
+def _attach_native_state_after_geoseries_getitem(owner, key, result) -> None:
+    if not _geoseries_accepts_native_state(result):
+        return
+    positions, unique = _geoseries_getitem_positions(owner, key, result)
+    _attach_native_state_after_geoseries_positions(
+        owner,
+        result,
+        positions,
+        unique=unique,
+    )
+
+
+def _attach_native_state_after_geoseries_result_index(owner, result) -> None:
+    if not _geoseries_accepts_native_state(result):
+        return
+    positions = _geoseries_positions_from_result_index(owner, result)
+    if positions is None:
+        return
+    _attach_native_state_after_geoseries_positions(
+        owner,
+        result,
+        positions,
+        unique=bool(result.index.is_unique),
+    )
+
+
+def _attach_native_state_after_geoseries_head_tail(owner, result, *, tail: bool) -> None:
+    if not _geoseries_accepts_native_state(result):
+        return
+    result_len = len(result)
+    if tail:
+        start = len(owner) - result_len
+        positions = np.arange(start, len(owner), dtype=np.int64)
+    else:
+        positions = np.arange(result_len, dtype=np.int64)
+    if not _geoseries_positions_match_result_index(owner, result, positions):
+        return
+    _attach_native_state_after_geoseries_positions(
+        owner,
+        result,
+        positions,
+        unique=True,
+    )
+
+
+def _attach_native_state_after_geoseries_metadata_relabel(owner, result) -> None:
+    if not _geoseries_accepts_native_state(result):
+        return
+
+    from vibespatial.api._native_result_core import GeometryNativeResult
+    from vibespatial.api._native_state import attach_native_state, get_native_state
+
+    state = get_native_state(owner)
+    if state is None or len(result) != state.row_count:
+        return
+
+    relabeled = state
+    if not _geoseries_indexes_equal_exact(result.index, owner.index):
+        try:
+            relabeled = relabeled.with_index(result.index)
+        except ValueError:
+            return
+
+    if result.name != relabeled.geometry_name:
+        relabeled = relabeled.rename_columns({relabeled.geometry_name: result.name})
+        if relabeled is None:
+            return
+
+    geometry = GeometryNativeResult.from_geoseries(result)
+    attach_native_state(result, relabeled.with_geometry_result(geometry))
+
+
+def _attach_native_state_after_geoseries_positions(
+    owner,
+    result,
+    positions,
+    *,
+    unique: bool,
+    index_override=None,
+) -> None:
+    if positions is None or not _geoseries_accepts_native_state(result):
+        return
+
+    from vibespatial.api._native_rowset import NativeRowSet
+    from vibespatial.api._native_state import attach_native_state, get_native_state
+
+    state = get_native_state(owner)
+    if state is None or len(result) != int(positions.size):
+        return
+    rowset = NativeRowSet.from_positions(
+        positions,
+        source_token=state.lineage_token,
+        source_row_count=state.row_count,
+        ordered=True,
+        unique=unique,
+    )
+    taken = state.take(rowset, preserve_index=True)
+    if index_override is not None:
+        try:
+            taken = taken.with_index(index_override)
+        except ValueError:
+            return
+    attach_native_state(result, taken)
+
+
+class _GeoSeriesNativeStateInvalidatingIndexer:
+    """Delegate pandas indexer reads while clearing private state on writes."""
+
+    def __init__(self, indexer, owner, *, kind: str) -> None:
+        self._indexer = indexer
+        self._owner = owner
+        self._kind = kind
+
+    def __getitem__(self, key):
+        result = self._indexer[key]
+        if self._kind == "iloc":
+            row_key = key[0] if isinstance(key, tuple) and key else key
+            positions, unique = _geoseries_row_positions(row_key, len(self._owner))
+            _attach_native_state_after_geoseries_positions(
+                self._owner,
+                result,
+                positions,
+                unique=unique,
+            )
+        elif self._kind == "loc":
+            _attach_native_state_after_geoseries_result_index(self._owner, result)
+        return result
+
+    def __setitem__(self, key, value) -> None:
+        from vibespatial.api._native_state import drop_native_state
+
+        drop_native_state(self._owner)
+        self._indexer[key] = value
+
+    def __call__(self, *args, **kwargs):
+        called = self._indexer(*args, **kwargs)
+        if called is self._indexer:
+            return self
+        return type(self)(called, self._owner, kind=self._kind)
+
+    def __getattr__(self, name):
+        return getattr(self._indexer, name)
 
 
 class GeoSeries(GeoPandasBase, Series):
@@ -698,7 +1006,19 @@ class GeoSeries(GeoPandasBase, Series):
         """
         from vibespatial.api.geodataframe import GeoDataFrame
 
-        return GeoDataFrame({"geometry": self}).__geo_interface__
+        _record_native_public_export_boundary(
+            self,
+            surface="vibespatial.api.GeoSeries.__geo_interface__",
+            operation="geoseries_geo_interface",
+            target="geo-interface",
+            reason="native GeoSeries exported to Python geo interface",
+        )
+        return GeoDataFrame({"geometry": self}).to_geo_dict(
+            na="null",
+            show_bbox=True,
+            drop_id=False,
+            _record_export=False,
+        )
 
     def to_file(
         self,
@@ -769,8 +1089,17 @@ class GeoSeries(GeoPandasBase, Series):
         """
         from vibespatial.api.geodataframe import GeoDataFrame
 
+        record_export = bool(kwargs.pop("_record_export", True))
+        if record_export:
+            _record_native_public_export_boundary(
+                self,
+                surface="vibespatial.api.GeoSeries.to_file",
+                operation="geoseries_to_file",
+                target="file",
+                reason="native GeoSeries exported to vector file writer",
+            )
         data = GeoDataFrame({"geometry": self}, index=self.index)
-        data.to_file(filename, driver, index=index, **kwargs)
+        data.to_file(filename, driver, index=index, _record_export=False, **kwargs)
 
     #
     # Implement pandas methods
@@ -804,16 +1133,169 @@ class GeoSeries(GeoPandasBase, Series):
             val.crs = self.crs
         return val
 
+    def __repr__(self) -> str:
+        _record_native_display_export(
+            self,
+            surface="vibespatial.api.GeoSeries.__repr__",
+            operation="geoseries_repr",
+            target="repr",
+        )
+        return super().__repr__()
+
+    @property
+    def loc(self):
+        return _GeoSeriesNativeStateInvalidatingIndexer(
+            Series.loc.fget(self),
+            self,
+            kind="loc",
+        )
+
+    @property
+    def iloc(self):
+        return _GeoSeriesNativeStateInvalidatingIndexer(
+            Series.iloc.fget(self),
+            self,
+            kind="iloc",
+        )
+
+    @property
+    def at(self):
+        return _GeoSeriesNativeStateInvalidatingIndexer(
+            Series.at.fget(self),
+            self,
+            kind="at",
+        )
+
+    @property
+    def iat(self):
+        return _GeoSeriesNativeStateInvalidatingIndexer(
+            Series.iat.fget(self),
+            self,
+            kind="iat",
+        )
+
     def __getitem__(self, key):
-        return self._wrapped_pandas_method("__getitem__", key)
+        result = self._wrapped_pandas_method("__getitem__", key)
+        _attach_native_state_after_geoseries_getitem(self, key, result)
+        return result
 
     @doc(pd.Series)
     def sort_index(self, *args, **kwargs):
-        return self._wrapped_pandas_method("sort_index", *args, **kwargs)
+        result = self._wrapped_pandas_method("sort_index", *args, **kwargs)
+        if result is None or kwargs.get("inplace", False):
+            return result
+        positions = _geoseries_positions_from_result_index(self, result)
+        if positions is None:
+            positions = _geoseries_sort_index_positions(self, result, *args, **kwargs)
+        if positions is not None:
+            index_override = None
+            if not _geoseries_positions_match_result_index(self, result, positions):
+                index_override = result.index
+            _attach_native_state_after_geoseries_positions(
+                self,
+                result,
+                positions,
+                unique=positions.size == np.unique(positions).size,
+                index_override=index_override,
+            )
+        return result
 
     @doc(pd.Series)
     def take(self, *args, **kwargs):
-        return self._wrapped_pandas_method("take", *args, **kwargs)
+        result = self._wrapped_pandas_method("take", *args, **kwargs)
+        if result is None:
+            return result
+        indices = args[0] if args else kwargs.get("indices")
+        positions, unique = _geoseries_row_positions(indices, len(self))
+        _attach_native_state_after_geoseries_positions(
+            self,
+            result,
+            positions,
+            unique=unique,
+        )
+        return result
+
+    @doc(pd.Series)
+    def copy(self, *args, **kwargs):
+        from vibespatial.api._native_state import get_native_state
+
+        source_native_state = get_native_state(self)
+        result = self._wrapped_pandas_method("copy", *args, **kwargs)
+        if source_native_state is not None:
+            _attach_native_state_to_geoseries_result(
+                self,
+                result,
+                source_native_state,
+            )
+        return result
+
+    @doc(pd.Series)
+    def head(self, *args, **kwargs):
+        result = self._wrapped_pandas_method("head", *args, **kwargs)
+        _attach_native_state_after_geoseries_head_tail(self, result, tail=False)
+        return result
+
+    @doc(pd.Series)
+    def tail(self, *args, **kwargs):
+        result = self._wrapped_pandas_method("tail", *args, **kwargs)
+        _attach_native_state_after_geoseries_head_tail(self, result, tail=True)
+        return result
+
+    @doc(pd.Series)
+    def drop(self, *args, **kwargs):
+        if kwargs.get("inplace", False):
+            from vibespatial.api._native_state import drop_native_state
+
+            drop_native_state(self)
+        result = self._wrapped_pandas_method("drop", *args, **kwargs)
+        if result is not None:
+            _attach_native_state_after_geoseries_result_index(self, result)
+        return result
+
+    @doc(pd.Series)
+    def reindex(self, *args, **kwargs):
+        result = self._wrapped_pandas_method("reindex", *args, **kwargs)
+        _attach_native_state_after_geoseries_result_index(self, result)
+        return result
+
+    @doc(pd.Series)
+    def sample(self, *args, **kwargs):
+        result = self._wrapped_pandas_method("sample", *args, **kwargs)
+        _attach_native_state_after_geoseries_result_index(self, result)
+        return result
+
+    @doc(pd.Series)
+    def rename(self, *args, **kwargs):
+        if kwargs.get("inplace", False):
+            from vibespatial.api._native_state import drop_native_state
+
+            drop_native_state(self)
+        result = self._wrapped_pandas_method("rename", *args, **kwargs)
+        if result is not None:
+            _attach_native_state_after_geoseries_metadata_relabel(self, result)
+        return result
+
+    @doc(pd.Series)
+    def rename_axis(self, *args, **kwargs):
+        if kwargs.get("inplace", False):
+            from vibespatial.api._native_state import drop_native_state
+
+            drop_native_state(self)
+        result = self._wrapped_pandas_method("rename_axis", *args, **kwargs)
+        if result is not None:
+            _attach_native_state_after_geoseries_metadata_relabel(self, result)
+        return result
+
+    @doc(pd.Series)
+    def set_axis(self, *args, **kwargs):
+        if kwargs.get("inplace", False):
+            from vibespatial.api._native_state import drop_native_state
+
+            drop_native_state(self)
+        result = self._wrapped_pandas_method("set_axis", *args, **kwargs)
+        if result is not None:
+            _attach_native_state_after_geoseries_metadata_relabel(self, result)
+        return result
 
     @doc(pd.Series)
     def apply(self, func, convert_dtype: bool | None = None, args=(), **kwargs):
@@ -1176,6 +1658,9 @@ class GeoSeries(GeoPandasBase, Series):
         """
         from pyproj import CRS
 
+        from vibespatial.api._native_state import get_native_state
+
+        source_native_state = get_native_state(self)
         if crs is not None:
             crs = CRS.from_user_input(crs)
         elif epsg is not None:
@@ -1193,6 +1678,13 @@ class GeoSeries(GeoPandasBase, Series):
         else:
             result = self
         result.array.crs = crs
+        _attach_native_state_to_geoseries_result(
+            self,
+            result,
+            None
+            if source_native_state is None
+            else source_native_state.with_geometry_crs(result.crs),
+        )
         return result
 
     def to_crs(self, crs: Any | None = None, epsg: int | None = None) -> GeoSeries:
@@ -1365,8 +1857,22 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         --------
         GeoSeries.to_file : write GeoSeries to file
         """
+        record_export = bool(kwargs.pop("_record_export", True))
+        if record_export:
+            _record_native_public_export_boundary(
+                self,
+                surface="vibespatial.api.GeoSeries.to_json",
+                operation="geoseries_to_json",
+                target="geojson",
+                reason="native GeoSeries exported to GeoJSON string",
+            )
         return self.to_frame("geometry").to_json(
-            na="null", show_bbox=show_bbox, drop_id=drop_id, to_wgs84=to_wgs84, **kwargs
+            na="null",
+            show_bbox=show_bbox,
+            drop_id=drop_id,
+            to_wgs84=to_wgs84,
+            _record_export=False,
+            **kwargs,
         )
 
     def to_wkb(self, hex: bool = False, **kwargs) -> Series:
@@ -1416,6 +1922,13 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         3                                                  NaN
         dtype: str
         """
+        _record_native_public_export_boundary(
+            self,
+            surface="vibespatial.api.GeoSeries.to_wkb",
+            operation="geoseries_to_wkb",
+            target="wkb-series",
+            reason="native GeoSeries exported to WKB Series",
+        )
         return Series(to_wkb(self.array, hex=hex, **kwargs), index=self.index)
 
     def to_wkt(self, **kwargs) -> Series:
@@ -1451,6 +1964,13 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         --------
         GeoSeries.to_wkb
         """
+        _record_native_public_export_boundary(
+            self,
+            surface="vibespatial.api.GeoSeries.to_wkt",
+            operation="geoseries_to_wkt",
+            target="wkt-series",
+            reason="native GeoSeries exported to WKT Series",
+        )
         return Series(to_wkt(self.array, **kwargs), index=self.index)
 
     def to_arrow(self, geometry_encoding="WKB", interleaved=True, include_z=None):
@@ -1518,12 +2038,22 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         """
         from vibespatial.io.arrow import geoseries_to_arrow
 
-        return geoseries_to_arrow(
+        result = geoseries_to_arrow(
             self,
             geometry_encoding=geometry_encoding,
             interleaved=interleaved,
             include_z=include_z,
+            record_export_boundary=False,
+            fallback_to_wkb_on_error=False,
         )
+        _record_native_public_export_boundary(
+            self,
+            surface="vibespatial.api.GeoSeries.to_arrow",
+            operation="geoseries_to_arrow",
+            target="arrow",
+            reason="native GeoSeries exported to Arrow compatibility object",
+        )
+        return result
 
     def clip(self, mask, keep_geom_type: bool = False, sort=False) -> GeoSeries:
         """Clip points, lines, or polygon geometries to the mask extent.

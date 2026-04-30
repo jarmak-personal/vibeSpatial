@@ -7,6 +7,8 @@ import numpy as np
 
 from vibespatial.overlay.microcells import OverlayMicrocellLabels
 
+from ._host_boundary import overlay_bool_scalar, overlay_device_to_host, overlay_int_scalar
+
 try:
     import cupy as cp
 except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
@@ -50,7 +52,10 @@ def _union(parent: np.ndarray, rank: np.ndarray, left: int, right: int) -> None:
 
 def _to_host_array(arr) -> np.ndarray:
     if cp is not None and hasattr(arr, "__cuda_array_interface__"):
-        return cp.asnumpy(arr)
+        return overlay_device_to_host(
+            arr,
+            reason="overlay contract host component assembly metadata",
+        )
     return np.asarray(arr)
 
 
@@ -124,8 +129,14 @@ def _build_contraction_edges_device(
     right_group_ends = group_ends[right_group_ids]
     left_sizes = (left_group_ends - left_group_starts).astype(cp.int32, copy=False)
     right_sizes = (right_group_ends - right_group_starts).astype(cp.int32, copy=False)
-    max_left = int(cp.max(left_sizes).item())
-    max_right = int(cp.max(right_sizes).item())
+    max_left = overlay_int_scalar(
+        cp.max(left_sizes),
+        reason="overlay contract left component batch-size fence",
+    )
+    max_right = overlay_int_scalar(
+        cp.max(right_sizes),
+        reason="overlay contract right component batch-size fence",
+    )
     if max_left <= 0 or max_right <= 0:
         empty = cp.empty(0, dtype=cp.int32)
         return empty, empty
@@ -173,7 +184,10 @@ def _build_contraction_edges_device(
             - cp.maximum(left_lo[:, :, None], right_lo[:, None, :])
         ) > vertical_tolerance
         matches = valid_pairs & same_left_inside & same_right_inside & overlap
-        if not bool(cp.any(matches).item()):
+        if not overlay_bool_scalar(
+            cp.any(matches),
+            reason="overlay contract component-edge match admission fence",
+        ):
             continue
 
         batch_ids, left_match_ids, right_match_ids = cp.nonzero(matches)
@@ -218,7 +232,10 @@ def _contract_component_ids_device(
             next_labels,
             next_labels[next_labels.astype(cp.int64, copy=False)],
         )
-        if bool(cp.all(next_labels == labels).item()):
+        if overlay_bool_scalar(
+            cp.all(next_labels == labels),
+            reason="overlay contract component-label convergence fence",
+        ):
             labels = next_labels
             converged = True
             break
@@ -232,7 +249,10 @@ def _contract_component_ids_device(
 
     roots = labels.astype(cp.int64, copy=False)
     compressed = cp.minimum(roots, roots[roots])
-    while not bool(cp.all(compressed == roots).item()):
+    while not overlay_bool_scalar(
+        cp.all(compressed == roots),
+        reason="overlay contract component-root compression convergence fence",
+    ):
         roots = compressed
         compressed = cp.minimum(roots, roots[roots])
 

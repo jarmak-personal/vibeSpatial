@@ -220,7 +220,10 @@ def _parse_header_row(
         Single-character field delimiter.
     """
     # Copy only the header row bytes D->H (small, one-time)
-    header_bytes = cp.asnumpy(d_bytes[:row_end_pos])
+    header_bytes = get_cuda_runtime().copy_device_to_host(
+        d_bytes[:row_end_pos],
+        reason="csv header row bytes host export",
+    )
     header_str = header_bytes.tobytes().decode("utf-8", errors="replace")
 
     # Strip trailing \r if present (Windows line endings)
@@ -749,7 +752,10 @@ def _detect_geom_format(
     end = int(d_ends[first_idx])
     # Transfer at most 64 bytes -- enough to classify the field.
     peek_end = min(end, start + 64)
-    sample_bytes: bytes = cp.asnumpy(d_bytes[start:peek_end]).tobytes()
+    sample_bytes: bytes = get_cuda_runtime().copy_device_to_host(
+        d_bytes[start:peek_end],
+        reason="csv geometry encoding sample bytes host export",
+    ).tobytes()
 
     # Strip leading whitespace.
     stripped = sample_bytes.lstrip()
@@ -1087,9 +1093,23 @@ def _extract_nonspatial_columns(
 
     # ---- Phase 2: bulk D->H transfer ----
     # Single transfer for the byte payload; batch span arrays together.
-    h_bytes: bytes = cp.asnumpy(d_bytes).tobytes()
+    runtime = get_cuda_runtime()
+    h_bytes: bytes = runtime.copy_device_to_host(
+        d_bytes,
+        reason="csv property decode byte payload host export",
+    ).tobytes()
     host_spans: list[tuple[int, np.ndarray, np.ndarray]] = [
-        (col_idx, cp.asnumpy(d_s), cp.asnumpy(d_e))
+        (
+            col_idx,
+            runtime.copy_device_to_host(
+                d_s,
+                reason=f"csv property column {col_idx} start-span host export",
+            ),
+            runtime.copy_device_to_host(
+                d_e,
+                reason=f"csv property column {col_idx} end-span host export",
+            ),
+        )
         for col_idx, d_s, d_e in device_spans
     ]
 

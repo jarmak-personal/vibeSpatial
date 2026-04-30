@@ -141,6 +141,12 @@ def _centroid_gpu(
     """
     from vibespatial.runtime.precision import PrecisionMode
 
+    if precision_plan is None or precision_plan.compute_precision is not PrecisionMode.FP32:
+        from vibespatial.constructive.point import _build_device_backed_point_output
+
+        d_cx, d_cy = _centroid_gpu_device_fp64(owned)
+        return _build_device_backed_point_output(d_cx, d_cy, row_count=owned.row_count)
+
     compute_type = "double"
     center_x, center_y = 0.0, 0.0
     if precision_plan is not None and precision_plan.compute_precision is PrecisionMode.FP32:
@@ -224,6 +230,300 @@ def _centroid_gpu(
     from vibespatial.constructive.point import _build_device_backed_point_output
 
     return _build_device_backed_point_output(d_cx, d_cy, row_count=row_count)
+
+
+def _centroid_gpu_device_fp64(owned: OwnedGeometryArray):
+    """Compute centroids into two device-resident fp64 vectors.
+
+    This is the internal NativeExpression helper.  Public ``centroid_owned``
+    keeps the point-geometry return contract, while native metric consumers
+    need row-aligned scalar vectors that never touch host routing metadata.
+    """
+    if owned.row_count == 0:
+        runtime = get_cuda_runtime()
+        return (
+            runtime.allocate((0,), np.float64),
+            runtime.allocate((0,), np.float64),
+        )
+
+    runtime = get_cuda_runtime()
+    device_state = owned._ensure_device_state()
+    d_cx = cp.full(owned.row_count, cp.nan, dtype=cp.float64)
+    d_cy = cp.full(owned.row_count, cp.nan, dtype=cp.float64)
+    d_tags = cp.asarray(device_state.tags)
+    d_family_row_offsets = cp.asarray(device_state.family_row_offsets)
+    center_x, center_y = 0.0, 0.0
+
+    def _scatter_family_result(family: GeometryFamily, d_family_cx, d_family_cy) -> None:
+        global_rows = cp.flatnonzero(d_tags == FAMILY_TAGS[family]).astype(
+            cp.int64,
+            copy=False,
+        )
+        if int(global_rows.size) == 0:
+            return
+        family_rows = d_family_row_offsets[global_rows].astype(cp.int64, copy=False)
+        d_cx[global_rows] = d_family_cx[family_rows]
+        d_cy[global_rows] = d_family_cy[family_rows]
+
+    def _launch_point() -> None:
+        family = GeometryFamily.POINT
+        if family not in device_state.families:
+            return
+        ds = device_state.families[family]
+        n = int(ds.empty_mask.size)
+        if n <= 0:
+            return
+        kernels = _compile_kernel(
+            "centroid-point",
+            _POINT_CENTROID_FP64,
+            _POINT_CENTROID_FP32,
+            _POINT_CENTROID_NAMES,
+            "double",
+        )
+        d_family_cx = runtime.allocate((n,), np.float64)
+        d_family_cy = runtime.allocate((n,), np.float64)
+        try:
+            ptr = runtime.pointer
+            params = (
+                (
+                    ptr(ds.x),
+                    ptr(ds.y),
+                    ptr(ds.geometry_offsets),
+                    ptr(d_family_cx),
+                    ptr(d_family_cy),
+                    center_x,
+                    center_y,
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_I32,
+                ),
+            )
+            kernel = kernels["point_centroid"]
+            grid, block = runtime.launch_config(kernel, n)
+            runtime.launch(kernel, grid=grid, block=block, params=params)
+            _scatter_family_result(family, d_family_cx, d_family_cy)
+        finally:
+            runtime.free(d_family_cx)
+            runtime.free(d_family_cy)
+
+    def _launch_simple(
+        family: GeometryFamily,
+        kernel_name: str,
+        fp64_source: str,
+        fp32_source: str,
+        kernel_names: tuple[str, ...],
+        prefix: str,
+        *,
+        has_part_offsets: bool,
+    ) -> None:
+        if family not in device_state.families:
+            return
+        ds = device_state.families[family]
+        n = int(ds.empty_mask.size)
+        if n <= 0 or (has_part_offsets and ds.part_offsets is None):
+            return
+        kernels = _compile_kernel(prefix, fp64_source, fp32_source, kernel_names, "double")
+        d_family_cx = runtime.allocate((n,), np.float64)
+        d_family_cy = runtime.allocate((n,), np.float64)
+        try:
+            ptr = runtime.pointer
+            if has_part_offsets:
+                params = (
+                    (
+                        ptr(ds.x),
+                        ptr(ds.y),
+                        ptr(ds.part_offsets),
+                        ptr(ds.geometry_offsets),
+                        ptr(d_family_cx),
+                        ptr(d_family_cy),
+                        center_x,
+                        center_y,
+                        n,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_I32,
+                    ),
+                )
+            else:
+                params = (
+                    (
+                        ptr(ds.x),
+                        ptr(ds.y),
+                        ptr(ds.geometry_offsets),
+                        ptr(d_family_cx),
+                        ptr(d_family_cy),
+                        center_x,
+                        center_y,
+                        n,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_I32,
+                    ),
+                )
+            kernel = kernels[kernel_name]
+            grid, block = runtime.launch_config(kernel, n)
+            runtime.launch(kernel, grid=grid, block=block, params=params)
+            _scatter_family_result(family, d_family_cx, d_family_cy)
+        finally:
+            runtime.free(d_family_cx)
+            runtime.free(d_family_cy)
+
+    def _launch_polygon(family: GeometryFamily) -> None:
+        if family not in device_state.families:
+            return
+        ds = device_state.families[family]
+        n = int(ds.empty_mask.size)
+        if n <= 0 or ds.ring_offsets is None:
+            return
+        avg_verts = int(ds.x.size) / max(n, 1)
+        use_cooperative = (
+            family is GeometryFamily.POLYGON
+            and ds.dense_single_ring_width is not None
+            and avg_verts >= 64
+        )
+        if use_cooperative:
+            kernels = _compile_kernel(
+                "centroid-polygon-cooperative",
+                _POLYGON_CENTROID_COOPERATIVE_FP64,
+                _POLYGON_CENTROID_COOPERATIVE_FP32,
+                _POLYGON_CENTROID_COOPERATIVE_NAMES,
+                "double",
+            )
+            kernel = kernels["polygon_centroid_cooperative"]
+        else:
+            kernels = _compile_polygon_centroid_kernel("double")
+            kernel = (
+                kernels["polygon_centroid"]
+                if family is GeometryFamily.POLYGON
+                else kernels["multipolygon_centroid"]
+            )
+
+        d_family_cx = runtime.allocate((n,), np.float64)
+        d_family_cy = runtime.allocate((n,), np.float64)
+        try:
+            ptr = runtime.pointer
+            if use_cooperative or family is GeometryFamily.POLYGON:
+                params = (
+                    (
+                        ptr(ds.x),
+                        ptr(ds.y),
+                        ptr(ds.ring_offsets),
+                        ptr(ds.geometry_offsets),
+                        ptr(d_family_cx),
+                        ptr(d_family_cy),
+                        center_x,
+                        center_y,
+                        n,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_I32,
+                    ),
+                )
+            else:
+                if ds.part_offsets is None:
+                    return
+                params = (
+                    (
+                        ptr(ds.x),
+                        ptr(ds.y),
+                        ptr(ds.ring_offsets),
+                        ptr(ds.part_offsets),
+                        ptr(ds.geometry_offsets),
+                        ptr(d_family_cx),
+                        ptr(d_family_cy),
+                        center_x,
+                        center_y,
+                        n,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_I32,
+                    ),
+                )
+            if use_cooperative:
+                grid = (n, 1, 1)
+                block = (256, 1, 1)
+            else:
+                grid, block = runtime.launch_config(kernel, n)
+            runtime.launch(kernel, grid=grid, block=block, params=params)
+            _scatter_family_result(family, d_family_cx, d_family_cy)
+        finally:
+            runtime.free(d_family_cx)
+            runtime.free(d_family_cy)
+
+    _launch_point()
+    _launch_simple(
+        GeometryFamily.MULTIPOINT,
+        "multipoint_centroid",
+        _MULTIPOINT_CENTROID_FP64,
+        _MULTIPOINT_CENTROID_FP32,
+        _MULTIPOINT_CENTROID_NAMES,
+        "centroid-multipoint",
+        has_part_offsets=False,
+    )
+    _launch_simple(
+        GeometryFamily.LINESTRING,
+        "linestring_centroid",
+        _LINESTRING_CENTROID_FP64,
+        _LINESTRING_CENTROID_FP32,
+        _LINESTRING_CENTROID_NAMES,
+        "centroid-linestring",
+        has_part_offsets=False,
+    )
+    _launch_simple(
+        GeometryFamily.MULTILINESTRING,
+        "multilinestring_centroid",
+        _MULTILINESTRING_CENTROID_FP64,
+        _MULTILINESTRING_CENTROID_FP32,
+        _MULTILINESTRING_CENTROID_NAMES,
+        "centroid-multilinestring",
+        has_part_offsets=True,
+    )
+    _launch_polygon(GeometryFamily.POLYGON)
+    _launch_polygon(GeometryFamily.MULTIPOLYGON)
+
+    d_cx[~cp.asarray(device_state.validity)] = cp.nan
+    d_cy[~cp.asarray(device_state.validity)] = cp.nan
+    return d_cx, d_cy
 
 
 def _launch_point_centroid(
@@ -743,3 +1043,103 @@ def centroid_owned(
     from vibespatial.constructive.point import point_owned_from_xy
 
     return point_owned_from_xy(cx, cy)
+
+
+def centroid_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = "auto",
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = centroid_owned(
+        owned,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="centroid",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )
+
+
+def centroid_expression_owned(
+    owned: OwnedGeometryArray,
+    *,
+    component: str,
+    source_token: str | None = None,
+):
+    """Compute a centroid coordinate as a private device expression.
+
+    Physical shape: segmented geometry centroid reduction to one fp64 device
+    coordinate per source row.  The native output carrier is
+    ``NativeExpression`` and the sanctioned consumers are rowsets, grouped
+    reducers, and native attribute assembly.  Public ``geometry.centroid``
+    continues to export a point geometry result.
+    """
+    if component not in {"x", "y"}:
+        raise ValueError("centroid expression component must be 'x' or 'y'")
+    if cp is None:  # pragma: no cover - GPU guard
+        raise RuntimeError("CuPy is required for device-resident centroid expressions")
+
+    from vibespatial.api._native_expression import NativeExpression
+
+    x_values, y_values = _centroid_expression_values(owned)
+    values = x_values if component == "x" else y_values
+    return NativeExpression(
+        operation=f"geometry.centroid.{component}",
+        values=values,
+        source_token=source_token,
+        source_row_count=owned.row_count,
+        dtype="float64",
+        precision="fp64",
+    )
+
+
+def centroid_expressions_owned(
+    owned: OwnedGeometryArray,
+    *,
+    source_token: str | None = None,
+):
+    """Compute centroid x/y as paired private device expressions."""
+    if cp is None:  # pragma: no cover - GPU guard
+        raise RuntimeError("CuPy is required for device-resident centroid expressions")
+
+    from vibespatial.api._native_expression import NativeExpression
+
+    x_values, y_values = _centroid_expression_values(owned)
+    return (
+        NativeExpression(
+            operation="geometry.centroid.x",
+            values=x_values,
+            source_token=source_token,
+            source_row_count=owned.row_count,
+            dtype="float64",
+            precision="fp64",
+        ),
+        NativeExpression(
+            operation="geometry.centroid.y",
+            values=y_values,
+            source_token=source_token,
+            source_row_count=owned.row_count,
+            dtype="float64",
+            precision="fp64",
+        ),
+    )
+
+
+def _centroid_expression_values(owned: OwnedGeometryArray):
+    return _centroid_gpu_device_fp64(owned)

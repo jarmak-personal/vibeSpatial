@@ -9,6 +9,52 @@ from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 # ---------------------------------------------------------------------------
 
 _HAUSDORFF_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+__device__ compute_t hausdorff_sample_x(
+    const double* __restrict__ x,
+    int start,
+    int coord_count,
+    int sample,
+    int densify_steps,
+    double center_x
+) {{
+    if (coord_count <= 1 || densify_steps <= 1) {{
+        return CX(x[start + sample]);
+    }}
+    const int last_sample = (coord_count - 1) * densify_steps;
+    if (sample >= last_sample) {{
+        return CX(x[start + coord_count - 1]);
+    }}
+    const int segment = sample / densify_steps;
+    const int step = sample - segment * densify_steps;
+    const compute_t t = (compute_t)step / (compute_t)densify_steps;
+    const compute_t x0 = CX(x[start + segment]);
+    const compute_t x1 = CX(x[start + segment + 1]);
+    return x0 + (x1 - x0) * t;
+}}
+
+__device__ compute_t hausdorff_sample_y(
+    const double* __restrict__ y,
+    int start,
+    int coord_count,
+    int sample,
+    int densify_steps,
+    double center_y
+) {{
+    if (coord_count <= 1 || densify_steps <= 1) {{
+        return CY(y[start + sample]);
+    }}
+    const int last_sample = (coord_count - 1) * densify_steps;
+    if (sample >= last_sample) {{
+        return CY(y[start + coord_count - 1]);
+    }}
+    const int segment = sample / densify_steps;
+    const int step = sample - segment * densify_steps;
+    const compute_t t = (compute_t)step / (compute_t)densify_steps;
+    const compute_t y0 = CY(y[start + segment]);
+    const compute_t y1 = CY(y[start + segment + 1]);
+    return y0 + (y1 - y0) * t;
+}}
+
 extern "C" __global__ __launch_bounds__(256, 4)
 void hausdorff_distance(
     const double* __restrict__ x_a,
@@ -20,6 +66,7 @@ void hausdorff_distance(
     double* __restrict__ result,
     double center_x,
     double center_y,
+    int densify_steps,
     int pair_count
 ) {{
     const int pair = blockIdx.x;
@@ -39,16 +86,28 @@ void hausdorff_distance(
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
+    const int a_samples = (na <= 1 || densify_steps <= 1)
+        ? na
+        : ((na - 1) * densify_steps + 1);
+    const int b_samples = (nb <= 1 || densify_steps <= 1)
+        ? nb
+        : ((nb - 1) * densify_steps + 1);
 
     /* Forward direction: max over A of {{ min over B of dist(a,b) }} */
     compute_t local_max_forward = (compute_t)0.0;
-    for (int i = tid; i < na; i += stride) {{
-        const compute_t ax = CX(x_a[a_start + i]);
-        const compute_t ay = CY(y_a[a_start + i]);
+    for (int i = tid; i < a_samples; i += stride) {{
+        const compute_t ax = hausdorff_sample_x(
+            x_a, a_start, na, i, densify_steps, center_x);
+        const compute_t ay = hausdorff_sample_y(
+            y_a, a_start, na, i, densify_steps, center_y);
         compute_t min_dist_sq = (compute_t)1e38;
-        for (int j = 0; j < nb; j++) {{
-            const compute_t dx = ax - CX(x_b[b_start + j]);
-            const compute_t dy = ay - CY(y_b[b_start + j]);
+        for (int j = 0; j < b_samples; j++) {{
+            const compute_t bx = hausdorff_sample_x(
+                x_b, b_start, nb, j, densify_steps, center_x);
+            const compute_t by = hausdorff_sample_y(
+                y_b, b_start, nb, j, densify_steps, center_y);
+            const compute_t dx = ax - bx;
+            const compute_t dy = ay - by;
             const compute_t d_sq = dx * dx + dy * dy;
             if (d_sq < min_dist_sq) min_dist_sq = d_sq;
         }}
@@ -58,13 +117,19 @@ void hausdorff_distance(
 
     /* Backward direction: max over B of {{ min over A of dist(b,a) }} */
     compute_t local_max_backward = (compute_t)0.0;
-    for (int j = tid; j < nb; j += stride) {{
-        const compute_t bx = CX(x_b[b_start + j]);
-        const compute_t by = CY(y_b[b_start + j]);
+    for (int j = tid; j < b_samples; j += stride) {{
+        const compute_t bx = hausdorff_sample_x(
+            x_b, b_start, nb, j, densify_steps, center_x);
+        const compute_t by = hausdorff_sample_y(
+            y_b, b_start, nb, j, densify_steps, center_y);
         compute_t min_dist_sq = (compute_t)1e38;
-        for (int i = 0; i < na; i++) {{
-            const compute_t dx = bx - CX(x_a[a_start + i]);
-            const compute_t dy = by - CY(y_a[a_start + i]);
+        for (int i = 0; i < a_samples; i++) {{
+            const compute_t ax = hausdorff_sample_x(
+                x_a, a_start, na, i, densify_steps, center_x);
+            const compute_t ay = hausdorff_sample_y(
+                y_a, a_start, na, i, densify_steps, center_y);
+            const compute_t dx = bx - ax;
+            const compute_t dy = by - ay;
             const compute_t d_sq = dx * dx + dy * dy;
             if (d_sq < min_dist_sq) min_dist_sq = d_sq;
         }}
@@ -102,6 +167,52 @@ MAX_FRECHET_B = 2048
 _FRECHET_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 #define MAX_FRECHET_B {max_frechet_b}
 
+__device__ compute_t frechet_sample_x(
+    const double* __restrict__ x,
+    int start,
+    int coord_count,
+    int sample,
+    int densify_steps,
+    double center_x
+) {{
+    if (coord_count <= 1 || densify_steps <= 1) {{
+        return CX(x[start + sample]);
+    }}
+    const int last_sample = (coord_count - 1) * densify_steps;
+    if (sample >= last_sample) {{
+        return CX(x[start + coord_count - 1]);
+    }}
+    const int segment = sample / densify_steps;
+    const int step = sample - segment * densify_steps;
+    const compute_t t = (compute_t)step / (compute_t)densify_steps;
+    const compute_t x0 = CX(x[start + segment]);
+    const compute_t x1 = CX(x[start + segment + 1]);
+    return x0 + (x1 - x0) * t;
+}}
+
+__device__ compute_t frechet_sample_y(
+    const double* __restrict__ y,
+    int start,
+    int coord_count,
+    int sample,
+    int densify_steps,
+    double center_y
+) {{
+    if (coord_count <= 1 || densify_steps <= 1) {{
+        return CY(y[start + sample]);
+    }}
+    const int last_sample = (coord_count - 1) * densify_steps;
+    if (sample >= last_sample) {{
+        return CY(y[start + coord_count - 1]);
+    }}
+    const int segment = sample / densify_steps;
+    const int step = sample - segment * densify_steps;
+    const compute_t t = (compute_t)step / (compute_t)densify_steps;
+    const compute_t y0 = CY(y[start + segment]);
+    const compute_t y1 = CY(y[start + segment + 1]);
+    return y0 + (y1 - y0) * t;
+}}
+
 extern "C" __global__
 void frechet_distance(
     const double* __restrict__ x_a,
@@ -114,7 +225,8 @@ void frechet_distance(
     double center_x,
     double center_y,
     int pair_count,
-    int max_b_len
+    int max_b_len,
+    int densify_steps
 ) {{
     const int pair = blockIdx.x * blockDim.x + threadIdx.x;
     if (pair >= pair_count) return;
@@ -131,7 +243,14 @@ void frechet_distance(
         return;
     }}
 
-    if (nb > MAX_FRECHET_B) {{
+    const int a_samples = (na <= 1 || densify_steps <= 1)
+        ? na
+        : ((na - 1) * densify_steps + 1);
+    const int b_samples = (nb <= 1 || densify_steps <= 1)
+        ? nb
+        : ((nb - 1) * densify_steps + 1);
+
+    if (b_samples > MAX_FRECHET_B) {{
         /* Too large for local arrays -- return NaN as safe fallback */
         result[pair] = 0.0 / 0.0;
         return;
@@ -144,37 +263,57 @@ void frechet_distance(
 
     /* Initialize row 0: ca[0][j] = max(ca[0][j-1], d(a_0, b_j)) */
     {{
-        const compute_t ax = CX(x_a[a_start]);
-        const compute_t ay = CY(y_a[a_start]);
+        const compute_t ax = frechet_sample_x(
+            x_a, a_start, na, 0, densify_steps, center_x);
+        const compute_t ay = frechet_sample_y(
+            y_a, a_start, na, 0, densify_steps, center_y);
         {{
-            const compute_t dx = ax - CX(x_b[b_start]);
-            const compute_t dy = ay - CY(y_b[b_start]);
+            const compute_t bx = frechet_sample_x(
+                x_b, b_start, nb, 0, densify_steps, center_x);
+            const compute_t by = frechet_sample_y(
+                y_b, b_start, nb, 0, densify_steps, center_y);
+            const compute_t dx = ax - bx;
+            const compute_t dy = ay - by;
             prev_row[0] = sqrt((double)(dx * dx + dy * dy));
         }}
-        for (int j = 1; j < nb; j++) {{
-            const compute_t dx = ax - CX(x_b[b_start + j]);
-            const compute_t dy = ay - CY(y_b[b_start + j]);
+        for (int j = 1; j < b_samples; j++) {{
+            const compute_t bx = frechet_sample_x(
+                x_b, b_start, nb, j, densify_steps, center_x);
+            const compute_t by = frechet_sample_y(
+                y_b, b_start, nb, j, densify_steps, center_y);
+            const compute_t dx = ax - bx;
+            const compute_t dy = ay - by;
             const double d = sqrt((double)(dx * dx + dy * dy));
             prev_row[j] = (d > prev_row[j - 1]) ? d : prev_row[j - 1];
         }}
     }}
 
     /* Fill rows 1..na-1 */
-    for (int i = 1; i < na; i++) {{
-        const compute_t ax = CX(x_a[a_start + i]);
-        const compute_t ay = CY(y_a[a_start + i]);
+    for (int i = 1; i < a_samples; i++) {{
+        const compute_t ax = frechet_sample_x(
+            x_a, a_start, na, i, densify_steps, center_x);
+        const compute_t ay = frechet_sample_y(
+            y_a, a_start, na, i, densify_steps, center_y);
 
         /* curr_row[0] = max(prev_row[0], d(a_i, b_0)) */
         {{
-            const compute_t dx = ax - CX(x_b[b_start]);
-            const compute_t dy = ay - CY(y_b[b_start]);
+            const compute_t bx = frechet_sample_x(
+                x_b, b_start, nb, 0, densify_steps, center_x);
+            const compute_t by = frechet_sample_y(
+                y_b, b_start, nb, 0, densify_steps, center_y);
+            const compute_t dx = ax - bx;
+            const compute_t dy = ay - by;
             const double d = sqrt((double)(dx * dx + dy * dy));
             curr_row[0] = (d > prev_row[0]) ? d : prev_row[0];
         }}
 
-        for (int j = 1; j < nb; j++) {{
-            const compute_t dx = ax - CX(x_b[b_start + j]);
-            const compute_t dy = ay - CY(y_b[b_start + j]);
+        for (int j = 1; j < b_samples; j++) {{
+            const compute_t bx = frechet_sample_x(
+                x_b, b_start, nb, j, densify_steps, center_x);
+            const compute_t by = frechet_sample_y(
+                y_b, b_start, nb, j, densify_steps, center_y);
+            const compute_t dx = ax - bx;
+            const compute_t dy = ay - by;
             const double d = sqrt((double)(dx * dx + dy * dy));
 
             double min_prev = prev_row[j];          /* ca[i-1][j]   */
@@ -185,10 +324,10 @@ void frechet_distance(
         }}
 
         /* Swap: prev_row = curr_row */
-        for (int j = 0; j < nb; j++) prev_row[j] = curr_row[j];
+        for (int j = 0; j < b_samples; j++) prev_row[j] = curr_row[j];
     }}
 
-    result[pair] = prev_row[nb - 1];
+    result[pair] = prev_row[b_samples - 1];
 }}
 """
 

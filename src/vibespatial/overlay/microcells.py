@@ -31,6 +31,8 @@ from vibespatial.spatial.segment_primitives import (
     summarize_exact_local_events,
 )
 
+from ._host_boundary import overlay_bool_scalar, overlay_device_to_host, overlay_int_scalar
+
 try:
     import cupy as cp
 except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
@@ -61,7 +63,13 @@ class OverlayMicrocellBands:
         if self.count == 0:
             return 0
         if cp is not None and hasattr(self.row_indices, "__cuda_array_interface__"):
-            return int(cp.max(self.row_indices).item()) + 1
+            return (
+                overlay_int_scalar(
+                    cp.max(self.row_indices),
+                    reason="overlay microcells row-count metadata fence",
+                )
+                + 1
+            )
         return int(np.max(self.row_indices, initial=-1)) + 1
 
     @property
@@ -105,6 +113,10 @@ def build_aligned_overlay_workload(
     keep = np.flatnonzero(np.asarray(exact_mask, dtype=bool))
     left_indices = left_indices[keep]
     right_indices = right_indices[keep]
+    if left_indices.size:
+        order = np.lexsort((right_indices, left_indices))
+        left_indices = left_indices[order]
+        right_indices = right_indices[order]
     return AlignedOverlayWorkload(
         left_aligned=left.take(left_indices),
         right_aligned=right.take(right_indices),
@@ -143,14 +155,62 @@ def _extract_segments_for_microcells(
     runtime = get_cuda_runtime()
     device_segments = _extract_segments_gpu(geometry_array)
     try:
-        row_indices = np.asarray(runtime.copy_device_to_host(device_segments.row_indices), dtype=np.int32)
-        part_indices = np.asarray(runtime.copy_device_to_host(device_segments.part_indices), dtype=np.int32)
-        ring_indices = np.asarray(runtime.copy_device_to_host(device_segments.ring_indices), dtype=np.int32)
-        segment_indices = np.asarray(runtime.copy_device_to_host(device_segments.segment_indices), dtype=np.int32)
-        x0 = np.asarray(runtime.copy_device_to_host(device_segments.x0), dtype=np.float64)
-        y0 = np.asarray(runtime.copy_device_to_host(device_segments.y0), dtype=np.float64)
-        x1 = np.asarray(runtime.copy_device_to_host(device_segments.x1), dtype=np.float64)
-        y1 = np.asarray(runtime.copy_device_to_host(device_segments.y1), dtype=np.float64)
+        row_indices = np.asarray(
+            runtime.copy_device_to_host(
+                device_segments.row_indices,
+                reason="overlay microcells segment row-index host export",
+            ),
+            dtype=np.int32,
+        )
+        part_indices = np.asarray(
+            runtime.copy_device_to_host(
+                device_segments.part_indices,
+                reason="overlay microcells segment part-index host export",
+            ),
+            dtype=np.int32,
+        )
+        ring_indices = np.asarray(
+            runtime.copy_device_to_host(
+                device_segments.ring_indices,
+                reason="overlay microcells segment ring-index host export",
+            ),
+            dtype=np.int32,
+        )
+        segment_indices = np.asarray(
+            runtime.copy_device_to_host(
+                device_segments.segment_indices,
+                reason="overlay microcells segment-index host export",
+            ),
+            dtype=np.int32,
+        )
+        x0 = np.asarray(
+            runtime.copy_device_to_host(
+                device_segments.x0,
+                reason="overlay microcells segment x0 host export",
+            ),
+            dtype=np.float64,
+        )
+        y0 = np.asarray(
+            runtime.copy_device_to_host(
+                device_segments.y0,
+                reason="overlay microcells segment y0 host export",
+            ),
+            dtype=np.float64,
+        )
+        x1 = np.asarray(
+            runtime.copy_device_to_host(
+                device_segments.x1,
+                reason="overlay microcells segment x1 host export",
+            ),
+            dtype=np.float64,
+        )
+        y1 = np.asarray(
+            runtime.copy_device_to_host(
+                device_segments.y1,
+                reason="overlay microcells segment y1 host export",
+            ),
+            dtype=np.float64,
+        )
     finally:
         device_segments.free()
 
@@ -498,7 +558,12 @@ def label_overlay_microcells(
     left_inside = cp.empty(bands.count, dtype=cp.bool_)
     right_inside = cp.empty(bands.count, dtype=cp.bool_)
     unique_rows = cp.unique(row_ids).astype(cp.int64, copy=False)
-    for row_id in cp.asnumpy(unique_rows):  # zcopy:ok(tiny row-id metadata loop avoids O(microcells) repeated polygon gathers on GPU)
+    unique_rows_h = overlay_device_to_host(
+        unique_rows,
+        reason="overlay microcells unique-row metadata loop",
+        dtype=np.int64,
+    )
+    for row_id in unique_rows_h:
         d_local = cp.flatnonzero(row_ids == int(row_id)).astype(cp.int64, copy=False)
         point_subset = points.take(d_local)
         d_row = cp.asarray([int(row_id)], dtype=cp.int64)
@@ -585,14 +650,20 @@ def _build_selected_row_microcell_arrays_device(
     start = cp.searchsorted(event_x, minx, side="right") - 1
     end = cp.searchsorted(event_x, maxx, side="left") - 1
     valid = (start >= 0) & (end >= start) & (start < interval_count) & (maxx > minx)
-    if not bool(cp.any(valid).item()):
+    if not overlay_bool_scalar(
+        cp.any(valid),
+        reason="overlay microcells selected-row valid-band admission fence",
+    ):
         return None
 
     start_valid = start[valid].astype(cp.int64, copy=False)
     end_valid = cp.minimum(end[valid], interval_count - 1).astype(cp.int64, copy=False)
     seg_ids_valid = cp.arange(int(x0.size), dtype=cp.int32)[valid]
     span = (end_valid - start_valid + 1).astype(cp.int32, copy=False)
-    total_memberships = int(cp.sum(span, dtype=cp.int64).item())
+    total_memberships = overlay_int_scalar(
+        cp.sum(span, dtype=cp.int64),
+        reason="overlay microcells selected-row membership-count allocation fence",
+    )
     if total_memberships == 0:
         return None
 
@@ -622,7 +693,10 @@ def _build_selected_row_microcell_arrays_device(
         return None
 
     same_next = interval_sorted[:-1] == interval_sorted[1:]
-    if not bool(cp.any(same_next).item()):
+    if not overlay_bool_scalar(
+        cp.any(same_next),
+        reason="overlay microcells selected-row adjacent-band admission fence",
+    ):
         return None
 
     interval_change = cp.empty(int(seg_sorted.size), dtype=cp.bool_)
@@ -673,7 +747,10 @@ def _build_selected_row_microcell_arrays_device(
         case _:
             raise ValueError(f"unsupported selection operation: {selection_operation}")
     band_keep = band_keep & band_mid_span
-    if not bool(cp.any(band_keep).item()):
+    if not overlay_bool_scalar(
+        cp.any(band_keep),
+        reason="overlay microcells selected-row kept-band admission fence",
+    ):
         return None
 
     band_intervals = interval_sorted[:-1][same_next][band_keep].astype(cp.int32, copy=False)
@@ -738,12 +815,36 @@ def _build_and_label_selected_overlay_microcells_device(
 
         left_row_ids, left_row_starts, left_row_ends = _segment_row_spans(left_device.row_indices)
         right_row_ids, right_row_starts, right_row_ends = _segment_row_spans(right_device.row_indices)
-        left_row_ids_h = cp.asnumpy(left_row_ids)  # zcopy:ok(tiny row-span metadata controls a per-row GPU build without materializing geometry on host)
-        left_row_starts_h = cp.asnumpy(left_row_starts)
-        left_row_ends_h = cp.asnumpy(left_row_ends)
-        right_row_ids_h = cp.asnumpy(right_row_ids)
-        right_row_starts_h = cp.asnumpy(right_row_starts)
-        right_row_ends_h = cp.asnumpy(right_row_ends)
+        left_row_ids_h = overlay_device_to_host(
+            left_row_ids,
+            reason="overlay microcells left row-span id metadata",
+            dtype=np.int64,
+        )
+        left_row_starts_h = overlay_device_to_host(
+            left_row_starts,
+            reason="overlay microcells left row-span start metadata",
+            dtype=np.int64,
+        )
+        left_row_ends_h = overlay_device_to_host(
+            left_row_ends,
+            reason="overlay microcells left row-span end metadata",
+            dtype=np.int64,
+        )
+        right_row_ids_h = overlay_device_to_host(
+            right_row_ids,
+            reason="overlay microcells right row-span id metadata",
+            dtype=np.int64,
+        )
+        right_row_starts_h = overlay_device_to_host(
+            right_row_starts,
+            reason="overlay microcells right row-span start metadata",
+            dtype=np.int64,
+        )
+        right_row_ends_h = overlay_device_to_host(
+            right_row_ends,
+            reason="overlay microcells right row-span end metadata",
+            dtype=np.int64,
+        )
         right_span_by_row = {
             int(row): (int(start), int(end))
             for row, start, end in zip(right_row_ids_h, right_row_starts_h, right_row_ends_h, strict=False)

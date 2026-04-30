@@ -5,7 +5,7 @@ Scope: Buffer and offset-curve kernel seam, prefix-sum emission strategy, and Sh
 Read If: You are changing buffer, offset_curve, or stroke-style constructive kernels.
 STOP IF: Your task already has the stroke kernel implementation open and only needs local implementation detail.
 Source Of Truth: Stroke kernel architecture for buffer and offset-curve constructive work.
-Body Budget: 64/220 lines
+Body Budget: 67/220 lines
 Document: docs/architecture/stroke-kernels.md
 
 Section Map (Body Lines)
@@ -18,8 +18,8 @@ Section Map (Body Lines)
 | 23-27 | Verify |
 | 28-32 | Risks |
 | 33-43 | Decision |
-| 44-52 | Current Scope |
-| 53-64 | Performance Notes |
+| 44-55 | Current Scope |
+| 56-67 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent
@@ -70,6 +70,9 @@ pipelines.
   joins.
 - GPU-dispatched buffer surfaces (point, linestring, polygon) return
   OwnedGeometryArray directly without Shapely materialization.
+- Owned point, linestring, and polygon buffers plus admitted `offset_curve`
+  `LineString` outputs can lower into geometry-only `NativeTabularResult` with
+  row-aligned source provenance and cached metadata.
 - CPU/host fallback paths still defer to Shapely.
 
 ## Performance Notes

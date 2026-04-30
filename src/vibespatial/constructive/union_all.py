@@ -44,19 +44,26 @@ from vibespatial.constructive.union_all_cpu import (
     empty_owned,
     reduce_all_cpu,
 )
+from vibespatial.constructive.union_all_kernels import (
+    BBOX_INTERACTION_KERNEL_NAMES,
+    BBOX_INTERACTION_KERNEL_SOURCE,
+)
+from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+from vibespatial.geometry.geometry_analysis_host import compute_geometry_bounds_cpu_vectorized
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
+    seed_all_validity_cache,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.config import OVERLAY_GPU_FAILURE_THRESHOLD
 from vibespatial.runtime.dispatch import record_dispatch_event
-from vibespatial.runtime.fallbacks import record_fallback_event
+from vibespatial.runtime.fallbacks import StrictNativeFallbackError, record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.residency import (
@@ -79,60 +86,165 @@ _MERGE_TARGETS: dict[GeometryFamily, GeometryFamily] = {
     GeometryFamily.POLYGON: GeometryFamily.MULTIPOLYGON,
     GeometryFamily.MULTIPOLYGON: GeometryFamily.MULTIPOLYGON,
 }
+
+_BBOX_INTERACTION_DEVICE_PAIR_LIMIT = 4096
 _SPATIAL_LOCALIZE_MIN_ROWS = 128
+_POLYGON_ASSEMBLY_FULL_VALIDITY_MAX_RINGS = 4
+_POLYGON_ASSEMBLY_FULL_VALIDITY_MAX_COORDS = 512
+
+request_nvrtc_warmup([
+    (
+        "union-all-bbox-interaction",
+        BBOX_INTERACTION_KERNEL_SOURCE,
+        BBOX_INTERACTION_KERNEL_NAMES,
+    ),
+])
+
+
+def _union_all_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    return np.asarray(
+        get_cuda_runtime().copy_device_to_host(device_array, reason=reason)
+    )
+
+
+def _union_all_bool_scalar(value: object, *, reason: str) -> bool:
+    return bool(_union_all_device_to_host(cp.asarray(value).reshape(1), reason=reason)[0])
+
+
+def _union_all_int_scalar(value: object, *, reason: str) -> int:
+    return int(_union_all_device_to_host(cp.asarray(value).reshape(1), reason=reason)[0])
+
+
+def _polygon_assembly_needs_full_validity_scan(result: OwnedGeometryArray) -> bool:
+    try:
+        state = result._ensure_device_state() if result.device_state is not None else None
+    except Exception:
+        state = None
+
+    ring_count = 0
+    coord_count = 0
+    buffers = state.families.values() if state is not None else result.families.values()
+    for buf in buffers:
+        if buf.family not in {
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTIPOLYGON,
+        }:
+            continue
+        coord_count += int(buf.x.size)
+        ring_offsets = getattr(buf, "ring_offsets", None)
+        if ring_offsets is not None:
+            ring_count += max(int(ring_offsets.size) - 1, 0)
+
+    return (
+        ring_count <= _POLYGON_ASSEMBLY_FULL_VALIDITY_MAX_RINGS
+        and coord_count <= _POLYGON_ASSEMBLY_FULL_VALIDITY_MAX_COORDS
+    )
 
 
 def _polygon_assembly_result_is_invalid(result: OwnedGeometryArray) -> bool:
-    valid_tags = np.asarray(result.tags[result.validity], dtype=np.int8)
-    polygon_tags = np.asarray(
-        [
-            FAMILY_TAGS[GeometryFamily.POLYGON],
-            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
-        ],
-        dtype=valid_tags.dtype if valid_tags.size else np.int8,
-    )
-    if not valid_tags.size or not np.all(np.isin(valid_tags, polygon_tags)):
+    if cp is not None and getattr(result, "device_state", None) is not None:
+        d_validity = cp.asarray(result._ensure_device_state().validity).astype(
+            cp.bool_,
+            copy=False,
+        )
+        if (
+            _union_all_int_scalar(
+                cp.count_nonzero(d_validity),
+                reason="union_all polygon-assembly valid-row count scalar fence",
+            )
+            == 0
+        ):
+            return False
+        if not _polygonal_family_only(result):
+            return False
+    else:
+        valid_tags = np.asarray(result.tags[result.validity], dtype=np.int8)
+        polygon_tags = np.asarray(
+            [
+                FAMILY_TAGS[GeometryFamily.POLYGON],
+                FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+            ],
+            dtype=valid_tags.dtype if valid_tags.size else np.int8,
+        )
+        if not valid_tags.size or not np.all(np.isin(valid_tags, polygon_tags)):
+            return False
+    if not _polygon_assembly_needs_full_validity_scan(result):
+        seed_all_validity_cache(result)
         return False
 
-    from vibespatial.constructive.validity import is_valid_owned
+    if cp is not None and getattr(result, "device_state", None) is not None:
+        from vibespatial.constructive.validity import validity_expression_owned
 
-    validity = np.asarray(is_valid_owned(result), dtype=bool)
-    if not bool(np.all(result.validity)):
-        validity = validity.copy()
-        validity[~result.validity] = True
-    return not bool(np.all(validity))
+        d_validity_result = cp.asarray(
+            validity_expression_owned(result).values,
+            dtype=cp.bool_,
+        )
+        return not _union_all_bool_scalar(
+            cp.all(d_validity_result | ~d_validity),
+            reason="union_all polygon-assembly validity-result scalar fence",
+        )
+    else:
+        from vibespatial.constructive.validity import is_valid_owned
+
+        validity = np.asarray(is_valid_owned(result), dtype=bool)
+        result_validity = result.validity
+        if not bool(np.all(result_validity)):
+            validity = validity.copy()
+            validity[~result_validity] = True
+        return not bool(np.all(validity))
 
 
 def _polygon_inputs_have_bbox_interactions_requiring_exact_union(
     owned: OwnedGeometryArray,
 ) -> bool:
-    valid_tags = np.asarray(owned.tags[owned.validity], dtype=np.int8)
-    polygon_tags = np.asarray(
-        [
-            FAMILY_TAGS[GeometryFamily.POLYGON],
-            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
-        ],
-        dtype=valid_tags.dtype if valid_tags.size else np.int8,
-    )
-    if not valid_tags.size or not np.all(np.isin(valid_tags, polygon_tags)):
+    if not _polygonal_family_only(owned):
         return False
-    if int(np.count_nonzero(owned.validity)) <= 1:
-        return False
+    if cp is not None and getattr(owned, "device_state", None) is not None:
+        from vibespatial.cuda._runtime import get_cuda_runtime
+        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
 
-    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+        d_validity = cp.asarray(owned._ensure_device_state().validity).astype(
+            cp.bool_,
+            copy=False,
+        )
+        d_bounds = cp.asarray(compute_geometry_bounds_device(owned), dtype=cp.float64)
+        device_result = _device_polygon_bbox_interactions_requiring_exact_union(
+            d_bounds,
+            d_validity,
+            row_count=owned.row_count,
+        )
+        if device_result is not None:
+            return device_result
+        d_bounds = d_bounds[d_validity]
+        d_finite = cp.isfinite(d_bounds).all(axis=1)
+        d_bounds = d_bounds[d_finite]
+        if int(d_bounds.shape[0]) <= 1:
+            return False
+        bounds = get_cuda_runtime().copy_device_to_host(
+            d_bounds,
+            reason="union_all bbox-interaction candidate bounds fence",
+        )
+    else:
+        if int(np.count_nonzero(owned.validity)) <= 1:
+            return False
 
-    bounds = np.asarray(
-        compute_geometry_bounds(
-            owned,
-            dispatch_mode=(
-                ExecutionMode.GPU
-                if cp is not None and owned.residency is Residency.DEVICE
-                else ExecutionMode.CPU
+        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+
+        bounds = np.asarray(
+            compute_geometry_bounds(
+                owned,
+                dispatch_mode=(
+                    ExecutionMode.GPU
+                    if cp is not None and owned.residency is Residency.DEVICE
+                    else ExecutionMode.CPU
+                ),
             ),
-        ),
-        dtype=np.float64,
-    )
-    bounds = bounds[np.asarray(owned.validity, dtype=bool)]
+            dtype=np.float64,
+        )
+        bounds = bounds[np.asarray(owned.validity, dtype=bool)]
+
     finite = np.isfinite(bounds).all(axis=1)
     bounds = bounds[finite]
     if bounds.shape[0] <= 1:
@@ -154,6 +266,32 @@ def _polygon_inputs_have_bbox_interactions_requiring_exact_union(
 
 def _polygonal_family_only(owned: OwnedGeometryArray) -> bool:
     """Return True when all valid rows are polygon-family geometries."""
+    if cp is not None and getattr(owned, "device_state", None) is not None:
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        state = owned._ensure_device_state()
+        polygon_families = {
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTIPOLYGON,
+        }
+        if set(state.families).issubset(polygon_families):
+            return True
+        d_validity = cp.asarray(state.validity).astype(cp.bool_, copy=False)
+        d_tags = cp.asarray(state.tags).astype(cp.int8, copy=False)
+        polygon_tags = (
+            np.int8(FAMILY_TAGS[GeometryFamily.POLYGON]),
+            np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]),
+        )
+        d_polygon = (d_tags == polygon_tags[0]) | (d_tags == polygon_tags[1])
+        d_summary = cp.empty(2, dtype=cp.bool_)
+        d_summary[0] = cp.any(d_validity)
+        d_summary[1] = cp.all((~d_validity) | d_polygon)
+        has_valid, all_polygonal = get_cuda_runtime().copy_device_to_host(
+            d_summary,
+            reason="union_all polygon-family admission scalar fence",
+        )
+        return bool((not has_valid) or all_polygonal)
+
     valid_tags = np.asarray(owned.tags[owned.validity])
     if valid_tags.size == 0:
         return True
@@ -167,21 +305,87 @@ def _polygonal_family_only(owned: OwnedGeometryArray) -> bool:
     return bool(np.all(np.isin(valid_tags, polygon_tags)))
 
 
-def _compute_union_bounds_host(owned: OwnedGeometryArray) -> np.ndarray | None:
-    try:
-        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+def _device_polygon_bbox_interactions_requiring_exact_union(
+    d_bounds,
+    d_validity,
+    *,
+    row_count: int,
+) -> bool | None:
+    if cp is None:
+        return None
+    if row_count <= 1:
+        return False
+    if row_count > _BBOX_INTERACTION_DEVICE_PAIR_LIMIT:
+        return None
 
-        return np.asarray(
-            compute_geometry_bounds(
-                owned,
-                dispatch_mode=(
-                    ExecutionMode.GPU
-                    if cp is not None and owned.residency is Residency.DEVICE
-                    else ExecutionMode.CPU
-                ),
+    from vibespatial.cuda._runtime import (
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR,
+        get_cuda_runtime,
+        make_kernel_cache_key,
+    )
+
+    runtime = get_cuda_runtime()
+    ptr = runtime.pointer
+    kernels = runtime.compile_kernels(
+        cache_key=make_kernel_cache_key(
+            "union-all-bbox-interaction",
+            BBOX_INTERACTION_KERNEL_SOURCE,
+        ),
+        source=BBOX_INTERACTION_KERNEL_SOURCE,
+        kernel_names=BBOX_INTERACTION_KERNEL_NAMES,
+    )
+    d_result = cp.zeros(1, dtype=cp.int32)
+    block = (16, 16, 1)
+    grid = (
+        (row_count + block[0] - 1) // block[0],
+        (row_count + block[1] - 1) // block[1],
+        1,
+    )
+    runtime.launch(
+        kernels["bbox_any_overlap"],
+        grid=grid,
+        block=block,
+        params=(
+            (
+                ptr(d_bounds),
+                ptr(d_validity),
+                ptr(d_result),
+                row_count,
             ),
-            dtype=np.float64,
-        )
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+    summary = runtime.copy_device_to_host(
+        d_result,
+        reason="union_all bbox-interaction overlap scalar fence",
+    )
+    return bool(int(summary[0]))
+
+
+def _compute_union_bounds_host(owned: OwnedGeometryArray) -> np.ndarray | None:
+    """Return host bounds only when the host shape is already available.
+
+    The bbox component/coloring optimizers below are host control-flow shapes.
+    Exporting a device-only row-bounds matrix just to feed that optional
+    optimizer is the wrong Native* boundary; device-only inputs should let the
+    normal native union path continue instead.
+    """
+    host_ready = (
+        getattr(owned, "_validity", None) is not None
+        and getattr(owned, "_tags", None) is not None
+        and getattr(owned, "_family_row_offsets", None) is not None
+        and all(buffer.host_materialized for buffer in owned.families.values())
+    )
+    if not host_ready:
+        return None
+    try:
+        return np.asarray(compute_geometry_bounds_cpu_vectorized(owned), dtype=np.float64)
     except Exception:
         logger.debug("polygon union bounds computation failed", exc_info=True)
         return None
@@ -336,7 +540,7 @@ def disjoint_subset_union_all_owned(
 
     # Empty input -> empty geometry.
     if row_count == 0:
-        return empty_owned()
+        return _empty_owned_like(owned)
 
     selection = plan_dispatch_selection(
         kernel_name="disjoint_subset_union_all",
@@ -370,6 +574,8 @@ def disjoint_subset_union_all_owned(
                 ),
             )
             return result
+        except StrictNativeFallbackError:
+            raise
         except Exception:
             logger.debug(
                 "exact disjoint-subset polygon union failed, falling back to CPU",
@@ -414,6 +620,8 @@ def disjoint_subset_union_all_owned(
                         implementation = (
                             "exact_union_for_invalid_disjoint_subset_assembly_gpu"
                         )
+                    except StrictNativeFallbackError:
+                        raise
                     except Exception:
                         logger.debug(
                             "exact GPU union for invalid disjoint-subset assembly failed",
@@ -453,6 +661,8 @@ def disjoint_subset_union_all_owned(
             # CPU path below.  Fallback event is recorded AFTER CPU
             # execution succeeds, not before.
             _gpu_fallback_reason = "mixed families not supported on GPU"
+        except StrictNativeFallbackError:
+            raise
         except Exception:
             logger.debug(
                 "disjoint_subset_union_all GPU failed, falling back to CPU",
@@ -541,7 +751,10 @@ def _disjoint_subset_union_all_gpu(
     # Single row, no nulls -> identity (just return the input).
     if owned.row_count == 1:
         valid = ds.validity
-        if bool(cp.all(valid)):
+        if _union_all_bool_scalar(
+            cp.all(valid),
+            reason="union_all disjoint-subset single-row validity scalar fence",
+        ):
             return owned
 
     # Dispatch to family-specific assembly.
@@ -614,9 +827,7 @@ def _assemble_multilinestring_gpu(
             # LineString geometry_offsets define coordinate ranges per line;
             # these become part_offsets in the MultiLineString.
             part_offset_arrays.append(d_buf.geometry_offsets)
-            part_counts.append(
-                int(d_buf.geometry_offsets[-1]) if d_buf.geometry_offsets.size > 0 else 0
-            )
+            part_counts.append(int(d_buf.x.size))
 
     if GeometryFamily.MULTILINESTRING in families:
         d_buf = ds.families[GeometryFamily.MULTILINESTRING]
@@ -625,9 +836,7 @@ def _assemble_multilinestring_gpu(
             all_y_parts.append(d_buf.y)
             # MultiLineString already has part_offsets -> coords.
             part_offset_arrays.append(d_buf.part_offsets)
-            part_counts.append(
-                int(d_buf.part_offsets[-1]) if d_buf.part_offsets.size > 0 else 0
-            )
+            part_counts.append(int(d_buf.x.size))
 
     if not all_x_parts:
         return empty_owned()
@@ -670,7 +879,7 @@ def _assemble_multipolygon_gpu(
     ring_offset_arrays: list = []
     ring_counts: list[int] = []
     part_offset_arrays: list = []
-    part_counts: list[int] = []
+    part_ring_counts: list[int] = []
 
     if GeometryFamily.POLYGON in families:
         d_buf = ds.families[GeometryFamily.POLYGON]
@@ -680,13 +889,9 @@ def _assemble_multipolygon_gpu(
             # Polygon geometry_offsets index into ring_offsets (row -> ring).
             # In MultiPolygon, these become part_offsets (polygon -> ring).
             part_offset_arrays.append(d_buf.geometry_offsets)
-            part_counts.append(
-                int(d_buf.geometry_offsets[-1]) if d_buf.geometry_offsets.size > 0 else 0
-            )
+            part_ring_counts.append(max(int(d_buf.ring_offsets.size) - 1, 0))
             ring_offset_arrays.append(d_buf.ring_offsets)
-            ring_counts.append(
-                int(d_buf.ring_offsets[-1]) if d_buf.ring_offsets.size > 0 else 0
-            )
+            ring_counts.append(int(d_buf.x.size))
 
     if GeometryFamily.MULTIPOLYGON in families:
         d_buf = ds.families[GeometryFamily.MULTIPOLYGON]
@@ -695,13 +900,9 @@ def _assemble_multipolygon_gpu(
             all_y_parts.append(d_buf.y)
             # MultiPolygon has 3 levels: geom -> part -> ring -> coord.
             part_offset_arrays.append(d_buf.part_offsets)
-            part_counts.append(
-                int(d_buf.part_offsets[-1]) if d_buf.part_offsets.size > 0 else 0
-            )
+            part_ring_counts.append(max(int(d_buf.ring_offsets.size) - 1, 0))
             ring_offset_arrays.append(d_buf.ring_offsets)
-            ring_counts.append(
-                int(d_buf.ring_offsets[-1]) if d_buf.ring_offsets.size > 0 else 0
-            )
+            ring_counts.append(int(d_buf.x.size))
 
     if not all_x_parts:
         return empty_owned()
@@ -713,11 +914,9 @@ def _assemble_multipolygon_gpu(
     merged_ring_offsets = _chain_device_offset_arrays(ring_offset_arrays, ring_counts)
 
     # Chain part_offsets (polygon -> ring), shifting by cumulative ring counts.
-    merged_part_ring_counts = [
-        int(po[-1]) if po.size > 0 else 0 for po in part_offset_arrays
-    ]
     merged_part_offsets = _chain_device_offset_arrays(
-        part_offset_arrays, merged_part_ring_counts,
+        part_offset_arrays,
+        part_ring_counts,
     )
     total_parts = int(merged_part_offsets.size) - 1
 
@@ -1101,8 +1300,6 @@ def _owned_valid_nonempty_mask(
 
         for family, device_buf in ds.families.items():
             family_mask = validity & (tags == FAMILY_TAGS[family])
-            if not bool(cp.any(family_mask)):
-                continue
             family_rows = row_offsets[family_mask]
             keep_mask[family_mask] = ~device_buf.empty_mask[family_rows]
 
@@ -1130,12 +1327,70 @@ def _owned_valid_nonempty_mask(
     return keep_mask
 
 
+def _empty_owned_like(source: OwnedGeometryArray) -> OwnedGeometryArray:
+    """Return a single empty geometry while preserving device residency."""
+    if cp is None or source.residency is not Residency.DEVICE:
+        return empty_owned()
+
+    polygon_tag = np.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
+    result = build_device_resident_owned(
+        device_families={
+            GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.POLYGON,
+                x=cp.empty(0, dtype=cp.float64),
+                y=cp.empty(0, dtype=cp.float64),
+                geometry_offsets=cp.zeros(2, dtype=cp.int32),
+                empty_mask=cp.ones(1, dtype=cp.bool_),
+                ring_offsets=cp.zeros(1, dtype=cp.int32),
+                bounds=None,
+            )
+        },
+        row_count=1,
+        tags=cp.full(1, polygon_tag, dtype=cp.int8),
+        validity=cp.ones(1, dtype=cp.bool_),
+        family_row_offsets=cp.zeros(1, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+    seed_all_validity_cache(result)
+    return result
+
+
 def _all_owned_rows_nonempty(owned: OwnedGeometryArray) -> bool:
     """Return True when every valid output row is non-empty."""
     keep_mask = _owned_valid_nonempty_mask(owned)
     if cp is not None and hasattr(keep_mask, "__cuda_array_interface__"):
-        return bool(cp.all(keep_mask).item())
+        return _union_all_bool_scalar(
+            cp.all(keep_mask),
+            reason="union_all valid-nonempty mask scalar fence",
+        )
     return bool(np.all(np.asarray(keep_mask, dtype=bool)))
+
+
+def _take_valid_nonempty_rows(
+    owned: OwnedGeometryArray,
+    *,
+    reason: str,
+) -> OwnedGeometryArray:
+    """Drop null/empty rows using owned routing metadata, not Shapely export."""
+    keep_mask = _owned_valid_nonempty_mask(owned)
+    if cp is not None and hasattr(keep_mask, "__cuda_array_interface__"):
+        keep_count = _union_all_int_scalar(
+            cp.count_nonzero(keep_mask),
+            reason=reason,
+        )
+        if keep_count == 0:
+            return _empty_owned_like(owned)
+        if keep_count < owned.row_count:
+            keep = cp.flatnonzero(keep_mask).astype(cp.int64, copy=False)
+            return owned.take(keep)
+        return owned
+
+    keep = np.flatnonzero(np.asarray(keep_mask, dtype=bool))
+    if keep.size == 0:
+        return _empty_owned_like(owned)
+    if keep.size < owned.row_count:
+        return owned.take(keep)
+    return owned
 
 
 def _tree_reduce_global(
@@ -1204,6 +1459,8 @@ def _tree_reduce_global(
                 )
                 gpu_ok = True
                 consecutive_gpu_failures = 0
+            except StrictNativeFallbackError:
+                raise
             except Exception:
                 consecutive_gpu_failures += 1
 
@@ -1368,12 +1625,12 @@ def union_all_gpu_owned(
 
         owned = set_precision_owned(owned, grid_size, mode="valid_output")
 
-    # Filter out null rows.
-    keep = np.flatnonzero(owned.validity)
-    if keep.size == 0:
-        return empty_owned()
-    if keep.size < owned.row_count:
-        owned = owned.take(keep)
+    # Filter null and empty rows without forcing device-backed routing metadata
+    # to host-visible geometry objects.
+    owned = _take_valid_nonempty_rows(
+        owned,
+        reason="union_all valid-nonempty row count scalar fence",
+    )
 
     # Single valid row -> identity.
     if owned.row_count == 1:
@@ -1444,10 +1701,24 @@ def union_all_gpu_owned(
                 selected=ExecutionMode.GPU,
             )
             return result
-        except Exception:
+        except StrictNativeFallbackError:
+            raise
+        except Exception as exc:
             logger.debug(
                 "union_all_gpu tree reduction failed, falling back to CPU",
                 exc_info=True,
+            )
+            record_fallback_event(
+                surface="constructive.union_all_gpu",
+                reason="GPU tree reduction failed",
+                detail=(
+                    f"rows={row_count}, "
+                    f"precision={precision_plan.compute_precision.value}, "
+                    f"error={type(exc).__name__}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.CPU,
+                d2h_transfer=owned.residency is Residency.DEVICE,
             )
 
     # CPU fallback: Shapely union_all.
@@ -1507,7 +1778,7 @@ def coverage_union_all_gpu_owned(
     row_count = owned.row_count
 
     if row_count == 0:
-        return empty_owned()
+        return _empty_owned_like(owned)
 
     selection = plan_dispatch_selection(
         kernel_name="coverage_union_all_gpu",
@@ -1520,24 +1791,11 @@ def coverage_union_all_gpu_owned(
 
     precision_plan = selection.precision_plan
 
-    # Filter nulls without forcing a full device validity mask to host.
-    if (
-        cp is not None
-        and owned.residency is Residency.DEVICE
-        and owned.device_state is not None
-    ):
-        d_validity = cp.asarray(owned.device_state.validity, dtype=cp.bool_)
-        keep_count = int(cp.count_nonzero(d_validity))
-        if keep_count == 0:
-            return empty_owned()
-        if keep_count < owned.row_count:
-            owned = owned.take(cp.flatnonzero(d_validity).astype(cp.int64, copy=False))
-    else:
-        keep = np.flatnonzero(owned.validity)
-        if keep.size == 0:
-            return empty_owned()
-        if keep.size < owned.row_count:
-            owned = owned.take(keep)
+    # Filter null and empty rows without forcing a full device metadata export.
+    owned = _take_valid_nonempty_rows(
+        owned,
+        reason="coverage_union_all valid-nonempty row count scalar fence",
+    )
 
     if owned.row_count == 1:
         record_dispatch_event(
@@ -1570,10 +1828,24 @@ def coverage_union_all_gpu_owned(
                 selected=ExecutionMode.GPU,
             )
             return result
-        except Exception:
+        except StrictNativeFallbackError:
+            raise
+        except Exception as exc:
             logger.debug(
                 "coverage_union_all_gpu tree reduction failed, falling back to CPU",
                 exc_info=True,
+            )
+            record_fallback_event(
+                surface="constructive.coverage_union_all_gpu",
+                reason="GPU tree reduction failed",
+                detail=(
+                    f"rows={row_count}, "
+                    f"precision={precision_plan.compute_precision.value}, "
+                    f"error={type(exc).__name__}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.CPU,
+                d2h_transfer=owned.residency is Residency.DEVICE,
             )
 
     # CPU fallback: Shapely coverage_union_all.
@@ -1683,10 +1955,24 @@ def intersection_all_gpu_owned(
                 selected=ExecutionMode.GPU,
             )
             return result
-        except Exception:
+        except StrictNativeFallbackError:
+            raise
+        except Exception as exc:
             logger.debug(
                 "intersection_all_gpu tree reduction failed, falling back to CPU",
                 exc_info=True,
+            )
+            record_fallback_event(
+                surface="constructive.intersection_all_gpu",
+                reason="GPU tree reduction failed",
+                detail=(
+                    f"rows={row_count}, "
+                    f"precision={precision_plan.compute_precision.value}, "
+                    f"error={type(exc).__name__}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.CPU,
+                d2h_transfer=owned.residency is Residency.DEVICE,
             )
 
     # CPU fallback: Shapely intersection_all.

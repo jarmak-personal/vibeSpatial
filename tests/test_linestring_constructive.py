@@ -143,10 +143,16 @@ def test_linestring_buffer_gpu_keeps_metadata_lazy(strict_device_guard) -> None:
 
     import cupy as cp
 
+    from vibespatial.runtime.execution_trace import execution_trace
+
     line = LineString([(0, 0), (10, 0)])
     lines = from_shapely_geometries([line], residency=Residency.DEVICE)
-    gpu = linestring_buffer_owned_array(lines, 1.0, quad_segs=4, dispatch_mode=ExecutionMode.GPU)
+    with execution_trace("linestring-buffer-metadata-canary") as trace:
+        gpu = linestring_buffer_owned_array(lines, 1.0, quad_segs=4, dispatch_mode=ExecutionMode.GPU)
 
+    assert [transfer.reason for transfer in trace.transfers] == [
+        "linestring buffer vertex allocation fence"
+    ]
     assert gpu.residency is Residency.DEVICE
     assert gpu._validity is None
     assert gpu._tags is None

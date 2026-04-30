@@ -216,6 +216,12 @@ class TestIndexing:
         assert len(result) == 2
         assert result[0].x == 1.0
 
+    def test_getitem_full_slice_preserves_owned_view(self, dga_points):
+        result = dga_points[:]
+        assert isinstance(result, DeviceGeometryArray)
+        assert result._owned is dga_points._owned
+        assert len(result) == len(dga_points)
+
     def test_getitem_bool_mask(self, dga_points):
         mask = np.array([True, False, True, False, True])
         result = dga_points[mask]
@@ -267,6 +273,11 @@ class TestTakeCopyConcatNoRoundtrip:
             e for e in dga._owned.diagnostics if e.kind == DiagnosticKind.MATERIALIZATION
         ]
         assert len(mat_events) == 0, f"Unexpected materialization: {mat_events}"
+
+    def test_take_full_index_vector_preserves_owned_view(self, dga_points):
+        result = dga_points.take(np.arange(len(dga_points), dtype=np.int64))
+        assert isinstance(result, DeviceGeometryArray)
+        assert result._owned is dga_points._owned
 
     def test_take_with_nulls(self, dga_with_nulls):
         result = dga_with_nulls.take(np.array([0, 1, 2]))

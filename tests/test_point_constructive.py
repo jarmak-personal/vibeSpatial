@@ -5,15 +5,21 @@ import pytest
 import shapely
 from shapely.geometry import Point, Polygon
 
+from vibespatial.api._native_result_core import NativeGeometryProvenance
 from vibespatial.constructive.boundary import boundary_owned
 from vibespatial.constructive.point import (
     clip_points_rect_owned,
+    point_buffer_native_tabular_result,
     point_buffer_owned_array,
     point_owned_from_xy_device,
 )
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.io.arrow import geoseries_from_owned
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.materialization import (
+    clear_materialization_events,
+    get_materialization_events,
+)
 from vibespatial.runtime.residency import Residency
 
 
@@ -45,6 +51,31 @@ def test_point_buffer_owned_array_cpu_matches_expected_diamonds() -> None:
         Polygon(((4, 2), (2, 0), (0, 2), (2, 4), (4, 2))),
     ]
     _assert_geometries_equal(buffered.to_shapely(), expected)
+
+
+def test_point_buffer_native_tabular_result_carries_source_provenance() -> None:
+    points = from_shapely_geometries([Point(0, 0), Point(2, 2)])
+    source_rows = np.asarray([7, 11], dtype=np.int32)
+
+    result = point_buffer_native_tabular_result(
+        points,
+        np.asarray([1.0, 2.0], dtype=np.float64),
+        quad_segs=1,
+        dispatch_mode=ExecutionMode.CPU,
+        crs="EPSG:3857",
+        source_rows=source_rows,
+        source_tokens=("points",),
+    )
+
+    assert result.geometry.row_count == 2
+    assert result.geometry.crs == "EPSG:3857"
+    assert result.column_order == ("geometry",)
+    assert isinstance(result.provenance, NativeGeometryProvenance)
+    assert result.provenance.operation == "buffer"
+    assert result.provenance.source_tokens == ("points",)
+    assert result.provenance.source_rows.tolist() == [7, 11]
+    assert result.geometry_metadata is not None
+    assert result.geometry_metadata.row_count == 2
 
 
 @pytest.mark.gpu
@@ -88,6 +119,58 @@ def test_point_buffer_owned_array_gpu_matches_cpu_diamonds() -> None:
     ]
     _assert_geometries_equal(gpu.to_shapely(), expected)
     assert gpu.families[next(iter(gpu.families))].host_materialized is True
+
+
+@pytest.mark.gpu
+def test_point_buffer_native_tabular_device_provenance_survives_rowset_take() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_profile,
+        reset_d2h_transfer_count,
+    )
+
+    points = point_owned_from_xy_device(
+        np.asarray([0.0, 2.0], dtype=np.float64),
+        np.asarray([0.0, 2.0], dtype=np.float64),
+    )
+    result = point_buffer_native_tabular_result(
+        points,
+        1.0,
+        quad_segs=1,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    state = result.to_native_frame_state()
+
+    assert result.geometry.owned.residency is Residency.DEVICE
+    assert isinstance(result.provenance, NativeGeometryProvenance)
+    assert result.provenance.is_device
+    assert result.geometry_metadata is not None
+    assert result.geometry_metadata.is_device
+    assert result.geometry_metadata.bounds is not None
+
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+    area_expression = state.geometry_area_expression()
+    rowset = area_expression.greater_than(1.5)
+    filtered = state.take(rowset, preserve_index=False)
+    transfer_count, transfer_bytes, _transfer_seconds = get_d2h_transfer_profile()
+
+    assert area_expression.is_device
+    assert rowset.is_device
+    assert filtered.row_count == 2
+    assert isinstance(filtered.provenance, NativeGeometryProvenance)
+    assert filtered.provenance.is_device
+    assert filtered.geometry_metadata_cache is not None
+    assert filtered.geometry_metadata_cache.is_device
+    assert transfer_count <= 2
+    assert transfer_bytes <= 16
+    assert get_materialization_events(clear=True) == []
+    assert cp.asnumpy(filtered.provenance.source_rows).tolist() == [0, 1]
+    reset_d2h_transfer_count()
 
 
 @pytest.mark.gpu
@@ -135,6 +218,7 @@ def test_point_buffer_owned_array_gpu_quad16_matches_cpu() -> None:
 
     assert gpu.residency is Residency.DEVICE
     for i, (g, c) in enumerate(zip(gpu.to_shapely(), cpu.to_shapely())):
+        assert shapely.equals(g, c), f"row {i} GPU/CPU topology mismatch"
         assert shapely.equals_exact(g, c, tolerance=1e-10), f"row {i} GPU/CPU mismatch"
 
 
@@ -164,6 +248,25 @@ def test_point_buffer_owned_array_gpu_quad4_matches_shapely() -> None:
     for i, geom in enumerate(gpu.to_shapely()):
         expected = shapely.buffer(points.to_shapely()[i], 3.0, quad_segs=4)
         assert shapely.equals_exact(geom, expected, tolerance=1e-10), f"row {i} mismatch"
+
+
+@pytest.mark.gpu
+def test_point_buffer_owned_array_gpu_round_buffer_matches_shapely_topology() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    points = from_shapely_geometries(
+        [
+            Point(0.8783596961872845, 0.424285920013213),
+            Point(0.11344929019320247, 0.9479274767330191),
+        ]
+    )
+
+    for quad_segs in (16, 25):
+        gpu = point_buffer_owned_array(points, 0.1, quad_segs=quad_segs, dispatch_mode=ExecutionMode.GPU)
+        for i, geom in enumerate(gpu.to_shapely()):
+            expected = shapely.buffer(points.to_shapely()[i], 0.1, quad_segs=quad_segs)
+            assert shapely.equals(geom, expected), f"row {i} quad_segs={quad_segs} topology mismatch"
 
 
 @pytest.mark.gpu

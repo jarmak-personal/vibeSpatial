@@ -468,9 +468,14 @@ def _native_tabular_to_arrow(
         interleaved=False,
         include_z=None,
     )
+    attributes = payload.attributes_for_export(
+        surface="vibespatial.api.io.arrow._native_tabular_to_arrow",
+        include_index=index is not False,
+        strict_disallowed=False,
+    )
     geometry_series_by_name = {
         geometry_column.name: geometry_column.geometry.to_geoseries(
-            index=payload.attributes.index,
+            index=attributes.index,
             name=geometry_column.name,
         )
         for geometry_column in payload.geometry_columns
@@ -660,6 +665,75 @@ def _record_arrow_geometry_decode_fallback(
     )
 
 
+def _arrow_read_format_name(surface: str, pipeline: str) -> str:
+    lowered = f"{surface} {pipeline}".lower()
+    if "feather" in lowered:
+        return "feather"
+    if "parquet" in lowered:
+        return "geoparquet"
+    return "arrow"
+
+
+def _attach_arrow_read_native_state(
+    frame,
+    *,
+    table,
+    table_attr,
+    geometry_name,
+    geometry_columns,
+    native_geometry_results,
+    to_pandas_kwargs,
+    fallback_surface: str,
+    fallback_pipeline: str,
+) -> None:
+    """Attach the private NativeFrameState for fully native Arrow reads."""
+    if geometry_name not in native_geometry_results:
+        return
+    if set(native_geometry_results) != set(geometry_columns):
+        return
+
+    from vibespatial.api._native_metadata import NativeGeometryMetadata
+    from vibespatial.api._native_result_core import (
+        NativeGeometryColumn,
+        NativeReadProvenance,
+        NativeTabularResult,
+    )
+    from vibespatial.api._native_results import native_attribute_table_from_arrow_table
+    from vibespatial.api._native_state import attach_native_state_from_native_tabular_result
+
+    primary_geometry = native_geometry_results[geometry_name]
+    owned = getattr(primary_geometry, "owned", None)
+    if owned is None:
+        return
+
+    attributes = native_attribute_table_from_arrow_table(
+        table_attr,
+        to_pandas_kwargs=to_pandas_kwargs,
+    ).with_index(frame.index)
+    secondary_geometry = tuple(
+        NativeGeometryColumn(column_name, geometry_result)
+        for column_name, geometry_result in native_geometry_results.items()
+        if column_name != geometry_name
+    )
+    attach_native_state_from_native_tabular_result(
+        frame,
+        NativeTabularResult(
+            attributes=attributes,
+            geometry=primary_geometry,
+            geometry_name=geometry_name,
+            column_order=tuple(table.column_names),
+            attrs=frame.attrs.copy() or None,
+            secondary_geometry=secondary_geometry,
+            provenance=NativeReadProvenance(
+                surface=fallback_surface,
+                format_name=_arrow_read_format_name(fallback_surface, fallback_pipeline),
+                backend="pyarrow",
+            ),
+            geometry_metadata=NativeGeometryMetadata.from_cached_owned(owned),
+        ),
+    )
+
+
 def _arrow_to_geopandas(
     table,
     geo_metadata=None,
@@ -711,6 +785,7 @@ def _arrow_to_geopandas(
 
     table_attr = table.drop(geometry_columns)
     df = table_attr.to_pandas(**to_pandas_kwargs)
+    native_geometry_results = {}
 
     # Convert the WKB columns that are present back to geometry.
     for col in geometry_columns:
@@ -731,6 +806,12 @@ def _arrow_to_geopandas(
             try:
                 owned = decode_wkb_arrow_array_owned(arrow_col)
                 geom_arr = GeometryArray.from_owned(owned, crs=crs)
+                from vibespatial.api._native_result_core import GeometryNativeResult
+
+                native_geometry_results[col] = GeometryNativeResult.from_owned(
+                    owned,
+                    crs=crs,
+                )
             except (ValueError, NotImplementedError) as exc:
                 _record_arrow_geometry_decode_fallback(
                     surface=fallback_surface,
@@ -752,6 +833,12 @@ def _arrow_to_geopandas(
                     field, arrow_col, encoding=col_metadata["encoding"],
                 )
                 geom_arr = GeometryArray.from_owned(owned, crs=crs)
+                from vibespatial.api._native_result_core import GeometryNativeResult
+
+                native_geometry_results[col] = GeometryNativeResult.from_owned(
+                    owned,
+                    crs=crs,
+                )
             except (ValueError, NotImplementedError) as exc:
                 _record_arrow_geometry_decode_fallback(
                     surface=fallback_surface,
@@ -775,7 +862,19 @@ def _arrow_to_geopandas(
     if df_attrs:
         df.attrs = json.loads(df_attrs)
 
-    return GeoDataFrame(df, geometry=geometry)
+    result = GeoDataFrame(df, geometry=geometry)
+    _attach_arrow_read_native_state(
+        result,
+        table=table,
+        table_attr=table_attr,
+        geometry_name=geometry,
+        geometry_columns=tuple(geometry_columns),
+        native_geometry_results=native_geometry_results,
+        to_pandas_kwargs=to_pandas_kwargs,
+        fallback_surface=fallback_surface,
+        fallback_pipeline=fallback_pipeline,
+    )
+    return result
 
 
 def _get_filesystem_path(path, filesystem=None, storage_options=None):

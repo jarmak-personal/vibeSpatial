@@ -48,6 +48,12 @@ def _linestring_buffer_kernels():
     return compile_kernel_group("linestring-buffer", _LINESTRING_BUFFER_KERNEL_SOURCE, _LINESTRING_BUFFER_KERNEL_NAMES)
 
 
+def _device_scalar_bool(value, *, reason: str) -> bool:
+    runtime = get_cuda_runtime()
+    host = runtime.copy_device_to_host(cp.asarray(value, dtype=cp.bool_).reshape(1), reason=reason)
+    return bool(np.asarray(host).reshape(-1)[0])
+
+
 _CAP_STYLE_MAP = {"round": 0, "flat": 1, "square": 2}
 _JOIN_STYLE_MAP = {"round": 0, "mitre": 1, "bevel": 2}
 
@@ -76,8 +82,9 @@ def supports_two_point_linestring_buffer_fast_path(
         or join_style != "round"
         or GeometryFamily.LINESTRING not in lines.families
         or len(lines.families) != 1
-        or not np.all(lines.validity)
     ):
+        return False
+    if lines._validity is not None and not bool(np.all(lines._validity)):
         return False
 
     line_buffer = lines.families[GeometryFamily.LINESTRING]
@@ -95,15 +102,47 @@ def supports_two_point_linestring_buffer_fast_path(
         return False
 
     try:
+        if not _device_scalar_bool(
+            cp.all(cp.asarray(state.validity)),
+            reason="linestring buffer fast-path validity scalar fence",
+        ):
+            return False
         device_line_buffer = state.families[GeometryFamily.LINESTRING]
-        if bool(cp.any(device_line_buffer.empty_mask).item()):
+        if _device_scalar_bool(
+            cp.any(device_line_buffer.empty_mask),
+            reason="linestring buffer fast-path empty-mask scalar fence",
+        ):
             return False
         offsets = cp.asarray(device_line_buffer.geometry_offsets)
         if int(offsets.size) != lines.row_count + 1:
             return False
-        return bool(cp.all((offsets[1:] - offsets[:-1]) == 2).item())
+        return _device_scalar_bool(
+            cp.all((offsets[1:] - offsets[:-1]) == 2),
+            reason="linestring buffer fast-path two-point scalar fence",
+        )
     except Exception:
         return False
+
+
+def _linestring_device_input_valid(lines: OwnedGeometryArray) -> bool:
+    if lines._validity is not None and lines._tags is not None:
+        return bool(
+            np.asarray(lines._validity, dtype=bool).all()
+            and np.all(lines._tags == FAMILY_TAGS[GeometryFamily.LINESTRING])
+        )
+    if cp is None or lines.device_state is None:
+        return bool(
+            np.asarray(lines.validity, dtype=bool).all()
+            and np.all(lines.tags == FAMILY_TAGS[GeometryFamily.LINESTRING])
+        )
+    state = lines._ensure_device_state()
+    return _device_scalar_bool(
+        cp.all(
+            cp.asarray(state.validity)
+            & (cp.asarray(state.tags) == FAMILY_TAGS[GeometryFamily.LINESTRING])
+        ),
+        reason="linestring buffer input admissibility scalar fence",
+    )
 
 
 def linestring_buffer_owned_array(
@@ -118,13 +157,20 @@ def linestring_buffer_owned_array(
 ) -> OwnedGeometryArray:
     if GeometryFamily.LINESTRING not in lines.families or len(lines.families) != 1:
         raise ValueError("linestring_buffer_owned_array requires a linestring-only OwnedGeometryArray")
-    if not np.all(lines.validity):
+    if not _linestring_device_input_valid(lines):
         raise ValueError("linestring_buffer_owned_array requires non-null rows only")
-    if np.any(lines.tags != FAMILY_TAGS[GeometryFamily.LINESTRING]):
-        raise ValueError("linestring_buffer_owned_array requires linestring-only rows")
 
     line_buffer = lines.families[GeometryFamily.LINESTRING]
-    if np.any(line_buffer.empty_mask):
+    if line_buffer.host_materialized:
+        has_empty = bool(np.any(line_buffer.empty_mask))
+    elif cp is not None and lines.device_state is not None:
+        has_empty = _device_scalar_bool(
+            cp.any(lines._ensure_device_state().families[GeometryFamily.LINESTRING].empty_mask),
+            reason="linestring buffer input empty-mask scalar fence",
+        )
+    else:
+        has_empty = bool(np.any(line_buffer.empty_mask))
+    if has_empty:
         raise ValueError("linestring_buffer_owned_array requires non-empty rows only")
 
     radii = (
@@ -156,6 +202,46 @@ def linestring_buffer_owned_array(
         lines, radii, quad_segs=quad_segs,
         cap_style=cap_int, join_style=join_int, mitre_limit=mitre_limit,
     )
+
+
+def linestring_buffer_native_tabular_result(
+    lines: OwnedGeometryArray,
+    distance: float | np.ndarray,
+    *,
+    quad_segs: int = 8,
+    cap_style: str = "round",
+    join_style: str = "round",
+    mitre_limit: float = 5.0,
+    dispatch_mode: ExecutionMode = ExecutionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+):
+    """Return linestring-buffer output as a private native constructive carrier."""
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    buffered = linestring_buffer_owned_array(
+        lines,
+        distance,
+        quad_segs=quad_segs,
+        cap_style=cap_style,
+        join_style=join_style,
+        mitre_limit=mitre_limit,
+        dispatch_mode=dispatch_mode,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        buffered,
+        operation="buffer",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+    )
+
+
 def _build_linestring_buffers_gpu(
     lines: OwnedGeometryArray,
     radii: np.ndarray,
@@ -223,7 +309,12 @@ def _build_linestring_buffers_gpu(
         # Compute exclusive prefix sum for scatter offsets
         device_offsets = exclusive_sum(device_counts)
 
-        total_verts = count_scatter_total(runtime, device_counts, device_offsets)
+        total_verts = count_scatter_total(
+            runtime,
+            device_counts,
+            device_offsets,
+            reason="linestring buffer vertex allocation fence",
+        )
 
         if total_verts == 0:
             device_x = runtime.allocate((0,), np.float64)

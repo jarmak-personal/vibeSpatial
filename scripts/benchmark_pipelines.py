@@ -45,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
         "join-heavy",
         "relation-semijoin",
         "small-grouped-constructive-reduce",
+        "constructive-output-native",
         "constructive",
         "predicate-heavy",
         "zero-transfer",

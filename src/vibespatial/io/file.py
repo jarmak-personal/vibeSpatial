@@ -14,6 +14,7 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import get_fallback_events, record_fallback_event
+from vibespatial.runtime.materialization import NativeExportBoundary, record_native_export_boundary
 
 # Re-exported from io_geojson for backward compatibility
 from .geojson import (  # noqa: F401
@@ -138,13 +139,17 @@ def _prepare_native_payload_for_file(payload, *, index: bool | None):
     if not include_index:
         return payload
 
-    attributes = payload.attributes.reset_index(drop=False)
+    attributes, reset_leading, _reset_trailing = payload.attributes.reset_index_deferred()
     return NativeTabularResult(
         attributes=attributes,
         geometry=payload.geometry,
         geometry_name=payload.geometry_name,
-        column_order=tuple([*attributes.columns, payload.geometry_name]),
+        column_order=tuple([*reset_leading, *payload.column_order]),
         attrs=payload.attrs,
+        secondary_geometry=payload.secondary_geometry,
+        provenance=payload.provenance,
+        geometry_metadata=payload.geometry_metadata,
+        index_plan=payload.index_plan,
     )
 
 
@@ -721,6 +726,17 @@ def _write_vector_file_native_pyogrio(
         geometry_encoding="WKB",
         force_device_geometry_encode=force_device_geometry_encode,
     )
+    record_native_export_boundary(NativeExportBoundary(
+        surface="vibespatial.io.file._write_vector_file_native_pyogrio",
+        operation="native_tabular_to_file",
+        target="file",
+        reason="native tabular result exported to pyogrio Arrow vector-file sink",
+        detail=(
+            f"driver={driver_name}, attribute_columns={len(normalized.attributes.columns)}, "
+            f"geometry_encoding=WKB, device_geometry_encode={int(force_device_geometry_encode)}"
+        ),
+        row_count=normalized.geometry.row_count,
+    ))
 
     pyogrio.write_arrow(
         arrow_table,
@@ -1022,6 +1038,7 @@ def _materialize_native_file_read_result(payload):
     from pandas.api.types import is_object_dtype, is_string_dtype
 
     frame = payload.to_geodataframe()
+    rewritten_columns = False
 
     def _looks_like_datetime_strings(series) -> bool:
         non_null = series.dropna()
@@ -1060,6 +1077,19 @@ def _materialize_native_file_read_result(payload):
                 pass
         if as_dt is not None and as_dt.dtype != "object":
             frame[col] = as_dt.dt.as_unit("ms")
+            rewritten_columns = True
+    if rewritten_columns:
+        from vibespatial.api._native_results import _spatial_to_native_tabular_result
+        from vibespatial.api._native_state import (
+            attach_native_state_from_native_tabular_result,
+            get_native_state,
+        )
+
+        if get_native_state(frame) is not None:
+            attach_native_state_from_native_tabular_result(
+                frame,
+                _spatial_to_native_tabular_result(frame),
+            )
     return frame
 
 
@@ -1452,6 +1482,14 @@ def _is_remote_named_file_source(source) -> bool:
     if isinstance(name, str) and name:
         return _is_remote_named_file_source(name)
     return False
+
+
+def _local_named_file_source_missing(source) -> bool:
+    """Return True when a local named file source does not exist."""
+    if _is_remote_named_file_source(source):
+        return False
+    path = _resolve_named_file_source_path(source)
+    return path is not None and not path.exists()
 
 
 def _rewindable_stream_payload(source):
@@ -2393,6 +2431,7 @@ def _supports_public_explicit_pyogrio_native_read(
 
 def _supports_native_mask_pyogrio_bridge(plan: VectorFilePlan) -> bool:
     return plan.format in {
+        IOFormat.GEOJSON,
         IOFormat.SHAPEFILE,
         IOFormat.GEOPACKAGE,
         IOFormat.FILE_GEODATABASE,
@@ -2474,6 +2513,8 @@ def _try_gpu_read_file_native(
 
     runtime = get_cuda_runtime()
     if not runtime.available():
+        return None
+    if plan.format is IOFormat.GEOJSON and _local_named_file_source_missing(filename):
         return None
 
     dispatch_detail = _read_file_dispatch_detail(

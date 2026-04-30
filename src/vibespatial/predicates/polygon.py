@@ -299,7 +299,11 @@ def compute_polygonal_covered_by_single_mask_no_holes_gpu(
 
         runtime.synchronize()
         h_out = np.empty(pair_count, dtype=np.bool_)
-        runtime.copy_device_to_host(d_out, h_out)
+        runtime.copy_device_to_host(
+            d_out,
+            h_out,
+            reason=f"polygon predicate {kernel_name} result host export",
+        )
         return h_out
     finally:
         if own_d_left:
@@ -438,7 +442,11 @@ def compute_polygon_de9im_gpu(
 
         runtime.synchronize()
         h_mask = np.empty(pair_count, dtype=np.uint16)
-        runtime.copy_device_to_host(d_mask, h_mask)
+        runtime.copy_device_to_host(
+            d_mask,
+            h_mask,
+            reason=f"polygon predicate {kernel_name} de9im-mask host export",
+        )
 
         if swap:
             h_mask = _transpose_de9im(h_mask)

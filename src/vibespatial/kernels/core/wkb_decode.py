@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import numpy as np
+
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
@@ -89,6 +91,28 @@ _TAG_TO_FAMILY = {
 
 # Reverse: GeometryFamily -> kernel family tag (int8)
 _FAMILY_TO_TAG = {v: k for k, v in _TAG_TO_FAMILY.items()}
+
+
+def _wkb_decode_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
+    """Copy WKB decode metadata through a named runtime D2H boundary."""
+    return np.asarray(get_cuda_runtime().copy_device_to_host(device_array, reason=reason))
+
+
+def _wkb_decode_size_summary(*values: object, reason: str) -> np.ndarray:
+    """Return host allocation sizes from device scalar expressions."""
+    import cupy as cp
+
+    summary = cp.empty(len(values), dtype=cp.int64)
+    for index, value in enumerate(values):
+        summary[index] = value
+    return _wkb_decode_device_to_host(summary, reason=reason).reshape(-1)
+
+
+def _wkb_decode_bool_scalar(value: object, *, reason: str) -> bool:
+    import cupy as cp
+
+    host = _wkb_decode_device_to_host(cp.asarray(value, dtype=cp.bool_).reshape(1), reason=reason)
+    return bool(host.reshape(-1)[0])
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +260,15 @@ def _decode_linestring_family(
     if n > 0:
         geometry_offsets[1:] = coord_offsets + point_counts
 
-    total_coords = int(geometry_offsets[-1]) if n > 0 else 0
+    size_summary = (
+        _wkb_decode_size_summary(
+            geometry_offsets[-1],
+            reason="WKB linestring decode coord-count scalar fence",
+        )
+        if n > 0
+        else np.zeros(1, dtype=np.int64)
+    )
+    total_coords = int(size_summary[0])
 
     x_out = cp.empty(total_coords, dtype=cp.float64)
     y_out = cp.empty(total_coords, dtype=cp.float64)
@@ -308,14 +340,26 @@ def _decode_polygon_family(
     geometry_offsets[0] = 0
     if n > 0:
         geometry_offsets[1:] = ring_count_offsets + total_rings_per
-    total_rings = int(geometry_offsets[-1]) if n > 0 else 0
     coord_offsets = exclusive_sum(total_coords_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
-    total_coords = int(coord_offsets[-1] + total_coords_per[-1]) if n > 0 else 0
+    size_summary = (
+        _wkb_decode_size_summary(
+            geometry_offsets[-1],
+            coord_offsets[-1] + total_coords_per[-1],
+            reason="WKB polygon decode size summary scalar fence",
+        )
+        if n > 0
+        else np.zeros(2, dtype=np.int64)
+    )
+    total_rings = int(size_summary[0])
+    total_coords = int(size_summary[1])
     dense_single_ring_width = None
     if n > 0 and total_coords > 0 and total_coords % n == 0:
         candidate_width = total_coords // n
         dense = cp.all(total_rings_per == 1) & cp.all(total_coords_per == candidate_width)
-        if bool(dense.item()):
+        if _wkb_decode_bool_scalar(
+            dense,
+            reason="WKB polygon dense single-ring scalar fence",
+        ):
             dense_single_ring_width = int(candidate_width)
 
     # Allocate output
@@ -380,7 +424,15 @@ def _decode_multipoint_family(
     geometry_offsets[0] = 0
     if n > 0:
         geometry_offsets[1:] = coord_offsets + part_counts
-    total_coords = int(geometry_offsets[-1]) if n > 0 else 0
+    size_summary = (
+        _wkb_decode_size_summary(
+            geometry_offsets[-1],
+            reason="WKB multipoint decode coord-count scalar fence",
+        )
+        if n > 0
+        else np.zeros(1, dtype=np.int64)
+    )
+    total_coords = int(size_summary[0])
 
     x_out = cp.empty(total_coords, dtype=cp.float64)
     y_out = cp.empty(total_coords, dtype=cp.float64)
@@ -452,9 +504,18 @@ def _decode_multilinestring_family(
     geometry_offsets[0] = 0
     if n > 0:
         geometry_offsets[1:] = part_count_offsets + total_parts_per
-    total_parts = int(geometry_offsets[-1]) if n > 0 else 0
     coord_offsets = exclusive_sum(total_coords_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
-    total_coords = int(coord_offsets[-1] + total_coords_per[-1]) if n > 0 else 0
+    size_summary = (
+        _wkb_decode_size_summary(
+            geometry_offsets[-1],
+            coord_offsets[-1] + total_coords_per[-1],
+            reason="WKB multilinestring decode size summary scalar fence",
+        )
+        if n > 0
+        else np.zeros(2, dtype=np.int64)
+    )
+    total_parts = int(size_summary[0])
+    total_coords = int(size_summary[1])
 
     part_offsets_out = cp.empty(total_parts + 1, dtype=cp.int32)
     x_out = cp.empty(total_coords, dtype=cp.float64)
@@ -538,12 +599,22 @@ def _decode_multipolygon_family(
     geometry_offsets[0] = 0
     if n > 0:
         geometry_offsets[1:] = poly_count_offsets + total_parts_per
-    total_parts = int(geometry_offsets[-1]) if n > 0 else 0
     ring_count_offsets = exclusive_sum(total_rings_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
     coord_offsets = exclusive_sum(total_coords_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
 
-    total_rings = int(ring_count_offsets[-1] + total_rings_per[-1]) if n > 0 else 0
-    total_coords = int(coord_offsets[-1] + total_coords_per[-1]) if n > 0 else 0
+    size_summary = (
+        _wkb_decode_size_summary(
+            geometry_offsets[-1],
+            ring_count_offsets[-1] + total_rings_per[-1],
+            coord_offsets[-1] + total_coords_per[-1],
+            reason="WKB multipolygon decode size summary scalar fence",
+        )
+        if n > 0
+        else np.zeros(3, dtype=np.int64)
+    )
+    total_parts = int(size_summary[0])
+    total_rings = int(size_summary[1])
+    total_coords = int(size_summary[2])
 
     part_offsets_out = cp.empty(total_parts + 1, dtype=cp.int32)
     ring_offsets_out = cp.empty(total_rings + 1, dtype=cp.int32)

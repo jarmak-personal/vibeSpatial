@@ -18,11 +18,45 @@ from shapely.geometry import (
     Polygon,
 )
 
+import vibespatial
 from vibespatial import ExecutionMode, has_gpu_runtime
 from vibespatial.constructive.remove_repeated_points import remove_repeated_points_owned
 from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.runtime.fallbacks import STRICT_NATIVE_ENV_VAR, StrictNativeFallbackError
+from vibespatial.runtime.residency import Residency
 
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
+
+
+@requires_gpu
+def test_strict_native_gpu_failure_is_not_swallowed(monkeypatch):
+    """Strict-native GPU failures must not continue to CPU dedup."""
+    import vibespatial.constructive.remove_repeated_points as rrp_module
+
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    def _fail_gpu(*_args, **_kwargs):
+        raise RuntimeError("forced remove repeated points failure")
+
+    monkeypatch.setattr(rrp_module, "_remove_repeated_points_gpu", _fail_gpu)
+    owned = from_shapely_geometries(
+        [LineString([(0, 0), (0, 0), (1, 1)])],
+        residency=Residency.DEVICE,
+    )
+    vibespatial.clear_fallback_events()
+
+    with pytest.raises(StrictNativeFallbackError, match=r"remove_repeated_points"):
+        rrp_module.remove_repeated_points_owned(
+            owned,
+            tolerance=0.0,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+
+    events = vibespatial.get_fallback_events(clear=True)
+    assert events
+    assert events[-1].surface == "geopandas.array.remove_repeated_points"
+    assert events[-1].reason == "GPU remove_repeated_points failed"
+    assert events[-1].d2h_transfer is True
 
 
 def _geom_coords(geom):

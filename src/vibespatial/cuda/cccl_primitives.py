@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from ._runtime import DeviceArray
+from ._runtime import DeviceArray, get_cuda_runtime
 
 try:
     import cupy as cp
@@ -108,6 +108,11 @@ def _require_cccl_primitives() -> tuple[object, object]:
 def _validate_vector(name: str, values: DeviceArray) -> None:
     if getattr(values, "ndim", None) != 1:
         raise ValueError(f"{name} must be a 1D device array")
+
+
+def _device_int_scalar(value, *, reason: str) -> int:
+    host = get_cuda_runtime().copy_device_to_host(value, reason=reason)
+    return int(np.asarray(host).reshape(-1)[0])
 
 
 def _sum_op(left, right):  # pragma: no cover - exercised through CCCL JIT
@@ -261,7 +266,10 @@ def _compact_indices_cccl(mask: DeviceArray, *, stream=None) -> CompactionResult
     cccl_algorithms.select(indices, out, count, _selected, item_count, stream=stream)
     # Returning a sliced output requires an explicit host count materialization.
     _stream_synchronize(cp_module, stream)
-    selected_count = int(count.item())
+    selected_count = _device_int_scalar(
+        count,
+        reason="cccl select selected-count scalar fence",
+    )
     return CompactionResult(values=out[:selected_count], count=selected_count)
 
 
@@ -848,7 +856,10 @@ def unique_sorted_pairs(
             temp, keys, values, out_keys, out_values,
             out_count, _equal_to, item_count, stream=stream)
         _finish_precompiled_call(precompiled, cp_module, stream=stream, synchronize=True)
-        selected_count = int(out_count.item())
+        selected_count = _device_int_scalar(
+            out_count,
+            reason="cccl unique-by-key selected-count scalar fence",
+        )
         return UniqueByKeyResult(
             keys=out_keys[:selected_count],
             values=out_values[:selected_count],
@@ -867,7 +878,10 @@ def unique_sorted_pairs(
     )
     # Returning a trimmed output still requires a host-materialized count.
     _stream_synchronize(cp_module, stream)
-    selected_count = int(out_count.item())
+    selected_count = _device_int_scalar(
+        out_count,
+        reason="cccl unique-by-key selected-count scalar fence",
+    )
     return UniqueByKeyResult(
         keys=out_keys[:selected_count],
         values=out_values[:selected_count],
@@ -1001,7 +1015,10 @@ def _three_way_partition_cccl(
         values, d_first, d_second, d_unselected, d_counts,
         first_pred, second_pred, item_count,
     )
-    h_counts = d_counts.get()
+    h_counts = get_cuda_runtime().copy_device_to_host(
+        d_counts,
+        reason="cccl three-way partition count export",
+    )
     first_count = int(h_counts[0])
     second_count = int(h_counts[1])
     # Concatenate the three partitions into a single output array

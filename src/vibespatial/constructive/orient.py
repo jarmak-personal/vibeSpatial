@@ -294,3 +294,34 @@ def orient_owned(
         families=new_families,
         residency=Residency.HOST,
     )
+
+
+def orient_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    exterior_cw: bool = False,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = orient_owned(
+        owned,
+        exterior_cw=exterior_cw,
+        dispatch_mode=dispatch_mode,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="orient",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )

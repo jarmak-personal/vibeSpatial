@@ -25,7 +25,9 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray, tile_single_row
 from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.fallbacks import StrictNativeFallbackError, record_fallback_event
 from vibespatial.runtime.precision import CoordinateStats, KernelClass, PrecisionMode
+from vibespatial.runtime.residency import Residency
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +293,44 @@ def _build_flat_coord_offsets(device_buf, family):
     return None
 
 
+def _single_row_flat_coord_count_host(
+    owned: OwnedGeometryArray,
+    family: GeometryFamily,
+) -> int | None:
+    buf = owned.families[family] if family in owned.families else None
+    if buf is None or buf.row_count != 1:
+        return None
+    try:
+        if family in (
+            GeometryFamily.POINT,
+            GeometryFamily.MULTIPOINT,
+            GeometryFamily.LINESTRING,
+        ):
+            return int(buf.geometry_offsets[1] - buf.geometry_offsets[0])
+        if family is GeometryFamily.POLYGON and buf.ring_offsets is not None:
+            ring_start = int(buf.geometry_offsets[0])
+            ring_end = int(buf.geometry_offsets[1])
+            return int(buf.ring_offsets[ring_end] - buf.ring_offsets[ring_start])
+        if family is GeometryFamily.MULTILINESTRING and buf.part_offsets is not None:
+            part_start = int(buf.geometry_offsets[0])
+            part_end = int(buf.geometry_offsets[1])
+            return int(buf.part_offsets[part_end] - buf.part_offsets[part_start])
+    except Exception:
+        return None
+    return None
+
+
+def _distance_int_scalar(value, *, reason: str) -> int:
+    if cp is None:
+        return int(np.asarray(value).reshape(-1)[0])
+    return int(
+        get_cuda_runtime().copy_device_to_host(
+            cp.asarray(value).reshape(1),
+            reason=reason,
+        ).reshape(-1)[0]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Kernel compilation helper
 # ---------------------------------------------------------------------------
@@ -305,6 +345,15 @@ def _compile_distance_kernel(name_prefix, fp64_source, fp32_source,
         kernel_names,
         compute_type,
     )
+
+
+def _densify_steps(densify: float | None) -> int:
+    if densify is None:
+        return 1
+    densify_value = float(densify)
+    if not (0.0 < densify_value <= 1.0):
+        raise ValueError("densify must be greater than 0 and less than or equal to 1")
+    return max(1, int(math.ceil(1.0 / densify_value)))
 
 
 def _fp32_center_coords_for_pair(
@@ -338,7 +387,10 @@ def _fp32_center_coords_for_pair(
                 max_y = max(max_y, float(buf.y.max()))
 
     if device_scalars:
-        stats = cp.array(device_scalars).get()
+        stats = get_cuda_runtime().copy_device_to_host(
+            cp.array(device_scalars),
+            reason="distance metrics fp32 coordinate-center scalar export",
+        )
         for idx in range(0, len(stats), 4):
             min_x = min(min_x, float(stats[idx]))
             max_x = max(max_x, float(stats[idx + 1]))
@@ -381,7 +433,7 @@ def _coord_stats_for_pair(
     supports_mixed=False,
     tags=("cuda-python", "metric", "hausdorff"),
 )
-def _hausdorff_gpu(owned_a, owned_b, precision_plan=None):
+def _hausdorff_gpu(owned_a, owned_b, precision_plan=None, *, densify_steps: int = 1):
     """GPU Hausdorff distance.  Returns ``np.ndarray`` of shape ``(n,)``."""
     runtime = get_cuda_runtime()
     d_state_a = owned_a._ensure_device_state()
@@ -398,6 +450,11 @@ def _hausdorff_gpu(owned_a, owned_b, precision_plan=None):
         raise NotImplementedError(
             f"GPU hausdorff does not support {family_a.name}/{family_b.name}"
         )
+    if densify_steps > 1 and (
+        family_a is not GeometryFamily.LINESTRING
+        or family_b is not GeometryFamily.LINESTRING
+    ):
+        raise NotImplementedError("GPU hausdorff densify currently supports LineString pairs")
 
     buf_a = d_state_a.families[family_a]
     buf_b = d_state_b.families[family_b]
@@ -416,7 +473,12 @@ def _hausdorff_gpu(owned_a, owned_b, precision_plan=None):
     d_bcast_x = None
     d_bcast_y = None
     if int(d_offsets_b.size) == 2 and n > 1:
-        k = int(d_offsets_b[1] - d_offsets_b[0])
+        k = _single_row_flat_coord_count_host(owned_b, family_b)
+        if k is None:
+            k = _distance_int_scalar(
+                d_offsets_b[1] - d_offsets_b[0],
+                reason="hausdorff broadcast coordinate-count scalar fence",
+            )
         d_offsets_b = cp.arange(0, (n + 1) * k, k, dtype=np.int32)
         d_bcast_x = cp.tile(cp.asarray(buf_b.x), n)
         d_bcast_y = cp.tile(cp.asarray(buf_b.y), n)
@@ -446,16 +508,19 @@ def _hausdorff_gpu(owned_a, owned_b, precision_plan=None):
     params = (
         (ptr(buf_a.x), ptr(buf_a.y), ptr(d_offsets_a),
          ptr(bx), ptr(by), ptr(d_offsets_b),
-         ptr(d_result), center_x, center_y, n),
+         ptr(d_result), center_x, center_y, densify_steps, n),
         (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
          KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
          KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-         KERNEL_PARAM_I32),
+         KERNEL_PARAM_I32, KERNEL_PARAM_I32),
     )
     runtime.launch(kernel, grid=grid, block=block, params=params)
 
-    # Single D->H transfer of the small result array
-    return cp.asnumpy(d_result)
+    # Single public-output D->H transfer of the small result array.
+    return runtime.copy_device_to_host(
+        d_result,
+        reason="hausdorff distance public result host export",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +536,7 @@ def _hausdorff_gpu(owned_a, owned_b, precision_plan=None):
     supports_mixed=False,
     tags=("cuda-python", "metric", "frechet"),
 )
-def _frechet_gpu(owned_a, owned_b):
+def _frechet_gpu(owned_a, owned_b, *, densify_steps: int = 1):
     """GPU discrete Frechet distance.  Returns ``np.ndarray`` of shape ``(n,)``."""
     runtime = get_cuda_runtime()
     d_state_a = owned_a._ensure_device_state()
@@ -497,7 +562,12 @@ def _frechet_gpu(owned_a, owned_b):
     d_bcast_x = None
     d_bcast_y = None
     if int(d_offsets_b.size) == 2 and n > 1:
-        k = int(d_offsets_b[1] - d_offsets_b[0])
+        k = _single_row_flat_coord_count_host(owned_b, GeometryFamily.LINESTRING)
+        if k is None:
+            k = _distance_int_scalar(
+                d_offsets_b[1] - d_offsets_b[0],
+                reason="frechet broadcast coordinate-count scalar fence",
+            )
         d_offsets_b = cp.arange(0, (n + 1) * k, k, dtype=np.int32)
         d_bcast_x = cp.tile(cp.asarray(buf_b.x), n)
         d_bcast_y = cp.tile(cp.asarray(buf_b.y), n)
@@ -505,7 +575,16 @@ def _frechet_gpu(owned_a, owned_b):
     # Compute max B geometry coord count on device, transfer single scalar
     if n > 0:
         d_lens_b = d_offsets_b[1:] - d_offsets_b[:-1]
-        max_b_len = int(cp.max(d_lens_b))
+        if densify_steps > 1:
+            d_lens_b = cp.where(
+                d_lens_b <= 1,
+                d_lens_b,
+                (d_lens_b - 1) * densify_steps + 1,
+            )
+        max_b_len = _distance_int_scalar(
+            cp.max(d_lens_b),
+            reason="frechet max B sequence length scalar fence",
+        )
     else:
         max_b_len = 0
 
@@ -536,16 +615,19 @@ def _frechet_gpu(owned_a, owned_b):
     params = (
         (ptr(buf_a.x), ptr(buf_a.y), ptr(d_offsets_a),
          ptr(bx), ptr(by), ptr(d_offsets_b),
-         ptr(d_result), center_x, center_y, n, max_b_len),
+         ptr(d_result), center_x, center_y, n, max_b_len, densify_steps),
         (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
          KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
          KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-         KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+         KERNEL_PARAM_I32, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
     )
     runtime.launch(kernel, grid=grid, block=block, params=params)
 
-    # Single D->H transfer of the small result array
-    return cp.asnumpy(d_result)
+    # Single public-output D->H transfer of the small result array.
+    return runtime.copy_device_to_host(
+        d_result,
+        reason="frechet distance public result host export",
+    )
 
 
 # ===========================================================================
@@ -556,12 +638,35 @@ def _frechet_gpu(owned_a, owned_b):
 # Hausdorff distance
 # ---------------------------------------------------------------------------
 
-def _hausdorff_pair(coords_a: np.ndarray, coords_b: np.ndarray) -> float:
+def _densify_coords(coords: np.ndarray, densify_steps: int) -> np.ndarray:
+    if densify_steps <= 1 or coords.shape[0] <= 1:
+        return coords
+    segment_count = coords.shape[0] - 1
+    out = np.empty((segment_count * densify_steps + 1, 2), dtype=np.float64)
+    out_index = 0
+    fractions = np.arange(densify_steps, dtype=np.float64) / float(densify_steps)
+    for segment in range(segment_count):
+        start = coords[segment]
+        delta = coords[segment + 1] - start
+        out[out_index:out_index + densify_steps] = start + fractions[:, None] * delta
+        out_index += densify_steps
+    out[out_index] = coords[-1]
+    return out
+
+
+def _hausdorff_pair(
+    coords_a: np.ndarray,
+    coords_b: np.ndarray,
+    *,
+    densify_steps: int = 1,
+) -> float:
     """Brute-force Hausdorff distance between two coordinate arrays.
 
     coords_a, coords_b: (N, 2) and (M, 2) float64 arrays.
     Returns max(max_min(A->B), max_min(B->A)).
     """
+    coords_a = _densify_coords(coords_a, densify_steps)
+    coords_b = _densify_coords(coords_b, densify_steps)
     # For each point in A, min distance to B; take max
     forward = _min_distances_vectorized(coords_a, coords_b)
     # For each point in B, min distance to A; take max
@@ -579,7 +684,7 @@ def _hausdorff_pair(coords_a: np.ndarray, coords_b: np.ndarray) -> float:
     supports_mixed=True,
     tags=("cpu", "metric", "hausdorff"),
 )
-def _hausdorff_cpu(owned_a, owned_b, n):
+def _hausdorff_cpu(owned_a, owned_b, n, *, densify_steps: int = 1):
     """CPU Hausdorff fallback.  Returns ``np.ndarray`` of shape ``(n,)``."""
     result = np.full(n, np.nan, dtype=np.float64)
     for i in range(n):
@@ -589,7 +694,7 @@ def _hausdorff_cpu(owned_a, owned_b, n):
             continue
         if coords_a.shape[0] == 0 or coords_b.shape[0] == 0:
             continue
-        result[i] = _hausdorff_pair(coords_a, coords_b)
+        result[i] = _hausdorff_pair(coords_a, coords_b, densify_steps=densify_steps)
     return result
 
 
@@ -645,7 +750,7 @@ def _frechet_pair(coords_a: np.ndarray, coords_b: np.ndarray) -> float:
     supports_mixed=False,
     tags=("cpu", "metric", "frechet"),
 )
-def _frechet_cpu(owned_a, owned_b, n):
+def _frechet_cpu(owned_a, owned_b, n, *, densify_steps: int = 1):
     """CPU Frechet fallback.  Returns ``np.ndarray`` of shape ``(n,)``."""
     result = np.full(n, np.nan, dtype=np.float64)
     for i in range(n):
@@ -655,6 +760,8 @@ def _frechet_cpu(owned_a, owned_b, n):
             continue
         if coords_a.shape[0] == 0 or coords_b.shape[0] == 0:
             continue
+        coords_a = _densify_coords(coords_a, densify_steps)
+        coords_b = _densify_coords(coords_b, densify_steps)
         result[i] = _frechet_pair(coords_a, coords_b)
     return result
 
@@ -675,10 +782,6 @@ def hausdorff_distance_owned(
     Returns a float64 array of length ``owned_a.row_count``.  NaN for null
     or empty geometry rows.
 
-    The *densify* parameter is accepted for API compatibility but is not
-    currently used by the CPU brute-force implementation (reserved for
-    future GPU kernel densification).
-
     Works directly on OwnedGeometryArray coordinate buffers -- no Shapely
     round-trip.
     """
@@ -693,6 +796,8 @@ def hausdorff_distance_owned(
 
     if n == 0:
         return np.empty(0, dtype=np.float64)
+
+    densify_steps = _densify_steps(densify)
 
     if isinstance(precision, str):
         precision = PrecisionMode(precision)
@@ -710,9 +815,32 @@ def hausdorff_distance_owned(
     if selection.selected is ExecutionMode.GPU:
         precision_plan = selection.precision_plan
         try:
-            result = _hausdorff_gpu(owned_a, owned_b, precision_plan=precision_plan)
+            result = _hausdorff_gpu(
+                owned_a,
+                owned_b,
+                precision_plan=precision_plan,
+                densify_steps=densify_steps,
+            )
+        except StrictNativeFallbackError:
+            raise
         except (NotImplementedError, RuntimeError) as exc:
             logger.debug("Hausdorff GPU dispatch failed, falling back to CPU: %s", exc)
+            record_fallback_event(
+                surface="geopandas.array.hausdorff_distance",
+                reason="GPU hausdorff_distance failed",
+                detail=(
+                    f"rows={n}, workload={workload.value}, "
+                    f"precision={precision_plan.compute_precision.value}, "
+                    f"densify_steps={densify_steps}, "
+                    f"error={type(exc).__name__}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.CPU,
+                d2h_transfer=(
+                    owned_a.residency is Residency.DEVICE
+                    or owned_b.residency is Residency.DEVICE
+                ),
+            )
         else:
             record_dispatch_event(
                 surface="geopandas.array.hausdorff_distance",
@@ -721,14 +849,15 @@ def hausdorff_distance_owned(
                 reason=selection.reason,
                 detail=(
                     f"rows={n}, workload={workload.value}, "
-                    f"precision={precision_plan.compute_precision.value}"
+                    f"precision={precision_plan.compute_precision.value}, "
+                    f"densify_steps={densify_steps}"
                 ),
                 requested=selection.requested,
                 selected=ExecutionMode.GPU,
             )
             return result
 
-    result = _hausdorff_cpu(owned_a, owned_b, n)
+    result = _hausdorff_cpu(owned_a, owned_b, n, densify_steps=densify_steps)
     record_dispatch_event(
         surface="geopandas.array.hausdorff_distance",
         operation="hausdorff_distance",
@@ -752,9 +881,6 @@ def frechet_distance_owned(
     Returns a float64 array of length ``owned_a.row_count``.  NaN for null
     rows or non-LineString geometry types.
 
-    The *densify* parameter is accepted for API compatibility but is not
-    currently used by the CPU implementation.
-
     Works directly on OwnedGeometryArray coordinate buffers -- no Shapely
     round-trip.
     """
@@ -770,6 +896,8 @@ def frechet_distance_owned(
     if n == 0:
         return np.empty(0, dtype=np.float64)
 
+    densify_steps = _densify_steps(densify)
+
     selection = plan_dispatch_selection(
         kernel_name="frechet_distance",
         kernel_class=KernelClass.METRIC,
@@ -780,22 +908,42 @@ def frechet_distance_owned(
 
     if selection.selected is ExecutionMode.GPU:
         try:
-            result = _frechet_gpu(owned_a, owned_b)
+            result = _frechet_gpu(owned_a, owned_b, densify_steps=densify_steps)
+        except StrictNativeFallbackError:
+            raise
         except (NotImplementedError, RuntimeError) as exc:
             logger.debug("Frechet GPU dispatch failed, falling back to CPU: %s", exc)
+            record_fallback_event(
+                surface="geopandas.array.frechet_distance",
+                reason="GPU frechet_distance failed",
+                detail=(
+                    f"rows={n}, workload={workload.value}, "
+                    f"densify_steps={densify_steps}, "
+                    f"error={type(exc).__name__}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.CPU,
+                d2h_transfer=(
+                    owned_a.residency is Residency.DEVICE
+                    or owned_b.residency is Residency.DEVICE
+                ),
+            )
         else:
             record_dispatch_event(
                 surface="geopandas.array.frechet_distance",
                 operation="frechet_distance",
                 implementation="frechet_gpu_nvrtc",
                 reason=selection.reason,
-                detail=f"rows={n}, workload={workload.value}",
+                detail=(
+                    f"rows={n}, workload={workload.value}, "
+                    f"densify_steps={densify_steps}"
+                ),
                 requested=selection.requested,
                 selected=ExecutionMode.GPU,
             )
             return result
 
-    result = _frechet_cpu(owned_a, owned_b, n)
+    result = _frechet_cpu(owned_a, owned_b, n, densify_steps=densify_steps)
     record_dispatch_event(
         surface="geopandas.array.frechet_distance",
         operation="frechet_distance",

@@ -41,6 +41,7 @@ from vibespatial.constructive.segmented_union_host import (
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
+    seed_all_validity_cache,
 )
 from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
@@ -72,6 +73,20 @@ _SEGMENTED_UNION_BATCH_SMALL_MIN_REDUCE_GROUPS = 4
 _SEGMENTED_UNION_ROBUST_SNAP_GRID = 1.0e-9
 _SEGMENTED_UNION_ROBUST_SNAP_PRE_MAX_COORDS = 4096
 _SEGMENTED_UNION_ROBUST_SNAP_RETRY_MAX_PARTS = 128
+
+
+def _segmented_union_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    return np.asarray(get_cuda_runtime().copy_device_to_host(device_array, reason=reason))
+
+
+def _segmented_union_int_scalar(value: object, *, reason: str) -> int:
+    return int(_segmented_union_device_to_host(cp.asarray(value).reshape(1), reason=reason)[0])
+
+
+def _segmented_union_bool_scalar(value: object, *, reason: str) -> bool:
+    return bool(_segmented_union_device_to_host(cp.asarray(value).reshape(1), reason=reason)[0])
 
 
 def _empty_group_owned_like(source: OwnedGeometryArray) -> OwnedGeometryArray:
@@ -157,7 +172,10 @@ def _polygon_exploded_part_count_gpu(result: OwnedGeometryArray) -> int:
     d_state = result.device_state
     polygon_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
     if GeometryFamily.POLYGON in d_state.families:
-        count += int(cp.count_nonzero(d_state.tags == polygon_tag).item())
+        count += _segmented_union_int_scalar(
+            cp.count_nonzero(d_state.tags == polygon_tag),
+            reason="segmented union polygon exploded-part count scalar fence",
+        )
     if GeometryFamily.MULTIPOLYGON not in d_state.families:
         return count
     d_buf = d_state.families[GeometryFamily.MULTIPOLYGON]
@@ -501,7 +519,16 @@ def _segmented_union_serial_gpu(
 
         if group_size == 1:
             single = geometries.take(singleton_indices(start))
-            if not single.validity[0]:
+            state = single._ensure_device_state() if single.device_state is not None else None
+            is_valid = (
+                _segmented_union_bool_scalar(
+                    cp.asarray(state.validity)[0],
+                    reason="segmented union singleton validity scalar fence",
+                )
+                if state is not None and cp is not None
+                else bool(single.validity[0])
+            )
+            if not is_valid:
                 group_results.append(_empty_group_owned_like(geometries))
             else:
                 group_results.append(single)
@@ -529,7 +556,9 @@ def _segmented_union_serial_gpu(
         except Exception:
             return None
 
-    return concat_owned_arrays(group_results)
+    result = concat_owned_arrays(group_results)
+    seed_all_validity_cache(result)
+    return result
 
 
 def _segmented_union_grouped_overlay_gpu(
@@ -576,7 +605,10 @@ def _segmented_union_grouped_overlay_gpu(
 
         state = geometries._ensure_device_state()
         d_valid = state.validity[:total_rows].astype(cp.bool_, copy=False)
-        valid_count = int(cp.count_nonzero(d_valid).item())
+        valid_count = _segmented_union_int_scalar(
+            cp.count_nonzero(d_valid),
+            reason="segmented union grouped-overlay valid-row count scalar fence",
+        )
         if valid_count == 0:
             return concat_owned_arrays([_empty_group_owned_like(geometries) for _ in range(n_groups)])
         if valid_count == total_rows:

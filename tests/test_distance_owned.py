@@ -7,6 +7,9 @@ integration surface.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
 import shapely
@@ -25,6 +28,24 @@ from vibespatial.spatial.distance_owned import distance_owned, dwithin_owned
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def test_distance_owned_d2h_exports_are_operation_named() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "src" / "vibespatial" / "spatial" / "distance_owned.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "copy_device_to_host"
+            and not any(keyword.arg == "reason" for keyword in node.keywords)
+        ):
+            offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+    assert offenders == []
+
 
 def _shapely_distances(left_geoms, right_geoms):
     """Oracle: element-wise Shapely distance."""

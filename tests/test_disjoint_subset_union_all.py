@@ -412,3 +412,35 @@ class TestGPUExecution:
         assert len(geoms) == 1
         expected = MultiPolygon(polys)
         assert shapely.equals(geoms[0], expected)
+
+    def test_gpu_complex_disjoint_polygon_assembly_uses_bbox_proof(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+        from vibespatial.constructive import validity as validity_module
+
+        def _fail_full_validity_scan(*_args, **_kwargs):
+            raise AssertionError(
+                "bbox-disjoint complex assembly should not run full OGC validity"
+            )
+
+        monkeypatch.setattr(validity_module, "is_valid_owned", _fail_full_validity_scan)
+        polys = [
+            Polygon([
+                (i * 10, 0), (i * 10 + 5, 0),
+                (i * 10 + 5, 5), (i * 10, 5),
+            ])
+            for i in range(8)
+        ]
+        owned = from_shapely_geometries(polys)
+
+        result = disjoint_subset_union_all_owned(
+            owned,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+
+        assert result is not None
+        assert getattr(result, "_cached_is_valid_mask", None) is not None
+        assert shapely.equals(result.to_shapely()[0], MultiPolygon(polys))

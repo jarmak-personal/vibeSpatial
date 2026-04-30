@@ -5,7 +5,7 @@ Scope: Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and 
 Read If: You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.
 STOP IF: Your task already has the specific IO adapter open and only needs local implementation detail.
 Source Of Truth: IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.
-Body Budget: 247/260 lines
+Body Budget: 260/260 lines
 Document: docs/architecture/io-arrow.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 32-37 | Risks |
 | 38-53 | Decision |
 | 54-75 | Performance Notes |
-| 76-209 | Current Behavior |
-| 210-247 | Measured Local Baseline |
+| 76-222 | Current Behavior |
+| 223-260 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -159,31 +159,32 @@ geometry buffers while keeping GPU-native formats as the design center.
   now also delegates to that shared native tabular boundary, so GeoArrow
   export no longer keeps a separate helper-local DeviceGeometryArray
   materialization branch alongside the repo-owned adapter.
-- Repo-owned GeoArrow export now also keeps the promotable single/multi mixes
-  (`Point`/`MultiPoint`, `LineString`/`MultiLineString`,
-  `Polygon`/`MultiPolygon`) on the native adapter instead of dropping those
-  columns into the host `construct_geometry_array(...)` bridge.
+- Repo-owned GeoArrow export keeps promotable single/multi mixes on the native
+  adapter instead of the host bridge; device-backed supported mixes promote to
+  native multi-family GeoArrow encodings.
 - The shared native boundary now also owns Parquet and Feather terminal
   emission, so Arrow-family write sinks no longer depend on GeoDataFrame
   assembly when a native result is already available.
 - `NativeTabularResult` now accepts a shared attribute payload abstraction, so
   Arrow-family sinks can lower Arrow-backed attribute tables directly instead
   of requiring pandas frames as the only internal attribute representation.
-- The GeoParquet writer consumes that shared native tabular boundary directly,
-  so writer-local payload assembly is no longer the place where native result
-  semantics live.
 - Native GeoParquet payload writes now also keep Arrow-backed attributes plus
   owned geometry on the device writer until the sink actually declines a
   feature, so the public `to_parquet` boundary no longer eagerly materializes
   a temporary `GeoSeries` just to discover that the native writer would have
   accepted the payload.
-- Shared native Arrow export now follows the same rule for WKB payloads: when
-  owned geometry is already available, it encodes directly from the owned
-  buffers instead of rebuilding a temporary `GeoSeries` before Arrow emission.
+- Shared native Arrow export now follows the same rule for WKB and GeoArrow
+  payloads: when owned geometry is already available, it encodes directly from
+  the owned buffers instead of rebuilding a temporary `GeoSeries`; public
+  host-backed GeoSeries/GeoDataFrame GeoArrow export does so for supported
+  families and preserves GeoPandas errors for unsupported mixed families.
 - Public host-originated `GeoDataFrame.to_arrow` and `GeoSeries.to_arrow`
   exports now record an explicit GeoArrow compatibility-writer boundary, while
   device-backed CPU misses stay in `io_write` coverage as real acceleration
   gaps instead of being hidden by the compatibility bucket.
+- Public `GeoDataFrame.to_arrow` and `GeoSeries.to_arrow` own the terminal
+  `NativeExportBoundary` event when they call the repo-owned Arrow adapter; direct
+  low-level adapter calls still record their own boundary.
 - Terminal GeoParquet compatibility decisions such as non-filesystem sinks or
   non-native compression now record an explicit CPU dispatch at the sink
   boundary instead of a fallback event, so strict-native mode still rejects
@@ -194,6 +195,19 @@ geometry buffers while keeping GPU-native formats as the design center.
   - row-group chunk planning from metadata summaries
   - direct GeoArrow-family decode into owned buffers
   - chunk concatenation at the owned-buffer layer
+- `read_geoparquet_native(...)` now seeds `NativeGeometryMetadata` on its
+  `NativeTabularResult` from decode-time validity/family classification and
+  GeoParquet total bounds without forcing eager per-row bounds recomputation;
+  chunked native reads concatenate that metadata along with geometry and
+  attributes.
+- Owned WKB/GeoArrow-style geometry results that cross
+  `to_native_tabular_result(...)` also seed cached `NativeGeometryMetadata`, so
+  immediate native consumers can reuse classification state instead of
+  rediscovering it after decode.
+- Public WKB and GeoArrow native imports from `GeoDataFrame.from_arrow` and
+  `GeoSeries.from_arrow` now attach metadata-seeded `NativeFrameState`, so
+  immediate native consumers can use decoded owned geometry without a second
+  decode/materialization.
 - The `pylibcudf` GeoParquet device path now decodes all native GeoArrow
   families (`point`, `linestring`, `polygon`, `multipoint`,
   `multilinestring`, `multipolygon`) into device-resident owned buffers without
@@ -216,10 +230,9 @@ geometry buffers while keeping GPU-native formats as the design center.
   - device-backed homogeneous exports now rebuild public Arrow arrays directly
     from the repo-owned device codec instead of routing through the generic host
     bridge first
-  - unsupported device-backed geometry mixes now drop to the repo-owned WKB
-    compatibility bridge instead of forcing a host `construct_wkb_array(...)`
-    materialization step
-  - mixed-family GeoArrow export still ends in WKB for truly unsupported mixes
+  - low-level/native-tabular unsupported host- and device-backed mixes drop to
+    the repo-owned WKB bridge instead of forcing `construct_wkb_array(...)`
+  - public unsupported mixed GeoArrow exports preserve GeoPandas `ValueError`
     until partition-and-restore mixed codecs land
   - successful homogeneous native export no longer records a fallback event on
     the public GeoPandas Arrow surface

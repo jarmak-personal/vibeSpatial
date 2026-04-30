@@ -124,6 +124,15 @@ def _property_num_bounds_kernels():
     )
 
 
+def _properties_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
+    return np.asarray(get_cuda_runtime().copy_device_to_host(device_array, reason=reason))
+
+
+def _properties_int_scalar(device_value: object, *, reason: str) -> int:
+    host = _properties_device_to_host(cp.asarray(device_value).reshape(1), reason=reason)
+    return int(host.reshape(-1)[0])
+
+
 # ---------------------------------------------------------------------------
 # Kernel launch helper
 # ---------------------------------------------------------------------------
@@ -332,11 +341,12 @@ def _extract_numeric_column(
         side="left",
     )
     d_valid = d_lookup < d_num_starts.shape[0]
-    if not bool(cp.any(d_valid)):
-        return cp.empty(0, dtype=cp.float64)
 
     d_selected_starts = d_num_starts[d_lookup[d_valid]]
-    d_selected_ends = d_num_ends[d_lookup[d_valid]]
+    d_end_lookup = cp.searchsorted(d_num_ends, d_selected_starts, side="left")
+    d_end_valid = d_end_lookup < d_num_ends.shape[0]
+    d_selected_starts = d_selected_starts[d_end_valid]
+    d_selected_ends = d_num_ends[d_end_lookup[d_end_valid]]
     return parse_ascii_floats(d_bytes, d_selected_starts, d_selected_ends)
 
 
@@ -437,11 +447,21 @@ def infer_property_schema(
     # Restrict parsing to the sampled feature spans. Parsing the feature
     # payloads on host is acceptable at this scale and correctly isolates
     # keys inside ``properties`` from sibling geometry keys like ``type``.
-    h_starts = cp.asnumpy(d_feature_starts[:n_sample]).astype(np.int64, copy=False)
-    h_ends = cp.asnumpy(d_feature_ends[:n_sample]).astype(np.int64, copy=False)
+    runtime = get_cuda_runtime()
+    h_starts = runtime.copy_device_to_host(
+        d_feature_starts[:n_sample],
+        reason="geojson schema sample feature-starts host export",
+    ).astype(np.int64, copy=False)
+    h_ends = runtime.copy_device_to_host(
+        d_feature_ends[:n_sample],
+        reason="geojson schema sample feature-ends host export",
+    ).astype(np.int64, copy=False)
     sample_start_byte = int(h_starts[0])
     sample_end_byte = int(h_ends[-1])
-    h_bytes = cp.asnumpy(d_bytes[sample_start_byte:sample_end_byte])
+    h_bytes = runtime.copy_device_to_host(
+        d_bytes[sample_start_byte:sample_end_byte],
+        reason="geojson schema sample bytes host export",
+    )
 
     schema: dict[str, int] = {}
     for start, end in zip(h_starts, h_ends, strict=True):
@@ -567,7 +587,10 @@ def extract_gpu_properties(
         if vtype == VTYPE_NUMBER:
             # Build a mask for features that actually have numeric values
             d_is_numeric = (d_vtypes == VTYPE_NUMBER)
-            n_numeric = int(cp.sum(d_is_numeric).item())
+            n_numeric = _properties_int_scalar(
+                cp.count_nonzero(d_is_numeric),
+                reason="geojson properties numeric-value count scalar fence",
+            )
 
             if n_numeric == 0:
                 continue
@@ -607,7 +630,10 @@ def extract_gpu_properties(
 
         elif vtype == VTYPE_BOOLEAN:
             d_is_bool = (d_vtypes == VTYPE_BOOLEAN)
-            n_bool = int(cp.sum(d_is_bool).item())
+            n_bool = _properties_int_scalar(
+                cp.count_nonzero(d_is_bool),
+                reason="geojson properties boolean-value count scalar fence",
+            )
 
             if n_bool == 0:
                 continue

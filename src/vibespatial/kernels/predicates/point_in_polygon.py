@@ -70,6 +70,7 @@ from vibespatial.predicates.support import (
     resolve_predicate_context,
 )
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.residency import Residency, TransferTrigger
@@ -1256,7 +1257,10 @@ def _evaluate_point_in_polygon_gpu(
                 _last_gpu_substage_timings = timings
                 _returned = True
                 return keepalive_out
-            dense_out = runtime.copy_device_to_host(device_dense_out)
+            dense_out = runtime.copy_device_to_host(
+                device_dense_out,
+                reason="point-in-polygon dense strategy result host export",
+            )
             cleanup_requires_sync = False
         finally:
             if cleanup_requires_sync:
@@ -1357,7 +1361,10 @@ def _evaluate_point_in_polygon_gpu(
                 _last_gpu_substage_timings = timings
                 _returned = True
                 return keepalive_out
-            dense_out = runtime.copy_device_to_host(device_dense_out)
+            dense_out = runtime.copy_device_to_host(
+                device_dense_out,
+                reason="point-in-polygon compacted strategy result host export",
+            )
             cleanup_requires_sync = False
         finally:
             if cleanup_requires_sync:
@@ -1479,7 +1486,10 @@ def _evaluate_point_in_polygon_gpu(
                 _last_gpu_substage_timings = timings
                 _returned = True
                 return keepalive_out
-            dense_out = runtime.copy_device_to_host(device_dense_out)
+            dense_out = runtime.copy_device_to_host(
+                device_dense_out,
+                reason="point-in-polygon binned strategy result host export",
+            )
             cleanup_requires_sync = False
         finally:
             if cleanup_requires_sync:
@@ -1505,7 +1515,10 @@ def _evaluate_point_in_polygon_gpu(
             _last_gpu_substage_timings = timings
             return device_out
         try:
-            dense_out = runtime.copy_device_to_host(device_out)
+            dense_out = runtime.copy_device_to_host(
+                device_out,
+                reason="point-in-polygon fused strategy result host export",
+            )
         finally:
             runtime.free(device_out)
         coarse = _initialize_host_coarse_result(points, right)
@@ -1655,3 +1668,69 @@ def point_in_polygon(
         # CPU fallback for _return_device: return numpy bool array
         return cpu_return_device_fallback(cpu_out)
     return _to_python_result(cpu_out)
+
+
+def point_in_polygon_expression(
+    points: PointSequence,
+    polygons: PointSequence,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    source_token: str | None = None,
+    operation: str = "point_in_polygon",
+):
+    """Return private point-in-polygon predicate results as a NativeExpression.
+
+    Physical shape: row-aligned point-vs-polygon predicate flow. The existing
+    staged PIP pipeline produces a dense bool vector; sanctioned native
+    consumers can compare it into a `NativeRowSet` instead of exporting a
+    public bool Series.
+    """
+    left = coerce_geometry_array(
+        points,
+        arg_name="points",
+        expected_families=(GeometryFamily.POINT,),
+    )
+    right = coerce_geometry_array(
+        polygons,
+        arg_name="polygons",
+        expected_families=(GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON),
+    )
+    values = point_in_polygon(
+        left,
+        right,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+        _return_device=True,
+    )
+    selected = (
+        ExecutionMode.GPU
+        if hasattr(values, "__cuda_array_interface__")
+        else ExecutionMode.CPU
+    )
+    record_dispatch_event(
+        surface="vibespatial.kernels.predicates.point_in_polygon_expression",
+        operation=operation,
+        requested=ExecutionMode.GPU,
+        selected=selected,
+        implementation=(
+            "native_point_in_polygon_expression_gpu"
+            if selected is ExecutionMode.GPU
+            else "native_point_in_polygon_expression_host"
+        ),
+        reason="point-in-polygon predicate result returned as NativeExpression",
+        detail=(
+            f"row_count={left.row_count}; "
+            "workload_shape=aligned_pairwise_point_region; carrier=NativeExpression"
+        ),
+    )
+    from vibespatial.api._native_expression import NativeExpression
+
+    return NativeExpression(
+        operation=operation,
+        values=values,
+        source_token=source_token,
+        source_row_count=left.row_count,
+        dtype=str(getattr(values, "dtype", "bool")),
+        precision="predicate",
+    )

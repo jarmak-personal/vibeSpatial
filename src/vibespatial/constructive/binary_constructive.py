@@ -36,7 +36,7 @@ from vibespatial.constructive.binary_constructive_cpu import binary_constructive
 from vibespatial.constructive.nonpolygon_binary_output import (
     build_point_result_from_source,
 )
-from vibespatial.cuda._runtime import DeviceArray
+from vibespatial.cuda._runtime import DeviceArray, count_scatter_total, get_cuda_runtime
 
 if TYPE_CHECKING:
     from vibespatial.spatial.segment_primitives import DeviceSegmentTable
@@ -50,10 +50,12 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     _concat_device_family_buffers,
     _device_gather_offset_slices,
+    _device_take_family_buffer,
     build_device_resident_owned,
     device_concat_owned_scatter,
     from_shapely_geometries,
     materialize_broadcast,
+    seed_all_validity_cache,
     tile_single_row,
     unique_tag_pairs,
 )
@@ -119,12 +121,37 @@ _POLYGON_UNION_EXACT_ROW_FALLBACK_MAX = 8
 # dominant area operand instead of fragmenting the dissolve with a sliver part.
 _POLYGON_UNION_DEGENERATE_AREA_RTOL = 1.0e-9
 
+# Full OGC validity for complex face-assembled multipolygons is an O(ring^2)
+# guard.  Direct union already proves area preservation from the same overlay
+# plan; keep the full scan for small outputs where it is cheap and use the
+# overlay proof for larger outputs.
+_DIRECT_UNION_FULL_VALIDITY_MAX_RINGS = 4
+_DIRECT_UNION_FULL_VALIDITY_MAX_COORDS = 512
+
 
 def _sync_hotpath() -> None:
     if hotpath_trace_enabled():
         from vibespatial.cuda._runtime import get_cuda_runtime
 
         get_cuda_runtime().synchronize()
+
+
+def _device_scalar_bool(value, *, reason: str) -> bool:
+    if cp is None:  # pragma: no cover - CPU-only installs do not call this path
+        return bool(value)
+    runtime = get_cuda_runtime()
+    d_value = cp.asarray(value, dtype=cp.bool_).reshape(1)
+    host = runtime.copy_device_to_host(d_value, reason=reason)
+    return bool(np.asarray(host).reshape(-1)[0])
+
+
+def _device_scalar_int(value, *, reason: str) -> int:
+    if cp is None:  # pragma: no cover - CPU-only installs do not call this path
+        return int(value)
+    runtime = get_cuda_runtime()
+    d_value = cp.asarray(value).reshape(1)
+    host = runtime.copy_device_to_host(d_value, reason=reason)
+    return int(np.asarray(host).reshape(-1)[0])
 
 
 def is_constructive_op(op: str) -> bool:
@@ -143,9 +170,209 @@ def _is_family_only(owned: OwnedGeometryArray, target_families: frozenset[Geomet
     return has_rows
 
 
+def _row_validity_array(owned: OwnedGeometryArray):
+    if getattr(owned, "device_state", None) is not None:
+        return owned._ensure_device_state().validity
+    return owned.validity
+
+
+def _row_tag_array(owned: OwnedGeometryArray):
+    if getattr(owned, "device_state", None) is not None:
+        return owned._ensure_device_state().tags
+    return owned.tags
+
+
+def _row_is_valid(owned: OwnedGeometryArray, row_index: int) -> bool:
+    cached = owned._current_cached_validity_mask()
+    if cached is not None:
+        return bool(cached[int(row_index)])
+    if getattr(owned, "_validity", None) is not None:
+        return bool(owned._validity[int(row_index)])
+    if cp is not None and getattr(owned, "device_state", None) is not None:
+        return _device_scalar_bool(
+            cp.asarray(owned._ensure_device_state().validity)[int(row_index)],
+            reason="binary constructive row-validity scalar fence",
+        )
+    return bool(owned.validity[int(row_index)])
+
+
+def _all_rows_valid(owned: OwnedGeometryArray) -> bool:
+    cached = owned._current_cached_validity_mask()
+    if cached is not None:
+        return bool(np.asarray(cached, dtype=bool).all())
+    if getattr(owned, "_validity", None) is not None:
+        return bool(np.asarray(owned._validity, dtype=bool).all())
+    if cp is not None and getattr(owned, "device_state", None) is not None:
+        return _device_scalar_bool(
+            cp.all(cp.asarray(owned._ensure_device_state().validity)),
+            reason="binary constructive all-validity scalar fence",
+        )
+    return bool(np.asarray(owned.validity, dtype=bool).all())
+
+
+def _device_single_family_covering_all_rows(
+    owned: OwnedGeometryArray,
+) -> GeometryFamily | None:
+    """Return the sole device family when its buffer accounts for every row."""
+    if cp is None or getattr(owned, "device_state", None) is None:
+        return None
+    state = owned._ensure_device_state()
+    if len(state.families) != 1:
+        return None
+    family, buffer = next(iter(state.families.items()))
+    if int(buffer.geometry_offsets.size) - 1 != int(owned.row_count):
+        return None
+    return family
+
+
+def _valid_family_tag_pairs(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+) -> list[tuple[int, int]]:
+    left_single_family = _device_single_family_covering_all_rows(left)
+    right_single_family = _device_single_family_covering_all_rows(right)
+    if left_single_family is not None and right_single_family is not None:
+        return [(FAMILY_TAGS[left_single_family], FAMILY_TAGS[right_single_family])]
+
+    if (
+        getattr(left, "device_state", None) is not None
+        and getattr(right, "device_state", None) is not None
+        and len(left._ensure_device_state().families) == 1
+        and len(right._ensure_device_state().families) == 1
+        and _all_rows_valid(left)
+        and _all_rows_valid(right)
+    ):
+        left_family = next(iter(left._ensure_device_state().families))
+        right_family = next(iter(right._ensure_device_state().families))
+        return [(FAMILY_TAGS[left_family], FAMILY_TAGS[right_family])]
+
+    left_validity = _row_validity_array(left)
+    right_validity = _row_validity_array(right)
+    left_tags = _row_tag_array(left)
+    right_tags = _row_tag_array(right)
+    if cp is not None and (
+        hasattr(left_validity, "__cuda_array_interface__")
+        or hasattr(right_validity, "__cuda_array_interface__")
+        or hasattr(left_tags, "__cuda_array_interface__")
+        or hasattr(right_tags, "__cuda_array_interface__")
+    ):
+        left_validity = cp.asarray(left_validity)
+        right_validity = cp.asarray(right_validity)
+        left_tags = cp.asarray(left_tags)
+        right_tags = cp.asarray(right_tags)
+    valid_mask = left_validity & right_validity
+    return unique_tag_pairs(left_tags[valid_mask], right_tags[valid_mask])
+
+
 def _is_polygon_only(owned: OwnedGeometryArray) -> bool:
     """Return True if every family with rows is Polygon or MultiPolygon."""
     return _is_family_only(owned, _POLYGONAL_FAMILIES)
+
+
+def _needs_full_direct_union_validity_scan(owned: OwnedGeometryArray) -> bool:
+    """Return True when full OGC validation is still the right-sized guard."""
+    try:
+        state = owned._ensure_device_state() if owned.device_state is not None else None
+    except Exception:
+        state = None
+
+    ring_count = 0
+    coord_count = 0
+    buffers = state.families.values() if state is not None else owned.families.values()
+    for buf in buffers:
+        if buf.family not in _POLYGONAL_FAMILIES:
+            continue
+        coord_count += int(buf.x.size)
+        ring_offsets = getattr(buf, "ring_offsets", None)
+        if ring_offsets is not None:
+            ring_count += max(int(ring_offsets.size) - 1, 0)
+
+    return (
+        ring_count <= _DIRECT_UNION_FULL_VALIDITY_MAX_RINGS
+        and coord_count <= _DIRECT_UNION_FULL_VALIDITY_MAX_COORDS
+    )
+
+
+def _seed_area_proven_single_row_polygon_union_cache(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    result: OwnedGeometryArray,
+    *,
+    overlap: OwnedGeometryArray | None = None,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> bool:
+    """Seed validity for exact single-row polygon unions with an area proof."""
+    if cp is None:
+        return False
+    if left.row_count != 1 or right.row_count != 1 or result.row_count != 1:
+        return False
+    if not (_all_rows_valid(left) and _all_rows_valid(right) and _all_rows_valid(result)):
+        return False
+    if not _is_polygon_only(result):
+        return False
+
+    try:
+        if overlap is None:
+            from vibespatial.overlay.gpu import (
+                _build_overlay_execution_plan,
+                _materialize_overlay_execution_plan,
+            )
+
+            plan = _build_overlay_execution_plan(
+                left,
+                right,
+                dispatch_mode=dispatch_mode,
+            )
+            try:
+                overlap, _ = _materialize_overlay_execution_plan(
+                    plan,
+                    operation="intersection",
+                    requested=ExecutionMode.GPU,
+                    preserve_row_count=1,
+                )
+            finally:
+                del plan
+        if overlap is None or overlap.row_count != 1:
+            return False
+
+        from vibespatial.constructive.measurement import _area_gpu_device_fp64
+        from vibespatial.constructive.validity import validity_expression_owned
+
+        left_area = _area_gpu_device_fp64(left)[0]
+        right_area = _area_gpu_device_fp64(right)[0]
+        overlap_area = cp.asarray(0.0, dtype=cp.float64)
+        if _all_rows_valid(overlap) and _is_polygon_only(overlap):
+            overlap_area = _area_gpu_device_fp64(overlap)[0]
+        result_area = _area_gpu_device_fp64(result)[0]
+        expected_area = left_area + right_area - overlap_area
+        area_scale = cp.maximum(
+            cp.maximum(cp.abs(expected_area), cp.abs(result_area)),
+            1.0,
+        )
+        area_matches = _device_scalar_bool(
+            (
+                cp.abs(result_area - expected_area)
+                <= (area_scale * 1.0e-8 + 1.0e-6)
+            ),
+            reason="binary constructive single-row union area-proof scalar fence",
+        )
+        if not area_matches:
+            return False
+        if _needs_full_direct_union_validity_scan(result):
+            valid_result = _device_scalar_bool(
+                cp.all(cp.asarray(validity_expression_owned(result).values)),
+                reason="binary constructive single-row union validity-proof scalar fence",
+            )
+            if not valid_result:
+                return False
+        seed_all_validity_cache(result)
+        return True
+    except Exception:
+        logger.debug(
+            "single-row polygon union validity proof failed",
+            exc_info=True,
+        )
+        return False
 
 
 def _resolve_indexed_polygon_fast_path_candidate(
@@ -870,7 +1097,10 @@ def _intersection_point_polygon_gpu(
     else:
         # CPU fallback or no device state: transfer to host.
         if hasattr(pip_mask, "get"):
-            h_pip = pip_mask.get()
+            h_pip = get_cuda_runtime().copy_device_to_host(
+                pip_mask,
+                reason="point-polygon intersection fallback PIP mask export",
+            )
         else:
             h_pip = np.asarray(pip_mask, dtype=bool)
         new_validity = h_pip.astype(bool, copy=False)
@@ -919,7 +1149,10 @@ def _difference_point_polygon_gpu(
     else:
         # CPU fallback or no device state: transfer to host.
         if hasattr(pip_mask, "get"):
-            h_pip = pip_mask.get()
+            h_pip = get_cuda_runtime().copy_device_to_host(
+                pip_mask,
+                reason="point-polygon difference fallback PIP mask export",
+            )
         else:
             h_pip = np.asarray(pip_mask, dtype=bool)
         new_validity = points.validity & ~h_pip
@@ -1075,7 +1308,10 @@ def _expand_right_segments_for_pair_rows(
         if int(d_base_row_indices.size) != int(base_segments.count):
             raise RuntimeError("segment row-index count mismatch")
         if int(d_base_row_indices.size) > 1:
-            monotonic = bool(cp.all(d_base_row_indices[1:] >= d_base_row_indices[:-1]).item())
+            monotonic = _device_scalar_bool(
+                cp.all(d_base_row_indices[1:] >= d_base_row_indices[:-1]),
+                reason="binary constructive right-segment row-order scalar fence",
+            )
             if not monotonic:
                 raise RuntimeError("segment rows are not grouped by right row")
 
@@ -1087,7 +1323,15 @@ def _expand_right_segments_for_pair_rows(
             minlength=group_count,
         ).astype(cp.int64, copy=False)
         d_expanded_counts = d_pair_counts * d_segment_counts
-        total = int(cp.sum(d_expanded_counts).item())
+        d_expanded_offsets = cp.empty(group_count + 1, dtype=cp.int64)
+        d_expanded_offsets[0] = 0
+        cp.cumsum(d_expanded_counts, out=d_expanded_offsets[1:])
+        total = count_scatter_total(
+            get_cuda_runtime(),
+            d_expanded_counts,
+            d_expanded_offsets[:-1],
+            reason="binary constructive expanded right-segment allocation fence",
+        )
         if total == 0:
             return None
 
@@ -1098,10 +1342,6 @@ def _expand_right_segments_for_pair_rows(
         d_segment_offsets = cp.empty(group_count + 1, dtype=cp.int64)
         d_segment_offsets[0] = 0
         cp.cumsum(d_segment_counts, out=d_segment_offsets[1:])
-
-        d_expanded_offsets = cp.empty(group_count + 1, dtype=cp.int64)
-        d_expanded_offsets[0] = 0
-        cp.cumsum(d_expanded_counts, out=d_expanded_offsets[1:])
 
         pair_order = np.argsort(inverse, kind="stable").astype(np.int32, copy=False)
         d_pair_row_ids = cp.asarray(pair_order, dtype=cp.int32)
@@ -1596,20 +1836,28 @@ def _explode_multipolygon_rows_to_polygons_gpu(
     d_family_rows = state.family_row_offsets[d_global_rows].astype(cp.int64, copy=False)
     d_part_counts = (
         buffer.geometry_offsets[d_family_rows + 1] - buffer.geometry_offsets[d_family_rows]
-    ).astype(cp.int32, copy=False)
-    d_nonempty = d_part_counts > 0
-    if not bool(cp.any(d_nonempty)):
+    ).astype(cp.int64, copy=False)
+    d_part_offsets = cp.empty(int(d_part_counts.size) + 1, dtype=cp.int64)
+    d_part_offsets[0] = 0
+    cp.cumsum(d_part_counts, out=d_part_offsets[1:])
+    total_parts = count_scatter_total(
+        get_cuda_runtime(),
+        d_part_counts,
+        d_part_offsets[:-1],
+        reason="constructive multipolygon part-count allocation fence",
+    )
+    if total_parts == 0:
         return _empty_device_constructive_output(0), cp.empty(0, dtype=cp.int64)
 
+    d_nonempty = d_part_counts > 0
     d_global_rows = d_global_rows[d_nonempty]
     d_family_rows = d_family_rows[d_nonempty]
     d_part_counts = d_part_counts[d_nonempty]
 
-    total_parts = int(d_part_counts.sum())
     d_part_starts = buffer.geometry_offsets[d_family_rows].astype(cp.int64, copy=False)
     d_part_offsets = cp.empty(int(d_part_counts.size) + 1, dtype=cp.int64)
     d_part_offsets[0] = 0
-    cp.cumsum(d_part_counts.astype(cp.int64, copy=False), out=d_part_offsets[1:])
+    cp.cumsum(d_part_counts, out=d_part_offsets[1:])
     d_positions = cp.arange(total_parts, dtype=cp.int64)
     d_segment_ids = cp.searchsorted(d_part_offsets, d_positions, side="right") - 1
     d_source_rows = d_global_rows[d_segment_ids]
@@ -1658,6 +1906,238 @@ def _explode_multipolygon_rows_to_polygons_gpu(
         execution_mode="gpu",
     )
     return exploded, d_source_rows
+
+
+def _explode_multipoint_rows_to_points_gpu(
+    owned: OwnedGeometryArray,
+) -> tuple[OwnedGeometryArray, DeviceArray]:
+    """Explode device-resident multipoint rows into point rows on GPU."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        raise RuntimeError("CuPy is required for multipoint explosion")
+
+    state = owned._ensure_device_state()
+    multipoint_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
+    d_global_rows = cp.flatnonzero(
+        state.validity & (state.tags == multipoint_tag)
+    ).astype(cp.int64, copy=False)
+    if int(d_global_rows.size) == 0:
+        return _empty_device_constructive_output(0), cp.empty(0, dtype=cp.int64)
+
+    buffer = state.families.get(GeometryFamily.MULTIPOINT)
+    if buffer is None:
+        return _empty_device_constructive_output(0), cp.empty(0, dtype=cp.int64)
+
+    d_family_rows = state.family_row_offsets[d_global_rows].astype(cp.int64, copy=False)
+    d_part_counts = (
+        buffer.geometry_offsets[d_family_rows + 1] - buffer.geometry_offsets[d_family_rows]
+    ).astype(cp.int64, copy=False)
+    d_part_offsets = cp.empty(int(d_part_counts.size) + 1, dtype=cp.int64)
+    d_part_offsets[0] = 0
+    cp.cumsum(d_part_counts, out=d_part_offsets[1:])
+    total_parts = count_scatter_total(
+        get_cuda_runtime(),
+        d_part_counts,
+        d_part_offsets[:-1],
+        reason="constructive multipoint point-count allocation fence",
+    )
+    if total_parts == 0:
+        return _empty_device_constructive_output(0), cp.empty(0, dtype=cp.int64)
+
+    d_nonempty = d_part_counts > 0
+    d_global_rows = d_global_rows[d_nonempty]
+    d_family_rows = d_family_rows[d_nonempty]
+    d_part_counts = d_part_counts[d_nonempty]
+
+    d_part_starts = buffer.geometry_offsets[d_family_rows].astype(cp.int64, copy=False)
+    d_part_offsets = cp.empty(int(d_part_counts.size) + 1, dtype=cp.int64)
+    d_part_offsets[0] = 0
+    cp.cumsum(d_part_counts, out=d_part_offsets[1:])
+    d_positions = cp.arange(total_parts, dtype=cp.int64)
+    d_segment_ids = cp.searchsorted(d_part_offsets, d_positions, side="right") - 1
+    d_source_rows = d_global_rows[d_segment_ids]
+    d_coord_indices = (
+        d_positions
+        - d_part_offsets[d_segment_ids]
+        + d_part_starts[d_segment_ids]
+    ).astype(cp.int64, copy=False)
+
+    point_buffer = DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.POINT,
+        x=buffer.x[d_coord_indices].copy(),
+        y=buffer.y[d_coord_indices].copy(),
+        geometry_offsets=cp.arange(total_parts + 1, dtype=cp.int32),
+        empty_mask=cp.zeros(total_parts, dtype=cp.bool_),
+        bounds=None,
+    )
+    exploded = build_device_resident_owned(
+        device_families={GeometryFamily.POINT: point_buffer},
+        row_count=total_parts,
+        tags=cp.full(total_parts, FAMILY_TAGS[GeometryFamily.POINT], dtype=cp.int8),
+        validity=cp.ones(total_parts, dtype=cp.bool_),
+        family_row_offsets=cp.arange(total_parts, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+    return exploded, d_source_rows
+
+
+def point_parts_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict | None = None,
+):
+    """Lower point part expansion to a non-row-aligned native result."""
+    from vibespatial.api._native_results import (
+        _point_parts_constructive_to_native_tabular_result,
+    )
+
+    return _point_parts_constructive_to_native_tabular_result(
+        owned,
+        operation="point_parts",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )
+
+
+def polygonal_parts_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict | None = None,
+):
+    """Lower polygonal part expansion to a non-row-aligned native result."""
+    from vibespatial.api._native_results import (
+        _polygonal_parts_constructive_to_native_tabular_result,
+    )
+
+    return _polygonal_parts_constructive_to_native_tabular_result(
+        owned,
+        operation="polygonal_parts",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )
+
+
+def _explode_multilinestring_rows_to_lines_gpu(
+    owned: OwnedGeometryArray,
+) -> tuple[OwnedGeometryArray, DeviceArray]:
+    """Explode device-resident multilinestring rows into linestring rows on GPU."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        raise RuntimeError("CuPy is required for multilinestring explosion")
+
+    state = owned._ensure_device_state()
+    multilinestring_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
+    d_global_rows = cp.flatnonzero(
+        state.validity & (state.tags == multilinestring_tag)
+    ).astype(cp.int64, copy=False)
+    if int(d_global_rows.size) == 0:
+        return _empty_device_constructive_output(0), cp.empty(0, dtype=cp.int64)
+
+    buffer = state.families.get(GeometryFamily.MULTILINESTRING)
+    if buffer is None or buffer.part_offsets is None:
+        return _empty_device_constructive_output(0), cp.empty(0, dtype=cp.int64)
+
+    d_family_rows = state.family_row_offsets[d_global_rows].astype(cp.int64, copy=False)
+    d_part_counts = (
+        buffer.geometry_offsets[d_family_rows + 1] - buffer.geometry_offsets[d_family_rows]
+    ).astype(cp.int64, copy=False)
+    d_part_offsets = cp.empty(int(d_part_counts.size) + 1, dtype=cp.int64)
+    d_part_offsets[0] = 0
+    cp.cumsum(d_part_counts, out=d_part_offsets[1:])
+    total_parts = count_scatter_total(
+        get_cuda_runtime(),
+        d_part_counts,
+        d_part_offsets[:-1],
+        reason="constructive multilinestring part-count allocation fence",
+    )
+    if total_parts == 0:
+        return _empty_device_constructive_output(0), cp.empty(0, dtype=cp.int64)
+
+    d_nonempty = d_part_counts > 0
+    d_global_rows = d_global_rows[d_nonempty]
+    d_family_rows = d_family_rows[d_nonempty]
+    d_part_counts = d_part_counts[d_nonempty]
+
+    d_part_starts = buffer.geometry_offsets[d_family_rows].astype(cp.int64, copy=False)
+    d_part_offsets = cp.empty(int(d_part_counts.size) + 1, dtype=cp.int64)
+    d_part_offsets[0] = 0
+    cp.cumsum(d_part_counts, out=d_part_offsets[1:])
+    d_positions = cp.arange(total_parts, dtype=cp.int64)
+    d_segment_ids = cp.searchsorted(d_part_offsets, d_positions, side="right") - 1
+    d_source_rows = d_global_rows[d_segment_ids]
+    d_part_indices = (
+        d_positions
+        - d_part_offsets[d_segment_ids]
+        + d_part_starts[d_segment_ids]
+    ).astype(cp.int64, copy=False)
+
+    d_coords = (
+        cp.column_stack([buffer.x, buffer.y])
+        if int(buffer.x.size) > 0
+        else cp.empty((0, 2), dtype=cp.float64)
+    )
+    d_gathered, d_geom_offsets = _device_gather_offset_slices(
+        d_coords,
+        buffer.part_offsets,
+        d_part_indices,
+    )
+    d_x = d_gathered[:, 0].copy() if int(d_gathered.size) else cp.empty(0, dtype=cp.float64)
+    d_y = d_gathered[:, 1].copy() if int(d_gathered.size) else cp.empty(0, dtype=cp.float64)
+
+    line_buffer = DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.LINESTRING,
+        x=d_x,
+        y=d_y,
+        geometry_offsets=d_geom_offsets,
+        empty_mask=cp.zeros(total_parts, dtype=cp.bool_),
+        bounds=None,
+    )
+    exploded = build_device_resident_owned(
+        device_families={GeometryFamily.LINESTRING: line_buffer},
+        row_count=total_parts,
+        tags=cp.full(total_parts, FAMILY_TAGS[GeometryFamily.LINESTRING], dtype=cp.int8),
+        validity=cp.ones(total_parts, dtype=cp.bool_),
+        family_row_offsets=cp.arange(total_parts, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+    return exploded, d_source_rows
+
+
+def lineal_parts_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict | None = None,
+):
+    """Lower lineal part expansion to a non-row-aligned native result."""
+    from vibespatial.api._native_results import (
+        _lineal_parts_constructive_to_native_tabular_result,
+    )
+
+    return _lineal_parts_constructive_to_native_tabular_result(
+        owned,
+        operation="lineal_parts",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )
 
 
 def _dispatch_multipolygon_polygon_intersection_gpu(
@@ -1891,7 +2371,13 @@ def _regroup_intersection_parts_with_grouped_union_gpu(
             cp.cumsum(d_group_counts, out=d_group_offsets[1:])
             _sync_hotpath()
             with hotpath_stage("constructive.intersection.multipart_union.fallback", category="refine"):
-                compact = segmented_union_all(valid_parts, cp.asnumpy(d_group_offsets))
+                compact = segmented_union_all(
+                    valid_parts,
+                    get_cuda_runtime().copy_device_to_host(
+                        d_group_offsets,
+                        reason="binary constructive multipart-union group-offset host export",
+                    ),
+                )
             _sync_hotpath()
 
     if compact is None or compact.row_count != int(d_nonempty_rows.size):
@@ -2099,7 +2585,10 @@ def _sorted_polygon_parts_have_strictly_disjoint_group_bounds(
 
     d_pair_i, d_pair_j = cp.triu_indices(part_count, k=1)
     d_same_source = d_sorted_source_rows[d_pair_i] == d_sorted_source_rows[d_pair_j]
-    if not bool(cp.any(d_same_source)):
+    if not _device_scalar_bool(
+        cp.any(d_same_source),
+        reason="binary constructive multipart disjoint source-pair scalar fence",
+    ):
         return True
 
     d_bounds = cp.asarray(compute_geometry_bounds_device(sorted_parts), dtype=cp.float64)
@@ -2111,7 +2600,11 @@ def _sorted_polygon_parts_have_strictly_disjoint_group_bounds(
         | (d_left[:, 3] < d_right[:, 1])
         | (d_right[:, 3] < d_left[:, 1])
     )
-    return not bool(cp.any(d_same_source & ~d_strictly_separated))
+    has_overlap = _device_scalar_bool(
+        cp.any(d_same_source & ~d_strictly_separated),
+        reason="binary constructive multipart disjoint overlap scalar fence",
+    )
+    return not has_overlap
 
 
 def _device_take_polygon_family_rows(
@@ -2328,11 +2821,21 @@ def _explode_polygonal_rows_to_polygons_gpu(
     source_rows: list[DeviceArray] = []
 
     if int(valid_polygon_rows.size) > 0:
-        polygon_parts.append(owned.take(valid_polygon_rows))
+        polygon_parts.append(
+            _device_take_known_family_rows(
+                owned,
+                valid_polygon_rows,
+                GeometryFamily.POLYGON,
+            )
+        )
         source_rows.append(valid_polygon_rows.astype(cp.int32, copy=False))
 
     if int(valid_multipolygon_rows.size) > 0:
-        multipolygon_rows = owned.take(valid_multipolygon_rows)
+        multipolygon_rows = _device_take_known_family_rows(
+            owned,
+            valid_multipolygon_rows,
+            GeometryFamily.MULTIPOLYGON,
+        )
         exploded, local_source_rows = _explode_multipolygon_rows_to_polygons_gpu(
             multipolygon_rows,
         )
@@ -2351,6 +2854,151 @@ def _explode_polygonal_rows_to_polygons_gpu(
     return OwnedGeometryArray.concat(polygon_parts), cp.concatenate(source_rows)
 
 
+def _explode_point_rows_to_points_gpu(
+    owned: OwnedGeometryArray,
+) -> tuple[OwnedGeometryArray, DeviceArray] | None:
+    """Explode point-family rows to point rows and keep source row ids."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    state = owned._ensure_device_state()
+    point_tag = FAMILY_TAGS[GeometryFamily.POINT]
+    multipoint_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
+    valid_point_rows = cp.flatnonzero(
+        state.validity & (state.tags == point_tag)
+    ).astype(cp.int64, copy=False)
+    valid_multipoint_rows = cp.flatnonzero(
+        state.validity & (state.tags == multipoint_tag)
+    ).astype(cp.int64, copy=False)
+
+    point_parts: list[OwnedGeometryArray] = []
+    source_rows: list[DeviceArray] = []
+
+    if int(valid_point_rows.size) > 0:
+        point_parts.append(
+            _device_take_known_family_rows(
+                owned,
+                valid_point_rows,
+                GeometryFamily.POINT,
+            )
+        )
+        source_rows.append(valid_point_rows.astype(cp.int32, copy=False))
+
+    if int(valid_multipoint_rows.size) > 0:
+        multipoint_rows = _device_take_known_family_rows(
+            owned,
+            valid_multipoint_rows,
+            GeometryFamily.MULTIPOINT,
+        )
+        exploded, local_source_rows = _explode_multipoint_rows_to_points_gpu(
+            multipoint_rows,
+        )
+        if exploded.row_count > 0:
+            point_parts.append(exploded)
+            source_rows.append(
+                valid_multipoint_rows[
+                    cp.asarray(local_source_rows, dtype=cp.int64)
+                ].astype(cp.int32, copy=False)
+            )
+
+    if not point_parts:
+        return None
+    if len(point_parts) == 1:
+        return point_parts[0], source_rows[0]
+    return OwnedGeometryArray.concat(point_parts), cp.concatenate(source_rows)
+
+
+def _explode_lineal_rows_to_lines_gpu(
+    owned: OwnedGeometryArray,
+) -> tuple[OwnedGeometryArray, DeviceArray] | None:
+    """Explode line-family rows to linestring rows and keep source row ids."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    state = owned._ensure_device_state()
+    linestring_tag = FAMILY_TAGS[GeometryFamily.LINESTRING]
+    multilinestring_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
+    valid_linestring_rows = cp.flatnonzero(
+        state.validity & (state.tags == linestring_tag)
+    ).astype(cp.int64, copy=False)
+    valid_multilinestring_rows = cp.flatnonzero(
+        state.validity & (state.tags == multilinestring_tag)
+    ).astype(cp.int64, copy=False)
+
+    line_parts: list[OwnedGeometryArray] = []
+    source_rows: list[DeviceArray] = []
+
+    if int(valid_linestring_rows.size) > 0:
+        line_parts.append(
+            _device_take_known_family_rows(
+                owned,
+                valid_linestring_rows,
+                GeometryFamily.LINESTRING,
+            )
+        )
+        source_rows.append(valid_linestring_rows.astype(cp.int32, copy=False))
+
+    if int(valid_multilinestring_rows.size) > 0:
+        multilinestring_rows = _device_take_known_family_rows(
+            owned,
+            valid_multilinestring_rows,
+            GeometryFamily.MULTILINESTRING,
+        )
+        exploded, local_source_rows = _explode_multilinestring_rows_to_lines_gpu(
+            multilinestring_rows,
+        )
+        if exploded.row_count > 0:
+            line_parts.append(exploded)
+            source_rows.append(
+                valid_multilinestring_rows[
+                    cp.asarray(local_source_rows, dtype=cp.int64)
+                ].astype(cp.int32, copy=False)
+            )
+
+    if not line_parts:
+        return None
+    if len(line_parts) == 1:
+        return line_parts[0], source_rows[0]
+    return OwnedGeometryArray.concat(line_parts), cp.concatenate(source_rows)
+
+
+def _device_take_known_family_rows(
+    owned: OwnedGeometryArray,
+    rows: DeviceArray,
+    family: GeometryFamily,
+) -> OwnedGeometryArray:
+    """Take device rows whose family tag has already been proven on device."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        raise RuntimeError("CuPy is required for device family-row takes")
+    if owned.device_state is None:
+        return owned.take(rows)
+    if family not in owned.device_state.families:
+        return _empty_device_constructive_output(0)
+
+    rows = cp.asarray(rows, dtype=cp.int64)
+    row_count = int(rows.size)
+    if row_count == 0:
+        return _empty_device_constructive_output(0)
+
+    device_family = owned.device_state.families[family]
+    source_family_rows = owned.device_state.family_row_offsets[rows].astype(
+        cp.int64,
+        copy=False,
+    )
+    taken_family = _device_take_family_buffer(
+        device_family,
+        family,
+        source_family_rows,
+        owned.families.get(family),
+    )
+    return build_device_resident_owned(
+        device_families={family: taken_family},
+        row_count=row_count,
+        tags=cp.full(row_count, FAMILY_TAGS[family], dtype=cp.int8),
+        validity=cp.ones(row_count, dtype=cp.bool_),
+        family_row_offsets=cp.arange(row_count, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+
+
 def _dispatch_row_aligned_polygon_known_coverage_union_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
@@ -2362,10 +3010,7 @@ def _dispatch_row_aligned_polygon_known_coverage_union_gpu(
         return None
     if left.row_count != right.row_count or left.row_count == 0:
         return None
-    if not (
-        bool(cp.all(left._ensure_device_state().validity).item())
-        and bool(cp.all(right._ensure_device_state().validity).item())
-    ):
+    if not (_all_rows_valid(left) and _all_rows_valid(right)):
         return None
 
     from vibespatial.overlay.assemble import _build_polygon_output_from_faces_gpu
@@ -2407,13 +3052,18 @@ def _dispatch_row_aligned_polygon_known_coverage_union_gpu(
 
     d_ring_sizes = d_ring_offsets[1:] - d_ring_offsets[:-1]
     d_seg_counts = cp.maximum(d_ring_sizes - 1, 0).astype(cp.int64, copy=False)
-    total_segments = int(cp.sum(d_seg_counts).item())
-    if total_segments == 0:
-        return None
-
     d_seg_offsets = cp.empty(int(d_seg_counts.size) + 1, dtype=cp.int64)
     d_seg_offsets[0] = 0
     cp.cumsum(d_seg_counts, out=d_seg_offsets[1:])
+    total_segments = count_scatter_total(
+        get_cuda_runtime(),
+        d_seg_counts,
+        d_seg_offsets[:-1],
+        reason="binary constructive row-aligned coverage segment allocation fence",
+    )
+    if total_segments == 0:
+        return None
+
     d_seg_ids = cp.arange(total_segments, dtype=cp.int64)
     d_ring_of_seg = cp.searchsorted(
         d_seg_offsets[1:],
@@ -2539,6 +3189,246 @@ def _dispatch_row_aligned_polygon_known_coverage_union_gpu(
     return result
 
 
+def _dispatch_grouped_polygon_known_coverage_union_gpu(
+    owned: OwnedGeometryArray,
+    source_rows,
+    *,
+    output_row_count: int,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+    assume_all_valid: bool = False,
+    assume_source_rows_valid: bool = False,
+    total_segments_hint: int | None = None,
+) -> OwnedGeometryArray | None:
+    """Coverage-union polygon rows by device source group.
+
+    Physical shape: polygon rings -> undirected boundary segments -> grouped
+    half-edge face assembly.  This is the n-ary/grouped coverage analogue of
+    the row-aligned known-coverage union path above; the public dissolve row is
+    not the work unit.
+    """
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    if output_row_count < 0 or owned.row_count == 0:
+        return None
+
+    d_source_rows = cp.asarray(source_rows, dtype=cp.int32)
+    if int(d_source_rows.size) != owned.row_count:
+        return None
+
+    state = owned._ensure_device_state()
+    valid_count = (
+        int(owned.row_count)
+        if assume_all_valid
+        else int(
+            np.asarray(
+                get_cuda_runtime().copy_device_to_host(
+                    cp.count_nonzero(state.validity),
+                    reason="grouped polygon coverage-union validity-count fence",
+                )
+            ).reshape(-1)[0]
+        )
+    )
+    if valid_count != owned.row_count:
+        return None
+
+    exploded = _explode_polygonal_rows_to_polygons_gpu(owned)
+    if exploded is None:
+        return None
+    polygons, local_source_rows = exploded
+    if polygons.row_count == 0:
+        return None
+
+    polygon_source_rows = d_source_rows[
+        cp.asarray(local_source_rows, dtype=cp.int64)
+    ].astype(cp.int32, copy=False)
+    if not assume_source_rows_valid:
+        valid_group_mask = (
+            (polygon_source_rows >= 0)
+            & (polygon_source_rows < np.int32(output_row_count))
+        )
+        valid_group_count = int(
+            np.asarray(
+                get_cuda_runtime().copy_device_to_host(
+                    cp.count_nonzero(valid_group_mask),
+                    reason="grouped polygon coverage-union valid-group count fence",
+                )
+            ).reshape(-1)[0]
+        )
+        if valid_group_count == 0:
+            return None
+        if valid_group_count != polygons.row_count:
+            keep = cp.flatnonzero(valid_group_mask).astype(cp.int64, copy=False)
+            polygons = polygons.take(keep)
+            polygon_source_rows = polygon_source_rows[keep]
+
+    polygon_state = polygons._ensure_device_state()
+    polygon_buffer = polygon_state.families.get(GeometryFamily.POLYGON)
+    if polygon_buffer is None:
+        return None
+
+    d_x = cp.asarray(polygon_buffer.x)
+    d_y = cp.asarray(polygon_buffer.y)
+    d_geometry_offsets = cp.asarray(polygon_buffer.geometry_offsets, dtype=cp.int64)
+    d_ring_offsets = cp.asarray(polygon_buffer.ring_offsets, dtype=cp.int64)
+    if int(d_geometry_offsets.size) < 2 or int(d_ring_offsets.size) < 2 or int(d_x.size) < 2:
+        return None
+
+    d_ring_sizes = d_ring_offsets[1:] - d_ring_offsets[:-1]
+    d_seg_counts = cp.maximum(d_ring_sizes - 1, 0).astype(cp.int64, copy=False)
+    total_segments = (
+        int(total_segments_hint)
+        if total_segments_hint is not None
+        else int(
+            np.asarray(
+                get_cuda_runtime().copy_device_to_host(
+                    cp.sum(d_seg_counts),
+                    reason="grouped polygon coverage-union segment-count fence",
+                )
+            ).reshape(-1)[0]
+        )
+    )
+    if total_segments == 0:
+        return None
+
+    d_seg_offsets = cp.empty(int(d_seg_counts.size) + 1, dtype=cp.int64)
+    d_seg_offsets[0] = 0
+    cp.cumsum(d_seg_counts, out=d_seg_offsets[1:])
+    d_seg_ids = cp.arange(total_segments, dtype=cp.int64)
+    d_ring_of_seg = cp.searchsorted(
+        d_seg_offsets[1:],
+        d_seg_ids,
+        side="right",
+    ).astype(cp.int64, copy=False)
+    d_polygon_of_ring = cp.searchsorted(
+        d_geometry_offsets[1:],
+        d_ring_of_seg,
+        side="right",
+    ).astype(cp.int64, copy=False)
+    d_segment_rows = polygon_source_rows[d_polygon_of_ring]
+    d_local_seg = d_seg_ids - d_seg_offsets[d_ring_of_seg]
+    d_vertex_ids = d_ring_offsets[d_ring_of_seg] + d_local_seg
+
+    start_x = d_x[d_vertex_ids]
+    start_y = d_y[d_vertex_ids]
+    end_x = d_x[d_vertex_ids + 1]
+    end_y = d_y[d_vertex_ids + 1]
+
+    swap = (
+        (start_x > end_x)
+        | ((start_x == end_x) & (start_y > end_y))
+    )
+    key_x0 = cp.where(swap, end_x, start_x)
+    key_y0 = cp.where(swap, end_y, start_y)
+    key_x1 = cp.where(swap, start_x, end_x)
+    key_y1 = cp.where(swap, start_y, end_y)
+
+    order = cp.lexsort(
+        cp.stack((key_y1, key_x1, key_y0, key_x0, d_segment_rows))
+    ).astype(cp.int64, copy=False)
+    if int(order.size) == 0:
+        return None
+    sorted_rows = d_segment_rows[order]
+    sorted_x0 = key_x0[order]
+    sorted_y0 = key_y0[order]
+    sorted_x1 = key_x1[order]
+    sorted_y1 = key_y1[order]
+    start_mask = cp.empty(int(order.size), dtype=cp.bool_)
+    start_mask[0] = True
+    if int(order.size) > 1:
+        start_mask[1:] = (
+            (sorted_rows[1:] != sorted_rows[:-1])
+            | (sorted_x0[1:] != sorted_x0[:-1])
+            | (sorted_y0[1:] != sorted_y0[:-1])
+            | (sorted_x1[1:] != sorted_x1[:-1])
+            | (sorted_y1[1:] != sorted_y1[:-1])
+        )
+    run_starts = cp.flatnonzero(start_mask).astype(cp.int64, copy=False)
+    run_lengths = cp.diff(
+        cp.concatenate((run_starts, cp.asarray([int(order.size)], dtype=cp.int64)))
+    )
+    boundary_orders = order[run_starts[run_lengths % 2 == 1]]
+    if int(boundary_orders.size) == 0:
+        return None
+
+    selection = plan_dispatch_selection(
+        kernel_name="binary_constructive",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=output_row_count,
+        requested_mode=dispatch_mode,
+        requested_precision=PrecisionMode.AUTO,
+        current_residency=combined_residency(owned),
+    )
+
+    from vibespatial.overlay.assemble import _build_polygon_output_from_faces_gpu
+    from vibespatial.overlay.graph import _gpu_face_walk, build_gpu_half_edge_graph
+    from vibespatial.overlay.types import OverlayFaceDeviceState, OverlayFaceTable
+
+    atomic_edges = _build_atomic_edges_from_boundary_segments_gpu(
+        start_x[boundary_orders],
+        start_y[boundary_orders],
+        end_x[boundary_orders],
+        end_y[boundary_orders],
+        row_indices=d_segment_rows[boundary_orders],
+        runtime_selection=selection.runtime_selection,
+    )
+    if atomic_edges is None:
+        return None
+
+    half_edge_graph = build_gpu_half_edge_graph(atomic_edges, isolate_rows=True)
+    if half_edge_graph.edge_count == 0:
+        return None
+
+    (
+        face_offsets,
+        face_edge_ids,
+        bounded_mask,
+        signed_area,
+        centroid_x,
+        centroid_y,
+        label_x,
+        label_y,
+        face_count,
+    ) = _gpu_face_walk(half_edge_graph)
+    if face_count == 0:
+        return None
+
+    selected_face_indices = cp.flatnonzero(
+        (bounded_mask != 0) & (signed_area > 0)
+    ).astype(cp.int32, copy=False)
+    faces = OverlayFaceTable(
+        runtime_selection=selection.runtime_selection,
+        _face_count=face_count,
+        device_state=OverlayFaceDeviceState(
+            face_offsets=face_offsets,
+            face_edge_ids=face_edge_ids,
+            bounded_mask=bounded_mask,
+            signed_area=signed_area,
+            centroid_x=centroid_x,
+            centroid_y=centroid_y,
+            left_covered=cp.ones(face_count, dtype=cp.int8),
+            right_covered=cp.zeros(face_count, dtype=cp.int8),
+        ),
+    )
+    result = _build_polygon_output_from_faces_gpu(
+        half_edge_graph,
+        faces,
+        selected_face_indices,
+        preserve_row_count=output_row_count,
+    )
+    if result is None or result.row_count != output_row_count:
+        return None
+    record_dispatch_event(
+        surface="constructive.grouped_polygon_coverage_union",
+        operation="grouped_coverage_union",
+        implementation="gpu_grouped_boundary_edge_face_assembly",
+        reason="grouped coverage union eliminated shared edges by source group on device",
+        detail=f"rows={owned.row_count}, groups={output_row_count}",
+        requested=dispatch_mode,
+        selected=ExecutionMode.GPU,
+    )
+    return result
+
+
 def _dispatch_single_row_polygon_known_coverage_union_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
@@ -2550,7 +3440,7 @@ def _dispatch_single_row_polygon_known_coverage_union_gpu(
         return None
     if left.row_count != right.row_count or left.row_count != 1:
         return None
-    if not (bool(left.validity[0]) and bool(right.validity[0])):
+    if not (_row_is_valid(left, 0) and _row_is_valid(right, 0)):
         return None
 
     from vibespatial.overlay.assemble import _build_polygon_output_from_faces_gpu
@@ -2586,13 +3476,18 @@ def _dispatch_single_row_polygon_known_coverage_union_gpu(
 
     d_ring_sizes = d_ring_offsets[1:] - d_ring_offsets[:-1]
     d_seg_counts = cp.maximum(d_ring_sizes - 1, 0).astype(cp.int64, copy=False)
-    total_segments = int(cp.sum(d_seg_counts).item())
-    if total_segments == 0:
-        return None
-
     d_seg_offsets = cp.empty(int(d_seg_counts.size) + 1, dtype=cp.int64)
     d_seg_offsets[0] = 0
     cp.cumsum(d_seg_counts, out=d_seg_offsets[1:])
+    total_segments = count_scatter_total(
+        get_cuda_runtime(),
+        d_seg_counts,
+        d_seg_offsets[:-1],
+        reason="binary constructive single-row coverage segment allocation fence",
+    )
+    if total_segments == 0:
+        return None
+
     d_seg_ids = cp.arange(total_segments, dtype=cp.int64)
     d_ring_of_seg = cp.searchsorted(
         d_seg_offsets[1:],
@@ -2727,7 +3622,7 @@ def _dispatch_single_row_polygon_partition_union_gpu(
         return None
     if left.row_count != right.row_count or left.row_count != 1:
         return None
-    if not (bool(left.validity[0]) and bool(right.validity[0])):
+    if not (_row_is_valid(left, 0) and _row_is_valid(right, 0)):
         return None
 
     from vibespatial.overlay.gpu import (
@@ -2752,7 +3647,7 @@ def _dispatch_single_row_polygon_partition_union_gpu(
             if (
                 direct_union.row_count == 1
                 and _is_polygon_only(direct_union)
-                and bool(np.asarray(direct_union.validity, dtype=bool).all())
+                and _all_rows_valid(direct_union)
             ):
                 overlap, _ = _materialize_overlay_execution_plan(
                     plan,
@@ -2760,26 +3655,13 @@ def _dispatch_single_row_polygon_partition_union_gpu(
                     requested=ExecutionMode.GPU,
                     preserve_row_count=1,
                 )
-                from vibespatial.constructive.measurement import _area_gpu_device_fp64
-                from vibespatial.constructive.validity import is_valid_owned
-
-                left_area = _area_gpu_device_fp64(left)[0]
-                right_area = _area_gpu_device_fp64(right)[0]
-                overlap_area = _area_gpu_device_fp64(overlap)[0]
-                direct_area = _area_gpu_device_fp64(direct_union)[0]
-                expected_area = left_area + right_area - overlap_area
-                area_scale = cp.maximum(cp.maximum(cp.abs(expected_area), cp.abs(direct_area)), 1.0)
-                area_matches = bool(
-                    (
-                        cp.abs(direct_area - expected_area)
-                        <= (area_scale * 1.0e-8 + 1.0e-6)
-                    ).item()
-                )
-                valid_direct = is_valid_owned(
+                if _seed_area_proven_single_row_polygon_union_cache(
+                    left,
+                    right,
                     direct_union,
-                    dispatch_mode=ExecutionMode.GPU,
-                )
-                if area_matches and bool(np.asarray(valid_direct, dtype=bool).all()):
+                    overlap=overlap,
+                    dispatch_mode=dispatch_mode,
+                ):
                     return direct_union
         except Exception:
             logger.debug(
@@ -2817,13 +3699,15 @@ def _dispatch_single_row_polygon_partition_union_gpu(
     ):
         return None
 
-    piece_candidates = [piece for piece in (left_only, overlap, right_only) if bool(piece.validity[0])]
+    piece_candidates = [
+        piece for piece in (left_only, overlap, right_only) if _row_is_valid(piece, 0)
+    ]
     if not piece_candidates:
         dominant_rescue = _dominant_tiny_area_polygon_union_rows_gpu(
             left,
             right,
         )
-        if dominant_rescue is not None and bool(dominant_rescue.validity[0]):
+        if dominant_rescue is not None and _row_is_valid(dominant_rescue, 0):
             record_dispatch_event(
                 surface="geopandas.array.union",
                 operation="union",
@@ -2839,7 +3723,18 @@ def _dispatch_single_row_polygon_partition_union_gpu(
             return dominant_rescue
         return None
     if len(piece_candidates) == 1:
-        return piece_candidates[0]
+        merged = piece_candidates[0]
+        if not _is_polygon_only(merged):
+            return None
+        if _seed_area_proven_single_row_polygon_union_cache(
+            left,
+            right,
+            merged,
+            overlap=overlap,
+            dispatch_mode=dispatch_mode,
+        ):
+            return merged
+        return None
 
     if not all(_is_polygon_only(piece) for piece in piece_candidates):
         return None
@@ -2853,18 +3748,26 @@ def _dispatch_single_row_polygon_partition_union_gpu(
         )
         if merged is None or merged.row_count != 1:
             return None
-        if not bool(merged.validity[0]):
+        if not _row_is_valid(merged, 0):
             dominant_rescue = _dominant_tiny_area_polygon_union_rows_gpu(
                 left,
                 right,
             )
-            if dominant_rescue is not None and bool(dominant_rescue.validity[0]):
+            if dominant_rescue is not None and _row_is_valid(dominant_rescue, 0):
                 return dominant_rescue
             return None
         if not _is_polygon_only(merged):
             return None
 
-    return merged
+    if _seed_area_proven_single_row_polygon_union_cache(
+        left,
+        right,
+        merged,
+        overlap=overlap,
+        dispatch_mode=dispatch_mode,
+    ):
+        return merged
+    return None
 
 
 def _dispatch_single_row_polygon_union_gpu(
@@ -2917,6 +3820,13 @@ def _dispatch_polygon_union_repair_gpu(
             dispatch_mode=dispatch_mode,
         )
         if batched is not None and batched.row_count == left.row_count:
+            if left.row_count == 1:
+                _seed_area_proven_single_row_polygon_union_cache(
+                    left,
+                    right,
+                    batched,
+                    dispatch_mode=dispatch_mode,
+                )
             return batched
     except Exception:
         logger.debug(
@@ -2953,34 +3863,36 @@ def _merge_row_aligned_polygon_piece_batches_gpu(
     if left_piece.row_count != right_piece.row_count:
         return None
 
-    left_valid = np.asarray(left_piece.validity, dtype=bool)
-    right_valid = np.asarray(right_piece.validity, dtype=bool)
+    left_state = left_piece._ensure_device_state()
+    right_state = right_piece._ensure_device_state()
+    left_valid = cp.asarray(left_state.validity).astype(cp.bool_, copy=False)
+    right_valid = cp.asarray(right_state.validity).astype(cp.bool_, copy=False)
     out = _empty_device_constructive_output(left_piece.row_count)
 
-    both_rows = np.flatnonzero(left_valid & right_valid).astype(np.int64, copy=False)
-    left_only_rows = np.flatnonzero(left_valid & ~right_valid).astype(np.int64, copy=False)
-    right_only_rows = np.flatnonzero(~left_valid & right_valid).astype(np.int64, copy=False)
+    both_rows = cp.flatnonzero(left_valid & right_valid).astype(cp.int64, copy=False)
+    left_only_rows = cp.flatnonzero(left_valid & ~right_valid).astype(cp.int64, copy=False)
+    right_only_rows = cp.flatnonzero(~left_valid & right_valid).astype(cp.int64, copy=False)
 
-    if both_rows.size > 0:
+    if int(both_rows.size) > 0:
         merged = _dispatch_row_aligned_polygon_known_coverage_union_gpu(
             left_piece.take(both_rows),
             right_piece.take(both_rows),
             dispatch_mode=dispatch_mode,
         )
-        if merged is None or merged.row_count != both_rows.size:
+        if merged is None or merged.row_count != int(both_rows.size):
             return None
-        out = device_concat_owned_scatter(out, merged, cp.asarray(both_rows, dtype=cp.int64))
-    if left_only_rows.size > 0:
+        out = device_concat_owned_scatter(out, merged, both_rows)
+    if int(left_only_rows.size) > 0:
         out = device_concat_owned_scatter(
             out,
             left_piece.take(left_only_rows),
-            cp.asarray(left_only_rows, dtype=cp.int64),
+            left_only_rows,
         )
-    if right_only_rows.size > 0:
+    if int(right_only_rows.size) > 0:
         out = device_concat_owned_scatter(
             out,
             right_piece.take(right_only_rows),
-            cp.asarray(right_only_rows, dtype=cp.int64),
+            right_only_rows,
         )
     return out
 
@@ -2988,20 +3900,47 @@ def _merge_row_aligned_polygon_piece_batches_gpu(
 def _dispatch_exact_rowwise_polygon_union_rows_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
-    row_indices: np.ndarray,
+    row_indices: np.ndarray | DeviceArray,
     *,
     dispatch_mode: ExecutionMode = ExecutionMode.GPU,
 ) -> OwnedGeometryArray | None:
     """Recompute selected polygon union rows exactly on GPU."""
-    row_indices = np.asarray(row_indices, dtype=np.int64)
-    if row_indices.size == 0:
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    indices_on_device = hasattr(row_indices, "__cuda_array_interface__")
+    if indices_on_device:
+        d_row_indices = cp.asarray(row_indices, dtype=cp.int64)
+        if int(d_row_indices.size) == 0:
+            return _empty_device_constructive_output(0)
+        row_indices_host = get_cuda_runtime().copy_device_to_host(
+            d_row_indices,
+            reason="polygon union exact rowwise row-index fence",
+        ).astype(np.int64, copy=False)
+    else:
+        row_indices_host = np.asarray(row_indices, dtype=np.int64)
+        if row_indices_host.size == 0:
+            return _empty_device_constructive_output(0)
+        d_row_indices = cp.asarray(row_indices_host, dtype=cp.int64)
+
+    left_state = left._ensure_device_state()
+    right_state = right._ensure_device_state()
+    d_valid_rows = (
+        cp.asarray(left_state.validity)[d_row_indices].astype(cp.bool_, copy=False)
+        & cp.asarray(right_state.validity)[d_row_indices].astype(cp.bool_, copy=False)
+    )
+    valid_rows = get_cuda_runtime().copy_device_to_host(
+        d_valid_rows,
+        reason="polygon union exact rowwise validity admission fence",
+    )
+    if not bool(np.all(valid_rows)):
+        return None
+
+    if row_indices_host.size == 0:
         return _empty_device_constructive_output(0)
 
-    if row_indices.size == left.row_count:
+    if row_indices_host.size == left.row_count:
         row_results: list[OwnedGeometryArray] = []
-        for row_index in row_indices.tolist():
-            if not (bool(left.validity[row_index]) and bool(right.validity[row_index])):
-                return None
+        for row_index in row_indices_host.tolist():
             d_row = cp.asarray([row_index], dtype=cp.int64)
             sub_result = _dispatch_single_row_polygon_union_gpu(
                 left.take(d_row),
@@ -3014,9 +3953,7 @@ def _dispatch_exact_rowwise_polygon_union_rows_gpu(
         return OwnedGeometryArray.concat(row_results)
 
     replacement_rows: list[OwnedGeometryArray] = []
-    for row_index in row_indices.tolist():
-        if not (bool(left.validity[row_index]) and bool(right.validity[row_index])):
-            return None
+    for row_index in row_indices_host.tolist():
         d_row = cp.asarray([row_index], dtype=cp.int64)
         sub_result = _dispatch_single_row_polygon_union_gpu(
             left.take(d_row),
@@ -3043,14 +3980,16 @@ def _dispatch_polygon_partition_union_gpu(
     if left.row_count == 0:
         return _empty_device_constructive_output(0)
 
-    left_valid = np.asarray(left.validity, dtype=bool)
-    right_valid = np.asarray(right.validity, dtype=bool)
-    both_rows = np.flatnonzero(left_valid & right_valid).astype(np.int64, copy=False)
-    left_only_rows = np.flatnonzero(left_valid & ~right_valid).astype(np.int64, copy=False)
-    right_only_rows = np.flatnonzero(~left_valid & right_valid).astype(np.int64, copy=False)
+    left_state = left._ensure_device_state()
+    right_state = right._ensure_device_state()
+    left_valid = cp.asarray(left_state.validity).astype(cp.bool_, copy=False)
+    right_valid = cp.asarray(right_state.validity).astype(cp.bool_, copy=False)
+    both_rows = cp.flatnonzero(left_valid & right_valid).astype(cp.int64, copy=False)
+    left_only_rows = cp.flatnonzero(left_valid & ~right_valid).astype(cp.int64, copy=False)
+    right_only_rows = cp.flatnonzero(~left_valid & right_valid).astype(cp.int64, copy=False)
 
     out = _empty_device_constructive_output(left.row_count)
-    if both_rows.size > 0:
+    if int(both_rows.size) > 0:
         from vibespatial.overlay.gpu import (
             _build_overlay_execution_plan,
             _materialize_overlay_execution_plan,
@@ -3117,10 +4056,11 @@ def _dispatch_polygon_partition_union_gpu(
                 if merged is None or merged.row_count != sub_left.row_count:
                     return None
 
-            invalid_local_rows = np.flatnonzero(
-                ~np.asarray(merged.validity, dtype=bool)
-            ).astype(np.int64, copy=False)
-            if invalid_local_rows.size:
+            merged_state = merged._ensure_device_state()
+            invalid_local_rows = cp.flatnonzero(
+                ~cp.asarray(merged_state.validity).astype(cp.bool_, copy=False)
+            ).astype(cp.int64, copy=False)
+            if int(invalid_local_rows.size):
                 exact_rescue = _dispatch_exact_rowwise_polygon_union_rows_gpu(
                     sub_left,
                     sub_right,
@@ -3129,8 +4069,8 @@ def _dispatch_polygon_partition_union_gpu(
                 )
                 if (
                     exact_rescue is None
-                    or exact_rescue.row_count != invalid_local_rows.size
-                    or not bool(np.asarray(exact_rescue.validity, dtype=bool).all())
+                    or exact_rescue.row_count != int(invalid_local_rows.size)
+                    or not _all_rows_valid(exact_rescue)
                 ):
                     return None
                 merged = device_concat_owned_scatter(
@@ -3158,20 +4098,20 @@ def _dispatch_polygon_partition_union_gpu(
         out = device_concat_owned_scatter(
             out,
             merged,
-            cp.asarray(both_rows, dtype=cp.int64),
+            both_rows,
         )
 
-    if left_only_rows.size > 0:
+    if int(left_only_rows.size) > 0:
         out = device_concat_owned_scatter(
             out,
             left.take(left_only_rows),
-            cp.asarray(left_only_rows, dtype=cp.int64),
+            left_only_rows,
         )
-    if right_only_rows.size > 0:
+    if int(right_only_rows.size) > 0:
         out = device_concat_owned_scatter(
             out,
             right.take(right_only_rows),
-            cp.asarray(right_only_rows, dtype=cp.int64),
+            right_only_rows,
         )
     return out
 
@@ -3292,6 +4232,7 @@ def _dispatch_polygon_difference_overlay_batched_gpu(
         return _empty_device_constructive_output(left.row_count)
 
     active_row_indices = np.flatnonzero(active_rows).astype(np.int64, copy=False)
+    d_active_row_indices = cp.asarray(active_row_indices, dtype=cp.int64)
     active_left = left.take(active_row_indices)
     active_right = right.take(active_row_indices)
 
@@ -3380,82 +4321,32 @@ def _dispatch_polygon_difference_overlay_batched_gpu(
         if fallback_result is None or fallback_result.row_count != fallback_left.row_count:
             return None
 
-    preserve_rows = cp.asnumpy(d_preserve_rows)  # zcopy:ok(final row-assembly metadata after batched GPU classification; tiny row-id materialization only)
-    partial_local = cp.asnumpy(d_partial_local)
-    fallback_local = cp.asnumpy(d_fallback_local)
-    out_validity = cp.zeros(left.row_count, dtype=cp.bool_)
-    out_tags = cp.full(left.row_count, NULL_TAG, dtype=cp.int8)
-    out_family_row_offsets = cp.full(left.row_count, -1, dtype=cp.int32)
-    family_buffers: dict[GeometryFamily, list] = {}
-    family_row_bases: dict[GeometryFamily, int] = {}
-    partial_pos = {
-        int(active_row_indices[int(local_pos)]): int(local_pos)
-        for local_pos in partial_local.tolist()
-    }
-    fallback_pos = {
-        int(active_row_indices[int(local_pos)]): compact_pos
-        for compact_pos, local_pos in enumerate(fallback_local.tolist())
-    }
-    preserve_set = set(preserve_rows.tolist())
+    out = _empty_device_constructive_output(left.row_count)
 
-    for row_index in range(left.row_count):
-        if not left_valid[row_index]:
-            continue
+    if int(d_preserve_rows.size) > 0:
+        out = device_concat_owned_scatter(
+            out,
+            left.take(d_preserve_rows),
+            d_preserve_rows,
+        )
 
-        if row_index in preserve_set:
-            sub_result = left.take(cp.asarray([row_index], dtype=cp.int64))
-        elif row_index in partial_pos:
-            if partial_result is None:
-                return None
-            sub_result = partial_result.take(
-                cp.asarray([partial_pos[row_index]], dtype=cp.int64)
-            )
-        elif row_index in fallback_pos:
-            if fallback_result is None:
-                return None
-            sub_result = fallback_result.take(
-                cp.asarray([fallback_pos[row_index]], dtype=cp.int64)
-            )
-        else:
-            continue
-
-        sub_result = _collapse_to_single_row(sub_result)
-        if sub_result is None:
+    if int(d_partial_local.size) > 0:
+        if partial_result is None:
             return None
-        if sub_result.row_count != 1:
+        d_partial_rows = d_active_row_indices[d_partial_local]
+        out = device_concat_owned_scatter(
+            out,
+            partial_result.take(d_partial_local),
+            d_partial_rows,
+        )
+
+    if int(d_fallback_local.size) > 0:
+        if fallback_result is None:
             return None
-        sub_state = sub_result._ensure_device_state()
-        if not bool(sub_state.validity[0]):
-            continue
+        d_fallback_rows = d_active_row_indices[d_fallback_local]
+        out = device_concat_owned_scatter(out, fallback_result, d_fallback_rows)
 
-        tag_value = int(sub_state.tags[0])
-        family = TAG_FAMILIES.get(tag_value)
-        if family is None:
-            return None
-
-        buffer = sub_state.families.get(family)
-        if buffer is None:
-            return None
-
-        base_row = family_row_bases.get(family, 0)
-        out_validity[row_index] = sub_state.validity[0]
-        out_tags[row_index] = sub_state.tags[0]
-        out_family_row_offsets[row_index] = base_row
-        family_buffers.setdefault(family, []).append(buffer)
-        family_row_bases[family] = base_row + (int(buffer.geometry_offsets.size) - 1)
-
-    device_families = {
-        family: _concat_device_family_buffers(family, buffers)
-        for family, buffers in family_buffers.items()
-    }
-    return build_device_resident_owned(
-        device_families=device_families,
-        row_count=left.row_count,
-        tags=out_tags,
-        validity=out_validity,
-        family_row_offsets=out_family_row_offsets,
-        execution_mode="gpu",
-    )
+    return out
 
 
 def _dispatch_polygon_difference_overlay_rowwise_gpu_legacy(
@@ -3587,13 +4478,7 @@ def _supports_gpu_constructive(
     right: OwnedGeometryArray,
 ) -> bool:
     """Return True when every valid family pair in the workload is GPU-supported."""
-    valid_mask = left.validity & right.validity
-    if not valid_mask.any():
-        return True
-
-    left_tags = left.tags[valid_mask]
-    right_tags = right.tags[valid_mask]
-    for left_tag, right_tag in unique_tag_pairs(left_tags, right_tags):
+    for left_tag, right_tag in _valid_family_tag_pairs(left, right):
         left_family = TAG_FAMILIES.get(left_tag)
         right_family = TAG_FAMILIES.get(right_tag)
         if left_family is None or right_family is None:
@@ -3610,10 +4495,7 @@ def _needs_grouped_gpu_dispatch(
     """Return True when the workload spans multiple valid family pairs."""
     if _is_polygon_only(left) and _is_polygon_only(right):
         return False
-    valid_mask = left.validity & right.validity
-    if not valid_mask.any():
-        return False
-    return len(unique_tag_pairs(left.tags[valid_mask], right.tags[valid_mask])) > 1
+    return len(_valid_family_tag_pairs(left, right)) > 1
 
 
 def _empty_device_constructive_output(row_count: int) -> OwnedGeometryArray:
@@ -3905,9 +4787,9 @@ def _dispatch_mixed_binary_constructive_gpu(
         out_tags[d_sub_rows] = sub_state.tags
 
         for family, buffer in sub_state.families.items():
-            family_mask = sub_state.tags == FAMILY_TAGS[family]
-            if not bool(cp.any(family_mask)):
+            if int(buffer.geometry_offsets.size) <= 1:
                 continue
+            family_mask = sub_state.tags == FAMILY_TAGS[family]
             base_row = family_row_bases.get(family, 0)
             out_family_row_offsets[d_sub_rows[family_mask]] = (
                 sub_state.family_row_offsets[family_mask] + base_row
@@ -4086,7 +4968,7 @@ def _binary_constructive_gpu(
                 if (
                     exact_partition_union is not None
                     and exact_partition_union.row_count == left.row_count
-                    and bool(np.asarray(exact_partition_union.validity, dtype=bool).all())
+                    and _all_rows_valid(exact_partition_union)
                 ):
                     return exact_partition_union
             except Exception:
@@ -4118,7 +5000,7 @@ def _binary_constructive_gpu(
                     if (
                         repaired_union is not None
                         and repaired_union.row_count == left.row_count
-                        and bool(np.asarray(repaired_union.validity, dtype=bool).all())
+                        and _all_rows_valid(repaired_union)
                     ):
                         return repaired_union
                 except Exception:
@@ -4177,12 +5059,7 @@ def _binary_constructive_gpu(
                 )
             return None
 
-        valid_mask = left.validity & right.validity
-        polygon_pair_count = (
-            len(unique_tag_pairs(left.tags[valid_mask], right.tags[valid_mask]))
-            if valid_mask.any()
-            else 0
-        )
+        polygon_pair_count = len(_valid_family_tag_pairs(left, right))
         if op == "intersection" and polygon_pair_count > 1:
             if left.row_count <= _MIXED_POLYGON_INTERSECTION_ROWWISE_MAX:
                 try:
@@ -4462,7 +5339,7 @@ def _binary_constructive_gpu(
                         exc_info=True,
                     )
 
-        if valid_mask.any() and len(unique_tag_pairs(left.tags[valid_mask], right.tags[valid_mask])) > 1:
+        if polygon_pair_count > 1:
             try:
                 mixed_polygonal = _dispatch_mixed_binary_constructive_gpu(
                     op,

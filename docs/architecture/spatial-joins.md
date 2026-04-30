@@ -5,7 +5,7 @@ Scope: Spatial-index query assembly, sjoin result semantics, bounded nearest str
 Read If: You are changing sindex query behavior, spatial join materialization, dwithin, or nearest result assembly.
 STOP IF: You already have the spatial-query engine and vendored join helpers open and only need local implementation detail.
 Source Of Truth: Phase-4 spatial query and join assembly policy before broader API dispatch work.
-Body Budget: 149/220 lines
+Body Budget: 155/220 lines
 Document: docs/architecture/spatial-joins.md
 
 Section Map (Body Lines)
@@ -17,11 +17,11 @@ Section Map (Body Lines)
 | 22-30 | Verify |
 | 31-36 | Risks |
 | 37-42 | Intent |
-| 43-71 | Decision |
-| 72-111 | Query Strategy |
-| 112-129 | Nearest Strategy |
-| 130-141 | Pandas Semantics |
-| 142-149 | Consequences |
+| 43-77 | Decision |
+| 78-117 | Query Strategy |
+| 118-135 | Nearest Strategy |
+| 136-147 | Pandas Semantics |
+| 148-155 | Consequences |
 DOC_HEADER:END -->
 
 ## Request Signals
@@ -82,6 +82,12 @@ This means:
   first, then wrap them in a deferred export result that owns join context
   until the explicit `GeoDataFrame` boundary so suffixes, index restoration,
   and geometry-column rules stay GeoPandas-compatible
+- public `sindex.query` indices, dense, and sparse outputs format
+  `NativeRelation` pairs when the owned/native index path is admissible; dense
+  and sparse remain public compatibility exports, not native carriers
+- public `sindex.nearest` can also format `NativeRelation` pairs when both
+  sides already have owned geometry and `nearest_relation()` admits the shape;
+  otherwise it keeps the existing nearest engine path
 - `RelationJoinExportResult -> NativeTabularResult` now builds a native
   attribute payload directly, so terminal Arrow-family and file sinks do not
   need to go back through the joined-frame materializer just to emit join rows

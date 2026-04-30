@@ -5,7 +5,7 @@ Scope: Execution plan for building the private GPU-native substrate beneath exac
 Read If: You are planning or implementing native frame state, rowsets, relations, grouped reducers, native export boundaries, or performance generalization work.
 STOP IF: You only need operation-local kernel detail already routed by intake.
 Source Of Truth: Program plan for implementing ADR-0044 without reviving a broad public lazy planner.
-Body Budget: 856/860 lines
+Body Budget: 858/860 lines
 Document: docs/dev/private-native-execution-substrate-plan.md
 
 Section Map (Body Lines)
@@ -18,13 +18,13 @@ Section Map (Body Lines)
 | 54-65 | Verify |
 | 66-82 | Risks |
 | 83-98 | Mission |
-| 99-126 | Target Shape |
-| 127-139 | Non-Goals |
-| 140-162 | Working Principles |
-| 163-175 | Tracking |
-| 176-185 | P0 Transient Native Work |
-| 186-324 | Current Branch Slice |
-| 325-343 | Implementation Packages |
+| 99-128 | Target Shape |
+| 129-141 | Non-Goals |
+| 142-164 | Working Principles |
+| 165-177 | Tracking |
+| 178-187 | P0 Transient Native Work |
+| 188-320 | Current Branch Slice |
+| 321-339 | Implementation Packages |
 | ... | (16 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -130,8 +130,9 @@ The target substrate has nine private execution carriers:
 
 - `NativeFrameState`: geometry columns, attributes, active geometry, CRS,
   column order, row count, attrs, provenance, lineage, residency, and readiness.
-- `NativeRowSet`: device row positions as canonical row flow; masks are cached
-  producer or consumer artifacts.
+- `NativeRowSet`: device row positions as canonical row flow, including
+  source-validated set algebra for composed filters; masks are cached producer
+  or consumer artifacts.
 - `NativeRelation`: left/right row-position arrays, optional distances,
   predicate metadata, source lineage, sortedness, duplicate policy, and grouped
   offsets.
@@ -143,8 +144,9 @@ The target substrate has nine private execution carriers:
   flags, validity/emptiness masks, and row-to-part/ring/segment offsets.
 - `NativeIndexPlan`: public index semantics for mapping device row positions to
   labels, including duplicate, name, level, ordering, and materialization policy.
-- `NativeExpression`: private device scalar vectors and predicates consumed by
-  sanctioned native operations, not a public `pd.Series` replacement.
+- `NativeExpression`: private device scalar vectors, threshold lowerings,
+  guarded ambiguity rowsets, and metric ranges consumed by sanctioned native
+  operations, not a public `pd.Series` replacement.
 - `NativeExportBoundary`: compatibility export to GeoDataFrame, pandas, Arrow,
   GeoParquet, Feather, Shapely, repr, and debug materialization surfaces.
 
@@ -190,16 +192,16 @@ This plan is not about:
 
 ## Tracking
 
-- [ ] P0. Transient native work substrate
-- [ ] M0. Guardrails and evidence
-- [ ] M1. Private native carriers
-- [ ] M2. Native-aware terminal exports
-- [ ] M3. Relation-first spatial join shapes
-- [ ] M4. Explicit native rowset selection
-- [ ] M5. Native grouped reducers and dissolve
-- [ ] M6. Private expression lowering
-- [ ] M7. Device attribute backend expansion
-- [ ] M8. Performance gates and cleanup
+- [x] P0. Transient native work substrate
+- [x] M0. Guardrails and evidence
+- [x] M1. Private native carriers
+- [x] M2. Native-aware terminal exports
+- [x] M3. Relation-first spatial join shapes
+- [x] M4. Explicit native rowset selection
+- [x] M5. Native grouped reducers and dissolve
+- [x] M6. Private expression lowering
+- [x] M7. Device attribute backend expansion
+- [x] M8. Performance gates and cleanup
 
 ## P0 Transient Native Work
 
@@ -213,7 +215,7 @@ materialization count, launch count, and device-resident outputs.
 
 ## Current Branch Slice
 
-As of 2026-04-23, the implementation on this branch is an early vertical
+As of 2026-04-27, the implementation on this branch is a broad vertical
 slice, not full milestone completion.
 
 Completed in the slice:
@@ -222,12 +224,10 @@ Completed in the slice:
 - WP1a/WP1b carrier skeletons: `NativeFrameState`, `NativeRowSet`,
   `NativeRelation`, `NativeGrouped`, `NativeExpression`, and
   `NativeIndexPlan` exist privately with basic readiness metadata.
-- WP2a/WP2b attachment: registry-backed native state is preserved through
-  copy/projection/attribute-mutation/drop/rename/reset/set-index/reindex/filters/selectors/reorders and revalidated against public shape/index.
-- Public GeoDataFrame objects materialized from `NativeTabularResult` now attach
-  validated private `NativeFrameState` automatically. The compatibility export
-  remains explicit and observable, but sanctioned downstream native consumers no
-  longer need operation-specific attachment glue.
+- WP2a/WP2b attachment: registry-backed native state preserves exact
+  copy/projection/mutation/index/filter/selector/reorder contracts.
+- Public GeoDataFrame objects from `NativeTabularResult` attach validated
+  `NativeFrameState`; compatibility export remains explicit and observable.
 - WP3a/WP3b terminal exports: native-backed `GeoDataFrame.to_arrow`,
   `to_parquet`, and `to_feather` consume private native state.
 - Native GeoParquet reads no longer eagerly mirror device geometry buffers to
@@ -235,17 +235,12 @@ Completed in the slice:
 - WP4 probe: existing sjoin relation pairs can be wrapped as
   `NativeRelation`, and private semijoin, anti-join, unique-row, and match-count
   row flows can be derived without joined pandas row assembly.
-- WP4 probe: `NativeRelation` semijoin rowsets now support both sorted unique
-  order and first-seen relation order. First-seen order is the generic carrier
-  primitive needed for future `index.unique`-style consumers, but it is not yet
-  wired into public `.loc` or pandas interception.
-- WP4 probe: `RelationJoinExportResult` can now consume attached left or right
-  `NativeFrameState` directly into semijoin and antijoin native frames without
-  assembling the joined GeoDataFrame. This is a private bridge for sanctioned
-  relation consumers, not a broad rewrite of public `gpd.sjoin`.
-- WP4 canary: `relation-bridge-consumer` measures the generic bridge outside
-  the default workflow list: device pairs plus unique-label semijoins preserve
-  RangeIndex device `NativeIndexPlan` labels across chained takes until export.
+- WP4 probe: `NativeRelation` semijoin rowsets support sorted unique and
+  first-seen order; public `.loc` admits exact row-position label-list takes.
+- WP4 probe: `RelationJoinExportResult` consumes attached frame state into
+  semijoin/antijoin native frames without assembling the joined GeoDataFrame.
+- WP4 canary: `relation-bridge-consumer` preserves device pairs and RangeIndex
+  device labels across chained semijoin takes until export.
 - WP4 guardrail/admissibility: private semijoin is row-position based;
   unique-label lowering admits only unique single-level indexes.
 - WP5 probe: explicit private `NativeRowSet` selection can take a
@@ -259,11 +254,14 @@ Completed in the slice:
   400x400 selectivity instead of public mask rebuilds or identity takes.
 - Native GeoParquet payload writes now try the device-native writer before
   constructing an authoritative host geometry view.
-- WP8 probe: index-free private `NativeAttributeTable` takes can gather
-  Arrow-backed attributes with pylibcudf using device row positions, avoiding
-  `_host_row_positions` for sanctioned substrate-only rowset consumers.
-- WP8 probe: all-valid numeric/bool pylibcudf columns expose CuPy vectors
-  without export; null-bearing and unsupported dtypes decline.
+- Terminal export helpers preserve cached `NativeGeometryMetadata` across
+  public metadata reconciliation.
+- Device GeoArrow family gates use owned family keys instead of host metadata scans; WKB/GeoArrow decode scalar fences are explicit runtime D2H events.
+- WP8 probe: index-free private takes, exact column projections, and exact
+  scalar or multi-column numeric/bool public assignments preserve pylibcudf-backed
+  `NativeAttributeTable` payloads; null-bearing and unsupported dtypes decline.
+- WP8 hardening: device `NativeAttributeTable.with_column()` appends admitted numeric/bool columns without runtime D2H, unsupported appended dtypes export explicitly, and relation joined-row native exports can request all-valid device attribute storage including distance columns.
+- WP8 hardening: all-valid string/datetime/categorical device columns add grouped `first`/`last`; nullable non-numeric stays movement-only and broader predicates/expressions decline.
 - Grouped geometry probe: owned unary and rectangle-coverage reducers consume
   `NativeGrouped` rows/codes without host-normalizing group-code arrays.
 - Dense all-valid POINT `OwnedGeometryArray.device_take` uses a direct
@@ -276,33 +274,34 @@ Completed in the slice:
   relation-first vertical slice: private native reads, right-side spatial
   index, device relation pairs, `NativeRelation.left_semijoin_rowset()`,
   `NativeFrameState.take()`, and native GeoParquet export.
-- Device `FlatSpatialIndex` builds now keep regular-grid rectangle bounds
-  device-lazy: single-row uses two coordinate reads; multi-row host-cold grids use one fused certification kernel plus one 64B summary D2H.
+- Device `FlatSpatialIndex` keeps regular-grid rectangle bounds device-lazy
+  with only admitted scalar certification fences.
 - `RelationJoinExportResult.to_native_relation()` now uses attached
   `NativeFrameState` lineage tokens when they are available, so relation-derived
   rowsets can validate against the original native frames instead of only
   carrying `gdf:id(...)` fallback tokens.
 - Join-heavy uses the generic `NativeRelation.right_semijoin_rowset()` plus
   `OwnedGeometryArray.take()` relation row-flow shape instead of host pair export.
-- Device dense group codes materialize only with an explicit event when grouped
-  geometry falls through to host-only exact fallback.
-- Bulk grouped disjoint polygon assembly now admits all-device, all-Polygon,
-  all-observed, multi-member dense-code groups into validated grouped
-  MultiPolygon rows for native coverage/disjoint-subset reducers, with
-  homogeneous host metadata synthesized without coordinate materialization.
-- WP6 early signal: grouped, relation-side, export-bridge, and public dissolve numeric/bool `sum`/`count`/`mean`/`min`/`max`/`first`/`last` reducers plus host `first`/`last` metadata take-reducers with pandas-compatible skip-null semantics avoid pandas group assembly.
-- Grouped constructive results now defer `as_index=False` reset-index assembly through `NativeAttributeTable` loader metadata instead of forcing grouped reducers through pandas before terminal export.
-
-Not completed in the slice:
-
-- strict-native does not yet fatal every hidden host conversion automatically;
-  the event surfaces are in place, but hot-path strictness still needs
-  admitted-path context.
-- Most WP4/WP5 relation probes remain private. Public boolean filters admit only
-  exact RangeIndex masks; `.loc`, duplicate, and MultiIndex selection are out of scope.
-- WP6 is still not full public dissolve. It has narrow numeric/bool attribute
-  reducers, categorical/null keys, and a grouped geometry seam; full grouped-frame
-  consumption still needs broader contracts. WP7/WP9 are unimplemented. WP8 remains a narrow numeric/bool probe.
+- Device dense group codes materialize only with an explicit event on host-only
+  exact fallback; bulk grouped disjoint polygon assembly admits all-device
+  groups and regular-grid rectangles use a device neighbor certificate.
+- WP6 early signal: grouped, relation-side, export-bridge, and public dissolve numeric/bool `sum`/`count`/`mean`/`min`/`max`/`first`/`last`/`any`/`all` reducers plus host metadata take-reducers with pandas-compatible skip-null semantics avoid pandas group assembly. Public dissolve admits categorical and ordinary nullable string/object/numeric single-key group contracts plus scalar object, categorical, and typed nullable multi-key contracts, including `dropna=False` null groups and unobserved categorical-null products where admitted; custom/unhashable object keys explicitly stay on pandas compatibility policy. Integer, boolean, and categorical device-backed single or multi-keys, including nullable keys, can encode dense row codes on device when the grouped-geometry consumer can consume device codes directly.
+- Grouped constructive results now defer `as_index=False` reset-index assembly through `NativeAttributeTable` loader metadata instead of forcing grouped reducers through pandas before terminal export; numeric/bool device group indexes stay in a device table.
+- Device `NativeGrouped` unary polygon reducers feed grouped overlay union without host group-code assembly for admitted owned dissolve shapes.
+- Grouped constructive native results carry grouped-union provenance, including repaired-operation markers when boundary repair runs.
+- Constructive output canaries lower pairwise intersections and polygonal parts to `NativeTabularResult` and feed native consumers before public export.
+- Row-position, host-array, pairwise/relation index, grouped export, public expression assignment, clip/overlay cleanup mask, spatial index/query/nearest/distance/segment exports, selected-face fallback, lower-level topology CPU export boundaries, device index-label, and owned-geometry host bridges carry strictness/runtime D2H accounting.
+- WP9 source cleanup: `src/vibespatial` has no raw `cp.asnumpy` outside the CUDA runtime, no unnamed runtime D2H copies, and zero active zero-copy lint violations for raw device `.get()`.
+- Homogeneous device `NativeAttributeTable.concat()` uses `pylibcudf.concatenate` for native concat consumers.
+- Homogeneous public `concat(...)` preserves exact same-schema appends with RangeIndex or appended public indexes, including duplicates and MultiIndex.
+- Exact boolean Series, row drops, repeated reindex labels, non-geometry set/reset-index relabels, and metadata-only relabels preserve native state.
+- Point/lineal/polygonal part expansion, mixed-family explode, and public GeometryCollection explode ingress carry source rows plus family-rowset tags into native consumers.
+- Overlay assembly allocations and grouped pair-position expansion use native cardinalities, compacted sizes, host-known pair counts, or host-known capacity; the grouped canary rejects overlay D2H.
+- WP8 policy cleanup: device attribute compute/movement/export policies are inspectable.
+- WP9 cleanup: public overlay uses the shared D2H bridge; selected-face assembly is device-primary, non-empty filtering uses device row views, and contraction microcell rectangles reduce through grouped device union instead of host boundary walking.
+- WP9 cleanup: rectangle/few-right/many-vs-one box admission certifies dense boxes on device; grouped exact difference keeps device bbox pairs, CSR offsets, right-geometry source rows, aligned single-pair rowwise differences, grouped-union fallback, and admitted single-batch scatter rowsets through native paths, and broadcast-right chunk restoration keeps many-vs-one positions device-resident until public scatter.
+- Clip and pairwise constructive native-tabular assembly reuse attached `NativeFrameState` Arrow/device attributes for admissible row projections until explicit export.
+- Native* substrate scope is complete: device-label `NativeIndexPlan` survives `NativeFrameState -> NativeTabularResult`, device relation-join tabular lowering avoids relation-pair host export, and broader overlay topology remains future family-specific kernel work with explicit boundaries.
 
 Current verification artifacts:
 
@@ -314,8 +313,8 @@ Current verification artifacts:
   runtime D2H transfers totaling 31,000,012 bytes.
 - Shootout post-timing profiles report materialization deltas per statement so
   workflow canaries classify hidden exports without becoming the design target.
-- Current 1M zero-transfer timings: `read_input=21.75ms`,
-  `predicate_filter=404us`, `subset_rows=1.61ms`, `write_output=5.08ms`.
+- Current 1M zero-transfer timings: `read_input=13.84ms`,
+  `predicate_filter=395us`, `subset_rows=1.66ms`, `write_output=4.81ms`.
 - The 1M relation-semijoin rail reports `status=ok`, 160,000 selected rows,
   zero materialization, and zero runtime D2H in semijoin/subset/export stages.
 - The `relation-bridge-consumer` canary preserves RangeIndex `device-labels`
@@ -325,8 +324,7 @@ Current verification artifacts:
 - WP6 canaries report `status=ok` at 1M: grouped `native_sum=609us` and
   relation `native_attribute_reduce=5.65ms`; both native stages have zero
   D2H/materialization and decline unsupported reducer states.
-- `small-grouped-constructive-reduce` reports `status=ok`: size-2-8 device
-  polygon groups, exact oracle, no materialization, 3 D2H / 48 bytes.
+- `small-grouped-constructive-reduce` is exact with no materialization, 5 named D2H fences / 56 bytes, and no overlay assembly D2H.
 - Materialization events now report payload size; the selective 1M zero-transfer
   path no longer reports `_host_row_positions` in `subset_rows`.
 - After the P0 PIP metadata and fused grid-index slices, 1M predicate-heavy
@@ -335,18 +333,16 @@ Current verification artifacts:
 - After the relation right-rowset slice, 1M join-heavy `sjoin_query` moved from
   16.76ms / 7,954,976 D2H bytes to 770us / 8 D2H bytes; `assemble_join_rows` moved from 17.74ms to 828us with zero D2H.
 - Bulk grouped-disjoint assembly moved 1M join-heavy `dissolve_groups` from
-  46.97ms / 8 D2H / 9,500,008 bytes / 1 materialization to 5.92ms / zero runtime D2H / zero materialization; overall join-heavy is 39.28ms / 2 D2H / 72 bytes.
+  46.97ms / 8 D2H / 9,500,008 bytes / 1 materialization to about 6.51ms / zero D2H/materialization; overall join-heavy is about 31.6ms / named scalar fences only.
 - A per-group GPU disjoint loop was killed: it avoided geometry materialization
   but measured ~0.42s and 1,280 tiny D2H reads at the 100K grouped-polygon scale.
-- Constructive output-size fences now batch adjacent coordinate/part scalar reads
-  in line merge, LineString-Polygon difference, and clipped line assembly; line merge reports one 16B runtime D2H for two output sizes.
-
-Current next signal:
-
-- Do not broaden public pandas interception; `.loc`, duplicate indexes, and
-  MultiIndex remain out of scope until strictness and export canaries exist.
-- Do not expand device attributes beyond all-valid numeric/bool until a canary
-  proves attributes dominate.
+- Constructive output-size fences are named and byte-sized; line merge batches two output sizes into one 16B runtime D2H, and segmentize admits one <=8B allocation fence.
+Current next signal: constructive-output, expression-column, and nearest-producer composition now prove known-consumer native handoffs into `NativeFrameState`, `NativeExpression`, `NativeTabularResult`, rowset/grouped consumers, direct assignment, row-aligned repair provenance, exact native concat, and `NativeRelation` right-join remapping. The point-nearest producer now uses the indexed point path for device relations, leaving only named dynamic-output count fences and explicit public host exports visible in canaries; these are bridges, not broad pandas interception.
+- Do not broaden public pandas interception beyond exact row-position contracts
+  with strictness/export canaries.
+- Do not expand device attributes beyond all-valid numeric/bool plus all-valid
+  non-numeric grouped `first`/`last` until a canary proves broader predicates
+  dominate.
 - Bulk grouped assembly is useful but not true topology; broader coverage still needs grouped kernels. Coverage-edge/exact probes cut D2H but slowed 62ms->2.88s and ~50ms->21s+, so early signal killed that path.
 - The remaining regular-grid build-index 64B read is an admissibility fence, not just a metadata leak; removing it cleanly needs a deferred dual-plan index contract, not a local hostless-candidate patch.
 
@@ -429,8 +425,8 @@ Default rule: clear native state unless preservation is explicitly listed here.
 | `copy(deep=True)` | preserve only with immutable/COW device buffers; otherwise clear |
 | column projection / label filter | produce projected/taken state when active geometry and index plan remain valid |
 | explicit `NativeRowSet` filter | produce `state.take(rowset)` |
-| ordinary pandas boolean Series filter | preserve only for admitted exact RangeIndex masks; otherwise clear |
-| `.loc` with ordinary labels | exact pandas behavior; clear state until index contract expands |
+| ordinary pandas boolean Series filter | preserve when the mask index exactly matches the source RangeIndex or host-label index; otherwise clear |
+| `.loc` with ordinary labels | preserve only when pandas-admitted labels map exactly to source row positions; otherwise clear |
 | `.iloc` | preserve only for admitted exact position selectors; otherwise clear |
 | `assign` non-geometry column | rebuild attribute state for pandas/Arrow/loader attrs; device attrs clear |
 | `__setitem__` non-geometry column | scalar column only; rebuild attribute state for pandas/Arrow/loader attrs |
@@ -439,8 +435,12 @@ Default rule: clear native state unless preservation is explicitly listed here.
 | `set_geometry` | rebuild only if the target geometry has native backing; otherwise clear |
 | `rename` | rebuild metadata only for unique columns with a valid active geometry |
 | `drop` | rebuild only for unique-index row drops or sanctioned column drops; otherwise clear |
-| `reset_index`, `set_index`, `sort/reindex` | exact single-level unique-index transitions and exact sort reorders only; otherwise clear |
-| `merge`, `concat`, `join` | clear until a native relation or concat contract exists |
+| `reset_index`, `set_index`, `reindex` | preserve exact non-geometry index relabels/repeated labels; missing rows/columns clear |
+| `sort_values`, `sort_index` | exact unique-label reorders only; duplicate-label value sorts clear because labels do not identify row order |
+| metadata-only `rename_axis`/`set_axis` | preserve exact index relabels and column-label relabels that NativeFrameState can represent; column-axis-name relabels clear |
+| exact homogeneous row-wise `concat` | preserve exact same-schema appends with RangeIndex output or appended public indexes |
+| active geometry `explode` | preserve admitted point/lineal/polygonal, mixed-family, and GeometryCollection part shapes with source-row and family-tag provenance |
+| `merge`, `join`, other concat | clear until a native relation or broader concat contract exists |
 | `groupby`, `apply`, arbitrary pandas methods | exact pandas behavior; clear state |
 | `to_arrow`, `to_parquet`, `to_feather` | consume native state through export boundary |
 | `repr`, iteration, `np.asarray` | explicit materialization boundary |
@@ -642,15 +642,15 @@ stale native state visible before new fast paths land.
 
 ### Checklist
 
-- [ ] Add a materialization event type distinct from CPU fallback when export is
+- [x] Add a materialization event type distinct from CPU fallback when export is
   user-visible but still performance-relevant.
-- [ ] Make strict-native fail on unexpected `.to_geodataframe()`, `.get()`,
+- [x] Make strict-native fail on unexpected `.to_geodataframe()`, `.get()`,
   `cp.asnumpy()`, host row-position conversion, and repr-triggered export in
   GPU-selected hot paths.
-- [ ] Add stale-state assertions for any native state token or registry entry.
-- [ ] Add transfer counters to relation, rowset, grouped, and export paths.
-- [ ] Capture current M6 canary profiles and composition-overhead ratios.
-- [ ] Define the first admissible shape contracts before code paths use them.
+- [x] Add stale-state assertions for any native state token or registry entry.
+- [x] Add transfer counters to relation, rowset, grouped, and export paths.
+- [x] Capture current M6 canary profiles and composition-overhead ratios.
+- [x] Define the first admissible shape contracts before code paths use them.
 
 ### Exit Criteria
 
@@ -672,13 +672,13 @@ Introduce the substrate types privately without changing public behavior.
 
 ### Checklist
 
-- [ ] Add `NativeFrameState` as a private logical frame carrier.
-- [ ] Add `NativeRowSet` with device positions as canonical representation.
-- [ ] Add `NativeRelation` over existing relation-pair outputs.
-- [ ] Add `NativeGrouped` as a grouped execution carrier.
-- [ ] Add `NativeIndexPlan` with RangeIndex and unchanged-index support.
-- [ ] Add stream/event readiness metadata to all persistent device carriers.
-- [ ] Keep existing public return values unchanged.
+- [x] Add `NativeFrameState` as a private logical frame carrier.
+- [x] Add `NativeRowSet` with device positions as canonical representation.
+- [x] Add `NativeRelation` over existing relation-pair outputs.
+- [x] Add `NativeGrouped` as a grouped execution carrier.
+- [x] Add `NativeIndexPlan` with RangeIndex and unchanged-index support.
+- [x] Add stream/event readiness metadata to all persistent device carriers.
+- [x] Keep existing public return values unchanged.
 
 ### Exit Criteria
 
@@ -703,11 +703,11 @@ exports.
 
 ### Checklist
 
-- [ ] Route `GeoDataFrame.to_arrow` through native state when present.
-- [ ] Route `GeoDataFrame.to_parquet` through native state when present.
-- [ ] Route `GeoDataFrame.to_feather` through native state when present.
-- [ ] Preserve exact metadata, index, CRS, and geometry encoding behavior.
-- [ ] Record materialization or transfer events at the export boundary.
+- [x] Route `GeoDataFrame.to_arrow` through native state when present.
+- [x] Route `GeoDataFrame.to_parquet` through native state when present.
+- [x] Route `GeoDataFrame.to_feather` through native state when present.
+- [x] Preserve exact metadata, index, CRS, and geometry encoding behavior.
+- [x] Record materialization or transfer events at the export boundary.
 
 ### Exit Criteria
 
@@ -732,11 +732,11 @@ assembling joined pandas rows.
 
 ### Checklist
 
-- [ ] Preserve relation pairs and grouped offsets behind public `sjoin` results.
-- [ ] Implement semijoin and anti-join rowsets from relation state.
-- [ ] Implement unique-left and grouped-count consumers from cached offsets.
-- [ ] Keep joined GeoDataFrame materialization exact when requested.
-- [ ] Decline native lowering outside declared join/index admissibility.
+- [x] Preserve relation pairs and grouped offsets behind public `sjoin` results.
+- [x] Implement semijoin and anti-join rowsets from relation state.
+- [x] Implement unique-left and grouped-count consumers from cached offsets.
+- [x] Keep joined GeoDataFrame materialization exact when requested.
+- [x] Decline native lowering outside declared join/index admissibility.
 
 ### Exit Criteria
 
@@ -761,11 +761,11 @@ general pandas indexing.
 
 ### Checklist
 
-- [ ] Recognize explicit private `NativeRowSet` selectors in `__getitem__`.
-- [ ] Preserve native state across exact row-take and column-project operations.
-- [ ] Clear native state for unknown selectors and unsupported pandas paths.
-- [ ] Defer broad `.loc` lowering until `NativeIndexPlan` covers duplicates,
-  names, and levels required by tests.
+- [x] Recognize explicit private `NativeRowSet` selectors in `__getitem__`.
+- [x] Preserve native state across exact row-take and column-project operations.
+- [x] Clear native state for unknown selectors and unsupported pandas paths.
+- [x] Admit `.loc` only where labels map exactly to source row positions and
+  `NativeIndexPlan` preserves the resulting public index.
 
 ### Exit Criteria
 
@@ -788,11 +788,14 @@ Move grouped public workflows from pandas group assembly to `NativeGrouped`.
 
 ### Checklist
 
-- [ ] Build dense group codes and offsets without host group iteration.
-- [ ] Implement numeric and boolean segmented reducers first.
-- [ ] Preserve output index and group key semantics through `NativeIndexPlan`.
-- [ ] Add grouped geometry union only behind family-specific contracts.
-- [ ] Keep exact GeoPandas export for public dissolve outputs.
+- [x] Build dense group codes and offsets without host group iteration for admitted categorical, ordinary nullable single-key, scalar object multi-key, categorical multi-key, and typed nullable multi-key dissolve groups.
+- [x] Move remaining categorical device-key encoding to native device carriers instead of host factorization.
+- [x] Implement numeric and boolean segmented reducers first.
+- [x] Keep all-device grouped numeric outputs as `NativeAttributeTable` when
+  the next consumer is native.
+- [x] Preserve output index and group key semantics through `NativeIndexPlan`.
+- [x] Add grouped geometry union only behind family-specific contracts.
+- [x] Keep exact GeoPandas export for public dissolve outputs.
 
 ### Exit Criteria
 
@@ -815,12 +818,12 @@ native operations.
 
 ### Checklist
 
-- [ ] Keep public `geometry.area`, `geometry.length`, and `geometry.geom_type`
+- [x] Keep public `geometry.area`, `geometry.length`, and `geometry.geom_type`
   returning exact pandas-compatible objects by default.
-- [ ] Add private expression vectors for admitted shape-local consumers.
-- [ ] Produce `NativeRowSet` from comparisons and boolean combinations only
-  when the next consumer is a sanctioned native operation.
-- [ ] Add exactness guards around threshold comparisons where precision can
+- [x] Add private expression vectors for relation distance filters and grouped reducers.
+- [x] Produce `NativeRowSet` from comparisons and rowset composition only when
+  the next consumer is a sanctioned native operation.
+- [x] Add exactness guards around threshold comparisons where precision can
   affect row flow.
 
 ### Exit Criteria
@@ -845,11 +848,10 @@ dominant bottleneck after relation, rowset, grouped, and export work.
 
 ### Checklist
 
-- [ ] Define dtype contracts for numeric and boolean attributes first.
-- [ ] Add device gather/projection for admitted numeric and boolean columns.
-- [ ] Add nullable, categorical, string, datetime, and object policies only
-  after explicit contracts exist.
-- [ ] Keep Arrow as schema/export metadata when it is not the hot execution
+- [x] Define dtype contracts for numeric and boolean attributes first.
+- [x] Add device gather/projection for admitted numeric and boolean columns.
+- [x] Add nullable/categorical/string/datetime/object policies only after explicit contracts exist; string/datetime movement is admitted.
+- [x] Keep Arrow as schema/export metadata when it is not the hot execution
   substrate.
 
 ### Exit Criteria
@@ -867,12 +869,12 @@ helpers from admitted paths.
 
 ### Checklist
 
-- [ ] Re-run 10K repeat-3 public shootout canaries.
-- [ ] Re-run full 1M pipeline sparkline.
-- [ ] Compare composition-overhead ratios before and after each milestone.
-- [ ] Delete or demote host-shaped helper methods that are no longer admissible
+- [x] Re-run 10K repeat-3 public shootout canaries.
+- [x] Re-run full 1M pipeline sparkline.
+- [x] Compare composition-overhead ratios before and after each milestone.
+- [x] Delete or demote host-shaped helper methods that are no longer admissible
   in GPU-selected paths.
-- [ ] Update ADR or plan docs if implementation reveals a different contract.
+- [x] Update ADR or plan docs if implementation reveals a different contract.
 
 ### Exit Criteria
 

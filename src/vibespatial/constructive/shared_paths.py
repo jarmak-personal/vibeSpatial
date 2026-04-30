@@ -186,7 +186,12 @@ def _launch_shared_paths_subgroup(
 
     # --- Prefix sum + total ---
     d_offsets = exclusive_sum(d_counts, synchronize=False)
-    total = count_scatter_total(runtime, d_counts, d_offsets)
+    total = count_scatter_total(
+        runtime,
+        d_counts,
+        d_offsets,
+        reason="constructive shared segment-path allocation fence",
+    )
 
     if total == 0:
         h_counts = np.zeros(sub_count, dtype=np.int32)
@@ -239,13 +244,41 @@ def _launch_shared_paths_subgroup(
     h_y2 = np.empty(total, dtype=np.float64)
     h_dir = np.empty(total, dtype=np.int32)
 
-    runtime.copy_device_to_host(d_counts, h_counts)
-    runtime.copy_device_to_host(d_offsets, h_offsets)
-    runtime.copy_device_to_host(d_out_x1, h_x1)
-    runtime.copy_device_to_host(d_out_y1, h_y1)
-    runtime.copy_device_to_host(d_out_x2, h_x2)
-    runtime.copy_device_to_host(d_out_y2, h_y2)
-    runtime.copy_device_to_host(d_out_dir, h_dir)
+    runtime.copy_device_to_host(
+        d_counts,
+        h_counts,
+        reason="shared-paths output counts host export",
+    )
+    runtime.copy_device_to_host(
+        d_offsets,
+        h_offsets,
+        reason="shared-paths output offsets host export",
+    )
+    runtime.copy_device_to_host(
+        d_out_x1,
+        h_x1,
+        reason="shared-paths first-path x-coordinate host export",
+    )
+    runtime.copy_device_to_host(
+        d_out_y1,
+        h_y1,
+        reason="shared-paths first-path y-coordinate host export",
+    )
+    runtime.copy_device_to_host(
+        d_out_x2,
+        h_x2,
+        reason="shared-paths second-path x-coordinate host export",
+    )
+    runtime.copy_device_to_host(
+        d_out_y2,
+        h_y2,
+        reason="shared-paths second-path y-coordinate host export",
+    )
+    runtime.copy_device_to_host(
+        d_out_dir,
+        h_dir,
+        reason="shared-paths direction-classification host export",
+    )
 
     # Direction classification is symmetric: if A and B share a collinear
     # segment in the same direction, it's "forward" regardless of which

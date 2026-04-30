@@ -4,7 +4,12 @@ from typing import Any
 
 import numpy as np
 
-from vibespatial.geometry.owned import OwnedGeometryArray
+from vibespatial.geometry.owned import TAG_FAMILIES, OwnedGeometryArray
+
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover - CPU-only installs
+    cp = None
 
 
 def normalize_group_offsets(group_offsets: Any) -> np.ndarray:
@@ -17,6 +22,29 @@ def group_has_only_polygon_families(
     polygon_tags: set[int],
 ) -> bool:
     """Return True when all valid rows are polygon-family geometries."""
+    if cp is not None and getattr(geometries, "device_state", None) is not None:
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        state = geometries._ensure_device_state()
+        polygon_families = {
+            TAG_FAMILIES[tag]
+            for tag in polygon_tags
+            if tag in TAG_FAMILIES
+        }
+        if set(state.families).issubset(polygon_families):
+            return True
+        d_validity = cp.asarray(state.validity).astype(cp.bool_, copy=False)
+        d_tags = cp.asarray(state.tags).astype(cp.int8, copy=False)
+        d_polygon = cp.zeros(int(geometries.row_count), dtype=cp.bool_)
+        for tag in polygon_tags:
+            d_polygon |= d_tags == np.int8(tag)
+        d_allowed = cp.asarray(cp.all((~d_validity) | d_polygon), dtype=cp.bool_).reshape(1)
+        allowed = get_cuda_runtime().copy_device_to_host(
+            d_allowed,
+            reason="segmented union polygon-family admission scalar fence",
+        )
+        return bool(allowed[0])
+
     valid_tags = np.isin(geometries.tags[geometries.validity], list(polygon_tags))
     return bool(np.all(valid_tags))
 
@@ -31,8 +59,13 @@ def group_indices(start: int, end: int) -> np.ndarray:
     return np.arange(start, end, dtype=np.intp)
 
 
-def valid_row_indices(owned: OwnedGeometryArray) -> np.ndarray:
+def valid_row_indices(owned: OwnedGeometryArray):
     """Return indices of valid rows in an OwnedGeometryArray."""
+    if cp is not None and getattr(owned, "device_state", None) is not None:
+        return cp.flatnonzero(cp.asarray(owned._ensure_device_state().validity)).astype(
+            cp.int64,
+            copy=False,
+        )
     return np.flatnonzero(owned.validity)
 
 

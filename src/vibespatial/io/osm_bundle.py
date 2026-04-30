@@ -13,6 +13,7 @@ from vibespatial.api._native_results import (
     NativeTabularResult,
     _concat_native_tabular_results,
 )
+from vibespatial.cuda._runtime import get_cuda_runtime
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import FAMILY_TAGS
 
@@ -187,7 +188,14 @@ def _build_osm_partition_frame(
     data["osm_element"] = osm_element
 
     if ids is not None:
-        host_ids = ids.get() if hasattr(ids, "get") else np.asarray(ids)
+        host_ids = (
+            get_cuda_runtime().copy_device_to_host(
+                ids,
+                reason=f"osm {element} id column export",
+            )
+            if hasattr(ids, "get")
+            else np.asarray(ids)
+        )
         data["osm_id"] = np.asarray(host_ids, copy=False)
 
     if tags is None:

@@ -9,15 +9,20 @@ Covers:
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import box
+from shapely.geometry import Polygon, box
 
 import geopandas
 import vibespatial
 from tests.upstream.geopandas.tests.util import _NATURALEARTH_LOWRES
+from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
+from vibespatial.runtime.fallbacks import STRICT_NATIVE_ENV_VAR, StrictNativeFallbackError
 from vibespatial.runtime.residency import Residency
 
 # ---------------------------------------------------------------------------
@@ -34,6 +39,51 @@ def _has_gpu() -> bool:
 
 
 requires_gpu = pytest.mark.skipif(not _has_gpu(), reason="GPU not available")
+
+
+def test_union_all_gpu_has_no_raw_cupy_scalar_syncs():
+    """Device scalar branches must use named runtime fences."""
+    source = Path("src/vibespatial/constructive/union_all.py").read_text()
+    tree = ast.parse(source)
+    failures: list[str] = []
+
+    cupy_reductions = {
+        "all",
+        "any",
+        "sum",
+        "count_nonzero",
+        "max",
+        "min",
+        "nanmax",
+        "nanmin",
+    }
+
+    def _contains_cupy_reduction(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == "cp"
+            and child.func.attr in cupy_reductions
+            for child in ast.walk(node)
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "item":
+                failures.append(f"raw .item() at line {node.lineno}")
+            continue
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"bool", "int", "float"}
+            and node.args
+        ):
+            continue
+        if _contains_cupy_reduction(node.args[0]):
+            failures.append(f"raw {node.func.id}(cp reduction) at line {node.lineno}")
+
+    assert failures == []
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +143,86 @@ class TestUnionAllGPU:
             f"GPU union_all != Shapely union_all\n"
             f"  GPU area={result_geom.area}, expected area={expected.area}"
         )
+
+    def test_known_coverage_union_reuses_validity_cache_without_scalar_fences(self):
+        """Known-coverage paths should trust seeded validity cache metadata."""
+        from vibespatial.constructive import binary_constructive as binary_module
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+        from vibespatial.geometry.owned import seed_all_validity_cache
+
+        left = from_shapely_geometries([box(0, 0, 1, 1)], residency=Residency.DEVICE)
+        right = from_shapely_geometries([box(1, 0, 2, 1)], residency=Residency.DEVICE)
+        for owned in (left, right):
+            seed_all_validity_cache(owned)
+            owned._validity = None
+
+        reset_d2h_transfer_count()
+        result = binary_module._dispatch_single_row_polygon_known_coverage_union_gpu(
+            left,
+            right,
+        )
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert result is not None
+        assert "binary constructive row-validity scalar fence" not in reasons
+
+        left_rows = from_shapely_geometries(
+            [box(0, 0, 1, 1), box(10, 0, 11, 1)],
+            residency=Residency.DEVICE,
+        )
+        right_rows = from_shapely_geometries(
+            [box(1, 0, 2, 1), box(11, 0, 12, 1)],
+            residency=Residency.DEVICE,
+        )
+        for owned in (left_rows, right_rows):
+            seed_all_validity_cache(owned)
+            owned._validity = None
+
+        reset_d2h_transfer_count()
+        result = binary_module._dispatch_row_aligned_polygon_known_coverage_union_gpu(
+            left_rows,
+            right_rows,
+        )
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert result is not None
+        assert result._current_cached_validity_mask() is not None
+        assert "binary constructive all-validity scalar fence" not in reasons
+
+        reset_d2h_transfer_count()
+        assert binary_module._all_rows_valid(result)
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+        assert "binary constructive all-validity scalar fence" not in reasons
+
+    def test_face_assembled_union_seeds_validity_cache_without_scalar_fences(self):
+        """Exact face assembly should seed validity for immediate union consumers."""
+        from vibespatial.constructive import binary_constructive as binary_module
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+        from vibespatial.geometry.owned import seed_all_validity_cache
+
+        left = from_shapely_geometries([box(0, 0, 2, 2)], residency=Residency.DEVICE)
+        right = from_shapely_geometries([box(1, 0, 3, 2)], residency=Residency.DEVICE)
+        for owned in (left, right):
+            seed_all_validity_cache(owned)
+            owned._validity = None
+
+        reset_d2h_transfer_count()
+        result = binary_module._dispatch_single_row_polygon_partition_union_gpu(
+            left,
+            right,
+        )
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert result is not None
+        assert result._current_cached_validity_mask() is not None
+        assert "binary constructive row-validity scalar fence" not in reasons
+        assert "binary constructive all-validity scalar fence" not in reasons
 
     def test_non_overlapping_polygons(self):
         """Union of non-overlapping polygons."""
@@ -288,6 +418,123 @@ class TestUnionAllGPU:
         assert bool(shapely.is_valid(result_geom))
         assert _geom_equiv(result_geom, expected)
 
+    def test_union_all_filters_empty_device_rows_before_tree_reduce(self, monkeypatch):
+        """Global union should drop structural empty rows without host geometry export."""
+        from vibespatial.constructive import union_all as union_all_module
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+
+        owned = from_shapely_geometries(
+            [Polygon(), box(0, 0, 1, 1)],
+            residency=Residency.DEVICE,
+        )
+        owned._validity = None
+        owned._tags = None
+        owned._family_row_offsets = None
+
+        def _fail_host_metadata(*_args, **_kwargs):
+            raise AssertionError("union_all empty-row filter should stay device-native")
+
+        def _fail_tree_reduce(*_args, **_kwargs):
+            raise AssertionError("empty rows should filter before tree reduction")
+
+        monkeypatch.setattr(type(owned), "_ensure_host_metadata", _fail_host_metadata)
+        monkeypatch.setattr(union_all_module, "_tree_reduce_global", _fail_tree_reduce)
+        reset_d2h_transfer_count()
+
+        result = union_all_module.union_all_gpu_owned(owned, dispatch_mode="gpu")
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert result.row_count == 1
+        assert result.residency is Residency.DEVICE
+        assert reasons == [
+            "union_all valid-nonempty row count scalar fence",
+            "owned geometry device-take nested slice-size allocation fence",
+        ]
+
+    def test_coverage_union_all_filters_empty_device_rows_before_tree_reduce(self, monkeypatch):
+        """Coverage union uses the same structural device empty-row filter."""
+        from vibespatial.constructive import union_all as union_all_module
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+
+        owned = from_shapely_geometries(
+            [Polygon(), box(0, 0, 1, 1)],
+            residency=Residency.DEVICE,
+        )
+        owned._validity = None
+        owned._tags = None
+        owned._family_row_offsets = None
+
+        def _fail_host_metadata(*_args, **_kwargs):
+            raise AssertionError("coverage empty-row filter should stay device-native")
+
+        def _fail_tree_reduce(*_args, **_kwargs):
+            raise AssertionError("empty rows should filter before tree reduction")
+
+        monkeypatch.setattr(type(owned), "_ensure_host_metadata", _fail_host_metadata)
+        monkeypatch.setattr(union_all_module, "_tree_reduce_global", _fail_tree_reduce)
+        reset_d2h_transfer_count()
+
+        result = union_all_module.coverage_union_all_gpu_owned(owned, dispatch_mode="gpu")
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert result.row_count == 1
+        assert result.residency is Residency.DEVICE
+        assert reasons == [
+            "coverage_union_all valid-nonempty row count scalar fence",
+            "owned geometry device-take nested slice-size allocation fence",
+        ]
+
+    def test_global_union_all_empty_device_rows_return_device_empty(self, monkeypatch):
+        """All-empty device inputs should not round-trip through host empties."""
+        from vibespatial.constructive import union_all as union_all_module
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+
+        def _fail_host_metadata(*_args, **_kwargs):
+            raise AssertionError("all-empty global union should stay device-native")
+
+        def _fail_tree_reduce(*_args, **_kwargs):
+            raise AssertionError("all-empty input should not enter tree reduction")
+
+        monkeypatch.setattr(
+            OwnedGeometryArray,
+            "_ensure_host_metadata",
+            _fail_host_metadata,
+        )
+        monkeypatch.setattr(union_all_module, "_tree_reduce_global", _fail_tree_reduce)
+
+        for fn_name, reason in (
+            ("union_all_gpu_owned", "union_all valid-nonempty row count scalar fence"),
+            (
+                "coverage_union_all_gpu_owned",
+                "coverage_union_all valid-nonempty row count scalar fence",
+            ),
+        ):
+            owned = from_shapely_geometries(
+                [Polygon(), Polygon()],
+                residency=Residency.DEVICE,
+            )
+            owned._validity = None
+            owned._tags = None
+            owned._family_row_offsets = None
+            reset_d2h_transfer_count()
+
+            result = getattr(union_all_module, fn_name)(owned, dispatch_mode="gpu")
+            reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+            assert result.row_count == 1
+            assert result.residency is Residency.DEVICE
+            assert result.device_state is not None
+            assert reasons == [reason]
+
     def test_single_row_union_preserves_enclosed_hole(self):
         """Single-row union must not fill holes created by coverage boundaries."""
         from vibespatial.constructive.binary_constructive import binary_constructive_owned
@@ -467,6 +714,82 @@ class TestUnionAllGPU:
         assert _geom_equiv(_to_shapely(result), expected)
         assert call_rows == [(2, 2), (1, 1), (1, 1)]
 
+    def test_strict_native_tree_reduce_fallback_is_observable(self, monkeypatch):
+        """Tree-reduction failures must hit strict-native before CPU reduce."""
+        from vibespatial.constructive import union_all as union_all_module
+
+        monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+        monkeypatch.setattr(
+            union_all_module,
+            "_spatially_localize_polygon_union_inputs",
+            lambda owned: owned,
+        )
+        monkeypatch.setattr(
+            union_all_module,
+            "_try_exact_union_disjoint_bbox_components",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            union_all_module,
+            "_try_exact_union_bbox_disjoint_color_subsets",
+            lambda *_args, **_kwargs: None,
+        )
+
+        def _fail_tree_reduce(*_args, **_kwargs):
+            raise RuntimeError("forced union tree failure")
+
+        monkeypatch.setattr(union_all_module, "_tree_reduce_global", _fail_tree_reduce)
+        owned = from_shapely_geometries(
+            [box(0, 0, 2, 2), box(1, 0, 3, 2)],
+            residency=Residency.DEVICE,
+        )
+        vibespatial.clear_fallback_events()
+
+        with pytest.raises(StrictNativeFallbackError, match=r"constructive\.union_all_gpu"):
+            union_all_module.union_all_gpu_owned(owned, dispatch_mode="gpu")
+
+        events = vibespatial.get_fallback_events(clear=True)
+        assert events
+        assert events[-1].surface == "constructive.union_all_gpu"
+        assert events[-1].reason == "GPU tree reduction failed"
+        assert events[-1].d2h_transfer is True
+
+    def test_strict_native_pairwise_decline_is_not_swallowed(self, monkeypatch):
+        """Pairwise strict-native declines inside tree reduction must propagate."""
+        from vibespatial.constructive import union_all as union_all_module
+
+        monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+        monkeypatch.setattr(
+            union_all_module,
+            "_spatially_localize_polygon_union_inputs",
+            lambda owned: owned,
+        )
+        monkeypatch.setattr(
+            union_all_module,
+            "_try_exact_union_disjoint_bbox_components",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            union_all_module,
+            "_try_exact_union_bbox_disjoint_color_subsets",
+            lambda *_args, **_kwargs: None,
+        )
+
+        def _strict_pairwise_decline(*_args, **_kwargs):
+            raise StrictNativeFallbackError("forced pairwise strict decline")
+
+        monkeypatch.setattr(
+            "vibespatial.constructive.binary_constructive.binary_constructive_owned",
+            _strict_pairwise_decline,
+        )
+        owned = from_shapely_geometries(
+            [box(0, 0, 2, 2), box(1, 0, 3, 2)],
+            residency=Residency.DEVICE,
+        )
+
+        with pytest.raises(StrictNativeFallbackError, match="forced pairwise strict decline"):
+            union_all_module.union_all_gpu_owned(owned, dispatch_mode="gpu")
+
     def test_multipolygon_assembly_stays_device_resident(self, strict_device_guard):
         """Single-row union assembly helper should keep routing metadata on device."""
         from vibespatial.constructive.union_all import _assemble_multipolygon_gpu
@@ -529,6 +852,39 @@ class TestCoverageUnionAllGPU:
         result = coverage_union_all_gpu_owned(owned)
         result_geom = _to_shapely(result)
         assert _geom_equiv(result_geom, poly)
+
+    def test_strict_native_tree_reduce_fallback_is_observable(self, monkeypatch):
+        """Coverage reduction failures must hit strict-native before CPU reduce."""
+        from vibespatial.constructive import union_all as union_all_module
+
+        monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+        monkeypatch.setattr(
+            union_all_module,
+            "_spatially_localize_polygon_union_inputs",
+            lambda owned: owned,
+        )
+
+        def _fail_tree_reduce(*_args, **_kwargs):
+            raise RuntimeError("forced coverage tree failure")
+
+        monkeypatch.setattr(union_all_module, "_tree_reduce_global", _fail_tree_reduce)
+        owned = from_shapely_geometries(
+            [box(0, 0, 1, 1), box(1, 0, 2, 1)],
+            residency=Residency.DEVICE,
+        )
+        vibespatial.clear_fallback_events()
+
+        with pytest.raises(
+            StrictNativeFallbackError,
+            match=r"constructive\.coverage_union_all_gpu",
+        ):
+            union_all_module.coverage_union_all_gpu_owned(owned, dispatch_mode="gpu")
+
+        events = vibespatial.get_fallback_events(clear=True)
+        assert events
+        assert events[-1].surface == "constructive.coverage_union_all_gpu"
+        assert events[-1].reason == "GPU tree reduction failed"
+        assert events[-1].d2h_transfer is True
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +970,34 @@ class TestIntersectionAllGPU:
         expected = shapely.intersection(box(0, 0, 3, 3), box(1, 1, 4, 4))
         assert _geom_equiv(result_geom, expected)
 
+    def test_strict_native_tree_reduce_fallback_is_observable(self, monkeypatch):
+        """Intersection reduction failures must hit strict-native before CPU reduce."""
+        from vibespatial.constructive import union_all as union_all_module
+
+        monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+        def _fail_tree_reduce(*_args, **_kwargs):
+            raise RuntimeError("forced intersection tree failure")
+
+        monkeypatch.setattr(union_all_module, "_tree_reduce_global", _fail_tree_reduce)
+        owned = from_shapely_geometries(
+            [box(0, 0, 3, 3), box(1, 1, 4, 4)],
+            residency=Residency.DEVICE,
+        )
+        vibespatial.clear_fallback_events()
+
+        with pytest.raises(
+            StrictNativeFallbackError,
+            match=r"constructive\.intersection_all_gpu",
+        ):
+            union_all_module.intersection_all_gpu_owned(owned, dispatch_mode="gpu")
+
+        events = vibespatial.get_fallback_events(clear=True)
+        assert events
+        assert events[-1].surface == "constructive.intersection_all_gpu"
+        assert events[-1].reason == "GPU tree reduction failed"
+        assert events[-1].d2h_transfer is True
+
 
 # ---------------------------------------------------------------------------
 # unary_union_gpu tests
@@ -660,8 +1044,6 @@ class TestGeometryArrayDispatch:
 
     def test_union_all_unary_dispatch(self):
         """GeometryArray.union_all(method='unary') dispatches to GPU."""
-        from vibespatial.api.geometry_array import GeometryArray
-
         polys = [box(0, 0, 2, 2), box(1, 1, 3, 3)]
         owned = from_shapely_geometries(polys)
         ga = GeometryArray.from_owned(owned)
@@ -675,8 +1057,6 @@ class TestGeometryArrayDispatch:
 
     def test_union_all_coverage_dispatch(self):
         """GeometryArray.union_all(method='coverage') dispatches to GPU."""
-        from vibespatial.api.geometry_array import GeometryArray
-
         polys = [box(0, 0, 1, 1), box(1, 0, 2, 1)]
         owned = from_shapely_geometries(polys)
         ga = GeometryArray.from_owned(owned)
@@ -690,8 +1070,6 @@ class TestGeometryArrayDispatch:
 
     def test_intersection_all_dispatch(self):
         """GeometryArray.intersection_all() dispatches to GPU."""
-        from vibespatial.api.geometry_array import GeometryArray
-
         polys = [box(0, 0, 3, 3), box(1, 1, 4, 4)]
         owned = from_shapely_geometries(polys)
         ga = GeometryArray.from_owned(owned)
@@ -702,3 +1080,45 @@ class TestGeometryArrayDispatch:
         expected = shapely.intersection_all(arr)
 
         assert _geom_equiv(result, expected)
+
+    def test_union_all_strict_native_decline_is_not_swallowed(self, monkeypatch):
+        """Strict native errors from GPU reductions must not fall through to Shapely."""
+        import vibespatial.constructive.union_all as union_all_module
+
+        def _strict_decline(*_args, **_kwargs):
+            raise StrictNativeFallbackError("test strict native union decline")
+
+        monkeypatch.setattr(union_all_module, "union_all_gpu_owned", _strict_decline)
+
+        ga = GeometryArray.from_owned(from_shapely_geometries([box(0, 0, 1, 1), box(2, 0, 3, 1)]))
+
+        with pytest.raises(StrictNativeFallbackError, match="strict native union decline"):
+            ga.union_all(method="unary")
+
+    def test_public_union_all_gpu_failure_is_observable_before_shapely(self, monkeypatch):
+        """Wrapper-level GPU failures must raise in strict mode before CPU reduce."""
+        import vibespatial.constructive.union_all as union_all_module
+
+        def _fail_native_reduction(*_args, **_kwargs):
+            raise RuntimeError("forced public wrapper reduction failure")
+
+        def _fail_shapely(*_args, **_kwargs):
+            raise AssertionError("strict native should stop before shapely")
+
+        monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+        monkeypatch.setattr(union_all_module, "union_all_gpu_owned", _fail_native_reduction)
+        monkeypatch.setattr(shapely, "union_all", _fail_shapely)
+        vibespatial.clear_fallback_events()
+
+        ga = GeometryArray.from_owned(
+            from_shapely_geometries([box(0, 0, 1, 1), box(2, 0, 3, 1)])
+        )
+
+        with pytest.raises(StrictNativeFallbackError, match=r"geopandas\.array\.union_all"):
+            ga.union_all(method="unary")
+
+        events = vibespatial.get_fallback_events(clear=True)
+        assert events
+        assert events[-1].surface == "geopandas.array.union_all"
+        assert events[-1].reason == "native global reduction failed; falling back to Shapely"
+        assert events[-1].requested.value == "gpu"

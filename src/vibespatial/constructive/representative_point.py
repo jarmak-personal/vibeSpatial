@@ -258,6 +258,35 @@ def representative_point_owned(
     return point_owned_from_xy(cx, cy)
 
 
+def representative_point_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = representative_point_owned(
+        owned,
+        dispatch_mode=dispatch_mode,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="representative_point",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )
+
+
 def _fill_point_representatives(
     owned: OwnedGeometryArray,
     tags: np.ndarray,

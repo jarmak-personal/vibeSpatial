@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
 from shapely.geometry import MultiPolygon, Point, Polygon, box
 
+import vibespatial.api as geopandas
 from vibespatial import (
     DEFAULT_CONSUMER_PROFILE,
     DeviceSnapshot,
@@ -12,9 +16,36 @@ from vibespatial import (
     from_shapely_geometries,
     has_gpu_runtime,
 )
-from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
+from vibespatial.kernels.predicates.point_in_polygon import (
+    point_in_polygon,
+    point_in_polygon_expression,
+)
 from vibespatial.runtime.residency import Residency
 from vibespatial.testing import compare_with_shapely, point_in_polygon_reference
+
+
+def test_point_predicate_d2h_exports_are_runtime_accounted() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    paths = (
+        repo_root / "src" / "vibespatial" / "kernels" / "core" / "geometry_analysis.py",
+        repo_root / "src" / "vibespatial" / "kernels" / "predicates" / "point_in_polygon.py",
+    )
+    offenders: list[str] = []
+    for path in paths:
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr == "asnumpy":
+                offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+            if func.attr == "copy_device_to_host" and not any(
+                keyword.arg == "reason" for keyword in node.keywords
+            ):
+                offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+    assert offenders == []
 
 
 @compare_with_shapely(reference=point_in_polygon_reference, handle_empty=True)
@@ -341,3 +372,44 @@ def test_public_return_device_path_does_not_materialize_lazy_device_metadata() -
         assert hasattr(result, "__cuda_array_interface__")
 
     assert cp.asnumpy(result).tolist() == [True, True, False]
+
+
+@pytest.mark.gpu
+def test_point_in_polygon_expression_feeds_native_rowset_without_public_export() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+
+    points = from_shapely_geometries(
+        [Point(0.5, 0.5), Point(2.0, 2.0), Point(0.0, 0.0)],
+        residency=Residency.DEVICE,
+    )
+    polygons = from_shapely_geometries(
+        [box(0, 0, 1, 1), box(0, 0, 1, 1), box(0, 0, 1, 1)],
+        residency=Residency.DEVICE,
+    )
+
+    geopandas.clear_dispatch_events()
+    with assert_zero_d2h_transfers():
+        expression = point_in_polygon_expression(
+            points,
+            polygons,
+            dispatch_mode=ExecutionMode.GPU,
+            source_token="points",
+        )
+        rowset = expression.equal_to(True)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert expression.is_device
+    assert expression.source_token == "points"
+    assert expression.source_row_count == 3
+    assert any(
+        event.implementation == "native_point_in_polygon_expression_gpu"
+        and "carrier=NativeExpression" in event.detail
+        for event in events
+    )
+    assert cp.asnumpy(expression.values).tolist() == [True, False, True]
+    assert cp.asnumpy(rowset.positions).tolist() == [0, 2]

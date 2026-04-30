@@ -22,6 +22,10 @@ from shapely.geometry import (
     Polygon,
 )
 
+import vibespatial
+from vibespatial.runtime.fallbacks import STRICT_NATIVE_ENV_VAR, StrictNativeFallbackError
+from vibespatial.runtime.residency import Residency
+
 
 def _has_gpu():
     try:
@@ -314,3 +318,38 @@ class TestMinimumRotatedRectangleGPU:
         result_geoms = result._data if hasattr(result, "_data") else result.to_shapely()
         result_area = shapely.area(result_geoms)[0]
         np.testing.assert_allclose(result_area, 1.0, atol=1e-10)
+
+    def test_strict_native_gpu_failure_is_not_swallowed(self, monkeypatch):
+        """Strict-native GPU failures must not continue to CPU rectangles."""
+        from vibespatial.constructive import (
+            minimum_rotated_rectangle as min_rect_module,
+        )
+        from vibespatial.geometry.owned import from_shapely_geometries
+        from vibespatial.runtime import ExecutionMode
+
+        monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+        def _fail_gpu(*_args, **_kwargs):
+            raise RuntimeError("forced min-rect failure")
+
+        monkeypatch.setattr(min_rect_module, "_min_rect_gpu", _fail_gpu)
+        owned = from_shapely_geometries(
+            [Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])],
+            residency=Residency.DEVICE,
+        )
+        vibespatial.clear_fallback_events()
+
+        with pytest.raises(
+            StrictNativeFallbackError,
+            match=r"minimum_rotated_rectangle",
+        ):
+            min_rect_module.minimum_rotated_rectangle_owned(
+                owned,
+                dispatch_mode=ExecutionMode.GPU,
+            )
+
+        events = vibespatial.get_fallback_events(clear=True)
+        assert events
+        assert events[-1].surface == "geopandas.array.minimum_rotated_rectangle"
+        assert events[-1].reason == "GPU minimum_rotated_rectangle failed"
+        assert events[-1].d2h_transfer is True

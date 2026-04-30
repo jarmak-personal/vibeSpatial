@@ -66,6 +66,25 @@ def _sync_gpu_profile_stage() -> None:
     get_cuda_runtime().synchronize()
 
 
+def _profile_pair_kind_counts(d_kinds) -> tuple[int, int, int]:
+    if cp is not None and hasattr(d_kinds, "__cuda_array_interface__"):
+        summary = cp.empty(3, dtype=cp.int64)
+        summary[0] = cp.count_nonzero(d_kinds == 1)
+        summary[1] = cp.count_nonzero(d_kinds == 2)
+        summary[2] = cp.count_nonzero(d_kinds == 3)
+        host = get_cuda_runtime().copy_device_to_host(
+            summary,
+            reason="profile overlay pair-kind count summary scalar fence",
+        )
+        counts = np.asarray(host).reshape(-1)
+        return int(counts[0]), int(counts[1]), int(counts[2])
+    return (
+        int(np.count_nonzero(d_kinds == 1)),
+        int(np.count_nonzero(d_kinds == 2)),
+        int(np.count_nonzero(d_kinds == 3)),
+    )
+
+
 def _build_join_inputs(rows: int, *, overlap_ratio: float) -> tuple[np.ndarray, np.ndarray]:
     tree = np.asarray(
         list(
@@ -444,9 +463,10 @@ def profile_overlay_kernel(
         if actual_selected_runtime is ExecutionMode.GPU and result.device_state is not None and cp is not None:
             d_kinds = cp.asarray(result.device_state.kinds)
             stage.metadata["ambiguous_pairs"] = int(result.device_state.ambiguous_rows.size)
-            stage.metadata["proper_pairs"] = int(cp.count_nonzero(d_kinds == 1))
-            stage.metadata["touch_pairs"] = int(cp.count_nonzero(d_kinds == 2))
-            stage.metadata["overlap_pairs"] = int(cp.count_nonzero(d_kinds == 3))
+            proper_pairs, touch_pairs, overlap_pairs = _profile_pair_kind_counts(d_kinds)
+            stage.metadata["proper_pairs"] = proper_pairs
+            stage.metadata["touch_pairs"] = touch_pairs
+            stage.metadata["overlap_pairs"] = overlap_pairs
         else:
             stage.metadata["ambiguous_pairs"] = int(result.ambiguous_rows.size)
             stage.metadata["proper_pairs"] = int(np.count_nonzero(result.kinds == 1))

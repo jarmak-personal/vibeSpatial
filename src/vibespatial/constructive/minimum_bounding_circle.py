@@ -72,9 +72,14 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     build_device_resident_owned,
 )
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import (
+    StrictNativeFallbackError,
+    record_fallback_event,
+    strict_native_mode_enabled,
+)
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.residency import Residency
@@ -340,7 +345,10 @@ def _minimum_bounding_radius_gpu(owned: OwnedGeometryArray) -> np.ndarray:
 
     # Single D2H transfer at pipeline end
     runtime.synchronize()
-    return runtime.copy_device_to_host(d_radius)
+    return runtime.copy_device_to_host(
+        d_radius,
+        reason="minimum-bounding-radius result host export",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -630,21 +638,40 @@ def minimum_bounding_circle_owned(
         current_residency=owned.residency,
     )
 
-    if selection.selected is ExecutionMode.GPU and cp is not None:
+    selected_mode = selection.selected
+    if strict_native_mode_enabled() and has_gpu_runtime() and cp is not None:
+        selected_mode = ExecutionMode.GPU
+
+    if selected_mode is ExecutionMode.GPU and cp is not None:
         precision_plan = selection.precision_plan
         families_with_rows = [
-            fam for fam, buf in owned.families.items()
-            if buf.row_count > 0
+            fam for fam in owned.families
+            if owned.family_has_rows(fam)
         ]
         is_single_family = len(families_with_rows) == 1
 
         if is_single_family:
             try:
                 result = _minimum_bounding_circle_gpu(owned)
-            except Exception:
+            except StrictNativeFallbackError:
+                raise
+            except Exception as exc:
                 logger.debug(
                     "GPU minimum_bounding_circle failed, falling back to CPU",
                     exc_info=True,
+                )
+                record_fallback_event(
+                    surface="geopandas.array.minimum_bounding_circle",
+                    reason="GPU minimum_bounding_circle failed",
+                    detail=(
+                        f"rows={row_count}, "
+                        f"families={','.join(fam.value for fam in families_with_rows)}, "
+                        f"precision={precision_plan.compute_precision.value}, "
+                        f"error={type(exc).__name__}"
+                    ),
+                    requested=selection.requested,
+                    selected=ExecutionMode.CPU,
+                    d2h_transfer=owned.residency is Residency.DEVICE,
                 )
             else:
                 record_dispatch_event(
@@ -657,6 +684,18 @@ def minimum_bounding_circle_owned(
                     detail=f"precision={precision_plan.compute_precision}",
                 )
                 return result
+        else:
+            record_fallback_event(
+                surface="geopandas.array.minimum_bounding_circle",
+                reason="GPU minimum_bounding_circle requires a single geometry family",
+                detail=(
+                    f"rows={row_count}, "
+                    f"families={','.join(fam.value for fam in families_with_rows)}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.CPU,
+                d2h_transfer=owned.residency is Residency.DEVICE,
+            )
 
     result = _minimum_bounding_circle_cpu(owned)
     record_dispatch_event(
@@ -668,6 +707,37 @@ def minimum_bounding_circle_owned(
         reason=selection.reason,
     )
     return result
+
+
+def minimum_bounding_circle_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = minimum_bounding_circle_owned(
+        owned,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="minimum_bounding_circle",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )
 
 
 def minimum_bounding_radius_owned(
@@ -708,11 +778,15 @@ def minimum_bounding_radius_owned(
         current_residency=owned.residency,
     )
 
-    if selection.selected is ExecutionMode.GPU and cp is not None:
+    selected_mode = selection.selected
+    if strict_native_mode_enabled() and has_gpu_runtime() and cp is not None:
+        selected_mode = ExecutionMode.GPU
+
+    if selected_mode is ExecutionMode.GPU and cp is not None:
         precision_plan = selection.precision_plan
         families_with_rows = [
-            fam for fam, buf in owned.families.items()
-            if buf.row_count > 0
+            fam for fam in owned.families
+            if owned.family_has_rows(fam)
         ]
         is_single_family = len(families_with_rows) == 1
 
@@ -721,10 +795,25 @@ def minimum_bounding_radius_owned(
                 result = _minimum_bounding_radius_gpu(owned)
                 # Mark invalid rows as NaN
                 result[~owned.validity] = np.nan
-            except Exception:
+            except StrictNativeFallbackError:
+                raise
+            except Exception as exc:
                 logger.debug(
                     "GPU minimum_bounding_radius failed, falling back to CPU",
                     exc_info=True,
+                )
+                record_fallback_event(
+                    surface="geopandas.array.minimum_bounding_radius",
+                    reason="GPU minimum_bounding_radius failed",
+                    detail=(
+                        f"rows={row_count}, "
+                        f"families={','.join(fam.value for fam in families_with_rows)}, "
+                        f"precision={precision_plan.compute_precision.value}, "
+                        f"error={type(exc).__name__}"
+                    ),
+                    requested=selection.requested,
+                    selected=ExecutionMode.CPU,
+                    d2h_transfer=owned.residency is Residency.DEVICE,
                 )
             else:
                 record_dispatch_event(
@@ -737,6 +826,18 @@ def minimum_bounding_radius_owned(
                     detail=f"precision={precision_plan.compute_precision}",
                 )
                 return result
+        else:
+            record_fallback_event(
+                surface="geopandas.array.minimum_bounding_radius",
+                reason="GPU minimum_bounding_radius requires a single geometry family",
+                detail=(
+                    f"rows={row_count}, "
+                    f"families={','.join(fam.value for fam in families_with_rows)}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.CPU,
+                d2h_transfer=owned.residency is Residency.DEVICE,
+            )
 
     result = _minimum_bounding_radius_cpu(owned)
     record_dispatch_event(

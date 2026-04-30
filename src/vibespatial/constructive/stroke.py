@@ -312,6 +312,46 @@ def offset_curve_owned(
     )
 
 
+def offset_curve_native_tabular_result(
+    values: Sequence[object | None] | np.ndarray,
+    distance,
+    *,
+    quad_segs: int = 8,
+    join_style: str = "round",
+    mitre_limit: float = 5.0,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = offset_curve_owned(
+        values,
+        distance,
+        quad_segs=quad_segs,
+        join_style=join_style,
+        mitre_limit=mitre_limit,
+    )
+    if result.owned_result is None:
+        raise ValueError(
+            "offset_curve native tabular lowering requires admitted row-aligned "
+            "LineString output"
+        )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result.owned_result,
+        operation="offset_curve",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )
+
+
 def evaluate_geopandas_buffer(
     values,
     distance,

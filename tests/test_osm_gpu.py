@@ -18,6 +18,7 @@ external dependencies (osmium, etc.) required.
 """
 from __future__ import annotations
 
+import ast
 import struct
 import tempfile
 import zlib
@@ -36,6 +37,42 @@ except (ImportError, ModuleNotFoundError):
     HAS_GPU = False
 
 needs_gpu = pytest.mark.skipif(not HAS_GPU, reason="GPU not available")
+
+
+def test_osm_gpu_way_processing_has_no_raw_cupy_scalar_syncs() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "src" / "vibespatial" / "io" / "osm_gpu.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+
+    def _contains_cupy_reduction(node: ast.AST) -> bool:
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "cp"
+            and node.func.attr in {"any", "all", "sum", "count_nonzero", "max", "min"}
+        ):
+            return True
+        return any(_contains_cupy_reduction(child) for child in ast.iter_child_nodes(node))
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "item":
+            offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}: .item()")
+        if (
+            isinstance(func, ast.Name)
+            and func.id in {"bool", "int", "float"}
+            and node.args
+            and _contains_cupy_reduction(node.args[0])
+        ):
+            offenders.append(
+                f"{path.relative_to(repo_root)}:{node.lineno}: {func.id}(cp.*)"
+            )
+
+    assert offenders == []
 
 
 # ---------------------------------------------------------------------------

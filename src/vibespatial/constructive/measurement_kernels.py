@@ -47,6 +47,8 @@ void polygon_area_cooperative(
             __syncthreads();  /* keep block synchronized even on skip */
             continue;
         }}
+        const double ring_center_x = x[cs];
+        const double ring_center_y = y[cs];
 
         /* Each thread accumulates partial cross product sum with Kahan */
         compute_t partial_sum = (compute_t)0.0;
@@ -55,7 +57,11 @@ void polygon_area_cooperative(
         for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {{
             const int cur = cs + i;
             const int nxt = cs + ((i + 1) % n);
-            KAHAN_ADD(partial_sum, CX(x[cur]) * CY(y[nxt]) - CX(x[nxt]) * CY(y[cur]), partial_c);
+            const compute_t xi  = (compute_t)(x[cur] - ring_center_x);
+            const compute_t yi  = (compute_t)(y[cur] - ring_center_y);
+            const compute_t xi1 = (compute_t)(x[nxt] - ring_center_x);
+            const compute_t yi1 = (compute_t)(y[nxt] - ring_center_y);
+            KAHAN_ADD(partial_sum, xi * yi1 - xi1 * yi, partial_c);
         }}
 
         /* Warp-level reduction via shared Kahan shuffle macro */
@@ -129,6 +135,8 @@ extern "C" __global__ void polygon_area(
         /* Strip closure vertex if present. */
         n = vs_strip_closure(x, y, cs, ce, n, 1e-24);
         if (n < 3) continue;
+        const double ring_center_x = x[cs];
+        const double ring_center_y = y[cs];
 
         compute_t sum_cross = (compute_t)0.0;
         compute_t c_cross = (compute_t)0.0;
@@ -136,10 +144,10 @@ extern "C" __global__ void polygon_area(
         for (int i = 0; i < n; i++) {{
             const int cur = cs + i;
             const int nxt = cs + ((i + 1) % n);
-            const compute_t xi  = CX(x[cur]);
-            const compute_t yi  = CY(y[cur]);
-            const compute_t xi1 = CX(x[nxt]);
-            const compute_t yi1 = CY(y[nxt]);
+            const compute_t xi  = (compute_t)(x[cur] - ring_center_x);
+            const compute_t yi  = (compute_t)(y[cur] - ring_center_y);
+            const compute_t xi1 = (compute_t)(x[nxt] - ring_center_x);
+            const compute_t yi1 = (compute_t)(y[nxt] - ring_center_y);
             KAHAN_ADD(sum_cross, xi * yi1 - xi1 * yi, c_cross);
         }}
 
@@ -192,6 +200,8 @@ extern "C" __global__ void multipolygon_area(
             /* Strip closure vertex if present. */
             n = vs_strip_closure(x, y, cs, ce, n, 1e-24);
             if (n < 3) continue;
+            const double ring_center_x = x[cs];
+            const double ring_center_y = y[cs];
 
             compute_t sum_cross = (compute_t)0.0;
             compute_t c_cross = (compute_t)0.0;
@@ -199,10 +209,10 @@ extern "C" __global__ void multipolygon_area(
             for (int i = 0; i < n; i++) {{
                 const int cur = cs + i;
                 const int nxt = cs + ((i + 1) % n);
-                const compute_t xi  = CX(x[cur]);
-                const compute_t yi  = CY(y[cur]);
-                const compute_t xi1 = CX(x[nxt]);
-                const compute_t yi1 = CY(y[nxt]);
+                const compute_t xi  = (compute_t)(x[cur] - ring_center_x);
+                const compute_t yi  = (compute_t)(y[cur] - ring_center_y);
+                const compute_t xi1 = (compute_t)(x[nxt] - ring_center_x);
+                const compute_t yi1 = (compute_t)(y[nxt] - ring_center_y);
                 KAHAN_ADD(sum_cross, xi * yi1 - xi1 * yi, c_cross);
             }}
 

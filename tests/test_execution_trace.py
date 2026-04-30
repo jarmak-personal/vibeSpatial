@@ -159,6 +159,38 @@ def test_ping_pong_emits_warning() -> None:
     assert summary["h2d_transfers"] == 1
 
 
+def test_terminal_export_transfer_counts_without_ping_pong_warning() -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with execution_trace("terminal_export") as ctx:
+            notify_dispatch(
+                surface="gpu_kernel",
+                operation="compute",
+                selected=ExecutionMode.GPU,
+                implementation="gpu",
+            )
+            notify_transfer(
+                direction="h2d",
+                trigger="explicit-runtime-request",
+                reason="upload for GPU kernel",
+            )
+            notify_transfer(
+                direction="d2h",
+                trigger="cuda-runtime-copy",
+                reason="public result host export",
+                source="cuda_runtime",
+                bytes_transferred=16,
+                terminal_export=True,
+            )
+    warning_messages = [str(w.message) for w in caught]
+    assert not any("ping-pong" in message for message in warning_messages)
+    assert not any("D->H transfer" in message for message in warning_messages)
+    summary = ctx.summary()
+    assert summary["d2h_transfers"] == 1
+    assert summary["runtime_d2h_transfers"] == 1
+    assert summary["runtime_d2h_transfer_bytes"] == 16
+
+
 def test_summary_counts() -> None:
     with execution_trace("summary_test") as ctx:
         ctx.record_step(TraceStep("a", "op", ExecutionMode.GPU, "gpu"))

@@ -233,7 +233,12 @@ def _polygon_intersection_gpu(
     d_offsets = exclusive_sum(d_counts, synchronize=False)
 
     # Get total output vertices
-    total_verts = count_scatter_total(runtime, d_counts, d_offsets)
+    total_verts = count_scatter_total(
+        runtime,
+        d_counts,
+        d_offsets,
+        reason="polygon-polygon intersection vertex allocation fence",
+    )
 
     if total_verts == 0:
         # All intersections are empty

@@ -9,6 +9,9 @@ Tests cover:
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -17,6 +20,35 @@ from vibespatial import has_gpu_runtime
 requires_gpu = pytest.mark.skipif(
     not has_gpu_runtime(), reason="GPU not available"
 )
+
+
+def test_fused_index_hilbert_extent_has_no_raw_cupy_scalar_syncs() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "src" / "vibespatial" / "io" / "gpu_parse" / "indexing.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "item":
+            offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}: .item()")
+            continue
+        if (
+            isinstance(func, ast.Name)
+            and func.id in {"bool", "int", "float"}
+            and node.args
+            and isinstance(node.args[0], ast.Call)
+            and isinstance(node.args[0].func, ast.Attribute)
+            and isinstance(node.args[0].func.value, ast.Name)
+            and node.args[0].func.value.id == "cp"
+        ):
+            offenders.append(
+                f"{path.relative_to(repo_root)}:{node.lineno}: {func.id}(cp.*)"
+            )
+
+    assert offenders == []
 
 
 def _make_point_data(xs, ys):

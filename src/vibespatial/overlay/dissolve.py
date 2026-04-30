@@ -15,7 +15,7 @@ import shapely
 from shapely.geometry import GeometryCollection
 
 from vibespatial.api._native_grouped import NativeGrouped, NativeGroupedAttributeReduction
-from vibespatial.api._native_result_core import NativeAttributeTable
+from vibespatial.api._native_result_core import NativeAttributeTable, NativeGeometryProvenance
 from vibespatial.api._native_results import (
     GeometryNativeResult,
     NativeTabularResult,
@@ -34,6 +34,8 @@ from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_mode_enabled
 from vibespatial.runtime.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
 from vibespatial.runtime.provenance import provenance_rewrites_enabled, record_rewrite_event
+
+from ._host_boundary import overlay_bool_scalar, overlay_device_to_host, overlay_int_scalar
 
 try:
     import cupy as cp
@@ -55,7 +57,7 @@ _BUFFERED_LINE_EXACT_CPU_MAX_ROWS = 2_048
 _COVERAGE_REWRITE_MAX_CANDIDATE_PAIRS = 250_000
 _COVERAGE_REWRITE_NEGATIVE_PROBE_PAIRS = 1
 _NATIVE_GROUPED_ATTRIBUTE_REDUCERS = frozenset(
-    {"sum", "count", "mean", "min", "max", "first", "last"}
+    {"sum", "count", "mean", "min", "max", "first", "last", "any", "all"}
 )
 _NATIVE_GROUPED_TAKE_REDUCERS = frozenset({"first", "last"})
 logger = logging.getLogger(__name__)
@@ -114,6 +116,27 @@ def _canonicalize_polygonal_make_valid_values(values: np.ndarray) -> np.ndarray:
     )
 
 
+def _device_grouped_union_repair_needed(owned: OwnedGeometryArray) -> bool | None:
+    """Return whether grouped-union output needs repair without host metadata."""
+    cached = owned._current_cached_validity_mask()
+    if cached is not None:
+        return not bool(np.all(cached))
+    if owned.device_state is None or cp is None:
+        return None
+    from vibespatial.constructive.validity import validity_expression_owned
+
+    state = owned._ensure_device_state()
+    expression = validity_expression_owned(owned)
+    d_validity = cp.asarray(state.validity, dtype=cp.bool_)
+    d_valid_flags = cp.asarray(expression.values, dtype=cp.bool_)
+    d_repair_needed = (~d_valid_flags) & d_validity
+    repair_count = overlay_int_scalar(
+        cp.count_nonzero(d_repair_needed),
+        reason="dissolve grouped-union repair-needed count fence",
+    )
+    return repair_count > 0
+
+
 def _recompute_invalid_grouped_union_owned_rows(
     reduced: OwnedGeometryArray,
     *,
@@ -128,8 +151,56 @@ def _recompute_invalid_grouped_union_owned_rows(
         seed_all_validity_cache,
     )
 
+    repair_needed = _device_grouped_union_repair_needed(reduced)
+    if repair_needed is not None:
+        if not repair_needed:
+            seed_all_validity_cache(reduced)
+            return reduced
+        if reduced.device_state is not None:
+            from vibespatial.constructive.make_valid_pipeline import make_valid_owned
+
+            requested_mode = (
+                ExecutionMode.GPU
+                if strict_native_mode_enabled()
+                else ExecutionMode.AUTO
+            )
+            try:
+                mv_result = make_valid_owned(
+                    owned=reduced,
+                    dispatch_mode=requested_mode,
+                )
+            except Exception:
+                if strict_native_mode_enabled():
+                    raise
+            else:
+                if (
+                    mv_result.owned is not None
+                    and mv_result.selected is ExecutionMode.GPU
+                ):
+                    repaired_owned = mv_result.owned
+                    remaining_repair_needed = _device_grouped_union_repair_needed(
+                        repaired_owned,
+                    )
+                    if remaining_repair_needed is False:
+                        seed_all_validity_cache(repaired_owned)
+                        record_dispatch_event(
+                            surface="geopandas.geodataframe.dissolve",
+                            operation="grouped_union_boundary_repair",
+                            implementation="gpu_make_valid_subset",
+                            reason=(
+                                "repaired invalid grouped GPU union rows through "
+                                "native make-valid"
+                            ),
+                            detail=(
+                                f"groups={group_count}, "
+                                f"repaired={int(mv_result.repaired_rows.size)}"
+                            ),
+                            selected=ExecutionMode.GPU,
+                        )
+                        return repaired_owned
+
     invalid_mask = ~np.asarray(is_valid_owned(reduced), dtype=bool)
-    if not bool(np.all(reduced.validity)):
+    if invalid_mask.any() and not bool(np.all(reduced.validity)):
         invalid_mask = invalid_mask.copy()
         invalid_mask[~reduced.validity] = False
     if not invalid_mask.any():
@@ -228,6 +299,12 @@ class GroupedUnionResult:
 
 
 @dataclass(frozen=True)
+class _GroupedGeometryResult:
+    geometry: GeometryNativeResult
+    repaired: bool = False
+
+
+@dataclass(frozen=True)
 class DissolveBenchmark:
     dataset: str
     rows: int
@@ -243,14 +320,12 @@ class DissolveBenchmark:
         return self.baseline_elapsed_seconds / self.pipeline_elapsed_seconds
 
 
-def _grouped_union_geometry_result(
+def _grouped_union_geometry_payload(
     grouped_union: GroupedUnionResult,
     *,
     geometry_name: str,
     crs,
-) -> GeometryNativeResult:
-    from vibespatial.api.geoseries import GeoSeries
-
+) -> _GroupedGeometryResult:
     if grouped_union.owned is not None:
         return _repair_grouped_union_owned_if_needed(
             grouped_union.owned,
@@ -259,8 +334,74 @@ def _grouped_union_geometry_result(
             crs=crs,
         )
 
-    return GeometryNativeResult.from_geoseries(
-        GeoSeries(grouped_union.geometries, name=geometry_name, crs=crs)
+    values = np.asarray(grouped_union.geometries, dtype=object)
+    try:
+        from vibespatial.geometry.owned import from_shapely_geometries
+
+        owned = from_shapely_geometries(values.tolist())
+    except (NotImplementedError, TypeError, ValueError):
+        from vibespatial.api.geoseries import GeoSeries
+
+        geometry = GeometryNativeResult.from_geoseries(
+            GeoSeries(values, name=geometry_name, crs=crs)
+        )
+    else:
+        geometry = GeometryNativeResult.from_owned(owned, crs=crs)
+
+    return _GroupedGeometryResult(
+        geometry,
+        repaired=False,
+    )
+
+
+def _grouped_union_geometry_result(
+    grouped_union: GroupedUnionResult,
+    *,
+    geometry_name: str,
+    crs,
+) -> GeometryNativeResult:
+    return _grouped_union_geometry_payload(
+        grouped_union,
+        geometry_name=geometry_name,
+        crs=crs,
+    ).geometry
+
+
+def _grouped_constructive_provenance(
+    grouped_union: GroupedUnionResult,
+    *,
+    frame,
+    repaired: bool,
+) -> NativeGeometryProvenance:
+    operation = f"grouped_{grouped_union.method.value}_union"
+    if repaired:
+        operation = f"{operation}_repair"
+    source_rows: Any
+    if grouped_union.owned is not None:
+        from vibespatial.runtime.residency import Residency
+
+        if grouped_union.owned.residency is Residency.DEVICE and cp is not None:
+            source_rows = cp.arange(grouped_union.group_count, dtype=cp.int64)
+        else:
+            source_rows = np.arange(grouped_union.group_count, dtype=np.int64)
+    else:
+        source_rows = np.arange(grouped_union.group_count, dtype=np.int64)
+
+    source_tokens: tuple[str, ...] = ()
+    try:
+        from vibespatial.api._native_state import get_native_state
+
+        state = get_native_state(frame)
+        if state is not None:
+            source_tokens = (state.lineage_token,)
+    except Exception:
+        source_tokens = ()
+
+    return NativeGeometryProvenance(
+        operation=operation,
+        row_count=grouped_union.group_count,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
     )
 
 
@@ -271,15 +412,21 @@ def _grouped_constructive_result(
     aggregated_data: pd.DataFrame,
     as_index: bool,
 ) -> NativeTabularResult:
+    geometry_payload = _grouped_union_geometry_payload(
+        grouped_union,
+        geometry_name=frame.geometry.name,
+        crs=frame.crs,
+    )
     return _grouped_constructive_to_native_tabular_result(
-        geometry=_grouped_union_geometry_result(
-            grouped_union,
-            geometry_name=frame.geometry.name,
-            crs=frame.crs,
-        ),
+        geometry=geometry_payload.geometry,
         geometry_name=frame.geometry.name,
         as_index=as_index,
         attributes=aggregated_data,
+        provenance=_grouped_constructive_provenance(
+            grouped_union,
+            frame=frame,
+            repaired=geometry_payload.repaired,
+        ),
     )
 
 
@@ -754,7 +901,10 @@ def _native_dissolve_group_index_and_codes(
     observed: bool,
     sort: bool,
     dropna: bool,
-) -> tuple[pd.Index, np.ndarray, tuple[Any, ...]] | None:
+    normalized_method: DissolveUnionMethod | None = None,
+    grid_size: float | None = None,
+    allow_device_key_codes: bool = False,
+) -> tuple[pd.Index, Any, tuple[Any, ...]] | None:
     """Build the narrow group contract used by native dissolve reducers."""
     if level is not None:
         return None
@@ -763,6 +913,26 @@ def _native_dissolve_group_index_and_codes(
             pd.Index(np.asarray([0], dtype=np.int64)),
             np.zeros(len(frame), dtype=np.int32),
             tuple(),
+        )
+    if allow_device_key_codes:
+        device_contract = _native_device_plain_group_index_and_codes(
+            frame,
+            by=by,
+            normalized_method=normalized_method,
+            grid_size=grid_size,
+            observed=observed,
+            sort=sort,
+            dropna=dropna,
+        )
+        if device_contract is not None:
+            return device_contract
+    if isinstance(by, (list, tuple)):
+        return _native_multi_plain_group_index_and_codes(
+            frame,
+            by=tuple(by),
+            observed=observed,
+            sort=sort,
+            dropna=dropna,
         )
     if not isinstance(by, str) or by not in frame.columns or by == frame.geometry.name:
         return None
@@ -777,22 +947,1080 @@ def _native_dissolve_group_index_and_codes(
             sort=sort,
             dropna=dropna,
         )
-    if not dropna:
+    return _native_plain_group_index_and_codes(
+        key,
+        sort=sort,
+        dropna=dropna,
+    )
+
+
+def _native_device_plain_group_index_and_codes(
+    frame,
+    *,
+    by,
+    normalized_method: DissolveUnionMethod | None,
+    grid_size: float | None = None,
+    observed: bool,
+    sort: bool,
+    dropna: bool,
+) -> tuple[pd.Index, Any, tuple[Any, ...]] | None:
+    """Encode admitted device-backed group keys on device.
+
+    Physical shape: row-aligned device key vector(s), optionally dictionary
+    codes plus validity -> dense group codes for a segmented `NativeGrouped`
+    consumer.  The only host boundary is the compact group-label export needed
+    for the public dissolve index.
+    """
+    if isinstance(by, str):
+        key_columns = (by,)
+    elif isinstance(by, (list, tuple)):
+        key_columns = tuple(by)
+    else:
         return None
-    if len(frame) == 0:
-        return pd.Index([], dtype=np.int64), np.asarray([], dtype=np.int32), tuple()
-    if key.hasnans:
+
+    if (
+        cp is None
+        or not sort
+        or grid_size is not None
+        or normalized_method
+        not in {
+            DissolveUnionMethod.UNARY,
+            DissolveUnionMethod.COVERAGE,
+            DissolveUnionMethod.DISJOINT_SUBSET,
+        }
+        or not key_columns
+        or len(set(key_columns)) != len(key_columns)
+        or any(
+            not isinstance(column, str)
+            or column not in frame.columns
+            or column == frame.geometry.name
+            for column in key_columns
+        )
+        or getattr(frame.geometry.values, "_provenance", None) is not None
+    ):
+        return None
+
+    try:
+        from vibespatial.api._native_state import get_native_state
+        from vibespatial.runtime.residency import Residency
+
+        state = get_native_state(frame)
+    except Exception:
+        return None
+    if state is None:
+        return None
+
+    owned = getattr(state.geometry, "owned", None)
+    if (
+        owned is None
+        or owned.residency is not Residency.DEVICE
+        or not _owned_supports_polygonal_grouped_union(owned)
+    ):
+        return None
+
+    key_payload = _device_dissolve_key_columns(
+        NativeAttributeTable.from_value(state.attributes),
+        key_columns,
+        frame=frame,
+    )
+    if key_payload is None:
+        return None
+    if len(key_columns) == 1 and key_payload[0].categorical_dtype is not None:
+        return _device_categorical_group_index_and_codes(
+            key_payload[0],
+            name=key_columns[0],
+            observed=observed,
+            dropna=dropna,
+        )
+    has_categorical = any(column.categorical_dtype is not None for column in key_payload)
+    value_arrays = tuple(column.values for column in key_payload)
+    dtypes = tuple(np.dtype(values.dtype) for values in value_arrays)
+    if any(
+        not (
+            np.issubdtype(dtype, np.integer)
+            or np.issubdtype(dtype, np.bool_)
+        )
+        for dtype in dtypes
+    ):
+        return None
+    row_count = int(value_arrays[0].size)
+    if any(int(values.size) != row_count for values in value_arrays):
+        return None
+    if has_categorical and not observed:
+        return _device_multi_unobserved_product_index_and_codes(
+            key_payload,
+            key_columns=key_columns,
+            dropna=dropna,
+        )
+
+    if len(key_columns) == 1:
+        key_column = key_payload[0]
+        values_array = key_column.values
+        try:
+            if key_column.valid_mask is None:
+                labels, inverse = cp.unique(values_array, return_inverse=True)
+            else:
+                valid_values = values_array[key_column.valid_mask]
+                labels, inverse_valid = cp.unique(valid_values, return_inverse=True)
+                inverse = cp.full(row_count, -1, dtype=cp.int32)
+                inverse[key_column.valid_mask] = inverse_valid.astype(
+                    cp.int32,
+                    copy=False,
+                )
+                if not dropna:
+                    inverse[~key_column.valid_mask] = int(labels.size)
+        except Exception:
+            return None
+        host_labels = _materialize_device_group_labels(
+            labels,
+            operation="device_group_key_labels_to_host",
+            reason="device dissolve group labels were materialized for public output index",
+        )
+        output_index = _device_group_label_index(
+            host_labels,
+            name=key_columns[0],
+            pandas_dtype=key_column.pandas_dtype,
+            include_null=key_column.valid_mask is not None and not dropna,
+        )
+        return output_index, inverse.astype(cp.int32, copy=False), key_columns
+
+    if row_count == 0:
+        host_columns = [
+            np.asarray([], dtype=dtype)
+            for dtype in dtypes
+        ]
+        host_valid_columns = [None for _ in host_columns]
+        return (
+            _device_multi_group_label_index(
+                host_columns,
+                host_valid_columns,
+                key_payload,
+                key_columns,
+            ),
+            cp.empty(0, dtype=cp.int32),
+            key_columns,
+        )
+
+    try:
+        ordered_rows = _device_multi_key_order(key_payload, dropna=dropna)
+        if ordered_rows is None:
+            return None
+        sorted_values = tuple(column.values[ordered_rows] for column in key_payload)
+        sorted_valid = tuple(
+            None if column.valid_mask is None else column.valid_mask[ordered_rows]
+            for column in key_payload
+        )
+        starts = cp.empty(row_count, dtype=cp.bool_)
+        starts[...] = False
+        ordered_count = int(ordered_rows.size)
+        if ordered_count:
+            starts[:ordered_count][0] = True
+        if ordered_count > 1:
+            changed = _device_multi_key_changed(sorted_values, sorted_valid)
+            starts[:ordered_count][1:] = changed
+        start_positions = cp.nonzero(starts)[0]
+        group_ids_sorted = cp.cumsum(starts.astype(cp.int32)) - 1
+        inverse = cp.full(row_count, -1, dtype=cp.int32)
+        inverse[ordered_rows] = group_ids_sorted[:ordered_count].astype(
+            cp.int32,
+            copy=False,
+        )
+        unique_source_rows = ordered_rows[start_positions]
+        label_columns = tuple(column.values[unique_source_rows] for column in key_payload)
+        label_valid_columns = tuple(
+            None if column.valid_mask is None else column.valid_mask[unique_source_rows]
+            for column in key_payload
+        )
+    except Exception:
+        return None
+
+    if any(valid is not None for valid in label_valid_columns) and not dropna:
+        host_columns, host_valid_columns = _materialize_device_group_label_columns_with_validity(
+            label_columns,
+            label_valid_columns,
+            operation="device_multi_group_key_labels_to_host",
+            reason="device dissolve multi-key labels were materialized for public output index",
+        )
+    else:
+        host_columns = _materialize_device_group_label_columns(
+            label_columns,
+            operation="device_multi_group_key_labels_to_host",
+            reason="device dissolve multi-key labels were materialized for public output index",
+        )
+        host_valid_columns = [None for _ in host_columns]
+    output_index = _device_multi_group_label_index(
+        host_columns,
+        host_valid_columns,
+        key_payload,
+        key_columns,
+    )
+    return output_index, inverse, key_columns
+
+
+@dataclass(frozen=True)
+class _DeviceDissolveKeyColumn:
+    values: Any
+    valid_mask: Any | None
+    pandas_dtype: Any | None
+    categorical_dtype: pd.CategoricalDtype | None = None
+
+
+def _device_dissolve_key_columns(
+    attributes: NativeAttributeTable,
+    key_columns: tuple[Any, ...],
+    *,
+    frame,
+) -> tuple[_DeviceDissolveKeyColumn, ...] | None:
+    if cp is None or attributes.device_table is None:
+        return None
+    positions = {
+        name: index
+        for index, name in enumerate(tuple(attributes.column_override or ()))
+    }
+    if len(positions) != len(tuple(attributes.column_override or ())):
+        return None
+    if any(column not in positions for column in key_columns):
+        return None
+    if not hasattr(attributes.device_table, "columns"):
+        return None
+    source_columns = attributes.device_table.columns()
+    payload = []
+    for column in key_columns:
+        try:
+            series = frame[column]
+        except Exception:
+            return None
+        if not isinstance(series, pd.Series):
+            return None
+        view = _device_dissolve_key_column_view(
+            source_columns[positions[column]],
+            series=series,
+        )
+        if view is None:
+            return None
+        payload.append(view)
+    return tuple(payload)
+
+
+def _device_dissolve_key_column_view(
+    column,
+    *,
+    series: pd.Series,
+) -> _DeviceDissolveKeyColumn | None:
+    try:
+        import pyarrow as pa
+    except ModuleNotFoundError:
+        return None
+    if int(column.offset()) != 0:
+        return None
+    if isinstance(series.dtype, pd.CategoricalDtype):
+        return _device_categorical_key_column_view(column, series.dtype)
+    arrow_type = column.type().to_arrow()
+    if not (pa.types.is_integer(arrow_type) or pa.types.is_boolean(arrow_type)):
         return None
     try:
-        unique_values = pd.Index(pd.unique(key.to_numpy(copy=False)), name=key.name)
-        if sort:
-            unique_values = unique_values.sort_values()
-        codes = unique_values.get_indexer(pd.Index(key.to_numpy(copy=False)))
+        dtype = np.dtype(column.type().typestr)
+        values = cp.asarray(column.data()).view(dtype)[: int(column.size())]
+    except Exception:
+        return None
+    null_count = int(column.null_count())
+    if null_count == 0:
+        return _DeviceDissolveKeyColumn(
+            values=values,
+            valid_mask=None,
+            pandas_dtype=None,
+        )
+    valid_mask = _device_column_valid_mask(column)
+    if valid_mask is None:
+        return None
+    return _DeviceDissolveKeyColumn(
+        values=values,
+        valid_mask=valid_mask,
+        pandas_dtype=_nullable_pandas_dtype_for_device_key(dtype),
+    )
+
+
+def _device_categorical_key_column_view(
+    column,
+    dtype: pd.CategoricalDtype,
+) -> _DeviceDissolveKeyColumn | None:
+    try:
+        if int(column.num_children()) < 1:
+            return None
+        codes_column = column.child(0)
+        codes_dtype = np.dtype(codes_column.type().typestr)
+        if not np.issubdtype(codes_dtype, np.integer):
+            return None
+        values = cp.asarray(codes_column.data()).view(codes_dtype)[: int(column.size())]
+    except Exception:
+        return None
+    valid_mask = None
+    if int(column.null_count()) > 0:
+        valid_mask = _device_column_valid_mask(column)
+        if valid_mask is None:
+            return None
+    return _DeviceDissolveKeyColumn(
+        values=values,
+        valid_mask=valid_mask,
+        pandas_dtype=None,
+        categorical_dtype=dtype,
+    )
+
+
+def _device_column_valid_mask(column):
+    try:
+        mask_bytes = cp.asarray(column.null_mask()).view(cp.uint8)
+        row_offsets = cp.arange(int(column.size()), dtype=cp.int64) + int(column.offset())
+        return ((mask_bytes[row_offsets >> 3] >> (row_offsets & 7)) & 1).astype(
+            cp.bool_,
+            copy=False,
+        )
+    except Exception:
+        return None
+
+
+def _nullable_pandas_dtype_for_device_key(dtype: np.dtype) -> str | None:
+    normalized = np.dtype(dtype)
+    if np.issubdtype(normalized, np.bool_):
+        return "boolean"
+    if np.issubdtype(normalized, np.signedinteger):
+        return f"Int{normalized.itemsize * 8}"
+    if np.issubdtype(normalized, np.unsignedinteger):
+        return f"UInt{normalized.itemsize * 8}"
+    return None
+
+
+def _device_group_label_index(
+    labels: np.ndarray,
+    *,
+    name: Any,
+    pandas_dtype: Any | None,
+    include_null: bool,
+) -> pd.Index:
+    if pandas_dtype is None:
+        return pd.Index(labels, name=name)
+    values: Any = labels
+    if include_null:
+        values = [*labels.tolist(), pd.NA]
+    return pd.Index(pd.array(values, dtype=pandas_dtype), name=name)
+
+
+def _device_categorical_group_index_and_codes(
+    key_column: _DeviceDissolveKeyColumn,
+    *,
+    name: Any,
+    observed: bool,
+    dropna: bool,
+) -> tuple[pd.CategoricalIndex, Any, tuple[Any, ...]] | None:
+    dtype = key_column.categorical_dtype
+    if dtype is None:
+        return None
+    try:
+        category_count = len(dtype.categories)
+        raw_codes = cp.asarray(key_column.values, dtype=cp.int32)
+        row_count = int(raw_codes.size)
+        valid_mask = key_column.valid_mask
+        include_null = valid_mask is not None and not dropna
+        if observed:
+            valid_codes = raw_codes if valid_mask is None else raw_codes[valid_mask]
+            observed_codes = cp.unique(valid_codes)
+            host_codes = _materialize_device_group_labels(
+                observed_codes,
+                operation="device_categorical_group_key_codes_to_host",
+                reason=(
+                    "device dissolve categorical group codes were materialized "
+                    "for public output index"
+                ),
+            )
+            output_codes = host_codes.astype(np.int64, copy=False)
+            observed_count = int(observed_codes.size)
+            inverse = cp.full(row_count, -1, dtype=cp.int32)
+            if observed_count:
+                if valid_mask is None:
+                    inverse = cp.searchsorted(observed_codes, raw_codes).astype(
+                        cp.int32,
+                        copy=False,
+                    )
+                else:
+                    inverse[valid_mask] = cp.searchsorted(
+                        observed_codes,
+                        raw_codes[valid_mask],
+                    ).astype(cp.int32, copy=False)
+            if include_null:
+                output_codes = np.concatenate(
+                    [output_codes, np.asarray([-1], dtype=np.int64)],
+                )
+                inverse[~valid_mask] = observed_count
+        else:
+            output_codes = np.arange(category_count, dtype=np.int64)
+            inverse = raw_codes.astype(cp.int32, copy=True)
+            if include_null:
+                output_codes = np.concatenate(
+                    [output_codes, np.asarray([-1], dtype=np.int64)],
+                )
+                inverse[~valid_mask] = category_count
+            elif valid_mask is not None:
+                inverse[~valid_mask] = -1
+        output_index = pd.CategoricalIndex(
+            pd.Categorical.from_codes(
+                output_codes,
+                categories=dtype.categories,
+                ordered=dtype.ordered,
+            ),
+            name=name,
+        )
+    except Exception:
+        return None
+    return output_index, inverse.astype(cp.int32, copy=False), (name,)
+
+
+def _device_multi_key_order(
+    columns: tuple[_DeviceDissolveKeyColumn, ...],
+    *,
+    dropna: bool,
+):
+    row_count = int(columns[0].values.size)
+    if dropna:
+        row_mask = cp.ones(row_count, dtype=cp.bool_)
+        for column in columns:
+            if column.valid_mask is not None:
+                row_mask = row_mask & column.valid_mask
+        row_indices = cp.nonzero(row_mask)[0]
+    else:
+        row_indices = cp.arange(row_count, dtype=cp.int64)
+    if int(row_indices.size) == 0:
+        return row_indices
+
+    sort_keys = []
+    for column in reversed(columns):
+        values = column.values[row_indices]
+        if column.valid_mask is None:
+            sort_keys.append(values)
+            continue
+        valid = column.valid_mask[row_indices]
+        safe_values = cp.where(valid, values, cp.zeros((), dtype=values.dtype))
+        sort_keys.append(safe_values)
+        sort_keys.append(~valid)
+    return row_indices[cp.lexsort(cp.stack(tuple(sort_keys)))]
+
+
+def _device_multi_key_changed(
+    sorted_values: tuple[Any, ...],
+    sorted_valid: tuple[Any | None, ...],
+):
+    changed = None
+    for values, valid in zip(sorted_values, sorted_valid, strict=True):
+        if valid is None:
+            column_changed = values[1:] != values[:-1]
+        else:
+            both_valid = valid[1:] & valid[:-1]
+            both_null = (~valid[1:]) & (~valid[:-1])
+            column_equal = both_null | (both_valid & (values[1:] == values[:-1]))
+            column_changed = ~column_equal
+        changed = column_changed if changed is None else changed | column_changed
+    return changed
+
+
+def _device_multi_group_label_index(
+    host_columns: list[np.ndarray],
+    host_valid_columns: list[np.ndarray | None],
+    key_payload: tuple[_DeviceDissolveKeyColumn, ...],
+    key_columns: tuple[Any, ...],
+) -> pd.MultiIndex:
+    arrays = []
+    for labels, valid, payload in zip(
+        host_columns,
+        host_valid_columns,
+        key_payload,
+        strict=True,
+    ):
+        if payload.categorical_dtype is not None:
+            codes: Any = labels.astype(np.int64, copy=False)
+            if valid is not None:
+                codes = np.where(valid.astype(bool, copy=False), codes, -1)
+            arrays.append(
+                pd.CategoricalIndex(
+                    pd.Categorical.from_codes(
+                        codes,
+                        categories=payload.categorical_dtype.categories,
+                        ordered=payload.categorical_dtype.ordered,
+                    )
+                )
+            )
+            continue
+        if payload.pandas_dtype is None:
+            arrays.append(labels)
+            continue
+        values = pd.array(labels, dtype=payload.pandas_dtype)
+        if valid is not None:
+            values[~valid.astype(bool, copy=False)] = pd.NA
+        arrays.append(values)
+    return pd.MultiIndex.from_arrays(arrays, names=list(key_columns))
+
+
+def _device_multi_unobserved_product_index_and_codes(
+    key_payload: tuple[_DeviceDissolveKeyColumn, ...],
+    *,
+    key_columns: tuple[Any, ...],
+    dropna: bool,
+) -> tuple[pd.MultiIndex, Any, tuple[Any, ...]] | None:
+    row_count = int(key_payload[0].values.size)
+    levels: list[pd.Index] = []
+    code_columns = []
+    level_sizes: list[int] = []
+    valid_rows = cp.ones(row_count, dtype=cp.bool_)
+    try:
+        for payload, name in zip(key_payload, key_columns, strict=True):
+            values = cp.asarray(payload.values, dtype=cp.int32)
+            if payload.categorical_dtype is not None:
+                dtype = payload.categorical_dtype
+                category_count = len(dtype.categories)
+                include_null = payload.valid_mask is not None and not dropna
+                level_codes = np.arange(category_count, dtype=np.int64)
+                if include_null:
+                    level_codes = np.concatenate(
+                        [level_codes, np.asarray([-1], dtype=np.int64)]
+                    )
+                levels.append(
+                    pd.CategoricalIndex(
+                        pd.Categorical.from_codes(
+                            level_codes,
+                            categories=dtype.categories,
+                            ordered=dtype.ordered,
+                        ),
+                        name=name,
+                    )
+                )
+                level_size = category_count + int(include_null)
+                if payload.valid_mask is None:
+                    column_codes = values
+                elif dropna:
+                    valid_rows = valid_rows & payload.valid_mask
+                    column_codes = values
+                else:
+                    column_codes = cp.where(
+                        payload.valid_mask,
+                        values,
+                        cp.asarray(category_count, dtype=cp.int32),
+                    )
+                code_columns.append(column_codes.astype(cp.int64, copy=False))
+                level_sizes.append(level_size)
+                continue
+
+            if payload.valid_mask is None:
+                labels = cp.unique(payload.values)
+                column_codes = cp.searchsorted(labels, payload.values).astype(
+                    cp.int64,
+                    copy=False,
+                )
+                include_null = False
+            else:
+                valid_values = payload.values[payload.valid_mask]
+                labels = cp.unique(valid_values)
+                valid_code_values = cp.searchsorted(labels, valid_values).astype(
+                    cp.int64,
+                    copy=False,
+                )
+                column_codes = cp.full(row_count, -1, dtype=cp.int64)
+                column_codes[payload.valid_mask] = valid_code_values
+                if dropna:
+                    valid_rows = valid_rows & payload.valid_mask
+                    include_null = False
+                else:
+                    include_null = True
+                    column_codes[~payload.valid_mask] = labels.size
+            host_labels = _materialize_device_group_labels(
+                labels,
+                operation="device_multi_product_group_key_labels_to_host",
+                reason=(
+                    "device dissolve multi-key product labels were materialized "
+                    "for public output index"
+                ),
+            )
+            levels.append(
+                _device_group_label_index(
+                    host_labels,
+                    name=name,
+                    pandas_dtype=payload.pandas_dtype,
+                    include_null=include_null,
+                )
+            )
+            code_columns.append(column_codes)
+            level_sizes.append(labels.size + int(include_null))
+        mixed_codes = cp.zeros(row_count, dtype=cp.int64)
+        for column_codes, level_size in zip(code_columns, level_sizes, strict=True):
+            mixed_codes = mixed_codes * int(level_size) + column_codes
+        if dropna:
+            row_group_codes = cp.full(row_count, -1, dtype=cp.int32)
+            row_group_codes[valid_rows] = mixed_codes[valid_rows].astype(
+                cp.int32,
+                copy=False,
+            )
+        else:
+            row_group_codes = mixed_codes.astype(cp.int32, copy=False)
+        output_index = pd.MultiIndex.from_product(levels, names=list(key_columns))
+    except Exception:
+        return None
+    return output_index, row_group_codes, key_columns
+
+
+def _materialize_device_group_label_columns_with_validity(
+    label_columns: tuple[Any, ...],
+    valid_columns: tuple[Any | None, ...],
+    *,
+    operation: str,
+    reason: str,
+) -> tuple[list[np.ndarray], list[np.ndarray | None]]:
+    from vibespatial.runtime.materialization import (
+        MaterializationBoundary,
+        record_materialization_event,
+    )
+
+    if not label_columns:
+        return [], []
+    group_count = int(getattr(label_columns[0], "size", len(label_columns[0])))
+    total_bytes = 0
+    for labels in label_columns:
+        item_count = int(getattr(labels, "size", len(labels)))
+        itemsize = int(getattr(getattr(labels, "dtype", None), "itemsize", 0))
+        total_bytes += item_count * itemsize
+    for valid in valid_columns:
+        if valid is None:
+            continue
+        item_count = int(getattr(valid, "size", len(valid)))
+        itemsize = int(getattr(getattr(valid, "dtype", None), "itemsize", 0))
+        total_bytes += item_count * itemsize
+    record_materialization_event(
+        surface="vibespatial.overlay.dissolve._native_device_plain_group_index_and_codes",
+        boundary=MaterializationBoundary.INTERNAL_HOST_CONVERSION,
+        operation=operation,
+        reason=reason,
+        detail=f"groups={group_count}, columns={len(label_columns)}, bytes={total_bytes}",
+        d2h_transfer=True,
+        strict_disallowed=False,
+    )
+    host_labels = [
+        overlay_device_to_host(
+            labels,
+            reason=(
+                "vibespatial.overlay.dissolve._native_device_plain_group_index_and_codes"
+                f"::{operation}"
+            ),
+        )
+        for labels in label_columns
+    ]
+    host_valid = [
+        None
+        if valid is None
+        else overlay_device_to_host(
+            valid,
+            reason=(
+                "vibespatial.overlay.dissolve._native_device_plain_group_index_and_codes"
+                f"::{operation}_validity"
+            ),
+        )
+        for valid in valid_columns
+    ]
+    return host_labels, host_valid
+
+
+def _materialize_device_group_label_columns(
+    label_columns: tuple[Any, ...],
+    *,
+    operation: str,
+    reason: str,
+) -> list[np.ndarray]:
+    from vibespatial.runtime.materialization import (
+        MaterializationBoundary,
+        record_materialization_event,
+    )
+
+    if not label_columns:
+        return []
+    group_count = int(getattr(label_columns[0], "size", len(label_columns[0])))
+    total_bytes = 0
+    for labels in label_columns:
+        item_count = int(getattr(labels, "size", len(labels)))
+        itemsize = int(getattr(getattr(labels, "dtype", None), "itemsize", 0))
+        total_bytes += item_count * itemsize
+    record_materialization_event(
+        surface="vibespatial.overlay.dissolve._native_device_plain_group_index_and_codes",
+        boundary=MaterializationBoundary.INTERNAL_HOST_CONVERSION,
+        operation=operation,
+        reason=reason,
+        detail=f"groups={group_count}, columns={len(label_columns)}, bytes={total_bytes}",
+        d2h_transfer=True,
+        strict_disallowed=False,
+    )
+    return [
+        overlay_device_to_host(
+            labels,
+            reason=(
+                "vibespatial.overlay.dissolve._native_device_plain_group_index_and_codes"
+                f"::{operation}"
+            ),
+        )
+        for labels in label_columns
+    ]
+
+
+def _materialize_device_group_labels(
+    labels: Any,
+    *,
+    operation: str,
+    reason: str,
+) -> np.ndarray:
+    from vibespatial.runtime.materialization import (
+        MaterializationBoundary,
+        record_materialization_event,
+    )
+
+    item_count = int(getattr(labels, "size", len(labels)))
+    itemsize = int(getattr(getattr(labels, "dtype", None), "itemsize", 0))
+    record_materialization_event(
+        surface="vibespatial.overlay.dissolve._native_device_plain_group_index_and_codes",
+        boundary=MaterializationBoundary.INTERNAL_HOST_CONVERSION,
+        operation=operation,
+        reason=reason,
+        detail=f"groups={item_count}, bytes={item_count * itemsize}",
+        d2h_transfer=True,
+        strict_disallowed=False,
+    )
+    return overlay_device_to_host(
+        labels,
+        reason=(
+            "vibespatial.overlay.dissolve._native_device_plain_group_index_and_codes"
+            f"::{operation}"
+        ),
+    )
+
+
+def _native_plain_group_index_and_codes(
+    key: pd.Series,
+    *,
+    sort: bool,
+    dropna: bool,
+) -> tuple[pd.Index, np.ndarray, tuple[Any, ...]] | None:
+    """Encode a single non-categorical dissolve key without pandas groupby."""
+    if pd.api.types.is_object_dtype(key.dtype) and not _is_admitted_object_group_key(
+        key
+    ):
+        return None
+    try:
+        codes, uniques = pd.factorize(
+            key,
+            sort=sort,
+            use_na_sentinel=dropna,
+        )
+        output_index = pd.Index(uniques, name=key.name)
+        if pd.api.types.is_object_dtype(key.dtype) and len(output_index):
+            output_index = pd.Index(output_index.tolist(), name=key.name)
     except Exception:
         return None
     if np.any(codes < 0):
+        if not dropna:
+            return None
+        missing_codes = codes[codes < 0]
+        if np.any(missing_codes != -1):
+            return None
+    return output_index, np.asarray(codes, dtype=np.int32), (key.name,)
+
+
+def _native_multi_plain_group_index_and_codes(
+    frame,
+    *,
+    by: tuple[Any, ...],
+    observed: bool,
+    sort: bool,
+    dropna: bool,
+) -> tuple[pd.MultiIndex, np.ndarray, tuple[Any, ...]] | None:
+    """Encode admitted non-categorical multi-column dissolve keys."""
+    if not by or len(set(by)) != len(by):
         return None
-    return unique_values, np.asarray(codes, dtype=np.int32), (by,)
+    if any(
+        not isinstance(column, str)
+        or column not in frame.columns
+        or column == frame.geometry.name
+        for column in by
+    ):
+        return None
+    try:
+        key_frame = frame.loc[:, list(by)]
+    except Exception:
+        return None
+    has_categorical = any(isinstance(dtype, pd.CategoricalDtype) for dtype in key_frame.dtypes)
+    object_columns = tuple(
+        column
+        for column, dtype in key_frame.dtypes.items()
+        if pd.api.types.is_object_dtype(dtype)
+    )
+    if any(
+        not _is_admitted_object_group_key(key_frame[column])
+        for column in object_columns
+    ):
+        return None
+    if (
+        has_categorical
+        and not observed
+        and not dropna
+        and not sort
+        and bool(key_frame.isna().any().any())
+    ):
+        return _native_unobserved_categorical_null_multi_group_index_and_codes(
+            key_frame,
+            by=by,
+        )
+
+    try:
+        valid_rows = ~key_frame.isna().any(axis=1) if dropna else pd.Series(True, index=key_frame.index)
+        valid_mask = valid_rows.to_numpy(dtype=bool, na_value=False)
+        admitted_frame = key_frame.loc[valid_rows]
+        row_index = _native_multi_key_row_index(key_frame)
+        observed_index = row_index[valid_mask].drop_duplicates()
+        if sort:
+            observed_index = observed_index.sort_values()
+        if has_categorical and not observed:
+            levels = []
+            for column in by:
+                series = admitted_frame[column]
+                if isinstance(series.dtype, pd.CategoricalDtype):
+                    category = series.array
+                    level_values = category.categories
+                    if not dropna and bool(series.isna().any()):
+                        level_values = pd.Categorical(
+                            list(category.categories) + [np.nan],
+                            categories=category.categories,
+                            ordered=category.ordered,
+                        )
+                    levels.append(
+                        pd.CategoricalIndex(
+                            level_values,
+                            categories=category.categories,
+                            ordered=category.ordered,
+                            name=column,
+                        )
+                    )
+                    continue
+                levels.append(_native_multi_key_level(series, sort=sort))
+            output_index = pd.MultiIndex.from_product(levels, names=list(by))
+            if not sort:
+                remaining = output_index[observed_index.get_indexer(output_index) < 0]
+                output_index = observed_index.append(remaining)
+        else:
+            output_index = observed_index
+        codes = output_index.get_indexer(row_index)
+    except Exception:
+        return None
+
+    if dropna:
+        codes = np.where(valid_mask, codes, -1)
+    if np.any(codes < 0):
+        missing_codes = codes[codes < 0]
+        if not dropna or np.any(missing_codes != -1):
+            return None
+    return output_index, np.asarray(codes, dtype=np.int32), by
+
+
+def _native_unobserved_categorical_null_multi_group_index_and_codes(
+    key_frame: pd.DataFrame,
+    *,
+    by: tuple[Any, ...],
+) -> tuple[pd.MultiIndex, np.ndarray, tuple[Any, ...]] | None:
+    """Encode pandas' sort=False unobserved categorical-null product."""
+    try:
+        from pandas.core.sorting import (
+            compress_group_index,
+            decons_obs_group_ids,
+            get_group_index,
+        )
+
+        levels: list[pd.Index] = []
+        codes: list[np.ndarray] = []
+        observed_flags: list[bool] = []
+        names = list(by)
+        for column in by:
+            series = key_frame[column]
+            raw_codes, uniques = pd.factorize(
+                series,
+                sort=False,
+                use_na_sentinel=False,
+            )
+            if isinstance(series.dtype, pd.CategoricalDtype):
+                category = series.array
+                values = list(uniques)
+                present = {value for value in values if not pd.isna(value)}
+                values.extend(
+                    value for value in category.categories if value not in present
+                )
+                level = pd.CategoricalIndex(
+                    pd.Categorical(
+                        values,
+                        categories=category.categories,
+                        ordered=category.ordered,
+                    ),
+                    name=column,
+                )
+                observed_flags.append(False)
+            else:
+                level = pd.Index(uniques, name=column)
+                observed_flags.append(True)
+            levels.append(level)
+            codes.append(np.asarray(raw_codes, dtype=np.intp))
+
+        observed_indices = [
+            index for index, observed in enumerate(observed_flags) if observed
+        ]
+        unobserved_indices = [
+            index for index, observed in enumerate(observed_flags) if not observed
+        ]
+        if not observed_indices or not unobserved_indices:
+            return None
+
+        observed_index, observed_ids = _native_observed_index_and_ids(
+            levels=[levels[index] for index in observed_indices],
+            codes=[codes[index] for index in observed_indices],
+            names=[names[index] for index in observed_indices],
+            sort=False,
+            get_group_index=get_group_index,
+            compress_group_index=compress_group_index,
+            decons_obs_group_ids=decons_obs_group_ids,
+        )
+        unobserved_index, unobserved_ids = _native_unobserved_index_and_ids(
+            levels=[levels[index] for index in unobserved_indices],
+            codes=[codes[index] for index in unobserved_indices],
+            names=[names[index] for index in unobserved_indices],
+            get_group_index=get_group_index,
+        )
+
+        result_index_codes = np.concatenate(
+            [
+                np.tile(unobserved_index.codes, len(observed_index)),
+                np.repeat(observed_index.codes, len(unobserved_index), axis=1),
+            ],
+            axis=0,
+        )
+        _, level_order = np.unique(
+            unobserved_indices + observed_indices,
+            return_index=True,
+        )
+        result_index = pd.MultiIndex(
+            levels=list(unobserved_index.levels) + list(observed_index.levels),
+            codes=result_index_codes,
+            names=list(unobserved_index.names) + list(observed_index.names),
+        ).reorder_levels(level_order)
+
+        row_group_codes = len(unobserved_index) * observed_ids + unobserved_ids
+        row_group_codes, observed_group_positions = compress_group_index(
+            row_group_codes,
+            sort=False,
+        )
+        take_order = np.concatenate(
+            [
+                observed_group_positions,
+                np.delete(
+                    np.arange(len(result_index), dtype=np.intp),
+                    observed_group_positions,
+                ),
+            ]
+        )
+        return (
+            result_index.take(take_order),
+            np.asarray(row_group_codes, dtype=np.int32),
+            by,
+        )
+    except Exception:
+        return None
+
+
+def _native_observed_index_and_ids(
+    *,
+    levels: list[pd.Index],
+    codes: list[np.ndarray],
+    names: list[Any],
+    sort: bool,
+    get_group_index,
+    compress_group_index,
+    decons_obs_group_ids,
+) -> tuple[pd.MultiIndex, np.ndarray]:
+    shape = tuple(len(level) for level in levels)
+    group_index = get_group_index(codes, shape, sort=True, xnull=True)
+    observed_ids, observed_group_ids = compress_group_index(group_index, sort=sort)
+    index_codes = decons_obs_group_ids(
+        observed_ids,
+        observed_group_ids,
+        shape,
+        codes,
+        xnull=True,
+    )
+    return (
+        pd.MultiIndex(
+            levels=levels,
+            codes=index_codes,
+            names=names,
+            verify_integrity=False,
+        ),
+        np.asarray(observed_ids, dtype=np.intp),
+    )
+
+
+def _native_unobserved_index_and_ids(
+    *,
+    levels: list[pd.Index],
+    codes: list[np.ndarray],
+    names: list[Any],
+    get_group_index,
+) -> tuple[pd.MultiIndex, np.ndarray]:
+    shape = tuple(len(level) for level in levels)
+    row_group_ids = get_group_index(codes, shape, sort=True, xnull=True)
+    return (
+        pd.MultiIndex.from_product(levels, names=names),
+        np.asarray(row_group_ids, dtype=np.intp),
+    )
+
+
+def _is_admitted_object_group_key(series: pd.Series) -> bool:
+    """Return whether an object key has scalar pandas group semantics."""
+    if not pd.api.types.is_object_dtype(series.dtype):
+        return True
+    values = series[~series.isna()]
+    if values.empty:
+        return True
+    inferred = pd.api.types.infer_dtype(values, skipna=True)
+    return inferred in {
+        "boolean",
+        "floating",
+        "integer",
+        "mixed-integer",
+        "mixed-integer-float",
+        "string",
+        "unicode",
+    }
+
+
+def _native_multi_key_array(series: pd.Series):
+    if pd.api.types.is_object_dtype(series.dtype):
+        return pd.Index(series.tolist(), name=series.name)
+    return series
+
+
+def _native_multi_key_level(series: pd.Series, *, sort: bool) -> pd.Index:
+    if pd.api.types.is_object_dtype(series.dtype):
+        level = pd.Index(series.drop_duplicates().tolist(), name=series.name)
+    else:
+        level = pd.Index(series.drop_duplicates(), name=series.name)
+    if sort:
+        level = level.sort_values()
+    return level
+
+
+def _native_multi_key_row_index(key_frame: pd.DataFrame) -> pd.MultiIndex:
+    return pd.MultiIndex.from_arrays(
+        [
+            _native_multi_key_array(key_frame[column])
+            for column in key_frame.columns
+        ],
+        names=list(key_frame.columns),
+    )
 
 
 def _native_categorical_group_index_and_codes(
@@ -929,10 +2157,13 @@ def _reduce_native_grouped_dissolve_attributes(
     attributes: NativeAttributeTable,
     grouped: NativeGrouped,
     reducers: Mapping[Any, str],
-) -> tuple[NativeGroupedAttributeReduction, bool] | None:
+) -> tuple[NativeGroupedAttributeReduction | NativeAttributeTable, bool] | None:
     numeric_columns = attributes.numeric_column_arrays(tuple(reducers))
     if numeric_columns is not None:
         return grouped.reduce_numeric_columns(numeric_columns, reducers), False
+    device_take = attributes.grouped_device_take_columns(grouped, reducers)
+    if device_take is not None:
+        return device_take, True
 
     reduced_columns = {}
     used_take_reducer = False
@@ -975,8 +2206,11 @@ def _try_prepare_native_grouped_dissolve_attributes(
     observed: bool,
     sort: bool,
     dropna: bool,
+    normalized_method: DissolveUnionMethod = DissolveUnionMethod.UNARY,
+    grid_size: float | None = None,
+    allow_device_key_codes: bool = False,
     agg_kwargs: dict[str, Any],
-) -> tuple[NativeAttributeTable, np.ndarray] | None:
+) -> tuple[NativeAttributeTable, Any] | None:
     group_contract = _native_dissolve_group_index_and_codes(
         frame,
         by=by,
@@ -984,6 +2218,9 @@ def _try_prepare_native_grouped_dissolve_attributes(
         observed=observed,
         sort=sort,
         dropna=dropna,
+        normalized_method=normalized_method,
+        grid_size=grid_size,
+        allow_device_key_codes=allow_device_key_codes,
     )
     if group_contract is None:
         return None
@@ -1011,6 +2248,11 @@ def _try_prepare_native_grouped_dissolve_attributes(
     if reduced_result is None:
         return None
     reduced, used_take_reducer = reduced_result
+    reduced_is_device = (
+        reduced.device_table is not None
+        if isinstance(reduced, NativeAttributeTable)
+        else reduced.is_device
+    )
     record_dispatch_event(
         surface="geopandas.geodataframe.dissolve",
         operation="dissolve_attribute_aggregation",
@@ -1024,9 +2266,14 @@ def _try_prepare_native_grouped_dissolve_attributes(
             f"rows={len(frame)}, groups={len(output_index)}, "
             f"columns={len(reducers)}, reducers={sorted(set(reducers.values()))}"
         ),
-        selected=ExecutionMode.GPU if reduced.is_device else ExecutionMode.CPU,
+        selected=ExecutionMode.GPU if reduced_is_device else ExecutionMode.CPU,
     )
-    return reduced.to_native_attribute_table(), row_group_codes
+    reduced_attributes = (
+        reduced
+        if isinstance(reduced, NativeAttributeTable)
+        else reduced.to_native_attribute_table()
+    )
+    return reduced_attributes, row_group_codes
 
 
 def _group_offsets_from_sorted_codes(sorted_codes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1053,6 +2300,30 @@ def _group_non_empty_counts(row_group_codes: np.ndarray, group_count: int) -> tu
     counts = np.bincount(observed.astype(np.int32, copy=False), minlength=group_count)
     non_empty = int(np.count_nonzero(counts))
     return non_empty, int(group_count - non_empty)
+
+
+def _host_known_observed_valid_count(
+    owned: OwnedGeometryArray,
+    row_group_codes: Any,
+    *,
+    group_count: int,
+) -> int | None:
+    if _is_device_array(row_group_codes):
+        return None
+    host_codes = np.asarray(row_group_codes, dtype=np.int32)
+    if int(host_codes.size) != int(owned.row_count):
+        return None
+    observed = (host_codes >= 0) & (host_codes < int(group_count))
+    if not bool(np.any(observed)):
+        return 0
+    cached = owned._current_cached_validity_mask()
+    if cached is not None and int(cached.size) == int(owned.row_count):
+        return int(np.count_nonzero(observed & np.asarray(cached, dtype=bool)))
+    if getattr(owned, "_validity", None) is not None:
+        validity = np.asarray(owned._validity, dtype=bool)
+        if int(validity.size) == int(owned.row_count):
+            return int(np.count_nonzero(observed & validity))
+    return None
 
 
 def _row_code_count(row_group_codes: Any) -> int:
@@ -1088,7 +2359,11 @@ def _materialize_device_group_codes(row_group_codes: Any) -> np.ndarray:
     )
     if cp is None:
         raise RuntimeError("CuPy is required to materialize device group codes")
-    return cp.asnumpy(row_group_codes).astype(np.int32, copy=False)
+    return overlay_device_to_host(
+        row_group_codes,
+        reason="overlay dissolve device group-code host fallback export",
+        dtype=np.int32,
+    )
 
 
 def _tag_grouped_convex_hull_source(
@@ -1142,6 +2417,162 @@ def _owned_supports_polygonal_grouped_union(owned: OwnedGeometryArray) -> bool:
     return bool(valid_tags.size == 0 or np.all(np.isin(valid_tags, polygon_tags)))
 
 
+def _execute_device_native_grouped_union(
+    grouped: NativeGrouped,
+    *,
+    method: DissolveUnionMethod,
+    owned: OwnedGeometryArray,
+) -> GroupedUnionResult | None:
+    """Reduce device `NativeGrouped` polygon rows without host group assembly.
+
+    Physical shape: device sorted row order + device grouped offsets -> one
+    grouped overlay union. Native input carriers are `NativeGrouped` and
+    `OwnedGeometryArray`; native output is `GroupedUnionResult` with an owned
+    device geometry payload for downstream `NativeTabularResult` lowering.
+    """
+    from vibespatial.runtime.residency import Residency
+
+    if cp is None or owned.residency is not Residency.DEVICE:
+        return None
+    if method is not DissolveUnionMethod.UNARY:
+        return None
+    if not grouped.is_device:
+        return None
+    if grouped.sorted_order is None or grouped.group_offsets is None or grouped.group_ids is None:
+        return None
+    if not _owned_supports_polygonal_grouped_union(owned):
+        return None
+
+    group_count = grouped.resolved_group_count
+    if group_count < 0:
+        return None
+
+    sorted_order = cp.asarray(grouped.sorted_order, dtype=cp.int64)
+    if int(sorted_order.size) != owned.row_count:
+        return None
+
+    group_offsets = cp.asarray(grouped.group_offsets, dtype=cp.int64)
+    group_ids = cp.asarray(grouped.group_ids, dtype=cp.int64)
+    if int(group_offsets.size) != int(group_ids.size) + 1:
+        return None
+
+    all_rows_valid = _owned_all_rows_valid_host_proof(owned)
+    ordered_owned = owned.take(sorted_order)
+    total_rows = int(sorted_order.size)
+    if total_rows == 0:
+        from vibespatial.constructive.binary_constructive import (
+            _empty_device_constructive_output,
+        )
+
+        empty = _empty_device_constructive_output(group_count)
+        return GroupedUnionResult(
+            geometries=None,
+            group_count=group_count,
+            non_empty_groups=0,
+            empty_groups=group_count,
+            method=method,
+            owned=empty,
+        )
+
+    positions = cp.arange(total_rows, dtype=cp.int64)
+    compact_group_positions = cp.searchsorted(
+        group_offsets[1:],
+        positions,
+        side="right",
+    ).astype(cp.int64, copy=False)
+    source_rows = group_ids[compact_group_positions].astype(cp.int32, copy=False)
+
+    cached_validity = ordered_owned._current_cached_validity_mask()
+    if all_rows_valid:
+        valid_count = total_rows
+        valid_mask = None
+    elif cached_validity is not None and int(cached_validity.size) == total_rows:
+        valid_count = int(np.count_nonzero(cached_validity))
+        valid_mask = None
+    else:
+        state = ordered_owned._ensure_device_state()
+        valid_mask = cp.asarray(state.validity)[:total_rows].astype(
+            cp.bool_,
+            copy=False,
+        )
+        valid_count = overlay_int_scalar(
+            cp.count_nonzero(valid_mask),
+            reason="overlay dissolve native grouped-union valid-row count fence",
+        )
+    if valid_count == 0:
+        from vibespatial.constructive.binary_constructive import (
+            _empty_device_constructive_output,
+        )
+
+        empty = _empty_device_constructive_output(group_count)
+        return GroupedUnionResult(
+            geometries=None,
+            group_count=group_count,
+            non_empty_groups=0,
+            empty_groups=group_count,
+            method=method,
+            owned=empty,
+        )
+    if valid_count == total_rows:
+        valid_owned = ordered_owned
+        valid_source_rows = source_rows
+    else:
+        if valid_mask is None:
+            valid_mask = cp.asarray(cached_validity, dtype=cp.bool_)
+        valid_positions = cp.flatnonzero(valid_mask).astype(cp.int64, copy=False)
+        valid_owned = ordered_owned.take(valid_positions)
+        valid_source_rows = source_rows[valid_positions]
+
+    from vibespatial.constructive.binary_constructive import (
+        _regroup_intersection_parts_with_grouped_union_gpu,
+    )
+
+    try:
+        reduced = _regroup_intersection_parts_with_grouped_union_gpu(
+            valid_owned,
+            valid_source_rows,
+            output_row_count=group_count,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+    except Exception:
+        logger.debug("device native grouped union failed", exc_info=True)
+        return None
+    if reduced is None or reduced.row_count != group_count:
+        return None
+    from vibespatial.geometry.owned import seed_all_validity_cache
+
+    seed_all_validity_cache(reduced)
+
+    if valid_count == total_rows:
+        non_empty_groups = int(group_ids.size)
+    else:
+        counts = cp.bincount(valid_source_rows, minlength=group_count)
+        non_empty_groups = overlay_int_scalar(
+            cp.count_nonzero(counts > 0),
+            reason="overlay dissolve native grouped-union nonempty-group count fence",
+        )
+    record_dispatch_event(
+        surface="vibespatial.overlay.dissolve.execute_native_grouped_union",
+        operation="grouped_union",
+        implementation="native_grouped_device_overlay_union",
+        reason="device NativeGrouped rows reduced without host group-code assembly",
+        detail=(
+            f"rows={owned.row_count}, groups={group_count}, "
+            f"non_empty_groups={non_empty_groups}"
+        ),
+        requested=ExecutionMode.GPU,
+        selected=ExecutionMode.GPU,
+    )
+    return GroupedUnionResult(
+        geometries=None,
+        group_count=group_count,
+        non_empty_groups=non_empty_groups,
+        empty_groups=group_count - non_empty_groups,
+        method=method,
+        owned=reduced,
+    )
+
+
 def _union_block(values: np.ndarray, method: DissolveUnionMethod, grid_size: float | None) -> object:
     if values.size == 0:
         return _EMPTY
@@ -1158,7 +2589,7 @@ def _repair_grouped_union_owned_if_needed(
     group_count: int,
     geometry_name: str,
     crs,
-) -> GeometryNativeResult:
+) -> _GroupedGeometryResult:
     """Repair invalid grouped-union outputs while preserving the native seam."""
     from vibespatial.api.geoseries import GeoSeries
     from vibespatial.constructive.make_valid_pipeline import make_valid_owned
@@ -1169,13 +2600,52 @@ def _repair_grouped_union_owned_if_needed(
         seed_all_validity_cache,
     )
 
+    repair_needed = _device_grouped_union_repair_needed(owned)
+    if repair_needed is False:
+        seed_all_validity_cache(owned)
+        return _GroupedGeometryResult(
+            GeometryNativeResult.from_owned(owned, crs=crs),
+            repaired=False,
+        )
+
+    if owned.device_state is not None:
+        requested_mode = ExecutionMode.GPU if strict_native_mode_enabled() else ExecutionMode.AUTO
+        try:
+            mv_result = make_valid_owned(owned=owned, dispatch_mode=requested_mode)
+        except Exception:
+            if strict_native_mode_enabled():
+                raise
+        else:
+            if mv_result.owned is not None and mv_result.selected is ExecutionMode.GPU:
+                seed_all_validity_cache(mv_result.owned)
+                return _GroupedGeometryResult(
+                    GeometryNativeResult.from_owned(mv_result.owned, crs=crs),
+                    repaired=bool(mv_result.repaired_rows.size),
+                )
+            if mv_result.owned is None:
+                return _GroupedGeometryResult(
+                    GeometryNativeResult.from_geoseries(
+                        GeoSeries(
+                            _canonicalize_polygonal_make_valid_values(
+                                np.asarray(mv_result.geometries, dtype=object)
+                            ),
+                            name=geometry_name,
+                            crs=crs,
+                        ),
+                    ),
+                    repaired=bool(mv_result.repaired_rows.size),
+                )
+
     invalid_mask = ~np.asarray(is_valid_owned(owned), dtype=bool)
-    if not bool(np.all(owned.validity)):
+    if invalid_mask.any() and not bool(np.all(owned.validity)):
         invalid_mask = invalid_mask.copy()
         invalid_mask[~owned.validity] = False
     if not invalid_mask.any():
         seed_all_validity_cache(owned)
-        return GeometryNativeResult.from_owned(owned, crs=crs)
+        return _GroupedGeometryResult(
+            GeometryNativeResult.from_owned(owned, crs=crs),
+            repaired=False,
+        )
 
     requested_mode = ExecutionMode.GPU if strict_native_mode_enabled() else ExecutionMode.AUTO
     mv_result = make_valid_owned(owned=owned, dispatch_mode=requested_mode)
@@ -1199,7 +2669,7 @@ def _repair_grouped_union_owned_if_needed(
     if mv_result.owned is not None:
         repaired_owned = mv_result.owned
         remaining_invalid = ~np.asarray(is_valid_owned(repaired_owned), dtype=bool)
-        if not bool(np.all(repaired_owned.validity)):
+        if remaining_invalid.any() and not bool(np.all(repaired_owned.validity)):
             remaining_invalid = remaining_invalid.copy()
             remaining_invalid[~repaired_owned.validity] = False
         if remaining_invalid.any():
@@ -1247,7 +2717,10 @@ def _repair_grouped_union_owned_if_needed(
                 selected=ExecutionMode.CPU,
             )
         seed_all_validity_cache(repaired_owned)
-        return GeometryNativeResult.from_owned(repaired_owned, crs=crs)
+        return _GroupedGeometryResult(
+            GeometryNativeResult.from_owned(repaired_owned, crs=crs),
+            repaired=True,
+        )
 
     record_dispatch_event(
         surface="geopandas.geodataframe.dissolve",
@@ -1260,14 +2733,17 @@ def _repair_grouped_union_owned_if_needed(
         ),
         selected=ExecutionMode.CPU,
     )
-    return GeometryNativeResult.from_geoseries(
-        GeoSeries(
-            _canonicalize_polygonal_make_valid_values(
-                np.asarray(mv_result.geometries, dtype=object)
+    return _GroupedGeometryResult(
+        GeometryNativeResult.from_geoseries(
+            GeoSeries(
+                _canonicalize_polygonal_make_valid_values(
+                    np.asarray(mv_result.geometries, dtype=object)
+                ),
+                name=geometry_name,
+                crs=crs,
             ),
-            name=geometry_name,
-            crs=crs,
-        )
+        ),
+        repaired=True,
     )
 
 
@@ -1489,22 +2965,25 @@ def _owned_rectangle_bounds_device(owned: OwnedGeometryArray):
     polygon_tag = np.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
     d_validity = cp.asarray(device_state.validity).astype(cp.bool_, copy=False)
     d_tags = cp.asarray(device_state.tags).astype(cp.int8, copy=False)
-    if not bool(cp.all(d_validity)) or not bool(cp.all(d_tags == polygon_tag)):
-        return None
 
     polygon_buffer = device_state.families[GeometryFamily.POLYGON]
-    if polygon_buffer.ring_offsets is None or bool(cp.any(polygon_buffer.empty_mask)):
+    if polygon_buffer.ring_offsets is None:
         return None
 
     d_geom_starts = cp.asarray(polygon_buffer.geometry_offsets[:-1]).astype(cp.int32, copy=False)
     d_geom_ends = cp.asarray(polygon_buffer.geometry_offsets[1:]).astype(cp.int32, copy=False)
-    if not bool(cp.all((d_geom_ends - d_geom_starts) == 1)):
-        return None
 
     d_ring_offsets = cp.asarray(polygon_buffer.ring_offsets).astype(cp.int32, copy=False)
     d_coord_starts = d_ring_offsets[d_geom_starts]
     d_coord_ends = d_ring_offsets[d_geom_ends]
-    if not bool(cp.all((d_coord_ends - d_coord_starts) == 5)):
+    if not overlay_bool_scalar(
+        cp.all(d_validity)
+        & cp.all(d_tags == polygon_tag)
+        & ~cp.any(polygon_buffer.empty_mask)
+        & cp.all((d_geom_ends - d_geom_starts) == 1)
+        & cp.all((d_coord_ends - d_coord_starts) == 5),
+        reason="dissolve rectangle bounds structural scalar fence",
+    ):
         return None
 
     compute_geometry_bounds_device(owned)
@@ -1528,15 +3007,182 @@ def _owned_rectangle_bounds_device(owned: OwnedGeometryArray):
     # Bounds kernels can use a lower-precision plan on consumer GPUs; keep
     # the bow-tie rejection but allow the small fp rounding error that shows
     # up on larger regular grids.
-    if not bool(
+    if not overlay_bool_scalar(
         cp.all(
             cp.all(on_corners, axis=1)
             & closed
             & cp.isclose(twice_area, expected_twice_area, rtol=1.0e-10, atol=SPATIAL_EPSILON)
-        )
+        ),
+        reason="dissolve rectangle bounds axis-aligned area scalar fence",
     ):
         return None
     return d_bounds
+
+
+def _host_polygon_segment_count_hint(owned: OwnedGeometryArray) -> int | None:
+    """Return polygon segment count from existing structure metadata, never D2H."""
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    state = owned.device_state
+    if state is None or set(state.families) != {GeometryFamily.POLYGON}:
+        return None
+    device_buffer = state.families.get(GeometryFamily.POLYGON)
+    if device_buffer is not None:
+        dense_width = getattr(device_buffer, "dense_single_ring_width", None)
+        if dense_width is not None:
+            return int(owned.row_count) * max(int(dense_width) - 1, 0)
+    buffer = owned.families.get(GeometryFamily.POLYGON)
+    if buffer is None or buffer.ring_offsets is None:
+        return None
+    ring_offsets = np.asarray(buffer.ring_offsets, dtype=np.int64)
+    if ring_offsets.ndim != 1 or ring_offsets.size < 2:
+        return None
+    ring_sizes = ring_offsets[1:] - ring_offsets[:-1]
+    if np.any(ring_sizes < 1):
+        return None
+    return int(np.maximum(ring_sizes - 1, 0).sum())
+
+
+def _owned_all_rows_valid_host_proof(owned: OwnedGeometryArray) -> bool:
+    """Return true when existing host/cache metadata proves every row valid."""
+    cached = owned._current_cached_validity_mask()
+    if cached is not None and int(cached.size) == int(owned.row_count):
+        return bool(np.all(cached))
+    validity = getattr(owned, "_validity", None)
+    if validity is not None and int(validity.size) == int(owned.row_count):
+        return bool(np.all(validity))
+    return False
+
+
+def _group_codes_cover_all_rows_and_groups(
+    row_group_codes: Any,
+    *,
+    group_count: int,
+    row_count: int,
+) -> bool:
+    """Prove dense group codes have no dropped rows and observe every group."""
+    if group_count < 0:
+        return False
+    if group_count == 0:
+        return row_count == 0
+    if _is_device_array(row_group_codes):
+        grouped = NativeGrouped.from_dense_codes(
+            row_group_codes,
+            group_count=group_count,
+        )
+        if grouped.sorted_order is None or grouped.group_ids is None:
+            return False
+        return (
+            int(grouped.sorted_order.size) == int(row_count)
+            and int(grouped.group_ids.size) == int(group_count)
+        )
+
+    codes = np.asarray(row_group_codes, dtype=np.int32)
+    if int(codes.size) != int(row_count):
+        return False
+    if not bool(np.all((codes >= 0) & (codes < int(group_count)))):
+        return False
+    return int(np.unique(codes).size) == int(group_count)
+
+
+def _group_codes_observed_in_range_row_count(
+    row_group_codes: Any,
+    *,
+    group_count: int,
+    row_count: int,
+) -> int | None:
+    """Count rows with dense in-range group codes without materializing codes."""
+    if group_count < 0:
+        return None
+    if _is_device_array(row_group_codes):
+        grouped = NativeGrouped.from_dense_codes(
+            row_group_codes,
+            group_count=group_count,
+        )
+        if grouped.sorted_order is None:
+            return None
+        observed_count = int(grouped.sorted_order.size)
+        if observed_count > int(row_count):
+            return None
+        return observed_count
+
+    codes = np.asarray(row_group_codes, dtype=np.int32)
+    if int(codes.size) != int(row_count):
+        return None
+    observed = (codes >= 0) & (codes < int(group_count))
+    return int(np.count_nonzero(observed))
+
+
+def _execute_low_fan_in_all_valid_coverage_union_gpu_owned_codes(
+    row_group_codes: Any,
+    *,
+    group_count: int,
+    owned: OwnedGeometryArray,
+) -> GroupedUnionResult | None:
+    """Exact grouped coverage union for low-fan-in all-valid device codes.
+
+    Physical shape: `NativeGrouped` proves observed device groups, an existing
+    all-valid cache proves row validity, and host polygon offsets provide only
+    an allocation size hint.  The reducer itself stays segment/group shaped on
+    device and avoids scalar D2H admissions before the exact coverage union.
+    """
+    if cp is None or not _is_device_array(row_group_codes):
+        return None
+    if group_count <= 0 or int(owned.row_count) == 0:
+        return None
+    if int(owned.row_count) > (2 * int(group_count)):
+        return None
+    if not _owned_all_rows_valid_host_proof(owned):
+        return None
+    if not _owned_supports_polygonal_grouped_union(owned):
+        return None
+
+    total_segments_hint = _host_polygon_segment_count_hint(owned)
+    if total_segments_hint is None:
+        return None
+
+    if not _group_codes_cover_all_rows_and_groups(
+        row_group_codes,
+        group_count=group_count,
+        row_count=owned.row_count,
+    ):
+        return None
+
+    from vibespatial.constructive.binary_constructive import (
+        _dispatch_grouped_polygon_known_coverage_union_gpu,
+    )
+
+    reduced = _dispatch_grouped_polygon_known_coverage_union_gpu(
+        owned,
+        cp.asarray(row_group_codes, dtype=cp.int32),
+        output_row_count=group_count,
+        dispatch_mode=ExecutionMode.GPU,
+        assume_all_valid=True,
+        assume_source_rows_valid=True,
+        total_segments_hint=total_segments_hint,
+    )
+    if reduced is None or reduced.row_count != int(group_count):
+        return None
+    from vibespatial.geometry.owned import seed_all_validity_cache
+
+    seed_all_validity_cache(reduced)
+    record_dispatch_event(
+        surface="vibespatial.overlay.dissolve.execute_grouped_union_codes",
+        operation="grouped_coverage_union",
+        implementation="native_low_fan_in_grouped_coverage_union",
+        reason="low-fan-in all-valid device coverage groups reduced without scalar admissions",
+        detail=f"rows={owned.row_count}, groups={group_count}",
+        requested=ExecutionMode.GPU,
+        selected=ExecutionMode.GPU,
+    )
+    return GroupedUnionResult(
+        geometries=None,
+        group_count=int(group_count),
+        non_empty_groups=int(group_count),
+        empty_groups=0,
+        method=DissolveUnionMethod.COVERAGE,
+        owned=reduced,
+    )
 
 
 def execute_grouped_box_union_gpu_owned_codes(
@@ -1559,7 +3205,10 @@ def execute_grouped_box_union_gpu_owned_codes(
 
     d_codes = cp.asarray(row_group_codes, dtype=cp.int32)
     d_observed_mask = d_codes >= 0
-    if not bool(cp.any(d_observed_mask)):
+    if not overlay_bool_scalar(
+        cp.any(d_observed_mask),
+        reason="dissolve grouped-box observed-row scalar fence",
+    ):
         merged = np.full(group_count, _EMPTY, dtype=object)
         return GroupedUnionResult(
             geometries=merged,
@@ -1574,8 +3223,6 @@ def execute_grouped_box_union_gpu_owned_codes(
     d_observed_codes = d_codes[d_observed_mask]
     d_observed_bounds = d_bounds[d_observed_mask]
     d_counts = cp.bincount(d_observed_codes, minlength=group_count)
-    if not bool(cp.all(d_counts[:group_count] > 0)):
-        return None
 
     d_xmin = cp.full(group_count, cp.inf, dtype=cp.float64)
     d_ymin = cp.full(group_count, cp.inf, dtype=cp.float64)
@@ -1591,8 +3238,6 @@ def execute_grouped_box_union_gpu_owned_codes(
     d_area_sum = cp.zeros(group_count, dtype=cp.float64)
     cp.add.at(d_area_sum, d_observed_codes, d_width * d_height)
     d_bbox_area = (d_xmax - d_xmin) * (d_ymax - d_ymin)
-    if not bool(cp.all(cp.isclose(d_area_sum, d_bbox_area, rtol=1.0e-12, atol=SPATIAL_EPSILON))):
-        return None
 
     d_group_ymin = d_ymin[d_observed_codes]
     d_group_ymax = d_ymax[d_observed_codes]
@@ -1631,15 +3276,13 @@ def execute_grouped_box_union_gpu_owned_codes(
     x_sorted_codes = d_observed_codes[x_order]
     x_sorted_bounds = d_observed_bounds[x_order]
     same_group = x_sorted_codes[1:] == x_sorted_codes[:-1]
-    x_contiguous = bool(
-        cp.all(
-            (~same_group)
-            | cp.isclose(
-                x_sorted_bounds[:-1, 2],
-                x_sorted_bounds[1:, 0],
-                rtol=1.0e-12,
-                atol=SPATIAL_EPSILON,
-            )
+    d_x_contiguous = cp.all(
+        (~same_group)
+        | cp.isclose(
+            x_sorted_bounds[:-1, 2],
+            x_sorted_bounds[1:, 0],
+            rtol=1.0e-12,
+            atol=SPATIAL_EPSILON,
         )
     )
     y_order = cp.lexsort(
@@ -1653,24 +3296,30 @@ def execute_grouped_box_union_gpu_owned_codes(
     y_sorted_codes = d_observed_codes[y_order]
     y_sorted_bounds = d_observed_bounds[y_order]
     same_group = y_sorted_codes[1:] == y_sorted_codes[:-1]
-    y_contiguous = bool(
-        cp.all(
-            (~same_group)
-            | cp.isclose(
-                y_sorted_bounds[:-1, 3],
-                y_sorted_bounds[1:, 1],
-                rtol=1.0e-12,
-                atol=SPATIAL_EPSILON,
-            )
+    d_y_contiguous = cp.all(
+        (~same_group)
+        | cp.isclose(
+            y_sorted_bounds[:-1, 3],
+            y_sorted_bounds[1:, 1],
+            rtol=1.0e-12,
+            atol=SPATIAL_EPSILON,
         )
     )
-    horizontal_strip = bool(cp.all(d_full_height)) and x_contiguous
-    vertical_strip = bool(cp.all(d_full_width)) and y_contiguous
-    if not (horizontal_strip or vertical_strip):
+    d_horizontal_strip = cp.all(d_full_height) & d_x_contiguous
+    d_vertical_strip = cp.all(d_full_width) & d_y_contiguous
+    if not overlay_bool_scalar(
+        cp.all(d_counts[:group_count] > 0)
+        & cp.all(cp.isclose(d_area_sum, d_bbox_area, rtol=1.0e-12, atol=SPATIAL_EPSILON))
+        & (d_horizontal_strip | d_vertical_strip),
+        reason="dissolve grouped-box strip-coverage scalar fence",
+    ):
         return None
 
     d_group_bounds = cp.stack((d_xmin, d_ymin, d_xmax, d_ymax), axis=1)
     reduced = _build_device_boxes_from_bounds(d_group_bounds, row_count=group_count)
+    from vibespatial.geometry.owned import seed_all_validity_cache
+
+    seed_all_validity_cache(reduced)
 
     return GroupedUnionResult(
         geometries=None,
@@ -1680,6 +3329,122 @@ def execute_grouped_box_union_gpu_owned_codes(
         method=DissolveUnionMethod.COVERAGE,
         owned=reduced,
     )
+
+
+def _regular_grid_rectangles_are_strictly_group_disjoint_device(
+    d_bounds,
+    d_codes,
+    *,
+    group_count: int,
+) -> bool:
+    """Certify sparse regular-grid rectangle groups for MultiPolygon assembly.
+
+    The shape is conservative: all observed rectangles must be equal-size
+    cells on a fp64 grid, each cell id must be unique, and no horizontal or
+    vertical neighbor may share a dissolve group. Under those constraints the
+    input coverage has no same-group touching/overlap, so grouped disjoint
+    assembly is exact without all-pairs checks.
+    """
+    row_count = int(getattr(d_bounds, "shape", (0,))[0])
+    if row_count <= 1:
+        return False
+    d_codes = cp.asarray(d_codes, dtype=cp.int32)
+
+    d_widths = d_bounds[:, 2] - d_bounds[:, 0]
+    d_heights = d_bounds[:, 3] - d_bounds[:, 1]
+    d_width = d_widths[0]
+    d_height = d_heights[0]
+    if not overlay_bool_scalar(
+        cp.all((d_codes >= 0) & (d_codes < int(group_count)))
+        & (d_width > 0.0)
+        & (d_height > 0.0),
+        reason="dissolve regular-grid domain-positive-size scalar fence",
+    ):
+        return False
+
+    d_min_x = cp.min(d_bounds[:, 0])
+    d_min_y = cp.min(d_bounds[:, 1])
+    d_ix_float = (d_bounds[:, 0] - d_min_x) / d_width
+    d_iy_float = (d_bounds[:, 1] - d_min_y) / d_height
+    d_ix = cp.rint(d_ix_float).astype(cp.int64, copy=False)
+    d_iy = cp.rint(d_iy_float).astype(cp.int64, copy=False)
+    d_uniform_cell_size = (
+        cp.all(cp.isclose(d_widths, d_width, rtol=1.0e-12, atol=SPATIAL_EPSILON))
+        & cp.all(cp.isclose(d_heights, d_height, rtol=1.0e-12, atol=SPATIAL_EPSILON))
+    )
+    d_integral_cell_index = (
+        cp.all(
+            cp.isclose(
+                d_ix_float,
+                d_ix.astype(cp.float64, copy=False),
+                rtol=1.0e-12,
+                atol=SPATIAL_EPSILON,
+            )
+        )
+        & cp.all(
+            cp.isclose(
+                d_iy_float,
+                d_iy.astype(cp.float64, copy=False),
+                rtol=1.0e-12,
+                atol=SPATIAL_EPSILON,
+            )
+        )
+    )
+
+    d_cols = cp.max(d_ix) + cp.asarray(1, dtype=cp.int64)
+    d_linear = d_iy * d_cols + d_ix
+    order = cp.argsort(d_linear)
+    d_sorted_linear = d_linear[order]
+    d_sorted_ix = d_ix[order]
+    d_sorted_iy = d_iy[order]
+    d_sorted_codes = d_codes[order]
+
+    d_unique_cells = cp.all(d_sorted_linear[1:] > d_sorted_linear[:-1])
+
+    d_horizontal_same_group = (
+        (d_sorted_iy[1:] == d_sorted_iy[:-1])
+        & (d_sorted_ix[1:] == (d_sorted_ix[:-1] + 1))
+        & (d_sorted_codes[1:] == d_sorted_codes[:-1])
+    )
+
+    def _has_same_group_target(d_targets, d_target_valid):
+        d_positions = cp.searchsorted(d_sorted_linear, d_targets)
+        d_found = d_target_valid & (d_positions < row_count)
+        d_safe_positions = cp.minimum(
+            d_positions,
+            cp.asarray(row_count - 1, dtype=d_positions.dtype),
+        )
+        d_same_group = (
+            d_found
+            & (d_sorted_linear[d_safe_positions] == d_targets)
+            & (d_sorted_codes[d_safe_positions] == d_sorted_codes)
+        )
+        return cp.any(d_same_group)
+
+    d_has_vertical_same_group = _has_same_group_target(
+        d_sorted_linear + d_cols,
+        cp.ones(row_count, dtype=cp.bool_),
+    )
+    d_has_diagonal_left_same_group = _has_same_group_target(
+        d_sorted_linear + d_cols - 1,
+        d_sorted_ix > 0,
+    )
+    d_has_diagonal_right_same_group = _has_same_group_target(
+        d_sorted_linear + d_cols + 1,
+        d_sorted_ix < (d_cols - 1),
+    )
+    if not overlay_bool_scalar(
+        d_uniform_cell_size
+        & d_integral_cell_index
+        & d_unique_cells
+        & ~cp.any(d_horizontal_same_group)
+        & ~d_has_vertical_same_group
+        & ~d_has_diagonal_left_same_group
+        & ~d_has_diagonal_right_same_group,
+        reason="dissolve regular-grid disjoint-neighbor scalar fence",
+    ):
+        return False
+    return True
 
 
 def execute_grouped_disjoint_subset_union_gpu_owned_codes(
@@ -1708,6 +3473,7 @@ def execute_grouped_disjoint_subset_union_gpu_owned_codes(
         FAMILY_TAGS,
         DeviceFamilyGeometryBuffer,
         build_device_resident_owned,
+        seed_all_validity_cache,
         seed_homogeneous_host_metadata,
     )
 
@@ -1715,12 +3481,11 @@ def execute_grouped_disjoint_subset_union_gpu_owned_codes(
     if set(device_state.families) != {GeometryFamily.POLYGON}:
         return None
     cached_validity = getattr(owned, "_cached_is_valid_mask", None)
-    if (
-        cached_validity is None
-        or int(getattr(cached_validity, "size", 0)) != int(owned.row_count)
-        or not bool(np.all(cached_validity))
-    ):
-        return None
+    cached_validity_ok = (
+        cached_validity is not None
+        and int(getattr(cached_validity, "size", 0)) == int(owned.row_count)
+        and bool(np.all(cached_validity))
+    )
 
     polygon_tag = np.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
     d_validity = cp.asarray(device_state.validity).astype(cp.bool_, copy=False)
@@ -1747,8 +3512,32 @@ def execute_grouped_disjoint_subset_union_gpu_owned_codes(
         d_admissible &= ~cp.any(polygon_buffer.empty_mask)
     d_admissible &= cp.any(d_observed_mask)
     d_admissible &= cp.all(d_counts > 1)
-    d_admissible &= cp.all(d_counts <= 8)
-    if not bool(d_admissible):
+    if not overlay_bool_scalar(
+        d_admissible,
+        reason="dissolve disjoint-subset admissibility scalar fence",
+    ):
+        return None
+
+    d_bounds = None
+    small_pairwise_groups = overlay_bool_scalar(
+        cp.all(d_counts <= 8),
+        reason="dissolve disjoint-subset small-pairwise scalar fence",
+    )
+    if not small_pairwise_groups:
+        try:
+            d_all_bounds = _owned_rectangle_bounds_device(owned)
+        except RuntimeError:
+            d_all_bounds = None
+        if d_all_bounds is None:
+            return None
+        d_bounds = d_all_bounds[d_observed_mask]
+        if not _regular_grid_rectangles_are_strictly_group_disjoint_device(
+            d_bounds,
+            d_observed_codes,
+            group_count=group_count,
+        ):
+            return None
+    elif not cached_validity_ok:
         return None
 
     order = cp.lexsort(
@@ -1772,33 +3561,40 @@ def execute_grouped_disjoint_subset_union_gpu_owned_codes(
             cp.cumsum(d_counts, dtype=cp.int32),
         ],
     )
-    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
+    if small_pairwise_groups:
+        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
 
-    sorted_bounds = cp.asarray(compute_geometry_bounds_device(sorted_owned), dtype=cp.float64)
-    max_group_size = 8
-    slot_ids = cp.arange(max_group_size, dtype=cp.int32)
-    slot_valid = slot_ids[None, :] < d_counts[:, None]
-    slot_positions = d_group_offsets[:-1, None] + slot_ids[None, :]
-    slot_positions = cp.minimum(
-        slot_positions,
-        cp.asarray(max(int(sorted_owned.row_count) - 1, 0), dtype=cp.int32),
-    )
-    slot_bounds = sorted_bounds[slot_positions]
-    a = slot_bounds[:, :, None, :]
-    b = slot_bounds[:, None, :, :]
-    pair_valid = (
-        slot_valid[:, :, None]
-        & slot_valid[:, None, :]
-        & (slot_ids[None, :, None] < slot_ids[None, None, :])
-    )
-    separated = (
-        (a[..., 2] < b[..., 0])
-        | (b[..., 2] < a[..., 0])
-        | (a[..., 3] < b[..., 1])
-        | (b[..., 3] < a[..., 1])
-    )
-    if not bool(cp.all((~pair_valid) | separated)):
-        return None
+        sorted_bounds = cp.asarray(
+            compute_geometry_bounds_device(sorted_owned),
+            dtype=cp.float64,
+        )
+        max_group_size = 8
+        slot_ids = cp.arange(max_group_size, dtype=cp.int32)
+        slot_valid = slot_ids[None, :] < d_counts[:, None]
+        slot_positions = d_group_offsets[:-1, None] + slot_ids[None, :]
+        slot_positions = cp.minimum(
+            slot_positions,
+            cp.asarray(max(int(sorted_owned.row_count) - 1, 0), dtype=cp.int32),
+        )
+        slot_bounds = sorted_bounds[slot_positions]
+        a = slot_bounds[:, :, None, :]
+        b = slot_bounds[:, None, :, :]
+        pair_valid = (
+            slot_valid[:, :, None]
+            & slot_valid[:, None, :]
+            & (slot_ids[None, :, None] < slot_ids[None, None, :])
+        )
+        separated = (
+            (a[..., 2] < b[..., 0])
+            | (b[..., 2] < a[..., 0])
+            | (a[..., 3] < b[..., 1])
+            | (b[..., 3] < a[..., 1])
+        )
+        if not overlay_bool_scalar(
+            cp.all((~pair_valid) | separated),
+            reason="dissolve disjoint-subset pair-separation scalar fence",
+        ):
+            return None
 
     d_empty_mask = cp.zeros(int(group_count), dtype=cp.bool_)
     d_multipolygon = DeviceFamilyGeometryBuffer(
@@ -1820,6 +3616,7 @@ def execute_grouped_disjoint_subset_union_gpu_owned_codes(
         execution_mode="gpu",
     )
     seed_homogeneous_host_metadata(reduced, GeometryFamily.MULTIPOLYGON)
+    seed_all_validity_cache(reduced)
 
     return GroupedUnionResult(
         geometries=None,
@@ -1974,68 +3771,137 @@ def execute_grouped_coverage_union_gpu(
     if not _owned_supports_polygonal_grouped_union(owned):
         return None
 
-    host_values: np.ndarray | None = None
-
-    def _values() -> np.ndarray | None:
-        nonlocal host_values
-        if values is None:
-            return None
-        if host_values is None:
-            host_values = np.asarray(values, dtype=object)
-        return host_values
-
     from vibespatial.constructive.union_all import coverage_union_all_gpu_owned
 
     group_owned_results: list[OwnedGeometryArray] = []
-    all_groups_observed = all(len(positions) > 0 for positions in group_positions)
-    merged = None if all_groups_observed else np.empty(len(group_positions), dtype=object)
+    observed_group_ids: list[int] = []
     non_empty_groups = 0
     empty_groups = 0
 
     for group_index, positions in enumerate(group_positions):
         positions = np.asarray(positions, dtype=np.intp)
         if positions.size == 0:
-            if merged is not None:
-                merged[group_index] = _EMPTY
             empty_groups += 1
             continue
         non_empty_groups += 1
+        observed_group_ids.append(group_index)
         if positions.size == 1:
             single = owned.take(positions)
             group_owned_results.append(single)
-            if merged is not None:
-                materialized = _values()
-                if materialized is not None:
-                    merged[group_index] = materialized[int(positions[0])]
-                else:
-                    single_geoms = single.to_shapely()
-                    merged[group_index] = single_geoms[0] if single_geoms else _EMPTY
             continue
         group_owned = owned.take(positions)
         reduced = coverage_union_all_gpu_owned(group_owned)
         if reduced is None:
             return None
         group_owned_results.append(reduced)
-        if merged is not None:
-            reduced_geoms = reduced.to_shapely()
-            merged[group_index] = reduced_geoms[0] if reduced_geoms else _EMPTY
 
-    if all_groups_observed and len(group_owned_results) == len(group_positions):
-        return GroupedUnionResult(
-            geometries=None,
-            group_count=len(group_positions),
-            non_empty_groups=non_empty_groups,
-            empty_groups=empty_groups,
-            method=DissolveUnionMethod.COVERAGE,
-            owned=type(owned).concat(group_owned_results),
-        )
-
-    return GroupedUnionResult(
-        geometries=merged if merged is not None else np.empty(0, dtype=object),
+    native_result = _grouped_owned_results_to_native_grouped_union_result(
+        group_owned_results,
+        observed_group_ids,
         group_count=len(group_positions),
         non_empty_groups=non_empty_groups,
         empty_groups=empty_groups,
         method=DissolveUnionMethod.COVERAGE,
+    )
+    if native_result is not None:
+        return native_result
+
+    merged = np.full(len(group_positions), _EMPTY, dtype=object)
+    for group_index, group_owned in zip(
+        observed_group_ids,
+        group_owned_results,
+        strict=True,
+    ):
+        group_geoms = group_owned.to_shapely()
+        merged[group_index] = group_geoms[0] if group_geoms else _EMPTY
+    return GroupedUnionResult(
+        geometries=merged,
+        group_count=len(group_positions),
+        non_empty_groups=non_empty_groups,
+        empty_groups=empty_groups,
+        method=DissolveUnionMethod.COVERAGE,
+    )
+
+
+def _grouped_owned_results_to_native_grouped_union_result(
+    group_owned_results: list[OwnedGeometryArray],
+    observed_group_ids: list[int],
+    *,
+    group_count: int,
+    non_empty_groups: int,
+    empty_groups: int,
+    method: DissolveUnionMethod,
+) -> GroupedUnionResult | None:
+    """Assemble grouped owned reductions into full grouped output rows.
+
+    Physical shape: observed grouped reductions plus sparse group ids -> full
+    grouped constructive output.  When sparse outputs are device-resident, empty
+    rows are prebuilt as device empty polygons and observed rows are scattered
+    into place without a host geometry array.
+    """
+    if len(group_owned_results) != len(observed_group_ids):
+        return None
+    if non_empty_groups != len(observed_group_ids):
+        return None
+    if int(group_count) != non_empty_groups + empty_groups:
+        return None
+
+    from vibespatial.geometry.owned import seed_all_validity_cache
+    from vibespatial.runtime.residency import Residency
+
+    if not group_owned_results:
+        if cp is None:
+            return None
+        owned_result = _empty_polygon_rows_device(group_count)
+        seed_all_validity_cache(owned_result)
+        return GroupedUnionResult(
+            geometries=None,
+            group_count=group_count,
+            non_empty_groups=non_empty_groups,
+            empty_groups=empty_groups,
+            method=method,
+            owned=owned_result,
+        )
+
+    if (
+        empty_groups == 0
+        and observed_group_ids == list(range(group_count))
+    ):
+        owned_result = type(group_owned_results[0]).concat(group_owned_results)
+        seed_all_validity_cache(owned_result)
+        return GroupedUnionResult(
+            geometries=None,
+            group_count=group_count,
+            non_empty_groups=non_empty_groups,
+            empty_groups=empty_groups,
+            method=method,
+            owned=owned_result,
+        )
+
+    if cp is None:
+        return None
+    if any(result.residency is not Residency.DEVICE for result in group_owned_results):
+        return None
+
+    replacement = type(group_owned_results[0]).concat(group_owned_results)
+    if replacement.row_count != len(observed_group_ids):
+        return None
+
+    from vibespatial.geometry.owned import concat_owned_scatter
+
+    owned_result = concat_owned_scatter(
+        _empty_polygon_rows_device(group_count),
+        replacement,
+        np.asarray(observed_group_ids, dtype=np.int64),
+    )
+    seed_all_validity_cache(owned_result)
+    return GroupedUnionResult(
+        geometries=None,
+        group_count=group_count,
+        non_empty_groups=non_empty_groups,
+        empty_groups=empty_groups,
+        method=method,
+        owned=owned_result,
     )
 
 
@@ -2059,64 +3925,51 @@ def execute_grouped_disjoint_subset_union_gpu(
     if not _owned_supports_polygonal_grouped_union(owned):
         return None
 
-    host_values: np.ndarray | None = None
-
-    def _values() -> np.ndarray | None:
-        nonlocal host_values
-        if values is None:
-            return None
-        if host_values is None:
-            host_values = np.asarray(values, dtype=object)
-        return host_values
-
     from vibespatial.constructive.union_all import disjoint_subset_union_all_owned
 
     group_owned_results: list[OwnedGeometryArray] = []
-    all_groups_observed = all(len(positions) > 0 for positions in group_positions)
-    merged = None if all_groups_observed else np.empty(len(group_positions), dtype=object)
+    observed_group_ids: list[int] = []
     non_empty_groups = 0
     empty_groups = 0
 
     for group_index, positions in enumerate(group_positions):
         positions = np.asarray(positions, dtype=np.intp)
         if positions.size == 0:
-            if merged is not None:
-                merged[group_index] = _EMPTY
             empty_groups += 1
             continue
         non_empty_groups += 1
+        observed_group_ids.append(group_index)
         if positions.size == 1:
             single = owned.take(positions)
             group_owned_results.append(single)
-            if merged is not None:
-                materialized = _values()
-                if materialized is not None:
-                    merged[group_index] = materialized[int(positions[0])]
-                else:
-                    single_geoms = single.to_shapely()
-                    merged[group_index] = single_geoms[0] if single_geoms else _EMPTY
             continue
         group_owned = owned.take(positions)
         reduced = disjoint_subset_union_all_owned(group_owned)
         if reduced is None:
             return None
         group_owned_results.append(reduced)
-        if merged is not None:
-            reduced_geoms = reduced.to_shapely()
-            merged[group_index] = reduced_geoms[0] if reduced_geoms else _EMPTY
 
-    if all_groups_observed and len(group_owned_results) == len(group_positions):
-        return GroupedUnionResult(
-            geometries=None,
-            group_count=len(group_positions),
-            non_empty_groups=non_empty_groups,
-            empty_groups=empty_groups,
-            method=DissolveUnionMethod.DISJOINT_SUBSET,
-            owned=type(owned).concat(group_owned_results),
-        )
+    native_result = _grouped_owned_results_to_native_grouped_union_result(
+        group_owned_results,
+        observed_group_ids,
+        group_count=len(group_positions),
+        non_empty_groups=non_empty_groups,
+        empty_groups=empty_groups,
+        method=DissolveUnionMethod.DISJOINT_SUBSET,
+    )
+    if native_result is not None:
+        return native_result
 
+    merged = np.full(len(group_positions), _EMPTY, dtype=object)
+    for group_index, group_owned in zip(
+        observed_group_ids,
+        group_owned_results,
+        strict=True,
+    ):
+        group_geoms = group_owned.to_shapely()
+        merged[group_index] = group_geoms[0] if group_geoms else _EMPTY
     return GroupedUnionResult(
-        geometries=merged if merged is not None else np.empty(0, dtype=object),
+        geometries=merged,
         group_count=len(group_positions),
         non_empty_groups=non_empty_groups,
         empty_groups=empty_groups,
@@ -2412,6 +4265,291 @@ def execute_grouped_coverage_edge_union_codes(
     )
 
 
+def _empty_polygon_rows_device(row_count: int) -> OwnedGeometryArray:
+    """Build valid empty polygon rows without leaving the device."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        raise RuntimeError("CuPy is required for device empty polygon rows")
+
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import (
+        FAMILY_TAGS,
+        DeviceFamilyGeometryBuffer,
+        build_device_resident_owned,
+        seed_homogeneous_host_metadata,
+    )
+
+    row_count = int(row_count)
+    polygon_tag = np.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
+    result = build_device_resident_owned(
+        device_families={
+            GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.POLYGON,
+                x=cp.empty(0, dtype=cp.float64),
+                y=cp.empty(0, dtype=cp.float64),
+                geometry_offsets=cp.zeros(row_count + 1, dtype=cp.int32),
+                empty_mask=cp.ones(row_count, dtype=cp.bool_),
+                ring_offsets=cp.zeros(1, dtype=cp.int32),
+                bounds=None,
+            )
+        },
+        row_count=row_count,
+        tags=cp.full(row_count, polygon_tag, dtype=cp.int8),
+        validity=cp.ones(row_count, dtype=cp.bool_),
+        family_row_offsets=cp.arange(row_count, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+    seed_homogeneous_host_metadata(result, GeometryFamily.POLYGON)
+    return result
+
+
+def _scatter_empty_polygon_groups_device(
+    reduced: OwnedGeometryArray,
+    counts,
+) -> OwnedGeometryArray:
+    """Replace unobserved grouped-output rows with valid empty polygon rows."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return reduced
+
+    empty_rows = cp.flatnonzero(cp.asarray(counts) == 0).astype(cp.int64, copy=False)
+    if int(empty_rows.size) == 0:
+        return reduced
+
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import (
+        FAMILY_TAGS,
+        DeviceFamilyGeometryBuffer,
+        build_device_resident_owned,
+    )
+
+    state = reduced._ensure_device_state()
+    n_empty = int(empty_rows.size)
+    polygon = GeometryFamily.POLYGON
+    polygon_tag = np.int8(FAMILY_TAGS[polygon])
+
+    out_validity = cp.asarray(state.validity, dtype=cp.bool_).copy()
+    out_tags = cp.asarray(state.tags, dtype=cp.int8).copy()
+    out_family_rows = cp.asarray(state.family_row_offsets, dtype=cp.int32).copy()
+
+    polygon_buffer = state.families.get(polygon)
+    if polygon_buffer is None:
+        polygon_row_count = 0
+        new_polygon_buffer = DeviceFamilyGeometryBuffer(
+            family=polygon,
+            x=cp.empty(0, dtype=cp.float64),
+            y=cp.empty(0, dtype=cp.float64),
+            geometry_offsets=cp.zeros(n_empty + 1, dtype=cp.int32),
+            empty_mask=cp.ones(n_empty, dtype=cp.bool_),
+            ring_offsets=cp.zeros(1, dtype=cp.int32),
+            bounds=None,
+        )
+    else:
+        polygon_row_count = int(polygon_buffer.geometry_offsets.size) - 1
+        last_geom_offset = polygon_buffer.geometry_offsets[-1:]
+        appended_geom_offsets = cp.repeat(last_geom_offset, n_empty)
+        new_bounds = None
+        if polygon_buffer.bounds is not None:
+            empty_bounds = cp.full((n_empty, 4), cp.nan, dtype=cp.float64)
+            new_bounds = cp.concatenate((polygon_buffer.bounds, empty_bounds))
+        new_polygon_buffer = DeviceFamilyGeometryBuffer(
+            family=polygon,
+            x=polygon_buffer.x,
+            y=polygon_buffer.y,
+            geometry_offsets=cp.concatenate(
+                (polygon_buffer.geometry_offsets, appended_geom_offsets)
+            ),
+            empty_mask=cp.concatenate(
+                (polygon_buffer.empty_mask, cp.ones(n_empty, dtype=cp.bool_))
+            ),
+            ring_offsets=polygon_buffer.ring_offsets,
+            bounds=new_bounds,
+        )
+
+    out_validity[empty_rows] = True
+    out_tags[empty_rows] = polygon_tag
+    out_family_rows[empty_rows] = cp.arange(
+        polygon_row_count,
+        polygon_row_count + n_empty,
+        dtype=cp.int32,
+    )
+    device_families = dict(state.families)
+    device_families[polygon] = new_polygon_buffer
+    result = build_device_resident_owned(
+        device_families=device_families,
+        row_count=reduced.row_count,
+        tags=out_tags,
+        validity=out_validity,
+        family_row_offsets=out_family_rows,
+        execution_mode="gpu",
+    )
+    result.runtime_history.extend(reduced.runtime_history)
+    return result
+
+
+def execute_grouped_coverage_edge_union_gpu_owned_codes(
+    row_group_codes,
+    *,
+    group_count: int,
+    owned: OwnedGeometryArray,
+) -> GroupedUnionResult | None:
+    """Topology-free grouped coverage dissolve from device native carriers."""
+    if cp is None:
+        return None
+    from vibespatial.runtime.residency import Residency
+
+    if owned.residency is not Residency.DEVICE:
+        return None
+    if group_count < 0 or not _owned_supports_polygonal_grouped_union(owned):
+        return None
+    if int(row_group_codes.size) != owned.row_count:
+        return None
+
+    if group_count == 0:
+        from vibespatial.constructive.binary_constructive import (
+            _empty_device_constructive_output,
+        )
+
+        return GroupedUnionResult(
+            geometries=None,
+            group_count=0,
+            non_empty_groups=0,
+            empty_groups=0,
+            method=DissolveUnionMethod.COVERAGE,
+            owned=_empty_device_constructive_output(0),
+        )
+
+    host_valid_count = _host_known_observed_valid_count(
+        owned,
+        row_group_codes,
+        group_count=group_count,
+    )
+    device_grouped_shape: NativeGrouped | None = None
+    if _is_device_array(row_group_codes):
+        device_grouped_shape = NativeGrouped.from_dense_codes(
+            row_group_codes,
+            group_count=group_count,
+        )
+        host_group_counts = (
+            int(device_grouped_shape.group_ids.size),
+            int(group_count) - int(device_grouped_shape.group_ids.size),
+        )
+    else:
+        host_group_counts = _group_non_empty_counts(
+            np.asarray(row_group_codes, dtype=np.int32),
+            group_count,
+        )
+    d_codes = cp.asarray(row_group_codes, dtype=cp.int32)
+    all_rows_valid = _owned_all_rows_valid_host_proof(owned)
+    if not all_rows_valid:
+        observed_in_range_count = None
+    elif device_grouped_shape is not None:
+        observed_in_range_count = int(device_grouped_shape.sorted_order.size)
+    else:
+        observed_in_range_count = _group_codes_observed_in_range_row_count(
+            row_group_codes,
+            group_count=group_count,
+            row_count=owned.row_count,
+        )
+    all_valid_all_rows = (
+        observed_in_range_count is not None
+        and int(observed_in_range_count) == int(owned.row_count)
+    )
+    all_valid_all_groups = all_valid_all_rows and host_group_counts[0] == int(group_count)
+    total_segments_hint = (
+        _host_polygon_segment_count_hint(owned)
+        if all_valid_all_rows
+        else None
+    )
+    state = owned._ensure_device_state()
+    d_valid = cp.asarray(state.validity, dtype=cp.bool_)
+    d_observed_valid = d_valid & (d_codes >= 0) & (d_codes < np.int32(group_count))
+    if observed_in_range_count is not None:
+        valid_count = int(observed_in_range_count)
+    elif all_valid_all_groups:
+        valid_count = int(owned.row_count)
+    elif host_valid_count is not None:
+        valid_count = host_valid_count
+    else:
+        valid_count = overlay_int_scalar(
+            cp.count_nonzero(d_observed_valid),
+            reason="overlay dissolve grouped coverage-edge valid-row count fence",
+        )
+    if valid_count == 0:
+        reduced = _empty_polygon_rows_device(group_count)
+        return GroupedUnionResult(
+            geometries=None,
+            group_count=group_count,
+            non_empty_groups=0,
+            empty_groups=group_count,
+            method=DissolveUnionMethod.COVERAGE,
+            owned=reduced,
+        )
+
+    if valid_count == owned.row_count:
+        valid_owned = owned
+        valid_source_rows = d_codes
+    else:
+        valid_positions = cp.flatnonzero(d_observed_valid).astype(cp.int64, copy=False)
+        valid_owned = owned.take(valid_positions)
+        valid_source_rows = d_codes[valid_positions]
+        if total_segments_hint is None:
+            total_segments_hint = _host_polygon_segment_count_hint(valid_owned)
+
+    from vibespatial.constructive.binary_constructive import (
+        _dispatch_grouped_polygon_known_coverage_union_gpu,
+    )
+
+    reduced = _dispatch_grouped_polygon_known_coverage_union_gpu(
+        valid_owned,
+        valid_source_rows,
+        output_row_count=group_count,
+        dispatch_mode=ExecutionMode.GPU,
+        assume_all_valid=True,
+        assume_source_rows_valid=True,
+        total_segments_hint=total_segments_hint,
+    )
+    if reduced is None or reduced.row_count != group_count:
+        return None
+
+    if all_valid_all_groups:
+        counts = None
+        non_empty_groups = int(group_count)
+    else:
+        counts = cp.bincount(valid_source_rows, minlength=group_count)
+        non_empty_groups = (
+            host_group_counts[0]
+            if host_group_counts is not None
+            else overlay_int_scalar(
+                cp.count_nonzero(counts > 0),
+                reason="overlay dissolve grouped coverage-edge nonempty-group count fence",
+            )
+        )
+    if counts is not None and non_empty_groups != group_count:
+        reduced = _scatter_empty_polygon_groups_device(reduced, counts)
+    from vibespatial.geometry.owned import seed_all_validity_cache
+
+    seed_all_validity_cache(reduced)
+    record_dispatch_event(
+        surface="vibespatial.overlay.dissolve.execute_grouped_union_codes",
+        operation="grouped_coverage_union",
+        implementation="native_grouped_coverage_edge_union",
+        reason="coverage dissolve eliminated shared edges by device group without host geometry assembly",
+        detail=(
+            f"rows={owned.row_count}, groups={group_count}, "
+            f"non_empty_groups={non_empty_groups}"
+        ),
+        requested=ExecutionMode.GPU,
+        selected=ExecutionMode.GPU,
+    )
+    return GroupedUnionResult(
+        geometries=None,
+        group_count=group_count,
+        non_empty_groups=non_empty_groups,
+        empty_groups=group_count - non_empty_groups,
+        method=DissolveUnionMethod.COVERAGE,
+        owned=reduced,
+    )
+
+
 def execute_grouped_disjoint_subset_union_codes(
     values: np.ndarray,
     row_group_codes: np.ndarray,
@@ -2551,6 +4689,21 @@ def execute_grouped_union_codes(
         and normalized is DissolveUnionMethod.COVERAGE
         and grid_size is None
     ):
+        accelerated = _execute_low_fan_in_all_valid_coverage_union_gpu_owned_codes(
+            row_group_codes,
+            group_count=group_count,
+            owned=owned,
+        )
+        if accelerated is not None:
+            return accelerated
+        if geometry_count <= 2 * max(int(group_count), 1):
+            accelerated = execute_grouped_coverage_edge_union_gpu_owned_codes(
+                row_group_codes,
+                group_count=group_count,
+                owned=owned,
+            )
+            if accelerated is not None:
+                return accelerated
         accelerated = execute_grouped_box_union_gpu_owned_codes(
             row_group_codes,
             group_count=group_count,
@@ -2573,6 +4726,19 @@ def execute_grouped_union_codes(
             group_count=group_count,
             owned=owned,
             method=normalized,
+        )
+        if accelerated is not None:
+            return accelerated
+
+    if (
+        owned is not None
+        and normalized is DissolveUnionMethod.COVERAGE
+        and grid_size is None
+    ):
+        accelerated = execute_grouped_coverage_edge_union_gpu_owned_codes(
+            row_group_codes,
+            group_count=group_count,
+            owned=owned,
         )
         if accelerated is not None:
             return accelerated
@@ -2669,14 +4835,26 @@ def execute_native_grouped_union(
     if owned is None or grid_size is not None:
         return None
     if normalized is DissolveUnionMethod.COVERAGE:
-        return execute_grouped_box_union_gpu_owned_codes(
+        accelerated = execute_grouped_box_union_gpu_owned_codes(
             grouped.group_codes,
             group_count=grouped.resolved_group_count,
             owned=owned,
         )
+        if accelerated is not None:
+            return accelerated
+        return execute_grouped_coverage_edge_union_gpu_owned_codes(
+            grouped.group_codes,
+            group_count=grouped.resolved_group_count,
+            owned=owned,
+        )
+    if grouped.is_device:
+        return _execute_device_native_grouped_union(
+            grouped,
+            method=normalized,
+            owned=owned,
+        )
     if (
         normalized is not DissolveUnionMethod.UNARY
-        or grouped.is_device
         or not _owned_supports_polygonal_grouped_union(owned)
     ):
         return None
@@ -2729,6 +4907,25 @@ def execute_native_grouped_union(
             empty_groups=empty_groups,
             method=normalized,
             owned=reduced,
+        )
+
+    from vibespatial.runtime.residency import Residency
+
+    if reduced.residency is Residency.DEVICE and cp is not None:
+        from vibespatial.geometry.owned import concat_owned_scatter
+
+        full_reduced = concat_owned_scatter(
+            _empty_polygon_rows_device(group_count),
+            reduced,
+            group_ids.astype(np.int64, copy=False),
+        )
+        return GroupedUnionResult(
+            geometries=None,
+            group_count=group_count,
+            non_empty_groups=non_empty_groups,
+            empty_groups=empty_groups,
+            method=normalized,
+            owned=full_reduced,
         )
 
     reduced_geometries = np.asarray(reduced.to_shapely(), dtype=object)
@@ -2836,12 +5033,14 @@ def _prepare_grouped_dissolve(
     observed: bool,
     dropna: bool,
     normalized_method: DissolveUnionMethod,
+    grid_size: float | None,
+    allow_device_key_codes: bool = True,
     agg_kwargs: dict[str, Any],
 ) -> tuple[
     pd.DataFrame | NativeAttributeTable,
     list[np.ndarray],
     OwnedGeometryArray | None,
-    np.ndarray | None,
+    Any | None,
 ]:
     groupby_by = by
     if groupby_by is None and level is None:
@@ -2865,6 +5064,9 @@ def _prepare_grouped_dissolve(
         observed=observed,
         sort=sort,
         dropna=dropna,
+        normalized_method=normalized_method,
+        grid_size=grid_size,
+        allow_device_key_codes=allow_device_key_codes,
         agg_kwargs=agg_kwargs,
     )
     if native_prepared is None:
@@ -2886,6 +5088,17 @@ def _prepare_grouped_dissolve(
     else:
         group_positions = []
     owned = getattr(frame.geometry.values, "_owned", None)
+    if owned is None:
+        try:
+            from vibespatial.api._native_state import get_native_state
+
+            state = get_native_state(frame)
+        except Exception:
+            state = None
+        if state is not None:
+            state_owned = getattr(state.geometry, "owned", None)
+            if state_owned is not None and int(state_owned.row_count) == int(len(frame)):
+                owned = state_owned
     if (
         owned is None
         and normalized_method is DissolveUnionMethod.COVERAGE
@@ -2919,6 +5132,13 @@ def _max_group_size(
 def _owned_supports_polygonal_coverage_certification(owned: OwnedGeometryArray) -> bool:
     from vibespatial.geometry.buffers import GeometryFamily
     from vibespatial.geometry.owned import FAMILY_TAGS
+
+    polygonal_families = {
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+    }
+    if owned.device_state is not None:
+        return set(owned.device_state.families).issubset(polygonal_families)
 
     valid_tags = owned.tags[owned.validity]
     if valid_tags.size == 0:
@@ -3007,7 +5227,10 @@ def _certify_grouped_polygon_coverage_gpu(
             & (d_left_codes >= 0)
             & (d_left_codes == d_right_codes)
         )
-        candidate_count = int(cp.count_nonzero(same_group).item())
+        candidate_count = overlay_int_scalar(
+            cp.count_nonzero(same_group),
+            reason="overlay dissolve coverage-certification candidate-count fence",
+        )
         if candidate_count == 0:
             return True
         if candidate_count > _COVERAGE_REWRITE_MAX_CANDIDATE_PAIRS:
@@ -3083,14 +5306,18 @@ def _maybe_rewrite_grouped_polygon_coverage_dissolve_method(
     ):
         return normalized_method
 
+    if _max_group_size(row_group_codes, [], group_count) <= 1:
+        return normalized_method
+
     from vibespatial.runtime.residency import Residency
 
     if (
         owned.residency is Residency.DEVICE
         and int(row_group_codes.size) < OVERLAY_GROUPED_BOX_GPU_THRESHOLD
     ):
-        # The small certified-coverage fallback is host-backed today; keep
-        # device-resident unary dissolves on the exact segmented GPU path.
+        # The unary->coverage certifier proves no positive-area overlap, but
+        # not that shared boundaries are noded identically enough for the
+        # grouped edge-elimination reducer to match exact unary union output.
         return normalized_method
 
     certified = _certify_grouped_polygon_coverage_gpu(
@@ -3187,7 +5414,10 @@ def _dedupe_two_point_linestring_rows_gpu(
             state = lines._ensure_device_state()
             line_buf = state.families[GeometryFamily.LINESTRING]
             offsets = cp.asarray(line_buf.geometry_offsets)
-            if int(offsets.size) == lines.row_count + 1 and bool(cp.all((offsets[1:] - offsets[:-1]) == 2).item()):
+            if int(offsets.size) == lines.row_count + 1 and overlay_bool_scalar(
+                cp.all((offsets[1:] - offsets[:-1]) == 2),
+                reason="overlay dissolve two-point line rewrite admissibility fence",
+            ):
                 coord_starts = offsets[:-1]
                 d_x = cp.asarray(line_buf.x)
                 d_y = cp.asarray(line_buf.y)
@@ -3217,7 +5447,11 @@ def _dedupe_two_point_linestring_rows_gpu(
                             | (sorted_by[1:] != sorted_by[:-1])
                         )
                     unique_rows = cp.sort(order[unique_mask]).astype(cp.int64, copy=False)
-                    return cp.asnumpy(unique_rows)
+                    return overlay_device_to_host(
+                        unique_rows,
+                        reason="overlay dissolve two-point line unique-row export",
+                        dtype=np.int64,
+                    )
         except Exception:
             pass
 
@@ -3339,8 +5573,9 @@ def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
     if unique_owned.row_count > _BUFFERED_TWO_POINT_EXACT_UNION_MAX_UNIQUE_ROWS:
         return None
 
-    expanded_bounds = np.asarray(
-        cp.asnumpy(cp.asarray(compute_geometry_bounds_device(unique_owned), dtype=cp.float64)),
+    expanded_bounds = overlay_device_to_host(
+        cp.asarray(compute_geometry_bounds_device(unique_owned), dtype=cp.float64),
+        reason="overlay dissolve buffered-line expanded-bounds host rewrite export",
         dtype=np.float64,
     )
     if int(expanded_bounds.shape[0]) != unique_owned.row_count:
@@ -3815,6 +6050,7 @@ def evaluate_geopandas_dissolve_native(
             observed=observed,
             dropna=dropna,
             normalized_method=normalized_method,
+            grid_size=grid_size,
             agg_kwargs=agg_kwargs,
         )
         provenance_tag = getattr(frame.geometry.values, "_provenance", None)
@@ -3949,6 +6185,8 @@ def evaluate_geopandas_lazy_dissolve(
         observed=observed,
         dropna=dropna,
         normalized_method=normalized_method,
+        grid_size=grid_size,
+        allow_device_key_codes=False,
         agg_kwargs=agg_kwargs,
     )
     return LazyDissolvedFrame(

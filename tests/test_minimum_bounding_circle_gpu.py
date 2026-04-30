@@ -23,11 +23,15 @@ from shapely.geometry import (
     Polygon,
 )
 
+import vibespatial
 from vibespatial import from_shapely_geometries, has_gpu_runtime
 from vibespatial.constructive.minimum_bounding_circle import (
     minimum_bounding_circle_owned,
     minimum_bounding_radius_owned,
 )
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.fallbacks import STRICT_NATIVE_ENV_VAR, StrictNativeFallbackError
+from vibespatial.runtime.residency import Residency
 
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
 
@@ -129,13 +133,64 @@ def test_radius_polygon():
 @requires_gpu
 def test_minimum_bounding_circle_stays_device_resident(strict_device_guard):
     """minimum_bounding_circle keeps single-family metadata on device."""
-    from vibespatial.runtime import ExecutionMode
-    from vibespatial.runtime.residency import Residency
-
     owned = from_shapely_geometries([SQUARE], residency=Residency.DEVICE)
     result = minimum_bounding_circle_owned(owned, dispatch_mode=ExecutionMode.GPU)
 
     assert result.residency == Residency.DEVICE
+
+
+@requires_gpu
+def test_minimum_bounding_circle_strict_native_gpu_failure_is_not_swallowed(monkeypatch):
+    """Strict-native circle failures must not continue to CPU circles."""
+    from vibespatial.constructive import minimum_bounding_circle as mbc_module
+
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    def _fail_gpu(*_args, **_kwargs):
+        raise RuntimeError("forced circle failure")
+
+    monkeypatch.setattr(mbc_module, "_minimum_bounding_circle_gpu", _fail_gpu)
+    owned = from_shapely_geometries([SQUARE], residency=Residency.DEVICE)
+    vibespatial.clear_fallback_events()
+
+    with pytest.raises(StrictNativeFallbackError, match=r"minimum_bounding_circle"):
+        mbc_module.minimum_bounding_circle_owned(
+            owned,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+
+    events = vibespatial.get_fallback_events(clear=True)
+    assert events
+    assert events[-1].surface == "geopandas.array.minimum_bounding_circle"
+    assert events[-1].reason == "GPU minimum_bounding_circle failed"
+    assert events[-1].d2h_transfer is True
+
+
+@requires_gpu
+def test_minimum_bounding_radius_strict_native_gpu_failure_is_not_swallowed(monkeypatch):
+    """Strict-native radius failures must not continue to CPU radii."""
+    from vibespatial.constructive import minimum_bounding_circle as mbc_module
+
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    def _fail_gpu(*_args, **_kwargs):
+        raise RuntimeError("forced radius failure")
+
+    monkeypatch.setattr(mbc_module, "_minimum_bounding_radius_gpu", _fail_gpu)
+    owned = from_shapely_geometries([SQUARE], residency=Residency.DEVICE)
+    vibespatial.clear_fallback_events()
+
+    with pytest.raises(StrictNativeFallbackError, match=r"minimum_bounding_radius"):
+        mbc_module.minimum_bounding_radius_owned(
+            owned,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+
+    events = vibespatial.get_fallback_events(clear=True)
+    assert events
+    assert events[-1].surface == "geopandas.array.minimum_bounding_radius"
+    assert events[-1].reason == "GPU minimum_bounding_radius failed"
+    assert events[-1].d2h_transfer is True
 
 
 @requires_gpu

@@ -442,6 +442,7 @@ def _count_scatter_complex(
                 (d_num_points, d_coord_offsets),
                 (d_num_parts, d_part_offsets_prefix),
             ],
+            reason="shapefile geometry totals allocation fence",
         )
     else:
         total_points = 0
@@ -454,6 +455,8 @@ def _count_scatter_complex(
             d_num_parts,
             d_part_offsets_prefix,
             precomputed_total=total_parts,
+            total_reason="shapefile part-count allocation fence",
+            counts_transfer_reason="shapefile part-count host transfer",
         )
 
     # ---- Pass 2: gather coordinates ----

@@ -8,6 +8,9 @@ MultiLineString x MultiLineString).
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
 import shapely
@@ -23,6 +26,35 @@ from vibespatial.runtime import has_gpu_runtime
 requires_gpu = pytest.mark.skipif(
     not has_gpu_runtime(), reason="GPU not available",
 )
+
+
+def test_constructive_helper_d2h_exports_are_runtime_accounted() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    files = (
+        "normalize.py",
+        "polygon.py",
+        "shared_paths.py",
+        "multipoint_polygon_constructive.py",
+        "linear_ref.py",
+        "snap.py",
+    )
+    paths = tuple(repo_root / "src" / "vibespatial" / "constructive" / name for name in files)
+    offenders: list[str] = []
+    for path in paths:
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr == "asnumpy":
+                offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+            if func.attr == "copy_device_to_host" and not any(
+                keyword.arg == "reason" for keyword in node.keywords
+            ):
+                offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+    assert offenders == []
 
 
 def _assert_shared_paths_match(gpu_results, left_geoms, right_geoms, atol=1e-10):

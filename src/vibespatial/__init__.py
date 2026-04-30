@@ -279,10 +279,12 @@ from .runtime.fusion import (
 from .runtime.materialization import (
     MaterializationBoundary,
     MaterializationEvent,
+    NativeExportBoundary,
     StrictNativeMaterializationError,
     clear_materialization_events,
     get_materialization_events,
     record_materialization_event,
+    record_native_export_boundary,
 )
 from .runtime.nulls import (
     NULL_BOUNDS,
@@ -445,6 +447,7 @@ __all__ = [
     "MakeValidStage",
     "MaterializationBoundary",
     "MaterializationEvent",
+    "NativeExportBoundary",
     "MonitoringBackend",
     "MonitoringSample",
     "MixedGeoArrowView",
@@ -585,6 +588,7 @@ __all__ = [
     "record_dispatch_event",
     "record_fallback_event",
     "record_materialization_event",
+    "record_native_export_boundary",
     "read_geoparquet",
     "read_geoparquet_native",
     "read_geoparquet_owned",

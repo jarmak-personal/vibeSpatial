@@ -52,11 +52,17 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     OwnedGeometryArray,
 )
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import (
+    StrictNativeFallbackError,
+    record_fallback_event,
+    strict_native_mode_enabled,
+)
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
+from vibespatial.runtime.residency import Residency
 
 if TYPE_CHECKING:
     pass
@@ -205,12 +211,16 @@ def minimum_rotated_rectangle_owned(
         current_residency=owned.residency,
     )
 
-    if selection.selected is ExecutionMode.GPU and cp is not None:
+    selected_mode = selection.selected
+    if strict_native_mode_enabled() and has_gpu_runtime() and cp is not None:
+        selected_mode = ExecutionMode.GPU
+
+    if selected_mode is ExecutionMode.GPU and cp is not None:
         precision_plan = selection.precision_plan
         # GPU path supports single-family non-MultiPolygon inputs
         families_with_rows = [
-            fam for fam, buf in owned.families.items()
-            if buf.row_count > 0
+            fam for fam in owned.families
+            if owned.family_has_rows(fam)
         ]
         is_single_family = len(families_with_rows) == 1
         has_multipolygon = GeometryFamily.MULTIPOLYGON in families_with_rows
@@ -218,10 +228,25 @@ def minimum_rotated_rectangle_owned(
         if is_single_family and not has_multipolygon:
             try:
                 result = _min_rect_gpu(owned)
-            except Exception:
+            except StrictNativeFallbackError:
+                raise
+            except Exception as exc:
                 logger.debug(
                     "GPU minimum_rotated_rectangle failed, falling back to CPU",
                     exc_info=True,
+                )
+                record_fallback_event(
+                    surface="geopandas.array.minimum_rotated_rectangle",
+                    reason="GPU minimum_rotated_rectangle failed",
+                    detail=(
+                        f"rows={row_count}, "
+                        f"families={','.join(fam.value for fam in families_with_rows)}, "
+                        f"precision={precision_plan.compute_precision.value}, "
+                        f"error={type(exc).__name__}"
+                    ),
+                    requested=selection.requested,
+                    selected=ExecutionMode.CPU,
+                    d2h_transfer=owned.residency is Residency.DEVICE,
                 )
             else:
                 record_dispatch_event(
@@ -234,6 +259,19 @@ def minimum_rotated_rectangle_owned(
                     detail=f"precision={precision_plan.compute_precision}",
                 )
                 return result
+        else:
+            record_fallback_event(
+                surface="geopandas.array.minimum_rotated_rectangle",
+                reason="GPU minimum_rotated_rectangle does not support this geometry mix",
+                detail=(
+                    f"rows={row_count}, "
+                    f"families={','.join(fam.value for fam in families_with_rows)}, "
+                    f"has_multipolygon={has_multipolygon}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.CPU,
+                d2h_transfer=owned.residency is Residency.DEVICE,
+            )
 
     result = _minimum_rotated_rectangle_cpu(owned)
     record_dispatch_event(
@@ -245,3 +283,33 @@ def minimum_rotated_rectangle_owned(
         reason=selection.reason,
     )
     return result
+
+
+def minimum_rotated_rectangle_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+):
+    """Return oriented-envelope output as a private native constructive carrier."""
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = minimum_rotated_rectangle_owned(
+        owned,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="minimum_rotated_rectangle",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+    )

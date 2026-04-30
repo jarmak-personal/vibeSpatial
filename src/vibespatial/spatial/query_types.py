@@ -7,6 +7,10 @@ import numpy as np
 
 from vibespatial.cuda._runtime import get_cuda_runtime
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.materialization import (
+    MaterializationBoundary,
+    record_materialization_event,
+)
 
 SUPPORTED_GEOM_TYPES = {
     "Point",
@@ -24,6 +28,31 @@ _POLYGON_DE9IM_PREDICATES = frozenset({
     "covers", "covered_by", "overlaps", "disjoint",
     "contains_properly",
 })
+
+
+def _device_array_detail(values: Any, *, side: str) -> str:
+    size = int(getattr(values, "size", 0))
+    itemsize = int(getattr(getattr(values, "dtype", None), "itemsize", 0))
+    return f"side={side}, rows={size}, bytes={size * itemsize}"
+
+
+def _record_device_join_materialization(
+    values: Any,
+    *,
+    side: str,
+    surface: str,
+    operation: str,
+    reason: str,
+) -> None:
+    record_materialization_event(
+        surface=surface,
+        boundary=MaterializationBoundary.INTERNAL_HOST_CONVERSION,
+        operation=operation,
+        reason=reason,
+        detail=_device_array_detail(values, side=side),
+        d2h_transfer=True,
+        strict_disallowed=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -55,8 +84,28 @@ class _DeviceCandidates:
     def to_host(self) -> tuple[np.ndarray, np.ndarray]:
         """Copy indices to host as numpy arrays."""
         runtime = get_cuda_runtime()
-        left = runtime.copy_device_to_host(self.d_left).astype(np.int32, copy=False)
-        right = runtime.copy_device_to_host(self.d_right).astype(np.int32, copy=False)
+        _record_device_join_materialization(
+            self.d_left,
+            side="left",
+            surface="vibespatial.spatial.query_types._DeviceCandidates.to_host",
+            operation="device_candidates_to_host",
+            reason="device candidate pairs crossed to host for CPU compatibility refinement",
+        )
+        left = runtime.copy_device_to_host(
+            self.d_left,
+            reason="device candidate left pairs host export",
+        ).astype(np.int32, copy=False)
+        _record_device_join_materialization(
+            self.d_right,
+            side="right",
+            surface="vibespatial.spatial.query_types._DeviceCandidates.to_host",
+            operation="device_candidates_to_host",
+            reason="device candidate pairs crossed to host for CPU compatibility refinement",
+        )
+        right = runtime.copy_device_to_host(
+            self.d_right,
+            reason="device candidate right pairs host export",
+        ).astype(np.int32, copy=False)
         return left, right
 
 
@@ -78,8 +127,28 @@ class DeviceSpatialJoinResult:
     def to_host(self) -> tuple[np.ndarray, np.ndarray]:
         """Copy index arrays to host as numpy int32 arrays."""
         runtime = get_cuda_runtime()
-        left = runtime.copy_device_to_host(self.d_left_idx).astype(np.int32, copy=False)
-        right = runtime.copy_device_to_host(self.d_right_idx).astype(np.int32, copy=False)
+        _record_device_join_materialization(
+            self.d_left_idx,
+            side="left",
+            surface="vibespatial.spatial.query_types.DeviceSpatialJoinResult.to_host",
+            operation="device_spatial_join_indices_to_host",
+            reason="device spatial join pairs crossed to host for public index export",
+        )
+        left = runtime.copy_device_to_host(
+            self.d_left_idx,
+            reason="device spatial join left-index host export",
+        ).astype(np.int32, copy=False)
+        _record_device_join_materialization(
+            self.d_right_idx,
+            side="right",
+            surface="vibespatial.spatial.query_types.DeviceSpatialJoinResult.to_host",
+            operation="device_spatial_join_indices_to_host",
+            reason="device spatial join pairs crossed to host for public index export",
+        )
+        right = runtime.copy_device_to_host(
+            self.d_right_idx,
+            reason="device spatial join right-index host export",
+        ).astype(np.int32, copy=False)
         return left, right
 
     @property
@@ -141,15 +210,39 @@ class _DeviceJoinResult:
         if self._h_left is not None:
             return
         runtime = get_cuda_runtime()
+        _record_device_join_materialization(
+            self._d_left,
+            side="left",
+            surface="vibespatial.spatial.query_types._DeviceJoinResult._materialize",
+            operation="device_join_indices_to_host",
+            reason="lazy device join pairs crossed to host for pandas-compatible assembly",
+        )
         self._h_left = runtime.copy_device_to_host(
             self._d_left,
+            reason="lazy device join left-index host export",
         ).astype(np.intp, copy=False)
+        _record_device_join_materialization(
+            self._d_right,
+            side="right",
+            surface="vibespatial.spatial.query_types._DeviceJoinResult._materialize",
+            operation="device_join_indices_to_host",
+            reason="lazy device join pairs crossed to host for pandas-compatible assembly",
+        )
         self._h_right = runtime.copy_device_to_host(
             self._d_right,
+            reason="lazy device join right-index host export",
         ).astype(np.intp, copy=False)
         if self._d_distances is not None:
+            _record_device_join_materialization(
+                self._d_distances,
+                side="distances",
+                surface="vibespatial.spatial.query_types._DeviceJoinResult._materialize",
+                operation="device_join_distances_to_host",
+                reason="lazy device join distances crossed to host for pandas-compatible assembly",
+            )
             self._h_distances = runtime.copy_device_to_host(
                 self._d_distances,
+                reason="lazy device join distance host export",
             ).astype(np.float64, copy=False)
 
     @property

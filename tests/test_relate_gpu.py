@@ -26,8 +26,15 @@ from shapely.geometry import (
 )
 
 from vibespatial import ExecutionMode, has_gpu_runtime
+from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.predicates.relate import relate_de9im
+from vibespatial.runtime.fallbacks import (
+    STRICT_NATIVE_ENV_VAR,
+    StrictNativeFallbackError,
+    clear_fallback_events,
+    get_fallback_events,
+)
 
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
 
@@ -423,8 +430,6 @@ class TestEdgeCases:
 class TestGeometryArrayWiring:
     def test_relate_via_geometry_array(self):
         """GeometryArray.relate() dispatches to GPU relate."""
-        from vibespatial.api.geometry_array import GeometryArray
-
         left_geoms = np.array([Point(1, 1), Point(2, 2)], dtype=object)
         right_geoms = np.array([Point(1, 1), Point(3, 3)], dtype=object)
         expected = shapely.relate(left_geoms, right_geoms)
@@ -439,6 +444,35 @@ class TestGeometryArrayWiring:
             assert result[i] == expected[i], (
                 f"[{i}]: expected {expected[i]!r}, got {result[i]!r}"
             )
+
+    def test_relate_strict_native_non_point_decline_is_not_swallowed(self, monkeypatch):
+        """Strict native must not be hidden by GeometryArray's Shapely fallback."""
+        left_geoms = np.array([Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])], dtype=object)
+        right_geoms = np.array([Polygon([(1, 1), (3, 1), (3, 3), (1, 3)])], dtype=object)
+
+        ga_left = GeometryArray(left_geoms)
+        ga_left.to_owned()
+        ga_right = GeometryArray(right_geoms)
+        monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+        with pytest.raises(StrictNativeFallbackError, match="non-point family"):
+            ga_left.relate(ga_right)
+
+    def test_relate_scalar_broadcast_stays_native_in_strict(self, monkeypatch):
+        """Scalar right-hand relate uses an owned broadcast view before Shapely."""
+        left_geoms = np.array([Point(2, 2), Point(5, 5)], dtype=object)
+        polygon = Polygon([(0, 0), (4, 0), (4, 4), (0, 4)])
+        expected = shapely.relate(left_geoms, polygon)
+
+        ga_left = GeometryArray(left_geoms)
+        ga_left.to_owned()
+        clear_fallback_events()
+        monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+        result = ga_left.relate(polygon)
+
+        np.testing.assert_array_equal(result, expected)
+        assert get_fallback_events(clear=True) == []
 
 
 # ---------------------------------------------------------------------------

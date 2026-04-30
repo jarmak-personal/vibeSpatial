@@ -8,21 +8,50 @@ Covers nsf.4: distance and metric broadcast-right support.
 """
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import shapely
 from shapely.geometry import LineString, Point, box
 
+import vibespatial
+from vibespatial import has_gpu_runtime
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.fallbacks import STRICT_NATIVE_ENV_VAR, StrictNativeFallbackError
 from vibespatial.runtime.precision import PrecisionMode
+from vibespatial.runtime.residency import Residency
 from vibespatial.spatial.distance_metrics import frechet_distance_owned, hausdorff_distance_owned
 from vibespatial.spatial.distance_owned import distance_owned, dwithin_owned
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def test_distance_metrics_d2h_exports_are_runtime_accounted() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "src" / "vibespatial" / "spatial" / "distance_metrics.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    raw_exports: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        if func.attr == "asnumpy":
+            raw_exports.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+        if func.attr == "get":
+            raw_exports.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+        if func.attr == "copy_device_to_host" and not any(
+            keyword.arg == "reason" for keyword in node.keywords
+        ):
+            raw_exports.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+    assert raw_exports == []
+
 
 def _shapely_distance_oracle(
     left_geoms: list[object | None],
@@ -259,6 +288,43 @@ def test_hausdorff_broadcast_tiling_equivalence() -> None:
     np.testing.assert_allclose(result_broadcast, result_tiled, rtol=1e-10)
 
 
+def test_hausdorff_owned_densify_matches_shapely() -> None:
+    """Owned Hausdorff honors densify instead of silently using vertices only."""
+    left_geom = LineString([(0, 0), (10, 0)])
+    right_geom = LineString([(0, 0), (5, 5), (10, 0)])
+
+    result = hausdorff_distance_owned(
+        from_shapely_geometries([left_geom]),
+        from_shapely_geometries([right_geom]),
+        densify=0.5,
+    )
+    expected = np.asarray(
+        [shapely.hausdorff_distance(left_geom, right_geom, densify=0.5)],
+        dtype=np.float64,
+    )
+
+    np.testing.assert_allclose(result, expected, rtol=1e-10)
+
+
+def test_hausdorff_gpu_densify_matches_shapely() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for Hausdorff densify kernel")
+
+    left_geom = LineString([(0, 0), (10, 0)])
+    right_geom = LineString([(0, 0), (5, 5), (10, 0)])
+    left_owned = from_shapely_geometries([left_geom] * 128, residency=Residency.DEVICE)
+    right_owned = from_shapely_geometries([right_geom] * 128, residency=Residency.DEVICE)
+
+    result = hausdorff_distance_owned(left_owned, right_owned, densify=0.5)
+    expected = np.full(
+        128,
+        shapely.hausdorff_distance(left_geom, right_geom, densify=0.5),
+        dtype=np.float64,
+    )
+
+    np.testing.assert_allclose(result, expected, rtol=1e-10)
+
+
 def test_hausdorff_dispatch_forwards_precision_plan(monkeypatch) -> None:
     import vibespatial.spatial.distance_metrics as distance_metrics
 
@@ -286,8 +352,9 @@ def test_hausdorff_dispatch_forwards_precision_plan(monkeypatch) -> None:
         captured["selection_kwargs"] = kwargs
         return selection
 
-    def fake_hausdorff_gpu(owned_a, owned_b, *, precision_plan=None):
+    def fake_hausdorff_gpu(owned_a, owned_b, *, precision_plan=None, densify_steps=1):
         captured["precision_plan"] = precision_plan
+        captured["densify_steps"] = densify_steps
         return np.full(owned_a.row_count, 4.0, dtype=np.float64)
 
     monkeypatch.setattr(
@@ -302,7 +369,45 @@ def test_hausdorff_dispatch_forwards_precision_plan(monkeypatch) -> None:
     assert captured["selection_kwargs"]["requested_precision"] is PrecisionMode.FP32
     assert captured["selection_kwargs"]["coordinate_stats"].max_abs_coord >= 1_000_003.0
     assert captured["precision_plan"] is precision_plan
+    assert captured["densify_steps"] == 1
     np.testing.assert_allclose(result, [4.0, 4.0])
+
+
+def test_hausdorff_strict_native_gpu_failure_is_not_swallowed(monkeypatch) -> None:
+    import vibespatial.spatial.distance_metrics as distance_metrics
+
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+    vibespatial.clear_fallback_events()
+    line = LineString([(0, 0), (1, 1)])
+    left_owned = from_shapely_geometries([line], residency=Residency.DEVICE)
+    right_owned = from_shapely_geometries([line], residency=Residency.DEVICE)
+    precision_plan = SimpleNamespace(compute_precision=PrecisionMode.FP64)
+    selection = SimpleNamespace(
+        selected=ExecutionMode.GPU,
+        precision_plan=precision_plan,
+        reason="test gpu",
+        requested=ExecutionMode.GPU,
+    )
+
+    monkeypatch.setattr(
+        distance_metrics,
+        "plan_dispatch_selection",
+        lambda **kwargs: selection,
+    )
+
+    def fake_hausdorff_gpu(*args, **kwargs):
+        raise RuntimeError("forced hausdorff failure")
+
+    monkeypatch.setattr(distance_metrics, "_hausdorff_gpu", fake_hausdorff_gpu)
+
+    with pytest.raises(StrictNativeFallbackError, match="hausdorff_distance"):
+        hausdorff_distance_owned(left_owned, right_owned)
+
+    events = vibespatial.get_fallback_events(clear=True)
+    assert events
+    assert events[-1].surface == "geopandas.array.hausdorff_distance"
+    assert events[-1].reason == "GPU hausdorff_distance failed"
+    assert events[-1].d2h_transfer is True
 
 
 # ---------------------------------------------------------------------------
@@ -350,3 +455,74 @@ def test_frechet_broadcast_tiling_equivalence() -> None:
     )
 
     np.testing.assert_allclose(result_broadcast, result_tiled, rtol=1e-10)
+
+
+def test_frechet_owned_densify_matches_shapely() -> None:
+    left_geom = LineString([(100, 0), (0, 0), (0, 100)])
+    right_geom = LineString([(5, 5), (5, 100), (100, 5)])
+
+    result = frechet_distance_owned(
+        from_shapely_geometries([left_geom]),
+        from_shapely_geometries([right_geom]),
+        densify=0.25,
+    )
+    expected = np.asarray(
+        [shapely.frechet_distance(left_geom, right_geom, densify=0.25)],
+        dtype=np.float64,
+    )
+
+    np.testing.assert_allclose(result, expected, rtol=1e-10)
+
+
+def test_frechet_gpu_densify_matches_shapely() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for Frechet densify kernel")
+
+    left_geom = LineString([(100, 0), (0, 0), (0, 100)])
+    right_geom = LineString([(5, 5), (5, 100), (100, 5)])
+    left_owned = from_shapely_geometries([left_geom] * 128, residency=Residency.DEVICE)
+    right_owned = from_shapely_geometries([right_geom] * 128, residency=Residency.DEVICE)
+
+    result = frechet_distance_owned(left_owned, right_owned, densify=0.25)
+    expected = np.full(
+        128,
+        shapely.frechet_distance(left_geom, right_geom, densify=0.25),
+        dtype=np.float64,
+    )
+
+    np.testing.assert_allclose(result, expected, rtol=1e-10)
+
+
+def test_frechet_strict_native_gpu_failure_is_not_swallowed(monkeypatch) -> None:
+    import vibespatial.spatial.distance_metrics as distance_metrics
+
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+    vibespatial.clear_fallback_events()
+    line = LineString([(0, 0), (1, 1)])
+    left_owned = from_shapely_geometries([line], residency=Residency.DEVICE)
+    right_owned = from_shapely_geometries([line], residency=Residency.DEVICE)
+    selection = SimpleNamespace(
+        selected=ExecutionMode.GPU,
+        reason="test gpu",
+        requested=ExecutionMode.GPU,
+    )
+
+    monkeypatch.setattr(
+        distance_metrics,
+        "plan_dispatch_selection",
+        lambda **kwargs: selection,
+    )
+
+    def fake_frechet_gpu(*args, **kwargs):
+        raise RuntimeError("forced frechet failure")
+
+    monkeypatch.setattr(distance_metrics, "_frechet_gpu", fake_frechet_gpu)
+
+    with pytest.raises(StrictNativeFallbackError, match="frechet_distance"):
+        frechet_distance_owned(left_owned, right_owned)
+
+    events = vibespatial.get_fallback_events(clear=True)
+    assert events
+    assert events[-1].surface == "geopandas.array.frechet_distance"
+    assert events[-1].reason == "GPU frechet_distance failed"
+    assert events[-1].d2h_transfer is True

@@ -394,23 +394,27 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     # Extract cycle-ordered edges for valid faces only.  The cycle-sorted
     # array has the same segment boundaries (valid_starts, valid_ends) as
     # the face_id-sorted array since the packed key preserves face_id order.
-    # Gather all valid-face edges into a contiguous output using vectorised
-    # CuPy index arithmetic — no per-face host loop.
-    total_edges = int(_total.item())
-
-    # Build a flat gather index: for each slot in the output, compute the
-    # source position in cycle_sorted_edge_ids.
-    # slot_face = which valid face does this slot belong to?
+    # Allocate by host-known edge capacity and let device CSR offsets delimit
+    # the live prefix; this avoids a D2H scalar allocation fence.
     with hotpath_stage("overlay.graph.gather_face_edges", category="emit"):
-        slot_ids = cp.arange(total_edges, dtype=cp.int32)
-        slot_face = cp.searchsorted(face_offsets[1:], slot_ids, side='right').astype(cp.int32)
-        # local offset within that face's segment
-        slot_local = slot_ids - face_offsets[slot_face]
+        slot_ids = cp.arange(edge_count, dtype=cp.int32)
+        live_slot = slot_ids < _total.reshape(1)[0]
+        safe_slot_ids = cp.where(live_slot, slot_ids, 0)
+        slot_face = cp.searchsorted(
+            face_offsets[1:],
+            safe_slot_ids,
+            side='right',
+        ).astype(cp.int32)
+        if face_count:
+            slot_face = cp.minimum(slot_face, np.int32(face_count - 1))
+        slot_face = cp.where(live_slot, slot_face, 0)
+        slot_local = safe_slot_ids - face_offsets[slot_face]
         # source position in the cycle-sorted full array
         src_pos = valid_starts[slot_face] + slot_local
         face_edge_ids = cycle_sorted_edge_ids[src_pos]
         # Phase 25 memory: face walk intermediates consumed.
-        del slot_ids, slot_face, slot_local, src_pos, cycle_sorted_edge_ids
+        del slot_ids, live_slot, safe_slot_ids, slot_face, slot_local, src_pos
+        del cycle_sorted_edge_ids
         del sorted_edge_ids, valid_starts, valid_ends, valid_lengths
         del packed_key, d_rank
         _sync_hotpath(runtime)

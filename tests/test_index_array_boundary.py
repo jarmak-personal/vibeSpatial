@@ -687,6 +687,101 @@ class TestSpatialNearestReturnsIndexArrays:
         )
         np.testing.assert_allclose(materialized["dist"], wrapped["dist"])
 
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for device nearest relation")
+    def test_sjoin_nearest_relation_preserves_device_distance_relation(self) -> None:
+        """Nearest producer can feed NativeRelation distance consumers on device."""
+        import cupy as cp
+
+        rows = 2048
+        left = GeoDataFrame(
+            {"a": np.arange(rows, dtype=np.int64)},
+            geometry=GeoSeries([Point(float(i), 0.0) for i in range(rows)]),
+        )
+        right = GeoDataFrame(
+            {"b": np.arange(rows, dtype=np.int64)},
+            geometry=GeoSeries([Point(float(i) + 0.25, 0.0) for i in range(rows)]),
+        )
+
+        native_result, selected = _sjoin_nearest_relation_result(
+            left,
+            right,
+            max_distance=0.5,
+            how="inner",
+            return_distance=True,
+            exclusive=False,
+        )
+        if selected.name != "GPU":
+            pytest.skip("device nearest relation path did not admit this runtime")
+
+        relation = native_result.to_native_relation(
+            left_token="left",
+            right_token="right",
+            predicate="nearest",
+            left_row_count=rows,
+            right_row_count=rows,
+        )
+        expression = relation.distance_expression(operation="nearest.distance")
+        filtered = relation.filter_by_distance("<=", 0.25)
+
+        assert hasattr(relation.left_indices, "__cuda_array_interface__")
+        assert hasattr(relation.right_indices, "__cuda_array_interface__")
+        assert hasattr(relation.distances, "__cuda_array_interface__")
+        assert expression.is_device
+        assert hasattr(filtered.left_indices, "__cuda_array_interface__")
+        assert hasattr(filtered.right_indices, "__cuda_array_interface__")
+        assert hasattr(filtered.distances, "__cuda_array_interface__")
+        np.testing.assert_array_equal(cp.asnumpy(filtered.left_indices), np.arange(rows))
+        np.testing.assert_array_equal(cp.asnumpy(filtered.right_indices), np.arange(rows))
+        np.testing.assert_allclose(cp.asnumpy(filtered.distances), 0.25)
+
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for device nearest relation")
+    def test_sjoin_nearest_right_relation_remaps_pairs_on_device(self) -> None:
+        """Right-nearest producer swaps query/tree pairs without host export."""
+        import cupy as cp
+
+        from vibespatial.runtime.materialization import (
+            clear_materialization_events,
+            get_materialization_events,
+        )
+
+        rows = 2048
+        left = GeoDataFrame(
+            {"a": np.arange(rows, dtype=np.int64)},
+            geometry=GeoSeries([Point(float(i), 0.0) for i in range(rows)]),
+        )
+        right = GeoDataFrame(
+            {"b": np.arange(rows, dtype=np.int64)},
+            geometry=GeoSeries([Point(float(i) + 0.25, 0.0) for i in range(rows)]),
+        )
+
+        clear_materialization_events()
+        native_result, selected = _sjoin_nearest_relation_result(
+            left,
+            right,
+            max_distance=0.5,
+            how="right",
+            return_distance=True,
+            exclusive=False,
+        )
+        if selected.name != "GPU":
+            pytest.skip("device nearest relation path did not admit this runtime")
+
+        relation = native_result.to_native_relation(
+            left_token="left",
+            right_token="right",
+            predicate="nearest",
+            left_row_count=rows,
+            right_row_count=rows,
+        )
+
+        assert hasattr(relation.left_indices, "__cuda_array_interface__")
+        assert hasattr(relation.right_indices, "__cuda_array_interface__")
+        assert hasattr(relation.distances, "__cuda_array_interface__")
+        np.testing.assert_array_equal(cp.asnumpy(relation.left_indices), np.arange(rows))
+        np.testing.assert_array_equal(cp.asnumpy(relation.right_indices), np.arange(rows))
+        np.testing.assert_allclose(cp.asnumpy(relation.distances), 0.25)
+        assert get_materialization_events(clear=True) == []
+
     def test_relation_join_pandas_export_uses_fast_inner_path(self, monkeypatch):
         left = GeoDataFrame(
             {"a": [1, 2]},
@@ -1145,7 +1240,7 @@ class TestSpatialNearestReturnsIndexArrays:
         monkeypatch.setattr(
             native_results_module,
             "_clip_owned_geometry_native_result",
-            lambda *args, **kwargs: (None, None),
+            lambda *args, **kwargs: (None, None, None),
         )
 
         real_to_shapely = OwnedGeometryArray.to_shapely

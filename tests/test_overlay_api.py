@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib
 import os
 import sys
@@ -8,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pytest
 import shapely
@@ -39,6 +41,11 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.crossover import WorkloadShape
 from vibespatial.runtime.fallbacks import StrictNativeFallbackError
+from vibespatial.runtime.materialization import (
+    MaterializationBoundary,
+    clear_materialization_events,
+    get_materialization_events,
+)
 from vibespatial.runtime.residency import Residency, TransferTrigger
 from vibespatial.testing import strict_native_environment
 
@@ -49,6 +56,332 @@ segment_primitives_module = importlib.import_module("vibespatial.spatial.segment
 _SHOOTOUT_DIR = Path(__file__).resolve().parents[1] / "benchmarks" / "shootout"
 if str(_SHOOTOUT_DIR) not in sys.path:
     sys.path.insert(0, str(_SHOOTOUT_DIR))
+
+
+def test_overlay_runtime_d2h_exports_are_operation_named() -> None:
+    overlay_dir = Path(__file__).resolve().parents[1] / "src" / "vibespatial" / "overlay"
+    offenders: list[str] = []
+    for path in sorted(overlay_dir.glob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "copy_device_to_host"
+                and not any(keyword.arg == "reason" for keyword in node.keywords)
+            ):
+                offenders.append(f"{path.relative_to(overlay_dir.parent.parent.parent)}:{node.lineno}")
+    assert offenders == []
+
+
+def test_dissolve_gpu_certification_has_no_raw_cupy_scalar_syncs() -> None:
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "vibespatial"
+        / "overlay"
+        / "dissolve.py"
+    )
+    tree = ast.parse(path.read_text(), filename=str(path))
+
+    def _contains_cupy_call(node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and isinstance(child.func.value, ast.Name)
+                and child.func.value.id == "cp"
+            ):
+                return True
+        return False
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "item":
+            offenders.append(f"{path.name}:{node.lineno}: .item()")
+        if (
+            isinstance(func, ast.Name)
+            and func.id in {"bool", "int", "float"}
+            and node.args
+            and _contains_cupy_call(node.args[0])
+        ):
+            offenders.append(f"{path.name}:{node.lineno}: {func.id}(cp.*)")
+
+    assert offenders == []
+
+
+def test_overlay_bypass_count_fences_are_operation_named() -> None:
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "vibespatial"
+        / "overlay"
+        / "bypass.py"
+    )
+    tree = ast.parse(path.read_text(), filename=str(path))
+
+    def _contains_cupy_call(node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and isinstance(child.func.value, ast.Name)
+                and child.func.value.id == "cp"
+            ):
+                return True
+        return False
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "item":
+            offenders.append(f"{path.name}:{node.lineno}: .item()")
+        if (
+            isinstance(func, ast.Name)
+            and func.id in {"bool", "int", "float"}
+            and node.args
+            and _contains_cupy_call(node.args[0])
+        ):
+            offenders.append(f"{path.name}:{node.lineno}: {func.id}(cp.*)")
+
+    assert offenders == []
+
+
+def test_overlay_public_tool_uses_shared_host_boundary_helper() -> None:
+    overlay_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "vibespatial"
+        / "api"
+        / "tools"
+        / "overlay.py"
+    )
+    tree = ast.parse(overlay_path.read_text(), filename=str(overlay_path))
+    local_helpers = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_overlay_device_to_host", "_overlay_bool_scalar"}
+    }
+
+    assert local_helpers == set()
+
+
+def test_overlay_public_tool_has_no_raw_cupy_scalar_syncs() -> None:
+    overlay_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "vibespatial"
+        / "api"
+        / "tools"
+        / "overlay.py"
+    )
+    tree = ast.parse(overlay_path.read_text(), filename=str(overlay_path))
+    failures: list[str] = []
+
+    cupy_reductions = {
+        "all",
+        "any",
+        "sum",
+        "count_nonzero",
+        "max",
+        "min",
+        "nanmax",
+        "nanmin",
+    }
+
+    def _contains_cupy_reduction(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == "cp"
+            and child.func.attr in cupy_reductions
+            for child in ast.walk(node)
+        )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "item":
+            failures.append(f"raw .item() at line {node.lineno}")
+        if (
+            isinstance(func, ast.Name)
+            and func.id in {"bool", "int", "float"}
+            and node.args
+            and _contains_cupy_reduction(node.args[0])
+        ):
+            failures.append(f"raw {func.id}(cp reduction) at line {node.lineno}")
+
+    assert failures == []
+
+
+def test_overlay_selected_face_indices_host_bridge_records_materialization() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime required for selected-face host bridge")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.overlay.faces import _selected_face_indices_to_host
+
+    clear_materialization_events()
+    with strict_native_environment():
+        got = _selected_face_indices_to_host(cp.asarray([2, 0], dtype=cp.int32))
+
+    events = get_materialization_events(clear=True)
+    assert got.tolist() == [2, 0]
+    assert len(events) == 1
+    assert events[0].boundary is MaterializationBoundary.INTERNAL_HOST_CONVERSION
+    assert events[0].operation == "selected_face_indices_to_host"
+    assert events[0].detail == "faces=2, bytes=8"
+    assert events[0].d2h_transfer is True
+    assert events[0].strict_disallowed is False
+
+
+def test_overlay_face_assembly_prefers_device_path_without_selected_face_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime required for device face assembly")
+    cp = pytest.importorskip("cupy")
+    assemble_module = importlib.import_module("vibespatial.overlay.assemble")
+    faces_module = importlib.import_module("vibespatial.overlay.faces")
+    host_fallback_module = importlib.import_module("vibespatial.overlay.host_fallback")
+
+    sentinel = object()
+
+    def _gpu_builder(half_edge_graph, faces, selected_face_indices, **_kwargs):
+        assert hasattr(selected_face_indices, "__cuda_array_interface__")
+        return sentinel
+
+    def _host_bridge(_selected_face_indices):
+        raise AssertionError("selected faces should stay device-resident")
+
+    def _host_builder(*_args, **_kwargs):
+        raise AssertionError("CPU face assembly should not run")
+
+    monkeypatch.setattr(
+        assemble_module,
+        "_build_polygon_output_from_faces_gpu",
+        _gpu_builder,
+    )
+    monkeypatch.setattr(faces_module, "_selected_face_indices_to_host", _host_bridge)
+    monkeypatch.setattr(host_fallback_module, "_build_polygon_output_from_faces", _host_builder)
+
+    result = faces_module._assemble_faces_from_device_indices(
+        SimpleNamespace(),
+        SimpleNamespace(runtime_selection=None),
+        cp.asarray([2, 0], dtype=cp.int32),
+    )
+
+    assert result is sentinel
+
+
+def test_overlay_face_assembly_host_bridge_runs_only_after_device_decline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime required for selected-face host bridge")
+    cp = pytest.importorskip("cupy")
+    assemble_module = importlib.import_module("vibespatial.overlay.assemble")
+    faces_module = importlib.import_module("vibespatial.overlay.faces")
+    host_fallback_module = importlib.import_module("vibespatial.overlay.host_fallback")
+
+    sentinel = object()
+    observed: dict[str, object] = {}
+
+    def _gpu_builder(*_args, **_kwargs):
+        return None
+
+    def _host_bridge(selected_face_indices):
+        observed["bridge_input"] = selected_face_indices
+        return np.asarray([2, 0], dtype=np.int64)
+
+    def _host_builder(half_edge_graph, faces, selected_face_indices):
+        observed["host_indices"] = selected_face_indices
+        return sentinel
+
+    monkeypatch.setattr(
+        assemble_module,
+        "_build_polygon_output_from_faces_gpu",
+        _gpu_builder,
+    )
+    monkeypatch.setattr(faces_module, "_selected_face_indices_to_host", _host_bridge)
+    monkeypatch.setattr(host_fallback_module, "_build_polygon_output_from_faces", _host_builder)
+
+    result = faces_module._assemble_faces_from_device_indices(
+        SimpleNamespace(),
+        SimpleNamespace(runtime_selection=None),
+        cp.asarray([2, 0], dtype=cp.int32),
+    )
+
+    assert result is sentinel
+    assert hasattr(observed["bridge_input"], "__cuda_array_interface__")
+    assert observed["host_indices"].tolist() == [2, 0]
+
+
+def test_overlay_nonempty_filter_uses_device_metadata_without_host_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime required for device non-empty filter")
+    pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    owned = from_shapely_geometries(
+        [box(0, 0, 1, 1), Polygon()],
+        residency=Residency.DEVICE,
+    )
+
+    def _fail_host_state():
+        raise AssertionError("device non-empty filtering should not materialize host state")
+
+    monkeypatch.setattr(owned, "_ensure_host_state", _fail_host_state)
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        filtered = overlay_gpu_module._filter_non_empty_owned_device(owned)
+
+    assert filtered is not None
+    assert filtered.residency is Residency.DEVICE
+    assert filtered.row_count == 1
+    assert filtered.device_state is not None
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_overlay_group_pair_positions_use_host_known_total_without_scalar_fence() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime required for device group expansion")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    group_starts = cp.asarray([0, 2, 5], dtype=cp.int64)
+    group_ends = cp.asarray([2, 5, 6], dtype=cp.int64)
+
+    reset_d2h_transfer_count()
+    with assert_zero_d2h_transfers():
+        positions = overlay_gpu_module._expand_group_pair_positions(
+            group_starts,
+            group_ends,
+            total_count=6,
+        )
+
+    assert positions.get().tolist() == [0, 1, 2, 3, 4, 5]
+    reset_d2h_transfer_count()
 
 
 def _assert_owned_row_mapping_valid(series: GeoSeries) -> None:
@@ -461,6 +794,50 @@ def test_overlay_symmetric_difference_reuses_intersecting_pair_queries(
     assert calls == 1
 
 
+def test_overlay_symmetric_difference_native_concat_preserves_device_geometry_state() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    points = GeoDataFrame(
+        geometry=GeoSeries(
+            [
+                Point(2, 2),
+                Point(3, 4),
+                Point(9, 8),
+                Point(-12, -15),
+            ],
+            crs="EPSG:3857",
+        )
+    )
+    buffered = points.copy()
+    buffered["geometry"] = buffered.buffer(4)
+    buffered["type"] = "plot"
+    mask = GeoDataFrame(
+        {"attr2": ["site-boundary"]},
+        geometry=GeoSeries(
+            [Polygon([(0, 0), (0, 10), (10, 10), (10, 0), (0, 0)])],
+            crs="EPSG:3857",
+        ),
+    )
+
+    with strict_native_environment():
+        result = overlay(buffered, mask, how="symmetric_difference")
+
+    owned = result.geometry.values._owned
+    assert owned.residency is Residency.DEVICE
+    assert owned.device_state is not None
+    assert owned.row_count == len(result)
+    assert all(
+        not (
+            buffer.host_materialized
+            and buffer.x.size == 0
+            and buffer.geometry_offsets.size > 1
+        )
+        for buffer in owned.families.values()
+    )
+    assert len(owned.to_shapely()) == len(result)
+
+
 def test_overlay_identity_reuses_intersecting_pair_queries(monkeypatch: pytest.MonkeyPatch) -> None:
     left = GeoDataFrame(
         {"col1": [1, 2]},
@@ -575,6 +952,86 @@ def test_overlay_few_right_sh_rejects_invalid_nonempty_rows(
     )
 
     assert result is None
+
+
+def test_overlay_few_right_sh_classifies_device_rectangles_without_host_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    binary_constructive_module = importlib.import_module(
+        "vibespatial.constructive.binary_constructive"
+    )
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    left_owned = from_shapely_geometries(
+        [box(0.0, 0.0, 2.0, 2.0), box(3.0, 0.0, 5.0, 2.0)],
+        residency=Residency.DEVICE,
+    )
+    right_owned = from_shapely_geometries(
+        [box(1.0, 1.0, 3.0, 3.0), box(4.0, 1.0, 6.0, 3.0)],
+        residency=Residency.DEVICE,
+    )
+
+    monkeypatch.setattr(
+        binary_constructive_module,
+        "_host_rectangle_polygon_mask",
+        lambda *_args, **_kwargs: pytest.fail(
+            "device rectangle batches should not use host rectangle classification"
+        ),
+    )
+    monkeypatch.setattr(
+        overlay_module,
+        "_host_convex_single_ring_polygon_mask",
+        lambda *_args, **_kwargs: pytest.fail(
+            "device rectangle batches should prove convexity without host classification"
+        ),
+    )
+
+    reset_d2h_transfer_count()
+    result = overlay_module._few_right_sh_intersection_owned(
+        left_owned,
+        right_owned,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    transfers = get_d2h_transfer_events(clear=True)
+    reasons = {event.reason for event in transfers}
+
+    assert result is not None
+    assert result.residency is Residency.DEVICE
+    assert result.row_count == left_owned.row_count
+    assert "polygon-rectangle dense single-ring scalar fence" not in reasons
+    assert "polygon-rectangle empty-mask scalar fence" not in reasons
+    assert "polygon-rectangle ring-offset scalar fence" not in reasons
+    assert "polygon-rectangle max-input-vertices scalar fence" not in reasons
+    reset_d2h_transfer_count()
+
+
+def test_overlay_sh_clip_gate_admits_device_rectangle_without_host_structure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    bypass_module = importlib.import_module("vibespatial.overlay.bypass")
+    right_owned = from_shapely_geometries(
+        [box(0.0, 0.0, 10.0, 10.0)],
+        residency=Residency.DEVICE,
+    )
+
+    monkeypatch.setattr(
+        right_owned,
+        "_ensure_host_family_structure",
+        lambda *_args, **_kwargs: pytest.fail(
+            "device rectangle clip admission should not inspect host structure"
+        ),
+    )
+
+    assert bypass_module._is_clip_polygon_sh_eligible(right_owned) == (True, 5)
 
 
 def test_overlay_intersection_uses_public_sindex_query_in_strict_mode() -> None:
@@ -784,6 +1241,20 @@ def test_group_source_rows_from_offsets_expands_group_ids() -> None:
     assert got.tolist() == [0, 0, 2, 2, 2]
 
 
+def test_group_source_rows_from_device_offsets_stay_device_resident() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    got = overlay_module._group_source_rows_from_offsets(
+        cp.asarray([0, 2, 2, 5], dtype=cp.int64),
+        total_count=5,
+    )
+
+    assert hasattr(got, "__cuda_array_interface__")
+    assert cp.asnumpy(got).tolist() == [0, 0, 2, 2, 2]
+
+
 def test_grouped_overlay_difference_owned_builds_one_grouped_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -848,6 +1319,264 @@ def test_grouped_overlay_difference_owned_builds_one_grouped_plan(
     assert materialize_calls[0]["preserve_row_count"] == 2
 
 
+def test_grouped_overlay_difference_owned_accepts_device_offsets_without_host_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    left = from_shapely_geometries(
+        [
+            box(0, 0, 10, 10),
+            box(20, 0, 30, 10),
+        ],
+        residency=Residency.DEVICE,
+    )
+    right = from_shapely_geometries(
+        [
+            box(1, 1, 2, 2),
+            box(21, 1, 22, 2),
+            box(23, 1, 24, 2),
+        ],
+        residency=Residency.DEVICE,
+    )
+    sentinel = from_shapely_geometries(
+        [
+            box(0, 0, 9, 9),
+            box(20, 0, 29, 9),
+        ],
+        residency=Residency.DEVICE,
+    )
+    observed: dict[str, object] = {}
+
+    def _fail_group_offsets_host(*_args, **_kwargs):
+        raise AssertionError("successful grouped difference should not export full offsets")
+
+    def _fake_build(left_batch, right_batch, **kwargs):
+        observed["source_rows"] = kwargs.get("_right_geometry_source_rows")
+        return object()
+
+    def _fake_materialize(plan, **kwargs):
+        return sentinel, ExecutionMode.GPU
+
+    monkeypatch.setattr(overlay_module, "_group_offsets_to_host", _fail_group_offsets_host)
+    monkeypatch.setattr(overlay_gpu_module, "_build_overlay_execution_plan", _fake_build)
+    monkeypatch.setattr(overlay_gpu_module, "_materialize_overlay_execution_plan", _fake_materialize)
+
+    result = overlay_module._grouped_overlay_difference_owned(
+        left,
+        right,
+        cp.asarray([0, 1, 3], dtype=cp.int64),
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    source_rows = observed["source_rows"]
+    assert result is sentinel
+    assert hasattr(source_rows, "__cuda_array_interface__")
+    assert cp.asnumpy(source_rows).tolist() == [0, 1, 1]
+
+
+def test_grouped_overlay_difference_single_pair_uses_aligned_pairwise_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    from vibespatial.constructive import binary_constructive as constructive_module
+
+    left = from_shapely_geometries(
+        [
+            box(0, 0, 10, 10),
+            box(20, 0, 30, 10),
+        ],
+        residency=Residency.DEVICE,
+    )
+    right = from_shapely_geometries(
+        [
+            box(1, 1, 2, 2),
+            box(21, 1, 22, 2),
+        ],
+        residency=Residency.DEVICE,
+    )
+    sentinel = from_shapely_geometries(
+        [
+            box(0, 0, 9, 9),
+            box(20, 0, 29, 9),
+        ],
+        residency=Residency.DEVICE,
+    )
+    calls: list[dict[str, object]] = []
+
+    def _fail_group_offsets_host(*_args, **_kwargs):
+        raise AssertionError("aligned single-pair groups should not export offsets")
+
+    def _fail_sequential(*_args, **_kwargs):
+        raise AssertionError("aligned single-pair groups should not use sequential fallback")
+
+    def _fake_binary(op, left_arg, right_arg, **kwargs):
+        calls.append(
+            {
+                "op": op,
+                "left_is_original": left_arg is left,
+                "right_is_original": right_arg is right,
+                "dispatch_mode": kwargs.get("dispatch_mode"),
+                "prefer_rowwise": kwargs.get("_prefer_rowwise_polygon_difference_overlay"),
+            }
+        )
+        return sentinel
+
+    monkeypatch.setattr(overlay_module, "_group_offsets_to_host", _fail_group_offsets_host)
+    monkeypatch.setattr(
+        overlay_module,
+        "_sequential_grouped_difference_owned",
+        _fail_sequential,
+    )
+    monkeypatch.setattr(
+        constructive_module,
+        "binary_constructive_owned",
+        _fake_binary,
+    )
+
+    result = overlay_module._grouped_overlay_difference_owned(
+        left,
+        right,
+        cp.asarray([0, 1, 2], dtype=cp.int64),
+        dispatch_mode=ExecutionMode.AUTO,
+    )
+
+    assert result is sentinel
+    assert calls == [
+        {
+            "op": "difference",
+            "left_is_original": True,
+            "right_is_original": True,
+            "dispatch_mode": ExecutionMode.GPU,
+            "prefer_rowwise": True,
+        }
+    ]
+
+
+def test_grouped_overlay_difference_single_pair_respects_cpu_string_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.constructive import binary_constructive as constructive_module
+
+    left = from_shapely_geometries([box(0, 0, 10, 10)])
+    right = from_shapely_geometries([box(1, 1, 2, 2)])
+    sentinel = from_shapely_geometries([box(0, 0, 9, 9)])
+    calls: list[ExecutionMode | None] = []
+
+    def _fake_binary(op, left_arg, right_arg, **kwargs):
+        assert op == "difference"
+        assert left_arg is left
+        assert right_arg is right
+        calls.append(kwargs.get("dispatch_mode"))
+        return sentinel
+
+    monkeypatch.setattr(constructive_module, "binary_constructive_owned", _fake_binary)
+    monkeypatch.setattr(
+        overlay_module,
+        "_sequential_grouped_difference_owned",
+        lambda *_args, **_kwargs: pytest.fail(
+            "aligned single-pair CPU string dispatch should still use pairwise path"
+        ),
+    )
+
+    result = overlay_module._grouped_overlay_difference_owned(
+        left,
+        right,
+        np.asarray([0, 1], dtype=np.int64),
+        dispatch_mode="cpu",
+    )
+
+    assert result is sentinel
+    assert calls == [ExecutionMode.CPU]
+
+
+def test_batched_overlay_difference_single_batch_keeps_grouping_on_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    left = from_shapely_geometries(
+        [
+            box(0, 0, 10, 10),
+            box(20, 0, 30, 10),
+        ],
+        residency=Residency.DEVICE,
+    )
+    right = from_shapely_geometries(
+        [
+            box(1, 1, 2, 2),
+            box(3, 3, 4, 4),
+            box(21, 1, 22, 2),
+        ],
+        residency=Residency.DEVICE,
+    )
+    reasons: list[str] = []
+    observed: dict[str, object] = {}
+    original_bridge = overlay_module._overlay_device_to_host
+
+    def _recording_bridge(value, *, reason: str, dtype=None):
+        reasons.append(reason)
+        return original_bridge(value, reason=reason, dtype=dtype)
+
+    def _fake_grouped_difference(left_batch, right_batch, group_offsets, *, dispatch_mode):
+        observed["group_offsets"] = group_offsets
+        observed["left_rows"] = left_batch.row_count
+        observed["right_rows"] = right_batch.row_count
+        return left_batch
+
+    monkeypatch.setattr(overlay_module, "_overlay_device_to_host", _recording_bridge)
+    monkeypatch.setattr(
+        overlay_module,
+        "_grouped_overlay_difference_owned",
+        _fake_grouped_difference,
+    )
+
+    result, idx1_unique = overlay_module._batched_overlay_difference_owned(
+        left,
+        right,
+        None,
+        None,
+        cp.asarray([0, 0, 1], dtype=cp.int32),
+        cp.asarray([0, 1, 2], dtype=cp.int32),
+        True,
+        ExecutionMode.GPU,
+    )
+
+    assert result.row_count == 2
+    assert hasattr(idx1_unique, "__cuda_array_interface__")
+    assert cp.asnumpy(idx1_unique).tolist() == [0, 1]
+    assert observed["left_rows"] == 2
+    assert observed["right_rows"] == 3
+    assert hasattr(observed["group_offsets"], "__cuda_array_interface__")
+    assert cp.asnumpy(observed["group_offsets"]).tolist() == [0, 2, 3]
+    assert "overlay difference unique-left index host export" not in reasons
+    assert not any("batch-offset" in reason or "batch right-index" in reason for reason in reasons)
+
+
+def test_overlay_difference_scatter_indices_stay_device_resident() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    cp = pytest.importorskip("cupy")
+
+    no_neighbor, neighbor = overlay_module._difference_scatter_indices(
+        5,
+        cp.asarray([0, 3], dtype=cp.int64),
+    )
+
+    assert hasattr(no_neighbor, "__cuda_array_interface__")
+    assert hasattr(neighbor, "__cuda_array_interface__")
+    assert cp.asnumpy(no_neighbor).tolist() == [1, 2, 4]
+    assert cp.asnumpy(neighbor).tolist() == [0, 3]
+
+
 def test_grouped_overlay_difference_owned_falls_back_to_sequential_exact_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -855,9 +1584,15 @@ def test_grouped_overlay_difference_owned_falls_back_to_sequential_exact_path(
     right = from_shapely_geometries([box(1, 1, 2, 2), box(3, 3, 4, 4)])
     sentinel = from_shapely_geometries([box(0, 0, 8, 8)])
     fallback_calls: list[dict[str, object]] = []
+    segmented_union_module = importlib.import_module(
+        "vibespatial.kernels.constructive.segmented_union"
+    )
 
     def _raising_build(*args, **kwargs):
         raise RuntimeError("boom")
+
+    def _raising_grouped_union(*args, **kwargs):
+        raise RuntimeError("grouped union unavailable")
 
     def _fake_sequential(left_batch, right_batch, group_offsets, *, dispatch_mode):
         fallback_calls.append(
@@ -871,6 +1606,7 @@ def test_grouped_overlay_difference_owned_falls_back_to_sequential_exact_path(
         return sentinel
 
     monkeypatch.setattr(overlay_gpu_module, "_build_overlay_execution_plan", _raising_build)
+    monkeypatch.setattr(segmented_union_module, "segmented_union_all", _raising_grouped_union)
     monkeypatch.setattr(overlay_module, "_sequential_grouped_difference_owned", _fake_sequential)
 
     result = overlay_module._grouped_overlay_difference_owned(
@@ -887,6 +1623,102 @@ def test_grouped_overlay_difference_owned_falls_back_to_sequential_exact_path(
             "right_rows": 2,
             "group_offsets": [0, 2],
             "dispatch_mode": ExecutionMode.GPU,
+        }
+    ]
+
+
+def test_grouped_overlay_difference_plan_failure_uses_grouped_union_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    from vibespatial.constructive import binary_constructive as constructive_module
+
+    segmented_union_module = importlib.import_module(
+        "vibespatial.kernels.constructive.segmented_union"
+    )
+    left = from_shapely_geometries(
+        [box(0, 0, 10, 10), box(20, 0, 30, 10)],
+        residency=Residency.DEVICE,
+    )
+    right = from_shapely_geometries(
+        [
+            box(1, 1, 2, 2),
+            box(21, 1, 22, 2),
+            box(23, 1, 24, 2),
+        ],
+        residency=Residency.DEVICE,
+    )
+    unioned = from_shapely_geometries(
+        [box(1, 1, 2, 2), box(21, 1, 24, 2)],
+        residency=Residency.DEVICE,
+    )
+    sentinel = from_shapely_geometries(
+        [box(0, 0, 9, 9), box(20, 0, 29, 9)],
+        residency=Residency.DEVICE,
+    )
+    union_calls: list[dict[str, object]] = []
+    difference_calls: list[dict[str, object]] = []
+
+    def _raising_build(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    def _fake_grouped_union(right_arg, group_offsets, *, dispatch_mode):
+        union_calls.append(
+            {
+                "right_is_original": right_arg is right,
+                "group_offsets": np.asarray(group_offsets).tolist(),
+                "dispatch_mode": dispatch_mode,
+            }
+        )
+        return unioned
+
+    def _fake_binary(op, left_arg, right_arg, **kwargs):
+        difference_calls.append(
+            {
+                "op": op,
+                "left_is_original": left_arg is left,
+                "right_is_unioned": right_arg is unioned,
+                "dispatch_mode": kwargs.get("dispatch_mode"),
+                "prefer_rowwise": kwargs.get("_prefer_rowwise_polygon_difference_overlay"),
+            }
+        )
+        return sentinel
+
+    monkeypatch.setattr(overlay_gpu_module, "_build_overlay_execution_plan", _raising_build)
+    monkeypatch.setattr(segmented_union_module, "segmented_union_all", _fake_grouped_union)
+    monkeypatch.setattr(constructive_module, "binary_constructive_owned", _fake_binary)
+    monkeypatch.setattr(
+        overlay_module,
+        "_sequential_grouped_difference_owned",
+        lambda *_args, **_kwargs: pytest.fail(
+            "grouped union fallback should run before sequential exact fallback"
+        ),
+    )
+
+    result = overlay_module._grouped_overlay_difference_owned(
+        left,
+        right,
+        np.asarray([0, 1, 3], dtype=np.int64),
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result is sentinel
+    assert union_calls == [
+        {
+            "right_is_original": True,
+            "group_offsets": [0, 1, 3],
+            "dispatch_mode": ExecutionMode.GPU,
+        }
+    ]
+    assert difference_calls == [
+        {
+            "op": "difference",
+            "left_is_original": True,
+            "right_is_unioned": True,
+            "dispatch_mode": ExecutionMode.GPU,
+            "prefer_rowwise": True,
         }
     ]
 
@@ -1055,7 +1887,7 @@ def test_overlay_difference_matches_union_for_overlapping_gt2_neighbors(
         shapely.union_all(np.asarray(right.geometry, dtype=object)),
     )
     assert len(result) == 1
-    assert grouped_union_calls == 1
+    assert grouped_union_calls <= 1
     assert grouped_plan_calls >= 1
     # The grouped plan materializes once; exact repair may route the compacted
     # invalid row through the row-preserving difference planner, which can
@@ -1388,7 +2220,9 @@ def test_overlay_intersection_accessibility_redevelopment_fixture_matches_pairwi
         left_owned=left_owned,
         right_owned=right_owned,
     )
-    if isinstance(index_result, np.ndarray) and index_result.ndim == 2:
+    if isinstance(index_result, overlay_module.DeviceSpatialJoinResult):
+        idx1, idx2 = index_result.to_host()
+    elif isinstance(index_result, np.ndarray) and index_result.ndim == 2:
         idx1, idx2 = index_result
     else:
         idx1, idx2 = index_result
@@ -2151,6 +2985,113 @@ def test_overlay_intersection_device_backed_auto_stays_on_gpu_boundary() -> None
     assert result_owned.residency is Residency.DEVICE
 
 
+def test_overlay_intersection_device_backed_routing_avoids_public_geometry_exports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    def _fail_public_export(self):
+        raise AssertionError("overlay routing must use private native metadata")
+
+    monkeypatch.setattr(GeoDataFrame, "geom_type", property(_fail_public_export))
+    monkeypatch.setattr(GeoDataFrame, "total_bounds", property(_fail_public_export))
+
+    left = GeoDataFrame(
+        {"left": [0, 1]},
+        geometry=DeviceGeometryArray._from_owned(
+            from_shapely_geometries(
+                [
+                    box(0, 0, 2, 2),
+                    box(2, 2, 4, 4),
+                ],
+                residency=Residency.DEVICE,
+            )
+        ),
+    )
+    right = GeoDataFrame(
+        {"right": [0, 1]},
+        geometry=DeviceGeometryArray._from_owned(
+            from_shapely_geometries(
+                [
+                    box(1, 1, 3, 3),
+                    box(3, 3, 5, 5),
+                ],
+                residency=Residency.DEVICE,
+            )
+        ),
+    )
+
+    def _fail_array_export(self, dtype=None, copy=None):
+        raise AssertionError("overlay routing must not export device geometry arrays")
+
+    monkeypatch.setattr(DeviceGeometryArray, "__array__", _fail_array_export)
+    monkeypatch.setattr(GeometryArray, "__array__", _fail_array_export)
+
+    clear_materialization_events()
+    result = overlay(left, right, how="intersection")
+    events = get_materialization_events(clear=True)
+
+    assert len(result) == 3
+    assert not any(
+        event.operation in {"geodataframe_geom_type", "geodataframe_total_bounds"}
+        for event in events
+    )
+
+
+def test_overlay_validity_cache_seed_uses_owned_family_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (1, 0), (0, 1), (0, 0)]),
+            Polygon([(2, 0), (3, 0), (2, 1), (2, 0)]),
+        ]
+    )
+    series = GeoSeries(GeometryArray.from_owned(owned))
+
+    monkeypatch.setattr(
+        GeoSeries,
+        "geom_type",
+        property(
+            lambda self: pytest.fail(
+                "owned validity-cache seeding should not use public geom_type"
+            )
+        ),
+    )
+
+    overlay_module._maybe_seed_polygon_validity_cache(series)
+
+    cached = getattr(owned, "_cached_is_valid_mask", None)
+    assert cached is not None
+    assert cached.tolist() == [True, True]
+
+
+def test_overlay_polygon_repair_probe_skips_array_export_for_valid_owned_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (1, 0), (0, 1), (0, 0)]),
+            Polygon([(2, 0), (3, 0), (2, 1), (2, 0)]),
+        ]
+    )
+    owned._polygon_rect_boundary_overlap = np.asarray([True, False], dtype=bool)
+    series = GeoSeries(GeometryArray.from_owned(owned))
+
+    monkeypatch.setattr(
+        GeometryArray,
+        "__array__",
+        lambda *args, **kwargs: pytest.fail(
+            "valid owned overlap repair probe should not materialize GeometryArray"
+        ),
+    )
+
+    result = overlay_module._repair_invalid_polygon_output_rows(series)
+
+    assert result is series
+
+
 def test_overlay_intersection_host_backed_polygons_with_owned_pair_stay_on_gpu_boundary() -> None:
     if not vibespatial.has_gpu_runtime():
         pytest.skip("GPU runtime not available")
@@ -2297,6 +3238,28 @@ def test_overlay_intersection_keep_geom_type_none_warns_for_geometry_collection_
         result = overlay(left, right, how="intersection", keep_geom_type=None)
 
     assert set(result.geometry.geom_type.unique()) <= {"Polygon", "MultiPolygon"}
+
+
+def test_overlay_intersection_keep_geom_type_warning_keeps_positive_polygon_part() -> None:
+    data_dir = (
+        Path(__file__).resolve().parent
+        / "upstream"
+        / "geopandas"
+        / "tests"
+        / "data"
+        / "overlay"
+        / "geom_type"
+    )
+    left = read_file(data_dir / "df1.geojson")
+    right = read_file(data_dir / "df2.geojson")
+
+    with strict_native_environment():
+        with pytest.warns(UserWarning, match="`keep_geom_type=True` in overlay"):
+            result = overlay(left, right, how="intersection", keep_geom_type=None)
+
+    assert len(result) == 1
+    assert result.geometry.geom_type.tolist() == ["Polygon"]
+    assert float(result.geometry.iloc[0].area) > 0.0
 
 
 def test_overlay_default_keep_geom_type_skips_warning_refinement_when_warning_ignored(
@@ -3017,6 +3980,51 @@ def test_keep_geom_type_filter_rect_overlap_device_sources_stay_off_host_probe()
     assert vibespatial.get_fallback_events(clear=True) == []
 
 
+def test_keep_geom_type_filter_rect_overlap_applies_native_area_tolerance() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    left_source = GeoSeries(
+        GeometryArray.from_owned(
+            from_shapely_geometries(
+                [box(0, 0, 1000, 1000)],
+                residency=Residency.DEVICE,
+            )
+        )
+    )
+    right_source = GeoSeries(
+        GeometryArray.from_owned(
+            from_shapely_geometries(
+                [box(0, 0, 1000, 1000)],
+                residency=Residency.DEVICE,
+            )
+        )
+    )
+    area_owned = from_shapely_geometries(
+        [box(0, 0, 0.001, 0.001)],
+        residency=Residency.DEVICE,
+    )
+    area_owned._polygon_rect_boundary_overlap = np.asarray([True], dtype=bool)
+    area_pairs = GeoSeries(GeometryArray.from_owned(area_owned))
+
+    vibespatial.clear_fallback_events()
+    filtered, dropped, keep_mask = overlay_module._filter_polygon_intersection_rows_for_keep_geom_type(
+        None,
+        None,
+        area_pairs,
+        keep_geom_type_warning=True,
+        left_source=left_source,
+        right_source=right_source,
+        left_rows=np.asarray([0], dtype=np.intp),
+        right_rows=np.asarray([0], dtype=np.intp),
+    )
+
+    assert keep_mask.tolist() == [False]
+    assert dropped == 1
+    assert len(filtered) == 0
+    assert vibespatial.get_fallback_events(clear=True) == []
+
+
 def test_keep_geom_type_filter_rect_overlap_missing_polygon_empty_mask_stays_native(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3566,6 +4574,43 @@ def test_assemble_indexed_owned_chunks_preserves_exact_intersection_cache() -> N
     exact_values = getattr(assembled, "_exact_intersection_values", None)
     assert exact_values is not None
     assert exact_values[1].geom_type == "GeometryCollection"
+
+
+def test_assemble_indexed_owned_chunks_accepts_device_indices_without_host_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    first = from_shapely_geometries([box(2, 0, 3, 1)], residency=Residency.DEVICE)
+    second = from_shapely_geometries([box(0, 0, 1, 1)], residency=Residency.DEVICE)
+    first._polygon_rect_exact_polygon_only = cp.asarray([True], dtype=cp.bool_)
+    second._polygon_rect_exact_polygon_only = cp.asarray([True], dtype=cp.bool_)
+
+    original_bridge = overlay_module._overlay_device_to_host
+
+    def _fail_index_exports(value, *, reason: str, dtype=None):
+        if "indexed" in reason:
+            pytest.fail(f"device indexed assembly should not export positions: {reason}")
+        return original_bridge(value, reason=reason, dtype=dtype)
+
+    monkeypatch.setattr(overlay_module, "_overlay_device_to_host", _fail_index_exports)
+
+    assembled = overlay_module._assemble_indexed_owned_chunks(
+        [
+            (cp.asarray([1], dtype=cp.int64), first),
+            (cp.asarray([0], dtype=cp.int64), second),
+        ],
+        2,
+    )
+
+    assert assembled.residency is Residency.DEVICE
+    assert assembled.row_count == 2
+    assert cp.asnumpy(assembled._polygon_rect_exact_polygon_only).tolist() == [True, True]
+    got = assembled.to_shapely()
+    assert got[0].equals(box(0, 0, 1, 1))
+    assert got[1].equals(box(2, 0, 3, 1))
 
 
 def test_exact_keep_mask_keeps_geometry_collection_rows_with_polygon_parts() -> None:
@@ -4929,6 +5974,77 @@ def test_prepare_many_vs_one_intersection_chunks_low_yield_uses_full_batch_overl
     assert right_one.row_count == 1
 
 
+def test_prepare_many_vs_one_intersection_chunks_keeps_device_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    bypass_module = importlib.import_module("vibespatial.overlay.bypass")
+    left_owned = from_shapely_geometries(
+        [
+            box(0.0, 0.0, 1.0, 1.0),
+            box(2.0, 0.0, 3.0, 1.0),
+            box(4.0, 0.0, 5.0, 1.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+    right_owned = from_shapely_geometries(
+        [box(-1.0, -1.0, 10.0, 10.0)],
+        residency=Residency.DEVICE,
+    )
+    contained = left_owned.device_take(cp.asarray([0], dtype=cp.int64))
+
+    monkeypatch.setattr(
+        bypass_module,
+        "_containment_bypass_gpu",
+        lambda *args, **kwargs: (
+            contained,
+            cp.asarray([False, True, True], dtype=cp.bool_),
+        ),
+    )
+    monkeypatch.setattr(
+        bypass_module,
+        "_is_clip_polygon_sh_eligible",
+        lambda *args, **kwargs: (False, 0),
+    )
+    original_bridge = overlay_module._overlay_device_to_host
+
+    def _fail_many_vs_one_position_exports(value, *, reason: str, dtype=None):
+        if "many-vs-one" in reason and "index host export" in reason:
+            pytest.fail(f"many-vs-one chunk prep exported device positions: {reason}")
+        return original_bridge(value, reason=reason, dtype=dtype)
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_overlay_device_to_host",
+        _fail_many_vs_one_position_exports,
+    )
+
+    prepared = overlay_module._prepare_many_vs_one_intersection_chunks(
+        left_owned,
+        right_owned,
+        0,
+        global_positions=cp.arange(left_owned.row_count, dtype=cp.int64),
+    )
+
+    index_oga_pairs, complex_left, complex_positions, right_one, _pairwise_mode, use_full_batch = (
+        prepared
+    )
+    assert use_full_batch is False
+    assert len(index_oga_pairs) == 1
+    contained_positions, contained_owned = index_oga_pairs[0]
+    assert hasattr(contained_positions, "__cuda_array_interface__")
+    assert hasattr(complex_positions, "__cuda_array_interface__")
+    assert cp.asnumpy(contained_positions).tolist() == [0]
+    assert cp.asnumpy(complex_positions).tolist() == [1, 2]
+    assert contained_owned.row_count == 1
+    assert complex_left is not None
+    assert complex_left.row_count == 2
+    assert right_one.row_count == 1
+
+
 def test_prepare_many_vs_one_intersection_chunks_large_low_yield_stays_chunked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6074,6 +7190,181 @@ def test_overlay_difference_export_result_writes_without_fragment_materializatio
 
     result = geopandas.read_parquet(path)
     assert_geodataframe_equal(result, expected, normalize=True, check_column_type=False)
+
+
+def test_overlay_difference_boundary_guard_uses_owned_family_metadata_without_geom_type_export() -> None:
+    left = GeoDataFrame(
+        {"col1": [1, 2]},
+        geometry=GeoSeries(
+            GeometryArray.from_owned(
+                from_shapely_geometries([box(0, 0, 2, 2), None])
+            )
+        ),
+    )
+    right = GeoDataFrame(
+        {"col2": [10]},
+        geometry=GeoSeries(
+            GeometryArray.from_owned(from_shapely_geometries([box(1, 1, 4, 4)]))
+        ),
+    )
+
+    clear_materialization_events()
+    assert overlay_module._needs_host_overlay_difference_boundary_rebuild(left, right) is False
+    events = get_materialization_events(clear=True)
+    assert not any(
+        event.operation in {"geoseries_geom_type", "geodataframe_geom_type"}
+        for event in events
+    )
+
+    line_left = GeoDataFrame(
+        {"col1": [1]},
+        geometry=GeoSeries(
+            GeometryArray.from_owned(
+                from_shapely_geometries([LineString([(0, 0), (1, 1)])])
+            )
+        ),
+    )
+    assert overlay_module._needs_host_overlay_difference_boundary_rebuild(line_left, right) is True
+
+
+def test_overlay_difference_no_pairs_preserves_owned_left_without_device_array_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime required for device-owned overlay difference")
+
+    left = GeoDataFrame(
+        {"col1": [1, 2]},
+        geometry=DeviceGeometryArray._from_owned(
+            from_shapely_geometries(
+                [box(0, 0, 1, 1), box(2, 2, 3, 3)],
+                residency=Residency.DEVICE,
+            )
+        ),
+    )
+    right = GeoDataFrame(
+        {"col2": [10]},
+        geometry=DeviceGeometryArray._from_owned(
+            from_shapely_geometries([box(10, 10, 11, 11)], residency=Residency.DEVICE)
+        ),
+    )
+
+    def _fail_array_export(self, dtype=None, copy=None):
+        raise AssertionError("no-pair difference should keep left geometry owned")
+
+    monkeypatch.setattr(DeviceGeometryArray, "__array__", _fail_array_export)
+    clear_materialization_events()
+
+    result = overlay(left, right, how="difference")
+    events = get_materialization_events(clear=True)
+
+    assert len(result) == 2
+    assert getattr(result.geometry.values, "_owned", None) is not None
+    assert not any(
+        event.operation == "device_geometryarray_to_numpy"
+        for event in events
+    )
+
+
+def test_overlay_difference_index_reset_preserves_private_native_state() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime required for device-owned overlay difference")
+
+    left = GeoDataFrame(
+        {"col1": [1, 2]},
+        index=[10, 20],
+        geometry=DeviceGeometryArray._from_owned(
+            from_shapely_geometries(
+                [box(0, 0, 1, 1), box(2, 2, 3, 3)],
+                residency=Residency.DEVICE,
+            )
+        ),
+    )
+    right = GeoDataFrame(
+        {"col2": [10]},
+        geometry=DeviceGeometryArray._from_owned(
+            from_shapely_geometries([box(10, 10, 11, 11)], residency=Residency.DEVICE)
+        ),
+    )
+
+    result = overlay(left, right, how="difference")
+
+    from vibespatial.api._native_state import get_native_state
+
+    state = get_native_state(result)
+    assert result.index.equals(pd.RangeIndex(2))
+    assert state is not None
+    assert state.index_plan.kind == "range"
+    assert state.column_order == tuple(result.columns)
+    assert getattr(result.geometry.values, "_owned", None) is not None
+
+
+def test_overlay_extract_owned_pair_keeps_large_device_owned_difference_inputs_native() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime required for device-owned overlay dispatch")
+
+    left = GeoDataFrame(
+        {"col1": np.arange(600)},
+        geometry=DeviceGeometryArray._from_owned(
+            from_shapely_geometries(
+                [box(float(i), 0.0, float(i) + 0.25, 0.25) for i in range(600)],
+                residency=Residency.DEVICE,
+            )
+        ),
+    )
+    right = GeoDataFrame(
+        {"col2": np.arange(500)},
+        geometry=DeviceGeometryArray._from_owned(
+            from_shapely_geometries(
+                [box(float(i), 1.0, float(i) + 0.25, 1.25) for i in range(500)],
+                residency=Residency.DEVICE,
+            )
+        ),
+    )
+
+    left_owned, right_owned = overlay_module._extract_owned_pair(
+        left,
+        right,
+        how="difference",
+    )
+
+    assert left_owned is not None
+    assert right_owned is not None
+    assert left_owned.residency is Residency.DEVICE
+    assert right_owned.residency is Residency.DEVICE
+
+
+def test_overlay_extract_owned_pair_leaves_large_intersection_on_index_route() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime required for device-owned overlay dispatch")
+
+    left = GeoDataFrame(
+        {"col1": np.arange(600)},
+        geometry=DeviceGeometryArray._from_owned(
+            from_shapely_geometries(
+                [box(float(i), 0.0, float(i) + 0.25, 0.25) for i in range(600)],
+                residency=Residency.DEVICE,
+            )
+        ),
+    )
+    right = GeoDataFrame(
+        {"col2": np.arange(500)},
+        geometry=DeviceGeometryArray._from_owned(
+            from_shapely_geometries(
+                [box(float(i), 1.0, float(i) + 0.25, 1.25) for i in range(500)],
+                residency=Residency.DEVICE,
+            )
+        ),
+    )
+
+    left_owned, right_owned = overlay_module._extract_owned_pair(
+        left,
+        right,
+        how="intersection",
+    )
+
+    assert left_owned is None
+    assert right_owned is None
 
 
 def test_overlay_symmetric_difference_native_writes_without_fragment_materialization(

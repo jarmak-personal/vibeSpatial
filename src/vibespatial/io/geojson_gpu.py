@@ -84,6 +84,49 @@ KERNEL_PARAM_I64 = ctypes.c_longlong
 KERNEL_PARAM_I8 = ctypes.c_int8
 _FEATURE_SEPARATOR_BYTES = np.frombuffer(b" \t\r\n,", dtype=np.uint8)
 _FEATURE_SEPARATOR_BYTES_PY = frozenset(int(v) for v in _FEATURE_SEPARATOR_BYTES.tolist())
+_GEOMETRY_FAMILY_ORDER = (
+    GeometryFamily.POINT,
+    GeometryFamily.LINESTRING,
+    GeometryFamily.POLYGON,
+    GeometryFamily.MULTIPOINT,
+    GeometryFamily.MULTILINESTRING,
+    GeometryFamily.MULTIPOLYGON,
+)
+_GEOMETRY_FAMILY_TAGS = tuple(np.int8(FAMILY_TAGS[family]) for family in _GEOMETRY_FAMILY_ORDER)
+
+
+def _device_scalar_int(runtime, device_value, *, reason: str) -> int:
+    d_value = cp.ascontiguousarray(cp.asarray(device_value).reshape(1))
+    with runtime.stream_context() as stream:
+        host = runtime.copy_device_to_host_async(d_value, stream, reason=reason)
+    return int(host[0])
+
+
+def _device_scalar_bool(runtime, device_value, *, reason: str) -> bool:
+    d_value = cp.ascontiguousarray(cp.asarray(device_value, dtype=cp.bool_).reshape(1))
+    with runtime.stream_context() as stream:
+        host = runtime.copy_device_to_host_async(d_value, stream, reason=reason)
+    return bool(host[0])
+
+
+def _device_geometry_family_domain(runtime, d_family_tags) -> tuple[int, ...]:
+    d_flags = cp.empty(len(_GEOMETRY_FAMILY_TAGS), dtype=cp.bool_)
+    for idx, tag in enumerate(_GEOMETRY_FAMILY_TAGS):
+        d_flags[idx] = cp.any(d_family_tags == tag)
+    d_mask = cp.packbits(d_flags.astype(cp.uint8), bitorder="little")[:1]
+    with runtime.stream_context() as stream:
+        host = runtime.copy_device_to_host_async(
+            d_mask,
+            stream,
+            reason="geojson geometry family-domain scalar fence",
+        )
+    mask = int(host[0])
+    return tuple(
+        int(tag)
+        for idx, tag in enumerate(_GEOMETRY_FAMILY_TAGS)
+        if mask & (1 << idx)
+    )
+
 
 # ---------------------------------------------------------------------------
 # NVRTC warmup (ADR-0034 Level 2)
@@ -209,11 +252,17 @@ class GeoJSONGpuResult:
             if self.device_feature_starts is None:
                 self.feature_starts = np.empty(0, dtype=np.int64)
             else:
-                self.feature_starts = cp.asnumpy(self.device_feature_starts)
+                self.feature_starts = get_cuda_runtime().copy_device_to_host(
+                    self.device_feature_starts,
+                    reason="geojson property feature-starts host export",
+                )
                 self.device_feature_starts = None
         if self.feature_ends is None:
             if self.device_feature_ends is not None:
-                self.feature_ends = cp.asnumpy(self.device_feature_ends)
+                self.feature_ends = get_cuda_runtime().copy_device_to_host(
+                    self.device_feature_ends,
+                    reason="geojson property feature-ends host export",
+                )
                 self.device_feature_ends = None
             else:
                 self.feature_ends = _derive_feature_ends_from_starts(host_bytes, self.feature_starts)
@@ -226,13 +275,19 @@ class GeoJSONGpuResult:
             if self.device_property_starts is None:
                 self.property_starts = np.empty(0, dtype=np.int64)
             else:
-                self.property_starts = cp.asnumpy(self.device_property_starts)
+                self.property_starts = get_cuda_runtime().copy_device_to_host(
+                    self.device_property_starts,
+                    reason="geojson property object-starts host export",
+                )
                 self.device_property_starts = None
         if self.property_ends is None:
             if self.device_property_ends is None:
                 self.property_ends = np.empty(0, dtype=np.int64)
             else:
-                self.property_ends = cp.asnumpy(self.device_property_ends)
+                self.property_ends = get_cuda_runtime().copy_device_to_host(
+                    self.device_property_ends,
+                    reason="geojson property object-ends host export",
+                )
                 self.device_property_ends = None
         return host_bytes, self.property_starts, self.property_ends
 
@@ -482,7 +537,11 @@ def _try_parse_compact_point_geometries(
             KERNEL_PARAM_I64,
         ),
     ))
-    if not bool(cp.all(d_point_valid).item()):
+    if not _device_scalar_bool(
+        runtime,
+        cp.all(d_point_valid),
+        reason="geojson compact point validity scalar fence",
+    ):
         del d_geometry_positions, d_point_x, d_point_y, d_point_valid
         return None
     del d_point_valid, d_geometry_positions
@@ -717,21 +776,25 @@ def read_geojson_gpu(
 
     # Check for unsupported types (only GeometryCollection now)
     unsupported_mask = d_family_tags < 0
-    if cp.any(unsupported_mask):
-        n_unsupported = int(cp.sum(unsupported_mask))
+    n_unsupported = _device_scalar_int(
+        runtime,
+        cp.sum(unsupported_mask),
+        reason="geojson unsupported geometry-count scalar fence",
+    )
+    if n_unsupported:
         raise NotImplementedError(
             f"GPU GeoJSON parser: {n_unsupported} features have unsupported "
             f"geometry types (GeometryCollection)"
         )
 
-    # Determine if homogeneous or mixed
-    unique_tags = cp.unique(d_family_tags)
-    is_homogeneous = len(unique_tags) == 1
-    single_tag = int(unique_tags[0]) if is_homogeneous else None
+    # Determine if homogeneous or mixed using a packed family-domain fence.
+    family_domain = _device_geometry_family_domain(runtime, d_family_tags)
+    is_homogeneous = len(family_domain) == 1
+    single_tag = family_domain[0] if is_homogeneous else None
     pg_tag = np.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
     mpoly_tag = np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
-    has_polygons = bool(cp.any(unique_tags == pg_tag))
-    has_multipolygons = bool(cp.any(unique_tags == mpoly_tag))
+    has_polygons = int(pg_tag) in family_domain
+    has_multipolygons = int(mpoly_tag) in family_domain
 
     if single_tag == FAMILY_TAGS[GeometryFamily.POINT]:
         point_kernels = _point_pair_kernels()
@@ -744,7 +807,11 @@ def read_geojson_gpu(
             (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_I32, KERNEL_PARAM_I64),
         ))
-        if bool(cp.all(d_point_valid).item()):
+        if _device_scalar_bool(
+            runtime,
+            cp.all(d_point_valid),
+            reason="geojson point coordinate validity scalar fence",
+        ):
             del d_point_valid
             del d_depth
 
@@ -882,13 +949,17 @@ def read_geojson_gpu(
     # Compute per-feature coordinate offsets in flat x/y
     d_feature_coord_offsets = cp.zeros(n_features + 1, dtype=cp.int32)
     cp.cumsum(d_effective_pairs, out=d_feature_coord_offsets[1:])
-    total_pairs = int(d_feature_coord_offsets[-1].get())
+    total_pairs = _device_scalar_int(
+        runtime,
+        d_feature_coord_offsets[-1:],
+        reason="geojson feature coordinate total scalar export",
+    )
 
     # S3e: Global segment offsets for Polygon/MultiLineString plus the
     # pseudo-segments needed to preserve gaps created by Point, LineString,
     # and MultiPoint rows in mixed files.
     mls_tag_val = np.int8(FAMILY_TAGS[GeometryFamily.MULTILINESTRING])
-    has_ring_types = has_polygons or bool(cp.any(unique_tags == mls_tag_val))
+    has_ring_types = has_polygons or int(mls_tag_val) in family_domain
     if has_ring_types and d_ring_counts is not None:
         d_ring_segment_counts = cp.where(
             d_family_tags == pt_tag,
@@ -913,10 +984,17 @@ def read_geojson_gpu(
         d_all_geometry_offsets = cp.empty(n_features + 1, dtype=cp.int32)
         d_all_geometry_offsets[0] = 0
         cp.cumsum(d_ring_segment_counts, out=d_all_geometry_offsets[1:])
-        total_rings = int(d_all_geometry_offsets[-1].get())
+        total_rings = _device_scalar_int(
+            runtime,
+            d_all_geometry_offsets[-1:],
+            reason="geojson ring total scalar export",
+        )
 
         d_ring_offsets = cp.empty(total_rings + 1, dtype=cp.int32)
-        d_ring_offsets[-1] = int(d_feature_coord_offsets[n_features]) if n_features > 0 else 0
+        if n_features > 0:
+            d_ring_offsets[-1] = d_feature_coord_offsets[n_features]
+        else:
+            d_ring_offsets[-1] = 0
 
         d_ring_scatter_starts = d_all_geometry_offsets[:n_features].copy()
         scatter_kernels = _scatter_coords_kernels()
@@ -940,14 +1018,22 @@ def read_geojson_gpu(
         d_mp_part_offset_starts = cp.concatenate(
             [cp.zeros(1, dtype=cp.int32), d_mp_part_psum[:-1]]
         )
-        total_mpoly_parts = int(d_mp_part_psum[-1])
+        total_mpoly_parts = _device_scalar_int(
+            runtime,
+            d_mp_part_psum[-1:],
+            reason="geojson multipolygon part count scalar export",
+        )
 
         d_mp_ring_psum = cp.empty(n_features, dtype=cp.int32)
         cp.cumsum(d_mpoly_ring_counts, out=d_mp_ring_psum)
         d_mp_ring_offset_starts = cp.concatenate(
             [cp.zeros(1, dtype=cp.int32), d_mp_ring_psum[:-1]]
         )
-        total_mpoly_rings = int(d_mp_ring_psum[-1])
+        total_mpoly_rings = _device_scalar_int(
+            runtime,
+            d_mp_ring_psum[-1:],
+            reason="geojson multipolygon ring count scalar export",
+        )
 
         # For pair offset starts, use the GLOBAL feature coord offsets so that
         # ring_offsets index into the global flat coordinate array.  This is
@@ -967,7 +1053,7 @@ def read_geojson_gpu(
         if total_mpoly_parts > 0:
             d_mpoly_part_offsets[-1] = total_mpoly_rings
         if total_mpoly_rings > 0:
-            d_mpoly_ring_offsets[-1] = int(d_feature_coord_offsets[n_features])
+            d_mpoly_ring_offsets[-1] = d_feature_coord_offsets[n_features]
 
         # Scatter offsets
         mpoly_scatter_k = _mpoly_scatter_kernels()

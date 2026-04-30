@@ -225,6 +225,7 @@ def _notify_runtime_d2h_transfer(
     trigger: str,
     reason: str,
     elapsed_seconds: float = 0.0,
+    terminal_export: bool = False,
 ) -> None:
     bytes_transferred = _device_array_nbytes(device_array, host_array)
     item_count = _device_array_size(device_array)
@@ -247,6 +248,7 @@ def _notify_runtime_d2h_transfer(
             item_count=item_count,
             bytes_transferred=bytes_transferred,
             elapsed_seconds=elapsed_seconds,
+            terminal_export=terminal_export,
         )
     except Exception:
         # Transfer accounting must never make a production copy fail.
@@ -807,7 +809,14 @@ class CudaDriverRuntime:
         with self.activate():
             device_array[...] = cp.asarray(host)
 
-    def copy_device_to_host(self, device_array: DeviceArray, host_array: np.ndarray | None = None) -> np.ndarray:
+    def copy_device_to_host(
+        self,
+        device_array: DeviceArray,
+        host_array: np.ndarray | None = None,
+        *,
+        reason: str = "CudaRuntime.copy_device_to_host",
+        terminal_export: bool = False,
+    ) -> np.ndarray:
         _require_gpu_arrays()
         started = perf_counter()
         with self.activate():
@@ -817,8 +826,9 @@ class CudaDriverRuntime:
             device_array,
             host_array=host if host_array is None else host_array,
             trigger="cuda-runtime-copy",
-            reason="CudaRuntime.copy_device_to_host",
+            reason=reason,
             elapsed_seconds=elapsed,
+            terminal_export=terminal_export,
         )
         if host_array is None:
             return host
@@ -894,6 +904,9 @@ class CudaDriverRuntime:
         device_array: DeviceArray,
         stream: Any,
         host_array: np.ndarray | None = None,
+        *,
+        reason: str = "CudaRuntime.copy_device_to_host_async",
+        terminal_export: bool = False,
     ) -> np.ndarray:
         """Enqueue an asynchronous device-to-host copy on *stream*.
 
@@ -917,7 +930,8 @@ class CudaDriverRuntime:
             device_array,
             host_array=host_array,
             trigger="cuda-runtime-copy-async",
-            reason="CudaRuntime.copy_device_to_host_async",
+            reason=reason,
+            terminal_export=terminal_export,
         )
         return host_array
 
@@ -1172,6 +1186,8 @@ def count_scatter_total(
     runtime: CudaDriverRuntime,
     device_counts: DeviceArray,
     device_offsets: DeviceArray,
+    *,
+    reason: str = "count-scatter total allocation fence",
 ) -> int:
     """Get total output size from count-scatter arrays.
 
@@ -1188,13 +1204,15 @@ def count_scatter_total(
         h_buf = runtime.allocate_pinned((2,), dtype)
         runtime.copy_device_to_device_async(device_counts[-1:], d_buf[:1], xfer)
         runtime.copy_device_to_device_async(device_offsets[-1:], d_buf[1:], xfer)
-        runtime.copy_device_to_host_async(d_buf, xfer, h_buf)
+        runtime.copy_device_to_host_async(d_buf, xfer, h_buf, reason=reason)
     return int(h_buf[0]) + int(h_buf[1])
 
 
 def count_scatter_totals(
     runtime: CudaDriverRuntime,
     count_offset_pairs: list[tuple[DeviceArray, DeviceArray]],
+    *,
+    reason: str = "batched count-scatter totals allocation fence",
 ) -> list[int]:
     """Get multiple count-scatter totals with one transfer-stream sync.
 
@@ -1217,7 +1235,12 @@ def count_scatter_totals(
         raise TypeError("count_scatter_totals requires counts and offsets with matching dtypes")
     if any(dtype != dtypes[0] for dtype in dtypes):
         return [
-            count_scatter_total(runtime, device_counts, device_offsets)
+            count_scatter_total(
+                runtime,
+                device_counts,
+                device_offsets,
+                reason=reason,
+            )
             for device_counts, device_offsets in count_offset_pairs
         ]
 
@@ -1230,7 +1253,7 @@ def count_scatter_totals(
             base = 2 * pair_index
             runtime.copy_device_to_device_async(device_counts[-1:], d_buf[base:base + 1], xfer)
             runtime.copy_device_to_device_async(device_offsets[-1:], d_buf[base + 1:base + 2], xfer)
-        runtime.copy_device_to_host_async(d_buf, xfer, h_buf)
+        runtime.copy_device_to_host_async(d_buf, xfer, h_buf, reason=reason)
     return [
         int(h_buf[2 * pair_index]) + int(h_buf[2 * pair_index + 1])
         for pair_index in range(n_pairs)
@@ -1243,6 +1266,8 @@ def count_scatter_total_with_transfer(
     device_offsets: DeviceArray,
     *,
     precomputed_total: int | None = None,
+    total_reason: str = "count-scatter total allocation fence",
+    counts_transfer_reason: str = "count-scatter counts host transfer",
 ) -> tuple[int, CudaStream, np.ndarray]:
     """Get total and start async full-counts transfer on a background stream.
 
@@ -1259,13 +1284,23 @@ def count_scatter_total_with_transfer(
     total = (
         int(precomputed_total)
         if precomputed_total is not None
-        else count_scatter_total(runtime, device_counts, device_offsets)
+        else count_scatter_total(
+            runtime,
+            device_counts,
+            device_offsets,
+            reason=total_reason,
+        )
     )
 
     # 2. Start async full-array transfer on a dedicated stream.
     xfer = runtime.create_stream()
     h_counts = runtime.allocate_pinned((n,), dtype)
-    runtime.copy_device_to_host_async(device_counts, xfer, h_counts)
+    runtime.copy_device_to_host_async(
+        device_counts,
+        xfer,
+        h_counts,
+        reason=counts_transfer_reason,
+    )
 
     return total, xfer, h_counts
 

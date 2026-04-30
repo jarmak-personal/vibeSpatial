@@ -7,6 +7,12 @@ import vibespatial.api as geopandas
 import vibespatial.spatial.query as spatial_query_module
 from vibespatial.runtime import has_gpu_runtime
 
+OWNED_OR_NATIVE_QUERY_IMPLEMENTATIONS = {
+    "native_spatial_index",
+    "owned_cpu_spatial_query",
+    "owned_gpu_spatial_query",
+}
+
 
 def test_geopandas_buffer_unsupported_surface_uses_host_dispatch() -> None:
     geopandas.clear_dispatch_events()
@@ -37,7 +43,7 @@ def test_geopandas_sindex_query_owned_dispatch_is_observable() -> None:
     assert not events
     assert dispatch_events
     assert dispatch_events[-1].surface == "geopandas.sindex.query"
-    assert dispatch_events[-1].implementation in ("owned_cpu_spatial_query", "owned_gpu_spatial_query")
+    assert dispatch_events[-1].implementation in OWNED_OR_NATIVE_QUERY_IMPLEMENTATIONS
     assert dispatch_events[-1].selected in (geopandas.ExecutionMode.CPU, geopandas.ExecutionMode.GPU)
 
 
@@ -54,7 +60,7 @@ def test_geopandas_sindex_query_contains_uses_owned_dispatch() -> None:
     assert not events
     assert dispatch_events
     assert dispatch_events[-1].surface == "geopandas.sindex.query"
-    assert dispatch_events[-1].implementation in {"owned_cpu_spatial_query", "owned_gpu_spatial_query"}
+    assert dispatch_events[-1].implementation in OWNED_OR_NATIVE_QUERY_IMPLEMENTATIONS
 
 
 @pytest.mark.parametrize("predicate", [None, "intersects", "contains", "covers"])
@@ -72,10 +78,16 @@ def test_geopandas_sindex_query_selects_gpu_for_large_point_tree_box_queries(pre
     assert dispatch_events
     assert dispatch_events[-1].surface == "geopandas.sindex.query"
     if has_gpu_runtime():
-        assert dispatch_events[-1].implementation == "owned_gpu_spatial_query"
+        assert dispatch_events[-1].implementation in {
+            "native_spatial_index",
+            "owned_gpu_spatial_query",
+        }
         assert dispatch_events[-1].selected is geopandas.ExecutionMode.GPU
     else:
-        assert dispatch_events[-1].implementation == "owned_cpu_spatial_query"
+        assert dispatch_events[-1].implementation in {
+            "native_spatial_index",
+            "owned_cpu_spatial_query",
+        }
         assert dispatch_events[-1].selected is geopandas.ExecutionMode.CPU
 
 
@@ -103,10 +115,16 @@ def test_geopandas_sindex_query_selects_gpu_for_boundary_sensitive_box_predicate
     assert dispatch_events
     assert dispatch_events[-1].surface == "geopandas.sindex.query"
     if has_gpu_runtime():
-        assert dispatch_events[-1].implementation == "owned_gpu_spatial_query"
+        assert dispatch_events[-1].implementation in {
+            "native_spatial_index",
+            "owned_gpu_spatial_query",
+        }
         assert dispatch_events[-1].selected is geopandas.ExecutionMode.GPU
     else:
-        assert dispatch_events[-1].implementation == "owned_cpu_spatial_query"
+        assert dispatch_events[-1].implementation in {
+            "native_spatial_index",
+            "owned_cpu_spatial_query",
+        }
         assert dispatch_events[-1].selected is geopandas.ExecutionMode.CPU
 
 
@@ -123,7 +141,7 @@ def test_geopandas_sindex_query_within_uses_owned_dispatch() -> None:
     assert not events
     assert dispatch_events
     assert dispatch_events[-1].surface == "geopandas.sindex.query"
-    assert dispatch_events[-1].implementation in {"owned_cpu_spatial_query", "owned_gpu_spatial_query"}
+    assert dispatch_events[-1].implementation in OWNED_OR_NATIVE_QUERY_IMPLEMENTATIONS
 
 
 def test_geopandas_sindex_query_scalar_box_avoids_query_owned_conversion(
@@ -147,7 +165,10 @@ def test_geopandas_sindex_query_scalar_box_avoids_query_owned_conversion(
 
     assert result.tolist() == list(range(100, 200))
     assert not events
-    assert dispatch_events[-1].implementation == "owned_gpu_spatial_query"
+    assert dispatch_events[-1].implementation in {
+        "native_spatial_index",
+        "owned_gpu_spatial_query",
+    }
     assert dispatch_events[-1].selected is geopandas.ExecutionMode.GPU
 
 
@@ -182,7 +203,10 @@ def test_geopandas_sindex_query_box_array_avoids_query_owned_conversion(
     assert result.shape[1] > 0
     assert set(result[0].tolist()) == {0, 1}
     assert not events
-    assert dispatch_events[-1].implementation == "owned_gpu_spatial_query"
+    assert dispatch_events[-1].implementation in {
+        "native_spatial_index",
+        "owned_gpu_spatial_query",
+    }
     assert dispatch_events[-1].selected is geopandas.ExecutionMode.GPU
 
 
@@ -246,7 +270,7 @@ def test_geopandas_sindex_query_multipoint_uses_gpu_dispatch() -> None:
     assert not events
     assert dispatch_events
     assert dispatch_events[-1].surface == "geopandas.sindex.query"
-    assert dispatch_events[-1].implementation in ("owned_cpu_spatial_query", "owned_gpu_spatial_query")
+    assert dispatch_events[-1].implementation in OWNED_OR_NATIVE_QUERY_IMPLEMENTATIONS
 
 
 def test_geopandas_sindex_nearest_fallback_is_observable() -> None:

@@ -1067,6 +1067,18 @@ def _polygon_rect_boundary_split_kernels():
     )
 
 
+def _polygon_rect_device_to_host(device_array: object, *, reason: str):
+    return get_cuda_runtime().copy_device_to_host(device_array, reason=reason)
+
+
+def _polygon_rect_bool_scalar(value: object, *, reason: str) -> bool:
+    return bool(_polygon_rect_device_to_host(cp.asarray(value).reshape(1), reason=reason)[0])
+
+
+def _polygon_rect_int_scalar(value: object, *, reason: str) -> int:
+    return int(_polygon_rect_device_to_host(cp.asarray(value).reshape(1), reason=reason)[0])
+
+
 def _extract_polygon_family_device_buffer(owned: OwnedGeometryArray):
     if GeometryFamily.POLYGON not in owned.families:
         return None, None
@@ -1082,41 +1094,89 @@ def _extract_polygon_family_device_buffer(owned: OwnedGeometryArray):
     return device_buf, host_buf
 
 
+def _device_dense_single_ring_width(polygon_buf, row_count: int) -> int | None:
+    """Return cached fixed-width one-ring proof for a device polygon buffer."""
+    if polygon_buf is None or row_count <= 0:
+        return None
+    width = getattr(polygon_buf, "dense_single_ring_width", None)
+    if width is None:
+        return None
+    width = int(width)
+    if width <= 0:
+        return None
+    if polygon_buf.ring_offsets is None:
+        return None
+    if (
+        int(polygon_buf.geometry_offsets.size) != row_count + 1
+        or int(polygon_buf.ring_offsets.size) != row_count + 1
+        or int(polygon_buf.empty_mask.size) != row_count
+        or int(polygon_buf.x.size) != row_count * width
+        or int(polygon_buf.y.size) != row_count * width
+    ):
+        return None
+    return width
+
+
 def _device_is_dense_single_ring_polygons(polygon_buf, row_count: int) -> bool:
     if polygon_buf is None or row_count <= 0:
         return False
+    if _device_dense_single_ring_width(polygon_buf, row_count) is not None:
+        return True
     if int(polygon_buf.geometry_offsets.size) != row_count + 1:
         return False
     geom_counts = polygon_buf.geometry_offsets[1:] - polygon_buf.geometry_offsets[:-1]
-    if not bool(cp.all(geom_counts == 1).item()):
+    if not _polygon_rect_bool_scalar(
+        cp.all(geom_counts == 1),
+        reason="polygon-rectangle dense single-ring scalar fence",
+    ):
         return False
-    if bool(cp.any(polygon_buf.empty_mask).item()):
+    if _polygon_rect_bool_scalar(
+        cp.any(polygon_buf.empty_mask),
+        reason="polygon-rectangle empty-mask scalar fence",
+    ):
         return False
     return True
 
 
 def _device_rectangle_bounds(polygon_buf, row_count: int):
-    if not _device_is_dense_single_ring_polygons(polygon_buf, row_count):
-        return None
-    if int(polygon_buf.ring_offsets.size) != row_count + 1:
-        return None
-    expected_offsets = cp.arange(0, (row_count + 1) * 5, 5, dtype=cp.int32)
-    if not bool(cp.all(polygon_buf.ring_offsets == expected_offsets).item()):
-        return None
+    dense_width = _device_dense_single_ring_width(polygon_buf, row_count)
+    if dense_width is not None:
+        if dense_width != 5:
+            return None
+    else:
+        if not _device_is_dense_single_ring_polygons(polygon_buf, row_count):
+            return None
+        if polygon_buf.ring_offsets is None or int(polygon_buf.ring_offsets.size) != row_count + 1:
+            return None
+        expected_offsets = cp.arange(0, (row_count + 1) * 5, 5, dtype=cp.int32)
+        if not _polygon_rect_bool_scalar(
+            cp.all(polygon_buf.ring_offsets == expected_offsets),
+            reason="polygon-rectangle ring-offset scalar fence",
+        ):
+            return None
     if int(polygon_buf.x.size) != row_count * 5 or int(polygon_buf.y.size) != row_count * 5:
         return None
 
     x = polygon_buf.x.reshape(row_count, 5)
     y = polygon_buf.y.reshape(row_count, 5)
-    if not bool(cp.all(cp.isclose(x[:, 0], x[:, 4])).item()):
+    if not _polygon_rect_bool_scalar(
+        cp.all(cp.isclose(x[:, 0], x[:, 4])),
+        reason="polygon-rectangle x-closure scalar fence",
+    ):
         return None
-    if not bool(cp.all(cp.isclose(y[:, 0], y[:, 4])).item()):
+    if not _polygon_rect_bool_scalar(
+        cp.all(cp.isclose(y[:, 0], y[:, 4])),
+        reason="polygon-rectangle y-closure scalar fence",
+    ):
         return None
 
     dx = x[:, 1:] - x[:, :-1]
     dy = y[:, 1:] - y[:, :-1]
     axis_aligned = ((cp.abs(dx) < 1e-12) ^ (cp.abs(dy) < 1e-12))
-    if not bool(cp.all(axis_aligned).item()):
+    if not _polygon_rect_bool_scalar(
+        cp.all(axis_aligned),
+        reason="polygon-rectangle axis-aligned scalar fence",
+    ):
         return None
 
     return (
@@ -1224,11 +1284,19 @@ def polygon_rect_split_boundary_components(
 
     # This is a narrow exact replacement for disconnected rect-clip rows. If a
     # row does not split into multiple components, leave it to generic repair.
-    if bool(cp.any(d_component_counts < 2).item()):
+    if _polygon_rect_bool_scalar(
+        cp.any(d_component_counts < 2),
+        reason="polygon-rectangle split-component admission scalar fence",
+    ):
         return None
 
     d_geometry_offsets = exclusive_sum(d_component_counts, synchronize=False)
-    total_parts = count_scatter_total(runtime, d_component_counts, d_geometry_offsets)
+    total_parts = count_scatter_total(
+        runtime,
+        d_component_counts,
+        d_geometry_offsets,
+        reason="polygon-rectangle split-component allocation fence",
+    )
     if total_parts <= 0:
         return None
 
@@ -1392,6 +1460,9 @@ def _host_max_input_vertices(polygon_buf, row_count: int) -> int | None:
 def _device_max_input_vertices(polygon_buf, row_count: int) -> int | None:
     if polygon_buf is None or polygon_buf.ring_offsets is None:
         return None
+    dense_width = _device_dense_single_ring_width(polygon_buf, row_count)
+    if dense_width is not None:
+        return dense_width
     if int(polygon_buf.ring_offsets.size) != row_count + 1:
         return None
     ring_spans = polygon_buf.ring_offsets[1:] - polygon_buf.ring_offsets[:-1]
@@ -1399,7 +1470,10 @@ def _device_max_input_vertices(polygon_buf, row_count: int) -> int | None:
         return None
     if int(ring_spans.size) == 0:
         return 0
-    return int(cp.max(ring_spans).item())
+    return _polygon_rect_int_scalar(
+        cp.max(ring_spans),
+        reason="polygon-rectangle max-input-vertices scalar fence",
+    )
 
 
 def polygon_rect_intersection_can_handle(
@@ -1547,7 +1621,12 @@ def _polygon_rect_intersection_gpu(
     )
 
     d_offsets = exclusive_sum(d_counts, synchronize=False)
-    total_verts = count_scatter_total(runtime, d_counts, d_offsets)
+    total_verts = count_scatter_total(
+        runtime,
+        d_counts,
+        d_offsets,
+        reason="polygon-rectangle intersection vertex allocation fence",
+    )
     if total_verts == 0:
         return _build_empty_result(n, runtime_selection)
 

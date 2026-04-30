@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
 
 from vibespatial import (
     ExecutionMode,
@@ -14,6 +17,62 @@ from vibespatial import (
     summarize_exact_local_events,
 )
 from vibespatial.runtime.hotpath_trace import reset_hotpath_trace, summarize_hotpath_trace
+from vibespatial.runtime.residency import Residency
+
+
+def test_segment_primitives_d2h_exports_are_runtime_accounted() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "src" / "vibespatial" / "spatial" / "segment_primitives.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    unnamed_runtime_exports: list[str] = []
+    raw_cupy_exports: list[str] = []
+    raw_scalar_syncs: list[str] = []
+    cupy_reductions = {
+        "all",
+        "any",
+        "sum",
+        "count_nonzero",
+        "max",
+        "min",
+        "nanmax",
+        "nanmin",
+    }
+
+    def _contains_cupy_reduction(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == "cp"
+            and child.func.attr in cupy_reductions
+            for child in ast.walk(node)
+        )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            if func.attr == "copy_device_to_host" and not any(
+                keyword.arg == "reason" for keyword in node.keywords
+            ):
+                unnamed_runtime_exports.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+            if func.attr == "asnumpy":
+                raw_cupy_exports.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+            if func.attr == "item":
+                raw_scalar_syncs.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+            continue
+        if (
+            isinstance(func, ast.Name)
+            and func.id in {"bool", "int", "float"}
+            and node.args
+            and _contains_cupy_reduction(node.args[0])
+        ):
+            raw_scalar_syncs.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+
+    assert unnamed_runtime_exports == []
+    assert raw_cupy_exports == []
+    assert raw_scalar_syncs == []
 
 
 def test_extract_segments_reads_owned_buffers_without_materialization() -> None:
@@ -28,6 +87,122 @@ def test_extract_segments_reads_owned_buffers_without_materialization() -> None:
 
     assert segments.count == 5
     assert all(event.kind.value != "materialization" for event in owned.diagnostics)
+
+
+@pytest.mark.gpu
+def test_extract_segments_gpu_uses_host_structural_totals() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.spatial.segment_primitives import _extract_segments_gpu
+
+    owned = from_shapely_geometries(
+        [
+            LineString([(0, 0), (1, 0), (1, 1)]),
+            Polygon(
+                [(10, 0), (16, 0), (16, 6), (10, 6), (10, 0)],
+                [[(11, 1), (12, 1), (12, 2), (11, 1)]],
+            ),
+            MultiLineString([[(20, 0), (21, 0)], [(22, 0), (22, 2)]]),
+            MultiPolygon([Polygon([(30, 0), (33, 0), (33, 3), (30, 0)])]),
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    segments = _extract_segments_gpu(owned)
+    events = get_d2h_transfer_events(clear=True)
+
+    assert segments.count > 0
+    assert [
+        event.reason
+        for event in events
+        if event.reason == "segment extraction total-segments allocation fence"
+    ] == []
+
+
+@pytest.mark.gpu
+def test_extract_segments_gpu_batches_device_only_family_total_fences() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.spatial.segment_primitives import _extract_segments_gpu
+
+    owned = from_shapely_geometries(
+        [
+            LineString([(0, 0), (1, 0), (1, 1)]),
+            Polygon(
+                [(10, 0), (16, 0), (16, 6), (10, 6), (10, 0)],
+                [[(11, 1), (12, 1), (12, 2), (11, 1)]],
+            ),
+            MultiLineString([[(20, 0), (21, 0)], [(22, 0), (22, 2)]]),
+            MultiPolygon([Polygon([(30, 0), (33, 0), (33, 3), (30, 0)])]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    device_only = owned.device_take(cp.arange(owned.row_count, dtype=cp.int64))
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    segments = _extract_segments_gpu(device_only)
+    events = get_d2h_transfer_events(clear=True)
+
+    assert segments.count > 0
+    assert [
+        event.reason
+        for event in events
+        if event.reason == "segment extraction total-segments allocation fence"
+    ] == ["segment extraction total-segments allocation fence"]
+
+
+@pytest.mark.gpu
+def test_extract_segments_gpu_uses_device_structural_totals_for_nested_families() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.spatial.segment_primitives import _extract_segments_gpu
+
+    owned = from_shapely_geometries(
+        [
+            Polygon(
+                [(0, 0), (6, 0), (6, 6), (0, 6), (0, 0)],
+                [[(1, 1), (2, 1), (2, 2), (1, 1)]],
+            ),
+            MultiPolygon(
+                [
+                    Polygon([(10, 0), (13, 0), (13, 3), (10, 0)]),
+                    Polygon([(20, 0), (24, 0), (24, 4), (20, 0)]),
+                ]
+            ),
+        ],
+        residency=Residency.DEVICE,
+    )
+    device_only = owned.device_take(cp.arange(owned.row_count, dtype=cp.int64))
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    segments = _extract_segments_gpu(device_only)
+    events = get_d2h_transfer_events(clear=True)
+
+    assert segments.count == 13
+    assert [
+        event.reason
+        for event in events
+        if event.reason == "segment extraction total-segments allocation fence"
+    ] == []
 
 
 def test_segment_primitives_classify_proper_cross() -> None:
@@ -140,6 +315,92 @@ def test_segment_primitives_explicit_gpu_request_matches_cpu_for_ambiguous_rows(
 
 
 @pytest.mark.gpu
+def test_segment_candidate_bounded_capacity_avoids_total_fence() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    left = from_shapely_geometries(
+        [
+            LineString([(0, 0), (4, 4)]),
+            LineString([(10, 0), (14, 4)]),
+            LineString([(20, 0), (24, 4)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    right = from_shapely_geometries(
+        [
+            LineString([(0, 4), (4, 0)]),
+            LineString([(10, 4), (14, 0)]),
+            LineString([(20, 4), (24, 0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    result = classify_segment_intersections(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    events = get_d2h_transfer_events(clear=True)
+
+    assert result.kind_names() == ["proper", "proper", "proper"]
+    assert [
+        event.reason
+        for event in events
+        if event.reason == "segment candidate total allocation fence"
+    ] == []
+
+
+@pytest.mark.gpu
+def test_segment_candidate_large_capacity_batches_avoid_total_fence() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    row_count = 1025
+    left = from_shapely_geometries(
+        [
+            LineString([(float(row) * 10.0, 0.0), (float(row) * 10.0 + 1.0, 1.0)])
+            for row in range(row_count)
+        ],
+        residency=Residency.DEVICE,
+    )
+    right = from_shapely_geometries(
+        [
+            LineString([(float(row) * 10.0, 1.0), (float(row) * 10.0 + 1.0, 0.0)])
+            for row in range(row_count)
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    result = classify_segment_intersections(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    events = get_d2h_transfer_events(clear=True)
+
+    assert result.count == row_count
+    assert set(result.kind_names()) == {"proper"}
+    assert [
+        event.reason
+        for event in events
+        if event.reason == "segment candidate total allocation fence"
+    ] == []
+
+
+@pytest.mark.gpu
 def test_segment_primitives_same_row_gpu_fast_path_skips_binary_search(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -178,6 +439,50 @@ def test_segment_primitives_same_row_gpu_fast_path_skips_binary_search(
     summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
     assert summary.get("segment.candidates.same_row_fast_path") == 1
     assert "segment.candidates.binary_search" not in summary
+
+
+@pytest.mark.gpu
+def test_segment_same_row_candidate_bounded_capacity_avoids_total_fence() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    left = from_shapely_geometries(
+        [
+            LineString([(0, 0), (3, 3)]),
+            LineString([(10, 0), (13, 3)]),
+            LineString([(20, 0), (23, 3)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    right = from_shapely_geometries(
+        [
+            LineString([(0, 3), (3, 0)]),
+            LineString([(10, 3), (13, 0)]),
+            LineString([(20, 3), (23, 0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    result = classify_segment_intersections(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _require_same_row=True,
+    )
+    events = get_d2h_transfer_events(clear=True)
+
+    assert result.kind_names() == ["proper", "proper", "proper"]
+    assert [
+        event.reason
+        for event in events
+        if event.reason == "segment same-row candidate total allocation fence"
+    ] == []
 
 
 @pytest.mark.gpu

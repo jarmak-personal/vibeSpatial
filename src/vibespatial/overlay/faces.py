@@ -28,6 +28,7 @@ from vibespatial.runtime.config import SPATIAL_EPSILON
 from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
 from vibespatial.spatial.segment_primitives import SegmentIntersectionResult
 
+from ._host_boundary import overlay_device_to_host
 from .types import (
     AtomicEdgeTable,
     HalfEdgeGraph,
@@ -356,21 +357,48 @@ def _select_overlay_face_indices_gpu(
     return cp.flatnonzero(d_mask).astype(cp.int32)
 
 
+def _selected_face_indices_to_host(d_selected_face_indices: cp.ndarray) -> np.ndarray:
+    """Export selected faces only at the admitted CPU face-assembly boundary."""
+    from vibespatial.runtime.materialization import (
+        MaterializationBoundary,
+        record_materialization_event,
+    )
+
+    item_count = int(getattr(d_selected_face_indices, "size", len(d_selected_face_indices)))
+    itemsize = int(getattr(getattr(d_selected_face_indices, "dtype", None), "itemsize", 0))
+    record_materialization_event(
+        surface="vibespatial.overlay.faces._assemble_faces_from_device_indices",
+        boundary=MaterializationBoundary.INTERNAL_HOST_CONVERSION,
+        operation="selected_face_indices_to_host",
+        reason="device selected overlay face indices were materialized for CPU face assembly",
+        detail=f"faces={item_count}, bytes={item_count * itemsize}",
+        d2h_transfer=True,
+        strict_disallowed=False,
+    )
+    return overlay_device_to_host(
+        d_selected_face_indices,
+        reason=(
+            "vibespatial.overlay.faces._assemble_faces_from_device_indices"
+            "::selected_face_indices_to_host"
+        ),
+        dtype=np.int64,
+    )
+
+
 def _assemble_faces_from_device_indices(
     half_edge_graph: HalfEdgeGraph,
     faces: OverlayFaceTable,
     d_selected_face_indices: cp.ndarray,
 ) -> OwnedGeometryArray:
-    """Try CPU face assembly first, fall back to GPU.
+    """Assemble selected overlay faces with device assembly as the primary path.
 
     Accepts device-resident (CuPy) face indices from
-    ``_select_overlay_face_indices_gpu`` and handles the D->H conversion
-    only for the CPU assembly path.  GPU assembly receives the CuPy array
-    directly (zero-copy).
+    ``_select_overlay_face_indices_gpu``. The physical shape is dynamic-output
+    polygon assembly: selected face rows, half-edge topology, rings, output
+    rows, and output bytes stay device-shaped until an explicit CPU fallback.
 
-    The CPU-first ordering is intentional: CPU face boundary walking is
-    faster for most cases.  GPU assembly handles the "spans multiple
-    source rows" edge case (ADR-0016 Stage 8).
+    The host bridge is now only the fallback/export boundary for cases where
+    device assembly is unavailable, rather than the default execution shape.
     """
     from vibespatial.overlay.assemble import (
         _build_polygon_output_from_faces_gpu,
@@ -381,15 +409,15 @@ def _assemble_faces_from_device_indices(
     if d_selected_face_indices.size == 0:
         return _empty_polygon_output(faces.runtime_selection)
     try:
-        selected_face_indices = cp.asnumpy(d_selected_face_indices)  # hygiene:ok(CPU assembly path requires host indices)
-        return _build_polygon_output_from_faces(half_edge_graph, faces, selected_face_indices)
-    except RuntimeError:
         result = _build_polygon_output_from_faces_gpu(
             half_edge_graph, faces, d_selected_face_indices,
         )
-        if result is None:
-            raise
-        return result
+        if result is not None:
+            return result
+    except RuntimeError:
+        pass
+    selected_face_indices = _selected_face_indices_to_host(d_selected_face_indices)
+    return _build_polygon_output_from_faces(half_edge_graph, faces, selected_face_indices)
 
 
 def build_gpu_overlay_faces(

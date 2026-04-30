@@ -5,7 +5,7 @@ Scope: Grouped dissolve pipeline staging, segmented union, and attribute aggrega
 Read If: You are changing dissolve, grouped union, or segmented attribute aggregation.
 STOP IF: Your task already has the dissolve pipeline open and only needs local implementation detail.
 Source Of Truth: Dissolve pipeline architecture for grouped constructive work.
-Body Budget: 86/220 lines
+Body Budget: 101/220 lines
 Document: docs/architecture/dissolve.md
 
 Section Map (Body Lines)
@@ -19,7 +19,7 @@ Section Map (Body Lines)
 | 29-34 | Risks |
 | 35-44 | Decision |
 | 45-53 | Pipeline |
-| 54-86 | Performance Notes |
+| 54-101 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent
@@ -78,8 +78,16 @@ iteration.
 - Sorting and group-span discovery are reusable across attribute and geometry
   work, which keeps the eventual GPU path coherent.
 - Numeric and bool `sum`/`count`/`mean`/`min`/`max`/`first`/`last` reducers may consume
-  `NativeGrouped` directly for admitted single-key shapes, including categorical keys with
-  explicit null-group handling.
+  `NativeGrouped` directly for admitted single-key shapes, including
+  categorical keys, ordinary nullable string/object/numeric single keys,
+  scalar object multi-key groups, categorical multi-key groups, and typed
+  nullable multi-key groups with explicit null-group handling.
+- Custom or unhashable object keys are a pandas compatibility policy, not a
+  native grouping contract.
+- Integer, boolean, and categorical device-backed single or multi-keys,
+  including nullable keys with explicit null-group policy, can encode dense
+  `NativeGrouped` row codes on device when the next grouped-geometry consumer
+  can consume device codes directly.
 - Host metadata columns may use `NativeGrouped` `first`/`last` take-reducers
   with pandas-compatible skip-null semantics.
 - `as_index=False` assembly should stay a native export-boundary concern:
@@ -90,6 +98,9 @@ iteration.
 - Many small polygon groups should still batch when enough groups need real
   reduction. The reusable shape is `OwnedGeometryArray + dense group offsets ->
   grouped constructive result`; public `dissolve` is only the first consumer.
+- Sparse grouped coverage and disjoint-subset reducers must assemble unobserved
+  groups by scattering observed owned reductions into device empty-polygon rows;
+  a host object array is only a compatibility fallback for host-resident rows.
 - `o18.x` is allowed to route polygon coverage dissolve groups into a shared-edge
   elimination fast path: cancel duplicate undirected edges inside each group,
   reconstruct grouped boundary linework in bulk, and build the final coverage
@@ -106,3 +117,7 @@ iteration.
 - `o17.9.6.5` is allowed to route axis-aligned rectangle coverages into a
   dedicated grouped GPU union fast path when that workload can be reduced to
   per-group bounds aggregation without reopening generic union topology work.
+- Large regular-grid rectangle coverages may route to grouped disjoint
+  MultiPolygon assembly when a device-side grid-neighbor check proves no
+  same-group cells touch. This is a conservative coverage/disjoint-subset
+  reducer, not a generic topology union.

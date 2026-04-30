@@ -8,7 +8,6 @@ os.environ["_VIBESPATIAL_GEOPANDAS_COMPAT"] = "1"
 
 import geopandas
 import pytest
-import shapely
 
 from tests.upstream.geopandas.tests.util import (
     _NATURALEARTH_CITIES,
@@ -23,34 +22,9 @@ collect_ignore_glob = [
     "tools/tests/test_sjoin.py",
 ]
 
-_GEOS_313_OVERLAY_FIXTURE_NODEIDS = {
-    "tests/upstream/geopandas/tests/test_overlay.py::test_overlay_nybb[union]",
-    "tests/upstream/geopandas/tests/test_overlay.py::test_overlay_nybb[intersection]",
-    "tests/upstream/geopandas/tests/test_overlay.py::test_overlay_nybb[symmetric_difference]",
-    "tests/upstream/geopandas/tests/test_overlay.py::test_overlay_nybb[identity]",
-}
-
-
 @pytest.fixture(autouse=True)
 def add_geopandas(doctest_namespace):
     doctest_namespace["geopandas"] = geopandas
-
-
-def pytest_collection_modifyitems(
-    config: pytest.Config, items: list[pytest.Item]
-) -> None:
-    if shapely.geos_version < (3, 13, 0):
-        return
-
-    marker = pytest.mark.xfail(
-        reason=(
-            "GEOS 3.13 overlay exact areas diverge from the saved QGIS nybb "
-            "fixtures; raw Shapely overlay matches vibeSpatial on this stack."
-        )
-    )
-    for item in items:
-        if item.nodeid in _GEOS_313_OVERLAY_FIXTURE_NODEIDS:
-            item.add_marker(marker)
 
 
 # Datasets used in our tests

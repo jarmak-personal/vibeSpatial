@@ -403,7 +403,12 @@ def _brute_force_multi(
         d_offsets = exclusive_sum(d_counts)
 
         total_pairs = (
-            count_scatter_total(runtime, d_counts, d_offsets)
+            count_scatter_total(
+                runtime,
+                d_counts,
+                d_offsets,
+                reason="device spatial-index candidate-pair allocation fence",
+            )
             if query_count > 0
             else 0
         )
@@ -605,7 +610,12 @@ def _morton_range_query(
         d_offsets = exclusive_sum(d_counts)
 
         total_pairs = (
-            count_scatter_total(runtime, d_counts, d_offsets)
+            count_scatter_total(
+                runtime,
+                d_counts,
+                d_offsets,
+                reason="device spatial-index refined-pair allocation fence",
+            )
             if query_count > 0
             else 0
         )

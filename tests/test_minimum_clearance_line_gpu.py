@@ -9,6 +9,9 @@ degenerate cases (points, too few segments).
 
 from __future__ import annotations
 
+import ast
+import inspect
+
 import numpy as np
 import pytest
 import shapely
@@ -39,6 +42,20 @@ def _has_gpu() -> bool:
 
 
 requires_gpu = pytest.mark.skipif(not _has_gpu(), reason="GPU not available")
+
+
+def test_minimum_clearance_gpu_path_has_no_raw_scalar_item_syncs():
+    import vibespatial.constructive.minimum_clearance as module
+
+    tree = ast.parse(inspect.getsource(module))
+    raw_item_calls = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "item"
+    ]
+    assert raw_item_calls == []
 
 
 def _assert_clearance_line_match(gpu_result, cpu_result, rtol=1e-10, atol=1e-12):
@@ -334,3 +351,27 @@ def test_minimum_clearance_line_stays_device_resident(strict_device_guard):
     assert result._validity is None
     assert result._tags is None
     assert result._family_row_offsets is None
+
+
+@requires_gpu
+def test_minimum_clearance_line_output_assembly_avoids_runtime_d2h():
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers, reset_d2h_transfer_count
+    from vibespatial.runtime.residency import Residency
+
+    owned = from_shapely_geometries(
+        [
+            LineString([(0, 0), (10, 0), (10, 0.5), (0, 0.5)]),
+            Point(1, 2),
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    reset_d2h_transfer_count()
+    with assert_zero_d2h_transfers():
+        result = minimum_clearance_line_owned(owned, dispatch_mode="gpu")
+
+    assert result.residency is Residency.DEVICE
+    assert result._validity is None
+    assert result._tags is None
+    assert result._family_row_offsets is None
+    reset_d2h_transfer_count()

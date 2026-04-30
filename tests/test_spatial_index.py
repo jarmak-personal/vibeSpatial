@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
 from shapely.geometry import Point, Polygon, box
@@ -11,6 +14,38 @@ from vibespatial import (
     from_shapely_geometries,
     has_gpu_runtime,
 )
+
+
+def test_native_spatial_index_d2h_exports_are_runtime_accounted() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    paths = (
+        repo_root / "src" / "vibespatial" / "spatial" / "indexing.py",
+        repo_root / "src" / "vibespatial" / "spatial" / "query_types.py",
+    )
+    unnamed_runtime_exports: list[str] = []
+    raw_cupy_exports: list[str] = []
+
+    for path in paths:
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr == "copy_device_to_host" and not any(
+                keyword.arg == "reason" for keyword in node.keywords
+            ):
+                unnamed_runtime_exports.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+            if (
+                func.attr == "asnumpy"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "cp"
+            ):
+                raw_cupy_exports.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+
+    assert unnamed_runtime_exports == []
+    assert raw_cupy_exports == []
 
 
 def test_build_flat_spatial_index_sorts_by_morton_key() -> None:
@@ -84,6 +119,48 @@ def test_build_flat_spatial_index_gpu_matches_cpu_order() -> None:
 
     assert gpu.morton_keys.tolist() == cpu.morton_keys.tolist()
     assert gpu.order.tolist() == cpu.order.tolist()
+
+
+@pytest.mark.gpu
+def test_build_flat_spatial_index_device_mixed_bounds_stay_device_resident() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from shapely.geometry import LineString
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.runtime.residency import Residency
+
+    owned = from_shapely_geometries(
+        [
+            Point(2, 2),
+            LineString([(0, 0), (1, 1)]),
+            box(5, 5, 7, 8),
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    reset_d2h_transfer_count()
+    index = build_flat_spatial_index(
+        owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.AUTO,
+            selected=ExecutionMode.GPU,
+            reason="gpu morton sort",
+        ),
+    )
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert index._host_bounds is None
+    assert index.device_bounds is not None
+    assert index.device_order is not None
+    assert index.total_bounds == (0.0, 0.0, 7.0, 8.0)
+    assert "geometry analysis mixed row-bounds host export" not in reasons
+    assert "geometry analysis cached row-bounds host export" not in reasons
+    assert reasons == ["flat spatial index device total-bounds scalar fence"]
 
 
 @pytest.mark.gpu
@@ -164,11 +241,14 @@ def test_build_flat_spatial_index_detects_regular_grid_from_device_polygon_stubs
     )
 
     hydrated = owned.families[polygon_family]
+    device_structure = owned.device_state.families[polygon_family]
     assert index.regular_grid is not None
     assert index.regular_grid.cols == 2
     assert index.regular_grid.rows == 2
     assert hydrated.host_materialized is False
     assert hydrated.x.size == 0
     assert hydrated.y.size == 0
-    np.testing.assert_array_equal(hydrated.geometry_offsets, geometry_offsets)
-    np.testing.assert_array_equal(hydrated.ring_offsets, ring_offsets)
+    assert hydrated.geometry_offsets.size == 0
+    assert hydrated.ring_offsets is None
+    assert device_structure.geometry_offsets.size == geometry_offsets.size
+    assert device_structure.ring_offsets.size == ring_offsets.size

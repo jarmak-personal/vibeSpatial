@@ -7,6 +7,9 @@ combinations.
 
 from __future__ import annotations
 
+import ast
+import inspect
+
 import numpy as np
 import pytest
 import shapely
@@ -25,6 +28,20 @@ from vibespatial.runtime.residency import Residency
 requires_gpu = pytest.mark.skipif(
     not has_gpu_runtime(), reason="GPU not available",
 )
+
+
+def test_shortest_line_gpu_path_has_no_raw_scalar_item_syncs():
+    import vibespatial.constructive.shortest_line as module
+
+    tree = ast.parse(inspect.getsource(module))
+    raw_item_calls = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "item"
+    ]
+    assert raw_item_calls == []
 
 
 def _assert_shortest_line_matches(gpu_result, left_geoms, right_geoms, rtol=1e-10):
@@ -105,6 +122,31 @@ def test_shortest_line_gpu_subgroup_writes_do_not_force_runtime_sync(monkeypatch
 
     assert result.device_state is not None
     assert result.row_count == 2
+
+
+@requires_gpu
+def test_shortest_line_output_assembly_avoids_runtime_d2h():
+    from vibespatial.constructive.shortest_line import shortest_line_owned
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers, reset_d2h_transfer_count
+
+    left = from_shapely_geometries(
+        [Point(0, 0), None, Point(1, 1)],
+        residency=Residency.DEVICE,
+    )
+    right = from_shapely_geometries(
+        [Point(3, 4), Point(1, 1), Point(4, 5)],
+        residency=Residency.DEVICE,
+    )
+
+    reset_d2h_transfer_count()
+    with assert_zero_d2h_transfers():
+        result = shortest_line_owned(left, right, dispatch_mode="gpu")
+
+    assert result.residency is Residency.DEVICE
+    assert result._validity is None
+    assert result._tags is None
+    assert result._family_row_offsets is None
+    reset_d2h_transfer_count()
 
 
 @requires_gpu

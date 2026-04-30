@@ -1,22 +1,42 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
-import select
+import signal
 import subprocess
 import sys
-import time
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from vibespatial import STRICT_NATIVE_ENV_VAR
-
 DEFAULT_TARGETS = ("tests/upstream/geopandas",)
 DEFAULT_GROUP_NAMES = ("tests", "io", "tools")
 PYTEST_WORKERS_ENV_VAR = "VIBESPATIAL_GPU_COVERAGE_WORKERS"
+STRICT_NATIVE_ENV_VAR = "VIBESPATIAL_STRICT_NATIVE"
+
+
+class _InProcessCoverageTimeout(BaseException):
+    pass
+
+
+class _TeeTextIO(io.StringIO):
+    def __init__(self, stream):
+        super().__init__()
+        self._stream = stream
+
+    def write(self, text: str) -> int:
+        written = super().write(text)
+        self._stream.write(text)
+        self._stream.flush()
+        return written
+
+    def flush(self) -> None:
+        super().flush()
+        self._stream.flush()
 
 
 @dataclass(frozen=True)
@@ -81,11 +101,32 @@ def compute_native_pass_rates(counts: dict[str, int]) -> tuple[float, float]:
     return native_pass_rate, suite_pass_rate
 
 
+def normalize_pytest_returncode(returncode: int, counts: dict[str, int]) -> int:
+    """Treat optional-dependency all-skip files as successful coverage groups."""
+    if returncode == 5 and counts["failed"] == 0 and counts["xpassed"] == 0:
+        return 0
+    return returncode
+
+
 def pytest_worker_args() -> list[str]:
     workers = os.environ.get(PYTEST_WORKERS_ENV_VAR, "").strip()
     if not workers or workers in {"0", "1", "false", "False", "none", "None"}:
         return []
     return ["-n", workers]
+
+
+def pytest_command(targets: tuple[str, ...]) -> list[str]:
+    """Build the pytest command without nesting uv inside uv-run coverage."""
+    return [sys.executable, "-m", "pytest", "-q", *pytest_worker_args(), *targets]
+
+
+def ensure_strict_native_process_env() -> None:
+    if os.environ.get(STRICT_NATIVE_ENV_VAR) == "1":
+        return
+    raise SystemExit(
+        f"{STRICT_NATIVE_ENV_VAR}=1 must be set before launching native coverage. "
+        f"Use: {STRICT_NATIVE_ENV_VAR}=1 uv run python scripts/upstream_native_coverage.py"
+    )
 
 
 def discover_group_targets(
@@ -115,7 +156,8 @@ def discover_group_targets(
                 if candidate.is_dir():
                     group_paths.append(str(candidate.relative_to(cwd)))
             if group_paths:
-                grouped[target] = tuple(group_paths)
+                for group_path in group_paths:
+                    grouped[group_path] = (group_path,)
                 continue
         grouped[target] = (target,)
     return grouped
@@ -135,70 +177,68 @@ def _run_command_capture(
     label: str,
     heartbeat_seconds: int,
 ) -> subprocess.CompletedProcess[str]:
-    if not progress:
-        return subprocess.run(
-            command,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            env=env,
-        )
+    _ = heartbeat_seconds
+    pytest_args = command[3:] if command[1:3] == ["-m", "pytest"] else command
+    output_buffer = _TeeTextIO(sys.stderr) if progress else io.StringIO()
+    old_cwd = Path.cwd()
+    old_env = os.environ.copy()
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, timeout)
 
-    _emit_progress(f"START {label}: {' '.join(command)}")
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=env,
-    )
-    assert process.stdout is not None
-    fd = process.stdout.fileno()
-    chunks: list[bytes] = []
-    start = time.monotonic()
-    last_heartbeat = start
+    def _timeout_handler(_signum, _frame):
+        raise _InProcessCoverageTimeout
 
-    while True:
-        now = time.monotonic()
-        if now - start > timeout:
-            process.kill()
-            remaining, _ = process.communicate()
-            if remaining:
-                chunks.append(remaining)
-                sys.stderr.buffer.write(remaining)
-                sys.stderr.flush()
-            raise subprocess.TimeoutExpired(
-                command,
-                timeout,
-                output=b"".join(chunks),
-            )
+    signal.signal(signal.SIGALRM, _timeout_handler)
+    if progress:
+        _emit_progress(f"START {label}: {' '.join(command)}")
+    try:
+        os.chdir(cwd)
+        os.environ.clear()
+        os.environ.update(env)
+        # Set strict-native before importing pytest.  Plugin/conftest import
+        # work can otherwise initialize vibeSpatial before strict mode exists,
+        # which makes GPU-heavy chunks take the wrong cold path.
+        import pytest
 
-        ready, _, _ = select.select([fd], [], [], 1.0)
-        if ready:
-            data = os.read(fd, 4096)
-            if data:
-                chunks.append(data)
-                sys.stderr.buffer.write(data)
-                sys.stderr.flush()
-            elif process.poll() is not None:
-                break
-        elif now - last_heartbeat >= heartbeat_seconds:
-            _emit_progress(f"RUNNING {label}: {int(now - start)}s elapsed")
-            last_heartbeat = now
-            if process.poll() is not None:
-                break
+        with contextlib.redirect_stdout(output_buffer), contextlib.redirect_stderr(output_buffer):
+            returncode = int(pytest.main(pytest_args))
+    except _InProcessCoverageTimeout as exc:
+        output = output_buffer.getvalue()
+        raise subprocess.TimeoutExpired(command, timeout, output=output) from exc
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
+        signal.signal(signal.SIGALRM, previous_handler)
+        os.environ.clear()
+        os.environ.update(old_env)
+        os.chdir(old_cwd)
 
-    returncode = process.wait()
-    output = b"".join(chunks).decode("utf-8", errors="replace")
-    _emit_progress(f"END {label}: returncode={returncode}")
+    output = output_buffer.getvalue()
+    if progress:
+        _emit_progress(f"END {label}: returncode={returncode}")
     return subprocess.CompletedProcess(
         command,
         returncode,
         stdout=output,
         stderr="",
     )
+
+
+def _timeout_output(exc: subprocess.TimeoutExpired) -> str:
+    output = exc.output or b""
+    stderr = exc.stderr or b""
+    if isinstance(output, bytes):
+        output_text = output.decode("utf-8", errors="replace")
+    else:
+        output_text = str(output)
+    if isinstance(stderr, bytes):
+        stderr_text = stderr.decode("utf-8", errors="replace")
+    else:
+        stderr_text = str(stderr)
+    return output_text + "\n" + stderr_text
+
+
+def _timeout_failure_label(targets: tuple[str, ...], timeout: int) -> str:
+    return f"TIMEOUT after {timeout}s: {', '.join(targets)}"
 
 
 def run_native_coverage(
@@ -209,20 +249,35 @@ def run_native_coverage(
     progress: bool = True,
     heartbeat_seconds: int = 30,
 ) -> NativeCoverageReport:
-    command = ["uv", "run", "pytest", "-q", *pytest_worker_args(), *targets]
+    command = pytest_command(targets)
     env = dict(os.environ)
     env[STRICT_NATIVE_ENV_VAR] = "1"
-    completed = _run_command_capture(
-        command,
-        cwd=cwd,
-        timeout=timeout,
-        env=env,
-        progress=progress,
-        label=", ".join(targets),
-        heartbeat_seconds=heartbeat_seconds,
-    )
+    timed_out = False
+    try:
+        completed = _run_command_capture(
+            command,
+            cwd=cwd,
+            timeout=timeout,
+            env=env,
+            progress=progress,
+            label=", ".join(targets),
+            heartbeat_seconds=heartbeat_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        completed = subprocess.CompletedProcess(
+            command,
+            124,
+            stdout=_timeout_output(exc),
+            stderr=f"timeout after {timeout}s",
+        )
     combined_output = completed.stdout + "\n" + completed.stderr
     counts, failing_tests = parse_pytest_summary(combined_output)
+    if timed_out:
+        failing_tests = failing_tests + (_timeout_failure_label(targets, timeout),)
+        returncode = 124
+    else:
+        returncode = normalize_pytest_returncode(completed.returncode, counts)
     native_pass_rate, suite_pass_rate = compute_native_pass_rates(counts)
     return NativeCoverageReport(
         command=" ".join(command),
@@ -232,7 +287,7 @@ def run_native_coverage(
         native_pass_rate_percent=native_pass_rate,
         suite_pass_rate_percent=suite_pass_rate,
         failing_tests=failing_tests,
-        returncode=completed.returncode,
+        returncode=returncode,
     )
 
 
@@ -299,6 +354,7 @@ def print_grouped_human_summary(report: GroupedNativeCoverageReport) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    ensure_strict_native_process_env()
     parser = argparse.ArgumentParser(
         description="Measure vendored GeoPandas upstream test coverage under strict native mode."
     )

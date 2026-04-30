@@ -40,6 +40,10 @@ from vibespatial.spatial.segment_primitives import (  # noqa: E402
     _extract_segments_gpu,
 )
 
+from ._host_boundary import (  # noqa: E402
+    overlay_device_to_host,
+    overlay_int_scalar,
+)
 from .types import (  # noqa: E402, F401  # Re-exported for backward compatibility
     AtomicEdgeDeviceState,
     AtomicEdgeTable,
@@ -208,6 +212,29 @@ def _containment_bypass_kernels():
 def _require_gpu_arrays() -> None:
     if cp is None:
         raise RuntimeError("CuPy is required for overlay split GPU primitives")
+
+
+def _filter_non_empty_owned_device(result_owned: OwnedGeometryArray) -> OwnedGeometryArray | None:
+    """Filter null/empty overlay rows without materializing owned metadata on host.
+
+    Physical shape: device rowset view over row-aligned owned geometry metadata.
+    The filter consumes device validity, family tags, family row offsets, and
+    per-family empty masks, then returns a device-resident indexed view.  This
+    preserves row flow without paying variable-width coordinate compaction
+    fences before a consumer actually needs contiguous output buffers.
+    """
+    if cp is None or result_owned.device_state is None:
+        return None
+    d_state = result_owned.device_state
+    d_non_empty = cp.asarray(d_state.validity, dtype=cp.bool_).copy()
+    for family, device_buffer in d_state.families.items():
+        d_family_rows = (d_state.tags == np.int8(FAMILY_TAGS[family])) & d_state.validity
+        if int(device_buffer.empty_mask.size) == 0:
+            continue
+        d_family_offsets = d_state.family_row_offsets[d_family_rows]
+        d_non_empty[d_family_rows] &= ~cp.asarray(device_buffer.empty_mask)[d_family_offsets]
+    keep_indices = cp.flatnonzero(d_non_empty).astype(cp.int64, copy=False)
+    return OwnedGeometryArray._indexed_view(result_owned, keep_indices)
 
 
 # Pipeline stages extracted to separate modules.  Re-export for backward
@@ -399,7 +426,11 @@ def _materialize_overlay_execution_plan(
                 pipeline="overlay",
                 d2h_transfer=True,
             )
-            selected_face_indices = cp.asnumpy(d_selected_face_indices)
+            selected_face_indices = overlay_device_to_host(
+                d_selected_face_indices,
+                reason="overlay gpu CPU fallback selected-face indices export",
+                dtype=np.int64,
+            )
             result = _build_polygon_output_from_faces(
                 plan.half_edge_graph, plan.faces, selected_face_indices,
             )
@@ -411,15 +442,28 @@ def _materialize_overlay_execution_plan(
         maybe_trim_pool_memory()
 
 
-def _expand_group_pair_positions(group_starts, group_ends):
-    """Expand grouped pair boundaries into flat sorted-pair positions."""
+def _expand_group_pair_positions(group_starts, group_ends, *, total_count: int | None = None):
+    """Expand grouped pair boundaries into flat sorted-pair positions.
+
+    Physical shape: device grouped-span expansion.  When the caller already
+    knows the selected pair cardinality from a native relation/candidate
+    buffer, pass it as ``total_count`` so allocation does not require a device
+    sum scalar fence.
+    """
     if cp is not None and hasattr(group_starts, "__cuda_array_interface__"):
         d_group_starts = cp.asarray(group_starts, dtype=cp.int64)
         d_group_ends = cp.asarray(group_ends, dtype=cp.int64)
         if int(d_group_starts.size) == 0:
             return cp.empty(0, dtype=cp.int64)
         d_counts = (d_group_ends - d_group_starts).astype(cp.int64, copy=False)
-        total = int(cp.sum(d_counts, dtype=cp.int64).item())
+        total = (
+            int(total_count)
+            if total_count is not None
+            else overlay_int_scalar(
+                cp.sum(d_counts, dtype=cp.int64),
+                reason="overlay grouped pair-position total allocation fence",
+            )
+        )
         if total == 0:
             return cp.empty(0, dtype=cp.int64)
         d_offsets = cp.cumsum(d_counts, dtype=cp.int64) - d_counts
@@ -849,7 +893,15 @@ def spatial_overlay_owned(
                 # rows which are not affected by left filtering.
             else:
                 # CPU path: rebuild grouping.
-                h_remainder_mask = cp.asnumpy(_containment_remainder_mask) if cp is not None else _containment_remainder_mask  # zcopy:ok(CPU-path branch; H2D at 5450 is in device branch — mutually exclusive)
+                h_remainder_mask = (
+                    overlay_device_to_host(
+                        _containment_remainder_mask,
+                        reason="overlay containment CPU regroup remainder-mask export",
+                        dtype=bool,
+                    )
+                    if cp is not None
+                    else _containment_remainder_mask
+                )
                 old_to_new = np.full(len(h_remainder_mask), -1, dtype=np.int64)
                 h_remainder_indices = np.flatnonzero(h_remainder_mask)
                 old_to_new[h_remainder_indices] = np.arange(len(h_remainder_indices), dtype=np.int64)
@@ -1051,7 +1103,11 @@ def spatial_overlay_owned(
             # FIX-09: when pairs are on device, materialise group_starts
             # to host here (single bulk D2H for small metadata).
             if _pairs_on_device:
-                h_group_starts = cp.asnumpy(group_starts)  # zcopy:ok(small metadata for segmented_union_all)
+                h_group_starts = overlay_device_to_host(
+                    group_starts,
+                    reason="overlay grouped-union segmented offsets export",
+                    dtype=np.int64,
+                )
                 n_rsi = int(right_subset_indices.shape[0])
             else:
                 h_group_starts = group_starts  # already host numpy
@@ -1078,7 +1134,11 @@ def spatial_overlay_owned(
             # This keeps per-pair topology isolated without materializing
             # group boundaries to host or iterating group-by-group in Python.
             if _pairs_on_device:
-                d_pair_positions = _expand_group_pair_positions(group_starts, group_ends)
+                d_pair_positions = _expand_group_pair_positions(
+                    group_starts,
+                    group_ends,
+                    total_count=int(right_subset_indices.shape[0]),
+                )
                 if int(d_pair_positions.size) == 0:
                     result_owned = left.take(d_pair_positions)
                 else:
@@ -1193,7 +1253,11 @@ def spatial_overlay_owned(
                 # (containment bypass, SH bypass) operated on device.
                 def _host_group_boundaries(values):
                     if cp is not None and hasattr(values, "__cuda_array_interface__"):
-                        host_values = cp.asnumpy(cp.asarray(values))  # zcopy:ok(small metadata for per-group overlay loop)
+                        host_values = overlay_device_to_host(
+                            cp.asarray(values),
+                            reason="overlay per-group loop boundary metadata export",
+                            dtype=np.int64,
+                        )
                         return np.asarray(host_values, dtype=np.int64).tolist()
                     return np.asarray(values, dtype=np.int64).tolist()
 
@@ -1342,23 +1406,24 @@ def spatial_overlay_owned(
         # leave freed-but-cached blocks in the CuPy pool.
         maybe_trim_pool_memory()
 
-        # Filter empty/null using owned-level metadata (validity + empty_mask)
-        # instead of to_shapely() — avoids D->H->D ping-pong.
-        # binary_constructive_owned returns polygon-family results (no
-        # GeometryCollections), so collection flattening is unnecessary.
-        result_owned._ensure_host_state()
-        non_empty = result_owned.validity.copy()
-        for family, buf in result_owned.families.items():
-            family_rows = (result_owned.tags == FAMILY_TAGS[family])
-            non_empty[family_rows] &= ~buf.empty_mask[
-                result_owned.family_row_offsets[family_rows]
-            ]
-        keep_indices = np.flatnonzero(non_empty)
-        if keep_indices.size == 0:
-            result = from_shapely_geometries([shapely.Point()])
-            result = result.take(np.asarray([], dtype=np.int64))
-        else:
-            result = result_owned.take(keep_indices)
+        # Filter empty/null using device owned metadata when available. This
+        # keeps grouped overlay output in the selected execution family instead
+        # of crossing to host only to build a row keep mask.
+        result = _filter_non_empty_owned_device(result_owned)
+        if result is None:
+            result_owned._ensure_host_state()
+            non_empty = result_owned.validity.copy()
+            for family, buf in result_owned.families.items():
+                family_rows = (result_owned.tags == FAMILY_TAGS[family])
+                non_empty[family_rows] &= ~buf.empty_mask[
+                    result_owned.family_row_offsets[family_rows]
+                ]
+            keep_indices = np.flatnonzero(non_empty)
+            if keep_indices.size == 0:
+                result = from_shapely_geometries([shapely.Point()])
+                result = result.take(np.asarray([], dtype=np.int64))
+            else:
+                result = result_owned.take(keep_indices)
 
         # lyy.16 + lyy.18: Combine bypass results with overlay results.
         result = _combine_bypass_results(
@@ -1375,12 +1440,36 @@ def spatial_overlay_owned(
         # This D->H transfer is acceptable because the Shapely path already
         # materialises the full geometries to host below.
         if _pairs_on_device:
-            left_indices = cp.asnumpy(d_left_indices)
-            right_indices = cp.asnumpy(d_right_indices)
-            group_starts = cp.asnumpy(d_group_starts)
-            group_ends = cp.asnumpy(d_group_ends)
-            unique_left = cp.asnumpy(d_unique_left)
-            right_subset_indices = cp.asnumpy(d_right_subset_indices)
+            left_indices = overlay_device_to_host(
+                d_left_indices,
+                reason="overlay Shapely fallback left-pair indices export",
+                dtype=np.int64,
+            )
+            right_indices = overlay_device_to_host(
+                d_right_indices,
+                reason="overlay Shapely fallback right-pair indices export",
+                dtype=np.int64,
+            )
+            group_starts = overlay_device_to_host(
+                d_group_starts,
+                reason="overlay Shapely fallback group-start metadata export",
+                dtype=np.int64,
+            )
+            group_ends = overlay_device_to_host(
+                d_group_ends,
+                reason="overlay Shapely fallback group-end metadata export",
+                dtype=np.int64,
+            )
+            unique_left = overlay_device_to_host(
+                d_unique_left,
+                reason="overlay Shapely fallback unique-left metadata export",
+                dtype=np.int64,
+            )
+            right_subset_indices = overlay_device_to_host(
+                d_right_subset_indices,
+                reason="overlay Shapely fallback right-subset metadata export",
+                dtype=np.int64,
+            )
 
         # Phase 24: Record fallback event for spatial overlay CPU path.
         record_fallback_event(

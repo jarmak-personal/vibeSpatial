@@ -20,6 +20,7 @@ except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
 from vibespatial.constructive.interiors_cpu import _interiors_cpu as _interiors_cpu
+from vibespatial.cuda._runtime import count_scatter_total, get_cuda_runtime
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -57,6 +58,37 @@ def _build_all_null_oga(row_count: int) -> OwnedGeometryArray:
 # GPU implementation — pure CuPy offset arithmetic (Tier 2)
 # ---------------------------------------------------------------------------
 
+
+def _host_polygon_interior_size_plan(host_buf, poly_count: int):
+    if (
+        host_buf is None
+        or not host_buf.host_materialized
+        or host_buf.ring_offsets is None
+        or int(host_buf.geometry_offsets.size) != poly_count + 1
+    ):
+        return None
+
+    geom_offsets = host_buf.geometry_offsets
+    ring_offsets = host_buf.ring_offsets
+    ring_counts = geom_offsets[1:] - geom_offsets[:-1]
+    interior_counts = np.maximum(ring_counts - 1, 0)
+    interior_total = int(interior_counts.sum())
+    coord_total = 0
+    if interior_total:
+        interior_starts = geom_offsets + 1
+        has_interiors = interior_counts > 0
+        coord_total = int(
+            (
+                ring_offsets[geom_offsets[1:][has_interiors]]
+                - ring_offsets[interior_starts[:-1][has_interiors]]
+            ).sum()
+        )
+    return {
+        "interior_total": interior_total,
+        "coord_total": coord_total,
+    }
+
+
 @register_kernel_variant(
     "interior_rings",
     "gpu-cupy",
@@ -81,11 +113,7 @@ def _interiors_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
     d_poly_valid = (d_state.tags == poly_tag) & d_state.validity
 
-    has_polys = (
-        int(d_poly_valid.sum().item()) > 0
-        and GeometryFamily.POLYGON in d_state.families
-    )
-
+    has_polys = GeometryFamily.POLYGON in d_state.families
     if not has_polys:
         # No polygons at all — return all-empty MultiLineString
         return _build_all_empty_multilinestring(owned)
@@ -100,6 +128,12 @@ def _interiors_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
     # Number of polygon family rows
     poly_count = int(d_geom_offsets.size) - 1
+    if poly_count == 0:
+        return _build_all_empty_multilinestring(owned, poly_count=0)
+    host_size_plan = _host_polygon_interior_size_plan(
+        owned.families.get(GeometryFamily.POLYGON),
+        poly_count,
+    )
 
     # -------------------------------------------------------------------
     # Step 2: Compute per-polygon ring counts on device
@@ -109,12 +143,6 @@ def _interiors_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     d_ring_counts = d_geom_offsets[1:] - d_geom_offsets[:-1]
     d_interior_counts = cp.maximum(d_ring_counts - 1, 0)
 
-    total_interior_rings = int(cp.sum(d_interior_counts).item())
-
-    if total_interior_rings == 0:
-        # All polygons have zero holes — return all-empty MultiLineString
-        return _build_all_empty_multilinestring(owned)
-
     # -------------------------------------------------------------------
     # Step 3: Build output geometry_offsets for MultiLineString
     # geometry_offsets[i] = cumulative sum of interior_counts[0..i-1]
@@ -122,6 +150,21 @@ def _interiors_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     # -------------------------------------------------------------------
     d_out_geom_offsets = cp.zeros(poly_count + 1, dtype=cp.int32)
     cp.cumsum(d_interior_counts, out=d_out_geom_offsets[1:])
+
+    total_interior_rings = (
+        host_size_plan["interior_total"]
+        if host_size_plan is not None
+        else count_scatter_total(
+            get_cuda_runtime(),
+            d_interior_counts,
+            d_out_geom_offsets[:-1],
+            reason="interiors ring allocation fence",
+        )
+    )
+
+    if total_interior_rings == 0:
+        # All polygons have zero holes — return all-empty MultiLineString
+        return _build_all_empty_multilinestring(owned, poly_count=poly_count)
 
     # -------------------------------------------------------------------
     # Step 4: Identify interior ring indices in the source ring_offsets
@@ -158,44 +201,32 @@ def _interiors_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     d_out_part_offsets = cp.zeros(total_interior_rings + 1, dtype=cp.int32)
     cp.cumsum(d_ring_lengths, out=d_out_part_offsets[1:])
 
-    total_coords = int(d_out_part_offsets[-1].item())
+    total_coords = (
+        host_size_plan["coord_total"]
+        if host_size_plan is not None
+        else count_scatter_total(
+            get_cuda_runtime(),
+            d_ring_lengths,
+            d_out_part_offsets[:-1],
+            reason="interiors coordinate allocation fence",
+        )
+    )
 
     # -------------------------------------------------------------------
-    # Step 6: Gather interior ring coordinates via segmented arange
-    #
-    # Build a flat source-index array so that output position p maps to
-    # source coordinate index src[p].  The pattern is:
-    #   d_src = [1, 1, 1, ...]   (fill with 1 = +1 increment)
-    #   d_src[part_start_0] = ring_starts[0]        (absolute start)
-    #   d_src[part_start_k] = ring_starts[k] - ring_ends[k-1] + 1
-    #                                                (jump between segments)
-    #   cumsum(d_src) → [ring_starts[0], +1, +1, ...,
-    #                     ring_starts[1], +1, +1, ...]
+    # Step 6: Gather interior ring coordinates with a device output-position
+    # map. ``searchsorted`` maps output slots to interior-ring parts without
+    # host-reading the first non-empty segment start.
     # -------------------------------------------------------------------
     if total_coords == 0:
         # Edge case: interior rings exist but are all empty (degenerate)
-        return _build_all_empty_multilinestring(owned)
+        return _build_all_empty_multilinestring(owned, poly_count=poly_count)
 
-    d_part_starts_out = d_out_part_offsets[:-1]
-    d_nonempty = d_ring_lengths > 0
-    d_nonempty_part_starts = d_part_starts_out[d_nonempty]
-    d_nonempty_ring_starts = d_ring_starts[d_nonempty]
-
-    d_src = cp.ones(total_coords, dtype=cp.int32)
-
-    if int(d_nonempty.sum().item()) > 0:
-        d_nonempty_ring_ends = d_ring_ends[d_nonempty]
-
-        # First non-empty ring: absolute start value
-        first_pos = int(d_nonempty_part_starts[0].item())
-        d_src[first_pos] = d_nonempty_ring_starts[0]
-
-        # Subsequent non-empty rings: jump from previous ring end
-        if int(d_nonempty_part_starts.size) > 1:
-            d_jumps = d_nonempty_ring_starts[1:] - d_nonempty_ring_ends[:-1] + 1
-            d_src[d_nonempty_part_starts[1:]] = d_jumps
-
-    d_src_indices = cp.cumsum(d_src)
+    d_out_positions = cp.arange(total_coords, dtype=cp.int32)
+    d_part_idx = cp.searchsorted(d_out_part_offsets[1:], d_out_positions, side="right")
+    d_src_indices = (
+        d_ring_starts[d_part_idx]
+        + (d_out_positions - d_out_part_offsets[d_part_idx])
+    )
 
     # Gather coordinates using fancy indexing (zero-copy on device)
     d_x_out = d_poly.x[d_src_indices]
@@ -236,6 +267,8 @@ def _interiors_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
 def _build_all_empty_multilinestring(
     owned: OwnedGeometryArray,
+    *,
+    poly_count: int | None = None,
 ) -> OwnedGeometryArray:
     """Build a MultiLineString OGA where every row is empty or null.
 
@@ -253,7 +286,13 @@ def _build_all_empty_multilinestring(
     out_tags = cp.full(row_count, -1, dtype=cp.int8)
     out_tags[d_poly_valid] = mls_tag
 
-    poly_count = int(d_poly_valid.sum().item())
+    if poly_count is None:
+        poly_buffer = d_state.families.get(GeometryFamily.POLYGON)
+        poly_count = (
+            0
+            if poly_buffer is None
+            else int(poly_buffer.geometry_offsets.size) - 1
+        )
 
     out_family_row_offsets = cp.full(row_count, -1, dtype=cp.int32)
     out_family_row_offsets[d_poly_valid] = d_state.family_row_offsets[d_poly_valid]
@@ -319,9 +358,10 @@ def interiors_owned(
     if row_count == 0:
         return _build_all_null_oga(0)
 
-    # Short-circuit: no polygons means all-null output
+    # Short-circuit only when host metadata is already present.  Device-only
+    # callers must route through the GPU implementation to avoid metadata D2H.
     poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
-    if not np.any(owned.tags == poly_tag):
+    if owned._tags is not None and not np.any(owned._tags == poly_tag):
         return _build_all_null_oga(row_count)
 
     selection = plan_dispatch_selection(
@@ -369,3 +409,34 @@ def interiors_owned(
         selected=ExecutionMode.CPU,
     )
     return result
+
+
+def interiors_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = interiors_owned(
+        owned,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="interiors",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )

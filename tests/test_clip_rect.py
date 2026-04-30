@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
 import shapely
@@ -12,11 +15,46 @@ from vibespatial import (
     Residency,
     benchmark_clip_by_rect,
     clip_by_rect_owned,
+    evaluate_geopandas_clip_by_rect,
     from_shapely_geometries,
     has_gpu_runtime,
 )
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.device_array import DeviceGeometryArray
+
+
+def test_clip_rect_gpu_output_assembly_has_no_raw_cupy_scalar_syncs() -> None:
+    path = Path(__file__).resolve().parents[1] / "src" / "vibespatial" / "constructive" / "clip_rect.py"
+    source = path.read_text()
+    tree = ast.parse(source, filename=str(path))
+
+    def _contains_cupy_call(node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and isinstance(child.func.value, ast.Name)
+                and child.func.value.id == "cp"
+            ):
+                return True
+        return False
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "item":
+            offenders.append(f"{path.name}:{node.lineno}: .item()")
+        if (
+            isinstance(func, ast.Name)
+            and func.id in {"bool", "int", "float"}
+            and node.args
+            and _contains_cupy_call(node.args[0])
+        ):
+            offenders.append(f"{path.name}:{node.lineno}: {func.id}(cp.*)")
+
+    assert offenders == []
 
 
 def _assert_geometries_match(actual, expected) -> None:
@@ -340,6 +378,48 @@ def test_clip_by_rect_gpu_line_row_map_stays_lazy_until_requested() -> None:
 
 
 @pytest.mark.gpu
+def test_geopandas_clip_by_rect_uses_device_row_map_for_native_scatter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    owned = _make_device_resident_with_host_stubs_cleared(
+        [
+            LineString([(0.0, 0.0), (4.0, 4.0), (8.0, 0.0)]),
+            LineString([(20.0, 20.0), (22.0, 22.0)]),
+        ]
+    )
+    runtime = get_cuda_runtime()
+    real_copy_device_to_host = runtime.copy_device_to_host
+
+    def _guarded_copy_device_to_host(*args, **kwargs):
+        if kwargs.get("reason") == "clip-rect combined row-map host export":
+            raise AssertionError(
+                "clip_by_rect native scatter should consume the device row map"
+            )
+        return real_copy_device_to_host(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "copy_device_to_host", _guarded_copy_device_to_host)
+
+    result, selected = evaluate_geopandas_clip_by_rect(
+        np.empty(owned.row_count, dtype=object),
+        0.0,
+        0.0,
+        6.0,
+        6.0,
+        prebuilt_owned=owned,
+    )
+
+    assert selected is ExecutionMode.GPU
+    assert result is not None
+    assert result.row_count == 2
+    assert result.residency is Residency.DEVICE
+
+
+@pytest.mark.gpu
 def test_clip_by_rect_gpu_row_classification_stays_lazy_until_requested() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
@@ -401,9 +481,9 @@ def test_clip_by_rect_gpu_dense_linestring_path_builds_mixed_outputs_without_gen
     total_calls: list[int] = []
     original_totals = clip_rect_mod.count_scatter_totals
 
-    def _record_count_scatter_totals(runtime, count_offset_pairs):
+    def _record_count_scatter_totals(runtime, count_offset_pairs, *, reason=None):
         total_calls.append(len(count_offset_pairs))
-        return original_totals(runtime, count_offset_pairs)
+        return original_totals(runtime, count_offset_pairs, reason=reason)
 
     monkeypatch.setattr(clip_rect_mod, "_build_line_clip_device_result", _fail_generic)
     monkeypatch.setattr(clip_rect_mod, "concat_owned_scatter", _fail_generic)

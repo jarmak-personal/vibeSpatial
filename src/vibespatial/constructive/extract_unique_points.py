@@ -235,7 +235,12 @@ def _extract_unique_points_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     d_coord_offsets = exclusive_sum(d_all_counts, synchronize=False)
 
     # Get total coordinate count
-    total_coords = count_scatter_total(runtime, d_all_counts, d_coord_offsets)
+    total_coords = count_scatter_total(
+        runtime,
+        d_all_counts,
+        d_coord_offsets,
+        reason="extract-unique-points input-coordinate allocation fence",
+    )
 
     if total_coords == 0:
         return _build_empty_multipoint_output(row_count, validity)
@@ -345,7 +350,12 @@ def _extract_unique_points_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
     # Build output geometry offsets via exclusive prefix sum
     d_out_offsets = exclusive_sum(d_unique_counts, synchronize=False)
-    total_unique = count_scatter_total(runtime, d_unique_counts, d_out_offsets)
+    total_unique = count_scatter_total(
+        runtime,
+        d_unique_counts,
+        d_out_offsets,
+        reason="extract-unique-points unique-coordinate allocation fence",
+    )
 
     if total_unique == 0:
         return _build_empty_multipoint_output(row_count, validity)
@@ -515,3 +525,34 @@ def extract_unique_points_owned(
         selected=ExecutionMode.CPU,
     )
     return result
+
+
+def extract_unique_points_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = extract_unique_points_owned(
+        owned,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="extract_unique_points",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )

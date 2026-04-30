@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import LineString, Point, Polygon, box
+from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box
 
 import vibespatial.spatial.nearest as spatial_nearest_module
 import vibespatial.spatial.query as spatial_query_module
@@ -18,8 +21,102 @@ from vibespatial.spatial.query import (
     nearest_spatial_index,
     query_spatial_index,
 )
-from vibespatial.spatial.query_box import _extract_box_query_bounds_shapely
+from vibespatial.spatial.query_box import (
+    _extract_box_query_bounds_from_owned,
+    _extract_box_query_bounds_shapely,
+)
 from vibespatial.spatial.spatial_index_device import spatial_index_device_query
+
+
+def test_spatial_query_candidate_d2h_exports_are_runtime_accounted() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    paths = (
+        repo_root / "src" / "vibespatial" / "spatial" / "query_candidates.py",
+        repo_root / "src" / "vibespatial" / "spatial" / "query_box.py",
+        repo_root / "src" / "vibespatial" / "spatial" / "query_utils.py",
+    )
+    unnamed_runtime_exports: list[str] = []
+    raw_cupy_exports: list[str] = []
+    for path in paths:
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr == "copy_device_to_host" and not any(
+                keyword.arg == "reason" for keyword in node.keywords
+            ):
+                unnamed_runtime_exports.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+            if func.attr == "asnumpy":
+                raw_cupy_exports.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+
+    assert unnamed_runtime_exports == []
+    assert raw_cupy_exports == []
+
+
+def test_nearest_runtime_d2h_exports_are_operation_named() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "src" / "vibespatial" / "spatial" / "nearest.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    unnamed_runtime_exports: list[str] = []
+    raw_cupy_exports: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        if func.attr == "copy_device_to_host" and not any(
+            keyword.arg == "reason" for keyword in node.keywords
+        ):
+            unnamed_runtime_exports.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+        if (
+            func.attr == "asnumpy"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "cp"
+        ):
+            raw_cupy_exports.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+
+    assert unnamed_runtime_exports == []
+    assert raw_cupy_exports == []
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for polygon-box scalar fences")
+def test_polygon_box_query_scalar_fences_are_operation_named() -> None:
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    query_owned = from_shapely_geometries(
+        [
+            box(0.0, 0.0, 1.0, 1.0),
+            box(2.0, 0.0, 3.0, 1.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    bounds = _extract_box_query_bounds_from_owned("intersects", query_owned)
+    events = get_d2h_transfer_events(clear=True)
+
+    assert bounds is not None
+    np.testing.assert_allclose(
+        bounds,
+        np.asarray([
+            [0.0, 0.0, 1.0, 1.0],
+            [2.0, 0.0, 3.0, 1.0],
+        ]),
+    )
+    reasons = [event.reason for event in events]
+    assert "spatial query polygon-box single-ring scalar fence" in reasons
+    assert "spatial query polygon-box coordinate-count scalar fence" in reasons
+    assert "spatial query polygon-box axis-aligned scalar fence" in reasons
+    assert "spatial query polygon-box bounds host export" in reasons
+    assert not any("CudaRuntime.copy_device_to_host" in reason for reason in reasons)
 
 
 def test_query_spatial_index_matches_expected_pairs_for_intersects() -> None:
@@ -898,6 +995,49 @@ def test_nearest_spatial_index_uses_device_owned_point_buffers() -> None:
     assert impl == "owned_gpu_nearest"
 
 
+def test_nearest_return_device_knn_bounds_stay_device_resident() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device-resident nearest kNN")
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    tree_owned = from_shapely_geometries(
+        [box(0.0, 0.0, 1.0, 1.0), box(10.0, 0.0, 11.0, 1.0)],
+        residency=Residency.DEVICE,
+    )
+    query_owned = from_shapely_geometries(
+        [Point(0.5, 0.5), Point(10.5, 0.5)],
+        residency=Residency.DEVICE,
+    )
+
+    reset_d2h_transfer_count()
+    result, impl = nearest_spatial_index(
+        None,
+        None,
+        tree_query_nearest=lambda *args, **kwargs: pytest.fail("device nearest should not hit STRtree"),
+        return_all=False,
+        max_distance=2.0,
+        return_distance=True,
+        exclusive=False,
+        return_device=True,
+        tree_owned=tree_owned,
+        query_owned=query_owned,
+    )
+    events = get_d2h_transfer_events(clear=True)
+    reasons = [event.reason for event in events]
+
+    assert impl == "owned_gpu_nearest"
+    indices, distances = result
+    assert indices[0].shape == (2,)
+    assert indices[1].shape == (2,)
+    assert distances.shape == (2,)
+    assert "geometry analysis mixed row-bounds host export" not in reasons
+    assert "geometry analysis cached row-bounds host export" not in reasons
+
+
 def test_nearest_spatial_index_unbounded_matches_expected_ties_and_distances() -> None:
     tree = np.asarray([Point(0, 0), Point(2, 0), Point(10, 0)], dtype=object)
     query = np.asarray([Point(1, 0), Point(20, 0)], dtype=object)
@@ -970,6 +1110,90 @@ def test_nearest_spatial_index_records_fallback_before_host_refine(
     assert impl == "owned_cpu_nearest"
     assert indices.tolist() == [[0], [0]]
     assert np.allclose(distances, [1.0])
+
+
+def test_nearest_spatial_index_return_device_declines_mixed_refine_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = np.asarray(
+        [
+            box(0.0, 0.0, 1.0, 1.0),
+            MultiPolygon([box(5.0, 0.0, 6.0, 1.0)]),
+        ],
+        dtype=object,
+    )
+    query = np.asarray([Point(0.5, 0.5)], dtype=object)
+
+    monkeypatch.setattr(
+        spatial_nearest_module,
+        "record_shapely_fallback_event",
+        lambda *args, **kwargs: pytest.fail("return_device decline must not record host fallback"),
+    )
+
+    result, impl = nearest_spatial_index(
+        tree,
+        query,
+        tree_query_nearest=lambda *args, **kwargs: pytest.fail("device relation decline should not call STRtree"),
+        return_all=True,
+        max_distance=10.0,
+        return_distance=True,
+        exclusive=False,
+        return_device=True,
+    )
+
+    assert result is None
+    assert impl == "owned_cpu_nearest"
+
+
+def test_nearest_spatial_index_return_device_failed_refine_declines_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = np.asarray(
+        [
+            LineString([(0.0, 0.0), (1.0, 0.0)]),
+            LineString([(5.0, 0.0), (6.0, 0.0)]),
+        ],
+        dtype=object,
+    )
+    query = np.asarray(
+        [LineString([(0.0, 1.0), (1.0, 1.0)])],
+        dtype=object,
+    )
+
+    monkeypatch.setattr(
+        spatial_nearest_module,
+        "record_shapely_fallback_event",
+        lambda *args, **kwargs: pytest.fail("return_device decline must not record host fallback"),
+    )
+    monkeypatch.setattr(
+        spatial_nearest_module,
+        "_generate_candidates_gpu",
+        lambda *args, **kwargs: (np.array([0], dtype=np.int32), np.array([0], dtype=np.int32)),
+    )
+    monkeypatch.setattr(
+        spatial_nearest_module,
+        "_generate_distance_pairs",
+        lambda *args, **kwargs: pytest.fail("GPU candidate generation should not fall back to host pairs"),
+    )
+    monkeypatch.setattr(spatial_nearest_module, "_nearest_refine_gpu", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "vibespatial.spatial.spatial_index_knn_device.spatial_index_knn_device",
+        lambda *args, **kwargs: None,
+    )
+
+    result, impl = nearest_spatial_index(
+        tree,
+        query,
+        tree_query_nearest=lambda *args, **kwargs: pytest.fail("device relation decline should not call STRtree"),
+        return_all=True,
+        max_distance=10.0,
+        return_distance=True,
+        exclusive=False,
+        return_device=True,
+    )
+
+    assert result is None
+    assert impl == "owned_gpu_nearest"
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for exact GPU nearest fallback")
@@ -1409,6 +1633,38 @@ class TestDeviceJoinResult:
         np.testing.assert_array_equal(left, [0, 1, 2])
         np.testing.assert_array_equal(right, [3, 4, 5])
 
+    def test_device_join_result_materialization_is_observable(self) -> None:
+        """_DeviceJoinResult should emit materialization events on lazy host copy."""
+        pytest.importorskip("cupy")
+        import cupy as cp
+
+        from vibespatial.runtime.materialization import (
+            clear_materialization_events,
+            get_materialization_events,
+        )
+        from vibespatial.spatial.query_types import _DeviceJoinResult
+
+        result = _DeviceJoinResult(
+            cp.asarray([0, 1], dtype=cp.int32),
+            cp.asarray([2, 3], dtype=cp.int32),
+            cp.asarray([0.5, 1.5], dtype=cp.float64),
+        )
+        clear_materialization_events()
+
+        left, right = result.as_tuple()
+        distances = result.distances
+        events = get_materialization_events(clear=True)
+
+        np.testing.assert_array_equal(left, [0, 1])
+        np.testing.assert_array_equal(right, [2, 3])
+        np.testing.assert_array_equal(distances, [0.5, 1.5])
+        assert [event.operation for event in events] == [
+            "device_join_indices_to_host",
+            "device_join_indices_to_host",
+            "device_join_distances_to_host",
+        ]
+        assert all(event.strict_disallowed is False for event in events)
+
 
 # ---------------------------------------------------------------------------
 # Phase 2: DeviceSpatialJoinResult and return_device parameter
@@ -1434,17 +1690,32 @@ class TestDeviceSpatialJoinResult:
         pytest.importorskip("cupy")
         import cupy as cp
 
+        from vibespatial.runtime.materialization import (
+            clear_materialization_events,
+            get_materialization_events,
+        )
         from vibespatial.spatial.query_types import DeviceSpatialJoinResult
 
         d_left = cp.array([0, 1, 2, 3], dtype=cp.int32)
         d_right = cp.array([4, 5, 6, 7], dtype=cp.int32)
         result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
+        clear_materialization_events()
 
         h_left, h_right = result.to_host()
+        events = get_materialization_events(clear=True)
+
         np.testing.assert_array_equal(h_left, [0, 1, 2, 3])
         np.testing.assert_array_equal(h_right, [4, 5, 6, 7])
         assert h_left.dtype == np.int32
         assert h_right.dtype == np.int32
+        assert len(events) == 2
+        assert {
+            (event.operation, event.detail, event.strict_disallowed)
+            for event in events
+        } == {
+            ("device_spatial_join_indices_to_host", "side=left, rows=4, bytes=16", False),
+            ("device_spatial_join_indices_to_host", "side=right, rows=4, bytes=16", False),
+        }
 
     def test_size_property(self) -> None:
         """size should report the number of index pairs."""
@@ -1472,6 +1743,39 @@ class TestDeviceSpatialJoinResult:
         h_left, h_right = result.to_host()
         assert h_left.size == 0
         assert h_right.size == 0
+
+
+def test_device_knn_result_to_host_materialization_is_observable() -> None:
+    pytest.importorskip("cupy")
+    import cupy as cp
+
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+    from vibespatial.spatial.spatial_index_knn_device import DeviceKnnResult
+
+    result = DeviceKnnResult(
+        d_query_idx=cp.asarray([0, 1], dtype=cp.int32),
+        d_target_idx=cp.asarray([2, 3], dtype=cp.int32),
+        d_distances=cp.asarray([0.5, 1.5], dtype=cp.float64),
+        total_pairs=2,
+        k=1,
+    )
+    clear_materialization_events()
+
+    query_idx, target_idx, distances = result.to_host()
+    events = get_materialization_events(clear=True)
+
+    np.testing.assert_array_equal(query_idx, [0, 1])
+    np.testing.assert_array_equal(target_idx, [2, 3])
+    np.testing.assert_array_equal(distances, [0.5, 1.5])
+    assert [event.operation for event in events] == [
+        "device_knn_indices_to_host",
+        "device_knn_indices_to_host",
+        "device_knn_distances_to_host",
+    ]
+    assert all(event.strict_disallowed is False for event in events)
 
 
 def test_return_device_false_returns_numpy() -> None:
@@ -1518,7 +1822,11 @@ def test_return_device_true_returns_device_result() -> None:
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
 def test_return_device_point_region_refine_avoids_pair_d2h() -> None:
     """Device pair export should not copy refined pair arrays through host."""
-    from vibespatial.cuda._runtime import get_d2h_transfer_stats, reset_d2h_transfer_count
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        get_d2h_transfer_stats,
+        reset_d2h_transfer_count,
+    )
     from vibespatial.spatial.query_types import DeviceSpatialJoinResult
 
     tree = np.asarray(
@@ -1548,14 +1856,92 @@ def test_return_device_point_region_refine_avoids_pair_d2h() -> None:
         return_metadata=True,
     )
     transfer_count, transfer_bytes = get_d2h_transfer_stats()
+    event_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert execution.selected is ExecutionMode.GPU
+    assert isinstance(result, DeviceSpatialJoinResult)
+    assert transfer_count <= 1
+    assert transfer_bytes <= 8
+    assert set(event_reasons) <= {"device spatial-index candidate-pair allocation fence"}
+    forbidden_exports = (
+        "device candidate left pairs host export",
+        "device candidate right pairs host export",
+        "spatial query predicate family-admission scalar fence",
+        "spatial query left family-tag host export",
+        "spatial query right family-tag host export",
+        "spatial query GPU-pair mask host export",
+        "de9im-mask host export",
+    )
+    assert not any(
+        forbidden in reason
+        for reason in event_reasons
+        for forbidden in forbidden_exports
+    )
+    h_left, h_right = result.to_host()
+    assert h_left.tolist() == [0, 1, 1]
+    assert h_right.tolist() == [0, 0, 1]
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+def test_return_device_de9im_refine_avoids_pair_d2h() -> None:
+    """Device DE-9IM refinement should return filtered pairs without host export."""
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        get_d2h_transfer_stats,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.spatial.query_types import DeviceSpatialJoinResult
+
+    tree = np.asarray(
+        [
+            box(0, 0, 5, 5),
+            box(10, 10, 12, 12),
+            box(3, 3, 6, 6),
+        ],
+        dtype=object,
+    )
+    tree_owned, flat = build_owned_spatial_index(tree)
+    query_owned = from_shapely_geometries(
+        [box(1, 1, 2, 2), box(4, 4, 11, 11)],
+        residency=Residency.DEVICE,
+    )
+
+    tree_owned._ensure_device_state()
+    query_owned._ensure_device_state()
+    reset_d2h_transfer_count()
+    result, execution = query_spatial_index(
+        tree_owned,
+        flat,
+        query_owned,
+        predicate="intersects",
+        sort=True,
+        return_device=True,
+        return_metadata=True,
+    )
+    transfer_count, transfer_bytes = get_d2h_transfer_stats()
+    event_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
 
     assert execution.selected is ExecutionMode.GPU
     assert isinstance(result, DeviceSpatialJoinResult)
     assert transfer_count <= 2
-    assert transfer_bytes <= 8
+    assert transfer_bytes <= 9
+    assert "spatial query predicate family-admission scalar fence" in event_reasons
+    forbidden_exports = (
+        "device candidate left pairs host export",
+        "device candidate right pairs host export",
+        "spatial query left family-tag host export",
+        "spatial query right family-tag host export",
+        "spatial query GPU-pair mask host export",
+        "de9im-mask host export",
+    )
+    assert not any(
+        forbidden in reason
+        for reason in event_reasons
+        for forbidden in forbidden_exports
+    )
     h_left, h_right = result.to_host()
-    assert h_left.tolist() == [0, 1, 1]
-    assert h_right.tolist() == [0, 0, 1]
+    assert h_left.tolist() == [0, 1, 1, 1]
+    assert h_right.tolist() == [0, 0, 1, 2]
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
@@ -1609,6 +1995,200 @@ def test_sindex_query_return_device_false_default() -> None:
     gs = GeoSeries([box(0, 0, 1, 1), box(2, 2, 3, 3)])
     result = gs.sindex.query(box(0.5, 0.5, 1.5, 1.5))
     assert isinstance(result, np.ndarray)
+
+
+def test_sindex_query_return_device_rejects_dense_sparse_exports() -> None:
+    """Dense/sparse query outputs are public exports, not native carriers."""
+    from vibespatial.api import GeoSeries
+
+    gs = GeoSeries([box(0, 0, 1, 1), box(2, 2, 3, 3)])
+    with pytest.raises(ValueError, match="query_relation"):
+        gs.sindex.query(
+            [box(0.5, 0.5, 1.5, 1.5)],
+            output_format="dense",
+            return_device=True,
+        )
+    with pytest.raises(ValueError, match="query_relation"):
+        gs.sindex.query(
+            [box(0.5, 0.5, 1.5, 1.5)],
+            output_format="sparse",
+            return_device=True,
+        )
+
+
+def test_sindex_query_dense_public_export_uses_native_relation() -> None:
+    from vibespatial.api import GeoSeries
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    gs = GeoSeries([box(0, 0, 1, 1), box(2, 2, 3, 3)])
+    query = [box(0.5, 0.5, 1.5, 1.5)]
+
+    clear_dispatch_events()
+    dense = gs.sindex.query(query, output_format="dense")
+    dense_events = [
+        event
+        for event in get_dispatch_events(clear=True)
+        if event.surface == "geopandas.sindex.query"
+    ]
+
+    assert dense.tolist() == [[True], [False]]
+    assert dense_events[-1].implementation == "native_spatial_index"
+
+
+def test_sindex_query_sparse_public_export_uses_native_relation() -> None:
+    scipy = pytest.importorskip("scipy")
+    from vibespatial.api import GeoSeries
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    gs = GeoSeries([box(0, 0, 1, 1), box(2, 2, 3, 3)])
+    query = [box(0.5, 0.5, 1.5, 1.5)]
+    expected_dense = np.asarray([[True], [False]], dtype=bool)
+
+    clear_dispatch_events()
+    sparse = gs.sindex.query(query, output_format="sparse")
+    sparse_events = [
+        event
+        for event in get_dispatch_events(clear=True)
+        if event.surface == "geopandas.sindex.query"
+    ]
+
+    assert isinstance(sparse, scipy.sparse.coo_array)
+    np.testing.assert_array_equal(sparse.todense(), expected_dense)
+    assert sparse_events[-1].implementation == "native_spatial_index"
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for device relation export probe")
+def test_sindex_query_public_native_relation_defers_device_pairs_to_terminal_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.api import GeoSeries
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+    from vibespatial.spatial.query_types import _DeviceCandidates
+
+    tree = GeoSeries(
+        [
+            box(float(x), float(y), float(x + 1), float(y + 1))
+            for y in range(50)
+            for x in range(50)
+        ]
+    )
+    query = np.asarray(
+        [
+            box(10.0, 10.0, 12.0, 12.0),
+            box(1000.0, 1000.0, 1001.0, 1001.0),
+        ],
+        dtype=object,
+    )
+
+    def _fail_candidate_host_export(self):
+        raise AssertionError(
+            "public sindex.query should keep native relation pairs device-resident "
+            "until the terminal public export"
+        )
+
+    monkeypatch.setattr(_DeviceCandidates, "to_host", _fail_candidate_host_export)
+    clear_materialization_events()
+
+    result = tree.sindex.query(query, predicate="intersects", sort=True)
+    events = [
+        event
+        for event in get_materialization_events(clear=True)
+        if event.operation == "sindex_query_relation_indices_to_host"
+    ]
+
+    assert result.shape[0] == 2
+    assert result.shape[1] > 0
+    assert events
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for device relation export probe")
+def test_sindex_query_scalar_native_relation_defers_device_pairs_to_terminal_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.api import GeoSeries
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+    from vibespatial.spatial.query_types import _DeviceCandidates
+
+    tree = GeoSeries(
+        [
+            box(float(x), float(y), float(x + 1), float(y + 1))
+            for y in range(50)
+            for x in range(50)
+        ]
+    )
+
+    def _fail_candidate_host_export(self):
+        raise AssertionError(
+            "scalar public sindex.query should keep native relation pairs "
+            "device-resident until the terminal public export"
+        )
+
+    monkeypatch.setattr(_DeviceCandidates, "to_host", _fail_candidate_host_export)
+    clear_materialization_events()
+
+    result = tree.sindex.query(box(10.0, 10.0, 12.0, 12.0), predicate="intersects", sort=True)
+    events = [
+        event
+        for event in get_materialization_events(clear=True)
+        if event.operation == "sindex_query_relation_indices_to_host"
+    ]
+
+    assert isinstance(result, np.ndarray)
+    assert result.ndim == 1
+    assert result.size > 0
+    assert events
+
+
+def test_sindex_nearest_public_export_can_format_native_relation(monkeypatch) -> None:
+    from vibespatial.api import GeoSeries
+    from vibespatial.api._native_relation import NativeRelation
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    tree = GeoSeries(
+        GeometryArray.from_owned(
+            from_shapely_geometries([Point(0, 0), Point(10, 0)])
+        )
+    )
+    query = GeoSeries(
+        GeometryArray.from_owned(
+            from_shapely_geometries([Point(1, 0), Point(9, 0)])
+        )
+    )
+
+    def fake_nearest_relation(*args, **kwargs):
+        return (
+            NativeRelation(
+                left_indices=np.asarray([0, 1], dtype=np.int32),
+                right_indices=np.asarray([0, 1], dtype=np.int32),
+                left_row_count=2,
+                right_row_count=2,
+                predicate="nearest",
+                distances=np.asarray([1.0, 1.0], dtype=np.float64),
+                sorted_by_left=True,
+            ),
+            ExecutionMode.GPU,
+        )
+
+    sindex = tree.sindex
+    monkeypatch.setattr(sindex, "nearest_relation", fake_nearest_relation)
+    clear_dispatch_events()
+
+    indices, distances = sindex.nearest(query, return_distance=True)
+    events = [
+        event
+        for event in get_dispatch_events(clear=True)
+        if event.surface == "geopandas.sindex.nearest"
+    ]
+
+    assert indices.tolist() == [[0, 1], [0, 1]]
+    np.testing.assert_allclose(distances, [1.0, 1.0])
+    assert events[-1].implementation == "native_relation_export"
 
 
 def test_overlay_intersecting_index_pairs_handles_device_result() -> None:

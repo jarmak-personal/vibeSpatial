@@ -5,7 +5,7 @@ Scope: Repository-wide agent workflow, intake usage, and verification expectatio
 Read If: You are starting, routing, or landing work in this repository.
 STOP IF: You only need a narrow API detail already covered by a routed doc.
 Source Of Truth: Agent workflow and handoff policy for vibeSpatial.
-Body Budget: 243/260 lines
+Body Budget: 254/260 lines
 Document: AGENTS.md
 
 Section Map (Body Lines)
@@ -13,18 +13,18 @@ Section Map (Body Lines)
 |---|---|
 | 1-5 | Preamble |
 | 6-12 | Intent |
-| 13-21 | Request Signals |
-| 22-28 | Open First |
-| 29-33 | Verify |
-| 34-39 | Risks |
-| 40-57 | Mission |
-| 58-71 | Startup |
-| 72-85 | Routing |
-| 86-104 | Execution Model |
-| 105-118 | Repo Health |
-| 119-130 | Test Strategy |
-| 131-139 | Build And Tooling |
-| 140-167 | Verification |
+| 13-22 | Request Signals |
+| 23-30 | Open First |
+| 31-35 | Verify |
+| 36-41 | Risks |
+| 42-61 | Mission |
+| 62-75 | Startup |
+| 76-89 | Routing |
+| 90-108 | Execution Model |
+| 109-122 | Repo Health |
+| 123-134 | Test Strategy |
+| 135-143 | Build And Tooling |
+| 144-175 | Verification |
 | ... | (3 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -43,6 +43,7 @@ health checks.
 - intake
 - agent workflow
 - autonomous mode / PRD execution
+- Native* feature hold
 - docs-only
 - verification
 - repo map / handoff
@@ -50,6 +51,7 @@ health checks.
 ## Open First
 
 - AGENTS.md
+- docs/dev/native-full-coverage-prd.md
 - docs/ops/intake.md
 - README.md
 - pyproject.toml
@@ -82,6 +84,8 @@ Build a new NVIDIA GPU-accelerated spatial analytics library from scratch.
 - Correctness is non-negotiable. Quick fixes, workarounds, and timeline
   considerations are never acceptable. Always find the root cause, consider
   multiple solutions, and implement the correct one.
+- New feature and general development work is on hold until
+  `docs/dev/native-full-coverage-prd.md` is complete.
 
 ## Startup
 
@@ -170,7 +174,11 @@ user's goal, and the deterministic checks still drive the work.
 The pre-commit hook runs all deterministic checks automatically:
 ruff, doc refresh/validation, ARCH, ZCOPY, VPAT, MAINT, IGRD.
 You do not need to run these manually.
-The pre-push hook runs cached contract/GPU health before code leaves the workstation.
+The long GPU health regression gate
+(`uv run python scripts/health.py --tier gpu --check`) is a pre-push-only
+check. Do not run it as routine targeted development verification; use the
+focused commands below during development, and let `.githooks/pre-push` run
+the cached heavy gate before code leaves the workstation.
 
 For targeted verification during development:
 
@@ -203,6 +211,9 @@ deterministic checks and AI-powered sub-agent reviews.
 - Do not spend time tuning an approach that cannot hit the target
   performance envelope. Throw it out and try a different shape.
 - A provided PRD or tasklist is sufficient authority. Do not stop for fallback questions or preference polls about local implementation choices; resolve them from repo principles and continue.
+- During the Native* feature hold, route unrelated feature requests to
+  `docs/dev/native-full-coverage-prd.md` and defer them unless they directly
+  complete Native* functionality.
 - Interrupt only for real external blockers: missing credentials, required sandbox or network approval, destructive irreversible actions not already authorized, or contradictory requirements.
 - Prefer ASCII in new files unless Unicode is already established.
 - Keep docs short, specific, and discoverable by agents.

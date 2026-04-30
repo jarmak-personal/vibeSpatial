@@ -83,6 +83,21 @@ request_warmup(["exclusive_scan_i32", "exclusive_scan_i64", "segmented_reduce_su
 _POINT_EPSILON = SPATIAL_EPSILON
 _POINT_TYPE_ID = 0
 
+
+def _clip_rect_int_scalar(value, *, reason: str) -> int:
+    """Read a device scalar through the runtime so profiles see the fence."""
+    try:
+        import cupy as cp
+    except ModuleNotFoundError:  # pragma: no cover - CPU-only installs
+        return int(value)
+
+    if hasattr(value, "__cuda_array_interface__") or type(value).__module__.startswith("cupy"):
+        d_value = cp.asarray(value).reshape(1)
+        host = get_cuda_runtime().copy_device_to_host(d_value, reason=reason)
+        return int(np.asarray(host).reshape(-1)[0])
+    return int(value)
+
+
 # ---------------------------------------------------------------------------
 # NVRTC kernel compilation helpers
 # ---------------------------------------------------------------------------
@@ -134,6 +149,7 @@ class RectClipResult:
         "_geometries",
         "_geometries_factory",
         "_owned_result_rows",
+        "_owned_result_rows_device",
         "_owned_result_rows_factory",
         "owned_result",
         "precision_plan",
@@ -159,6 +175,7 @@ class RectClipResult:
         robustness_plan: RobustnessPlan,
         owned_result: OwnedGeometryArray | None = None,
         owned_result_rows: np.ndarray | None = None,
+        owned_result_rows_device: object | None = None,
         owned_result_rows_factory: object | None = None,
     ):
         self._candidate_rows = candidate_rows
@@ -170,6 +187,7 @@ class RectClipResult:
         self._geometries = geometries
         self._geometries_factory = geometries_factory
         self._owned_result_rows = owned_result_rows
+        self._owned_result_rows_device = owned_result_rows_device
         self._owned_result_rows_factory = owned_result_rows_factory
         self.row_count = row_count
         self.runtime_selection = runtime_selection
@@ -219,6 +237,10 @@ class RectClipResult:
             self._owned_result_rows = self._owned_result_rows_factory()
             self._owned_result_rows_factory = None
         return self._owned_result_rows
+
+    @property
+    def owned_result_rows_device(self):
+        return self._owned_result_rows_device
 
 
 @dataclass(frozen=True)
@@ -361,8 +383,6 @@ def _clip_polygon_rings_gpu(
 
     Returns (clipped_x, clipped_y, clipped_ring_offsets) as host numpy arrays.
     """
-    import cupy as cp
-
     d_out_x, d_out_y, d_full_offsets = _clip_polygon_rings_gpu_device(
         ring_x, ring_y, ring_offsets, rect,
     )
@@ -373,10 +393,20 @@ def _clip_polygon_rings_gpu(
             np.empty(0, dtype=np.float64),
             np.zeros(ring_count + 1, dtype=np.int32),
         )
+    runtime = get_cuda_runtime()
     return (
-        cp.asnumpy(d_out_x),
-        cp.asnumpy(d_out_y),
-        cp.asnumpy(d_full_offsets),
+        runtime.copy_device_to_host(
+            d_out_x,
+            reason="clip-rect polygon-ring x-coordinate host export",
+        ),
+        runtime.copy_device_to_host(
+            d_out_y,
+            reason="clip-rect polygon-ring y-coordinate host export",
+        ),
+        runtime.copy_device_to_host(
+            d_full_offsets,
+            reason="clip-rect polygon-ring full-offset host export",
+        ),
     )
 
 
@@ -450,7 +480,12 @@ def _clip_polygon_rings_gpu_device(
     d_out_offsets = exclusive_sum(d_vertex_counts)
 
     # Total output size via single-sync async transfer.
-    total_verts = count_scatter_total(runtime, d_vertex_counts, d_out_offsets)
+    total_verts = count_scatter_total(
+        runtime,
+        d_vertex_counts,
+        d_out_offsets,
+        reason="clip-rect ring vertex allocation fence",
+    )
 
     if total_verts == 0:
         return None, None, None
@@ -555,17 +590,31 @@ def _clip_line_segments_gpu(
     Returns (out_x0, out_y0, out_x1, out_y1, valid_mask) as host numpy arrays.
     For the device-resident path, use ``_clip_line_segments_gpu_device`` instead.
     """
-    import cupy as cp
-
     d_out_x0, d_out_y0, d_out_x1, d_out_y1, d_valid = _clip_line_segments_gpu_device(
         seg_x0, seg_y0, seg_x1, seg_y1, rect,
     )
+    runtime = get_cuda_runtime()
     return (
-        cp.asnumpy(d_out_x0),
-        cp.asnumpy(d_out_y0),
-        cp.asnumpy(d_out_x1),
-        cp.asnumpy(d_out_y1),
-        cp.asnumpy(d_valid),
+        runtime.copy_device_to_host(
+            d_out_x0,
+            reason="clip-rect line-segment x0 host export",
+        ),
+        runtime.copy_device_to_host(
+            d_out_y0,
+            reason="clip-rect line-segment y0 host export",
+        ),
+        runtime.copy_device_to_host(
+            d_out_x1,
+            reason="clip-rect line-segment x1 host export",
+        ),
+        runtime.copy_device_to_host(
+            d_out_y1,
+            reason="clip-rect line-segment y1 host export",
+        ),
+        runtime.copy_device_to_host(
+            d_valid,
+            reason="clip-rect line-segment validity host export",
+        ),
     )
 
 
@@ -997,7 +1046,12 @@ def _build_segmented_gather_indices_device(
     d_selected_ends = d_offsets[d_selected_indices + 1].astype(cp.int64, copy=False)
     d_selected_lengths_i64 = (d_selected_ends - d_selected_starts).astype(cp.int64, copy=False)
     d_write_offsets = exclusive_sum(d_selected_lengths_i64, synchronize=False)
-    total_selected_coords = count_scatter_total(runtime, d_selected_lengths_i64, d_write_offsets)
+    total_selected_coords = count_scatter_total(
+        runtime,
+        d_selected_lengths_i64,
+        d_write_offsets,
+        reason="clip-rect selected-coordinate allocation fence",
+    )
 
     d_new_offsets = cp.empty(selected_count + 1, dtype=cp.int32)
     d_new_offsets[:selected_count] = d_write_offsets.astype(cp.int32, copy=False)
@@ -1239,8 +1293,11 @@ def _build_line_clip_device_result(
     # ---------------------------------------------------------------
     d_geom_lengths = cp.diff(d_geom_offsets)
     d_valid_geom_mask = d_geom_lengths >= 2
-    # Single sync for the gate check — unavoidable since it controls branching
-    valid_geom_count = int(cp.sum(d_valid_geom_mask))
+    # Single named fence for the host branch gate.
+    valid_geom_count = _clip_rect_int_scalar(
+        cp.count_nonzero(d_valid_geom_mask),
+        reason="clip-rect line output valid-geometry count scalar fence",
+    )
 
     if valid_geom_count == 0:
         return None, None
@@ -1310,7 +1367,11 @@ def _build_line_clip_device_result(
 
         device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
 
-        if int(cp.sum(d_single_row_mask)) > 0:
+        single_row_count = _clip_rect_int_scalar(
+            cp.count_nonzero(d_single_row_mask),
+            reason="clip-rect line output single-row count scalar fence",
+        )
+        if single_row_count > 0:
             d_single_run_indices = d_row_starts[d_single_row_mask]
             single_compacted = _compact_selected_runs(d_single_run_indices)
             if single_compacted is not None:
@@ -1324,11 +1385,17 @@ def _build_line_clip_device_result(
                     bounds=None,
                 )
 
-        if int(cp.sum(d_multi_row_mask)) > 0:
+        multi_row_count = _clip_rect_int_scalar(
+            cp.count_nonzero(d_multi_row_mask),
+            reason="clip-rect line output multi-row count scalar fence",
+        )
+        if multi_row_count > 0:
             d_multi_row_starts = d_row_starts[d_multi_row_mask]
             d_multi_part_counts = d_row_run_counts[d_multi_row_mask].astype(cp.int32)
-            multi_row_count = int(d_multi_row_starts.shape[0])
-            total_multi_parts = int(cp.sum(d_multi_part_counts))
+            total_multi_parts = _clip_rect_int_scalar(
+                cp.sum(d_multi_part_counts),
+                reason="clip-rect line output multi-part count scalar fence",
+            )
             d_multi_row_part_offsets = cp.empty(multi_row_count + 1, dtype=cp.int64)
             d_multi_row_part_offsets[0] = 0
             d_multi_row_part_offsets[1:] = cp.cumsum(d_multi_part_counts).astype(cp.int64)
@@ -1525,7 +1592,15 @@ def _clip_linestring_rows_gpu_fast_path(
             (d_multi_coord_counts_i64, d_multi_coord_offsets_i64),
         ])
 
-    total_values = count_scatter_totals(runtime, total_pairs) if total_pairs else []
+    total_values = (
+        count_scatter_totals(
+            runtime,
+            total_pairs,
+            reason="clip-rect mixed-family total allocation fence",
+        )
+        if total_pairs
+        else []
+    )
     total_cursor = 0
 
     if single_count > 0:
@@ -2178,7 +2253,10 @@ def _build_polygon_clip_owned_result(
         # Any rings before the first exterior have owner index 0 from
         # the exclusive scan, but they should be invalid.  Guard by
         # zeroing rings before the first exterior position.
-        first_ext_pos = int(d_ext_positions[0].item())  # zcopy:ok(single scalar for branch guard)
+        first_ext_pos = _clip_rect_int_scalar(
+            d_ext_positions[0],
+            reason="clip-rect first exterior-position branch scalar fence",
+        )
         if first_ext_pos > 0:
             d_ext_validity_filled[:first_ext_pos] = False
     else:
@@ -2205,8 +2283,14 @@ def _build_polygon_clip_owned_result(
 
     # Bring small per-geometry results to host for validity mask construction
     # and GeoArrow metadata.  These are O(n_geoms) -- small metadata.
-    h_geom_has_output = cp.asnumpy(d_geom_has_output)  # zcopy:ok(small per-geom metadata for host mask)
-    h_surviving_per_geom = cp.asnumpy(d_surviving_per_geom)  # zcopy:ok(small per-geom metadata for GeoArrow offsets)
+    h_geom_has_output = runtime.copy_device_to_host(
+        d_geom_has_output,
+        reason="clip-rect polygon output-geometry mask host export",
+    )
+    h_surviving_per_geom = runtime.copy_device_to_host(
+        d_surviving_per_geom,
+        reason="clip-rect polygon surviving-ring counts host export",
+    )
 
     # Global row indices for geometries with output.
     global_rows_arr = np.asarray(global_row_indices, dtype=np.intp)
@@ -2232,7 +2316,10 @@ def _build_polygon_clip_owned_result(
     d_ring_offsets_dev = cp.empty(d_surviving_verts.size + 1, dtype=cp.int32)
     d_ring_offsets_dev[0] = 0
     cp.cumsum(d_surviving_verts, out=d_ring_offsets_dev[1:])
-    h_ring_offsets = cp.asnumpy(d_ring_offsets_dev)  # zcopy:ok(small ring offsets for GeoArrow metadata)
+    h_ring_offsets = runtime.copy_device_to_host(
+        d_ring_offsets_dev,
+        reason="clip-rect polygon output ring-offset host export",
+    )
 
     # Geometry offsets: cumulative surviving-ring counts per output geometry.
     output_surviving_counts = h_surviving_per_geom[h_geom_has_output]
@@ -2518,7 +2605,12 @@ def _clip_all_polygons_gpu_rect_fast_path(
     )
 
     d_offsets = exclusive_sum(d_counts, synchronize=False)
-    total_verts = count_scatter_total(runtime, d_counts, d_offsets)
+    total_verts = count_scatter_total(
+        runtime,
+        d_counts,
+        d_offsets,
+        reason="clip-rect polygon output-vertex allocation fence",
+    )
     detail = (
         f"rows={row_count}, "
         f"precision={precision_plan.compute_precision.value}, "
@@ -2691,8 +2783,9 @@ def _build_gpu_clip_row_factories(
     )
 
     def _materialize_mask_rows(d_mask):
-        return cp.asnumpy(
-            cp.flatnonzero(d_mask).astype(cp.int32, copy=False)
+        return get_cuda_runtime().copy_device_to_host(
+            cp.flatnonzero(d_mask).astype(cp.int32, copy=False),
+            reason="clip-rect lazy diagnostic row mask host export",
         ).astype(np.int32, copy=False)  # zcopy:ok(lazy diagnostic row materialization on explicit property access)
 
     def _fast_rows_factory():
@@ -2858,7 +2951,10 @@ def clip_by_rect_owned(
                     ymax,
                     boundary_inclusive=False,
                 )
-                keep_rows_host = runtime.copy_device_to_host(keep_rows)
+                keep_rows_host = runtime.copy_device_to_host(
+                    keep_rows,
+                    reason="clip-rect point fast-path keep-row host export",
+                )
                 kept_count = int(keep_rows_host.size)
 
                 # Build owned_result directly from device arrays -- no Shapely
@@ -2983,7 +3079,10 @@ def clip_by_rect_owned(
                     except ModuleNotFoundError:  # pragma: no cover - GPU path guarded above
                         cp = None
                     if cp is not None and hasattr(combined_row_map, "__cuda_array_interface__"):
-                        return cp.asnumpy(combined_row_map).astype(np.int32, copy=False)  # zcopy:ok(explicit host row metadata for lazy public-result scatter/materialization)
+                        return get_cuda_runtime().copy_device_to_host(
+                            combined_row_map,
+                            reason="clip-rect combined row-map host export",
+                        ).astype(np.int32, copy=False)  # zcopy:ok(explicit host row metadata for lazy public-result scatter/materialization)
                     return np.asarray(combined_row_map, dtype=np.int32)
 
                 owned_result_rows_factory = _materialize_combined_row_map
@@ -2996,7 +3095,10 @@ def clip_by_rect_owned(
                     except ModuleNotFoundError:  # pragma: no cover - GPU path guarded above
                         cp = None
                     if cp is not None and hasattr(line_global_row_map, "__cuda_array_interface__"):
-                        return cp.asnumpy(line_global_row_map).astype(  # zcopy:ok(explicit host row metadata for line-result scatter into public geometry array)
+                        return get_cuda_runtime().copy_device_to_host(
+                            line_global_row_map,
+                            reason="clip-rect line row-map host export",
+                        ).astype(  # zcopy:ok(explicit host row metadata for line-result scatter into public geometry array)
                             np.int32,
                             copy=False,
                         )
@@ -3110,6 +3212,7 @@ def clip_by_rect_owned(
                 robustness_plan=robustness_plan,
                 owned_result=owned_result,
                 owned_result_rows=owned_result_rows,
+                owned_result_rows_device=combined_row_map,
                 owned_result_rows_factory=owned_result_rows_factory,
             )
         raise NotImplementedError("clip_by_rect GPU variant currently supports point-only, polygon, and line owned arrays")
@@ -3166,14 +3269,33 @@ def evaluate_geopandas_clip_by_rect(
             )
         except NotImplementedError:
             return None, ExecutionMode.CPU
-        if result.owned_result is not None and result.owned_result_rows is not None:
+        row_map_native = result.owned_result_rows_device
+        row_map_host = None
+        if row_map_native is None:
+            row_map_host = result.owned_result_rows
+            row_map_native = row_map_host
+        if result.owned_result is not None and row_map_native is not None:
             owned_result = result.owned_result
-            row_map = np.asarray(result.owned_result_rows, dtype=np.int64)
-            if (
-                owned_result.row_count != result.row_count
-                or row_map.size != result.row_count
-                or not np.array_equal(row_map, np.arange(result.row_count, dtype=np.int64))
-            ):
+            row_map_is_device = hasattr(row_map_native, "__cuda_array_interface__")
+            if row_map_is_device:
+                row_map_size = int(row_map_native.size)
+                scatter_rows = row_map_native
+                needs_scatter = (
+                    owned_result.row_count != result.row_count
+                    or row_map_size != result.row_count
+                )
+            else:
+                row_map = np.asarray(row_map_native, dtype=np.int64)
+                scatter_rows = row_map
+                needs_scatter = (
+                    owned_result.row_count != result.row_count
+                    or row_map.size != result.row_count
+                    or not np.array_equal(
+                        row_map,
+                        np.arange(result.row_count, dtype=np.int64),
+                    )
+                )
+            if needs_scatter:
                 base = build_null_owned_array(
                     result.row_count,
                     residency=owned_result.residency,
@@ -3181,7 +3303,7 @@ def evaluate_geopandas_clip_by_rect(
                 owned_result = concat_owned_scatter(
                     base,
                     owned_result,
-                    row_map,
+                    scatter_rows,
                 )
             return owned_result, result.runtime_selection.selected
         return np.asarray(result.geometries, dtype=object), result.runtime_selection.selected

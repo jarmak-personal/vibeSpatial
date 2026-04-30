@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from os import PathLike
 from pathlib import Path
@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 
+from vibespatial.api._native_metadata import NativeGeometryMetadata
 from vibespatial.api._native_results import (
     GeometryNativeResult,
     NativeAttributeTable,
@@ -89,9 +90,14 @@ def _record_public_geoparquet_dispatch(
 
 
 def _payload_geometry_series(payload: NativeTabularResult):
+    attributes = payload.attributes_for_export(
+        surface="vibespatial.io.geoparquet._payload_geometry_series",
+        include_index=True,
+        strict_disallowed=False,
+    )
     return _authoritative_geometry_series(
         payload.geometry.to_geoseries(
-            index=payload.attributes.index,
+            index=attributes.index,
             name=payload.geometry_name,
         )
     )
@@ -169,6 +175,8 @@ def _authoritative_native_tabular_result(
         attrs=payload.attrs,
         secondary_geometry=authoritative_secondary,
         provenance=payload.provenance,
+        geometry_metadata=payload.geometry_metadata,
+        index_plan=payload.index_plan,
     )
 
 
@@ -1230,9 +1238,9 @@ def _geoparquet_scan_row_groups(
     return [list(selected_row_groups)]
 
 
-def _native_bbox_row_positions(payload: NativeTabularResult, bbox):
+def _native_bbox_row_positions_and_metadata(payload: NativeTabularResult, bbox):
     if bbox is None:
-        return None
+        return None, payload.geometry_metadata
     geometry = payload.geometry
     if geometry.owned is not None:
         import cupy as cp
@@ -1246,7 +1254,16 @@ def _native_bbox_row_positions(payload: NativeTabularResult, bbox):
             | (d_bounds[:, 2] < bbox[0])
             | (d_bounds[:, 3] < bbox[1])
         )
-        return cp.flatnonzero(d_keep).astype(cp.int64, copy=False)
+        metadata = payload.geometry_metadata
+        if metadata is None:
+            metadata = NativeGeometryMetadata.from_cached_owned(geometry.owned)
+        if metadata.bounds is None:
+            metadata = replace(
+                metadata,
+                bounds=d_bounds,
+                residency=Residency.DEVICE,
+            )
+        return cp.flatnonzero(d_keep).astype(cp.int64, copy=False), metadata
 
     bounds = np.asarray(geometry.series.bounds, dtype=np.float64)
     keep = ~(
@@ -1255,13 +1272,21 @@ def _native_bbox_row_positions(payload: NativeTabularResult, bbox):
         | (bounds[:, 2] < bbox[0])
         | (bounds[:, 3] < bbox[1])
     )
-    return np.flatnonzero(keep).astype(np.int64, copy=False)
+    return np.flatnonzero(keep).astype(np.int64, copy=False), payload.geometry_metadata
+
+
+def _native_bbox_row_positions(payload: NativeTabularResult, bbox):
+    row_positions, _metadata = _native_bbox_row_positions_and_metadata(payload, bbox)
+    return row_positions
 
 
 def _apply_native_bbox_filter(payload: NativeTabularResult, bbox) -> NativeTabularResult:
     if bbox is None:
         return payload
-    return payload.take(_native_bbox_row_positions(payload, bbox))
+    row_positions, metadata = _native_bbox_row_positions_and_metadata(payload, bbox)
+    if metadata is not payload.geometry_metadata:
+        payload = replace(payload, geometry_metadata=metadata)
+    return payload.take(row_positions)
 
 
 def _apply_owned_bbox_filter(owned: OwnedGeometryArray, bbox) -> OwnedGeometryArray:
@@ -1288,6 +1313,17 @@ def _table_row_count(table) -> int:
     if callable(num_rows):
         return int(num_rows())
     return int(num_rows)
+
+
+def _geoparquet_column_total_bounds(
+    column_meta: dict[str, Any],
+) -> tuple[float, float, float, float] | None:
+    bbox = column_meta.get("bbox")
+    if bbox is None:
+        return None
+    if len(bbox) != 4:
+        return None
+    return tuple(float(value) for value in bbox)
 
 
 def _pylibcudf_table_to_geopandas(
@@ -1431,6 +1467,7 @@ def _geoparquet_table_to_native_tabular_result(
         )
 
     decoded_geometry: dict[str, GeometryNativeResult] = {}
+    decoded_metadata: dict[str, NativeGeometryMetadata] = {}
     row_count = None
     for column_name in geometry_columns:
         column_meta = geo_metadata["columns"][column_name]
@@ -1454,6 +1491,10 @@ def _geoparquet_table_to_native_tabular_result(
             if row_count is None:
                 row_count = owned.row_count
             decoded_geometry[column_name] = GeometryNativeResult.from_owned(owned, crs=crs)
+            decoded_metadata[column_name] = NativeGeometryMetadata.from_cached_owned(
+                owned,
+                total_bounds=_geoparquet_column_total_bounds(column_meta),
+            )
         except NotImplementedError as exc:
             record_fallback_event(
                 surface="vibespatial.io.geoparquet",
@@ -1502,6 +1543,7 @@ def _geoparquet_table_to_native_tabular_result(
         attrs=attrs,
         secondary_geometry=secondary_geometry,
         provenance=provenance,
+        geometry_metadata=decoded_metadata.get(geometry_name),
     )
 
 
@@ -2346,6 +2388,7 @@ def _read_geoparquet_native_impl(
             attrs=payload.attrs,
             secondary_geometry=payload.secondary_geometry,
             provenance=provenance,
+            geometry_metadata=payload.geometry_metadata,
         )
 
     return _concat_native_tabular_results(

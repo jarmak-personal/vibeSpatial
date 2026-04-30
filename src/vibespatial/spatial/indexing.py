@@ -49,6 +49,11 @@ _REGULAR_GRID_SINGLE_BLOCK_CERTIFY_LIMIT = 256
 _REGULAR_GRID_MAX_CERTIFY_BLOCKS = 65535
 
 
+def _runtime_device_to_host(device_array: object, dtype, *, reason: str) -> np.ndarray:
+    host = get_cuda_runtime().copy_device_to_host(device_array, reason=reason)
+    return host.astype(dtype, copy=False)
+
+
 def _default_index_runtime_selection() -> RuntimeSelection:
     return plan_dispatch_selection(
         kernel_name="flat_index_build",
@@ -92,7 +97,11 @@ class CandidatePairs:
         """Lazily materialise host left_indices from device (ADR-0005)."""
         if self._host_left_indices is not None:
             return self._host_left_indices
-        host = cp.asnumpy(self._device_left_indices).astype(np.int32, copy=False)
+        host = _runtime_device_to_host(
+            self._device_left_indices,
+            np.int32,
+            reason="spatial index candidate left-index host export",
+        )
         object.__setattr__(self, "_host_left_indices", host)
         return host
 
@@ -101,7 +110,11 @@ class CandidatePairs:
         """Lazily materialise host right_indices from device (ADR-0005)."""
         if self._host_right_indices is not None:
             return self._host_right_indices
-        host = cp.asnumpy(self._device_right_indices).astype(np.int32, copy=False)
+        host = _runtime_device_to_host(
+            self._device_right_indices,
+            np.int32,
+            reason="spatial index candidate right-index host export",
+        )
         object.__setattr__(self, "_host_right_indices", host)
         return host
 
@@ -233,7 +246,12 @@ def _generate_bounds_pairs_gpu(
     # Prefix sum for scatter offsets (CCCL exclusive_sum, ADR-0033)
     cp_counts = cp.asarray(d_counts)
     d_offsets = exclusive_sum(cp_counts, synchronize=False)
-    total_pairs = count_scatter_total(runtime, cp_counts, d_offsets)
+    total_pairs = count_scatter_total(
+        runtime,
+        cp_counts,
+        d_offsets,
+        reason="spatial index sweep candidate-pair allocation fence",
+    )
 
     if total_pairs == 0:
         empty = cp.empty(0, dtype=cp.int32)
@@ -429,10 +447,10 @@ class FlatSpatialIndex:
             return self._host_bounds
         if self.device_bounds is None:
             raise ValueError("FlatSpatialIndex has neither host nor device bounds")
-        runtime = get_cuda_runtime()
-        host_bounds = runtime.copy_device_to_host(self.device_bounds).astype(
+        host_bounds = _runtime_device_to_host(
+            self.device_bounds,
             np.float64,
-            copy=False,
+            reason="flat spatial index device bounds host export",
         )
         object.__setattr__(self, "_host_bounds", host_bounds)
         return host_bounds
@@ -442,7 +460,11 @@ class FlatSpatialIndex:
         """Lazily materialise host order array from device (ADR-0005)."""
         if self._host_order is not None:
             return self._host_order
-        host_order = cp.asnumpy(self.device_order).astype(np.int32, copy=False)
+        host_order = _runtime_device_to_host(
+            self.device_order,
+            np.int32,
+            reason="flat spatial index device order host export",
+        )
         object.__setattr__(self, "_host_order", host_order)
         return host_order
 
@@ -451,7 +473,11 @@ class FlatSpatialIndex:
         """Lazily materialise host morton_keys array from device (ADR-0005)."""
         if self._host_morton_keys is not None:
             return self._host_morton_keys
-        host_keys = cp.asnumpy(self.device_morton_keys).astype(np.uint64, copy=False)
+        host_keys = _runtime_device_to_host(
+            self.device_morton_keys,
+            np.uint64,
+            reason="flat spatial index device morton-key host export",
+        )
         object.__setattr__(self, "_host_morton_keys", host_keys)
         return host_keys
 
@@ -467,6 +493,24 @@ class FlatSpatialIndex:
             return int(self.device_bounds.shape[0])
         # Avoid D→H just for size — use bounds row count.
         return int(self.bounds.shape[0])
+
+    def geometry_metadata(self, *, source_token: str | None = None):
+        """Wrap index bounds/metadata as a private native carrier."""
+        from vibespatial.api._native_metadata import NativeGeometryMetadata
+
+        return NativeGeometryMetadata.from_spatial_index(
+            self,
+            source_token=source_token,
+        )
+
+    def to_native_spatial_index(self, *, source_token: str | None = None):
+        """Wrap this index as reusable private native execution state."""
+        from vibespatial.api._native_metadata import NativeSpatialIndex
+
+        return NativeSpatialIndex.from_flat_index(
+            self,
+            source_token=source_token,
+        )
 
     def query_bounds(
         self,
@@ -586,8 +630,14 @@ def _detect_single_row_device_rect_index(
         return None
 
     runtime = get_cuda_runtime()
-    xs = runtime.copy_device_to_host(device_buffer.x).astype(np.float64, copy=False)
-    ys = runtime.copy_device_to_host(device_buffer.y).astype(np.float64, copy=False)
+    xs = runtime.copy_device_to_host(
+        device_buffer.x,
+        reason="spatial index single-rectangle x-coordinate validation fence",
+    ).astype(np.float64, copy=False)
+    ys = runtime.copy_device_to_host(
+        device_buffer.y,
+        reason="spatial index single-rectangle y-coordinate validation fence",
+    ).astype(np.float64, copy=False)
     bounds_tuple = _coords_form_axis_aligned_box(xs, ys)
     if bounds_tuple is None:
         return None
@@ -757,7 +807,10 @@ def _detect_regular_grid_rect_index_device(
                     (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR),
                 ),
             )
-        host_summary = runtime.copy_device_to_host(d_summary)
+        host_summary = runtime.copy_device_to_host(
+            d_summary,
+            reason="spatial index regular-grid summary scalar fence",
+        )
     except Exception:
         runtime.free(d_bounds)
         raise
@@ -827,8 +880,14 @@ def _sample_regular_grid_polygon_vertices(
         + np.arange(5, dtype=np.int64)[None, :]
     ).reshape(-1)
     d_sample_coord_indices = cp.asarray(sample_coord_indices)
-    ring_x = runtime.copy_device_to_host(device_buffer.x[d_sample_coord_indices]).reshape(sample_indices.size, 5)
-    ring_y = runtime.copy_device_to_host(device_buffer.y[d_sample_coord_indices]).reshape(sample_indices.size, 5)
+    ring_x = runtime.copy_device_to_host(
+        device_buffer.x[d_sample_coord_indices],
+        reason="spatial index regular-grid sampled x-coordinate validation export",
+    ).reshape(sample_indices.size, 5)
+    ring_y = runtime.copy_device_to_host(
+        device_buffer.y[d_sample_coord_indices],
+        reason="spatial index regular-grid sampled y-coordinate validation export",
+    ).reshape(sample_indices.size, 5)
     return (
         np.ascontiguousarray(ring_x, dtype=np.float64),
         np.ascontiguousarray(ring_y, dtype=np.float64),
@@ -999,6 +1058,15 @@ def _build_flat_spatial_index_gpu(
     runtime = get_cuda_runtime()
     finite = bounds[~np.isnan(bounds).any(axis=1)]
     if finite.size == 0:
+        if keep_on_device and cp is not None:
+            return (
+                cp.full(
+                    geometry_array.row_count,
+                    np.iinfo(np.uint64).max,
+                    dtype=cp.uint64,
+                ),
+                cp.arange(geometry_array.row_count, dtype=cp.int32),
+            )
         return (
             np.full(geometry_array.row_count, np.iinfo(np.uint64).max, dtype=np.uint64),
             np.arange(geometry_array.row_count, dtype=np.int32),
@@ -1010,6 +1078,74 @@ def _build_flat_spatial_index_gpu(
         reason="build_flat_spatial_index selected GPU morton sort",
     )
     device_bounds = runtime.from_host(bounds)
+    total_bounds = (
+        float(finite[:, 0].min()),
+        float(finite[:, 1].min()),
+        float(finite[:, 2].max()),
+        float(finite[:, 3].max()),
+    )
+    try:
+        return _build_flat_spatial_index_gpu_from_device_bounds(
+            geometry_array,
+            device_bounds,
+            total_bounds=total_bounds,
+            keep_on_device=keep_on_device,
+        )
+    finally:
+        runtime.free(device_bounds)
+
+
+def _device_total_bounds(d_bounds) -> tuple[float, float, float, float]:
+    """Summarize device row bounds with one named scalar fence."""
+    if cp is None:  # pragma: no cover - exercised on CPU-only installs
+        raise RuntimeError("CuPy is required for device total bounds")
+    row_count = int(getattr(d_bounds, "shape", (0,))[0])
+    if row_count == 0:
+        return (float("nan"),) * 4
+
+    finite = cp.isfinite(d_bounds).all(axis=1)
+    summary = cp.empty(5, dtype=cp.float64)
+    summary[0] = cp.count_nonzero(finite).astype(cp.float64)
+    summary[1] = cp.min(cp.where(finite, d_bounds[:, 0], cp.inf))
+    summary[2] = cp.min(cp.where(finite, d_bounds[:, 1], cp.inf))
+    summary[3] = cp.max(cp.where(finite, d_bounds[:, 2], -cp.inf))
+    summary[4] = cp.max(cp.where(finite, d_bounds[:, 3], -cp.inf))
+    host = get_cuda_runtime().copy_device_to_host(
+        summary,
+        reason="flat spatial index device total-bounds scalar fence",
+    )
+    if int(host[0]) == 0:
+        return (float("nan"),) * 4
+    return (float(host[1]), float(host[2]), float(host[3]), float(host[4]))
+
+
+def _build_flat_spatial_index_gpu_from_device_bounds(
+    geometry_array: OwnedGeometryArray,
+    device_bounds,
+    *,
+    total_bounds: tuple[float, float, float, float],
+    keep_on_device: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build Morton order from already device-resident bounds."""
+    if cp is None:  # pragma: no cover - exercised on CPU-only installs
+        raise RuntimeError("CuPy is required for device spatial indexing")
+
+    runtime = get_cuda_runtime()
+    if not np.isfinite(np.asarray(total_bounds, dtype=np.float64)).all():
+        if keep_on_device:
+            return (
+                cp.full(
+                    geometry_array.row_count,
+                    np.iinfo(np.uint64).max,
+                    dtype=cp.uint64,
+                ),
+                cp.arange(geometry_array.row_count, dtype=cp.int32),
+            )
+        return (
+            np.full(geometry_array.row_count, np.iinfo(np.uint64).max, dtype=np.uint64),
+            np.arange(geometry_array.row_count, dtype=np.int32),
+        )
+
     device_keys = None
     device_order = None
     sorted_result = None
@@ -1020,10 +1156,10 @@ def _build_flat_spatial_index_gpu(
         params = (
             (
                 ptr(device_bounds),
-                float(finite[:, 0].min()),
-                float(finite[:, 1].min()),
-                float(finite[:, 2].max()),
-                float(finite[:, 3].max()),
+                float(total_bounds[0]),
+                float(total_bounds[1]),
+                float(total_bounds[2]),
+                float(total_bounds[3]),
                 ptr(device_keys),
                 geometry_array.row_count,
             ),
@@ -1039,7 +1175,7 @@ def _build_flat_spatial_index_gpu(
         )
         grid, block = runtime.launch_config(kernel, geometry_array.row_count)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        device_order = runtime.from_host(np.arange(geometry_array.row_count, dtype=np.int32))
+        device_order = cp.arange(geometry_array.row_count, dtype=cp.int32)
         sorted_result = sort_pairs(device_keys, device_order, synchronize=False)
 
         if keep_on_device:
@@ -1049,12 +1185,19 @@ def _build_flat_spatial_index_gpu(
             order = sorted_result.values
             return morton_keys, order
 
-        # Standard path: transfer to host
-        morton_keys = cp.asnumpy(device_keys).astype(np.uint64, copy=False)
-        order = cp.asnumpy(sorted_result.values).astype(np.int32, copy=False)
+        # Standard path: explicit host export for CPU/public compatibility.
+        morton_keys = _runtime_device_to_host(
+            device_keys,
+            np.uint64,
+            reason="flat spatial index GPU morton-key build host export",
+        )
+        order = _runtime_device_to_host(
+            sorted_result.values,
+            np.int32,
+            reason="flat spatial index GPU order build host export",
+        )
         return morton_keys, order
     finally:
-        runtime.free(device_bounds)
         if not keep_on_device:
             runtime.free(device_keys)
             runtime.free(device_order)
@@ -1139,8 +1282,18 @@ def build_flat_spatial_index(
             device_bounds=device_bounds,
         )
 
-    bounds = compute_geometry_bounds(geometry_array, dispatch_mode=bounds_dispatch)
-    regular_grid = _detect_regular_grid_rect_index(geometry_array, bounds)
+    device_bounds = None
+    total_bounds = None
+    if (
+        selection.selected is ExecutionMode.GPU
+        and geometry_array.residency is Residency.DEVICE
+        and has_gpu_runtime()
+    ):
+        device_bounds = compute_geometry_bounds_device(geometry_array)
+        regular_grid = None
+    else:
+        bounds = compute_geometry_bounds(geometry_array, dispatch_mode=bounds_dispatch)
+        regular_grid = _detect_regular_grid_rect_index(geometry_array, bounds)
     d_morton_keys = None
     d_order = None
     if regular_grid is None:
@@ -1152,9 +1305,21 @@ def build_flat_spatial_index(
             # Keep device arrays to avoid D→H transfer mid-pipeline
             # (ADR-0005).  Host fields are lazily populated on first
             # access via query_bounds() / CPU fallback paths.
-            d_morton_keys_raw, d_order_raw = _build_flat_spatial_index_gpu(
-                geometry_array, bounds, keep_on_device=True,
-            )
+            if device_bounds is not None:
+                total_bounds = _device_total_bounds(device_bounds)
+                d_morton_keys_raw, d_order_raw = (
+                    _build_flat_spatial_index_gpu_from_device_bounds(
+                        geometry_array,
+                        device_bounds,
+                        total_bounds=total_bounds,
+                        keep_on_device=True,
+                    )
+                )
+                bounds = None
+            else:
+                d_morton_keys_raw, d_order_raw = _build_flat_spatial_index_gpu(
+                    geometry_array, bounds, keep_on_device=True,
+                )
             morton_keys = None
             order = None
             d_morton_keys = d_morton_keys_raw
@@ -1169,7 +1334,9 @@ def build_flat_spatial_index(
     # are finite (validated during detection), so skip NaN filtering.
     # Otherwise use np.nanmin/np.nanmax which is faster than building a
     # boolean mask + fancy-indexing the finite rows.
-    if regular_grid is not None:
+    if total_bounds is not None:
+        pass
+    elif regular_grid is not None:
         total_bounds = (
             float(bounds[:, 0].min()),
             float(bounds[:, 1].min()),
@@ -1194,6 +1361,7 @@ def build_flat_spatial_index(
         regular_grid=regular_grid,
         device_morton_keys=d_morton_keys,
         device_order=d_order,
+        device_bounds=device_bounds,
     )
 
 
@@ -1226,10 +1394,20 @@ class SegmentMBRTable:
         """
         if self.residency is Residency.HOST:
             return self
+        runtime = get_cuda_runtime()
         return SegmentMBRTable(
-            row_indices=cp.asnumpy(self.row_indices),
-            segment_indices=cp.asnumpy(self.segment_indices),
-            bounds=cp.asnumpy(self.bounds),
+            row_indices=runtime.copy_device_to_host(
+                self.row_indices,
+                reason="segment MBR row-index host export",
+            ),
+            segment_indices=runtime.copy_device_to_host(
+                self.segment_indices,
+                reason="segment MBR segment-index host export",
+            ),
+            bounds=runtime.copy_device_to_host(
+                self.bounds,
+                reason="segment MBR bounds host export",
+            ),
             residency=Residency.HOST,
         )
 
@@ -1395,7 +1573,12 @@ def _launch_segment_mbr_family(
 
     # Prefix sum for scatter offsets (CCCL, ADR-0033 Tier 3a)
     d_offsets = exclusive_sum(d_counts, synchronize=False)
-    total = count_scatter_total(runtime, d_counts, d_offsets)
+    total = count_scatter_total(
+        runtime,
+        d_counts,
+        d_offsets,
+        reason="spatial index segment-bounds allocation fence",
+    )
 
     if total == 0:
         return None
@@ -1531,7 +1714,11 @@ class SegmentCandidatePairs:
         """Lazily materialise host left_rows from device (ADR-0005)."""
         if self._host_left_rows is not None:
             return self._host_left_rows
-        host = cp.asnumpy(self._device_left_rows).astype(np.int32, copy=False)
+        host = _runtime_device_to_host(
+            self._device_left_rows,
+            np.int32,
+            reason="segment candidate left-row host export",
+        )
         object.__setattr__(self, "_host_left_rows", host)
         return host
 
@@ -1540,7 +1727,11 @@ class SegmentCandidatePairs:
         """Lazily materialise host left_segments from device (ADR-0005)."""
         if self._host_left_segments is not None:
             return self._host_left_segments
-        host = cp.asnumpy(self._device_left_segments).astype(np.int32, copy=False)
+        host = _runtime_device_to_host(
+            self._device_left_segments,
+            np.int32,
+            reason="segment candidate left-segment host export",
+        )
         object.__setattr__(self, "_host_left_segments", host)
         return host
 
@@ -1549,7 +1740,11 @@ class SegmentCandidatePairs:
         """Lazily materialise host right_rows from device (ADR-0005)."""
         if self._host_right_rows is not None:
             return self._host_right_rows
-        host = cp.asnumpy(self._device_right_rows).astype(np.int32, copy=False)
+        host = _runtime_device_to_host(
+            self._device_right_rows,
+            np.int32,
+            reason="segment candidate right-row host export",
+        )
         object.__setattr__(self, "_host_right_rows", host)
         return host
 
@@ -1558,7 +1753,11 @@ class SegmentCandidatePairs:
         """Lazily materialise host right_segments from device (ADR-0005)."""
         if self._host_right_segments is not None:
             return self._host_right_segments
-        host = cp.asnumpy(self._device_right_segments).astype(np.int32, copy=False)
+        host = _runtime_device_to_host(
+            self._device_right_segments,
+            np.int32,
+            reason="segment candidate right-segment host export",
+        )
         object.__setattr__(self, "_host_right_segments", host)
         return host
 
@@ -1693,7 +1892,12 @@ def _generate_segment_mbr_pairs_gpu(
     # Prefix sum for scatter offsets (CCCL, ADR-0033 Tier 3a)
     cp_counts = cp.asarray(d_counts)
     d_offsets = exclusive_sum(cp_counts, synchronize=False)
-    total_pairs = count_scatter_total(runtime, cp_counts, d_offsets)
+    total_pairs = count_scatter_total(
+        runtime,
+        cp_counts,
+        d_offsets,
+        reason="spatial index segment sweep-pair allocation fence",
+    )
 
     if total_pairs > 2_147_483_647:
         raise OverflowError(

@@ -72,9 +72,10 @@ extern "C" __global__ void point_buffer_round(
     const double* point_x,
     const double* point_y,
     const double* radii,
+    const double* unit_x,
+    const double* unit_y,
     double* out_x,
     double* out_y,
-    int quad_segs,
     int verts_per_ring,
     int row_count
 ) {
@@ -91,12 +92,12 @@ extern "C" __global__ void point_buffer_round(
   const double py = point_y[coord];
   const double radius = radii[row];
   const int base = row * verts_per_ring;
-  const int n_arc = 4 * quad_segs;
-  const double step = -2.0 * 3.14159265358979323846 / (double)n_arc;
+  const int n_arc = verts_per_ring - 1;
   for (int i = 0; i < n_arc; i++) {
-    double angle = (double)i * step;
-    out_x[base + i] = px + radius * cos(angle);
-    out_y[base + i] = py + radius * sin(angle);
+    const double dx = __dmul_rn(radius, unit_x[i]);
+    const double dy = __dmul_rn(radius, unit_y[i]);
+    out_x[base + i] = __dadd_rn(px, dx);
+    out_y[base + i] = __dadd_rn(py, dy);
   }
   out_x[base + n_arc] = out_x[base];
   out_y[base + n_arc] = out_y[base];

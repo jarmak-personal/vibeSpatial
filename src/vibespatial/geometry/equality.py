@@ -227,7 +227,10 @@ def _geom_equals_exact_gpu(
 
     # --- Step 3: Single D2H transfer for final result ---
     runtime.synchronize()
-    result_host = runtime.copy_device_to_host(d_result)
+    result_host = runtime.copy_device_to_host(
+        d_result,
+        reason="geometry equality result host export",
+    )
     return result_host.astype(bool, copy=False)
 
 

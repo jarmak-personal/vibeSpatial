@@ -50,6 +50,43 @@ class MaterializationEvent:
         return payload
 
 
+@dataclass(frozen=True)
+class NativeExportBoundary:
+    """First-class contract for an explicit Native* terminal export."""
+
+    surface: str
+    operation: str
+    target: str
+    reason: str
+    row_count: int | None = None
+    byte_count: int | None = None
+    detail: str = ""
+    boundary: MaterializationBoundary = MaterializationBoundary.USER_EXPORT
+    d2h_transfer: bool = False
+    strict_disallowed: bool = False
+
+    def event_detail(self) -> str:
+        parts = [f"native_export_target={self.target}"]
+        if self.row_count is not None:
+            parts.append(f"rows={int(self.row_count)}")
+        if self.byte_count is not None:
+            parts.append(f"bytes={int(self.byte_count)}")
+        if self.detail:
+            parts.append(self.detail)
+        return ", ".join(parts)
+
+    def record(self) -> MaterializationEvent:
+        return record_materialization_event(
+            surface=self.surface,
+            boundary=self.boundary,
+            operation=self.operation,
+            reason=self.reason,
+            detail=self.event_detail(),
+            d2h_transfer=self.d2h_transfer,
+            strict_disallowed=self.strict_disallowed,
+        )
+
+
 _MATERIALIZATION_EVENTS: deque[MaterializationEvent] = deque(maxlen=512)
 _MATERIALIZATION_CONTEXT: ContextVar[MaterializationContext | None] = ContextVar(
     "vibespatial_materialization_context",
@@ -126,6 +163,10 @@ def record_materialization_event(
     return event
 
 
+def record_native_export_boundary(boundary: NativeExportBoundary) -> MaterializationEvent:
+    return boundary.record()
+
+
 def get_materialization_events(*, clear: bool = False) -> list[MaterializationEvent]:
     events = list(_MATERIALIZATION_EVENTS)
     if clear:
@@ -141,10 +182,12 @@ __all__ = [
     "MaterializationBoundary",
     "MaterializationContext",
     "MaterializationEvent",
+    "NativeExportBoundary",
     "StrictNativeMaterializationError",
     "clear_materialization_events",
     "current_materialization_context",
     "get_materialization_events",
     "materialization_context",
     "record_materialization_event",
+    "record_native_export_boundary",
 ]

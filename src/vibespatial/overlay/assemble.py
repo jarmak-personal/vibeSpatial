@@ -28,6 +28,7 @@ from vibespatial.geometry.owned import (
     DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
+    seed_all_validity_cache,
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
 from vibespatial.runtime.config import SPATIAL_EPSILON
@@ -50,6 +51,16 @@ logger = logging.getLogger(__name__)
 def _sync_hotpath(runtime) -> None:
     if hotpath_trace_enabled():
         runtime.synchronize()
+
+
+def _device_int_scalar(value, *, reason: str) -> int:
+    host = get_cuda_runtime().copy_device_to_host(value, reason=reason)
+    return int(np.asarray(host).reshape(-1)[0])
+
+
+def _device_bool_scalar(value, *, reason: str) -> bool:
+    host = get_cuda_runtime().copy_device_to_host(value, reason=reason)
+    return bool(np.asarray(host).reshape(-1)[0])
 
 
 def _ring_segment_signatures_gpu(
@@ -229,6 +240,7 @@ def _build_device_backed_fixed_polygon_output(
                 empty_mask=cp.zeros(row_count, dtype=cp.bool_),
                 ring_offsets=cp.arange(0, (row_count + 1) * 5, 5, dtype=cp.int32),
                 bounds=None,
+                dense_single_ring_width=5,
             )
         },
         row_count=row_count,
@@ -238,6 +250,7 @@ def _build_device_backed_fixed_polygon_output(
         execution_mode="gpu",
     )
     result.runtime_history.append(runtime_selection)
+    seed_all_validity_cache(result)
     return result
 
 
@@ -281,6 +294,52 @@ def _axis_aligned_box_bounds(values: OwnedGeometryArray) -> np.ndarray | None:
             np.max(y[:, :4], axis=1),
         )
     ).astype(np.float64, copy=False)
+
+
+def _axis_aligned_box_bounds_device(values: OwnedGeometryArray):
+    """Return device bounds for dense rectangle polygons without host x/y export."""
+    if cp is None or values.device_state is None:
+        return None
+    if set(values.families) != {GeometryFamily.POLYGON}:
+        return None
+    device_buffer = values.device_state.families.get(GeometryFamily.POLYGON)
+    if device_buffer is None:
+        return None
+    row_count = int(values.row_count)
+    if row_count == 0:
+        return None
+    if int(device_buffer.geometry_offsets.size) != row_count + 1:
+        return None
+    if int(device_buffer.x.size) != row_count * 5 or int(device_buffer.y.size) != row_count * 5:
+        return None
+    if device_buffer.dense_single_ring_width != 5:
+        return None
+
+    x = cp.asarray(device_buffer.x).reshape(row_count, 5)
+    y = cp.asarray(device_buffer.y).reshape(row_count, 5)
+    closed = (cp.abs(x[:, 0] - x[:, 4]) <= SPATIAL_EPSILON) & (
+        cp.abs(y[:, 0] - y[:, 4]) <= SPATIAL_EPSILON
+    )
+    dx = cp.diff(x, axis=1)
+    dy = cp.diff(y, axis=1)
+    axis_aligned_edges = (cp.abs(dx) < SPATIAL_EPSILON) ^ (
+        cp.abs(dy) < SPATIAL_EPSILON
+    )
+    bounds = cp.column_stack(
+        (
+            cp.min(x[:, :4], axis=1),
+            cp.min(y[:, :4], axis=1),
+            cp.max(x[:, :4], axis=1),
+            cp.max(y[:, :4], axis=1),
+        )
+    )
+    nondegenerate = (bounds[:, 0] < bounds[:, 2]) & (bounds[:, 1] < bounds[:, 3])
+    if not _device_bool_scalar(
+        cp.all(closed & cp.all(axis_aligned_edges, axis=1) & nondegenerate),
+        reason="overlay rectangle fast-path box certification scalar fence",
+    ):
+        return None
+    return bounds
 
 
 def _build_polygon_output_from_faces_gpu(
@@ -524,8 +583,10 @@ def _build_polygon_output_from_faces_gpu(
         # Each ring needs edge_count + 1 coordinates (for closure)
         ring_coord_counts = d_ring_edge_counts + 1
         d_ring_coord_offsets = exclusive_sum(ring_coord_counts.astype(cp.int32, copy=False))
-        # Single scalar D->H read: total_coords = last_offset + last_count.
-        total_coords = int(cp.asnumpy(d_ring_coord_offsets[-1:] + ring_coord_counts[-1:])[0])  # zcopy:ok(allocation-fence: need total_coords to size d_out_x/d_out_y output buffers)
+        # Allocate by the known boundary-edge upper bound instead of copying
+        # the exact device sum to host. Invalid tiny cycles may leave unused
+        # tail slots, but downstream offsets reference only written coords.
+        total_coords = int(boundary_count + ring_count)
 
         # --- Step 7: Scatter ring coordinates via GPU kernel ---
         # Zero-fill to prevent denormalized garbage in unwritten positions if the
@@ -600,7 +661,10 @@ def _build_polygon_output_from_faces_gpu(
                 d_hole_coord_offsets_partial = exclusive_sum(d_hole_coord_counts.astype(cp.int32))
                 _last_offset = d_hole_coord_offsets_partial[-1:] + d_hole_coord_counts[-1:]
                 d_hole_coord_offsets = cp.concatenate([d_hole_coord_offsets_partial, _last_offset])
-                total_hole_coords = int(cp.asnumpy(_last_offset)[0])  # hygiene:ok(allocation-fence: need total_hole_coords to size d_hole_x/d_hole_y)
+                # Allocate by host-known face-edge capacity instead of
+                # synchronizing for the exact valid-hole coordinate total.
+                # Exact offsets below still delimit every referenced ring.
+                total_hole_coords = int(d_face_edge_ids_dev.size + n_valid_holes)
 
                 d_hole_x = cp.zeros(total_hole_coords, dtype=cp.float64)
                 d_hole_y = cp.zeros(total_hole_coords, dtype=cp.float64)
@@ -684,12 +748,18 @@ def _build_polygon_output_from_faces_gpu(
 
             d_hole_coord_counts = _d_hole_lengths + 1
             d_hole_offsets_compact = exclusive_sum(d_hole_coord_counts.astype(cp.int32))
-            total_hole_compact = int(cp.asnumpy(d_hole_offsets_compact[-1:])[0]) + int(cp.asnumpy(d_hole_coord_counts[-1:])[0])  # hygiene:ok(allocation-fence: need total_hole_compact to size compact gather buffers)
+            total_hole_compact = int(_d_hole_all_x.size)
 
             if total_hole_compact > 0:
                 slot_ids_h = cp.arange(total_hole_compact, dtype=cp.int32)
-                slot_ring_h = cp.searchsorted(d_hole_offsets_compact[1:], slot_ids_h, side="right").astype(cp.int32)
-                slot_local_h = slot_ids_h - d_hole_offsets_compact[slot_ring_h]
+                hole_used = d_hole_offsets_compact[-1:] + d_hole_coord_counts[-1:]
+                safe_slots_h = cp.minimum(slot_ids_h, hole_used[0] - 1)
+                slot_ring_h = cp.searchsorted(
+                    d_hole_offsets_compact[1:],
+                    safe_slots_h,
+                    side="right",
+                ).astype(cp.int32)
+                slot_local_h = safe_slots_h - d_hole_offsets_compact[slot_ring_h]
                 slot_src_h = _d_hole_starts[slot_ring_h] + slot_local_h
                 d_hole_compact_x = _d_hole_all_x[slot_src_h]
                 d_hole_compact_y = _d_hole_all_y[slot_src_h]
@@ -1055,20 +1125,20 @@ def _build_device_resident_polygon_output(
     # ring_indices[i] = the i-th ring in output order across all polygons.
     # Use vectorised expansion: repeat each polygon's ring range.
     ring_counts_per_poly = d_rings_per_poly.astype(cp.int32, copy=False)
-    total_output_rings = int(ring_counts_per_poly.sum(dtype=cp.int64).item())
+    total_output_rings = int(d_sorted_output_ids.size)
     if total_output_rings == 0:
         return _empty_polygon_output(runtime_selection, row_count=preserve_row_count or 0)
 
     # Build per-polygon -> row mapping: polygon p belongs to the row
     # determined by cumulative polys_per_row.
     # poly_to_row[p] = which output row polygon p belongs to.
-    poly_to_row = _expand_by_counts(d_polys_per_row)
+    poly_to_row = _expand_by_counts(d_polys_per_row, total=n_total_polys)
 
     # For each polygon, the rings in sorted_output_ids
     # are at positions [poly_starts[p], poly_starts[p]+rings_per_poly[p]).
     # Vectorised expansion: for each ring slot, compute which polygon it
     # belongs to and its offset within that polygon's ring list.
-    ring_poly_ids = _expand_by_counts(ring_counts_per_poly)
+    ring_poly_ids = _expand_by_counts(ring_counts_per_poly, total=total_output_rings)
     poly_ring_offsets_prefix = cp.zeros(n_total_polys + 1, dtype=cp.int32)
     cp.cumsum(ring_counts_per_poly, out=poly_ring_offsets_prefix[1:])
     ring_local_offsets = cp.arange(total_output_rings, dtype=cp.int32) - poly_ring_offsets_prefix[ring_poly_ids]
@@ -1092,13 +1162,15 @@ def _build_device_resident_polygon_output(
     ring_is_poly = poly_mask_per_polygon[ring_poly_ids]
     ring_is_mpoly = mpoly_mask_per_polygon[ring_poly_ids]
 
-    # Assign family tags and family_row_offsets (vectorised, no Python loop)
-    polygon_count = int(poly_row_mask.sum().item())
-    multipolygon_count = int(mpoly_row_mask.sum().item())
+    # Assign family tags and family_row_offsets (vectorised, no Python loop).
+    # Use compaction result cardinality instead of a separate device-sum fence.
+    poly_row_positions = cp.flatnonzero(poly_row_mask).astype(cp.int32, copy=False)
+    polygon_count = int(poly_row_positions.size)
+    multipolygon_count = int(n_output_rows) - polygon_count
     # Family-local sequential index: polygon rows get 0..polygon_count-1,
     # multipolygon rows get 0..multipolygon_count-1.
     if polygon_count > 0:
-        poly_rows = compact_row_ids[poly_row_mask]
+        poly_rows = compact_row_ids[poly_row_positions]
         family_row_offsets[poly_rows] = cp.arange(polygon_count, dtype=cp.int32)
         validity[poly_rows] = True
         tags[poly_rows] = poly_tag
@@ -1125,7 +1197,12 @@ def _build_device_resident_polygon_output(
         cp.cumsum(rings_per_family_poly, out=d_poly_geom_offsets[1:])
         # Vectorised coordinate gather
         d_poly_x, d_poly_y = _gather_coords_vectorised(
-            d_all_x, d_all_y, d_all_coord_offsets, poly_ring_order, poly_coord_counts,
+            d_all_x,
+            d_all_y,
+            d_all_coord_offsets,
+            poly_ring_order,
+            poly_coord_counts,
+            total_capacity=int(d_all_x.size),
         )
         device_families[GeometryFamily.POLYGON] = DeviceFamilyGeometryBuffer(
             family=GeometryFamily.POLYGON,
@@ -1139,6 +1216,7 @@ def _build_device_resident_polygon_output(
 
     if multipolygon_count > 0:
         # Extract multipolygon rings
+        mpoly_rows = compact_row_ids[mpoly_row_mask]
         mpoly_ring_indices = cp.flatnonzero(ring_is_mpoly).astype(cp.int32, copy=False)
         mpoly_ring_order = all_ring_order[mpoly_ring_indices]
         mpoly_coord_counts = all_ring_coord_counts[mpoly_ring_indices]
@@ -1158,7 +1236,6 @@ def _build_device_resident_polygon_output(
         mpoly_row_indices = compact_row_ids[poly_to_row[mpoly_polygons]]
         # Map row indices to family-local multipolygon index
         mpoly_row_to_family = cp.full(output_row_count, -1, dtype=cp.int32)
-        mpoly_rows = compact_row_ids[mpoly_row_mask]
         mpoly_row_to_family[mpoly_rows] = cp.arange(multipolygon_count, dtype=cp.int32)
         mpoly_family_ids = mpoly_row_to_family[mpoly_row_indices]
         parts_per_geom = cp.bincount(mpoly_family_ids, minlength=multipolygon_count).astype(cp.int32, copy=False)
@@ -1166,7 +1243,12 @@ def _build_device_resident_polygon_output(
         cp.cumsum(parts_per_geom, out=d_mpoly_geom_offsets[1:])
         # Vectorised coordinate gather
         d_mpoly_x, d_mpoly_y = _gather_coords_vectorised(
-            d_all_x, d_all_y, d_all_coord_offsets, mpoly_ring_order, mpoly_coord_counts,
+            d_all_x,
+            d_all_y,
+            d_all_coord_offsets,
+            mpoly_ring_order,
+            mpoly_coord_counts,
+            total_capacity=int(d_all_x.size),
         )
         device_families[GeometryFamily.MULTIPOLYGON] = DeviceFamilyGeometryBuffer(
             family=GeometryFamily.MULTIPOLYGON,
@@ -1188,6 +1270,8 @@ def _build_device_resident_polygon_output(
         execution_mode="gpu",
     )
     result.runtime_history.append(runtime_selection)
+    if preserve_row_count is None or int(n_output_rows) == output_row_count:
+        seed_all_validity_cache(result)
     return result
 
 
@@ -1197,6 +1281,8 @@ def _gather_coords_vectorised(
     d_all_coord_offsets: cp.ndarray,
     ring_order: cp.ndarray,
     coord_counts: cp.ndarray,
+    *,
+    total_capacity: int | None = None,
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """Vectorised coordinate gather: build flat index array without Python loops.
 
@@ -1205,29 +1291,58 @@ def _gather_coords_vectorised(
     """
     if ring_order.size == 0:
         return cp.empty(0, dtype=cp.float64), cp.empty(0, dtype=cp.float64)
-    total_coords = int(coord_counts.sum(dtype=cp.int64).item())
+    total_coords = (
+        _device_int_scalar(
+            coord_counts.sum(dtype=cp.int64),
+            reason="overlay assemble coordinate-gather total-coords allocation fence",
+        )
+        if total_capacity is None
+        else int(total_capacity)
+    )
     # Build per-ring start positions in source coordinate array
     ring_starts = d_all_coord_offsets[ring_order].astype(cp.int64, copy=False)
     # Expand: for each coordinate slot, compute source index.
     # slot_ring[i] = which ring does coordinate slot i belong to?
     ring_offsets = cp.zeros(int(ring_order.size) + 1, dtype=cp.int64)
     cp.cumsum(coord_counts.astype(cp.int64, copy=False), out=ring_offsets[1:])
-    slot_ring = _expand_by_counts(coord_counts.astype(cp.int32, copy=False))
-    slot_local = cp.arange(total_coords, dtype=cp.int64) - ring_offsets[slot_ring]
+    slots = cp.arange(total_coords, dtype=cp.int64)
+    if total_capacity is not None:
+        # The caller deliberately overallocates to avoid an exact allocation
+        # fence.  Keep unused tail slots in-bounds by repeating the last valid
+        # coordinate; offsets prevent the tail from becoming geometry data.
+        slots = cp.minimum(slots, ring_offsets[-1] - 1)
+    slot_ring = _expand_by_counts(
+        coord_counts.astype(cp.int32, copy=False),
+        total=total_coords,
+        slots=slots,
+    )
+    slot_local = slots - ring_offsets[slot_ring]
     d_gather = ring_starts[slot_ring] + slot_local
     return d_all_x[d_gather], d_all_y[d_gather]
 
 
-def _expand_by_counts(counts: cp.ndarray) -> cp.ndarray:
+def _expand_by_counts(
+    counts: cp.ndarray,
+    *,
+    total: int | None = None,
+    slots: cp.ndarray | None = None,
+) -> cp.ndarray:
     """Return the repeated source index for each slot implied by ``counts``."""
     if counts.size == 0:
         return cp.empty(0, dtype=cp.int32)
-    total = int(counts.sum(dtype=cp.int64).item())
+    if total is None:
+        total = _device_int_scalar(
+            counts.sum(dtype=cp.int64),
+            reason="overlay assemble expand-by-counts total allocation fence",
+        )
+    else:
+        total = int(total)
     if total == 0:
         return cp.empty(0, dtype=cp.int32)
     offsets = cp.zeros(int(counts.size) + 1, dtype=cp.int64)
     cp.cumsum(counts.astype(cp.int64, copy=False), out=offsets[1:])
-    slots = cp.arange(total, dtype=cp.int64)
+    if slots is None:
+        slots = cp.arange(total, dtype=cp.int64)
     return cp.searchsorted(offsets[1:], slots, side="right").astype(cp.int32, copy=False)
 
 
@@ -1239,8 +1354,12 @@ def _overlay_intersection_rectangles_gpu(
 ) -> OwnedGeometryArray | None:
     if cp is None or left.row_count != right.row_count:
         return None
-    left_bounds = _axis_aligned_box_bounds(left)
-    right_bounds = _axis_aligned_box_bounds(right)
+    left_bounds = _axis_aligned_box_bounds_device(left)
+    right_bounds = _axis_aligned_box_bounds_device(right)
+    if left_bounds is None:
+        left_bounds = _axis_aligned_box_bounds(left)
+    if right_bounds is None:
+        right_bounds = _axis_aligned_box_bounds(right)
     if left_bounds is None or right_bounds is None:
         return None
 

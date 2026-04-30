@@ -65,6 +65,58 @@ class TestSpatialOverlayIntersection:
         assert result._tags is None
         assert result._family_row_offsets is None
 
+    def test_rectangle_fast_path_uses_device_box_bounds(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        strict_device_guard,
+    ):
+        """Device-only rectangle inputs should not materialize host coordinates."""
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+        cp = pytest.importorskip("cupy")
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+
+        left = from_shapely_geometries(
+            [box(0, 0, 2, 2), box(10, 10, 11, 11)],
+            residency=Residency.DEVICE,
+        ).take(cp.asarray([0], dtype=cp.int64))
+        right = from_shapely_geometries(
+            [box(1, 1, 3, 3), box(20, 20, 21, 21)],
+            residency=Residency.DEVICE,
+        ).take(cp.asarray([0], dtype=cp.int64))
+
+        monkeypatch.setattr(
+            left,
+            "_ensure_host_state",
+            lambda: pytest.fail("left rectangle detector should stay on device"),
+        )
+        monkeypatch.setattr(
+            right,
+            "_ensure_host_state",
+            lambda: pytest.fail("right rectangle detector should stay on device"),
+        )
+
+        reset_d2h_transfer_count()
+        get_d2h_transfer_events(clear=True)
+        result = _overlay_intersection_rectangles_gpu(
+            left,
+            right,
+            requested=ExecutionMode.GPU,
+        )
+        events = get_d2h_transfer_events(clear=True)
+
+        assert result is not None
+        assert result.residency is Residency.DEVICE
+        assert result.row_count == 1
+        assert [event.reason for event in events] == [
+            "overlay rectangle fast-path box certification scalar fence",
+            "overlay rectangle fast-path box certification scalar fence",
+        ]
+        assert sum(event.bytes_transferred for event in events) <= 2
+
     def test_many_left_vs_one_right_clip(self):
         """10 polygons clipped against 1 larger polygon (vegetation-corridor pattern)."""
         # Create 10 small squares spread across x=[0..10], y=[0..1]

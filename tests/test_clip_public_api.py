@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import importlib
 import math
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -29,6 +31,56 @@ from vibespatial.runtime.residency import Residency
 from vibespatial.testing import strict_native_environment
 
 clip_module = importlib.import_module("vibespatial.api.tools.clip")
+
+
+def test_clip_public_tool_has_no_raw_cupy_scalar_syncs() -> None:
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "vibespatial"
+        / "api"
+        / "tools"
+        / "clip.py"
+    )
+    tree = ast.parse(path.read_text(), filename=str(path))
+    failures: list[str] = []
+
+    cupy_reductions = {
+        "all",
+        "any",
+        "sum",
+        "count_nonzero",
+        "max",
+        "min",
+        "nanmax",
+        "nanmin",
+    }
+
+    def _contains_cupy_reduction(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == "cp"
+            and child.func.attr in cupy_reductions
+            for child in ast.walk(node)
+        )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "item":
+            failures.append(f"raw .item() at line {node.lineno}")
+        if (
+            isinstance(func, ast.Name)
+            and func.id in {"bool", "int", "float"}
+            and node.args
+            and _contains_cupy_reduction(node.args[0])
+        ):
+            failures.append(f"raw {func.id}(cp reduction) at line {node.lineno}")
+
+    assert failures == []
 
 
 def _materialize_native_clip_result(
@@ -327,7 +379,7 @@ def test_clip_mask_covering_source_bounds_passthrough_drops_empty_rows() -> None
         },
         crs="EPSG:3857",
     )
-    mask = Polygon([(0.5, -2.0), (4.0, 0.5), (0.5, 4.0), (-2.0, 0.5), (0.5, -2.0)])
+    mask = box(-1.0, -1.0, 2.0, 2.0)
 
     vibespatial.clear_dispatch_events()
     result = clip(gdf, mask)
@@ -342,6 +394,48 @@ def test_clip_mask_covering_source_bounds_passthrough_drops_empty_rows() -> None
         and "kept_rows=1" in event.detail
         for event in dispatch_events
     )
+
+
+def test_clip_mask_covering_source_bounds_uses_native_state_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.api._native_state import attach_native_state_from_native_tabular_result
+
+    owned = from_shapely_geometries([box(0.0, 0.0, 1.0, 1.0), Polygon()])
+    gdf = vibespatial.GeoDataFrame(
+        {
+            "value": [1, 2],
+            "geometry": vibespatial.GeoSeries(
+                GeometryArray.from_owned(owned, crs="EPSG:3857"),
+                name="geometry",
+            ),
+        },
+        crs="EPSG:3857",
+    )
+    attach_native_state_from_native_tabular_result(
+        gdf,
+        clip_module._spatial_to_native_tabular_result(gdf),
+    )
+    mask = box(-1.0, -1.0, 2.0, 2.0)
+
+    monkeypatch.setattr(
+        clip_module,
+        "_take_spatial_rows",
+        lambda *_args, **_kwargs: pytest.fail(
+            "native mask-cover passthrough should take NativeFrameState directly"
+        ),
+    )
+    monkeypatch.setattr(
+        GeometryArray,
+        "is_empty",
+        property(lambda self: pytest.fail("owned structural metadata should decide empties")),
+    )
+
+    native_result = clip_module.evaluate_geopandas_clip_native(gdf, mask)
+
+    assert native_result.geometry.owned is not None
+    assert native_result.geometry.owned.row_count == 1
+    assert native_result.attributes.to_pandas()["value"].tolist() == [1]
 
 
 def test_clip_polygon_mask_keep_geom_type_sort_false_strict_preserves_input_order() -> None:
@@ -652,6 +746,123 @@ def test_clip_polygon_mask_exact_stage_skips_predicate_rejects(
 
     assert exact_row_counts == [2]
     assert list(result["row"]) == [0, 1, 3]
+
+
+def test_clip_polygon_mask_predicate_split_exports_rowsets_not_full_bool_masks() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+
+    gdf = vibespatial.GeoDataFrame(
+        {"row": [0, 1, 2, 3]},
+        geometry=vibespatial.GeoSeries(
+            [
+                box(0.1, 0.1, 0.9, 0.9),
+                box(0.5, 0.5, 1.5, 1.5),
+                box(2.0, 2.0, 2.5, 2.5),
+                box(3.0, 0.2, 4.0, 0.8),
+            ],
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+    mask = Polygon(
+        [
+            (0.0, 0.0),
+            (3.0, 0.0),
+            (3.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 3.0),
+            (0.0, 3.0),
+            (0.0, 0.0),
+        ]
+    )
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    clear_materialization_events()
+
+    result = clip(gdf, mask, sort=False)
+    runtime_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    materialization_surfaces = {
+        event.surface for event in get_materialization_events(clear=True)
+    }
+
+    assert list(result["row"]) == [0, 1, 3]
+    assert "binary predicate fused predicate-results host export" not in runtime_reasons
+    assert "vibespatial.api.tools.clip.polygon_mask_inside_rows::rowset_to_host" in runtime_reasons
+    assert "vibespatial.api.tools.clip.polygon_mask_exact_rows::rowset_to_host" in runtime_reasons
+    assert {
+        "vibespatial.api.tools.clip.polygon_mask_inside_rows",
+        "vibespatial.api.tools.clip.polygon_mask_exact_rows",
+    }.issubset(materialization_surfaces)
+
+
+def test_clip_polygon_single_mask_split_exports_rowsets_not_full_bool_mask() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+
+    gdf = vibespatial.GeoDataFrame(
+        {"row": [0, 1, 2, 3]},
+        geometry=vibespatial.GeoSeries(
+            [
+                box(0.1, 0.1, 0.8, 0.8),
+                box(2.0, 0.2, 3.0, 0.8),
+                box(0.2, 2.0, 0.8, 3.0),
+                box(2.0, 2.0, 3.0, 3.0),
+            ],
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+    mask = Polygon(
+        [
+            (0.0, 0.0),
+            (4.0, 0.0),
+            (4.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 4.0),
+            (0.0, 4.0),
+            (0.0, 0.0),
+        ]
+    )
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    clear_materialization_events()
+
+    result = clip(gdf, mask, sort=False)
+    runtime_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    materialization_surfaces = {
+        event.surface for event in get_materialization_events(clear=True)
+    }
+
+    assert set(result["row"]) == {0, 1, 2}
+    assert "binary predicate covered-by single-mask result host export" not in runtime_reasons
+    assert (
+        "vibespatial.api.tools.clip.polygon_single_mask_inside_rows::rowset_to_host"
+        in runtime_reasons
+    )
+    assert (
+        "vibespatial.api.tools.clip.polygon_single_mask_remaining_rows::rowset_to_host"
+        in runtime_reasons
+    )
+    assert {
+        "vibespatial.api.tools.clip.polygon_single_mask_inside_rows",
+        "vibespatial.api.tools.clip.polygon_single_mask_remaining_rows",
+        "vibespatial.api.tools.clip.polygon_single_mask_exact_local_rows",
+    }.issubset(materialization_surfaces)
 
 
 def test_clip_records_fallback_before_line_make_valid(
@@ -1208,6 +1419,44 @@ def test_clip_polygon_mask_preserves_boundary_touch_rows_and_exact_dimension() -
     assert result_by_id == expected_by_id
 
 
+def test_clip_polygon_mask_reuses_correction_boundary_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime required for device-backed clip materialization canary")
+
+    mask = _benchmark_admin_star_mask()
+    owned = from_shapely_geometries(
+        [
+            box(390.0, 320.0, 400.0, 330.0),
+            box(670.0, 390.0, 680.0, 400.0),
+            box(600.0, 670.0, 610.0, 680.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+    gdf = vibespatial.GeoDataFrame(
+        {
+            "building_id": [3239, 3967, 6760],
+            "geometry": DeviceGeometryArray._from_owned(owned, crs="EPSG:4326"),
+        },
+        crs="EPSG:4326",
+    )
+    materialized_rows: list[int] = []
+    original_array = DeviceGeometryArray.__array__
+
+    def _record_array(self, dtype=None, copy=None):
+        materialized_rows.append(len(self))
+        return original_array(self, dtype=dtype, copy=copy)
+
+    monkeypatch.setattr(DeviceGeometryArray, "__array__", _record_array)
+
+    result = clip(gdf, mask)
+
+    assert len(result) == 3
+    assert materialized_rows == [3]
+    assert all(rows == 3 for rows in materialized_rows)
+
+
 def test_clip_rectangle_filter_avoids_device_array_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1239,6 +1488,56 @@ def test_clip_rectangle_filter_avoids_device_array_materialization(
     monkeypatch.setattr(DeviceGeometryArray, "__array__", _fail)
 
     result = clip(gdf, box(0.0, 0.0, 6.0, 6.0))
+
+    assert list(result["value"]) == [1, 2]
+    assert isinstance(result.geometry.values, DeviceGeometryArray)
+
+
+def test_clip_device_backed_routing_avoids_public_frame_metadata_exports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        return
+
+    def _fail_public_metadata(self):
+        raise AssertionError("clip routing must use private native geometry metadata")
+
+    monkeypatch.setattr(vibespatial.GeoDataFrame, "geom_type", property(_fail_public_metadata))
+    monkeypatch.setattr(vibespatial.GeoDataFrame, "total_bounds", property(_fail_public_metadata))
+    monkeypatch.setattr(vibespatial.GeoSeries, "geom_type", property(_fail_public_metadata))
+    monkeypatch.setattr(vibespatial.GeoSeries, "total_bounds", property(_fail_public_metadata))
+
+    source = vibespatial.GeoDataFrame(
+        {
+            "value": [1, 2, 3],
+            "geometry": DeviceGeometryArray._from_owned(
+                from_shapely_geometries(
+                    [
+                        box(0.0, 0.0, 2.0, 2.0),
+                        box(3.0, 3.0, 5.0, 5.0),
+                        box(10.0, 10.0, 12.0, 12.0),
+                    ],
+                    residency=Residency.DEVICE,
+                ),
+                crs="EPSG:3857",
+            ),
+        },
+        crs="EPSG:3857",
+    )
+    mask = vibespatial.GeoDataFrame(
+        {
+            "geometry": DeviceGeometryArray._from_owned(
+                from_shapely_geometries(
+                    [box(0.0, 0.0, 6.0, 6.0)],
+                    residency=Residency.DEVICE,
+                ),
+                crs="EPSG:3857",
+            )
+        },
+        crs="EPSG:3857",
+    )
+
+    result = clip(source, mask)
 
     assert list(result["value"]) == [1, 2]
     assert isinstance(result.geometry.values, DeviceGeometryArray)
@@ -2505,6 +2804,53 @@ def test_clip_polygon_partition_polygon_mask_mixed_inside_and_exact_positive_ski
     actual = shapely.normalize(np.asarray(result, dtype=object))
     expected = shapely.normalize(np.asarray(expected_owned.to_shapely(), dtype=object))
     assert [geom.wkb for geom in actual] == [geom.wkb for geom in expected]
+
+
+def test_clip_semantically_clean_owned_part_skips_valid_nonempty_host_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime required for device clip mask canary")
+
+    native_results_module = importlib.import_module("vibespatial.api._native_results")
+    owned = from_shapely_geometries(
+        [box(0.0, 0.0, 1.0, 1.0), box(2.0, 2.0, 3.0, 3.0)],
+        residency=Residency.DEVICE,
+    )
+    owned._clip_semantically_clean = True
+    values = DeviceGeometryArray._from_owned(owned, crs="EPSG:3857")
+    source = vibespatial.GeoDataFrame(
+        {"value": [1, 2], "geometry": values},
+        crs="EPSG:3857",
+    )
+    part = clip_module._clip_native_part(
+        source,
+        np.asarray([0, 1], dtype=np.intp),
+        values,
+    )
+
+    real_host_array = native_results_module._host_array
+
+    def _guard_host_array(values, *args, **kwargs):
+        if kwargs.get("operation") == "clip_valid_nonempty_mask_to_host":
+            raise AssertionError(
+                "semantically clean clip fragments should not recopy a valid/non-empty mask"
+            )
+        return real_host_array(values, *args, **kwargs)
+
+    monkeypatch.setattr(native_results_module, "_host_array", _guard_host_array)
+
+    result = native_results_module._clip_constructive_parts_to_native_tabular_result(
+        source=source,
+        parts=(part,),
+        ordered_row_positions=np.asarray([0, 1], dtype=np.intp),
+        clipping_by_rectangle=False,
+        has_non_point_candidates=True,
+        keep_geom_type=False,
+    )
+
+    assert result.geometry.owned is not None
+    assert result.provenance.source_rows.tolist() == [0, 1]
 
 
 def test_clip_polygon_keep_geom_type_true_skips_boundary_reconstruction(

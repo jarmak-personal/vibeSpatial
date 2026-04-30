@@ -394,6 +394,7 @@ def test_device_scatter_repaired_remaps_mixed_family_outputs(strict_device_guard
     import cupy as cp
 
     from vibespatial.constructive.make_valid_gpu import _device_scatter_repaired
+    from vibespatial.cuda._runtime import get_cuda_runtime
     from vibespatial.geometry.owned import TAG_FAMILIES
     from vibespatial.runtime.residency import Residency
 
@@ -430,8 +431,19 @@ def test_device_scatter_repaired_remaps_mixed_family_outputs(strict_device_guard
     polygon_tag = next(tag for tag, family in TAG_FAMILIES.items() if family.value == "polygon")
     multipolygon_tag = next(tag for tag, family in TAG_FAMILIES.items() if family.value == "multipolygon")
 
-    assert bool(cp.all(state.tags == cp.asarray([polygon_tag, multipolygon_tag], dtype=cp.int8)))
-    assert bool(cp.all(state.family_row_offsets == cp.asarray([0, 0], dtype=cp.int32)))
+    runtime = get_cuda_runtime()
+    tags_match = runtime.copy_device_to_host(
+        cp.asarray(
+            cp.all(state.tags == cp.asarray([polygon_tag, multipolygon_tag], dtype=cp.int8)),
+        ).reshape(1),
+        reason="test make-valid mixed-family tag assertion scalar fence",
+    )
+    fro_match = runtime.copy_device_to_host(
+        cp.asarray(cp.all(state.family_row_offsets == cp.asarray([0, 0], dtype=cp.int32))).reshape(1),
+        reason="test make-valid mixed-family row-offset assertion scalar fence",
+    )
+    assert bool(np.asarray(tags_match).reshape(-1)[0])
+    assert bool(np.asarray(fro_match).reshape(-1)[0])
     assert polygon_count == 1
     assert multipolygon_count == 1
 

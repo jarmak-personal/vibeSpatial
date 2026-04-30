@@ -11,6 +11,9 @@ Validates that the device-side k-NN query:
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pytest
 import shapely
@@ -21,6 +24,81 @@ from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
 from vibespatial.runtime import has_gpu_runtime
 
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+
+
+def test_device_knn_runtime_d2h_exports_are_operation_named() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "src" / "vibespatial" / "spatial" / "spatial_index_knn_device.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+
+    def _contains_cupy_reduction(node: ast.AST) -> bool:
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "cp"
+            and node.func.attr in {"any", "all", "sum", "count_nonzero", "max", "min"}
+        ):
+            return True
+        return any(_contains_cupy_reduction(child) for child in ast.iter_child_nodes(node))
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "copy_device_to_host"
+            and not any(keyword.arg == "reason" for keyword in node.keywords)
+        ):
+            offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}")
+        if isinstance(func, ast.Attribute) and func.attr == "item":
+            offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}: .item()")
+        if (
+            isinstance(func, ast.Name)
+            and func.id in {"bool", "int", "float"}
+            and node.args
+            and _contains_cupy_reduction(node.args[0])
+        ):
+            offenders.append(
+                f"{path.relative_to(repo_root)}:{node.lineno}: {func.id}(cp.*)"
+            )
+    assert offenders == []
+
+
+@requires_gpu
+def test_knn_device_bounds_extent_fence_is_operation_named():
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
+    from vibespatial.spatial.spatial_index_knn_device import spatial_index_knn_device
+
+    tree_geoms = _make_grid_points(4, 4)
+    query_geoms = _make_points([(0.25, 0.25), (3.75, 3.75)])
+
+    query_owned = from_shapely_geometries(query_geoms)
+    tree_owned = from_shapely_geometries(tree_geoms)
+    query_bounds = compute_geometry_bounds_device(query_owned)
+    tree_bounds = compute_geometry_bounds_device(tree_owned)
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    result = spatial_index_knn_device(
+        query_owned,
+        tree_owned,
+        query_bounds,
+        tree_bounds,
+        k=1,
+    )
+    events = get_d2h_transfer_events(clear=True)
+
+    assert result is not None
+    assert "spatial index kNN unbounded extent scalar fence" in {
+        event.reason for event in events
+    }
 
 
 # ---------------------------------------------------------------------------

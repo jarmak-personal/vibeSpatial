@@ -8,6 +8,7 @@ from shapely.geometry import MultiPoint, box
 from shapely.geometry.base import BaseGeometry
 
 from vibespatial.api.geometry_array import GeometryDtype, points_from_xy
+from vibespatial.runtime.residency import Residency
 
 from . import _compat as compat
 
@@ -34,6 +35,92 @@ def is_geometry_type(data):
         return True
     else:
         return False
+
+
+def _active_geometry_values(obj):
+    if isinstance(obj, Series):
+        return getattr(obj, "values", None)
+    try:
+        geometry = obj.geometry
+    except Exception:
+        return None
+    return getattr(geometry, "values", None)
+
+
+def _native_display_export_payload(obj):
+    try:
+        from vibespatial.api._native_state import get_native_state
+
+        state = get_native_state(obj)
+    except Exception:
+        state = None
+
+    values = _active_geometry_values(obj)
+    owned = getattr(values, "owned", None)
+    if owned is None:
+        owned = getattr(values, "_owned", None)
+
+    dtype_name = getattr(getattr(values, "dtype", None), "name", None)
+    native_geometry = owned is not None or dtype_name == "device_geometry"
+    if state is None and not native_geometry:
+        return None
+
+    row_count = len(obj)
+    byte_count = getattr(values, "nbytes", None)
+    detail_parts = []
+    d2h_transfer = False
+    if state is not None:
+        state_residency = getattr(getattr(state, "residency", None), "value", None)
+        detail_parts.append(f"state_residency={state_residency or 'unknown'}")
+        detail_parts.append(f"state_geometry={getattr(state, 'geometry_name', 'geometry')}")
+        d2h_transfer = state.residency is Residency.DEVICE
+    if owned is not None:
+        owned_residency = getattr(getattr(owned, "residency", None), "value", None)
+        detail_parts.append(f"geometry_residency={owned_residency or 'unknown'}")
+        d2h_transfer = d2h_transfer or owned.residency is Residency.DEVICE
+    elif dtype_name is not None:
+        detail_parts.append(f"geometry_dtype={dtype_name}")
+
+    return row_count, byte_count, d2h_transfer, ", ".join(detail_parts)
+
+
+def _record_native_public_export_boundary(
+    obj,
+    *,
+    surface: str,
+    operation: str,
+    target: str,
+    reason: str,
+) -> None:
+    payload = _native_display_export_payload(obj)
+    if payload is None:
+        return
+    row_count, byte_count, d2h_transfer, detail = payload
+    from vibespatial.runtime.materialization import (
+        NativeExportBoundary,
+        record_native_export_boundary,
+    )
+
+    record_native_export_boundary(NativeExportBoundary(
+        surface=surface,
+        operation=operation,
+        target=target,
+        reason=reason,
+        row_count=row_count,
+        byte_count=byte_count,
+        detail=detail,
+        d2h_transfer=d2h_transfer,
+    ))
+
+
+def _record_native_display_export(obj, *, surface: str, operation: str, target: str) -> None:
+    _record_native_public_export_boundary(
+        obj,
+        surface=surface,
+        operation=operation,
+        target=target,
+        reason="native public object exported for display representation",
+    )
 
 
 def _delegate_binary_method(op, this, other, align, *args, **kwargs):
@@ -96,6 +183,14 @@ def _binary_op(op, this, other, align, *args, **kwargs):
     # type: (str, GeoSeries, GeoSeries, args/kwargs) -> Series[bool/float]
     """Binary operation on GeoSeries objects that returns a Series."""
     data, index = _delegate_binary_method(op, this, other, align, *args, **kwargs)
+    surface_owner = this.__class__.__name__
+    _record_native_public_export_boundary(
+        this,
+        surface=f"vibespatial.api.{surface_owner}.{op}",
+        operation=f"{surface_owner.lower()}_{op}",
+        target="series",
+        reason=f"native {surface_owner} binary operation exported to public Series",
+    )
     return Series(data, index=index)
 
 
@@ -108,6 +203,14 @@ def _delegate_property(op, this):
 
         return GeoSeries(data, index=this.index, crs=this.crs)
     else:
+        surface_owner = this.__class__.__name__
+        _record_native_public_export_boundary(
+            this,
+            surface=f"vibespatial.api.{surface_owner}.{op}",
+            operation=f"{surface_owner.lower()}_{op}",
+            target="series",
+            reason=f"native {surface_owner} geometry property exported to public Series",
+        )
         return Series(data, index=this.index)
 
 
@@ -5314,6 +5417,14 @@ GeometryCollection
         1  POLYGON ((0 0, 1 1, 1 0, 0 0))   0.0   0.0   1.0   1.0
         2           LINESTRING (0 1, 1 2)   0.0   1.0   1.0   2.0
         """
+        surface_owner = self.__class__.__name__
+        _record_native_public_export_boundary(
+            self,
+            surface=f"vibespatial.api.{surface_owner}.bounds",
+            operation=f"{surface_owner.lower()}_bounds",
+            target="dataframe",
+            reason=f"native {surface_owner} bounds exported to public DataFrame",
+        )
         bounds = self.geometry.values.bounds
         return DataFrame(
             bounds, columns=["minx", "miny", "maxx", "maxy"], index=self.index
@@ -5336,6 +5447,14 @@ GeometryCollection
         >>> gdf.total_bounds
         array([ 0., -1.,  3.,  2.])
         """
+        surface_owner = self.__class__.__name__
+        _record_native_public_export_boundary(
+            self,
+            surface=f"vibespatial.api.{surface_owner}.total_bounds",
+            operation=f"{surface_owner.lower()}_total_bounds",
+            target="numpy",
+            reason=f"native {surface_owner} total bounds exported to public NumPy array",
+        )
         return self.geometry.values.total_bounds
 
     @property

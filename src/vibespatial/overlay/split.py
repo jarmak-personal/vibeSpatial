@@ -21,7 +21,6 @@ import numpy as np
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
-    count_scatter_totals,
     get_cuda_runtime,
 )
 from vibespatial.cuda.cccl_primitives import (
@@ -527,13 +526,13 @@ def build_gpu_split_events(
 
         with hotpath_stage("overlay.split.prefix_pair_events", category="sort"):
             pair_offsets = exclusive_sum(pair_counts)
-            pair_event_count = 0
+            pair_event_capacity = int(result.count) * 4
         extra_source_ids = None
         extra_t = None
         extra_x = None
         extra_y = None
         extra_keys = None
-        rr_pair_event_count = 0
+        rr_pair_event_capacity = 0
         rr_count = 0
         rr_pair_counts = None
         rr_pair_offsets = None
@@ -614,33 +613,17 @@ def build_gpu_split_events(
 
                         with hotpath_stage("overlay.split.prefix_right_right_events", category="sort"):
                             rr_pair_offsets = exclusive_sum(rr_pair_counts)
-                            rr_pair_event_count = 0
+                            rr_pair_event_capacity = int(rr_count) * 4
                 except Exception as exc:
                     raise RuntimeError(
                         f"overlay split grouped right-right event pipeline failed: {type(exc).__name__}: {exc}"
                     ) from exc
 
-            with hotpath_stage("overlay.split.resolve_pair_event_totals", category="sort"):
-                total_pairs = []
-                pair_total_slot = None
-                rr_total_slot = None
-                if int(result.count):
-                    pair_total_slot = len(total_pairs)
-                    total_pairs.append((pair_counts, pair_offsets))
-                if rr_pair_counts is not None and rr_pair_offsets is not None and rr_count:
-                    rr_total_slot = len(total_pairs)
-                    total_pairs.append((rr_pair_counts, rr_pair_offsets))
-                total_values = count_scatter_totals(runtime, total_pairs)
-                if pair_total_slot is not None:
-                    pair_event_count = total_values[pair_total_slot]
-                if rr_total_slot is not None:
-                    rr_pair_event_count = total_values[rr_total_slot]
-
-            extra_source_ids = runtime.allocate((pair_event_count,), np.int32)
-            extra_t = runtime.allocate((pair_event_count,), np.float64)
-            extra_x = runtime.allocate((pair_event_count,), np.float64)
-            extra_y = runtime.allocate((pair_event_count,), np.float64)
-            extra_keys = runtime.allocate((pair_event_count,), np.uint64)
+            extra_source_ids = runtime.allocate((pair_event_capacity,), np.int32)
+            extra_t = runtime.allocate((pair_event_capacity,), np.float64)
+            extra_x = runtime.allocate((pair_event_capacity,), np.float64)
+            extra_y = runtime.allocate((pair_event_capacity,), np.float64)
+            extra_keys = runtime.allocate((pair_event_capacity,), np.uint64)
 
             scatter_params = (
                 (
@@ -711,12 +694,12 @@ def build_gpu_split_events(
 
             if rr_pair_offsets is not None and rr_count:
                 rr_extra_source_ids_raw = runtime.allocate(
-                    (rr_pair_event_count,), np.int32,
+                    (rr_pair_event_capacity,), np.int32,
                 )
-                rr_extra_t = runtime.allocate((rr_pair_event_count,), np.float64)
-                rr_extra_x = runtime.allocate((rr_pair_event_count,), np.float64)
-                rr_extra_y = runtime.allocate((rr_pair_event_count,), np.float64)
-                rr_extra_keys_raw = runtime.allocate((rr_pair_event_count,), np.uint64)
+                rr_extra_t = runtime.allocate((rr_pair_event_capacity,), np.float64)
+                rr_extra_x = runtime.allocate((rr_pair_event_capacity,), np.float64)
+                rr_extra_y = runtime.allocate((rr_pair_event_capacity,), np.float64)
+                rr_extra_keys_raw = runtime.allocate((rr_pair_event_capacity,), np.uint64)
 
                 rr_scatter_params = (
                     (
@@ -794,17 +777,45 @@ def build_gpu_split_events(
 
             try:
                 with hotpath_stage("overlay.split.concat_events", category="emit"):
-                    event_source_ids = [endpoint_source_ids, extra_source_ids]
-                    event_t = [endpoint_t, extra_t]
-                    event_x = [endpoint_x, extra_x]
-                    event_y = [endpoint_y, extra_y]
-                    event_keys = [endpoint_keys, extra_keys]
-                    if rr_event_source_ids is not None:
-                        event_source_ids.append(rr_event_source_ids)
-                        event_t.append(rr_extra_t)
-                        event_x.append(rr_extra_x)
-                        event_y.append(rr_extra_y)
-                        event_keys.append(rr_event_keys)
+                    event_source_ids = [endpoint_source_ids]
+                    event_t = [endpoint_t]
+                    event_x = [endpoint_x]
+                    event_y = [endpoint_y]
+                    event_keys = [endpoint_keys]
+                    if pair_event_capacity:
+                        pair_live_total = (
+                            pair_offsets[-1].astype(cp.int32, copy=False)
+                            + pair_counts[-1].astype(cp.int32, copy=False)
+                        )
+                        pair_live_slots = cp.arange(
+                            pair_event_capacity,
+                            dtype=cp.int32,
+                        ) < pair_live_total
+                        pair_live_indices = compact_indices(
+                            pair_live_slots.astype(cp.uint8, copy=False),
+                        ).values
+                        event_source_ids.append(extra_source_ids[pair_live_indices])
+                        event_t.append(extra_t[pair_live_indices])
+                        event_x.append(extra_x[pair_live_indices])
+                        event_y.append(extra_y[pair_live_indices])
+                        event_keys.append(extra_keys[pair_live_indices])
+                    if rr_event_source_ids is not None and rr_pair_event_capacity:
+                        rr_live_total = (
+                            rr_pair_offsets[-1].astype(cp.int32, copy=False)
+                            + rr_pair_counts[-1].astype(cp.int32, copy=False)
+                        )
+                        rr_live_slots = cp.arange(
+                            rr_pair_event_capacity,
+                            dtype=cp.int32,
+                        ) < rr_live_total
+                        rr_live_indices = compact_indices(
+                            rr_live_slots.astype(cp.uint8, copy=False),
+                        ).values
+                        event_source_ids.append(rr_event_source_ids[rr_live_indices])
+                        event_t.append(rr_extra_t[rr_live_indices])
+                        event_x.append(rr_extra_x[rr_live_indices])
+                        event_y.append(rr_extra_y[rr_live_indices])
+                        event_keys.append(rr_event_keys[rr_live_indices])
                     all_source_ids = cp.concatenate(tuple(event_source_ids))
                     all_t = cp.concatenate(tuple(event_t))
                     all_x = cp.concatenate(tuple(event_x))
@@ -995,7 +1006,10 @@ def build_gpu_atomic_edges(
     ).astype(cp.uint8, copy=False)
     adjacency_counts = adjacency_mask.astype(cp.int32, copy=False)
     adjacency_offsets = exclusive_sum(adjacency_counts)
-    pair_count = int(cp.asnumpy(adjacency_offsets[-1] + adjacency_counts[-1])) if int(adjacency_counts.size) else 0  # zcopy:ok(allocation-fence: need pair_count to size 6 atomic-edge output buffers) hygiene:ok
+    segment_total = split_events.left_segment_count + split_events.right_segment_count
+    pair_count = int(split_events.count) - int(segment_total)
+    if pair_count < 0:
+        raise RuntimeError("split event table has fewer events than source segments")
 
     out_source_ids = runtime.allocate((pair_count * 2,), np.int32)
     out_direction = runtime.allocate((pair_count * 2,), np.int8)

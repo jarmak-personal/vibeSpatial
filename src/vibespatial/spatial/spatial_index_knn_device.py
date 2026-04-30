@@ -45,6 +45,7 @@ from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode, combined_residency, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
+from vibespatial.spatial.query_types import _record_device_join_materialization
 
 from .query_candidates import _generate_candidates_gpu_device
 from .query_utils import _expand_bounds
@@ -99,9 +100,39 @@ class DeviceKnnResult:
     def to_host(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Copy result to host as numpy arrays."""
         runtime = get_cuda_runtime()
-        query_idx = runtime.copy_device_to_host(self.d_query_idx).astype(np.int32, copy=False)
-        target_idx = runtime.copy_device_to_host(self.d_target_idx).astype(np.int32, copy=False)
-        distances = runtime.copy_device_to_host(self.d_distances).astype(np.float64, copy=False)
+        _record_device_join_materialization(
+            self.d_query_idx,
+            side="query",
+            surface="vibespatial.spatial.spatial_index_knn_device.DeviceKnnResult.to_host",
+            operation="device_knn_indices_to_host",
+            reason="device kNN query indices crossed to host for public nearest export",
+        )
+        query_idx = runtime.copy_device_to_host(
+            self.d_query_idx,
+            reason="device kNN query-index host export",
+        ).astype(np.int32, copy=False)
+        _record_device_join_materialization(
+            self.d_target_idx,
+            side="target",
+            surface="vibespatial.spatial.spatial_index_knn_device.DeviceKnnResult.to_host",
+            operation="device_knn_indices_to_host",
+            reason="device kNN target indices crossed to host for public nearest export",
+        )
+        target_idx = runtime.copy_device_to_host(
+            self.d_target_idx,
+            reason="device kNN target-index host export",
+        ).astype(np.int32, copy=False)
+        _record_device_join_materialization(
+            self.d_distances,
+            side="distances",
+            surface="vibespatial.spatial.spatial_index_knn_device.DeviceKnnResult.to_host",
+            operation="device_knn_distances_to_host",
+            reason="device kNN distances crossed to host for public nearest export",
+        )
+        distances = runtime.copy_device_to_host(
+            self.d_distances,
+            reason="device kNN distance host export",
+        ).astype(np.float64, copy=False)
         return query_idx, target_idx, distances
 
 
@@ -307,11 +338,57 @@ def _topk_per_query(
 # Public API
 # ---------------------------------------------------------------------------
 
+def _bounds_are_device(*bounds_arrays: Any) -> bool:
+    return any(hasattr(bounds, "__cuda_array_interface__") for bounds in bounds_arrays)
+
+
+def _effective_unbounded_max_distance(
+    query_bounds: Any,
+    tree_bounds: Any,
+    *,
+    bounds_on_device: bool,
+) -> float | None:
+    """Compute the unbounded kNN search ceiling without raw CuPy syncs."""
+    if bounds_on_device:
+        d_query_bounds = cp.asarray(query_bounds)
+        d_tree_bounds = cp.asarray(tree_bounds)
+        d_all_bounds = cp.vstack((d_query_bounds, d_tree_bounds))
+        d_valid_mask = ~cp.isnan(d_all_bounds).any(axis=1)
+        d_extent = cp.empty(5, dtype=cp.float64)
+        d_extent[0] = cp.count_nonzero(d_valid_mask).astype(cp.float64)
+        d_extent[1] = cp.min(cp.where(d_valid_mask, d_all_bounds[:, 0], cp.inf))
+        d_extent[2] = cp.min(cp.where(d_valid_mask, d_all_bounds[:, 1], cp.inf))
+        d_extent[3] = cp.max(cp.where(d_valid_mask, d_all_bounds[:, 2], -cp.inf))
+        d_extent[4] = cp.max(cp.where(d_valid_mask, d_all_bounds[:, 3], -cp.inf))
+        h_extent = get_cuda_runtime().copy_device_to_host(
+            d_extent,
+            reason="spatial index kNN unbounded extent scalar fence",
+        )
+        valid_count, xmin, ymin, xmax, ymax = np.asarray(h_extent, dtype=np.float64)
+    else:
+        all_bounds = np.vstack((np.asarray(query_bounds), np.asarray(tree_bounds)))
+        valid_mask = ~np.isnan(all_bounds).any(axis=1)
+        valid_count = float(np.count_nonzero(valid_mask))
+        if valid_count == 0:
+            return None
+        valid_bounds = all_bounds[valid_mask]
+        xmin = float(valid_bounds[:, 0].min())
+        ymin = float(valid_bounds[:, 1].min())
+        xmax = float(valid_bounds[:, 2].max())
+        ymax = float(valid_bounds[:, 3].max())
+
+    if int(valid_count) == 0:
+        return None
+    extent_dx = float(xmax - xmin)
+    extent_dy = float(ymax - ymin)
+    return float(np.hypot(extent_dx, extent_dy)) * 1.01 + 1.0
+
+
 def spatial_index_knn_device(
     query_owned: OwnedGeometryArray,
     tree_owned: OwnedGeometryArray,
-    query_bounds: np.ndarray,
-    tree_bounds: np.ndarray,
+    query_bounds: Any,
+    tree_bounds: Any,
     *,
     k: int = 1,
     max_distance: float | None = None,
@@ -359,6 +436,7 @@ def spatial_index_knn_device(
 
     n_queries = query_bounds.shape[0]
     n_tree = tree_bounds.shape[0]
+    bounds_on_device = _bounds_are_device(query_bounds, tree_bounds)
     if n_queries == 0 or n_tree == 0:
         return DeviceKnnResult(
             d_query_idx=cp.empty(0, dtype=cp.int32),
@@ -395,12 +473,14 @@ def spatial_index_knn_device(
     if max_distance is not None and np.isfinite(max_distance):
         effective_max_distance = float(max_distance)
     else:
-        # Compute bounding box diagonal of all valid geometry bounds on device.
-        d_query_bounds = cp.asarray(query_bounds)
-        d_tree_bounds = cp.asarray(tree_bounds)
-        d_all_bounds = cp.vstack((d_query_bounds, d_tree_bounds))
-        d_valid_mask = ~cp.isnan(d_all_bounds).any(axis=1)
-        if not bool(d_valid_mask.any()):
+        # Compute the bounding-box diagonal of all valid geometry bounds.  Host
+        # bounds stay host-known; device bounds use one named extent fence.
+        effective_max_distance = _effective_unbounded_max_distance(
+            query_bounds,
+            tree_bounds,
+            bounds_on_device=bounds_on_device,
+        )
+        if effective_max_distance is None:
             return DeviceKnnResult(
                 d_query_idx=cp.empty(0, dtype=cp.int32),
                 d_target_idx=cp.empty(0, dtype=cp.int32),
@@ -408,17 +488,17 @@ def spatial_index_knn_device(
                 total_pairs=0,
                 k=k,
             )
-        d_valid_bounds = d_all_bounds[d_valid_mask]
-        extent_dx = float(d_valid_bounds[:, 2].max() - d_valid_bounds[:, 0].min())
-        extent_dy = float(d_valid_bounds[:, 3].max() - d_valid_bounds[:, 1].min())
-        effective_max_distance = float(cp.hypot(extent_dx, extent_dy)) * 1.01 + 1.0
 
     # --- Candidate generation ------------------------------------------------
     # Expand query bounds by effective_max_distance and find bbox overlaps.
     # Use the device-resident candidate generator to avoid D->H->D round-trip.
     # NOTE: _expand_bounds and _generate_candidates_gpu_device expect host
     # numpy arrays -- do not pass CuPy arrays to them.
-    per_row_dist = np.full(n_queries, effective_max_distance, dtype=np.float64)
+    per_row_dist = (
+        cp.full(n_queries, effective_max_distance, dtype=cp.float64)
+        if bounds_on_device
+        else np.full(n_queries, effective_max_distance, dtype=np.float64)
+    )
     expanded_bounds = _expand_bounds(query_bounds, per_row_dist)
 
     device_candidates = _generate_candidates_gpu_device(expanded_bounds, tree_bounds)
@@ -427,6 +507,14 @@ def spatial_index_knn_device(
         d_right_cp = device_candidates.d_right
         pair_count = device_candidates.total_pairs
     else:
+        if bounds_on_device:
+            return DeviceKnnResult(
+                d_query_idx=cp.empty(0, dtype=cp.int32),
+                d_target_idx=cp.empty(0, dtype=cp.int32),
+                d_distances=cp.empty(0, dtype=cp.float64),
+                total_pairs=0,
+                k=k,
+            )
         # CPU fallback for candidate generation (small workloads).
         from .query_candidates import _generate_distance_pairs
         left_idx_h, right_idx_h = _generate_distance_pairs(

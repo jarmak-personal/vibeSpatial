@@ -194,7 +194,10 @@ def _launch_linestring_clearance(
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        family_result = runtime.copy_device_to_host(d_out)
+        family_result = runtime.copy_device_to_host(
+            d_out,
+            reason="minimum-clearance linestring family-result host export",
+        )
         result[global_rows] = family_result[family_rows]
     finally:
         runtime.free(d_out)
@@ -251,7 +254,10 @@ def _launch_multilinestring_clearance(
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        family_result = runtime.copy_device_to_host(d_out)
+        family_result = runtime.copy_device_to_host(
+            d_out,
+            reason="minimum-clearance multilinestring family-result host export",
+        )
         result[global_rows] = family_result[family_rows]
     finally:
         runtime.free(d_out)
@@ -308,7 +314,10 @@ def _launch_polygon_clearance(
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        family_result = runtime.copy_device_to_host(d_out)
+        family_result = runtime.copy_device_to_host(
+            d_out,
+            reason="minimum-clearance polygon family-result host export",
+        )
         result[global_rows] = family_result[family_rows]
     finally:
         runtime.free(d_out)
@@ -374,7 +383,10 @@ def _launch_multipolygon_clearance(
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        family_result = runtime.copy_device_to_host(d_out)
+        family_result = runtime.copy_device_to_host(
+            d_out,
+            reason="minimum-clearance multipolygon family-result host export",
+        )
         result[global_rows] = family_result[family_rows]
     finally:
         runtime.free(d_out)
@@ -818,10 +830,13 @@ def _build_clearance_line_oga(
     geometry_offsets = cp.empty(row_count + 1, dtype=cp.int32)
     geometry_offsets[0] = 0
     cp.cumsum(coords_per_row, out=geometry_offsets[1:])
-    total_coords = int(geometry_offsets[-1].item()) if row_count else 0
 
-    x = cp.empty(total_coords, dtype=cp.float64)
-    y = cp.empty(total_coords, dtype=cp.float64)
+    # Allocate the maximum possible coordinate payload and compact writes by
+    # device offsets. geometry_offsets[-1] remains the authoritative used
+    # length; avoiding it here keeps assembly free of scalar D2H fences.
+    max_coords = row_count * 2
+    x = cp.empty(max_coords, dtype=cp.float64)
+    y = cp.empty(max_coords, dtype=cp.float64)
 
     valid_indices = cp.flatnonzero(has_line)
     if int(valid_indices.size):
@@ -922,3 +937,34 @@ def minimum_clearance_line_owned(
         selected=ExecutionMode.CPU,
     )
     return _minimum_clearance_line_cpu(owned)
+
+
+def minimum_clearance_line_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = "auto",
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = minimum_clearance_line_owned(
+        owned,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="minimum_clearance_line",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )

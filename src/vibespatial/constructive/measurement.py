@@ -110,11 +110,10 @@ def _fp32_center_coords(
     Scans the first non-empty family in *owned* and computes the midpoint of
     the bounding box.  When device buffers are available the four CuPy
     reductions (min_x, max_x, min_y, max_y) are packed into a single device
-    array so that only **one** ``.get()`` call (and therefore one implicit D2H
-    sync) is issued instead of four.
+    array so that only one named runtime D2H export is issued instead of four.
 
-    The ``.get()`` is issued outside the family search loop to satisfy
-    ZCOPY002 (no D2H transfers inside loop bodies).
+    The host export is issued outside the family search loop to satisfy ZCOPY002
+    (no D2H transfers inside loop bodies).
     """
     # Phase 1: find the first non-empty family and compute device stats
     # (no .get() inside the loop).
@@ -150,7 +149,10 @@ def _fp32_center_coords(
 
     # Phase 2: single D2H transfer outside the loop.
     if d_stats is not None:
-        s = d_stats.get()
+        s = get_cuda_runtime().copy_device_to_host(
+            d_stats,
+            reason="geometry measurement fp32 center-coordinate scalar export",
+        )
         return float((s[0] + s[1]) * 0.5), float((s[2] + s[3]) * 0.5)
     if host_center is not None:
         return host_center
@@ -164,8 +166,8 @@ def _coord_stats_from_owned(
 
     When device buffers are available the six CuPy reductions per family
     (abs_max_x, abs_max_y, min_x, min_y, max_x, max_y) are collected into
-    a single device array across ALL families so that only **one** ``.get()``
-    call is issued outside the loop, satisfying ZCOPY002.
+    a single device array across ALL families so that only one named runtime
+    D2H export is issued outside the loop, satisfying ZCOPY002.
     """
     max_abs: float = 0.0
     coord_min: float = float("inf")
@@ -203,7 +205,10 @@ def _coord_stats_from_owned(
 
     # Phase 2: single D2H transfer outside the loop for all device families.
     if device_scalars:
-        all_stats = _cp.array(device_scalars).get()
+        all_stats = get_cuda_runtime().copy_device_to_host(
+            _cp.array(device_scalars),
+            reason="geometry measurement coordinate-stats scalar export",
+        )
         # Process in groups of 6 (abs_max_x, abs_max_y, min_x, min_y, max_x, max_y)
         for i in range(0, len(all_stats), 6):
             max_abs = max(max_abs, float(all_stats[i]), float(all_stats[i + 1]))
@@ -216,6 +221,24 @@ def _coord_stats_from_owned(
 # ---------------------------------------------------------------------------
 # GPU implementation: Area
 # ---------------------------------------------------------------------------
+
+def _single_family_without_nulls(owned: OwnedGeometryArray) -> GeometryFamily | None:
+    families = getattr(owned, "families", {})
+    if len(families) != 1:
+        return None
+    family, host_buffer = next(iter(families.items()))
+    row_count = getattr(host_buffer, "row_count", None)
+    device_state = getattr(owned, "device_state", None)
+    if device_state is not None:
+        device_buffer = device_state.families.get(family)
+        if device_buffer is not None:
+            offsets = getattr(device_buffer, "geometry_offsets", None)
+            if offsets is not None:
+                row_count = int(offsets.size) - 1
+    if int(row_count or 0) != int(owned.row_count):
+        return None
+    return family
+
 
 @register_kernel_variant(
     "geometry_area",
@@ -243,10 +266,174 @@ def _area_gpu(
     runtime = get_cuda_runtime()
     row_count = owned.row_count
     result = np.zeros(row_count, dtype=np.float64)
+    device_state = owned.device_state
+    single_family = _single_family_without_nulls(owned)
+
+    if single_family is GeometryFamily.POLYGON:
+        buf = owned.families[GeometryFamily.POLYGON]
+        n = row_count
+        if device_state is not None and GeometryFamily.POLYGON in device_state.families:
+            avg_verts = (
+                int(device_state.families[GeometryFamily.POLYGON].x.size) / max(n, 1)
+                if n > 0
+                else 0
+            )
+        else:
+            avg_verts = buf.x.size / max(n, 1) if n > 0 else 0
+        use_cooperative = avg_verts >= 64
+
+        if use_cooperative:
+            coop_kernels = _compile_kernel(
+                "polygon-area-cooperative",
+                _POLYGON_AREA_COOPERATIVE_FP64,
+                _POLYGON_AREA_COOPERATIVE_FP32,
+                _POLYGON_AREA_COOPERATIVE_NAMES,
+                compute_type,
+            )
+            kernel = coop_kernels["polygon_area_cooperative"]
+        else:
+            kernels = _compile_kernel(
+                "polygon-area",
+                _POLYGON_AREA_FP64,
+                _POLYGON_AREA_FP32,
+                _POLYGON_AREA_NAMES,
+                compute_type,
+            )
+            kernel = kernels["polygon_area"]
+
+        needs_free = (
+            device_state is None or GeometryFamily.POLYGON not in device_state.families
+        )
+        if not needs_free:
+            ds = device_state.families[GeometryFamily.POLYGON]
+            d_x, d_y = ds.x, ds.y
+            d_ring = ds.ring_offsets
+            d_geom = ds.geometry_offsets
+        else:
+            d_x = runtime.from_host(buf.x)
+            d_y = runtime.from_host(buf.y)
+            d_ring = runtime.from_host(buf.ring_offsets.astype(np.int32))
+            d_geom = runtime.from_host(buf.geometry_offsets.astype(np.int32))
+
+        d_out = runtime.allocate((n,), np.float64)
+        try:
+            ptr = runtime.pointer
+            params = (
+                (
+                    ptr(d_x),
+                    ptr(d_y),
+                    ptr(d_ring),
+                    ptr(d_geom),
+                    ptr(d_out),
+                    center_x,
+                    center_y,
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_I32,
+                ),
+            )
+            if use_cooperative:
+                grid = (n, 1, 1)
+                block = (256, 1, 1)
+            else:
+                grid, block = runtime.launch_config(kernel, n)
+            runtime.launch(kernel, grid=grid, block=block, params=params)
+            return runtime.copy_device_to_host(
+                d_out,
+                reason="geometry area polygon family-result host export",
+            )
+        finally:
+            runtime.free(d_out)
+            if needs_free:
+                runtime.free(d_x)
+                runtime.free(d_y)
+                runtime.free(d_ring)
+                runtime.free(d_geom)
+
+    if single_family is GeometryFamily.MULTIPOLYGON:
+        buf = owned.families[GeometryFamily.MULTIPOLYGON]
+        n = row_count
+        kernels = _compile_kernel(
+            "multipolygon-area",
+            _MULTIPOLYGON_AREA_FP64,
+            _MULTIPOLYGON_AREA_FP32,
+            _MULTIPOLYGON_AREA_NAMES,
+            compute_type,
+        )
+        kernel = kernels["multipolygon_area"]
+
+        needs_free = (
+            device_state is None
+            or GeometryFamily.MULTIPOLYGON not in device_state.families
+        )
+        if not needs_free:
+            ds = device_state.families[GeometryFamily.MULTIPOLYGON]
+            d_x, d_y = ds.x, ds.y
+            d_ring = ds.ring_offsets
+            d_part = ds.part_offsets
+            d_geom = ds.geometry_offsets
+        else:
+            d_x = runtime.from_host(buf.x)
+            d_y = runtime.from_host(buf.y)
+            d_ring = runtime.from_host(buf.ring_offsets.astype(np.int32))
+            d_part = runtime.from_host(buf.part_offsets.astype(np.int32))
+            d_geom = runtime.from_host(buf.geometry_offsets.astype(np.int32))
+
+        d_out = runtime.allocate((n,), np.float64)
+        try:
+            ptr = runtime.pointer
+            params = (
+                (
+                    ptr(d_x),
+                    ptr(d_y),
+                    ptr(d_ring),
+                    ptr(d_part),
+                    ptr(d_geom),
+                    ptr(d_out),
+                    center_x,
+                    center_y,
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_I32,
+                ),
+            )
+            grid, block = runtime.launch_config(kernel, n)
+            runtime.launch(kernel, grid=grid, block=block, params=params)
+            return runtime.copy_device_to_host(
+                d_out,
+                reason="geometry area multipolygon family-result host export",
+            )
+        finally:
+            runtime.free(d_out)
+            if needs_free:
+                runtime.free(d_x)
+                runtime.free(d_y)
+                runtime.free(d_ring)
+                runtime.free(d_part)
+                runtime.free(d_geom)
+
+    if single_family is not None:
+        return result
 
     tags = owned.tags
     family_row_offsets = owned.family_row_offsets
-    device_state = owned.device_state
 
     # --- Polygon family ---
     poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
@@ -309,7 +496,10 @@ def _area_gpu(
             else:
                 grid, block = runtime.launch_config(kernel, n)
             runtime.launch(kernel, grid=grid, block=block, params=params)
-            family_result = runtime.copy_device_to_host(d_out)
+            family_result = runtime.copy_device_to_host(
+                d_out,
+                reason="geometry area polygon family-result host export",
+            )
             result[global_rows] = family_result[family_rows]
         finally:
             runtime.free(d_out)
@@ -357,7 +547,10 @@ def _area_gpu(
             )
             grid, block = runtime.launch_config(kernel, n)
             runtime.launch(kernel, grid=grid, block=block, params=params)
-            family_result = runtime.copy_device_to_host(d_out)
+            family_result = runtime.copy_device_to_host(
+                d_out,
+                reason="geometry area multipolygon family-result host export",
+            )
             result[global_rows] = family_result[family_rows]
         finally:
             runtime.free(d_out)
@@ -393,7 +586,7 @@ def _area_gpu_device_fp64(owned: OwnedGeometryArray):
     d_result = cp.zeros(owned.row_count, dtype=cp.float64)
     d_tags = cp.asarray(device_state.tags)
     d_family_row_offsets = cp.asarray(device_state.family_row_offsets)
-    center_x, center_y = _fp32_center_coords(owned)
+    center_x, center_y = 0.0, 0.0
 
     if GeometryFamily.POLYGON in device_state.families:
         ds = device_state.families[GeometryFamily.POLYGON]
@@ -522,6 +715,31 @@ def _area_gpu_device_fp64(owned: OwnedGeometryArray):
     return d_result
 
 
+def area_expression_owned(
+    owned: OwnedGeometryArray,
+    *,
+    source_token: str | None = None,
+):
+    """Compute geometry area as a private device expression.
+
+    Physical shape: segmented polygon/multipolygon metric reduction to one
+    fp64 device value per source row.  The only sanctioned consumers are
+    native row-flow and grouped reducers; public ``geometry.area`` continues
+    to materialize through ``area_owned``.
+    """
+    from vibespatial.api._native_expression import NativeExpression
+
+    values = _area_gpu_device_fp64(owned)
+    return NativeExpression(
+        operation="geometry.area",
+        values=values,
+        source_token=source_token,
+        source_row_count=owned.row_count,
+        dtype="float64",
+        precision="fp64",
+    )
+
+
 # ---------------------------------------------------------------------------
 # GPU implementation: Length
 # ---------------------------------------------------------------------------
@@ -612,7 +830,10 @@ def _length_gpu(
                 )
             grid, block = runtime.launch_config(kernel, n)
             runtime.launch(kernel, grid=grid, block=block, params=params)
-            family_result = runtime.copy_device_to_host(d_out)
+            family_result = runtime.copy_device_to_host(
+                d_out,
+                reason=f"geometry length {family.value} ring-result host export",
+            )
             result[global_rows] = family_result[family_rows]
         finally:
             runtime.free(d_out)
@@ -671,7 +892,10 @@ def _length_gpu(
                 )
             grid, block = runtime.launch_config(kernel, n)
             runtime.launch(kernel, grid=grid, block=block, params=params)
-            family_result = runtime.copy_device_to_host(d_out)
+            family_result = runtime.copy_device_to_host(
+                d_out,
+                reason=f"geometry length {family.value} line-result host export",
+            )
             result[global_rows] = family_result[family_rows]
         finally:
             runtime.free(d_out)
@@ -708,6 +932,249 @@ def _length_gpu(
 
     # Points and MultiPoints: length = 0.0 (already zero-initialized)
     return result
+
+
+def _length_gpu_device_fp64(owned: OwnedGeometryArray):
+    """Compute owned geometry lengths into a device-resident float64 array.
+
+    This is an internal NativeExpression helper.  Public ``length_owned`` keeps
+    the precision-planned host-return contract.
+    """
+    if owned.row_count == 0:
+        runtime = get_cuda_runtime()
+        return runtime.allocate((0,), np.float64)
+
+    try:
+        import cupy as cp
+    except ModuleNotFoundError as exc:  # pragma: no cover - GPU guard
+        raise RuntimeError("CuPy is required for device-resident length") from exc
+
+    runtime = get_cuda_runtime()
+    device_state = owned._ensure_device_state()
+    d_result = cp.zeros(owned.row_count, dtype=cp.float64)
+    d_tags = cp.asarray(device_state.tags)
+    d_family_row_offsets = cp.asarray(device_state.family_row_offsets)
+    center_x, center_y = 0.0, 0.0
+
+    def _scatter_family_result(family: GeometryFamily, d_out) -> None:
+        global_rows = cp.flatnonzero(d_tags == FAMILY_TAGS[family]).astype(
+            cp.int64,
+            copy=False,
+        )
+        if int(global_rows.size) == 0:
+            return
+        family_rows = d_family_row_offsets[global_rows].astype(cp.int64, copy=False)
+        d_result[global_rows] = d_out[family_rows]
+
+    def _launch_ring_length(
+        family: GeometryFamily,
+        kernel_name: str,
+        source_fp64: str,
+        source_fp32: str,
+        names: tuple[str, ...],
+        prefix: str,
+        *,
+        has_part_offsets: bool,
+    ) -> None:
+        if family not in device_state.families:
+            return
+        ds = device_state.families[family]
+        n = int(ds.empty_mask.size)
+        if n <= 0:
+            return
+        kernels = _compile_kernel(prefix, source_fp64, source_fp32, names, "double")
+        kernel = kernels[kernel_name]
+        d_out = runtime.allocate((n,), np.float64)
+        try:
+            ptr = runtime.pointer
+            if has_part_offsets:
+                params = (
+                    (
+                        ptr(ds.x),
+                        ptr(ds.y),
+                        ptr(ds.ring_offsets),
+                        ptr(ds.part_offsets),
+                        ptr(ds.geometry_offsets),
+                        ptr(d_out),
+                        center_x,
+                        center_y,
+                        n,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_I32,
+                    ),
+                )
+            else:
+                params = (
+                    (
+                        ptr(ds.x),
+                        ptr(ds.y),
+                        ptr(ds.ring_offsets),
+                        ptr(ds.geometry_offsets),
+                        ptr(d_out),
+                        center_x,
+                        center_y,
+                        n,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_I32,
+                    ),
+                )
+            grid, block = runtime.launch_config(kernel, n)
+            runtime.launch(kernel, grid=grid, block=block, params=params)
+            _scatter_family_result(family, d_out)
+        finally:
+            runtime.free(d_out)
+
+    def _launch_line_length(
+        family: GeometryFamily,
+        kernel_name: str,
+        source_fp64: str,
+        source_fp32: str,
+        names: tuple[str, ...],
+        prefix: str,
+        *,
+        has_part_offsets: bool,
+    ) -> None:
+        if family not in device_state.families:
+            return
+        ds = device_state.families[family]
+        n = int(ds.empty_mask.size)
+        if n <= 0:
+            return
+        kernels = _compile_kernel(prefix, source_fp64, source_fp32, names, "double")
+        kernel = kernels[kernel_name]
+        d_out = runtime.allocate((n,), np.float64)
+        try:
+            ptr = runtime.pointer
+            if has_part_offsets:
+                params = (
+                    (
+                        ptr(ds.x),
+                        ptr(ds.y),
+                        ptr(ds.part_offsets),
+                        ptr(ds.geometry_offsets),
+                        ptr(d_out),
+                        center_x,
+                        center_y,
+                        n,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_I32,
+                    ),
+                )
+            else:
+                params = (
+                    (
+                        ptr(ds.x),
+                        ptr(ds.y),
+                        ptr(ds.geometry_offsets),
+                        ptr(d_out),
+                        center_x,
+                        center_y,
+                        n,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_I32,
+                    ),
+                )
+            grid, block = runtime.launch_config(kernel, n)
+            runtime.launch(kernel, grid=grid, block=block, params=params)
+            _scatter_family_result(family, d_out)
+        finally:
+            runtime.free(d_out)
+
+    _launch_ring_length(
+        GeometryFamily.POLYGON,
+        "polygon_length",
+        _POLYGON_LENGTH_FP64,
+        _POLYGON_LENGTH_FP32,
+        _POLYGON_LENGTH_NAMES,
+        "polygon-length",
+        has_part_offsets=False,
+    )
+    _launch_ring_length(
+        GeometryFamily.MULTIPOLYGON,
+        "multipolygon_length",
+        _MULTIPOLYGON_LENGTH_FP64,
+        _MULTIPOLYGON_LENGTH_FP32,
+        _MULTIPOLYGON_LENGTH_NAMES,
+        "multipolygon-length",
+        has_part_offsets=True,
+    )
+    _launch_line_length(
+        GeometryFamily.LINESTRING,
+        "linestring_length",
+        _LINESTRING_LENGTH_FP64,
+        _LINESTRING_LENGTH_FP32,
+        _LINESTRING_LENGTH_NAMES,
+        "linestring-length",
+        has_part_offsets=False,
+    )
+    _launch_line_length(
+        GeometryFamily.MULTILINESTRING,
+        "multilinestring_length",
+        _MULTILINESTRING_LENGTH_FP64,
+        _MULTILINESTRING_LENGTH_FP32,
+        _MULTILINESTRING_LENGTH_NAMES,
+        "multilinestring-length",
+        has_part_offsets=True,
+    )
+
+    d_result[~cp.asarray(device_state.validity)] = cp.nan
+    return d_result
+
+
+def length_expression_owned(
+    owned: OwnedGeometryArray,
+    *,
+    source_token: str | None = None,
+):
+    """Compute geometry length as a private device expression.
+
+    Physical shape: segmented line/ring metric reduction to one fp64 device
+    value per source row.  The sanctioned consumers match area expressions:
+    native row-flow and grouped reducers.
+    """
+    from vibespatial.api._native_expression import NativeExpression
+
+    values = _length_gpu_device_fp64(owned)
+    return NativeExpression(
+        operation="geometry.length",
+        values=values,
+        source_token=source_token,
+        source_row_count=owned.row_count,
+        dtype="float64",
+        precision="fp64",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -959,7 +1426,8 @@ def area_owned(
     if selection.selected is ExecutionMode.GPU:
         precision_plan = selection.precision_plan
         result = _area_gpu(owned, precision_plan=precision_plan)
-        result[~owned.validity] = np.nan
+        if _single_family_without_nulls(owned) is None:
+            result[~owned.validity] = np.nan
         record_dispatch_event(
             surface="geopandas.array.area",
             operation="area",

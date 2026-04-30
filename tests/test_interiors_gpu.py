@@ -182,6 +182,7 @@ def test_interiors_gpu_metadata_stays_device_resident():
     from vibespatial.constructive.interiors import interiors_owned
     from vibespatial.geometry.owned import from_shapely_geometries
     from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.execution_trace import assert_no_transfers
     from vibespatial.runtime.residency import Residency
 
     poly = Polygon(
@@ -190,12 +191,41 @@ def test_interiors_gpu_metadata_stays_device_resident():
     )
 
     owned = from_shapely_geometries([poly], residency=Residency.DEVICE)
-    result = interiors_owned(owned, dispatch_mode=ExecutionMode.GPU)
+    with assert_no_transfers():
+        result = interiors_owned(owned, dispatch_mode=ExecutionMode.GPU)
 
     assert result.residency == Residency.DEVICE
     assert result._validity is None
     assert result._tags is None
     assert result._family_row_offsets is None
+
+
+@requires_gpu
+def test_interiors_gpu_device_only_metadata_does_not_materialize_for_dispatch():
+    """GPU interiors does not host-materialize routing metadata before dispatch."""
+    from vibespatial.constructive.interiors import interiors_owned
+    from vibespatial.geometry.owned import from_shapely_geometries
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.execution_trace import assert_no_transfers
+    from vibespatial.runtime.residency import Residency
+
+    poly = Polygon(
+        [(0, 0), (8, 0), (8, 8), (0, 8), (0, 0)],
+        [[(2, 2), (6, 2), (6, 6), (2, 6), (2, 2)]],
+    )
+
+    owned = from_shapely_geometries([poly], residency=Residency.DEVICE)
+    owned._validity = None
+    owned._tags = None
+    owned._family_row_offsets = None
+
+    with assert_no_transfers():
+        result = interiors_owned(owned, dispatch_mode=ExecutionMode.GPU)
+
+    assert result.residency == Residency.DEVICE
+    assert owned._validity is None
+    assert owned._tags is None
+    assert owned._family_row_offsets is None
 
 
 # ---------------------------------------------------------------------------

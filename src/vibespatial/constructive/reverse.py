@@ -199,3 +199,29 @@ def reverse_owned(
         families=new_families,
         residency=Residency.HOST,
     )
+
+
+def reverse_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+    attrs: dict[str, object] | None = None,
+):
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = reverse_owned(owned, dispatch_mode=dispatch_mode)
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="reverse",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+        attrs=attrs,
+    )

@@ -179,6 +179,34 @@ def _collect_maint() -> list[PropertyState]:
     ]
 
 
+def _collect_native_inventory() -> list[PropertyState]:
+    """NATIVE001: Native* inventory partial/debt ratchet."""
+    from check_native_inventory import count_inventory, evaluate_counts
+
+    inventory_path = REPO_ROOT / "docs" / "dev" / "native-format-inventory.md"
+    report = evaluate_counts(count_inventory(inventory_path.read_text(encoding="utf-8")))
+    count = len(report.violations)
+    status = "ok" if report.ok else "regressed"
+    detail = (
+        f"partial={report.counts.partial_rows}/{report.baselines.partial_rows}, "
+        f"debt={report.counts.debt_rows}/{report.baselines.debt_rows}, "
+        f"implicit-host={report.counts.implicit_host_rows}/"
+        f"{report.baselines.implicit_host_rows}"
+    )
+    return [
+        PropertyState(
+            name="native_inventory_ratchet",
+            code="NATIVE001",
+            category="residency",
+            violations=count,
+            baseline=0,
+            distance=0.0 if report.ok else 1.0,
+            status=status,
+            detail=detail,
+        ),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
@@ -189,6 +217,7 @@ ALL_COLLECTORS = [
     _collect_vpat,
     _collect_igrd,
     _collect_maint,
+    _collect_native_inventory,
 ]
 
 

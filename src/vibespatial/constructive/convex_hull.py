@@ -52,7 +52,11 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
-from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_mode_enabled
+from vibespatial.runtime.fallbacks import (
+    StrictNativeFallbackError,
+    record_fallback_event,
+    strict_native_mode_enabled,
+)
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.provenance import provenance_rewrites_enabled, record_rewrite_event
@@ -62,6 +66,21 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _convex_hull_device_bool_scalar(value: object, *, reason: str) -> bool:
+    """Read a device boolean scalar through the runtime transfer ledger."""
+    if cp is not None and (
+        hasattr(value, "__cuda_array_interface__")
+        or type(value).__module__.startswith("cupy")
+    ):
+        host = get_cuda_runtime().copy_device_to_host(
+            cp.asarray(value).reshape(1),
+            reason=reason,
+        )
+        return bool(np.asarray(host).reshape(-1)[0])
+    return bool(value)
+
 
 # ---------------------------------------------------------------------------
 # NVRTC warmup (ADR-0034): register kernels for background precompilation
@@ -517,7 +536,12 @@ def _convex_hull_family_gpu(runtime, device_buf, family, row_count):
     d_hull_offsets = exclusive_sum(d_hull_counts, synchronize=False)
 
     # Get total output coordinate count via single async transfer
-    total_coords = count_scatter_total(runtime, d_hull_counts, d_hull_offsets)
+    total_coords = count_scatter_total(
+        runtime,
+        d_hull_counts,
+        d_hull_offsets,
+        reason="convex-hull coordinate allocation fence",
+    )
 
     # --- Step 5: NVRTC write pass ---
     d_ox = runtime.allocate((max(total_coords, 1),), np.float64)
@@ -614,9 +638,8 @@ def _convex_hull_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     new_tags = cp.full(row_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=cp.int8)
     new_family_row_offsets = cp.arange(row_count, dtype=cp.int32)
     d_null = ~d_validity
-    if int(d_null.any()) != 0:
-        new_tags[d_null] = -1
-        new_family_row_offsets[d_null] = -1
+    new_tags[d_null] = -1
+    new_family_row_offsets[d_null] = -1
 
     return build_device_resident_owned(
         device_families={GeometryFamily.POLYGON: result_buf},
@@ -672,7 +695,10 @@ def _grouped_convex_hull_from_source_owned(
             - 1
         )
         valid_group_ids = (d_group_ids >= 0) & (d_group_ids < group_count)
-        if not bool(cp.all(valid_group_ids)):
+        if not _convex_hull_device_bool_scalar(
+            cp.all(valid_group_ids),
+            reason="grouped convex-hull source-row group-domain scalar fence",
+        ):
             return None
 
         part_count = int(d_group_ids.size)
@@ -686,7 +712,10 @@ def _grouped_convex_hull_from_source_owned(
             d_sorted_group_ids,
             minlength=group_count,
         ).astype(cp.int32, copy=False)
-        if bool(cp.any(d_group_counts == 0)):
+        if _convex_hull_device_bool_scalar(
+            cp.any(d_group_counts == 0),
+            reason="grouped convex-hull nonempty-group scalar fence",
+        ):
             return None
 
         d_group_offsets = cp.empty(group_count + 1, dtype=cp.int32)
@@ -721,6 +750,8 @@ def _grouped_convex_hull_from_source_owned(
             execution_mode="gpu",
         )
         result = _convex_hull_gpu(grouped_owned)
+    except StrictNativeFallbackError:
+        raise
     except Exception:
         logger.debug(
             "grouped dissolve convex-hull rewrite failed; using regular hull",
@@ -836,9 +867,26 @@ def convex_hull_owned(
         if is_single_family:
             try:
                 result = _convex_hull_gpu(owned)
-            except Exception:
-                logger.debug("GPU convex_hull failed, falling back to CPU",
-                            exc_info=True)
+            except StrictNativeFallbackError:
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "GPU convex_hull failed, falling back to CPU",
+                    exc_info=True,
+                )
+                record_fallback_event(
+                    surface="geopandas.array.convex_hull",
+                    reason="GPU convex_hull failed",
+                    detail=(
+                        f"rows={row_count}, "
+                        f"families={','.join(fam.value for fam in families_with_rows)}, "
+                        f"precision={precision_plan.compute_precision.value}, "
+                        f"error={type(exc).__name__}"
+                    ),
+                    requested=selection.requested,
+                    selected=ExecutionMode.CPU,
+                    d2h_transfer=owned.residency is Residency.DEVICE,
+                )
             else:
                 record_dispatch_event(
                     surface="geopandas.array.convex_hull",
@@ -850,14 +898,56 @@ def convex_hull_owned(
                     detail=f"precision={precision_plan.compute_precision}",
                 )
                 return result
+        else:
+            record_fallback_event(
+                surface="geopandas.array.convex_hull",
+                reason="GPU convex_hull requires a single geometry family",
+                detail=(
+                    f"rows={row_count}, "
+                    f"families={','.join(fam.value for fam in families_with_rows)}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.CPU,
+                d2h_transfer=owned.residency is Residency.DEVICE,
+            )
 
     result = _convex_hull_cpu(owned)
     record_dispatch_event(
         surface="geopandas.array.convex_hull",
         operation="convex_hull",
         requested=dispatch_mode,
-        selected=selected_mode,
+        selected=ExecutionMode.CPU,
         implementation="convex_hull_cpu_numpy",
         reason=selection.reason,
     )
     return result
+
+
+def convex_hull_native_tabular_result(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    crs=None,
+    geometry_name: str = "geometry",
+    source_rows=None,
+    source_tokens: tuple[str, ...] = (),
+):
+    """Return convex-hull output as a private native constructive carrier."""
+    from vibespatial.api._native_results import (
+        _unary_constructive_owned_to_native_tabular_result,
+    )
+
+    result = convex_hull_owned(
+        owned,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+    )
+    return _unary_constructive_owned_to_native_tabular_result(
+        result,
+        operation="convex_hull",
+        crs=crs,
+        geometry_name=geometry_name,
+        source_rows=source_rows,
+        source_tokens=source_tokens,
+    )

@@ -275,6 +275,24 @@ class TestAreaGPU:
         expected = _shapely_area(geoms)
         np.testing.assert_allclose(result, expected, rtol=1e-10)
 
+    def test_tiny_polygon_area_at_large_coordinates(self):
+        base_x = 366_000.0
+        base_y = 3_080_000.0
+        geoms = [
+            Polygon(
+                [
+                    (base_x, base_y),
+                    (base_x + 0.001, base_y),
+                    (base_x + 0.001, base_y + 0.001),
+                    (base_x, base_y + 0.001),
+                ]
+            )
+        ]
+        owned = _make_owned(geoms)
+        result = area_owned(owned, dispatch_mode=ExecutionMode.GPU)
+        expected = _shapely_area(geoms)
+        np.testing.assert_allclose(result, expected, rtol=1e-6, atol=1e-12)
+
 
 @requires_gpu
 class TestLengthGPU:

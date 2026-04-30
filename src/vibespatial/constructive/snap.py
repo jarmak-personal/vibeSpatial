@@ -143,12 +143,33 @@ def _get_coord_range_for_geom(device_buf, family):
 def _transfer_coord_range_to_host(device_buf, family):
     """Transfer a single family's coordinate ranges D->H."""
     d_cs, d_ce = _get_coord_range_for_geom(device_buf, family)
-    return cp.asnumpy(d_cs), cp.asnumpy(d_ce)
+    runtime = get_cuda_runtime()
+    return (
+        runtime.copy_device_to_host(
+            d_cs,
+            reason=f"snap {family.value} coordinate-starts host export",
+        ),
+        runtime.copy_device_to_host(
+            d_ce,
+            reason=f"snap {family.value} coordinate-ends host export",
+        ),
+    )
 
 
 def _transfer_family_xy_to_host(device_buf):
     """Transfer a single family's x/y vertex data D->H."""
-    return cp.asnumpy(cp.asarray(device_buf.x)), cp.asnumpy(cp.asarray(device_buf.y))
+    runtime = get_cuda_runtime()
+    family = device_buf.family.value
+    return (
+        runtime.copy_device_to_host(
+            cp.asarray(device_buf.x),
+            reason=f"snap {family} x-coordinate host export",
+        ),
+        runtime.copy_device_to_host(
+            cp.asarray(device_buf.y),
+            reason=f"snap {family} y-coordinate host export",
+        ),
+    )
 
 
 def _pretransfer_family_data(d_left_state, d_right_state):

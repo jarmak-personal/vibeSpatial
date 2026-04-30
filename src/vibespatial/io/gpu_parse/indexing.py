@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 try:
     import cupy as cp
 except ModuleNotFoundError:  # pragma: no cover
@@ -89,6 +91,10 @@ def _hilbert_kernels():
         source=_HILBERT_KERNEL_SOURCE,
         kernel_names=_HILBERT_KERNEL_NAMES,
     )
+
+
+def _indexing_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
+    return np.asarray(get_cuda_runtime().copy_device_to_host(device_array, reason=reason))
 
 
 # ---------------------------------------------------------------------------
@@ -191,15 +197,19 @@ def _compute_hilbert_codes_gpu(
     kernel = kernels["compute_hilbert_codes"]
     ptr = runtime.pointer
 
-    # Compute total extent from bounds.  The 4 scalar D->H transfers below
-    # are unavoidable: extent values are passed as kernel parameters (not
-    # pointers) to avoid an extra indirection in the hot loop.  This is the
-    # same pattern used by the existing morton_keys_from_bounds kernel.
+    # Compute total extent from bounds.  The extent values are passed as
+    # kernel parameters, so the small host fence is explicit and batched.
     d_bounds_flat = d_bounds.reshape(-1, 4)
-    extent_minx = float(cp.nanmin(d_bounds_flat[:, 0]))
-    extent_miny = float(cp.nanmin(d_bounds_flat[:, 1]))
-    extent_maxx = float(cp.nanmax(d_bounds_flat[:, 2]))
-    extent_maxy = float(cp.nanmax(d_bounds_flat[:, 3]))
+    d_extent = cp.empty(4, dtype=cp.float64)
+    d_extent[0] = cp.nanmin(d_bounds_flat[:, 0])
+    d_extent[1] = cp.nanmin(d_bounds_flat[:, 1])
+    d_extent[2] = cp.nanmax(d_bounds_flat[:, 2])
+    d_extent[3] = cp.nanmax(d_bounds_flat[:, 3])
+    extent = _indexing_device_to_host(
+        d_extent,
+        reason="gpu-parse hilbert extent scalar fence",
+    ).astype(np.float64, copy=False)
+    extent_minx, extent_miny, extent_maxx, extent_maxy = (float(v) for v in extent)
 
     d_hilbert_codes = cp.empty(n_features, dtype=cp.uint32)
 

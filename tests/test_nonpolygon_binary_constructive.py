@@ -419,9 +419,9 @@ class TestLineStringPolygonDifference:
         total_calls: list[int] = []
         original_totals = nonpoly_mod.count_scatter_totals
 
-        def _record_count_scatter_totals(runtime, count_offset_pairs):
+        def _record_count_scatter_totals(runtime, count_offset_pairs, *, reason=None):
             total_calls.append(len(count_offset_pairs))
-            return original_totals(runtime, count_offset_pairs)
+            return original_totals(runtime, count_offset_pairs, reason=reason)
 
         monkeypatch.setattr(
             nonpoly_mod,

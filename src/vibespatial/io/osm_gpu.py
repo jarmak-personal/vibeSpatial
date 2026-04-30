@@ -2501,11 +2501,15 @@ def _process_ways_gpu(
     if n_ways == 0:
         return None, None, 0, None
 
-    # Flatten refs into a single array and compute per-way offsets (CPU,
-    # small data -- list of ints from protobuf parsing)
-    ref_counts = [len(refs) for refs in all_refs]
+    # Flatten refs into a single array and compute per-way metadata from the
+    # existing CPU protobuf parse.  Keeping closure/count/reorder metadata on
+    # host avoids scalar D2H fences after the refs are uploaded.
+    ref_counts: list[int] = []
+    closed_flags: list[bool] = []
     flat_refs: list[int] = []
     for refs in all_refs:
+        ref_counts.append(len(refs))
+        closed_flags.append(bool(refs) and refs[0] == refs[-1])
         flat_refs.extend(refs)
 
     total_refs = len(flat_refs)
@@ -2523,10 +2527,9 @@ def _process_ways_gpu(
         d_requested_node_ids = cp.unique(d_way_refs)
         if d_requested_node_ids.size < d_node_ids.size:
             d_keep_nodes = cp.isin(d_node_ids, d_requested_node_ids)
-            if bool(cp.any(d_keep_nodes)):
-                d_node_ids = d_node_ids[d_keep_nodes]
-                d_lon = d_lon[d_keep_nodes]
-                d_lat = d_lat[d_keep_nodes]
+            d_node_ids = d_node_ids[d_keep_nodes]
+            d_lon = d_lon[d_keep_nodes]
+            d_lat = d_lat[d_keep_nodes]
 
     # Build node lookup table on GPU (Tier 2 CuPy)
     d_sorted_ids, d_sorted_x, d_sorted_y = _build_node_lookup(
@@ -2545,26 +2548,25 @@ def _process_ways_gpu(
     cp.cumsum(d_ref_counts, out=d_way_offsets[1:])
 
     # Classify: only closed Ways whose tags are area-bearing according to the
-    # OSM layer config become Polygons. Closed non-area ways stay LineStrings.
-    # Compare first and last ref per way on device (Tier 2 CuPy)
-    d_first_ref = d_way_refs[d_way_offsets[:-1].astype(cp.int64)]
-    d_last_ref = d_way_refs[(d_way_offsets[1:] - 1).astype(cp.int64)]
-    d_is_closed = d_first_ref == d_last_ref
+    # OSM layer config become Polygons.  The refs and tags are already
+    # CPU-parsed inputs, so class counts and mixed reorder can be host-known
+    # without synchronizing device classification reductions.
+    h_is_closed = np.asarray(closed_flags, dtype=np.bool_)
     if way_area_flags is None:
-        d_is_polygon = d_is_closed
+        h_is_polygon = h_is_closed
     else:
-        d_is_polygon = d_is_closed & cp.asarray(way_area_flags, dtype=cp.bool_)
+        h_is_polygon = h_is_closed & np.asarray(way_area_flags, dtype=np.bool_)
 
     # Way IDs to device
     h_way_ids = np.array(all_way_ids, dtype=np.int64)
     d_way_ids = cp.asarray(h_way_ids)
 
-    # Split into LineString and Polygon groups
-    d_poly_mask = d_is_polygon
-    d_line_mask = ~d_is_polygon
-
-    n_poly = int(cp.sum(d_poly_mask))
-    n_line = int(cp.sum(d_line_mask))
+    # Split into LineString and Polygon groups.
+    h_ref_counts = np.asarray(ref_counts, dtype=np.int32)
+    h_poly_indices = np.flatnonzero(h_is_polygon).astype(np.int32, copy=False)
+    h_line_indices = np.flatnonzero(~h_is_polygon).astype(np.int32, copy=False)
+    n_poly = int(h_poly_indices.size)
+    n_line = int(h_line_indices.size)
 
     if n_poly == 0 and n_line == 0:
         return None, None, 0, None
@@ -2589,13 +2591,16 @@ def _process_ways_gpu(
 
     # Mixed: split coordinates by classification and build mixed owned
     # Reorder ways so LineStrings come first, then Polygons
-    d_line_indices = cp.flatnonzero(d_line_mask).astype(cp.int32)
-    d_poly_indices = cp.flatnonzero(d_poly_mask).astype(cp.int32)
-    d_reorder = cp.concatenate([d_line_indices, d_poly_indices])
+    h_reorder = np.concatenate([h_line_indices, h_poly_indices]).astype(
+        np.int32,
+        copy=False,
+    )
+    d_line_indices = cp.asarray(h_line_indices)
+    d_poly_indices = cp.asarray(h_poly_indices)
+    d_reorder = cp.asarray(h_reorder)
 
-    # Reorder way IDs and export reorder indices to host for tag alignment
+    # Reorder way IDs.  The same reorder is host-known for tag alignment.
     d_way_ids = d_way_ids[d_reorder]
-    h_reorder = cp.asnumpy(d_reorder)
 
     # Extract per-family coordinate slices
     d_line_offsets_raw = d_way_offsets[:-1][d_line_indices]
@@ -2606,7 +2611,7 @@ def _process_ways_gpu(
     # Build LineString family buffers
     d_line_geom_offsets = cp.zeros(n_line + 1, dtype=cp.int32)
     cp.cumsum(d_line_counts, out=d_line_geom_offsets[1:])
-    total_line_coords = int(d_line_geom_offsets[-1])
+    total_line_coords = int(h_ref_counts[h_line_indices].sum())
 
     # Gather LineString coordinates
     d_line_coord_indices = _expand_offsets_to_indices(
@@ -2633,7 +2638,7 @@ def _process_ways_gpu(
     d_poly_geom_offsets = cp.arange(n_poly + 1, dtype=cp.int32)  # each polygon has 1 ring
     d_poly_ring_offsets = cp.zeros(n_poly + 1, dtype=cp.int32)
     cp.cumsum(d_poly_counts, out=d_poly_ring_offsets[1:])
-    total_poly_coords = int(d_poly_ring_offsets[-1])
+    total_poly_coords = int(h_ref_counts[h_poly_indices].sum())
 
     # Gather Polygon coordinates
     d_poly_coord_indices = _expand_offsets_to_indices(
@@ -2784,16 +2789,33 @@ def _assemble_point_geometry(
     d_empty_mask = cp.zeros(n_nodes, dtype=cp.bool_)
 
     # Host copies of structural metadata (small, KB-scale)
-    validity = runtime.copy_device_to_host(d_validity).astype(np.bool_, copy=False)
-    tags = runtime.copy_device_to_host(d_tags).astype(np.int8, copy=False)
-    family_row_offsets = runtime.copy_device_to_host(d_family_row_offsets).astype(
+    validity = runtime.copy_device_to_host(
+        d_validity,
+        reason="osm point geometry validity metadata host boundary",
+    ).astype(np.bool_, copy=False)
+    tags = runtime.copy_device_to_host(
+        d_tags,
+        reason="osm point geometry family-tags metadata host boundary",
+    ).astype(np.int8, copy=False)
+    family_row_offsets = runtime.copy_device_to_host(
+        d_family_row_offsets,
+        reason="osm point geometry family-row-offset metadata host boundary",
+    ).astype(
         np.int32, copy=False,
     )
     host_geometry_offsets = np.ascontiguousarray(
-        runtime.copy_device_to_host(d_geometry_offsets), dtype=np.int32,
+        runtime.copy_device_to_host(
+            d_geometry_offsets,
+            reason="osm point geometry offsets host boundary",
+        ),
+        dtype=np.int32,
     )
     host_empty_mask = np.ascontiguousarray(
-        runtime.copy_device_to_host(d_empty_mask), dtype=np.bool_,
+        runtime.copy_device_to_host(
+            d_empty_mask,
+            reason="osm point geometry empty-mask host boundary",
+        ),
+        dtype=np.bool_,
     )
 
     buffer = FamilyGeometryBuffer(
@@ -3069,10 +3091,12 @@ def read_osm_pbf(
             decoded_way_tags = []
             for wb in way_blocks_for_geometry:
                 decoded_way_tags.extend(_decode_way_tags(wb))
-        way_area_flags = np.asarray(
-            [_osm_way_is_area(tag_map) for tag_map in decoded_way_tags],
-            dtype=np.bool_,
-        )
+        way_area_flags = None
+        if normalized_layer in {"lines", "multipolygons"}:
+            way_area_flags = np.asarray(
+                [_osm_way_is_area(tag_map) for tag_map in decoded_way_tags],
+                dtype=np.bool_,
+            )
         ways_owned, d_way_ids, n_ways, way_reorder = _process_ways_gpu(
             way_blocks_for_geometry,
             d_node_ids,
@@ -3142,7 +3166,10 @@ def read_osm_pbf(
             rel_id_to_tags.update(zip(rb.relation_ids, decoded))
 
         # Align with the valid relation IDs from _process_relations_gpu
-        h_valid_rel_ids = cp.asnumpy(d_relation_ids)
+        h_valid_rel_ids = get_cuda_runtime().copy_device_to_host(
+            d_relation_ids,
+            reason="osm relation valid-id tag-alignment host boundary",
+        )
         aligned_tags = [
             rel_id_to_tags.get(int(rid), {}) for rid in h_valid_rel_ids
         ]
