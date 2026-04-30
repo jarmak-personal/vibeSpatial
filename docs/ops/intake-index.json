@@ -3415,6 +3415,7 @@
         "docs/dev/private-native-execution-substrate-plan.md",
         "docs/dev/native-format-library-plan.md",
         "docs/decisions/0044-private-native-execution-substrate.md",
+        "docs/decisions/0046-gpu-physical-workload-shape-contracts.md",
         "docs/ops/intake-index.json"
       ],
       "path": "docs/dev/native-100ms-physical-shape-plan.md",
@@ -3437,6 +3438,7 @@
       "sections": [
         "Acceptance",
         "Baseline Reading",
+        "Fresh Session Handoff",
         "Intent",
         "Open First",
         "Open Questions",
@@ -3464,9 +3466,11 @@
         "detail",
         "execution",
         "first",
+        "fresh",
         "generalized",
         "goal",
         "goals",
+        "handoff",
         "implementation",
         "improves",
         "increase",
@@ -3494,6 +3498,7 @@
         "rich",
         "risks",
         "routed",
+        "session",
         "shape",
         "shapes",
         "shootout",
@@ -9053,6 +9058,7 @@
       "kind": "doc",
       "path": "docs/decisions/0046-gpu-physical-workload-shape-contracts.md",
       "referenced_by": [
+        "docs/dev/native-100ms-physical-shape-plan.md",
         "docs/dev/native-format-inventory.md",
         "docs/dev/native-format-library-plan.md",
         "docs/dev/native-full-coverage-prd.md"
