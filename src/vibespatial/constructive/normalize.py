@@ -297,8 +297,6 @@ def _normalize_polygon_family_gpu(
     ring_src = _RING_KERNEL_SOURCE.format(compute_type=compute_type)
     kernels = compile_kernel_group(f"normalize-ring-{compute_type}", ring_src, _RING_KERNEL_NAMES)
 
-    d_min_index = runtime.allocate((total_rings,), np.int32, zero=True)
-
     # Allocate output coordinate buffers
     d_x_out = runtime.allocate((total_coords,), np.float64)
     d_y_out = runtime.allocate((total_coords,), np.float64)
@@ -335,13 +333,14 @@ def _normalize_polygon_family_gpu(
         d_is_exterior[cp.asarray(d_shell_offsets, dtype=cp.int64)[:-1]] = 1
         ptr = runtime.pointer
 
-        # Pass 1: find lex-min vertex per ring
         params = (
             (
                 ptr(d_x),
                 ptr(d_y),
+                ptr(d_x_out),
+                ptr(d_y_out),
                 ptr(d_ring_offsets),
-                ptr(d_min_index),
+                ptr(d_is_exterior),
                 center_x,
                 center_y,
                 total_rings,
@@ -351,34 +350,10 @@ def _normalize_polygon_family_gpu(
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_F64,
                 KERNEL_PARAM_F64,
-                KERNEL_PARAM_I32,
-            ),
-        )
-        grid, block = runtime.launch_config(kernels["normalize_ring_find_min"], total_rings)
-        runtime.launch(kernels["normalize_ring_find_min"], grid=grid, block=block, params=params)
-
-        # Pass 2: rotate ring coordinates
-        params = (
-            (
-                ptr(d_x),
-                ptr(d_y),
-                ptr(d_x_out),
-                ptr(d_y_out),
-                ptr(d_ring_offsets),
-                ptr(d_min_index),
-                ptr(d_is_exterior),
-                total_rings,
-            ),
-            (
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_I32,
             ),
         )
@@ -449,7 +424,7 @@ def _normalize_polygon_family_gpu(
         for d in hierarchy_outputs_to_free:
             runtime.free(d)
         runtime.free(d_is_exterior)
-        for d in (d_min_index, d_x_out, d_y_out):
+        for d in (d_x_out, d_y_out):
             runtime.free(d)
 
     return FamilyGeometryBuffer(

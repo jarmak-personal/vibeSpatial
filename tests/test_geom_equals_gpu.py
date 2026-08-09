@@ -570,6 +570,37 @@ def test_geopandas_rotated_rings():
 
 
 @requires_gpu
+def test_gpu_normalize_fuses_ring_start_selection_with_rotation():
+    """Canonical ring starts must not depend on an intermediate launch."""
+    from vibespatial.constructive.normalize import normalize_owned
+    from vibespatial.constructive.normalize_kernels import _RING_KERNEL_NAMES
+
+    base = [
+        (-1.0, 0.0),
+        (-0.70710678118655, 0.707106781186545),
+        (0.0, 1.0),
+        (1.0, 0.0),
+        (0.0, -1.0),
+        (-0.707106781186546, -0.707106781186549),
+    ]
+    geometries = []
+    for row in range(256):
+        shift = row % len(base)
+        coordinates = base[shift:] + base[:shift]
+        if row % 2:
+            coordinates = list(reversed(coordinates))
+        geometries.append(Polygon([*coordinates, coordinates[0]]))
+
+    owned = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+    normalized = normalize_owned(owned, dispatch_mode=ExecutionMode.GPU)
+    actual = np.asarray(normalized.to_shapely(), dtype=object)
+    expected = shapely.normalize(np.asarray(geometries, dtype=object))
+
+    assert _RING_KERNEL_NAMES == ("normalize_ring_rotate",)
+    assert shapely.equals_exact(actual, expected, tolerance=0.0).all()
+
+
+@requires_gpu
 def test_indexed_multipolygon_equality_survives_terminal_host_materialization():
     """Indexed device rows retain correct normalization after host export."""
     cp = pytest.importorskip("cupy")

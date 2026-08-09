@@ -1021,7 +1021,12 @@ class CudaDriverRuntime:
         shared_mem_bytes: int = 0,
         stream: Any | None = None,
     ) -> None:
-        stream_handle = _normalize_stream_handle(stream)
+        # CuPy owns the arrays and allocator lifetimes passed to driver kernels.
+        # Inherit its active stream when callers do not provide one explicitly;
+        # a raw null handle can otherwise race CuPy producers/consumers when the
+        # active stream is PTDS or an ExternalStream.
+        effective_stream = cp.cuda.get_current_stream() if stream is None else stream
+        stream_handle = _normalize_stream_handle(effective_stream)
         with self.activate():
             _check_driver(
                 cu.cuLaunchKernel(

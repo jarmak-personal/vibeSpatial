@@ -1,9 +1,50 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
+
+def test_driver_launch_inherits_cupy_current_stream(monkeypatch) -> None:
+    """Implicit driver launches must share CuPy's producer/consumer stream."""
+    import vibespatial.cuda._runtime as rt_mod
+
+    current_stream = object()
+    normalized_streams: list[object] = []
+    launch_streams: list[object] = []
+    driver_stream = object()
+    runtime = rt_mod.CudaDriverRuntime.__new__(rt_mod.CudaDriverRuntime)
+
+    monkeypatch.setattr(
+        rt_mod.cp.cuda,
+        "get_current_stream",
+        lambda: current_stream,
+    )
+    monkeypatch.setattr(
+        rt_mod,
+        "_normalize_stream_handle",
+        lambda stream: normalized_streams.append(stream) or driver_stream,
+    )
+    monkeypatch.setattr(runtime, "activate", nullcontext)
+    monkeypatch.setattr(rt_mod, "_check_driver", lambda result: result)
+
+    def _launch(*args):
+        launch_streams.append(args[8])
+        return None
+
+    monkeypatch.setattr(rt_mod.cu, "cuLaunchKernel", _launch)
+
+    runtime.launch(
+        rt_mod.CompiledKernel(name="test", function=object()),
+        grid=(1, 1, 1),
+        block=(1, 1, 1),
+        params=((), ()),
+    )
+
+    assert normalized_streams == [current_stream]
+    assert launch_streams == [driver_stream]
 
 # ---------------------------------------------------------------------------
 # OOM callback unit tests (pure Python, no GPU required)

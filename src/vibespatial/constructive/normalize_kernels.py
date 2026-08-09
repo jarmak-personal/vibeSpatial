@@ -13,56 +13,15 @@ _RING_KERNEL_SOURCE = (
     + r"""
 typedef {compute_type} compute_t;
 
-extern "C" __global__ void normalize_ring_find_min(
-    const double* x,
-    const double* y,
-    const int* ring_offsets,
-    int* min_index,
+extern "C" __global__ void normalize_ring_rotate(
+    const double* __restrict__ x_in,
+    const double* __restrict__ y_in,
+    double* __restrict__ x_out,
+    double* __restrict__ y_out,
+    const int* __restrict__ ring_offsets,
+    const unsigned char* __restrict__ is_exterior,
     double center_x,
     double center_y,
-    int total_rings
-) {{
-    const int ring = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ring >= total_rings) return;
-
-    const int coord_start = ring_offsets[ring];
-    const int coord_end = ring_offsets[ring + 1];
-    int n = coord_end - coord_start;
-
-    // Strip closing vertex if present (last == first)
-    n = vs_strip_closure(x, y, coord_start, coord_end, n, 1e-24);
-
-    if (n <= 0) {{
-        min_index[ring] = coord_start;
-        return;
-    }}
-
-    // Find lexicographically smallest vertex (min x, then min y on tie)
-    int best = coord_start;
-    compute_t best_x = (compute_t)(x[coord_start] - center_x);
-    compute_t best_y = (compute_t)(y[coord_start] - center_y);
-
-    for (int i = 1; i < n; i++) {{
-        const int idx = coord_start + i;
-        const compute_t cx = (compute_t)(x[idx] - center_x);
-        const compute_t cy = (compute_t)(y[idx] - center_y);
-        if (cx < best_x || (cx == best_x && cy < best_y)) {{
-            best = idx;
-            best_x = cx;
-            best_y = cy;
-        }}
-    }}
-    min_index[ring] = best;
-}}
-
-extern "C" __global__ void normalize_ring_rotate(
-    const double* x_in,
-    const double* y_in,
-    double* x_out,
-    double* y_out,
-    const int* ring_offsets,
-    const int* min_index,
-    const unsigned char* is_exterior,
     int total_rings
 ) {{
     const int ring = blockIdx.x * blockDim.x + threadIdx.x;
@@ -76,8 +35,23 @@ extern "C" __global__ void normalize_ring_rotate(
     // Determine unique vertex count (strip closing vertex)
     int n = total;
     n = vs_strip_closure(x_in, y_in, coord_start, coord_end, n, 1e-24);
+    if (n <= 0) return;
 
-    const int best = min_index[ring];
+    // Select and consume the canonical start in one ring-owned launch. This
+    // avoids a cross-launch intermediate and its allocator-lifetime hazard.
+    int best = coord_start;
+    compute_t best_x = (compute_t)(x_in[coord_start] - center_x);
+    compute_t best_y = (compute_t)(y_in[coord_start] - center_y);
+    for (int i = 1; i < n; i++) {{
+        const int idx = coord_start + i;
+        const compute_t cx = (compute_t)(x_in[idx] - center_x);
+        const compute_t cy = (compute_t)(y_in[idx] - center_y);
+        if (cx < best_x || (cx == best_x && cy < best_y)) {{
+            best = idx;
+            best_x = cx;
+            best_y = cy;
+        }}
+    }}
     const int offset_in_ring = best - coord_start;
 
     // Choose the lexicographically smaller cyclic direction. This makes the
@@ -162,5 +136,5 @@ extern "C" __global__ void normalize_linestring_reverse(
     }}
 }}
 """
-_RING_KERNEL_NAMES = ("normalize_ring_find_min", "normalize_ring_rotate")
+_RING_KERNEL_NAMES = ("normalize_ring_rotate",)
 _LINE_KERNEL_NAMES = ("normalize_linestring_reverse",)
