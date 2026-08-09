@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import pandas as pd
+import pytest
 from shapely.geometry import GeometryCollection, Polygon
 
 from vibespatial import GeoDataFrame, GeoSeries
 from vibespatial.api.testing import (
+    _geom_type_arrays_equal,
     assert_geodataframe_equal,
     assert_geoseries_equal,
     geom_almost_equals,
@@ -45,6 +48,15 @@ def test_assert_geoseries_equal_allows_geometrycollection_under_strict_native() 
         assert_geoseries_equal(left, right)
 
 
+def test_geom_type_equality_ignores_pandas_string_storage() -> None:
+    arrow = pd.Series(["Point", None, "Polygon"], dtype="string[pyarrow]")
+    objects = pd.Series(["Point", None, "Polygon"], dtype=object)
+
+    assert _geom_type_arrays_equal(arrow, objects)
+    assert not _geom_type_arrays_equal(arrow, pd.Series(["Point", "LineString", "Polygon"]))
+
+
+@pytest.mark.gpu
 def test_assert_geodataframe_equal_uses_public_equality_for_clip_polygon_rounding() -> None:
     source = GeoDataFrame(
         [1],

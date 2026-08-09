@@ -17,6 +17,7 @@ from vibespatial import (
     decode_wkb_owned,
     from_shapely_geometries,
     from_wkb,
+    has_gpu_runtime,
     has_pylibcudf_support,
     read_geoparquet_owned,
 )
@@ -228,7 +229,9 @@ def _sample_owned(geometry_type: str, rows: int, *, seed: int = 0) -> OwnedGeome
 
 def _sample_geodataframe(geometry_type: str, rows: int, *, seed: int = 0):
     if geometry_type == "point":
-        return generate_points(SyntheticSpec("point", "uniform", count=rows, seed=seed)).to_geodataframe()
+        return generate_points(
+            SyntheticSpec("point", "uniform", count=rows, seed=seed)
+        ).to_geodataframe()
     if geometry_type == "polygon":
         return generate_polygons(
             SyntheticSpec("polygon", "regular-grid", count=rows, seed=seed, vertices=6)
@@ -242,7 +245,9 @@ def _consume_first_gpu_stage(frame) -> None:
     compute_geometry_bounds_device(frame.geometry.values.to_owned())
 
 
-def _benchmark_geojson_public_pipeline(*, rows: int, repeat: int, seed: int = 0) -> tuple[float, float] | None:
+def _benchmark_geojson_public_pipeline(
+    *, rows: int, repeat: int, seed: int = 0
+) -> tuple[float, float] | None:
     import pyogrio
 
     import vibespatial.api as geopandas
@@ -277,7 +282,9 @@ def _benchmark_geojson_public_pipeline(*, rows: int, repeat: int, seed: int = 0)
     return baseline_rows_per_second, candidate_rows_per_second
 
 
-def _benchmark_shapefile_public_pipeline(*, rows: int, repeat: int, seed: int = 0) -> tuple[float, float] | None:
+def _benchmark_shapefile_public_pipeline(
+    *, rows: int, repeat: int, seed: int = 0
+) -> tuple[float, float] | None:
     import pyogrio
 
     import vibespatial.api as geopandas
@@ -427,7 +434,9 @@ def _benchmark_geoparquet_scan(
     return rows_per_second, file_bytes
 
 
-def _benchmark_mixed_wkb_decode(*, rows: int, repeat: int, seed: int = 0) -> tuple[float, float, int, int]:
+def _benchmark_mixed_wkb_decode(
+    *, rows: int, repeat: int, seed: int = 0
+) -> tuple[float, float, int, int]:
     dataset = generate_mixed_geometries(
         SyntheticSpec(
             "mixed",
@@ -476,7 +485,9 @@ def benchmark_io_arrow_suite(*, suite: str = "all", repeat: int = 1) -> list[IOB
 
     point_scales = {"smoke": [10_000], "ci": [100_000], "all": [10_000, 100_000, 1_000_000]}[suite]
     polygon_scales = {"smoke": [10_000], "ci": [20_000], "all": [20_000, 100_000]}[suite]
-    geoparquet_scales = {"smoke": [1_000_000], "ci": [1_000_000], "all": [1_000_000, 10_000_000]}[suite]
+    geoparquet_scales = {"smoke": [1_000_000], "ci": [1_000_000], "all": [1_000_000, 10_000_000]}[
+        suite
+    ]
     results: list[IOBenchmarkCase] = []
 
     for rows in point_scales:
@@ -601,7 +612,9 @@ def benchmark_io_arrow_suite(*, suite: str = "all", repeat: int = 1) -> list[IOB
                 baseline_rows_per_second=host.rows_per_second,
                 candidate_rows_per_second=native.rows_per_second,
                 rows_decoded=rows,
-                bytes_scanned=sum(len(value) for value in owned.to_wkb() if isinstance(value, bytes)),
+                bytes_scanned=sum(
+                    len(value) for value in owned.to_wkb() if isinstance(value, bytes)
+                ),
                 copies_made=1,
                 fallback_pool_share=native.fallback_rows / rows if rows else 0.0,
                 notes="WKB decode should use staged native planning instead of per-row host decode.",
@@ -744,7 +757,7 @@ def benchmark_io_arrow_suite(*, suite: str = "all", repeat: int = 1) -> list[IOB
             repeat=scan_repeat,
             compression=None,
         )
-        if has_pylibcudf_support():
+        if has_gpu_runtime() and has_pylibcudf_support():
             gpu_rows_per_second, gpu_bytes = _benchmark_geoparquet_scan(
                 geometry_type="point",
                 rows=rows,
@@ -787,8 +800,8 @@ def benchmark_io_arrow_suite(*, suite: str = "all", repeat: int = 1) -> list[IOB
 
     if suite != "smoke":
         mixed_rows = 100_000 if suite == "all" else 20_000
-        host_rows_per_second, native_rows_per_second, bytes_scanned, fallback_rows = _benchmark_mixed_wkb_decode(
-            rows=mixed_rows, repeat=repeat
+        host_rows_per_second, native_rows_per_second, bytes_scanned, fallback_rows = (
+            _benchmark_mixed_wkb_decode(rows=mixed_rows, repeat=repeat)
         )
         results.append(
             _speedup_case(
@@ -997,7 +1010,13 @@ def benchmark_io_file_suite(*, suite: str = "all", repeat: int = 1) -> list[IOBe
             )
 
     container_cases = (
-        ("GPKG", ".gpkg", "geopackage_public_pipeline", "pyogrio", "public_engine_pyogrio_native_boundary"),
+        (
+            "GPKG",
+            ".gpkg",
+            "geopackage_public_pipeline",
+            "pyogrio",
+            "public_engine_pyogrio_native_boundary",
+        ),
         ("FlatGeobuf", ".fgb", "flatgeobuf_public_pipeline", None, "public_auto_pipeline"),
     )
     for rows in vector_container_scales:

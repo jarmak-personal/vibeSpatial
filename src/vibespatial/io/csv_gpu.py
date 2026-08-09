@@ -58,6 +58,7 @@ Tier classification (ADR-0033):
     - WKT field concatenation: Tier 2 (CuPy scatter/copy)
     - WKT parsing: delegates to wkt_gpu.read_wkt_gpu
 """
+
 from __future__ import annotations
 
 import ctypes
@@ -103,12 +104,14 @@ KERNEL_PARAM_I64 = ctypes.c_longlong
 
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("csv-quote-toggle", _CSV_QUOTE_TOGGLE_SOURCE, _CSV_QUOTE_TOGGLE_NAMES),
-    ("csv-find-row-ends", _CSV_FIND_ROW_ENDS_SOURCE, _CSV_FIND_ROW_ENDS_NAMES),
-    ("csv-find-delimiters", _CSV_FIND_DELIMITERS_SOURCE, _CSV_FIND_DELIMITERS_NAMES),
-    ("csv-hex-wkb", _CSV_HEX_WKB_SOURCE, _CSV_HEX_WKB_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("csv-quote-toggle", _CSV_QUOTE_TOGGLE_SOURCE, _CSV_QUOTE_TOGGLE_NAMES),
+        ("csv-find-row-ends", _CSV_FIND_ROW_ENDS_SOURCE, _CSV_FIND_ROW_ENDS_NAMES),
+        ("csv-find-delimiters", _CSV_FIND_DELIMITERS_SOURCE, _CSV_FIND_DELIMITERS_NAMES),
+        ("csv-hex-wkb", _CSV_HEX_WKB_SOURCE, _CSV_HEX_WKB_NAMES),
+    ]
+)
 
 # ---------------------------------------------------------------------------
 # Kernel compilation helpers
@@ -117,25 +120,33 @@ request_nvrtc_warmup([
 
 def _quote_toggle_kernels() -> dict[str, object]:
     return compile_kernel_group(
-        "csv-quote-toggle", _CSV_QUOTE_TOGGLE_SOURCE, _CSV_QUOTE_TOGGLE_NAMES,
+        "csv-quote-toggle",
+        _CSV_QUOTE_TOGGLE_SOURCE,
+        _CSV_QUOTE_TOGGLE_NAMES,
     )
 
 
 def _row_end_kernels() -> dict[str, object]:
     return compile_kernel_group(
-        "csv-find-row-ends", _CSV_FIND_ROW_ENDS_SOURCE, _CSV_FIND_ROW_ENDS_NAMES,
+        "csv-find-row-ends",
+        _CSV_FIND_ROW_ENDS_SOURCE,
+        _CSV_FIND_ROW_ENDS_NAMES,
     )
 
 
 def _delimiter_kernels() -> dict[str, object]:
     return compile_kernel_group(
-        "csv-find-delimiters", _CSV_FIND_DELIMITERS_SOURCE, _CSV_FIND_DELIMITERS_NAMES,
+        "csv-find-delimiters",
+        _CSV_FIND_DELIMITERS_SOURCE,
+        _CSV_FIND_DELIMITERS_NAMES,
     )
 
 
 def _hex_wkb_kernels() -> dict[str, object]:
     return compile_kernel_group(
-        "csv-hex-wkb", _CSV_HEX_WKB_SOURCE, _CSV_HEX_WKB_NAMES,
+        "csv-hex-wkb",
+        _CSV_HEX_WKB_SOURCE,
+        _CSV_HEX_WKB_NAMES,
     )
 
 
@@ -155,15 +166,36 @@ def _launch_kernel(runtime, kernel, n: int, params) -> None:
 
 # Canonical name sets for spatial column identification.
 # All comparisons are done against lower-cased, stripped column names.
-_LATITUDE_NAMES: frozenset[str] = frozenset({
-    "latitude", "lat", "y", "lat_y", "point_y",
-})
-_LONGITUDE_NAMES: frozenset[str] = frozenset({
-    "longitude", "lon", "lng", "x", "long", "lon_x", "point_x",
-})
-_GEOMETRY_NAMES: frozenset[str] = frozenset({
-    "geometry", "geom", "wkt", "the_geom", "shape", "wkb",
-})
+_LATITUDE_NAMES: frozenset[str] = frozenset(
+    {
+        "latitude",
+        "lat",
+        "y",
+        "lat_y",
+        "point_y",
+    }
+)
+_LONGITUDE_NAMES: frozenset[str] = frozenset(
+    {
+        "longitude",
+        "lon",
+        "lng",
+        "x",
+        "long",
+        "lon_x",
+        "point_x",
+    }
+)
+_GEOMETRY_NAMES: frozenset[str] = frozenset(
+    {
+        "geometry",
+        "geom",
+        "wkt",
+        "the_geom",
+        "shape",
+        "wkb",
+    }
+)
 
 
 def _detect_spatial_columns(column_names: list[str]) -> dict[str, int]:
@@ -355,14 +387,10 @@ def csv_structural_analysis(
     {'lat': 1, 'lon': 2}
     """
     if len(delimiter) != 1:
-        raise ValueError(
-            f"Delimiter must be a single character, got {delimiter!r}"
-        )
+        raise ValueError(f"Delimiter must be a single character, got {delimiter!r}")
     delimiter_byte = ord(delimiter)
     if delimiter_byte > 127:
-        raise ValueError(
-            f"Delimiter must be ASCII, got {delimiter!r} (ord={delimiter_byte})"
-        )
+        raise ValueError(f"Delimiter must be ASCII, got {delimiter!r} (ord={delimiter_byte})")
 
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
@@ -387,10 +415,15 @@ def csv_structural_analysis(
     # Doubled quotes ("") naturally cancel in the cumsum parity.
     kernels_qt = _quote_toggle_kernels()
     d_toggle = cp.empty(n, dtype=cp.uint8)
-    _launch_kernel(runtime, kernels_qt["csv_quote_toggle"], n, (
-        (ptr(d_bytes), ptr(d_toggle), n_i64),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
-    ))
+    _launch_kernel(
+        runtime,
+        kernels_qt["csv_quote_toggle"],
+        n,
+        (
+            (ptr(d_bytes), ptr(d_toggle), n_i64),
+            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
+        ),
+    )
     # uint8 cumsum + bitwise AND for parity (no sync needed -- same stream).
     # uint8 overflow is safe because 256 is even, so parity bit is preserved.
     d_quote_parity = cp.cumsum(d_toggle, dtype=cp.uint8) & np.uint8(1)
@@ -401,10 +434,15 @@ def csv_structural_analysis(
     # ------------------------------------------------------------------
     kernels_re = _row_end_kernels()
     d_is_row_end = cp.empty(n, dtype=cp.uint8)
-    _launch_kernel(runtime, kernels_re["csv_find_row_ends"], n, (
-        (ptr(d_bytes), ptr(d_quote_parity), ptr(d_is_row_end), n_i64),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
-    ))
+    _launch_kernel(
+        runtime,
+        kernels_re["csv_find_row_ends"],
+        n,
+        (
+            (ptr(d_bytes), ptr(d_quote_parity), ptr(d_is_row_end), n_i64),
+            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
+        ),
+    )
     d_row_ends = cp.flatnonzero(d_is_row_end).astype(cp.int64)
     del d_is_row_end
 
@@ -428,12 +466,27 @@ def csv_structural_analysis(
     # ------------------------------------------------------------------
     kernels_dl = _delimiter_kernels()
     d_is_delimiter = cp.empty(n, dtype=cp.uint8)
-    _launch_kernel(runtime, kernels_dl["csv_find_delimiters"], n, (
-        (ptr(d_bytes), ptr(d_quote_parity), ptr(d_is_delimiter), n_i64,
-         np.int32(delimiter_byte)),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64,
-         KERNEL_PARAM_I32),
-    ))
+    _launch_kernel(
+        runtime,
+        kernels_dl["csv_find_delimiters"],
+        n,
+        (
+            (
+                ptr(d_bytes),
+                ptr(d_quote_parity),
+                ptr(d_is_delimiter),
+                n_i64,
+                np.int32(delimiter_byte),
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I64,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
     d_delimiters = cp.flatnonzero(d_is_delimiter).astype(cp.int64)
     del d_is_delimiter
 
@@ -694,11 +747,7 @@ def _strip_quotes_from_spans(
     d_last_byte_pos = cp.maximum(d_ends_stripped - 1, d_starts)
     d_last_byte = d_bytes[d_last_byte_pos]
 
-    d_is_quoted = (
-        d_long_enough
-        & (d_first_byte == ord('"'))
-        & (d_last_byte == ord('"'))
-    )
+    d_is_quoted = d_long_enough & (d_first_byte == ord('"')) & (d_last_byte == ord('"'))
 
     d_starts_out = cp.where(d_is_quoted, d_starts + 1, d_starts)
     d_ends_out = cp.where(d_is_quoted, d_ends_stripped - 1, d_ends_stripped)
@@ -706,9 +755,7 @@ def _strip_quotes_from_spans(
     return d_starts_out, d_ends_out
 
 
-_HEX_CHARS: frozenset[int] = frozenset(
-    b"0123456789abcdefABCDEF"
-)
+_HEX_CHARS: frozenset[int] = frozenset(b"0123456789abcdefABCDEF")
 
 
 def _detect_geom_format(
@@ -752,10 +799,14 @@ def _detect_geom_format(
     end = int(d_ends[first_idx])
     # Transfer at most 64 bytes -- enough to classify the field.
     peek_end = min(end, start + 64)
-    sample_bytes: bytes = get_cuda_runtime().copy_device_to_host(
-        d_bytes[start:peek_end],
-        reason="csv geometry encoding sample bytes host export",
-    ).tobytes()
+    sample_bytes: bytes = (
+        get_cuda_runtime()
+        .copy_device_to_host(
+            d_bytes[start:peek_end],
+            reason="csv geometry encoding sample bytes host export",
+        )
+        .tobytes()
+    )
 
     # Strip leading whitespace.
     stripped = sample_bytes.lstrip()
@@ -831,10 +882,15 @@ def _extract_wkb_and_parse(
 
     ptr = runtime.pointer
     count_params = (
-        (ptr(d_bytes), ptr(d_starts), ptr(d_ends),
-         ptr(d_counts), ptr(d_valid), n_rows),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+        (ptr(d_bytes), ptr(d_starts), ptr(d_ends), ptr(d_counts), ptr(d_valid), n_rows),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+        ),
     )
     _launch_kernel(runtime, kernels["csv_hex_wkb_count"], n_rows, count_params)
 
@@ -860,11 +916,24 @@ def _extract_wkb_and_parse(
     # --- Pass 2: decode hex to binary ---
     d_payload = cp.empty(total_bytes, dtype=cp.uint8)
     decode_params = (
-        (ptr(d_bytes), ptr(d_starts), ptr(d_ends),
-         ptr(d_offsets), ptr(d_valid), ptr(d_payload), n_rows),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_I32),
+        (
+            ptr(d_bytes),
+            ptr(d_starts),
+            ptr(d_ends),
+            ptr(d_offsets),
+            ptr(d_valid),
+            ptr(d_payload),
+            n_rows,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+        ),
     )
     _launch_kernel(runtime, kernels["csv_hex_wkb_decode"], n_rows, decode_params)
     runtime.synchronize()
@@ -1075,9 +1144,7 @@ def _extract_nonspatial_columns(
     n_columns = structural.n_columns
     column_names = structural.column_names
 
-    nonspatial_indices = [
-        i for i in range(n_columns) if i not in spatial_column_indices
-    ]
+    nonspatial_indices = [i for i in range(n_columns) if i not in spatial_column_indices]
     if not nonspatial_indices or n_rows == 0:
         return None
 
@@ -1086,7 +1153,10 @@ def _extract_nonspatial_columns(
     device_spans: list[tuple[int, cp.ndarray, cp.ndarray]] = []
     for col_idx in nonspatial_indices:
         d_starts, d_ends = _extract_field_spans(
-            d_bytes, structural, col_idx, has_header=True,
+            d_bytes,
+            structural,
+            col_idx,
+            has_header=True,
         )
         d_starts, d_ends = _strip_quotes_from_spans(d_bytes, d_starts, d_ends)
         device_spans.append((col_idx, d_starts, d_ends))
@@ -1296,11 +1366,15 @@ def read_csv_gpu(
         spatial_indices = {lat_idx, lon_idx}
 
         # Extract lat field spans
-        d_lat_starts, d_lat_ends = _extract_field_spans(d_bytes, structural, lat_idx, has_header=True)
+        d_lat_starts, d_lat_ends = _extract_field_spans(
+            d_bytes, structural, lat_idx, has_header=True
+        )
         d_lat_starts, d_lat_ends = _strip_quotes_from_spans(d_bytes, d_lat_starts, d_lat_ends)
 
         # Extract lon field spans
-        d_lon_starts, d_lon_ends = _extract_field_spans(d_bytes, structural, lon_idx, has_header=True)
+        d_lon_starts, d_lon_ends = _extract_field_spans(
+            d_bytes, structural, lon_idx, has_header=True
+        )
         d_lon_starts, d_lon_ends = _strip_quotes_from_spans(d_bytes, d_lon_starts, d_lon_ends)
 
         # Parse numeric values (delegates to gpu_parse NVRTC kernel)
@@ -1314,9 +1388,13 @@ def read_csv_gpu(
     # Stage 4: Extract non-spatial attribute columns
     # ------------------------------------------------------------------
     attributes = _extract_nonspatial_columns(
-        d_bytes, structural, spatial_column_indices=spatial_indices,
+        d_bytes,
+        structural,
+        spatial_column_indices=spatial_indices,
     )
 
     return CsvGpuResult(
-        geometry=geometry, n_rows=structural.n_rows, attributes=attributes,
+        geometry=geometry,
+        n_rows=structural.n_rows,
+        attributes=attributes,
     )

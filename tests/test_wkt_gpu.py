@@ -4,12 +4,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from vibespatial import has_gpu_runtime
 from vibespatial.geometry.buffers import GeometryFamily
 
 try:
     import cupy as cp
 
-    HAS_GPU = True
+    HAS_GPU = has_gpu_runtime()
 except (ImportError, ModuleNotFoundError):
     HAS_GPU = False
 

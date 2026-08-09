@@ -38,7 +38,6 @@ from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
     compile_kernel_group,
-    count_scatter_total,
     get_cuda_runtime,
 )
 from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
@@ -51,6 +50,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import (
     StrictNativeFallbackError,
@@ -71,8 +71,7 @@ logger = logging.getLogger(__name__)
 def _convex_hull_device_bool_scalar(value: object, *, reason: str) -> bool:
     """Read a device boolean scalar through the runtime transfer ledger."""
     if cp is not None and (
-        hasattr(value, "__cuda_array_interface__")
-        or type(value).__module__.startswith("cupy")
+        hasattr(value, "__cuda_array_interface__") or type(value).__module__.startswith("cupy")
     ):
         host = get_cuda_runtime().copy_device_to_host(
             cp.asarray(value).reshape(1),
@@ -88,15 +87,18 @@ def _convex_hull_device_bool_scalar(value: object, *, reason: str) -> bool:
 from vibespatial.cuda.cccl_precompile import request_warmup  # noqa: E402
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("convex-hull-fp64", _CONVEX_HULL_FP64, _CONVEX_HULL_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("convex-hull-fp64", _CONVEX_HULL_FP64, _CONVEX_HULL_KERNEL_NAMES),
+    ]
+)
 request_warmup(["exclusive_scan_i32", "segmented_sort_asc_f64"])
 
 
 # ---------------------------------------------------------------------------
 # CPU implementation: Andrew's monotone chain convex hull
 # ---------------------------------------------------------------------------
+
 
 def _cross(ox, oy, ax, ay, bx, by):
     """2D cross product of vectors OA and OB."""
@@ -152,22 +154,36 @@ def _convex_hull_geometry_cpu(x, y, start, end):
     # Build lower hull.
     lower = []
     for i in range(nu):
-        while len(lower) >= 2 and _cross(
-            lower[-2][0], lower[-2][1],
-            lower[-1][0], lower[-1][1],
-            pts[i, 0], pts[i, 1],
-        ) <= 0:
+        while (
+            len(lower) >= 2
+            and _cross(
+                lower[-2][0],
+                lower[-2][1],
+                lower[-1][0],
+                lower[-1][1],
+                pts[i, 0],
+                pts[i, 1],
+            )
+            <= 0
+        ):
             lower.pop()
         lower.append(pts[i])
 
     # Build upper hull.
     upper = []
     for i in range(nu - 1, -1, -1):
-        while len(upper) >= 2 and _cross(
-            upper[-2][0], upper[-2][1],
-            upper[-1][0], upper[-1][1],
-            pts[i, 0], pts[i, 1],
-        ) <= 0:
+        while (
+            len(upper) >= 2
+            and _cross(
+                upper[-2][0],
+                upper[-2][1],
+                upper[-1][0],
+                upper[-1][1],
+                pts[i, 0],
+                pts[i, 1],
+            )
+            <= 0
+        ):
             upper.pop()
         upper.append(pts[i])
 
@@ -303,14 +319,19 @@ def _convex_hull_family_cpu(buf, family):
 # CPU kernel variant (registered)
 # ---------------------------------------------------------------------------
 
+
 @register_kernel_variant(
     "convex_hull",
     "cpu",
     kernel_class=KernelClass.COARSE,
     execution_modes=(ExecutionMode.CPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("numpy", "constructive", "convex_hull"),
@@ -323,6 +344,7 @@ def _convex_hull_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     row_count = owned.row_count
     if row_count == 0:
         from vibespatial.geometry.owned import from_shapely_geometries
+
         return from_shapely_geometries([])
 
     # Materialize device-resident coordinate buffers to host before
@@ -412,6 +434,7 @@ def _convex_hull_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 # ADR-0002: COARSE class, stays fp64 (hull = coordinate subset)
 # ---------------------------------------------------------------------------
 
+
 def _compute_flat_coord_offsets(device_buf, family):
     """Compute per-geometry flat coordinate offset array on device.
 
@@ -423,8 +446,7 @@ def _compute_flat_coord_offsets(device_buf, family):
 
     Returns None if the family is not supported for GPU path.
     """
-    if family in (GeometryFamily.POINT, GeometryFamily.MULTIPOINT,
-                  GeometryFamily.LINESTRING):
+    if family in (GeometryFamily.POINT, GeometryFamily.MULTIPOINT, GeometryFamily.LINESTRING):
         # geometry_offsets directly index into coords
         return cp.asarray(device_buf.geometry_offsets)
 
@@ -511,7 +533,9 @@ def _convex_hull_family_gpu(runtime, device_buf, family, row_count):
 
     # --- Step 3: NVRTC count pass ---
     kernels = compile_kernel_group(
-        "convex-hull-fp64", _CONVEX_HULL_FP64, _CONVEX_HULL_KERNEL_NAMES,
+        "convex-hull-fp64",
+        _CONVEX_HULL_FP64,
+        _CONVEX_HULL_KERNEL_NAMES,
     )
 
     d_hull_counts = runtime.allocate((row_count,), np.int32, zero=True)
@@ -519,12 +543,18 @@ def _convex_hull_family_gpu(runtime, device_buf, family, row_count):
 
     count_params = (
         (
-            ptr(d_sorted_x), ptr(d_sorted_y), ptr(d_flat_offsets_i32),
-            ptr(d_hull_counts), row_count,
+            ptr(d_sorted_x),
+            ptr(d_sorted_y),
+            ptr(d_flat_offsets_i32),
+            ptr(d_hull_counts),
+            row_count,
         ),
         (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
         ),
     )
     count_kernel = kernels["convex_hull_count"]
@@ -535,32 +565,38 @@ def _convex_hull_family_gpu(runtime, device_buf, family, row_count):
     # No sync needed between count kernel and exclusive_sum (same null stream).
     d_hull_offsets = exclusive_sum(d_hull_counts, synchronize=False)
 
-    # Get total output coordinate count via single async transfer
-    total_coords = count_scatter_total(
-        runtime,
-        d_hull_counts,
-        d_hull_offsets,
-        reason="convex-hull coordinate allocation fence",
-    )
-
     # --- Step 5: NVRTC write pass ---
-    d_ox = runtime.allocate((max(total_coords, 1),), np.float64)
-    d_oy = runtime.allocate((max(total_coords, 1),), np.float64)
+    output_capacity = max(coord_count + row_count * 4, 1)
+    d_ox = runtime.allocate((output_capacity,), np.float64)
+    d_oy = runtime.allocate((output_capacity,), np.float64)
 
     write_params = (
         (
-            ptr(d_sorted_x), ptr(d_sorted_y), ptr(d_flat_offsets_i32),
-            ptr(d_hull_offsets), ptr(d_ox), ptr(d_oy), row_count,
+            ptr(d_sorted_x),
+            ptr(d_sorted_y),
+            ptr(d_flat_offsets_i32),
+            ptr(d_hull_offsets),
+            ptr(d_ox),
+            ptr(d_oy),
+            row_count,
         ),
         (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
         ),
     )
     write_kernel = kernels["convex_hull_write"]
     grid, block = runtime.launch_config(write_kernel, row_count)
     runtime.launch(write_kernel, grid=grid, block=block, params=write_params)
+    d_total_coords = d_hull_offsets[-1] + d_hull_counts[-1]
+    d_coord_keep = cp.arange(output_capacity, dtype=cp.int32) < d_total_coords
+    d_ox = d_ox[d_coord_keep]
+    d_oy = d_oy[d_coord_keep]
 
     # --- Step 6: build Polygon output ---
     # Polygon output: 1 ring per geometry, so:
@@ -571,14 +607,14 @@ def _convex_hull_family_gpu(runtime, device_buf, family, row_count):
     # ring_offsets = hull_offsets ++ [total_coords]
     d_ring_offsets = cp.empty(row_count + 1, dtype=cp.int32)
     d_ring_offsets[:row_count] = cp.asarray(d_hull_offsets)
-    d_ring_offsets[row_count] = total_coords
+    d_ring_offsets[row_count] = d_total_coords
 
     d_empty_mask = cp.zeros(row_count, dtype=cp.bool_)
 
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.POLYGON,
-        x=d_ox[:total_coords] if total_coords > 0 else d_ox[:0],
-        y=d_oy[:total_coords] if total_coords > 0 else d_oy[:0],
+        x=d_ox,
+        y=d_oy,
         geometry_offsets=d_geom_offsets,
         empty_mask=d_empty_mask,
         ring_offsets=d_ring_offsets,
@@ -592,8 +628,12 @@ def _convex_hull_family_gpu(runtime, device_buf, family, row_count):
     kernel_class=KernelClass.COARSE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=False,
     tags=("cuda-python", "constructive", "convex_hull"),
@@ -617,14 +657,16 @@ def _convex_hull_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
     # Find the single active family
     active_families = [
-        (fam, dbuf) for fam, dbuf in d_state.families.items()
+        (fam, dbuf)
+        for fam, dbuf in d_state.families.items()
         if int(dbuf.geometry_offsets.size) >= 2
     ]
 
     if len(active_families) != 1:
         # Defensive: should not happen since supports_mixed=False
-        logger.warning("GPU convex_hull received %d families, falling back to CPU",
-                        len(active_families))
+        logger.warning(
+            "GPU convex_hull received %d families, falling back to CPU", len(active_families)
+        )
         return _convex_hull_cpu(owned)
 
     family, device_buf = active_families[0]
@@ -672,21 +714,36 @@ def _grouped_convex_hull_from_source_owned(
     group_count = int(offsets.size - 1)
     if group_count <= 0 or np.any(offsets[1:] < offsets[:-1]):
         return None
+    if np.any(offsets[1:] == offsets[:-1]):
+        return None
 
     try:
+        from vibespatial.api._native_grouped import NativeGroupedSelection
         from vibespatial.constructive.binary_constructive import (
-            _explode_polygonal_rows_to_polygons_gpu,
+            _explode_polygonal_rows_to_polygon_capacity_gpu,
+        )
+        from vibespatial.cuda.cccl_primitives import PairSortStrategy, sort_pairs
+
+        source_for_parts = source_owned
+        if source_owned.is_indexed_view:
+            source_for_parts = source_owned.physicalize_device_rows(
+                allow_capacity_allocation=True,
+            )
+
+        polygon_parts = _explode_polygonal_rows_to_polygon_capacity_gpu(
+            source_for_parts,
+        )
+        if polygon_parts is None or polygon_parts.capacity == 0:
+            return None
+        source_state = source_owned._ensure_device_state(preserve_indexed_view=True)
+        trusted_dense_polygonal_source = (
+            source_state.trusted_all_valid is True
+            and source_state.trusted_all_non_empty is True
+            and source_state.trusted_polygonal_only is True
         )
 
-        exploded = _explode_polygonal_rows_to_polygons_gpu(source_owned)
-        if exploded is None:
-            return None
-        polygon_parts, d_part_source_rows = exploded
-        if polygon_parts.row_count == 0:
-            return None
-
         d_offsets = cp.asarray(offsets, dtype=cp.int64)
-        d_part_source_rows = cp.asarray(d_part_source_rows, dtype=cp.int64)
+        d_part_source_rows = cp.asarray(polygon_parts.source_rows, dtype=cp.int64)
         d_group_ids = (
             cp.searchsorted(d_offsets, d_part_source_rows, side="right").astype(
                 cp.int64,
@@ -694,25 +751,18 @@ def _grouped_convex_hull_from_source_owned(
             )
             - 1
         )
-        valid_group_ids = (d_group_ids >= 0) & (d_group_ids < group_count)
-        if not _convex_hull_device_bool_scalar(
-            cp.all(valid_group_ids),
-            reason="grouped convex-hull source-row group-domain scalar fence",
-        ):
-            return None
 
-        part_count = int(d_group_ids.size)
-        d_order = cp.argsort(
-            d_group_ids * np.int64(max(part_count, 1))
-            + cp.arange(part_count, dtype=cp.int64),
-        ).astype(cp.int64, copy=False)
-        sorted_parts = polygon_parts.take(d_order)
-        d_sorted_group_ids = d_group_ids[d_order]
-        d_group_counts = cp.bincount(
-            d_sorted_group_ids,
-            minlength=group_count,
-        ).astype(cp.int32, copy=False)
-        if _convex_hull_device_bool_scalar(
+        part_capacity = polygon_parts.capacity
+        grouped_parts = NativeGroupedSelection(
+            selection=polygon_parts.selection,
+            group_codes=d_group_ids.astype(cp.int32, copy=False),
+            group_count=group_count,
+        )
+        d_group_counts = grouped_parts.reduce_numeric(
+            cp.ones(part_capacity, dtype=cp.int32),
+            "count",
+        ).values.astype(cp.int32, copy=False)
+        if not trusted_dense_polygonal_source and _convex_hull_device_bool_scalar(
             cp.any(d_group_counts == 0),
             reason="grouped convex-hull nonempty-group scalar fence",
         ):
@@ -722,6 +772,26 @@ def _grouped_convex_hull_from_source_owned(
         d_group_offsets[0] = 0
         cp.cumsum(d_group_counts, out=d_group_offsets[1:])
 
+        d_active = polygon_parts.selection.active_capacity_mask()
+        d_sort_group_ids = cp.where(
+            d_active,
+            d_group_ids,
+            cp.int64(group_count),
+        ).astype(cp.uint64, copy=False)
+        d_sort_keys = (d_sort_group_ids << cp.uint64(32)) | cp.arange(
+            part_capacity, dtype=cp.uint64
+        )
+        d_order = sort_pairs(
+            d_sort_keys,
+            cp.arange(part_capacity, dtype=cp.int32),
+            strategy=PairSortStrategy.RADIX,
+            synchronize=False,
+        ).values.astype(cp.int64, copy=False)
+        sorted_parts = polygon_parts.geometry._device_indexed_take(d_order)
+        if getattr(sorted_parts, "is_indexed_view", False):
+            sorted_parts = sorted_parts.physicalize_device_rows(
+                allow_capacity_allocation=True,
+            )
         sorted_state = sorted_parts._ensure_device_state()
         polygon_buffer = sorted_state.families.get(GeometryFamily.POLYGON)
         if polygon_buffer is None:
@@ -779,7 +849,7 @@ def _grouped_convex_hull_from_source_owned(
         reason="dissolve grouped-union provenance avoided exact-union hull input",
         detail=(
             f"groups={group_count}, source_rows={source_owned.row_count}, "
-            f"polygon_parts={polygon_parts.row_count}"
+            f"polygon_part_capacity={polygon_parts.capacity}"
         ),
     )
     return result
@@ -788,6 +858,7 @@ def _grouped_convex_hull_from_source_owned(
 # ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
+
 
 def convex_hull_owned(
     owned: OwnedGeometryArray,
@@ -824,15 +895,12 @@ def convex_hull_owned(
         return from_shapely_geometries([])
 
     requested_mode = (
-        dispatch_mode
-        if isinstance(dispatch_mode, ExecutionMode)
-        else ExecutionMode(dispatch_mode)
+        dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
     )
     if (
         requested_mode is not ExecutionMode.CPU
         and provenance_rewrites_enabled()
-        and (grouped_source := getattr(owned, "_grouped_convex_hull_source", None))
-        is not None
+        and (grouped_source := getattr(owned, "_grouped_convex_hull_source", None)) is not None
     ):
         source_owned, group_offsets = grouped_source
         result = _grouped_convex_hull_from_source_owned(source_owned, group_offsets)
@@ -846,6 +914,11 @@ def convex_hull_owned(
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=owned.residency,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            primary_unit_name="convex-hull-coordinate",
+        ),
     )
 
     selected_mode = selection.selected
@@ -859,10 +932,7 @@ def convex_hull_owned(
         # GPU path supports single-family non-MultiPolygon inputs.
         # Use family_has_rows() which checks device buffers when present,
         # avoiding false negatives from unmaterialized host stubs.
-        families_with_rows = [
-            fam for fam in owned.families
-            if owned.family_has_rows(fam)
-        ]
+        families_with_rows = [fam for fam in owned.families if owned.family_has_rows(fam)]
         is_single_family = len(families_with_rows) == 1
         if is_single_family:
             try:

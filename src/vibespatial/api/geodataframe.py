@@ -20,7 +20,10 @@ from vibespatial.api._decorator import doc
 from vibespatial.api.explore import _explore
 from vibespatial.api.geo_base import (
     GeoPandasBase,
+    _attach_native_expression,
     _is_geometry_like_dtype,
+    _native_boolean_rowset_from_public_mask,
+    _native_expression_from_public_series,
     _record_native_display_export,
     _record_native_public_export_boundary,
     is_geometry_type,
@@ -105,14 +108,48 @@ def _current_public_geometry_crs(frame, column_name: Any, fallback: Any):
     return fallback
 
 
-def _native_tabular_result_with_public_metadata(frame, native_state):
+def _public_attribute_frame_for_terminal_export(frame, native_result):
+    """Use the public frame as the terminal attribute carrier when it is exact."""
+    attributes = native_result.attributes
+    attribute_columns = tuple(attributes.columns)
+    if len(frame.index) != len(attributes):
+        return None
+    if any(column not in frame.columns for column in attribute_columns):
+        return None
+    if not attribute_columns:
+        return pd.DataFrame(index=frame.index)
+    public_attributes = frame.loc[:, list(attribute_columns)].copy(deep=False)
+    if not public_attributes.index.equals(frame.index):
+        public_attributes.index = frame.index
+    return public_attributes
+
+
+def _native_tabular_result_with_public_metadata(
+    frame,
+    native_state,
+    *,
+    index=None,
+    preserve_native_attributes: bool = False,
+):
     """Keep private buffers but honor current public metadata at export time."""
     from vibespatial.api._native_result_core import (
         NativeGeometryColumn,
         NativeTabularResult,
     )
+    from vibespatial.api._native_rowset import NativeIndexPlan
 
     result = native_state.to_native_tabular_result()
+    attributes = result.attributes
+    index_plan = result.index_plan
+    if (
+        not preserve_native_attributes
+        and index is not False
+        and getattr(attributes, "device_table", None) is not None
+    ):
+        public_attributes = _public_attribute_frame_for_terminal_export(frame, result)
+        if public_attributes is not None:
+            attributes = public_attributes
+            index_plan = NativeIndexPlan.from_index(frame.index)
     geometry = result.geometry.with_crs(
         _current_public_geometry_crs(
             frame,
@@ -135,13 +172,15 @@ def _native_tabular_result_with_public_metadata(frame, native_state):
     )
     attrs = frame.attrs.copy() or None
     if (
-        geometry is result.geometry
+        attributes is result.attributes
+        and geometry is result.geometry
         and secondary_geometry == result.secondary_geometry
         and attrs == result.attrs
+        and index_plan == result.index_plan
     ):
         return result
     return NativeTabularResult(
-        attributes=result.attributes,
+        attributes=attributes,
         geometry=geometry,
         geometry_name=result.geometry_name,
         column_order=result.column_order,
@@ -149,6 +188,11 @@ def _native_tabular_result_with_public_metadata(frame, native_state):
         secondary_geometry=secondary_geometry,
         provenance=result.provenance,
         geometry_metadata=result.geometry_metadata,
+        index_plan=index_plan,
+        terminal_geodataframe_materializer=result.terminal_geodataframe_materializer,
+        terminal_geodataframe_materializer_owns_export=(
+            result.terminal_geodataframe_materializer_owns_export
+        ),
     )
 
 
@@ -245,6 +289,11 @@ def _native_boolean_filter_rowset(key, state, *, public_index=None):
     if isinstance(key, Series):
         if public_index is None or not key.index.equals(public_index):
             return None
+        native_rowset = _native_boolean_rowset_from_aligned_mask(key, state)
+        if native_rowset is not None:
+            return native_rowset
+        if not pd.api.types.is_bool_dtype(key.dtype):
+            return None
         values = key.to_numpy(dtype=bool, na_value=False)
     elif isinstance(key, pd.Index):
         if key.dtype != bool:
@@ -279,6 +328,62 @@ def _native_boolean_filter_rowset(key, state, *, public_index=None):
         unique=True,
         identity=identity,
     )
+
+
+def _native_boolean_rowset_from_aligned_mask(key, state):
+    rowset = _native_boolean_rowset_from_public_mask(key, state)
+    if rowset is None:
+        from vibespatial.api._native_public_arrays import (
+            native_boolean_rowset_from_mask_array,
+        )
+
+        rowset = native_boolean_rowset_from_mask_array(key)
+        if rowset is None:
+            return None
+        if (
+            rowset.source_row_count is not None
+            and int(rowset.source_row_count) != int(state.row_count)
+        ):
+            return None
+
+        from vibespatial.api._native_rowset import NativeRowSet
+
+        rowset = NativeRowSet.from_positions(
+            rowset.positions,
+            source_token=state.lineage_token,
+            source_row_count=state.row_count,
+            ordered=rowset.ordered,
+            unique=rowset.unique,
+            identity=rowset.identity,
+            geometry_family_domain=rowset.geometry_family_domain,
+            trusted_all_valid_rows=rowset.trusted_all_valid_rows,
+        )
+    return _native_rowset_mark_identity_if_full(rowset, state)
+
+
+def _native_rowset_mark_identity_if_full(rowset, state):
+    if (
+        rowset is not None
+        and not bool(getattr(rowset, "identity", False))
+        and bool(getattr(rowset, "ordered", False))
+        and bool(getattr(rowset, "unique", False))
+        and getattr(rowset, "source_row_count", None) is not None
+        and int(rowset.source_row_count) == int(state.row_count)
+        and len(rowset) == int(state.row_count)
+    ):
+        from vibespatial.api._native_rowset import NativeRowSet
+
+        return NativeRowSet.from_positions(
+            rowset.positions,
+            source_token=rowset.source_token,
+            source_row_count=rowset.source_row_count,
+            ordered=rowset.ordered,
+            unique=rowset.unique,
+            identity=True,
+            geometry_family_domain=rowset.geometry_family_domain,
+            trusted_all_valid_rows=rowset.trusted_all_valid_rows,
+        )
+    return rowset
 
 
 def _maybe_device_row_positions(positions, state):
@@ -391,6 +496,230 @@ def _is_full_slice(key) -> bool:
     return isinstance(key, slice) and key.start is None and key.stop is None and key.step is None
 
 
+def _take_public_frame_with_native_rowset(
+    frame,
+    rowset,
+    positions: np.ndarray,
+    *,
+    source_native_state,
+    geometry_column,
+):
+    if (
+        bool(getattr(rowset, "identity", False))
+        and len(rowset) == int(source_native_state.row_count)
+    ):
+        source_native_state._apply_rowset_geometry_proofs(
+            source_native_state.geometry,
+            rowset,
+        )
+        projected = source_native_state.project_columns(tuple(frame.columns))
+        if projected is None:
+            return None
+        return _shallow_public_frame_with_native_state(
+            frame,
+            projected,
+            geometry_column=geometry_column,
+        )
+
+    taken_state = source_native_state.take(
+        rowset,
+        preserve_index=True,
+        index_positions=positions,
+    )
+
+    projected = taken_state.project_columns(tuple(frame.columns))
+    if projected is None:
+        return None
+
+    return _public_frame_from_native_state(
+        frame,
+        projected,
+        geometry_column=geometry_column,
+    )
+
+
+def _native_lazy_public_attribute_frame(native_state):
+    from vibespatial.api._native_public_arrays import (
+        NativeAttributeColumnArray,
+        NativeNumericExpressionArray,
+    )
+
+    index_plan = getattr(native_state, "index_plan", None)
+    index = _native_public_index_from_plan(index_plan)
+    if index is None:
+        return None
+    columns: dict[Any, Any] = {}
+    attributes = native_state.attributes
+    attribute_columns = tuple(attributes.columns)
+    numeric_arrays = attributes.numeric_column_arrays(attribute_columns)
+    if numeric_arrays is None:
+        numeric_columns: tuple[Any, ...] = ()
+        if getattr(attributes, "device_table", None) is not None:
+            policies = attributes.device_column_policies(attribute_columns)
+            numeric_columns = tuple(
+                column
+                for column in attribute_columns
+                if (
+                    policy := policies.get(column)
+                ) is not None
+                and policy.can_compute_numeric
+            )
+        numeric_arrays = (
+            attributes.numeric_column_arrays(numeric_columns)
+            if numeric_columns
+            else {}
+        )
+        if numeric_arrays is None:
+            numeric_arrays = {}
+    if numeric_arrays:
+        from vibespatial.api._native_expression import NativeExpression
+
+    for column in attribute_columns:
+        values = numeric_arrays.get(column)
+        if values is not None:
+            columns[column] = NativeNumericExpressionArray(
+                NativeExpression(
+                    operation=f"attribute.{column}",
+                    values=values,
+                    source_token=native_state.lineage_token,
+                    source_row_count=native_state.row_count,
+                    dtype=str(getattr(values, "dtype", "")) or None,
+                    precision="source",
+                ),
+                export_surface="vibespatial.api.GeoDataFrame.__getitem__",
+                export_operation="native_attribute_column_to_public_series",
+            )
+        else:
+            columns[column] = NativeAttributeColumnArray(
+                attributes,
+                column,
+                export_surface="vibespatial.api.GeoDataFrame.__getitem__",
+                export_operation="native_attribute_column_to_public_series",
+            )
+    if not columns:
+        return pd.DataFrame(index=index)
+    return pd.DataFrame(columns, index=index)
+
+
+def _native_public_index_from_plan(index_plan):
+    from vibespatial.api._native_public_arrays import native_public_index_from_plan
+
+    return native_public_index_from_plan(index_plan)
+
+
+def _take_public_frame_with_native_state(
+    frame,
+    rowset,
+    *,
+    source_native_state,
+    geometry_column,
+    preserve_index: bool = True,
+    index_positions=None,
+):
+    if (
+        preserve_index
+        and bool(getattr(rowset, "identity", False))
+        and len(rowset) == int(source_native_state.row_count)
+    ):
+        source_native_state._apply_rowset_geometry_proofs(
+            source_native_state.geometry,
+            rowset,
+        )
+        projected = source_native_state.project_columns(tuple(frame.columns))
+        if projected is None:
+            return None
+        return _shallow_public_frame_with_native_state(
+            frame,
+            projected,
+            geometry_column=geometry_column,
+        )
+
+    taken_state = source_native_state.take(
+        rowset,
+        preserve_index=preserve_index,
+        index_positions=index_positions,
+    )
+    projected = taken_state.project_columns(tuple(frame.columns))
+    if projected is None:
+        return None
+    return _public_frame_from_native_state(
+        frame,
+        projected,
+        geometry_column=geometry_column,
+    )
+
+
+def _shallow_public_frame_with_native_state(
+    frame,
+    native_state,
+    *,
+    geometry_column,
+):
+    from vibespatial.api._native_state import attach_native_state
+
+    try:
+        result = frame._constructor_from_mgr(frame._mgr, frame._mgr.axes)
+        result = result.__finalize__(frame)
+    except Exception:
+        result = pd.DataFrame.copy(frame, deep=False)
+    if type(result) is pd.DataFrame:
+        result.__class__ = type(frame)
+    if hasattr(result, "_geometry_column_name"):
+        result._geometry_column_name = geometry_column
+    result.attrs = frame.attrs.copy()
+    attach_native_state(result, native_state)
+    return result
+
+
+def _public_frame_columns_are_native_lazy(frame) -> bool:
+    from vibespatial.api._native_public_arrays import (
+        NativeAttributeColumnArray,
+        NativeNumericExpressionArray,
+    )
+
+    for column in frame.columns:
+        series = pd.DataFrame.__getitem__(frame, column)
+        if not isinstance(series, Series):
+            return False
+        if _is_geometry_like_dtype(getattr(series, "dtype", None)):
+            continue
+        if not isinstance(
+            getattr(series, "array", None),
+            (NativeAttributeColumnArray, NativeNumericExpressionArray),
+        ):
+            return False
+    return True
+
+
+def _public_frame_from_native_state(
+    frame,
+    native_state,
+    *,
+    geometry_column,
+):
+    from vibespatial.api._native_state import attach_native_state
+
+    attributes = _native_lazy_public_attribute_frame(native_state)
+    if attributes is None:
+        return None
+    geometry = native_state.geometry.to_geoseries(
+        index=attributes.index,
+        name=native_state.geometry_name,
+    )
+    result = attributes
+    if native_state.geometry_name in result.columns:
+        result = result.copy(deep=False)
+        result[native_state.geometry_name] = geometry
+    else:
+        geometry_position = native_state.column_order.index(native_state.geometry_name)
+        result.insert(geometry_position, native_state.geometry_name, geometry)
+    result.__class__ = type(frame)
+    if geometry_column in result:
+        result._geometry_column_name = geometry_column
+    attach_native_state(result, native_state)
+    return result
+
+
 def _native_loc_row_positions(key, source_index, result_index):
     """Return exact source row positions for admitted label-based ``.loc`` takes."""
     row_key = key[0] if isinstance(key, tuple) and key else key
@@ -466,6 +795,63 @@ def _attach_native_state_after_loc(owner, key, result) -> None:
                 )
                 return
     _attach_native_state_from_result_index(owner, result)
+
+
+def _native_loc_from_lazy_unique_index(owner, key):
+    """Serve ``source.loc[joined.index.unique()]`` from native row positions."""
+    row_key = key
+    if isinstance(key, tuple):
+        if not key:
+            return None
+        row_key = key[0]
+        column_key = key[1] if len(key) > 1 else slice(None)
+        if not _is_full_slice(column_key):
+            return None
+
+    if not isinstance(row_key, pd.Index):
+        return None
+    try:
+        from vibespatial.api._native_public_arrays import NativeIndexLabelsArray
+        from vibespatial.api._native_rowset import NativeRowSet
+        from vibespatial.api._native_state import get_native_state
+    except Exception:
+        return None
+
+    index_array = getattr(row_key, "array", None)
+    if not isinstance(index_array, NativeIndexLabelsArray):
+        return None
+    plan = index_array.index_plan
+    positions = getattr(plan, "selection_positions", None)
+    if positions is None:
+        return None
+
+    state = get_native_state(owner)
+    if state is None:
+        return None
+    if getattr(plan, "selection_source_token", None) != state.lineage_token:
+        return None
+    if getattr(plan, "selection_source_row_count", None) != state.row_count:
+        return None
+    if not state.index_plan.admits_unique_label_selection:
+        return None
+    if hasattr(positions, "__cuda_array_interface__") and not _native_state_can_take_device_row_positions(
+        state,
+    ):
+        return None
+
+    rowset = NativeRowSet.from_positions(
+        positions,
+        source_token=state.lineage_token,
+        source_row_count=state.row_count,
+        ordered=True,
+        unique=True,
+    )
+    return _take_public_frame_with_native_state(
+        owner,
+        rowset,
+        source_native_state=state,
+        geometry_column=owner._geometry_column_name,
+    )
 
 
 def _ordered_subset_index_positions(source_index, result_index):
@@ -587,6 +973,202 @@ def _sort_values_with_native_row_position_marker(
         return None, None, False
     unique = positions.size == np.unique(positions).size
     return result, positions, bool(unique)
+
+
+def _normalize_sort_columns(by) -> tuple[Any, ...] | None:
+    if isinstance(by, (str, bytes)):
+        return (by,)
+    if pd.api.types.is_list_like(by):
+        try:
+            columns = tuple(by)
+        except TypeError:
+            return None
+        return columns if columns else None
+    return None
+
+
+def _normalize_sort_ascending(ascending, key_count: int) -> tuple[bool, ...] | None:
+    if isinstance(ascending, (bool, np.bool_)):
+        return (bool(ascending),) * int(key_count)
+    if pd.api.types.is_list_like(ascending):
+        try:
+            values = tuple(bool(value) for value in ascending)
+        except TypeError:
+            return None
+        if len(values) != int(key_count):
+            return None
+        return values
+    return None
+
+
+_NATIVE_SORT_CUPY_MAX_ROWS = 4096
+
+
+def _cupy_sort_key(values, *, ascending: bool, na_position: str):
+    import cupy as cp
+
+    dtype = np.dtype(getattr(values, "dtype", np.float64))
+    d_values = cp.asarray(values)
+    if np.issubdtype(dtype, np.bool_):
+        key = d_values.astype(cp.uint8, copy=False)
+        return key if ascending else cp.bitwise_xor(key, cp.uint8(1))
+    if np.issubdtype(dtype, np.unsignedinteger):
+        key = d_values
+        return key if ascending else cp.bitwise_not(key)
+    if np.issubdtype(dtype, np.signedinteger):
+        unsigned_dtype = np.dtype(f"uint{dtype.itemsize * 8}")
+        sign_mask = np.array(1 << (dtype.itemsize * 8 - 1), dtype=unsigned_dtype)
+        key = d_values.view(unsigned_dtype) ^ cp.asarray(sign_mask, dtype=unsigned_dtype)
+        return key if ascending else cp.bitwise_not(key)
+    if np.issubdtype(dtype, np.floating):
+        key = d_values if ascending else -d_values
+        nan_mask = cp.isnan(d_values)
+        sentinel = cp.inf if na_position == "last" else -cp.inf
+        return cp.where(nan_mask, sentinel, key)
+    return None
+
+
+def _cupy_native_sort_positions(
+    arrays: dict[Any, Any],
+    sort_columns: tuple[Any, ...],
+    ascending_values: tuple[bool, ...],
+    *,
+    na_position: str,
+):
+    """Return a device row order for small all-valid numeric native sorts."""
+    import cupy as cp
+
+    if not sort_columns:
+        return None
+    first = cp.asarray(arrays[sort_columns[0]])
+    row_count = int(first.size)
+    if row_count > _NATIVE_SORT_CUPY_MAX_ROWS:
+        return None
+    order = cp.arange(row_count, dtype=cp.int64)
+    for column, ascending in reversed(
+        tuple(zip(sort_columns, ascending_values, strict=True))
+    ):
+        values = cp.asarray(arrays[column])
+        if int(values.size) != row_count:
+            return None
+        key = _cupy_sort_key(values[order], ascending=ascending, na_position=na_position)
+        if key is None:
+            return None
+        local_order = cp.argsort(key, kind="stable")
+        order = order[local_order]
+    return order
+
+
+def _native_sort_values_rowset(
+    owner,
+    by,
+    *,
+    ascending,
+    kind,
+    na_position,
+    key,
+):
+    """Return a native sorted rowset for sortable device-backed attributes."""
+    if key is not None or na_position not in {"first", "last"}:
+        return None
+    sort_columns = _normalize_sort_columns(by)
+    if sort_columns is None:
+        return None
+    ascending_values = _normalize_sort_ascending(ascending, len(sort_columns))
+    if ascending_values is None:
+        return None
+
+    from vibespatial.api._native_result_core import _pylibcudf_numeric_column_view
+    from vibespatial.api._native_rowset import NativeRowSet
+    from vibespatial.api._native_state import get_native_state
+
+    state = get_native_state(owner)
+    if state is None or not _native_state_can_take_device_row_positions(state):
+        return None
+    attributes = getattr(state, "attributes", None)
+    if attributes is None:
+        return None
+    attribute_columns = tuple(attributes.columns)
+    if any(column not in attribute_columns for column in sort_columns):
+        return None
+
+    try:
+        import cupy as cp
+    except ModuleNotFoundError:
+        cp = None
+    if cp is not None:
+        arrays = attributes.numeric_column_arrays(sort_columns)
+        if arrays is not None:
+            try:
+                sorted_positions = _cupy_native_sort_positions(
+                    arrays,
+                    sort_columns,
+                    ascending_values,
+                    na_position=na_position,
+                )
+            except Exception:
+                sorted_positions = None
+            if sorted_positions is not None:
+                sorted_positions = cp.asarray(sorted_positions, dtype=cp.int64)
+                if int(sorted_positions.size) == int(state.row_count):
+                    return NativeRowSet.from_positions(
+                        sorted_positions,
+                        source_token=state.lineage_token,
+                        source_row_count=state.row_count,
+                        ordered=True,
+                        unique=True,
+                        identity=False,
+                    )
+
+    if getattr(attributes, "device_table", None) is None:
+        return None
+    policies = attributes.device_column_policies(sort_columns)
+    if any(
+        (policy := policies.get(column)) is None
+        or not policy.can_compute_numeric
+        for column in sort_columns
+    ):
+        return None
+
+    try:
+        import pylibcudf as plc
+        import pylibcudf.sorting as sorting
+        from pylibcudf.types import NullOrder, Order
+    except ModuleNotFoundError:
+        return None
+
+    try:
+        key_table = plc.Table(attributes.to_pylibcudf_columns(sort_columns))
+        column_order = [
+            Order.ASCENDING if is_ascending else Order.DESCENDING
+            for is_ascending in ascending_values
+        ]
+        null_order = (
+            NullOrder.BEFORE if na_position == "first" else NullOrder.AFTER
+        )
+        null_precedence = [null_order] * len(sort_columns)
+        sort_fn = (
+            sorting.stable_sorted_order
+            if kind in {"stable", "mergesort"} or len(sort_columns) > 1
+            else sorting.sorted_order
+        )
+        order_column = sort_fn(key_table, column_order, null_precedence)
+        sorted_positions = _pylibcudf_numeric_column_view(order_column)
+    except Exception:
+        return None
+    if sorted_positions is None:
+        return None
+    sorted_positions = cp.asarray(sorted_positions, dtype=cp.int64)
+    if int(sorted_positions.size) != int(state.row_count):
+        return None
+    return NativeRowSet.from_positions(
+        sorted_positions,
+        source_token=state.lineage_token,
+        source_row_count=state.row_count,
+        ordered=True,
+        unique=True,
+        identity=False,
+    )
 
 
 def _sort_index_with_native_row_position_marker(
@@ -997,14 +1579,10 @@ def _mixed_geometry_parts_native_tabular_result(
     include_lineal: bool,
     include_polygonal: bool,
 ):
-    from vibespatial.api._native_metadata import NativeGeometryMetadata
     from vibespatial.api._native_result_core import (
-        GeometryNativeResult,
-        NativeAttributeTable,
-        NativeGeometryProvenance,
-        NativeTabularResult,
+        NativeTabularSelection,
     )
-    from vibespatial.geometry.owned import OwnedGeometryArray
+    from vibespatial.api._native_results import _concat_native_tabular_results
 
     part_results = []
     if include_point:
@@ -1047,60 +1625,31 @@ def _mixed_geometry_parts_native_tabular_result(
             )
         )
 
-    owned_parts = []
-    source_row_parts = []
-    for part in part_results:
-        part_owned = getattr(part.geometry, "owned", None)
-        source_rows = getattr(part.provenance, "source_rows", None)
-        if part_owned is None or source_rows is None:
-            return None
-        if part.geometry.row_count == 0:
-            continue
-        owned_parts.append(part_owned)
-        source_row_parts.append(source_rows)
-    if not owned_parts:
+    if not part_results:
         return None
-
-    combined_owned = OwnedGeometryArray.concat(owned_parts)
-    if any(hasattr(rows, "__cuda_array_interface__") for rows in source_row_parts):
-        import cupy as cp
-
-        source_rows = cp.concatenate(
-            [cp.asarray(rows, dtype=cp.int64) for rows in source_row_parts]
-        )
-        stable_key = cp.arange(source_rows.size, dtype=cp.int64)
-        order = cp.lexsort(cp.stack((stable_key, source_rows)))
-    else:
-        source_rows = np.concatenate(
-            [np.asarray(rows, dtype=np.int64) for rows in source_row_parts]
-        )
-        order = np.argsort(source_rows, kind="stable")
-    if int(source_rows.size) != int(combined_owned.row_count):
-        return None
-    if int(source_rows.size) > 1:
-        combined_owned = combined_owned.take(order)
-        source_rows = source_rows[order]
-
-    geometry = GeometryNativeResult.from_owned(combined_owned, crs=crs)
-    row_count = int(combined_owned.row_count)
-    return NativeTabularResult(
-        attributes=NativeAttributeTable(
-            dataframe=pd.DataFrame(index=pd.RangeIndex(row_count))
-        ),
-        geometry=geometry,
+    combined = _concat_native_tabular_results(
+        part_results,
         geometry_name=geometry_name,
-        column_order=(geometry_name,),
-        provenance=NativeGeometryProvenance(
-            operation="mixed_geometry_parts",
-            row_count=row_count,
-            source_rows=source_rows,
-            part_family_tags=combined_owned._ensure_device_state().tags
-            if getattr(combined_owned, "residency", None) is Residency.DEVICE
-            else combined_owned.tags,
-            source_tokens=source_tokens,
-        ),
-        geometry_metadata=NativeGeometryMetadata.from_cached_owned(combined_owned),
+        crs=crs,
+        ignore_index=True,
     )
+    if not isinstance(combined, NativeTabularSelection):
+        return None
+    provenance = combined.capacity_result.provenance
+    source_rows = getattr(provenance, "source_rows", None)
+    if provenance is None or source_rows is None:
+        return None
+
+    from dataclasses import replace
+
+    capacity_result = replace(
+        combined.capacity_result,
+        provenance=replace(provenance, operation="mixed_geometry_parts"),
+    )
+    return replace(
+        combined,
+        capacity_result=capacity_result,
+    ).sort_selected_by_int64(source_rows)
 
 
 def _shapely_object_values(series) -> np.ndarray:
@@ -1214,7 +1763,10 @@ def _attach_native_state_after_geometry_explode(
     if not _native_result_accepts_frame_state(result):
         return
 
-    from vibespatial.api._native_result_core import NativeTabularResult
+    from vibespatial.api._native_result_core import (
+        NativeTabularResult,
+        NativeTabularSelection,
+    )
     from vibespatial.api._native_state import (
         NativeFrameState,
         attach_native_state,
@@ -1279,6 +1831,8 @@ def _attach_native_state_after_geometry_explode(
         if parts is None:
             return
 
+    if isinstance(parts, NativeTabularSelection):
+        parts = parts.physicalize_known_count(len(result))
     if parts.geometry.row_count != len(result):
         return
     source_rows = getattr(parts.provenance, "source_rows", None)
@@ -1456,8 +2010,14 @@ def _native_expression_assignment_public_series(
     index: pd.Index,
     surface: str,
 ) -> Series:
-    """Materialize a private expression at an explicit public column boundary."""
+    """Build a public column shell for a private expression.
+
+    Numeric expressions stay lazy so assignment remains a native row-aligned
+    expression transition. Public array materialization happens only when a
+    consumer asks for NumPy/pandas values.
+    """
     from vibespatial.api._native_expression import NativeExpression
+    from vibespatial.api._native_public_arrays import NativeNumericExpressionArray
     from vibespatial.runtime.materialization import (
         MaterializationBoundary,
         record_materialization_event,
@@ -1469,6 +2029,17 @@ def _native_expression_assignment_public_series(
         raise ValueError("NativeExpression assignment length must match GeoDataFrame")
 
     values = expression.values
+    dtype = np.dtype(getattr(values, "dtype", np.float64))
+    if np.issubdtype(dtype, np.number) and not np.issubdtype(dtype, np.bool_):
+        return Series(
+            NativeNumericExpressionArray(
+                expression,
+                export_surface=surface,
+                export_operation="native_expression_to_public_column",
+            ),
+            index=index,
+            name=name,
+        )
     if expression.is_device:
         import cupy as cp
 
@@ -1508,39 +2079,62 @@ def _prepare_native_expression_assignments(
     public_values = dict(values_by_name)
     expressions: dict[Any, NativeExpression] = {}
     for name, value in values_by_name.items():
-        if not isinstance(value, NativeExpression):
-            continue
-        if source_state is None:
-            raise ValueError(
-                "NativeExpression assignment requires a matching NativeFrameState"
-            )
-        if name == source_state.geometry_name:
-            raise ValueError("NativeExpression cannot replace the active geometry column")
-        if (
-            value.source_token is not None
-            and value.source_token != source_state.lineage_token
-        ):
-            raise ValueError(
-                "NativeExpression source token does not match GeoDataFrame native state"
-            )
-        if (
-            value.source_row_count is not None
-            and int(value.source_row_count) != source_state.row_count
-        ):
-            raise ValueError(
-                "NativeExpression row count does not match GeoDataFrame native state"
-            )
-        if len(index) != source_state.row_count:
-            raise ValueError(
-                "NativeExpression assignment index length does not match native state"
-            )
-        public_values[name] = _native_expression_assignment_public_series(
-            name,
-            value,
-            index=index,
-            surface=surface,
+        expression = (
+            value
+            if isinstance(value, NativeExpression)
+            else _native_expression_from_public_series(value)
         )
-        expressions[name] = value
+        if not isinstance(expression, NativeExpression):
+            continue
+        can_preserve = (
+            source_state is not None
+            and name != source_state.geometry_name
+            and (
+                expression.source_token is None
+                or expression.source_token == source_state.lineage_token
+            )
+            and (
+                expression.source_row_count is None
+                or int(expression.source_row_count) == source_state.row_count
+            )
+            and len(index) == source_state.row_count
+        )
+        if not can_preserve:
+            if isinstance(value, Series):
+                public_values[name] = Series(
+                    value.array.to_numpy(copy=False),
+                    index=value.index,
+                    name=value.name,
+                    copy=False,
+                )
+            else:
+                public = _native_expression_assignment_public_series(
+                    name,
+                    expression,
+                    index=index,
+                    surface=surface,
+                )
+                public_values[name] = Series(
+                    public.array.to_numpy(copy=False),
+                    index=index,
+                    name=name,
+                    copy=False,
+                )
+            continue
+        if isinstance(value, NativeExpression):
+            public_values[name] = _native_expression_assignment_public_series(
+                name,
+                expression,
+                index=index,
+                surface=surface,
+            )
+        elif (
+            isinstance(value, Series)
+            and len(value) == len(index)
+            and value.index.equals(index)
+        ):
+            public_values[name] = value
+        expressions[name] = expression
     return public_values, expressions
 
 
@@ -1573,6 +2167,8 @@ def _native_state_can_take_device_row_positions(state) -> bool:
     if getattr(getattr(state, "index_plan", None), "kind", None) not in {
         "range",
         "device-labels",
+        "host-labels",
+        "host-labels-take",
     }:
         return False
     geometry = getattr(state, "geometry", None)
@@ -1583,11 +2179,16 @@ def _native_state_can_take_device_row_positions(state) -> bool:
             return False
 
     attributes = getattr(state, "attributes", None)
-    return getattr(attributes, "device_table", None) is not None or getattr(
-        attributes,
-        "arrow_table",
-        None,
-    ) is not None
+    return any(
+        getattr(attributes, attr, None) is not None
+        for attr in (
+            "device_table",
+            "arrow_table",
+            "dataframe",
+            "loader",
+            "parts",
+        )
+    )
 
 
 def _drop_native_state_from_result(result):
@@ -1626,6 +2227,166 @@ def _native_drop_duplicates_positions(owner, subset, keep) -> np.ndarray | None:
     duplicated = pd.DataFrame.duplicated(owner, subset=subset, keep=keep)
     values = duplicated.to_numpy(dtype=bool, copy=False)
     return np.flatnonzero(~values).astype(np.int64, copy=False)
+
+
+def _normalize_drop_duplicates_subset(subset, columns) -> tuple[Any, ...] | None:
+    if subset is None:
+        labels = tuple(columns)
+    elif isinstance(subset, (str, bytes)):
+        labels = (subset,)
+    else:
+        try:
+            labels = tuple(subset)
+        except TypeError:
+            return None
+    if not labels:
+        return None
+    try:
+        if any(label not in columns for label in labels):
+            return None
+    except TypeError:
+        return None
+    return labels
+
+
+def _native_drop_duplicates_rowset(owner, subset, keep):
+    """Return a native rowset for device-backed attribute duplicate filtering."""
+    if keep not in {"first", "last", False}:
+        return None
+
+    from vibespatial.api._native_result_core import _pylibcudf_numeric_column_view
+    from vibespatial.api._native_rowset import NativeRowSet
+    from vibespatial.api._native_state import get_native_state
+
+    state = get_native_state(owner)
+    if state is None or not _native_state_can_take_device_row_positions(state):
+        return None
+    labels = _normalize_drop_duplicates_subset(subset, owner.columns)
+    if labels is None or any(
+        _is_geometry_like_dtype(getattr(owner[label], "dtype", None))
+        for label in labels
+    ):
+        return None
+    attributes = getattr(state, "attributes", None)
+    if attributes is None:
+        return None
+    attribute_columns = tuple(attributes.columns)
+    if any(label not in attribute_columns for label in labels):
+        return None
+
+    if len(labels) == 1:
+        arrays = attributes.numeric_column_arrays(labels)
+        if arrays is not None:
+            values = arrays.get(labels[0])
+            if values is not None:
+                dtype = np.dtype(getattr(values, "dtype", np.dtype("O")))
+                if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.bool_):
+                    try:
+                        import cupy as cp
+                    except ModuleNotFoundError:
+                        return None
+                    d_values = cp.asarray(values)
+                    row_count = int(d_values.size)
+                    if row_count == 0:
+                        unique_positions = cp.asarray([], dtype=cp.int64)
+                    elif keep == "first":
+                        _unique_values, first_positions = cp.unique(
+                            d_values,
+                            return_index=True,
+                        )
+                        unique_positions = cp.sort(first_positions.astype(cp.int64, copy=False))
+                    elif keep == "last":
+                        _unique_values, reverse_first_positions = cp.unique(
+                            d_values[::-1],
+                            return_index=True,
+                        )
+                        unique_positions = cp.sort(
+                            row_count
+                            - 1
+                            - reverse_first_positions.astype(cp.int64, copy=False)
+                        )
+                    else:
+                        _unique_values, first_positions, counts = cp.unique(
+                            d_values,
+                            return_index=True,
+                            return_counts=True,
+                        )
+                        unique_positions = cp.sort(
+                            first_positions.astype(cp.int64, copy=False)[counts == 1]
+                        )
+                    return NativeRowSet.from_positions(
+                        unique_positions.astype(cp.int64, copy=False),
+                        source_token=state.lineage_token,
+                        source_row_count=state.row_count,
+                        ordered=True,
+                        unique=True,
+                        identity=int(unique_positions.size) == int(state.row_count),
+                    )
+
+    if getattr(attributes, "device_table", None) is None:
+        return None
+    policies = attributes.device_column_policies(labels)
+    if any(
+        (policy := policies.get(label)) is None or not policy.can_compute_numeric
+        for label in labels
+    ):
+        return None
+
+    try:
+        import cupy as cp
+        import pylibcudf as plc
+        import pylibcudf.sorting as sorting
+        import pylibcudf.stream_compaction as stream_compaction
+        from pylibcudf.types import NanEquality, NullEquality, NullOrder, Order
+    except ModuleNotFoundError:
+        return None
+
+    keep_option = {
+        "first": stream_compaction.DuplicateKeepOption.KEEP_FIRST,
+        "last": stream_compaction.DuplicateKeepOption.KEEP_LAST,
+        False: stream_compaction.DuplicateKeepOption.KEEP_NONE,
+    }[keep]
+    try:
+        key_table = plc.Table(attributes.to_pylibcudf_columns(labels))
+        sorted_column = sorting.stable_sorted_order(
+            key_table,
+            [Order.ASCENDING] * len(labels),
+            [NullOrder.AFTER] * len(labels),
+        )
+        sorted_positions = _pylibcudf_numeric_column_view(sorted_column)
+        if sorted_positions is None:
+            return None
+        sorted_positions = cp.asarray(sorted_positions, dtype=cp.int64)
+        target_dtype = cp.int32 if state.row_count <= np.iinfo(np.int32).max else cp.int64
+        gather_map = plc.Column.from_cuda_array_interface(
+            sorted_positions.astype(target_dtype, copy=False)
+        )
+        sorted_keys = plc.copying.gather(
+            key_table,
+            gather_map,
+            plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+        )
+        unique_local_column = stream_compaction.distinct_indices(
+            sorted_keys,
+            keep_option,
+            NullEquality.EQUAL,
+            NanEquality.ALL_EQUAL,
+        )
+        unique_local = _pylibcudf_numeric_column_view(unique_local_column)
+    except Exception:
+        return None
+    if unique_local is None:
+        return None
+    unique_positions = sorted_positions[cp.asarray(unique_local, dtype=cp.int64)]
+    unique_positions = unique_positions[cp.argsort(unique_positions)]
+    return NativeRowSet.from_positions(
+        unique_positions.astype(cp.int64, copy=False),
+        source_token=state.lineage_token,
+        source_row_count=state.row_count,
+        ordered=True,
+        unique=True,
+        identity=int(unique_positions.size) == int(state.row_count),
+    )
 
 
 def _concat_input_objects(other) -> list[Any]:
@@ -1713,6 +2474,10 @@ class _NativeStateInvalidatingIndexer:
         self._kind = kind
 
     def __getitem__(self, key):
+        if self._kind == "loc":
+            native_result = _native_loc_from_lazy_unique_index(self._owner, key)
+            if native_result is not None:
+                return native_result
         result = self._indexer[key]
         if self._kind == "iloc":
             _attach_native_state_after_iloc(self._owner, key, result)
@@ -3203,6 +3968,8 @@ properties': {'col1': 'name1'}, 'geometry': {'type': 'Point', 'coordinates': (1.
             native_result = _native_tabular_result_with_public_metadata(
                 self,
                 native_state,
+                index=index,
+                preserve_native_attributes=True,
             )
             result = native_result.to_arrow(
                 index=index,
@@ -3319,6 +4086,8 @@ default 'snappy'
             native_result = _native_tabular_result_with_public_metadata(
                 self,
                 native_state,
+                index=index,
+                preserve_native_attributes=True,
             )
             native_result.to_parquet(
                 path,
@@ -3336,6 +4105,7 @@ default 'snappy'
                 operation="geodataframe_to_parquet",
                 target="geoparquet",
                 reason="native GeoDataFrame exported to GeoParquet writer",
+                d2h_transfer=False,
             )
             return
 
@@ -3410,6 +4180,7 @@ default 'snappy'
             native_result = _native_tabular_result_with_public_metadata(
                 self,
                 native_state,
+                index=index,
             )
             native_result.to_feather(
                 path,
@@ -3774,6 +4545,13 @@ default 'snappy'
         --------
         GeoDataFrame.set_crs : assign CRS without re-projection
         """
+        from vibespatial.api._native_state import (
+            attach_native_state,
+            drop_native_state,
+            get_native_state,
+        )
+
+        source_native_state = get_native_state(self)
         if inplace:
             df = self
         else:
@@ -3789,6 +4567,19 @@ default 'snappy'
                 geom.values,
                 crs=geom.crs,
             )
+        if (
+            source_native_state is not None
+            and len(df) == source_native_state.row_count
+            and tuple(df.columns) == source_native_state.column_order
+            and df.index.equals(self.index)
+            and getattr(df, "_geometry_column_name", None) == source_native_state.geometry_name
+        ):
+            from vibespatial.api._native_result_core import GeometryNativeResult
+
+            geometry = GeometryNativeResult.from_geoseries(geom)
+            attach_native_state(df, source_native_state.with_geometry_result(geometry))
+        else:
+            drop_native_state(df)
         if not inplace:
             return df
 
@@ -3875,6 +4666,7 @@ default 'snappy'
         )
 
         source_native_state = get_native_state(self)
+        geo_col = self._geometry_column_name
         if isinstance(key, NativeRowSet):
             if source_native_state is None:
                 return self.take(key.to_host_positions(strict_disallowed=False))
@@ -3882,6 +4674,146 @@ default 'snappy'
             result = taken_state.to_native_tabular_result().to_geodataframe()
             attach_native_state(result, taken_state)
             return result
+        if source_native_state is not None:
+            rowset = None
+            native_mask_rowset = None
+            if _is_native_state_column_projection_key(key, self.columns):
+                projected = source_native_state.project_columns(tuple(key))
+                if projected is not None:
+                    result = _public_frame_from_native_state(
+                        self,
+                        projected,
+                        geometry_column=geo_col,
+                    )
+                    if result is not None:
+                        return result
+            if isinstance(key, Series) and key.index.equals(self.index):
+                rowset = _native_boolean_filter_rowset(
+                    key,
+                    source_native_state,
+                    public_index=self.index,
+                )
+                native_mask_rowset = _native_boolean_rowset_from_aligned_mask(
+                    key,
+                    source_native_state,
+                )
+                if (
+                    rowset is None
+                    and native_mask_rowset is not None
+                    and (
+                        not native_mask_rowset.is_device
+                        or _native_state_can_take_device_row_positions(
+                            source_native_state,
+                        )
+                    )
+                ):
+                    rowset = _native_rowset_mark_identity_if_full(
+                        native_mask_rowset,
+                        source_native_state,
+                    )
+            elif not isinstance(key, (str, bytes)):
+                native_mask_rowset = _native_boolean_rowset_from_aligned_mask(
+                    key,
+                    source_native_state,
+                )
+                if (
+                    native_mask_rowset is not None
+                    and (
+                        not native_mask_rowset.is_device
+                        or _native_state_can_take_device_row_positions(
+                            source_native_state,
+                        )
+                    )
+                ):
+                    rowset = _native_rowset_mark_identity_if_full(
+                        native_mask_rowset,
+                        source_native_state,
+                    )
+            attributes = getattr(source_native_state, "attributes", None)
+            if (
+                rowset is not None
+                and not bool(getattr(rowset, "identity", False))
+                and attributes is not None
+            ):
+                positions = None
+                if (
+                    rowset.is_device
+                    and _native_state_can_take_device_row_positions(
+                        source_native_state,
+                    )
+                ):
+                    index_positions = None
+                    if isinstance(key, Series) and (
+                        native_mask_rowset is None or not native_mask_rowset.is_device
+                    ):
+                        mask_values = key.to_numpy(dtype=bool, na_value=False)
+                        if (
+                            mask_values.ndim == 1
+                            and int(mask_values.sum()) == len(rowset)
+                        ):
+                            index_positions = np.flatnonzero(mask_values).astype(
+                                np.int64,
+                                copy=False,
+                            )
+                    result = _take_public_frame_with_native_state(
+                        self,
+                        rowset,
+                        source_native_state=source_native_state,
+                        geometry_column=geo_col,
+                        index_positions=index_positions,
+                    )
+                    if result is not None:
+                        return result
+                if isinstance(key, Series) and not (
+                    native_mask_rowset is not None and native_mask_rowset.is_device
+                ):
+                    mask_values = key.to_numpy(dtype=bool, na_value=False)
+                    if (
+                        mask_values.ndim == 1
+                        and int(mask_values.sum()) == len(rowset)
+                    ):
+                        positions = np.flatnonzero(mask_values).astype(
+                            np.int64,
+                            copy=False,
+                        )
+                if positions is None and native_mask_rowset is None:
+                    mask_values = key.to_numpy(dtype=bool, na_value=False)
+                    if (
+                        mask_values.ndim != 1
+                        or int(mask_values.sum()) != len(rowset)
+                    ):
+                        positions = None
+                    else:
+                        positions = np.flatnonzero(mask_values).astype(
+                            np.int64,
+                            copy=False,
+                        )
+                elif positions is None:
+                    positions = rowset.to_host_positions(
+                        surface="vibespatial.api.GeoDataFrame.__getitem__",
+                        strict_disallowed=False,
+                    )
+                if positions is not None:
+                    result = _take_public_frame_with_native_rowset(
+                        self,
+                        rowset,
+                        positions,
+                        source_native_state=source_native_state,
+                        geometry_column=geo_col,
+                    )
+                    if result is not None:
+                        return result
+            elif rowset is not None and bool(getattr(rowset, "identity", False)):
+                positions = np.arange(source_native_state.row_count, dtype=np.int64)
+                result = _take_public_frame_with_native_rowset(
+                    self,
+                    rowset,
+                    positions,
+                    source_native_state=source_native_state,
+                    geometry_column=geo_col,
+                )
+                if result is not None:
+                    return result
 
         result = super().__getitem__(key)
         # Custom logic to avoid waiting for pandas GH51895
@@ -3896,9 +4828,29 @@ default 'snappy'
             loc = self.columns.get_loc(key)
             # squeeze stops multilevel columns from returning a gdf
             result = self.iloc[:, loc].squeeze(axis="columns")
-        geo_col = self._geometry_column_name
         if isinstance(result, Series) and _is_geometry_like_dtype(result.dtype):
             result.__class__ = GeoSeries
+            if source_native_state is not None and pd.api.types.is_scalar(key):
+                selected_state = source_native_state.with_active_geometry(
+                    key,
+                    crs=getattr(result, "crs", None),
+                )
+                if (
+                    selected_state is not None
+                    and len(result) == selected_state.row_count
+                    and result.index.equals(self.index)
+                ):
+                    attach_native_state(result, selected_state)
+        elif (
+            isinstance(result, Series)
+            and source_native_state is not None
+            and pd.api.types.is_scalar(key)
+            and result.index.equals(self.index)
+            and len(result) == source_native_state.row_count
+        ):
+            expression = source_native_state.attribute_expression(key)
+            if expression is not None:
+                _attach_native_expression(result, expression)
         elif isinstance(result, DataFrame):
             if result.dtypes.map(_is_geometry_like_dtype).sum() > 0:
                 result.__class__ = type(self)
@@ -3920,9 +4872,39 @@ default 'snappy'
                         public_index=self.index,
                     )
                     if rowset is not None and len(result) == len(rowset):
+                        native_take_rowset = rowset
+                        if rowset.is_device and isinstance(key, Series):
+                            native_mask_rowset = _native_boolean_rowset_from_aligned_mask(
+                                key,
+                                source_native_state,
+                            )
+                            if native_mask_rowset is None or not native_mask_rowset.is_device:
+                                mask_values = key.to_numpy(dtype=bool, na_value=False)
+                            else:
+                                mask_values = None
+                            if mask_values is not None and (
+                                mask_values.ndim == 1
+                                and int(mask_values.sum()) == len(rowset)
+                            ):
+                                native_take_rowset = NativeRowSet.from_positions(
+                                    np.flatnonzero(mask_values).astype(
+                                        np.int64,
+                                        copy=False,
+                                    ),
+                                    source_token=rowset.source_token,
+                                    source_row_count=rowset.source_row_count,
+                                    ordered=rowset.ordered,
+                                    unique=rowset.unique,
+                                    identity=rowset.identity,
+                                    geometry_family_domain=rowset.geometry_family_domain,
+                                    trusted_all_valid_rows=rowset.trusted_all_valid_rows,
+                                )
                         attach_native_state(
                             result,
-                            source_native_state.take(rowset, preserve_index=True),
+                            source_native_state.take(
+                                native_take_rowset,
+                                preserve_index=True,
+                            ),
                         )
                     else:
                         from vibespatial.api._native_state import drop_native_state
@@ -4201,19 +5183,30 @@ default 'snappy'
         allow_duplicates=lib.no_default,
         names=None,
     ):
-        if inplace:
-            from vibespatial.api._native_state import drop_native_state
-
-            drop_native_state(self)
-        result = super().reset_index(
-            level=level,
-            drop=drop,
-            inplace=inplace,
-            col_level=col_level,
-            col_fill=col_fill,
-            allow_duplicates=allow_duplicates,
-            names=names,
+        from vibespatial.api._native_state import (
+            attach_native_state,
+            drop_native_state,
+            get_native_state,
         )
+
+        source_native_state = get_native_state(self)
+        if inplace:
+            drop_native_state(self)
+        elif source_native_state is not None:
+            drop_native_state(self)
+        try:
+            result = super().reset_index(
+                level=level,
+                drop=drop,
+                inplace=inplace,
+                col_level=col_level,
+                col_fill=col_fill,
+                allow_duplicates=allow_duplicates,
+                names=names,
+            )
+        finally:
+            if not inplace and source_native_state is not None:
+                attach_native_state(self, source_native_state)
         if result is not None and level is None:
             if drop:
                 _attach_native_state_after_reset_index_drop(self, result)
@@ -4499,6 +5492,21 @@ default 'snappy'
         from vibespatial.api._native_state import drop_native_state, get_native_state
 
         source_native_state = get_native_state(self)
+        native_rowset = (
+            None
+            if inplace or source_native_state is None
+            else _native_drop_duplicates_rowset(self, subset, keep)
+        )
+        if native_rowset is not None:
+            result = _take_public_frame_with_native_state(
+                self,
+                native_rowset,
+                source_native_state=source_native_state,
+                geometry_column=self._geometry_column_name,
+                preserve_index=not ignore_index,
+            )
+            if result is not None:
+                return result
         positions = (
             None
             if inplace or source_native_state is None
@@ -4558,16 +5566,29 @@ default 'snappy'
             and source_native_state is not None
             and bool(self.columns.is_unique)
         )
+        if fast_native_copy:
+            projected = source_native_state.project_columns(tuple(self.columns))
+            if projected is not None:
+                if _public_frame_columns_are_native_lazy(self):
+                    return _shallow_public_frame_with_native_state(
+                        self,
+                        projected,
+                        geometry_column=self._geometry_column_name,
+                    )
         copied = super().copy(deep=False if fast_native_copy else deep)
         if type(copied) is pd.DataFrame:
             copied.__class__ = type(self)
             copied._geometry_column_name = self._geometry_column_name
         if fast_native_copy:
+            from vibespatial.api._native_public_arrays import NativeNumericExpressionArray
+
             for column in self.columns:
                 source_column = pd.DataFrame.__getitem__(self, column)
                 if not isinstance(source_column, Series):
                     fast_native_copy = False
                     break
+                if isinstance(getattr(source_column, "array", None), NativeNumericExpressionArray):
+                    continue
                 if _is_geometry_like_dtype(source_column.dtype):
                     pd.DataFrame.__setitem__(
                         copied,
@@ -4606,6 +5627,28 @@ default 'snappy'
 
             drop_native_state(self)
         axis_number = self._get_axis_number(axis)
+        if not inplace and axis_number == 0:
+            from vibespatial.api._native_state import get_native_state
+
+            native_state = get_native_state(self)
+            native_rowset = _native_sort_values_rowset(
+                self,
+                by,
+                ascending=ascending,
+                kind=kind,
+                na_position=na_position,
+                key=key,
+            )
+            if native_state is not None and native_rowset is not None:
+                result = _take_public_frame_with_native_state(
+                    self,
+                    native_rowset,
+                    source_native_state=native_state,
+                    geometry_column=self._geometry_column_name,
+                    preserve_index=not ignore_index,
+                )
+                if result is not None:
+                    return result
         if not inplace and axis_number == 0 and (
             not self.index.is_unique or getattr(self.index, "nlevels", 1) != 1
         ):

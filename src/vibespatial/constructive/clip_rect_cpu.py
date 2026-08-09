@@ -25,7 +25,9 @@ EMPTY = GeometryCollection()
 _POINT_EPSILON = SPATIAL_EPSILON
 
 
-def normalize_values(values: Sequence[object | None] | np.ndarray | OwnedGeometryArray) -> tuple[np.ndarray, OwnedGeometryArray]:
+def normalize_values(
+    values: Sequence[object | None] | np.ndarray | OwnedGeometryArray,
+) -> tuple[np.ndarray, OwnedGeometryArray]:
     if isinstance(values, OwnedGeometryArray):
         shapely_values = np.asarray(values.to_shapely(), dtype=object)
         return shapely_values, values
@@ -171,7 +173,9 @@ def liang_barsky_segment(
     return float(cx0), float(cy0), float(cx1), float(cy1)
 
 
-def merge_clipped_segments(parts: list[list[tuple[float, float]]], segment: tuple[float, float, float, float]) -> None:
+def merge_clipped_segments(
+    parts: list[list[tuple[float, float]]], segment: tuple[float, float, float, float]
+) -> None:
     start = (segment[0], segment[1])
     end = (segment[2], segment[3])
     if not parts:
@@ -231,7 +235,9 @@ def clip_point_family(buffer, family_row: int, rect: tuple[float, float, float, 
 def clip_line_family(buffer, family_row: int, rect: tuple[float, float, float, float]) -> object:
     parts: list[list[tuple[float, float]]] = []
     if buffer.family.value == "linestring":
-        spans = [(int(buffer.geometry_offsets[family_row]), int(buffer.geometry_offsets[family_row + 1]))]
+        spans = [
+            (int(buffer.geometry_offsets[family_row]), int(buffer.geometry_offsets[family_row + 1]))
+        ]
     else:
         part_start = int(buffer.geometry_offsets[family_row])
         part_end = int(buffer.geometry_offsets[family_row + 1])
@@ -261,7 +267,9 @@ def polygon_ring_spans(buffer, family_row: int) -> list[list[tuple[float, float]
         return int(buffer.ring_offsets[ring_index]), int(buffer.ring_offsets[ring_index + 1])
 
     if buffer.family.value == "polygon":
-        polygon_indices = [(int(buffer.geometry_offsets[family_row]), int(buffer.geometry_offsets[family_row + 1]))]
+        polygon_indices = [
+            (int(buffer.geometry_offsets[family_row]), int(buffer.geometry_offsets[family_row + 1]))
+        ]
     else:
         polygon_start = int(buffer.geometry_offsets[family_row])
         polygon_end = int(buffer.geometry_offsets[family_row + 1])
@@ -401,8 +409,8 @@ def materialize_candidates_vectorized(
                 s = int(buffer.geometry_offsets[lr])
                 e = int(buffer.geometry_offsets[lr + 1])
                 n = e - s
-                flat_xy[pos:pos + n, 0] = buffer.x[s:e]
-                flat_xy[pos:pos + n, 1] = buffer.y[s:e]
+                flat_xy[pos : pos + n, 0] = buffer.x[s:e]
+                flat_xy[pos : pos + n, 1] = buffer.y[s:e]
                 pos += n
             indices = np.repeat(np.arange(len(local_rows), dtype=np.int32), np.diff(offsets))
             return shapely.linestrings(flat_xy, indices=indices)
@@ -458,7 +466,9 @@ def clip_by_rect_cpu(
     shapely_values: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     bounds = compute_geometry_bounds(owned)
-    candidate_rows = np.flatnonzero(rect_intersects_bounds(bounds, rect)).astype(np.int32, copy=False)
+    candidate_rows = np.flatnonzero(rect_intersects_bounds(bounds, rect)).astype(
+        np.int32, copy=False
+    )
 
     result = np.empty(owned.row_count, dtype=object)
     result[:] = EMPTY
@@ -479,7 +489,9 @@ def clip_by_rect_cpu(
     return result, candidate_rows
 
 
-def clip_by_rect_array(candidate_shapely: np.ndarray, rect: tuple[float, float, float, float]) -> np.ndarray:
+def clip_by_rect_array(
+    candidate_shapely: np.ndarray, rect: tuple[float, float, float, float]
+) -> np.ndarray:
     """Apply Shapely clip_by_rect to an object array and return object array output."""
     clipped = shapely.clip_by_rect(candidate_shapely, *rect)
     return np.asarray(clipped, dtype=object)

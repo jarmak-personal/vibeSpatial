@@ -502,4 +502,3 @@ wkt_assign_ring_coords(
 """
 
 _WKT_ASSIGN_RING_COORDS_NAMES: tuple[str, ...] = ("wkt_assign_ring_coords",)
-

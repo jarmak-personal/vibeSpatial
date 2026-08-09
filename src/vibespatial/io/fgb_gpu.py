@@ -1035,11 +1035,7 @@ def _extract_dense_long_string_attributes(
     if len(header.columns) != 2:
         return None
     long_idx = next(
-        (
-            idx
-            for idx, column in enumerate(header.columns)
-            if column.type == FGB_COL_LONG
-        ),
+        (idx for idx, column in enumerate(header.columns) if column.type == FGB_COL_LONG),
         None,
     )
     string_idx = next(

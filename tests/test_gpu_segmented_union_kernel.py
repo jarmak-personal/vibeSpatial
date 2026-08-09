@@ -89,6 +89,70 @@ def test_segmented_union_has_no_raw_cupy_scalar_syncs() -> None:
     assert failures == []
 
 
+def test_segmented_union_has_no_serial_group_constructive_path() -> None:
+    source = Path(segmented_union_module.__file__).read_text()
+
+    assert "_segmented_union_serial_gpu" not in source
+    assert "segmented union singleton validity scalar fence" not in source
+    assert "gpu_native_grouped_constructive_carrier" in source
+    assert "int(d_group_offsets[-1])" not in source
+
+    grouped_start = source.index("def segmented_union_all_device_grouped(")
+    grouped_source = source[grouped_start:]
+    assert "except Exception:\n        pass" not in grouped_source
+    assert "except Exception:\n        return None" not in grouped_source
+    assert "admitted grouped overlay union did not produce" in grouped_source
+    assert grouped_source.count("_segmented_union_device_grouped_pairwise_tree(") == 1
+    assert "_tree_reduce_group" not in source
+    assert "segmented_union_pair_cpu" not in source
+    assert "gpu-native-grouped-constructive" in source
+    assert "_polygon_exploded_part_count_gpu" not in source
+    assert "_SEGMENTED_UNION_ROBUST_SNAP_RETRY_MAX_PARTS" not in source
+
+
+def test_segmented_union_grouped_reducer_uses_carrier_cardinalities() -> None:
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "vibespatial"
+        / "kernels"
+        / "constructive"
+        / "segmented_union.py"
+    )
+    source = path.read_text()
+    retired_fences = {
+        "segmented union grouped-overlay valid-row count scalar fence",
+        "segmented union device grouped valid-row count scalar fence",
+        "segmented union device grouped pair-count scalar fence",
+        "segmented union device grouped carry-count scalar fence",
+        "segmented union device grouped next-row-count scalar fence",
+        "segmented union polygon exploded-part count scalar fence",
+        "segmented union grouped-overlay degenerate-area scalar fence",
+        "segmented union grouped-overlay exact-zero-area scalar fence",
+    }
+
+    assert all(fence not in source for fence in retired_fences)
+
+    pairwise_start = source.index(
+        "def _segmented_union_device_grouped_pairwise_tree("
+    )
+    pairwise_end = source.index("\ndef ", pairwise_start + 1)
+    pairwise_source = source[pairwise_start:pairwise_end]
+    assert "d_span_sizes" in pairwise_source
+    assert "device_take_owned_capacity_selection" in pairwise_source
+    assert "cp.flatnonzero(" not in pairwise_source
+    assert "concat_owned_arrays(" not in pairwise_source
+    assert "d_carry_groups" not in pairwise_source
+    assert "pair_count =" not in pairwise_source
+
+    strip_start = source.index("def _grouped_rectangle_strip_union_device(")
+    strip_end = source.index("\ndef ", strip_start + 1)
+    strip_source = source[strip_start:strip_end]
+    assert "d_row_present = device_valid_nonempty_mask(geometries)" in strip_source
+    assert "d_tags == cp.int8(FAMILY_TAGS[GeometryFamily.POLYGON])" in strip_source
+    assert "ptr(d_row_present)" in strip_source
+
+
 def _shapely_segmented_union(geometries: list, group_offsets: np.ndarray) -> list:
     """Reference implementation using shapely.union_all per group."""
     n_groups = len(group_offsets) - 1
@@ -383,8 +447,8 @@ class TestSegmentedUnionGPU:
         _assert_geom_equal(result_geoms[0], ref[0])
 
     @requires_gpu
-    def test_serial_small_group_gpu_result_seeds_validity_cache(self):
-        """GPU: trusted serial grouped reductions should not re-run OGC scans."""
+    def test_native_small_group_gpu_result_seeds_validity_cache(self):
+        """GPU: trusted native grouped reductions should not re-run OGC scans."""
         geoms = [
             box(0, 0, 2, 1),
             box(1, 0, 3, 1),
@@ -473,8 +537,8 @@ class TestSegmentedUnionGPU:
         _assert_geom_equal(result_geoms[0], ref[0])
 
     @requires_gpu
-    def test_multi_group_gpu_uses_native_union_all_per_group(self, monkeypatch):
-        """GPU: grouped union should route each multi-row group through native union_all."""
+    def test_multi_group_gpu_uses_one_native_grouped_carrier(self, monkeypatch):
+        """GPU: all groups should enter one native grouped constructive carrier."""
         geoms = [
             MultiPolygon([box(0, 0, 1, 1), box(3, 0, 4, 1)]),
             MultiPolygon([box(0.5, 0, 1.5, 1), box(5, 0, 6, 1)]),
@@ -485,47 +549,36 @@ class TestSegmentedUnionGPU:
         owned = _make_owned(geoms)
         offsets = np.array([0, 3, 5], dtype=np.int64)
 
-        from vibespatial.constructive.union_all import union_all_gpu_owned as real_union_all
+        real_grouped = segmented_union_module.segmented_union_all_device_grouped
+        calls: list[tuple[int, int]] = []
 
-        call_rows: list[int] = []
-
-        def _count_union_all(group_owned, **kwargs):
-            call_rows.append(group_owned.row_count)
-            return real_union_all(group_owned, **kwargs)
+        def _count_grouped(grouped_owned, _offsets, group_ids, **kwargs):
+            calls.append((grouped_owned.row_count, int(group_ids.size)))
+            return real_grouped(grouped_owned, _offsets, group_ids, **kwargs)
 
         monkeypatch.setattr(
-            "vibespatial.constructive.union_all.union_all_gpu_owned",
-            _count_union_all,
+            segmented_union_module,
+            "segmented_union_all_device_grouped",
+            _count_grouped,
         )
 
         result = segmented_union_all(owned, offsets, dispatch_mode=ExecutionMode.GPU)
         ref = _shapely_segmented_union(geoms, offsets)
 
         result_geoms = result.to_shapely()
-        assert call_rows == [3, 2]
+        assert calls[0] == (5, 2)
+        assert len(calls) <= 4
+        assert set(calls) == {(5, 2)}
         assert len(result_geoms) == 2
         for gpu_g, ref_g in zip(result_geoms, ref):
             _assert_geom_equal(gpu_g, ref_g)
 
     @requires_gpu
-    def test_multi_group_gpu_concat_preserves_device_residency(self, monkeypatch):
-        """GPU: per-group results must not be host-materialized during final concat."""
+    def test_multi_group_gpu_carrier_preserves_device_residency(self):
+        """GPU: grouped results must remain device-resident through assembly."""
         geoms = [box(i, 0, i + 1, 1) for i in range(4)]
         owned = _make_owned(geoms, residency=Residency.DEVICE)
         offsets = np.array([0, 2, 4], dtype=np.int64)
-        group_results = [
-            _make_owned([box(0, 0, 2, 1)], residency=Residency.DEVICE),
-            _make_owned([box(2, 0, 4, 1)], residency=Residency.DEVICE),
-        ]
-
-        def _fake_union_all_gpu_owned(group_owned, **_kwargs):
-            return group_results.pop(0)
-
-        monkeypatch.setattr(
-            "vibespatial.constructive.union_all.union_all_gpu_owned",
-            _fake_union_all_gpu_owned,
-        )
-
         result = segmented_union_all(owned, offsets, dispatch_mode=ExecutionMode.GPU)
 
         assert result.row_count == 2
@@ -534,37 +587,27 @@ class TestSegmentedUnionGPU:
         assert not any(buffer.host_materialized for buffer in result.families.values())
 
     @requires_gpu
-    def test_single_group_gpu_uses_global_tree_reduce_fast_path(self, monkeypatch):
-        """GPU: single-group unions should bypass the legacy per-row reducer."""
+    def test_single_group_gpu_uses_grouped_constructive_carrier(self, monkeypatch):
+        """GPU: single-group unions should stay in the grouped executor."""
         geoms = [box(0, 0, 1, 1), box(0.5, 0, 1.5, 1), box(1.0, 0, 2.0, 1)]
         owned = _make_owned(geoms)
         offsets = np.array([0, 3], dtype=np.int64)
 
         called: dict[str, object] = {}
 
-        def _fake_union_all_gpu_owned(geometries, **kwargs):
+        def _fake_grouped(geometries, *_args, **_kwargs):
             called["row_count"] = geometries.row_count
-            called["dispatch_mode"] = kwargs.get("dispatch_mode")
             return geometries.take(np.array([0], dtype=np.int64))
 
         monkeypatch.setattr(
-            "vibespatial.constructive.union_all.union_all_gpu_owned",
-            _fake_union_all_gpu_owned,
-        )
-        monkeypatch.setattr(
             segmented_union_module,
-            "_tree_reduce_group",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                AssertionError("single-group path should not use legacy per-row reducer")
-            ),
+            "segmented_union_all_device_grouped",
+            _fake_grouped,
         )
 
         result = segmented_union_all(owned, offsets, dispatch_mode=ExecutionMode.GPU)
 
-        assert called == {
-            "row_count": 3,
-            "dispatch_mode": ExecutionMode.GPU,
-        }
+        assert called == {"row_count": 3}
         assert result.row_count == 1
 
     @requires_gpu
@@ -607,6 +650,29 @@ class TestSegmentedUnionAutoDispatch:
         assert len(result_geoms) == 1
         _assert_geom_equal(result_geoms[0], ref[0])
 
+    def test_dispatch_estimate_uses_grouped_coordinate_shape(self):
+        import vibespatial.kernels.constructive.segmented_union as segmented_union_module
+
+        owned = _make_owned(
+            [
+                box(0, 0, 1, 1),
+                box(1, 0, 2, 1),
+                box(4, 0, 5, 1),
+            ]
+        )
+        estimate = segmented_union_module._segmented_union_work_estimate(
+            owned,
+            n_groups=2,
+        )
+
+        assert estimate.row_count == 3
+        assert estimate.coordinate_count == 15
+        assert estimate.segment_count == 15
+        assert estimate.group_count == 2
+        assert estimate.output_row_count == 2
+        assert estimate.dispatch_unit_name() == "segmented-union-coordinate"
+
+    @requires_gpu
     def test_auto_dispatch_stays_on_gpu_for_device_resident_input(self, monkeypatch):
         """Device-resident AUTO inputs should not demote below crossover."""
         import vibespatial.kernels.constructive.segmented_union as segmented_union_module

@@ -93,7 +93,6 @@ def _current_cuda_stream():
     return cp.cuda.get_current_stream()
 
 
-
 # ---------------------------------------------------------------------------
 # Block-per-pair kernel: for complex polygons (>1024 vertices), one thread
 # block cooperatively processes a single (point, polygon) pair.  Threads
@@ -105,9 +104,7 @@ def _current_cuda_stream():
 def _pip_block_per_pair_kernels(compute_type: str = "double"):
     source = _format_block_per_pair_source(compute_type)
     runtime = get_cuda_runtime()
-    cache_key = make_kernel_cache_key(
-        f"pip-block-per-pair-{compute_type}", source
-    )
+    cache_key = make_kernel_cache_key(f"pip-block-per-pair-{compute_type}", source)
     return runtime.compile_kernels(
         cache_key=cache_key,
         source=source,
@@ -237,8 +234,8 @@ def _binned_polygon_dispatch(
     import cupy as _cp
 
     runtime = get_cuda_runtime()
-    left_state = left._ensure_device_state()
-    right_state = right._ensure_device_state()
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right._ensure_device_state(preserve_indexed_view=True)
     point_buffer = left_state.families[GeometryFamily.POINT]
     polygon_buffer = right_state.families[GeometryFamily.POLYGON]
 
@@ -250,9 +247,12 @@ def _binned_polygon_dispatch(
     _log.debug(
         "binned_polygon_dispatch: %d candidates, bin_edges=%s, "
         "work min=%d max=%d mean=%.1f std=%.1f",
-        candidate_count, bin_edges,
-        work_estimates.min(), work_estimates.max(),
-        work_estimates.mean(), work_estimates.std(),
+        candidate_count,
+        bin_edges,
+        work_estimates.min(),
+        work_estimates.max(),
+        work_estimates.mean(),
+        work_estimates.std(),
     )
 
     pending_free = []
@@ -269,9 +269,7 @@ def _binned_polygon_dispatch(
             device_bin_indices = _cp.flatnonzero(mask).astype(_cp.int32)
             device_bin_candidates = candidate_rows_device[device_bin_indices].astype(_cp.int32)
             device_bin_out = runtime.allocate((bin_count,), cp.uint8)
-            pending_free.extend(
-                (device_bin_candidates, device_bin_indices, device_bin_out)
-            )
+            pending_free.extend((device_bin_candidates, device_bin_indices, device_bin_out))
 
             use_block_per_pair = lo >= _PIP_WORK_BINS[-1]
 
@@ -293,15 +291,28 @@ def _binned_polygon_dispatch(
                         runtime.pointer(polygon_buffer.y),
                         FAMILY_TAGS[GeometryFamily.POLYGON],
                         runtime.pointer(device_bin_out),
-                        bin_count, center_x, center_y,
+                        bin_count,
+                        center_x,
+                        center_y,
                     ),
                     (
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_I32, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                        KERNEL_PARAM_F64, KERNEL_PARAM_F64,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
                     ),
                 )
                 grid, block = runtime.launch_config(kernel, bin_count)
@@ -313,7 +324,9 @@ def _binned_polygon_dispatch(
                     stream=_current_cuda_stream(),
                 )
             else:
-                kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_polygon_compacted_tagged"]
+                kernel = _point_in_polygon_kernels(compute_type)[
+                    "point_in_polygon_polygon_compacted_tagged"
+                ]
                 params = (
                     (
                         runtime.pointer(device_bin_candidates),
@@ -330,15 +343,28 @@ def _binned_polygon_dispatch(
                         runtime.pointer(polygon_buffer.y),
                         FAMILY_TAGS[GeometryFamily.POLYGON],
                         runtime.pointer(device_bin_out),
-                        bin_count, center_x, center_y,
+                        bin_count,
+                        center_x,
+                        center_y,
                     ),
                     (
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_I32, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                        KERNEL_PARAM_F64, KERNEL_PARAM_F64,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
                     ),
                 )
                 grid, block = runtime.launch_config(kernel, bin_count)
@@ -351,8 +377,13 @@ def _binned_polygon_dispatch(
                 )
 
             _scatter_bin_results(
-                device_bin_indices, device_bin_out, device_out, bin_count,
-                compute_type=compute_type, center_x=center_x, center_y=center_y,
+                device_bin_indices,
+                device_bin_out,
+                device_out,
+                bin_count,
+                compute_type=compute_type,
+                center_x=center_x,
+                center_y=center_y,
             )
         return device_out, pending_free
     except Exception:
@@ -380,8 +411,8 @@ def _binned_multipolygon_dispatch(
     import cupy as _cp
 
     runtime = get_cuda_runtime()
-    left_state = left._ensure_device_state()
-    right_state = right._ensure_device_state()
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right._ensure_device_state(preserve_indexed_view=True)
     point_buffer = left_state.families[GeometryFamily.POINT]
     multipolygon_buffer = right_state.families[GeometryFamily.MULTIPOLYGON]
 
@@ -392,7 +423,9 @@ def _binned_multipolygon_dispatch(
     bin_edges = [0] + _PIP_WORK_BINS + [int(work_estimates.max()) + 1]
     _log.debug(
         "binned_multipolygon_dispatch: %d candidates, work min=%d max=%d",
-        candidate_count, work_estimates.min(), work_estimates.max(),
+        candidate_count,
+        work_estimates.min(),
+        work_estimates.max(),
     )
 
     pending_free = []
@@ -409,14 +442,14 @@ def _binned_multipolygon_dispatch(
             device_bin_indices = _cp.flatnonzero(mask).astype(_cp.int32)
             device_bin_candidates = candidate_rows_device[device_bin_indices].astype(_cp.int32)
             device_bin_out = runtime.allocate((bin_count,), cp.uint8)
-            pending_free.extend(
-                (device_bin_candidates, device_bin_indices, device_bin_out)
-            )
+            pending_free.extend((device_bin_candidates, device_bin_indices, device_bin_out))
 
             use_block_per_pair = lo >= _PIP_WORK_BINS[-1]
 
             if use_block_per_pair:
-                kernel = _pip_block_per_pair_kernels(compute_type)["pip_block_per_pair_multipolygon"]
+                kernel = _pip_block_per_pair_kernels(compute_type)[
+                    "pip_block_per_pair_multipolygon"
+                ]
                 params = (
                     (
                         runtime.pointer(device_bin_candidates),
@@ -434,15 +467,29 @@ def _binned_multipolygon_dispatch(
                         runtime.pointer(multipolygon_buffer.y),
                         FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
                         runtime.pointer(device_bin_out),
-                        bin_count, center_x, center_y,
+                        bin_count,
+                        center_x,
+                        center_y,
                     ),
                     (
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_I32, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
                     ),
                 )
                 grid, block = runtime.launch_config(kernel, bin_count)
@@ -454,7 +501,9 @@ def _binned_multipolygon_dispatch(
                     stream=_current_cuda_stream(),
                 )
             else:
-                kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_multipolygon_compacted_tagged"]
+                kernel = _point_in_polygon_kernels(compute_type)[
+                    "point_in_polygon_multipolygon_compacted_tagged"
+                ]
                 params = (
                     (
                         runtime.pointer(device_bin_candidates),
@@ -472,15 +521,29 @@ def _binned_multipolygon_dispatch(
                         runtime.pointer(multipolygon_buffer.y),
                         FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
                         runtime.pointer(device_bin_out),
-                        bin_count, center_x, center_y,
+                        bin_count,
+                        center_x,
+                        center_y,
                     ),
                     (
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_I32, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
                     ),
                 )
                 grid, block = runtime.launch_config(kernel, bin_count)
@@ -493,8 +556,13 @@ def _binned_multipolygon_dispatch(
                 )
 
             _scatter_bin_results(
-                device_bin_indices, device_bin_out, device_out, bin_count,
-                compute_type=compute_type, center_x=center_x, center_y=center_y,
+                device_bin_indices,
+                device_bin_out,
+                device_out,
+                bin_count,
+                compute_type=compute_type,
+                center_x=center_x,
+                center_y=center_y,
             )
         return device_out, pending_free
     except Exception:
@@ -516,16 +584,16 @@ def _compute_work_estimates_for_candidates_device(
     right_array: OwnedGeometryArray,
 ):
     """Compute per-candidate polygon work estimates fully on device."""
-    right_state = right_array._ensure_device_state()
+    right_state = right_array._ensure_device_state(preserve_indexed_view=True)
     d_candidate_rows = cp.asarray(candidate_rows_device, dtype=cp.int32)
     d_tags = cp.asarray(right_state.tags)[d_candidate_rows]
     d_family_row_offsets = cp.asarray(right_state.family_row_offsets)[d_candidate_rows]
     d_work = cp.zeros(d_candidate_rows.size, dtype=cp.int32)
 
     if GeometryFamily.POLYGON in right_state.families:
-        poly_indices = cp.flatnonzero(
-            d_tags == FAMILY_TAGS[GeometryFamily.POLYGON]
-        ).astype(cp.int32, copy=False)
+        poly_indices = cp.flatnonzero(d_tags == FAMILY_TAGS[GeometryFamily.POLYGON]).astype(
+            cp.int32, copy=False
+        )
         if poly_indices.size > 0:
             poly_family_rows = d_family_row_offsets[poly_indices]
             poly_valid = poly_family_rows >= 0
@@ -540,13 +608,14 @@ def _compute_work_estimates_for_candidates_device(
                 coord_start = d_ring_offsets[ring_start]
                 coord_end = d_ring_offsets[ring_end]
                 d_work[poly_valid_indices] = (coord_end - coord_start).astype(
-                    cp.int32, copy=False,
+                    cp.int32,
+                    copy=False,
                 )
 
     if GeometryFamily.MULTIPOLYGON in right_state.families:
-        mp_indices = cp.flatnonzero(
-            d_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
-        ).astype(cp.int32, copy=False)
+        mp_indices = cp.flatnonzero(d_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]).astype(
+            cp.int32, copy=False
+        )
         if mp_indices.size > 0:
             mp_family_rows = d_family_row_offsets[mp_indices]
             mp_valid = mp_family_rows >= 0
@@ -564,19 +633,19 @@ def _compute_work_estimates_for_candidates_device(
                 coord_start = d_ring_offsets[ring_start]
                 coord_end = d_ring_offsets[ring_end]
                 d_work[mp_valid_indices] = (coord_end - coord_start).astype(
-                    cp.int32, copy=False,
+                    cp.int32,
+                    copy=False,
                 )
 
     return d_work
 
 
-
-
-
 if cp is not None:
-    request_nvrtc_warmup([
-        ("point-in-polygon", _POINT_IN_POLYGON_KERNEL_SOURCE, _POINT_IN_POLYGON_KERNEL_NAMES),
-    ])
+    request_nvrtc_warmup(
+        [
+            ("point-in-polygon", _POINT_IN_POLYGON_KERNEL_SOURCE, _POINT_IN_POLYGON_KERNEL_NAMES),
+        ]
+    )
 
 
 def _point_in_polygon_kernels(compute_type: str = "double"):
@@ -621,8 +690,8 @@ def _launch_polygon_dense(
 ) -> tuple[object, object]:
     """Launch dense polygon PIP kernel and return temporary buffers to keep alive."""
     runtime = get_cuda_runtime()
-    left_state = left._ensure_device_state()
-    right_state = right._ensure_device_state()
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right._ensure_device_state(preserve_indexed_view=True)
     point_buffer = left_state.families[GeometryFamily.POINT]
     polygon_buffer = right_state.families[GeometryFamily.POLYGON]
     n = left.row_count
@@ -694,8 +763,8 @@ def _launch_polygon_compacted(
     center_y: float = 0.0,
 ):
     runtime = get_cuda_runtime()
-    left_state = left._ensure_device_state()
-    right_state = right._ensure_device_state()
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right._ensure_device_state(preserve_indexed_view=True)
     point_buffer = left_state.families[GeometryFamily.POINT]
     polygon_buffer = right_state.families[GeometryFamily.POLYGON]
     device_out = runtime.allocate((candidate_count,), cp.uint8)
@@ -762,8 +831,8 @@ def _launch_multipolygon_dense(
 ) -> tuple[object, object]:
     """Launch dense multipolygon PIP kernel and return temporary buffers to keep alive."""
     runtime = get_cuda_runtime()
-    left_state = left._ensure_device_state()
-    right_state = right._ensure_device_state()
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right._ensure_device_state(preserve_indexed_view=True)
     point_buffer = left_state.families[GeometryFamily.POINT]
     multipolygon_buffer = right_state.families[GeometryFamily.MULTIPOLYGON]
     n = left.row_count
@@ -837,12 +906,14 @@ def _launch_multipolygon_compacted(
     center_y: float = 0.0,
 ):
     runtime = get_cuda_runtime()
-    left_state = left._ensure_device_state()
-    right_state = right._ensure_device_state()
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right._ensure_device_state(preserve_indexed_view=True)
     point_buffer = left_state.families[GeometryFamily.POINT]
     multipolygon_buffer = right_state.families[GeometryFamily.MULTIPOLYGON]
     device_out = runtime.allocate((candidate_count,), cp.uint8)
-    kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_multipolygon_compacted_tagged"]
+    kernel = _point_in_polygon_kernels(compute_type)[
+        "point_in_polygon_multipolygon_compacted_tagged"
+    ]
     params = (
         (
             runtime.pointer(candidate_rows),
@@ -944,20 +1015,25 @@ def _launch_fused(
 ):
     """Single-kernel fused bounds check + PIP test for all rows."""
     runtime = get_cuda_runtime()
-    left_state = points._ensure_device_state()
-    right_state = right._ensure_device_state()
+    left_state = points._ensure_device_state(preserve_indexed_view=True)
+    right_state = right._ensure_device_state(preserve_indexed_view=True)
     point_buffer = left_state.families[GeometryFamily.POINT]
 
     has_polygon = GeometryFamily.POLYGON in right_state.families
     has_multipolygon = GeometryFamily.MULTIPOLYGON in right_state.families
     polygon_buffer = right_state.families[GeometryFamily.POLYGON] if has_polygon else None
-    multipolygon_buffer = right_state.families[GeometryFamily.MULTIPOLYGON] if has_multipolygon else None
+    multipolygon_buffer = (
+        right_state.families[GeometryFamily.MULTIPOLYGON] if has_multipolygon else None
+    )
 
     # Ensure per-family bounds exist on device.  When the fused path skips
     # CPU compute_geometry_bounds, the device buffers have bounds=None.
     # Compute them directly on-device — this is much cheaper than the CPU
     # path that was the original bottleneck we're eliminating.
-    for family, device_buffer in ((GeometryFamily.POLYGON, polygon_buffer), (GeometryFamily.MULTIPOLYGON, multipolygon_buffer)):
+    for family, device_buffer in (
+        (GeometryFamily.POLYGON, polygon_buffer),
+        (GeometryFamily.MULTIPOLYGON, multipolygon_buffer),
+    ):
         if device_buffer is not None and device_buffer.bounds is None:
             row_count = right.families[family].row_count
             device_buffer.bounds = runtime.allocate((row_count, 4), cp.float64)
@@ -1047,8 +1123,8 @@ def _launch_bounds_candidate_rows(
     center_y: float = 0.0,
 ):
     runtime = get_cuda_runtime()
-    left_state = points._ensure_device_state()
-    right_state = right._ensure_device_state()
+    left_state = points._ensure_device_state(preserve_indexed_view=True)
+    right_state = right._ensure_device_state(preserve_indexed_view=True)
     point_buffer = left_state.families[GeometryFamily.POINT]
     polygon_bounds = (
         None
@@ -1119,6 +1195,7 @@ def launch_point_region_candidate_rows(
     """Return device-resident candidate rows for aligned point/region bounds hits."""
     return _launch_bounds_candidate_rows(points, regions)
 
+
 _log = logging.getLogger("vibespatial.kernels.point_in_polygon")
 
 _last_gpu_substage_timings: dict[str, float] | None = None
@@ -1164,6 +1241,7 @@ def _evaluate_point_in_polygon_gpu(
 
     # Determine compute precision from device profile.
     from vibespatial.runtime.adaptive import get_cached_snapshot
+
     snapshot = get_cached_snapshot()
     use_fp32 = not snapshot.device_profile.favors_native_fp64
     compute_type = "float" if use_fp32 else "double"
@@ -1172,15 +1250,17 @@ def _evaluate_point_in_polygon_gpu(
     center_x, center_y = _compute_pip_center(points, right_array)
 
     t0 = perf_counter()
-    points._ensure_device_state()
+    points._ensure_device_state(preserve_indexed_view=True)
     timings["point_upload_s"] = perf_counter() - t0
 
     t0 = perf_counter()
-    right_array._ensure_device_state()
+    right_array._ensure_device_state(preserve_indexed_view=True)
     timings["polygon_upload_s"] = perf_counter() - t0
 
     selected_strategy = _select_gpu_strategy(
-        points.row_count, strategy=strategy, right_array=right_array,
+        points.row_count,
+        strategy=strategy,
+        right_array=right_array,
     )
     timings["requested_strategy"] = selected_strategy
     if return_device and selected_strategy == "dense":
@@ -1272,20 +1352,25 @@ def _evaluate_point_in_polygon_gpu(
     elif selected_strategy == "compacted":
         # Ensure per-family bounds exist on device (same as fused/binned paths).
         runtime = get_cuda_runtime()
-        right_state = right_array._ensure_device_state()
+        right_state = right_array._ensure_device_state(preserve_indexed_view=True)
         for family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
             if family in right_state.families:
                 device_buffer = right_state.families[family]
                 if device_buffer.bounds is None:
                     fam_row_count = right_array.families[family].row_count
                     device_buffer.bounds = runtime.allocate(
-                        (fam_row_count, 4), cp.float64,
+                        (fam_row_count, 4),
+                        cp.float64,
                     )
                     _launch_family_bounds_kernel(
-                        family, device_buffer, row_count=fam_row_count,
+                        family,
+                        device_buffer,
+                        row_count=fam_row_count,
                     )
         t0 = perf_counter()
-        candidate_rows = _launch_bounds_candidate_rows(points, right_array, compute_type=compute_type, center_x=center_x, center_y=center_y)
+        candidate_rows = _launch_bounds_candidate_rows(
+            points, right_array, compute_type=compute_type, center_x=center_x, center_y=center_y
+        )
         timings["coarse_filter_s"] = perf_counter() - t0
         timings["candidate_mask_s"] = 0.0
         timings["candidate_count"] = int(candidate_rows.count)
@@ -1380,22 +1465,28 @@ def _evaluate_point_in_polygon_gpu(
         # with a block-per-pair kernel for the complex (>1024 vertex) bin.
         runtime = get_cuda_runtime()
         # Ensure per-family bounds exist on device (same as fused path).
-        right_state = right_array._ensure_device_state()
+        right_state = right_array._ensure_device_state(preserve_indexed_view=True)
         for family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
             if family in right_state.families:
                 device_buffer = right_state.families[family]
                 if device_buffer.bounds is None:
                     fam_row_count = right_array.families[family].row_count
                     device_buffer.bounds = runtime.allocate(
-                        (fam_row_count, 4), cp.float64,
+                        (fam_row_count, 4),
+                        cp.float64,
                     )
                     _launch_family_bounds_kernel(
-                        family, device_buffer, row_count=fam_row_count,
+                        family,
+                        device_buffer,
+                        row_count=fam_row_count,
                     )
         t0 = perf_counter()
         candidate_rows = _launch_bounds_candidate_rows(
-            points, right_array, compute_type=compute_type,
-            center_x=center_x, center_y=center_y,
+            points,
+            right_array,
+            compute_type=compute_type,
+            center_x=center_x,
+            center_y=center_y,
         )
         timings["coarse_filter_s"] = perf_counter() - t0
         timings["candidate_mask_s"] = 0.0
@@ -1504,7 +1595,9 @@ def _evaluate_point_in_polygon_gpu(
         # Fused: single kernel does bounds check + PIP in one launch.
         runtime = get_cuda_runtime()
         t0 = perf_counter()
-        device_out = _launch_fused(points, right_array, compute_type=compute_type, center_x=center_x, center_y=center_y)
+        device_out = _launch_fused(
+            points, right_array, compute_type=compute_type, center_x=center_x, center_y=center_y
+        )
         timings["fused_kernel_s"] = perf_counter() - t0
         timings["coarse_filter_s"] = 0.0
         timings["candidate_mask_s"] = 0.0
@@ -1631,7 +1724,9 @@ def point_in_polygon(
         move_to_device_s = perf_counter() - t0
 
         gpu_out = _evaluate_point_in_polygon_gpu(
-            left, right, return_device=_return_device,
+            left,
+            right,
+            return_device=_return_device,
         )
 
         # Merge outer timing into substage report
@@ -1644,6 +1739,7 @@ def point_in_polygon(
         # zero-copy pipelines (feeds into device_take).
         if _return_device:
             import cupy as _cp
+
             bool_out = _cp.asarray(gpu_out, dtype=_cp.bool_)
             if bool_out is gpu_out:
                 return bool_out
@@ -1704,9 +1800,7 @@ def point_in_polygon_expression(
         _return_device=True,
     )
     selected = (
-        ExecutionMode.GPU
-        if hasattr(values, "__cuda_array_interface__")
-        else ExecutionMode.CPU
+        ExecutionMode.GPU if hasattr(values, "__cuda_array_interface__") else ExecutionMode.CPU
     )
     record_dispatch_event(
         surface="vibespatial.kernels.predicates.point_in_polygon_expression",

@@ -5,7 +5,7 @@ Scope: Overlay reconstruction staging, face-labeling plan, and CCCL-oriented out
 Read If: You are changing union, difference, symmetric difference, or overlay output reconstruction.
 STOP IF: You already have the reconstruction planner open and only need local implementation detail.
 Source Of Truth: Phase-5 reconstruction plan from segment primitives to public overlay outputs.
-Body Budget: 122/220 lines
+Body Budget: 150/220 lines
 Document: docs/architecture/overlay-reconstruction.md
 
 Section Map (Body Lines)
@@ -20,7 +20,7 @@ Section Map (Body Lines)
 | 40-49 | Options Considered |
 | 50-63 | Decision |
 | 64-77 | CCCL Mapping |
-| 78-122 | Consequences |
+| 78-150 | Consequences |
 DOC_HEADER:END -->
 
 `o17.5.3` fixes the constructive assembly shape before full overlay kernels land.
@@ -123,6 +123,34 @@ overlay operations.
   mixed-family constructive overlay stays explicitly unsupported until a later
   a later change widens the kernel contract
 - later GPU overlay work has an explicit CCCL-friendly assembly seam
+- half-edge node construction sorts source endpoints once and derives target
+  node ids from adjacent twins; node and radial orders use exact stable radix
+  passes instead of duplicated endpoint relations or stacked fp64 key matrices;
+  coordinate keys stream one pass at a time, endpoint grouping reads the sorted
+  permutation directly, and one radial-successor kernel replaces edge-position,
+  span, group, and twin-position work arrays
+- successor ids are an `int32` graph contract through face walk and assembly;
+  face tables retain unordered membership from the first face-id sort and use
+  successors for traversal, production graphs omit diagnostic node/radial
+  arrays, and boundary cycles require neither list ranking nor a rank-key sort
+- assembly scatters selected-face state directly to edge bits instead of
+  rebuilding an edge-to-face inverse; hole classification is block-per-face,
+  while boundary successors and coordinate traversal are sized from the compact
+  boundary relation
+- aligned, grouped, and single-row known-coverage unions share one exact
+  undirected-segment reducer whose radix keys and run comparisons stream one
+  column at a time
+- an oversized row with strictly separated combined polygon-part x intervals
+  lowers to independent synthetic topology rows; grouped right-side parts keep
+  same-side splitting, and interval-disjoint results pack back without a union
+- device geometry concat compacts active coordinate and nested-offset prefixes
+  into retained capacity, so topology pages do not read terminal offsets on host
+- a connected aligned interval component that exceeds the final graph target
+  lowers through `MicrocellOverlayExecutionPlan`: complete x intervals page at
+  a fixed membership budget, vertical seams atomize by exact endpoint scans,
+  surviving boundary atoms feed the canonical half-edge graph, and contour
+  nesting restores holes and islands without host union-find or grouped cell
+  union; grouped-right indirection remains on its existing exact topology path
 - **Memory-Safe Difference Batching:** overlay difference splits large
   workloads into VRAM-safe batches to prevent OOM at scale. The strategy:
   1. Estimate per-pair byte cost from right-side coordinate density.

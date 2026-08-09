@@ -42,8 +42,10 @@ the full public dissolve surface.
   semantics.
 - The geometry core has a clean seam for CUDA and CCCL-driven work later.
 - Deterministic group order is explicit instead of incidental.
-- This does not yet provide a GPU union kernel; it provides the correct staging
-  contract for one.
+- Device polygon groups now lower through `NativeGrouped` sorted offsets into
+  one grouped constructive executor; global polygon union is the one-group case.
+- Admitted grouped execution is atomic. Failures do not trigger a host-shaped
+  tree reduction, pairwise retry, or Shapely re-execution.
 
 ## Alternatives Considered
 
@@ -53,6 +55,6 @@ the full public dissolve surface.
 
 ## Acceptance Notes
 
-The landed implementation exposes a dissolve planner, grouped union executor,
-benchmark surface, and a repo-owned `GeoDataFrame.dissolve` path that preserves
-upstream test behavior.
+The implementation exposes a dissolve planner, native grouped union executor,
+benchmark surface, and repo-owned `GeoDataFrame.dissolve` path. Host CSR group
+metadata lowers once; device grouped metadata remains resident through output.

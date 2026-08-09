@@ -17,7 +17,14 @@ from vibespatial.runtime.residency import Residency
     "cpu",
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.CPU,),
-    geometry_families=("polygon", "multipolygon", "linestring", "multilinestring", "point", "multipoint"),
+    geometry_families=(
+        "polygon",
+        "multipolygon",
+        "linestring",
+        "multilinestring",
+        "point",
+        "multipoint",
+    ),
     supports_mixed=True,
     tags=("shapely", "constructive", "make_valid"),
 )

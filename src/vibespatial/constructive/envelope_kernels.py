@@ -8,7 +8,9 @@ from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 # NVRTC kernel: compute bounds per geometry and emit envelope polygon
 # ---------------------------------------------------------------------------
 
-_ENVELOPE_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_ENVELOPE_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + r"""
 extern "C" __global__ void envelope_from_bounds(
     const double* __restrict__ bounds,  /* (N, 4): xmin, ymin, xmax, ymax */
     double* __restrict__ x_out,         /* 5*N coords */
@@ -32,6 +34,7 @@ extern "C" __global__ void envelope_from_bounds(
     x_out[base + 4] = xmin;  y_out[base + 4] = ymin;  /* close ring */
 }}
 """
+)
 _ENVELOPE_KERNEL_NAMES = ("envelope_from_bounds",)
 _ENVELOPE_FP64 = _ENVELOPE_KERNEL_SOURCE.format(compute_type="double")
 _ENVELOPE_FP32 = _ENVELOPE_KERNEL_SOURCE.format(compute_type="float")

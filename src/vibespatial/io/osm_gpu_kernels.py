@@ -57,9 +57,7 @@ osm_gather_way_coords(
 }
 """
 
-_WAY_COORD_GATHER_NAMES: tuple[str, ...] = (
-    "osm_gather_way_coords",
-)
+_WAY_COORD_GATHER_NAMES: tuple[str, ...] = ("osm_gather_way_coords",)
 
 _VARINT_DECODE_SOURCE = r"""
 // Protobuf varint decoder -- each thread decodes one varint at a known
@@ -152,4 +150,3 @@ _VARINT_DECODE_NAMES: tuple[str, ...] = (
     "decode_varints_zigzag",
     "decode_varints_unsigned",
 )
-

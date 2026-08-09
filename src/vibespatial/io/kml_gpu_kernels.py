@@ -259,4 +259,3 @@ kml_assign_coord_regions(
 """
 
 _KML_ASSIGN_COORD_REGIONS_NAMES: tuple[str, ...] = ("kml_assign_coord_regions",)
-

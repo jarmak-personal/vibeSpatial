@@ -1,21 +1,27 @@
 from __future__ import annotations
 
-import contextlib
-import logging
+from dataclasses import dataclass
 
 import numpy as np
 import shapely
 
 from vibespatial.cuda.cccl_precompile import request_warmup
 
-request_warmup([
-    "exclusive_scan_i32", "exclusive_scan_i64",
-    "radix_sort_i32_i32", "radix_sort_i64_i32", "radix_sort_u64_i32",
-    "unique_by_key_i32_i32", "unique_by_key_u64_i32",
-    "segmented_reduce_sum_f64",
-    "segmented_reduce_min_f64", "segmented_reduce_max_f64",
-    "select_i32",
-])
+request_warmup(
+    [
+        "exclusive_scan_i32",
+        "exclusive_scan_i64",
+        "radix_sort_i32_i32",
+        "radix_sort_i64_i32",
+        "radix_sort_u64_i32",
+        "unique_by_key_i32_i32",
+        "unique_by_key_u64_i32",
+        "segmented_reduce_sum_f64",
+        "segmented_reduce_min_f64",
+        "segmented_reduce_max_f64",
+        "select_i32",
+    ]
+)
 from vibespatial.cuda._runtime import (  # noqa: E402
     compile_kernel_group,
     get_cuda_runtime,
@@ -28,30 +34,28 @@ from vibespatial.geometry.owned import (  # noqa: E402
     from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
-from vibespatial.runtime.adaptive import plan_dispatch_selection  # noqa: E402
 from vibespatial.runtime.dispatch import record_dispatch_event  # noqa: E402
 from vibespatial.runtime.fallbacks import record_fallback_event  # noqa: E402
 from vibespatial.runtime.kernel_registry import register_kernel_variant  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
-from vibespatial.runtime.residency import Residency, combined_residency  # noqa: E402
+from vibespatial.runtime.residency import Residency  # noqa: E402
 from vibespatial.spatial.segment_primitives import (  # noqa: E402
+    DeviceBroadcastSegmentRelation,
     DeviceSegmentTable,
     SegmentIntersectionResult,
-    _extract_segments_gpu,
 )
 
-from ._host_boundary import (  # noqa: E402
-    overlay_device_to_host,
-    overlay_int_scalar,
-)
 from .types import (  # noqa: E402, F401  # Re-exported for backward compatibility
     AtomicEdgeDeviceState,
     AtomicEdgeTable,
+    ComponentOverlayExecutionPlan,
     HalfEdgeGraph,
     HalfEdgeGraphDeviceState,
+    MicrocellOverlayExecutionPlan,
     OverlayExecutionPlan,
     OverlayFaceDeviceState,
     OverlayFaceTable,
+    PagedOverlayExecutionPlan,
     SplitEventDeviceState,
     SplitEventTable,
 )
@@ -61,28 +65,88 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
     cp = None
 
-logger = logging.getLogger(__name__)
+# Peak live bytes per split event while endpoint/pair batches, packed keys,
+# priority keys, sort order, and deduplicated payload overlap. This is a
+# conservative execution-layout estimate, not the persistent table width.
+_BYTES_PER_LIVE_SPLIT_EVENT = 192
+_MIN_LIVE_SPLIT_EVENT_BUDGET = 64 * 1024
+_MAX_LIVE_SPLIT_EVENT_BUDGET = 2 * 1024 * 1024
 
-# lyy.22: Number of CUDA streams in the per-group overlay stream pool.
-# Each stream processes one overlay pair at a time.  Streams enable
-# deferred synchronization: results are collected after all pairs are
-# dispatched rather than synchronizing per pair.
-#
-# NOTE: non_blocking=False is required for correctness.  The overlay
-# pipeline interleaves CuPy operations (which respect the CuPy stream
-# context) with NVRTC kernel launches via runtime.launch() (which use
-# the null/default CUDA stream).  Non-blocking streams do NOT
-# synchronize with the null stream, which would allow CuPy ops on the
-# stream to race with NVRTC kernels on the null stream within a single
-# _overlay_owned call.  Blocking streams (the default) synchronize with
-# the null stream on every operation, maintaining correct ordering.
-#
-# The primary benefit of this pattern is structural: it provides a
-# framework for future stream-parallel execution once runtime.launch()
-# is plumbed with per-stream support.  In the current architecture,
-# GPU work is serialized by the null-stream NVRTC kernels regardless
-# of the CuPy stream assignment.
-_OVERLAY_STREAM_POOL_SIZE = 2
+
+@dataclass(frozen=True)
+class _RowIsolatedTopologyPageShape:
+    row_count: int
+    rows_per_page: int
+    live_event_budget: int
+    worst_live_events_per_row: int
+
+    @property
+    def page_count(self) -> int:
+        return (self.row_count + self.rows_per_page - 1) // self.rows_per_page
+
+    @property
+    def single_row_oversized(self) -> bool:
+        return self.worst_live_events_per_row > self.live_event_budget
+
+    def row_spans(self) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (start, min(start + self.rows_per_page, self.row_count))
+            for start in range(0, self.row_count, self.rows_per_page)
+        )
+
+
+def _compute_live_split_event_budget() -> int:
+    """Derive a bounded live-event budget from currently available memory."""
+    try:
+        runtime = get_cuda_runtime()
+        stats = runtime.memory_pool_stats()
+        if "free_bytes" in stats:
+            free_bytes = int(stats["free_bytes"])
+        else:
+            free_bytes = int(cp.cuda.Device().mem_info[0])
+    except Exception:
+        return _MAX_LIVE_SPLIT_EVENT_BUDGET
+
+    usable_bytes = max(free_bytes // 5, 0)
+    event_budget = usable_bytes // _BYTES_PER_LIVE_SPLIT_EVENT
+    return min(
+        max(event_budget, _MIN_LIVE_SPLIT_EVENT_BUDGET),
+        _MAX_LIVE_SPLIT_EVENT_BUDGET,
+    )
+
+
+def _row_isolated_topology_page_shape(
+    *,
+    row_count: int,
+    max_left_segments_per_row: int,
+    max_right_segments_per_row: int,
+    include_same_side_splits: bool,
+    live_event_budget: int | None = None,
+) -> _RowIsolatedTopologyPageShape:
+    """Plan complete-row topology pages from worst-case split-event work."""
+    row_count = max(int(row_count), 0)
+    left_span = max(int(max_left_segments_per_row), 0)
+    right_span = max(int(max_right_segments_per_row), 0)
+    budget = max(
+        int(_compute_live_split_event_budget() if live_event_budget is None else live_event_budget),
+        1,
+    )
+
+    endpoint_events = 2 * (left_span + right_span)
+    pair_events = 4 * left_span * right_span
+    if include_same_side_splits:
+        pair_events += 2 * left_span * max(left_span - 1, 0)
+        pair_events += 2 * right_span * max(right_span - 1, 0)
+    worst_per_row = max(endpoint_events + pair_events, 1)
+    rows_per_page = max(1, budget // worst_per_row)
+    if row_count:
+        rows_per_page = min(rows_per_page, row_count)
+    return _RowIsolatedTopologyPageShape(
+        row_count=row_count,
+        rows_per_page=rows_per_page,
+        live_event_budget=budget,
+        worst_live_events_per_row=worst_per_row,
+    )
 
 
 from vibespatial.overlay.gpu_kernels import (  # noqa: E402
@@ -103,22 +167,29 @@ from vibespatial.overlay.gpu_kernels import (  # noqa: E402
 _OVERLAY_COORDINATE_SCALE = 1_000_000_000.0
 
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
-from vibespatial.overlay.bypass import (  # noqa: E402
-    _batched_sh_clip,
-    _classify_remainder_sh_eligible,
-    _combine_bypass_results,
-    _containment_bypass_gpu,
-    _is_clip_polygon_sh_eligible,
-)
 
-request_nvrtc_warmup([
-    ("overlay-split", _OVERLAY_SPLIT_KERNEL_SOURCE, _OVERLAY_SPLIT_KERNEL_NAMES),
-    ("overlay-face-walk", _OVERLAY_FACE_WALK_KERNEL_SOURCE, _OVERLAY_FACE_WALK_KERNEL_NAMES),
-    ("overlay-face-label", _OVERLAY_FACE_LABEL_KERNEL_SOURCE, _OVERLAY_FACE_LABEL_KERNEL_NAMES),
-    ("overlay-face-assembly", _OVERLAY_FACE_ASSEMBLY_KERNEL_SOURCE, _OVERLAY_FACE_ASSEMBLY_KERNEL_NAMES),
-    ("overlay-batch-pip", _BATCH_POINT_IN_RING_KERNEL_SOURCE, _BATCH_POINT_IN_RING_KERNEL_NAMES),
-    ("overlay-containment-bypass", _CONTAINMENT_BYPASS_KERNEL_SOURCE, _CONTAINMENT_BYPASS_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("overlay-split", _OVERLAY_SPLIT_KERNEL_SOURCE, _OVERLAY_SPLIT_KERNEL_NAMES),
+        ("overlay-face-walk", _OVERLAY_FACE_WALK_KERNEL_SOURCE, _OVERLAY_FACE_WALK_KERNEL_NAMES),
+        ("overlay-face-label", _OVERLAY_FACE_LABEL_KERNEL_SOURCE, _OVERLAY_FACE_LABEL_KERNEL_NAMES),
+        (
+            "overlay-face-assembly",
+            _OVERLAY_FACE_ASSEMBLY_KERNEL_SOURCE,
+            _OVERLAY_FACE_ASSEMBLY_KERNEL_NAMES,
+        ),
+        (
+            "overlay-batch-pip",
+            _BATCH_POINT_IN_RING_KERNEL_SOURCE,
+            _BATCH_POINT_IN_RING_KERNEL_NAMES,
+        ),
+        (
+            "overlay-containment-bypass",
+            _CONTAINMENT_BYPASS_KERNEL_SOURCE,
+            _CONTAINMENT_BYPASS_KERNEL_NAMES,
+        ),
+    ]
+)
 
 
 @register_kernel_variant(
@@ -132,7 +203,9 @@ request_nvrtc_warmup([
     tags=("nvrtc", "overlay", "split"),
 )
 def _overlay_split_kernels():
-    return compile_kernel_group("overlay-split", _OVERLAY_SPLIT_KERNEL_SOURCE, _OVERLAY_SPLIT_KERNEL_NAMES)
+    return compile_kernel_group(
+        "overlay-split", _OVERLAY_SPLIT_KERNEL_SOURCE, _OVERLAY_SPLIT_KERNEL_NAMES
+    )
 
 
 @register_kernel_variant(
@@ -146,7 +219,9 @@ def _overlay_split_kernels():
     tags=("nvrtc", "overlay", "face-walk"),
 )
 def _overlay_face_walk_kernels():
-    return compile_kernel_group("overlay-face-walk", _OVERLAY_FACE_WALK_KERNEL_SOURCE, _OVERLAY_FACE_WALK_KERNEL_NAMES)
+    return compile_kernel_group(
+        "overlay-face-walk", _OVERLAY_FACE_WALK_KERNEL_SOURCE, _OVERLAY_FACE_WALK_KERNEL_NAMES
+    )
 
 
 @register_kernel_variant(
@@ -160,7 +235,9 @@ def _overlay_face_walk_kernels():
     tags=("nvrtc", "overlay", "face-label"),
 )
 def _overlay_face_label_kernels():
-    return compile_kernel_group("overlay-face-label", _OVERLAY_FACE_LABEL_KERNEL_SOURCE, _OVERLAY_FACE_LABEL_KERNEL_NAMES)
+    return compile_kernel_group(
+        "overlay-face-label", _OVERLAY_FACE_LABEL_KERNEL_SOURCE, _OVERLAY_FACE_LABEL_KERNEL_NAMES
+    )
 
 
 @register_kernel_variant(
@@ -174,7 +251,11 @@ def _overlay_face_label_kernels():
     tags=("nvrtc", "overlay", "face-assembly"),
 )
 def _overlay_face_assembly_kernels():
-    return compile_kernel_group("overlay-face-assembly", _OVERLAY_FACE_ASSEMBLY_KERNEL_SOURCE, _OVERLAY_FACE_ASSEMBLY_KERNEL_NAMES)
+    return compile_kernel_group(
+        "overlay-face-assembly",
+        _OVERLAY_FACE_ASSEMBLY_KERNEL_SOURCE,
+        _OVERLAY_FACE_ASSEMBLY_KERNEL_NAMES,
+    )
 
 
 @register_kernel_variant(
@@ -188,7 +269,9 @@ def _overlay_face_assembly_kernels():
     tags=("nvrtc", "overlay", "batch-pip"),
 )
 def _batch_pip_kernels():
-    return compile_kernel_group("overlay-batch-pip", _BATCH_POINT_IN_RING_KERNEL_SOURCE, _BATCH_POINT_IN_RING_KERNEL_NAMES)
+    return compile_kernel_group(
+        "overlay-batch-pip", _BATCH_POINT_IN_RING_KERNEL_SOURCE, _BATCH_POINT_IN_RING_KERNEL_NAMES
+    )
 
 
 @register_kernel_variant(
@@ -237,6 +320,48 @@ def _filter_non_empty_owned_device(result_owned: OwnedGeometryArray) -> OwnedGeo
     return OwnedGeometryArray._indexed_view(result_owned, keep_indices)
 
 
+def _logical_polygonal_only(owned: OwnedGeometryArray) -> bool:
+    """Return whether logical non-null rows are polygon/multipolygon rows."""
+    polygonal_families = {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
+    state = getattr(owned, "device_state", None)
+    if state is not None and state.trusted_polygonal_only is True:
+        return True
+    if set(owned.families) <= polygonal_families:
+        if state is not None:
+            state.trusted_polygonal_only = True
+        return True
+
+    polygon_tags = tuple(np.int8(FAMILY_TAGS[family]) for family in polygonal_families)
+    host_tags = getattr(owned, "_tags", None)
+    host_validity = getattr(owned, "_validity", None)
+    if host_tags is not None and host_validity is not None:
+        tags = np.asarray(host_tags, dtype=np.int8)
+        validity = np.asarray(host_validity, dtype=bool)
+        ok = bool(((~validity) | np.isin(tags, polygon_tags)).all())
+        if ok and state is not None:
+            state.trusted_polygonal_only = True
+        return ok
+
+    if state is not None and cp is not None:
+        d_tags = cp.asarray(state.tags, dtype=cp.int8)
+        d_validity = cp.asarray(state.validity, dtype=cp.bool_)
+        d_polygonal = (d_tags == polygon_tags[0]) | (d_tags == polygon_tags[1])
+        d_ok = cp.asarray(cp.all((~d_validity) | d_polygonal)).reshape(1)
+        ok = bool(
+            get_cuda_runtime().copy_device_to_host(
+                d_ok,
+                reason="overlay logical polygonal admission scalar fence",
+            )[0]
+        )
+        if ok:
+            state.trusted_polygonal_only = True
+        return ok
+
+    tags = np.asarray(owned.tags, dtype=np.int8)
+    validity = np.asarray(owned.validity, dtype=bool)
+    return bool(((~validity) | np.isin(tags, polygon_tags)).all())
+
+
 # Pipeline stages extracted to separate modules.  Re-export for backward
 # compatibility.
 from vibespatial.overlay.assemble import (  # noqa: E402, F401
@@ -252,16 +377,12 @@ from vibespatial.overlay.assemble import (  # noqa: E402, F401
 from vibespatial.overlay.faces import (  # noqa: E402, F401
     _assemble_faces_from_device_indices,
     _gpu_label_face_coverage,
-    _select_overlay_face_indices_gpu,
     build_gpu_overlay_faces,
 )
 from vibespatial.overlay.graph import (  # noqa: E402, F401
     _gpu_face_walk,
     _quantize_coordinate,
     build_gpu_half_edge_graph,
-)
-from vibespatial.overlay.host_fallback import (  # noqa: E402
-    _build_polygon_output_from_faces,
 )
 from vibespatial.overlay.split import (  # noqa: E402, F401
     _free_atomic_edge_excess,
@@ -278,20 +399,30 @@ def build_gpu_split_events(
     intersection_result: SegmentIntersectionResult | None = None,
     dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
     _cached_right_segments: DeviceSegmentTable | None = None,
+    right_segment_broadcast: DeviceBroadcastSegmentRelation | None = None,
     require_same_row: bool = False,
     use_same_row_fast_path: bool | None = None,
+    same_row_single_group: bool = False,
+    same_row_span_summary: tuple[int, int, int] | None = None,
     right_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
+    include_same_side_splits: bool = False,
 ) -> SplitEventTable:
     # Delegated to overlay/split.py — this re-export preserves import compatibility.
     from vibespatial.overlay.split import build_gpu_split_events as _impl
+
     return _impl(
-        left, right,
+        left,
+        right,
         intersection_result=intersection_result,
         dispatch_mode=dispatch_mode,
         _cached_right_segments=_cached_right_segments,
+        right_segment_broadcast=right_segment_broadcast,
         require_same_row=require_same_row,
         use_same_row_fast_path=use_same_row_fast_path,
+        same_row_single_group=same_row_single_group,
+        same_row_span_summary=same_row_span_summary,
         right_geometry_source_rows=right_geometry_source_rows,
+        include_same_side_splits=include_same_side_splits,
     )
 
 
@@ -302,7 +433,580 @@ def build_gpu_atomic_edges(
 ) -> AtomicEdgeTable:
     # Delegated to overlay/split.py — this re-export preserves import compatibility.
     from vibespatial.overlay.split import build_gpu_atomic_edges as _impl
+
     return _impl(split_events, isolate_rows=isolate_rows)
+
+
+def _polygonal_device_families(owned: OwnedGeometryArray) -> bool:
+    state = getattr(owned, "device_state", None)
+    families = set(state.families if state is not None else owned.families)
+    return bool(families) and families <= {
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+    }
+
+
+def _pack_polygon_parts_by_component(
+    polygon_parts,
+    component_ids,
+    *,
+    component_count: int,
+) -> OwnedGeometryArray:
+    """Pack disjoint Polygon parts into aligned MultiPolygon component rows."""
+    from vibespatial.api._native_grouped import NativeGroupedSelection
+    from vibespatial.constructive.binary_constructive import (
+        _assemble_sorted_polygon_part_capacity_gpu,
+    )
+    from vibespatial.cuda.cccl_primitives import PairSortStrategy, sort_pairs
+
+    part_count = int(polygon_parts.capacity)
+    d_active = polygon_parts.selection.active_capacity_mask()
+    d_component_ids = cp.asarray(component_ids, dtype=cp.int32)
+    grouped_parts = NativeGroupedSelection(
+        selection=polygon_parts.selection,
+        group_codes=d_component_ids,
+        group_count=component_count,
+    )
+    d_counts = grouped_parts.reduce_numeric(
+        cp.ones(part_count, dtype=cp.int32),
+        "count",
+    ).values.astype(cp.int32, copy=False)
+    d_sort_component_ids = cp.where(
+        d_active,
+        d_component_ids,
+        cp.int32(component_count),
+    ).astype(cp.uint64, copy=False)
+    d_sort_keys = (d_sort_component_ids << cp.uint64(32)) | cp.arange(part_count, dtype=cp.uint64)
+    ordered = sort_pairs(
+        d_sort_keys,
+        cp.arange(part_count, dtype=cp.int32),
+        strategy=PairSortStrategy.RADIX,
+        synchronize=False,
+    )
+    d_sorted_part_rows = ordered.values.astype(cp.int64, copy=False)
+    sorted_parts = polygon_parts.geometry._device_indexed_take(
+        d_sorted_part_rows,
+    )._apply_row_activity(d_active[d_sorted_part_rows])
+    result = _assemble_sorted_polygon_part_capacity_gpu(
+        sorted_parts,
+        polygon_parts.logical_count,
+        d_counts,
+        cp.arange(component_count, dtype=cp.int32),
+        output_row_count=component_count,
+        runtime_reason="polygon component capacity assembly",
+        ring_capacity=polygon_parts.ring_capacity,
+        coord_capacity=polygon_parts.coord_capacity,
+    )
+    if result is None:
+        raise RuntimeError("component overlay requires exact Polygon part buffers")
+    return result
+
+
+def _single_row_interval_components(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+) -> tuple[OwnedGeometryArray, OwnedGeometryArray, int] | None:
+    """Create aligned rows for strictly x-separated polygon-part components."""
+    from vibespatial.constructive.binary_constructive import (
+        _explode_polygonal_rows_to_polygon_capacity_gpu,
+    )
+    from vibespatial.cuda.cccl_primitives import inclusive_max
+    from vibespatial.kernels.core.geometry_analysis import (
+        compute_geometry_bounds_device,
+    )
+    from vibespatial.overlay.graph import (
+        _fp64_radix_keys,
+        _stable_radix_lexicographic_order,
+    )
+
+    def _capacity_parts(owned):
+        return _explode_polygonal_rows_to_polygon_capacity_gpu(owned)
+
+    left_parts = _capacity_parts(left)
+    right_parts = _capacity_parts(right)
+    if left_parts is None or right_parts is None:
+        return None
+    left_part_count = int(left_parts.capacity)
+    right_part_count = int(right_parts.capacity)
+    part_count = left_part_count + right_part_count
+    if part_count <= 1:
+        return None
+
+    bound_parts = [
+        cp.asarray(
+            compute_geometry_bounds_device(parts.geometry, preserve_indexed_view=True),
+            dtype=cp.float64,
+        ).reshape(parts.capacity, 4)
+        for parts in (left_parts, right_parts)
+    ]
+    d_bounds = cp.concatenate(bound_parts)
+    d_active = cp.concatenate(
+        [parts.selection.active_capacity_mask() for parts in (left_parts, right_parts)]
+    )
+    d_bounds = cp.where(
+        d_active[:, None],
+        d_bounds,
+        cp.asarray([cp.inf, cp.inf, -cp.inf, -cp.inf], dtype=cp.float64),
+    )
+    d_order = _stable_radix_lexicographic_order(
+        _fp64_radix_keys(d_bounds[:, 0]),
+    )
+    d_sorted_xmin = d_bounds[d_order, 0]
+    d_prefix_xmax = inclusive_max(d_bounds[d_order, 2])
+    d_sorted_active = d_active[d_order]
+    d_component_start = cp.zeros(part_count, dtype=cp.bool_)
+    d_component_start[0] = d_sorted_active[0]
+    d_component_start[1:] = d_sorted_active[1:] & (
+        ~d_sorted_active[:-1] | (d_sorted_xmin[1:] > d_prefix_xmax[:-1])
+    )
+    d_component_count = cp.sum(d_component_start, dtype=cp.int32).reshape(1)
+    component_count = int(
+        get_cuda_runtime().copy_device_to_host(
+            d_component_count,
+            reason="overlay interval-component plan-count admission scalar fence",
+        )[0]
+    )
+    if component_count <= 1:
+        return None
+
+    d_sorted_component_ids = cp.cumsum(d_component_start.astype(cp.int32), dtype=cp.int32) - 1
+    d_component_ids = cp.full(part_count, component_count, dtype=cp.int32)
+    d_component_ids[d_order] = cp.where(
+        d_sorted_active,
+        d_sorted_component_ids,
+        cp.int32(component_count),
+    )
+    d_left_component_ids = d_component_ids[:left_part_count]
+    d_right_component_ids = d_component_ids[left_part_count:]
+    component_left = _pack_polygon_parts_by_component(
+        left_parts,
+        d_left_component_ids,
+        component_count=component_count,
+    )
+    component_right = _pack_polygon_parts_by_component(
+        right_parts,
+        d_right_component_ids,
+        component_count=component_count,
+    )
+    return component_left, component_right, component_count
+
+
+def _try_single_row_component_overlay_plan(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode,
+    same_row_span_summary: tuple[int, int, int] | None,
+    include_same_side_splits: bool,
+    grouped_right: bool,
+) -> ComponentOverlayExecutionPlan | None:
+    if (
+        same_row_span_summary is None
+        or left.row_count != 1
+        or right.row_count < 1
+        or not _polygonal_device_families(left)
+        or not _polygonal_device_families(right)
+    ):
+        return None
+    left_span, right_span, max_row_id = same_row_span_summary
+    if int(max_row_id) != 0:
+        return None
+    page_shape = _row_isolated_topology_page_shape(
+        row_count=1,
+        max_left_segments_per_row=left_span,
+        max_right_segments_per_row=right_span,
+        include_same_side_splits=include_same_side_splits,
+    )
+    if not page_shape.single_row_oversized:
+        return None
+    components = _single_row_interval_components(left, right)
+    if components is None:
+        return None
+    component_left, component_right, component_count = components
+    record_dispatch_event(
+        surface="vibespatial.overlay.gpu",
+        operation="build_overlay_execution_plan",
+        implementation="single_row_interval_component_topology_gpu",
+        reason=(
+            "one logical row exceeded the live topology target and its combined "
+            "polygon parts had strictly separated x-interval components"
+        ),
+        detail=(
+            f"components={component_count}; left_segments={left_span}; "
+            f"right_segments={right_span}; event_budget={page_shape.live_event_budget}; "
+            f"worst_events={page_shape.worst_live_events_per_row}"
+        ),
+        requested=dispatch_mode,
+        selected=ExecutionMode.GPU,
+    )
+    return ComponentOverlayExecutionPlan(
+        left=component_left,
+        right=component_right,
+        component_count=component_count,
+        max_left_segments_per_component=int(left_span),
+        max_right_segments_per_component=int(right_span),
+        dispatch_mode=dispatch_mode,
+        include_same_side_splits=include_same_side_splits or grouped_right,
+    )
+
+
+def _try_single_row_microcell_overlay_plan(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode,
+    same_row_span_summary: tuple[int, int, int] | None,
+    include_same_side_splits: bool,
+) -> MicrocellOverlayExecutionPlan | None:
+    if (
+        same_row_span_summary is None
+        or left.row_count != 1
+        or right.row_count != 1
+        or include_same_side_splits
+        or not _polygonal_device_families(left)
+        or not _polygonal_device_families(right)
+    ):
+        return None
+    left_span, right_span, max_row_id = same_row_span_summary
+    if int(max_row_id) != 0:
+        return None
+    page_shape = _row_isolated_topology_page_shape(
+        row_count=1,
+        max_left_segments_per_row=left_span,
+        max_right_segments_per_row=right_span,
+        include_same_side_splits=False,
+    )
+    if not page_shape.single_row_oversized:
+        return None
+    record_dispatch_event(
+        surface="vibespatial.overlay.gpu",
+        operation="build_overlay_execution_plan",
+        implementation="single_row_connected_microcell_boundary_graph_gpu",
+        reason=(
+            "one connected logical row exceeded the live topology target and "
+            "was lowered to bounded x-interval microcell pages"
+        ),
+        detail=(
+            f"left_segments={left_span}; right_segments={right_span}; "
+            f"event_budget={page_shape.live_event_budget}; "
+            f"worst_events={page_shape.worst_live_events_per_row}"
+        ),
+        requested=dispatch_mode,
+        selected=ExecutionMode.GPU,
+    )
+    return MicrocellOverlayExecutionPlan(
+        left=left,
+        right=right,
+        max_left_segments=int(left_span),
+        max_right_segments=int(right_span),
+        dispatch_mode=dispatch_mode,
+    )
+
+
+def _pack_disjoint_component_result(result: OwnedGeometryArray) -> OwnedGeometryArray:
+    """Pack strictly interval-disjoint component rows into one polygonal row."""
+    from vibespatial.constructive.binary_constructive import (
+        _pack_disjoint_multipart_intersection_parts_gpu,
+    )
+    from vibespatial.geometry.owned import build_empty_polygon_rows_device
+
+    packed = _pack_disjoint_multipart_intersection_parts_gpu(
+        result,
+        cp.zeros(result.row_count, dtype=cp.int64),
+        output_row_count=1,
+        assume_disjoint=True,
+    )
+    return packed if packed is not None else build_empty_polygon_rows_device(1)
+
+
+def _pack_disjoint_component_remnants(
+    result: OwnedGeometryArray,
+) -> tuple[OwnedGeometryArray, ...] | None:
+    """Regroup component-row remnant carriers into one logical output row."""
+    component_parts = getattr(
+        result,
+        "_polygon_intersection_lower_dimensional_parts",
+        None,
+    )
+    if component_parts is None:
+        return None
+    if not component_parts:
+        return ()
+
+    from vibespatial.constructive.binary_constructive import (
+        _explode_lineal_rows_to_line_capacity_gpu,
+        _explode_point_rows_to_point_capacity_gpu,
+    )
+    from vibespatial.constructive.grouped_mixed_union import (
+        pack_line_part_capacity_device,
+        pack_point_part_capacity_device,
+    )
+
+    packed_parts: list[OwnedGeometryArray] = []
+    for component_part in component_parts:
+        line_parts = _explode_lineal_rows_to_line_capacity_gpu(component_part)
+        if line_parts is not None:
+            packed_line = pack_line_part_capacity_device(
+                line_parts,
+                cp.zeros(line_parts.capacity, dtype=cp.int64),
+                output_row_count=1,
+            )
+            if packed_line is None:
+                return None
+            packed_parts.append(packed_line)
+            continue
+        point_parts = _explode_point_rows_to_point_capacity_gpu(component_part)
+        if point_parts is not None:
+            packed_point = pack_point_part_capacity_device(
+                point_parts,
+                cp.zeros(point_parts.capacity, dtype=cp.int64),
+                output_row_count=1,
+            )
+            if packed_point is None:
+                return None
+            packed_parts.append(packed_point)
+    return tuple(packed_parts)
+
+
+def _intersection_lower_dimensional_remnants(
+    plan: OverlayExecutionPlan,
+    selected_faces,
+    *,
+    row_count: int,
+):
+    """Assemble exact non-area intersection components from live topology.
+
+    A polygon intersection has a lower-dimensional remnant exactly when the
+    two source boundaries meet at a graph edge or node that is not incident to
+    a selected intersection face. Atomic-edge deduplication retains a two-bit
+    source-membership mask, so coincident spans remain identifiable after the
+    graph has collapsed duplicate geometry.
+
+    Physical shape: half-edge and node capacity reduced directly to row-aligned
+    line and point carriers. No source boundary reconstruction is required.
+    """
+    graph_state = plan.half_edge_graph.device_state
+    face_state = plan.faces.device_state
+    d_source_membership = getattr(graph_state, "source_membership", None)
+    d_src_node_ids = graph_state.src_node_ids
+    d_rows = graph_state.row_indices
+    if d_source_membership is None or d_src_node_ids is None or d_rows is None:
+        return None
+
+    edge_count = int(plan.half_edge_graph.edge_count)
+    if edge_count == 0:
+        return cp.zeros(row_count, dtype=cp.bool_), ()
+    if edge_count % 2 != 0:
+        raise RuntimeError("overlay half-edge graph lost forward/reverse pairing")
+
+    d_membership = cp.asarray(d_source_membership, dtype=cp.uint8)
+    d_nodes = cp.asarray(d_src_node_ids, dtype=cp.int32)
+    d_edge_rows = cp.asarray(d_rows, dtype=cp.int32)
+    if any(int(values.size) != edge_count for values in (d_membership, d_nodes, d_edge_rows)):
+        return None
+
+    d_selected_face = cp.asarray(
+        selected_faces.source_mask(),
+        dtype=cp.bool_,
+    )
+    d_face_offsets = cp.asarray(face_state.face_offsets, dtype=cp.int32)
+    d_face_edges = cp.asarray(face_state.face_edge_ids, dtype=cp.int32)
+    d_selected_edges = cp.zeros(edge_count, dtype=cp.bool_)
+    if int(d_face_edges.size) > 0:
+        d_face_positions = cp.arange(int(d_face_edges.size), dtype=cp.int32)
+        d_face_ids = cp.searchsorted(
+            d_face_offsets[1:],
+            d_face_positions,
+            side="right",
+        )
+        d_selected_edges[d_face_edges] = d_selected_face[d_face_ids]
+
+    # Both orientations belong to one geometric edge. An edge is covered by
+    # area when either orientation is incident to a selected face.
+    d_twins = cp.arange(edge_count, dtype=cp.int32) ^ cp.int32(1)
+    d_area_incident_edges = d_selected_edges | d_selected_edges[d_twins]
+    d_line_remnant_edges = (
+        (cp.arange(edge_count, dtype=cp.int32) % cp.int32(2) == 0)
+        & (d_membership == cp.uint8(3))
+        & ~d_area_incident_edges
+    )
+
+    # Node capacity is bounded by edge capacity. Reducing in that capacity
+    # avoids a node-count scalar fence while preserving exact source bits.
+    d_node_membership = cp.zeros(edge_count, dtype=cp.uint32)
+    cp.bitwise_or.at(
+        d_node_membership,
+        d_nodes,
+        d_membership.astype(cp.uint32, copy=False),
+    )
+    d_selected_nodes = cp.zeros(edge_count, dtype=cp.uint32)
+    cp.maximum.at(
+        d_selected_nodes,
+        d_nodes,
+        d_selected_edges.astype(cp.uint32, copy=False),
+    )
+    d_line_incident_edges = d_line_remnant_edges | d_line_remnant_edges[d_twins]
+    d_line_nodes = cp.zeros(edge_count, dtype=cp.uint32)
+    cp.maximum.at(
+        d_line_nodes,
+        d_nodes,
+        d_line_incident_edges.astype(cp.uint32, copy=False),
+    )
+    d_point_nodes = (
+        (d_node_membership == cp.uint32(3))
+        & (d_selected_nodes == cp.uint32(0))
+        & (d_line_nodes == cp.uint32(0))
+    )
+    d_edge_ids = cp.arange(edge_count, dtype=cp.int32)
+    d_node_representatives = cp.full(edge_count, edge_count, dtype=cp.int32)
+    cp.minimum.at(d_node_representatives, d_nodes, d_edge_ids)
+    d_point_remnant_edges = (
+        d_point_nodes[d_nodes]
+        & (d_node_representatives[d_nodes] == d_edge_ids)
+    )
+
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+    from vibespatial.constructive.binary_constructive import (
+        LinePartCapacitySelection,
+        PointPartCapacitySelection,
+    )
+    from vibespatial.constructive.grouped_mixed_union import (
+        pack_line_part_capacity_device,
+        pack_point_part_capacity_device,
+    )
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import (
+        FAMILY_TAGS,
+        DeviceFamilyGeometryBuffer,
+        build_device_resident_owned,
+        device_valid_nonempty_mask,
+    )
+
+    d_src_x = cp.asarray(graph_state.src_x, dtype=cp.float64)
+    d_src_y = cp.asarray(graph_state.src_y, dtype=cp.float64)
+    d_dst_x = d_src_x[d_twins]
+    d_dst_y = d_src_y[d_twins]
+    d_forward_edges = cp.arange(0, edge_count, 2, dtype=cp.int32)
+    line_capacity = int(d_forward_edges.size)
+    d_line_active = d_line_remnant_edges[d_forward_edges]
+    d_line_x = cp.empty(line_capacity * 2, dtype=cp.float64)
+    d_line_y = cp.empty(line_capacity * 2, dtype=cp.float64)
+    d_line_x[0::2] = d_src_x[d_forward_edges]
+    d_line_y[0::2] = d_src_y[d_forward_edges]
+    d_line_x[1::2] = d_dst_x[d_forward_edges]
+    d_line_y[1::2] = d_dst_y[d_forward_edges]
+    line_geometry = build_device_resident_owned(
+        device_families={
+            GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.LINESTRING,
+                x=d_line_x,
+                y=d_line_y,
+                geometry_offsets=(
+                    cp.arange(line_capacity + 1, dtype=cp.int32) * cp.int32(2)
+                ),
+                empty_mask=cp.zeros(line_capacity, dtype=cp.bool_),
+                bounds=None,
+            )
+        },
+        row_count=line_capacity,
+        tags=cp.full(
+            line_capacity,
+            FAMILY_TAGS[GeometryFamily.LINESTRING],
+            dtype=cp.int8,
+        ),
+        validity=cp.ones(line_capacity, dtype=cp.bool_),
+        family_row_offsets=cp.arange(line_capacity, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+    line_selection = NativeDeviceSelection.from_mask(d_line_active)
+    d_line_capacity_active = line_selection.active_capacity_mask()
+    line_parts = LinePartCapacitySelection(
+        geometry=line_geometry._device_indexed_take(
+            line_selection.partition_capacity_positions(),
+            assume_unique_indices=True,
+        )._apply_row_activity(
+            d_line_capacity_active,
+            assume_active_indices_unique=True,
+        ),
+        source_rows=line_selection.gather_capacity(
+            d_edge_rows[d_forward_edges],
+            fill_value=0,
+        ).astype(cp.int32, copy=False),
+        selection=line_selection.as_capacity_prefix(),
+        coord_capacity=line_capacity * 2,
+    )
+    line_owned = pack_line_part_capacity_device(
+        line_parts,
+        line_parts.source_rows,
+        output_row_count=row_count,
+    )
+    if line_owned is None:
+        return None
+
+    point_capacity = edge_count
+    point_geometry = build_device_resident_owned(
+        device_families={
+            GeometryFamily.POINT: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.POINT,
+                x=d_src_x,
+                y=d_src_y,
+                geometry_offsets=cp.arange(point_capacity + 1, dtype=cp.int32),
+                empty_mask=cp.zeros(point_capacity, dtype=cp.bool_),
+                bounds=None,
+            )
+        },
+        row_count=point_capacity,
+        tags=cp.full(
+            point_capacity,
+            FAMILY_TAGS[GeometryFamily.POINT],
+            dtype=cp.int8,
+        ),
+        validity=cp.ones(point_capacity, dtype=cp.bool_),
+        family_row_offsets=cp.arange(point_capacity, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+    point_selection = NativeDeviceSelection.from_mask(d_point_remnant_edges)
+    d_point_capacity_active = point_selection.active_capacity_mask()
+    point_parts = PointPartCapacitySelection(
+        geometry=point_geometry._device_indexed_take(
+            point_selection.partition_capacity_positions(),
+            assume_unique_indices=True,
+        )._apply_row_activity(
+            d_point_capacity_active,
+            assume_active_indices_unique=True,
+        ),
+        source_rows=point_selection.gather_capacity(
+            d_edge_rows,
+            fill_value=0,
+        ).astype(cp.int32, copy=False),
+        selection=point_selection.as_capacity_prefix(),
+    )
+    point_owned = pack_point_part_capacity_device(
+        point_parts,
+        point_parts.source_rows,
+        output_row_count=row_count,
+    )
+    if point_owned is None:
+        return None
+
+    d_line_keep = cp.asarray(device_valid_nonempty_mask(line_owned), dtype=cp.bool_)
+    d_point_keep = cp.asarray(device_valid_nonempty_mask(point_owned), dtype=cp.bool_)
+    return d_line_keep | d_point_keep, (line_owned, point_owned)
+
+
+def _intersection_lower_dimensional_remnant_mask(
+    plan: OverlayExecutionPlan,
+    selected_faces,
+    *,
+    row_count: int,
+):
+    """Return the row mask from the topology-native remnant carrier."""
+    result = _intersection_lower_dimensional_remnants(
+        plan,
+        selected_faces,
+        row_count=row_count,
+    )
+    return None if result is None else result[0]
 
 
 def _build_overlay_execution_plan(
@@ -311,20 +1015,176 @@ def _build_overlay_execution_plan(
     *,
     dispatch_mode: ExecutionMode = ExecutionMode.GPU,
     _cached_right_segments: DeviceSegmentTable | None = None,
+    _right_segment_broadcast: DeviceBroadcastSegmentRelation | None = None,
     _row_isolated: bool = False,
     _use_same_row_fast_path: bool | None = None,
+    _same_row_single_group: bool = False,
+    _same_row_span_summary: tuple[int, int, int] | None = None,
+    _include_same_side_splits: bool = False,
     _left_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
     _right_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
-) -> OverlayExecutionPlan:
+    _right_segment_source_rows: cp.ndarray | np.ndarray | None = None,
+    _allow_row_paging: bool = True,
+    _allow_component_decomposition: bool = True,
+) -> (
+    OverlayExecutionPlan
+    | PagedOverlayExecutionPlan
+    | ComponentOverlayExecutionPlan
+    | MicrocellOverlayExecutionPlan
+):
+    if (
+        _allow_component_decomposition
+        and _row_isolated
+        and _cached_right_segments is None
+        and _left_geometry_source_rows is None
+    ):
+        grouped_right = (
+            _right_geometry_source_rows is not None or _right_segment_source_rows is not None
+        )
+        component_plan = _try_single_row_component_overlay_plan(
+            left,
+            right,
+            dispatch_mode=dispatch_mode,
+            same_row_span_summary=_same_row_span_summary,
+            include_same_side_splits=_include_same_side_splits,
+            grouped_right=grouped_right,
+        )
+        if component_plan is not None:
+            return component_plan
+        if not grouped_right:
+            microcell_plan = _try_single_row_microcell_overlay_plan(
+                left,
+                right,
+                dispatch_mode=dispatch_mode,
+                same_row_span_summary=_same_row_span_summary,
+                include_same_side_splits=_include_same_side_splits,
+            )
+            if microcell_plan is not None:
+                return microcell_plan
+
+    if (
+        _allow_row_paging
+        and _right_segment_broadcast is not None
+        and _row_isolated
+        and left.row_count > 1
+    ):
+        left_span = getattr(
+            left,
+            "_active_family_row_segment_capacity_bound",
+            None,
+        )
+        if left_span is not None:
+            right_span = int(_right_segment_broadcast.physical_count)
+            page_shape = _row_isolated_topology_page_shape(
+                row_count=left.row_count,
+                max_left_segments_per_row=int(left_span),
+                max_right_segments_per_row=right_span,
+                include_same_side_splits=_include_same_side_splits,
+            )
+            if page_shape.page_count > 1:
+                record_dispatch_event(
+                    surface="vibespatial.overlay.gpu",
+                    operation="build_overlay_execution_plan",
+                    implementation="broadcast_right_complete_row_topology_pages_gpu",
+                    reason=(
+                        "broadcast-right virtual segment topology exceeded the "
+                        "live-event target and was partitioned at row boundaries"
+                    ),
+                    detail=(
+                        f"rows={left.row_count}; pages={page_shape.page_count}; "
+                        f"rows_per_page={page_shape.rows_per_page}; "
+                        f"left_span={left_span}; right_span={right_span}; "
+                        f"event_budget={page_shape.live_event_budget}"
+                    ),
+                    requested=dispatch_mode,
+                    selected=ExecutionMode.GPU,
+                )
+                return PagedOverlayExecutionPlan(
+                    left=left,
+                    right=right,
+                    row_count=left.row_count,
+                    rows_per_page=page_shape.rows_per_page,
+                    max_left_segments_per_row=int(left_span),
+                    max_right_segments_per_row=right_span,
+                    dispatch_mode=dispatch_mode,
+                    use_same_row_fast_path=False,
+                    include_same_side_splits=_include_same_side_splits,
+                    right_segment_broadcast=_right_segment_broadcast,
+                    allow_component_decomposition=False,
+                )
+
+    if (
+        _allow_row_paging
+        and _row_isolated
+        and _cached_right_segments is None
+        and _left_geometry_source_rows is None
+        and _same_row_span_summary is not None
+        and left.row_count > 1
+    ):
+        left_span, right_span, max_row_id = _same_row_span_summary
+        page_shape = _row_isolated_topology_page_shape(
+            row_count=left.row_count,
+            max_left_segments_per_row=left_span,
+            max_right_segments_per_row=right_span,
+            include_same_side_splits=_include_same_side_splits,
+        )
+        right_source_rows = (
+            _right_segment_source_rows
+            if _right_segment_source_rows is not None
+            else _right_geometry_source_rows
+        )
+        right_rows_admit_paging = right_source_rows is not None or right.row_count == left.row_count
+        if (
+            page_shape.page_count > 1
+            and int(max_row_id) < left.row_count
+            and right_rows_admit_paging
+        ):
+            record_dispatch_event(
+                surface="vibespatial.overlay.gpu",
+                operation="build_overlay_execution_plan",
+                implementation="row_isolated_complete_row_topology_pages_gpu",
+                reason=(
+                    "row-isolated topology exceeded the live split-event layout "
+                    "target and was partitioned at complete logical-row boundaries"
+                ),
+                detail=(
+                    f"rows={left.row_count}; pages={page_shape.page_count}; "
+                    f"rows_per_page={page_shape.rows_per_page}; "
+                    f"worst_events_per_row={page_shape.worst_live_events_per_row}; "
+                    f"event_budget={page_shape.live_event_budget}; "
+                    f"single_row_oversized={page_shape.single_row_oversized}"
+                ),
+                requested=dispatch_mode,
+                selected=ExecutionMode.GPU,
+            )
+            return PagedOverlayExecutionPlan(
+                left=left,
+                right=right,
+                row_count=left.row_count,
+                rows_per_page=page_shape.rows_per_page,
+                max_left_segments_per_row=int(left_span),
+                max_right_segments_per_row=int(right_span),
+                dispatch_mode=dispatch_mode,
+                use_same_row_fast_path=_use_same_row_fast_path,
+                include_same_side_splits=_include_same_side_splits,
+                right_geometry_source_rows=_right_geometry_source_rows,
+                right_segment_source_rows=_right_segment_source_rows,
+                allow_component_decomposition=_allow_component_decomposition,
+            )
+
     try:
         split_events = build_gpu_split_events(
             left,
             right,
             dispatch_mode=dispatch_mode,
             _cached_right_segments=_cached_right_segments,
+            right_segment_broadcast=_right_segment_broadcast,
             require_same_row=_row_isolated,
             use_same_row_fast_path=_use_same_row_fast_path,
-            right_geometry_source_rows=_right_geometry_source_rows,
+            same_row_single_group=_same_row_single_group,
+            same_row_span_summary=_same_row_span_summary,
+            right_geometry_source_rows=_right_segment_source_rows,
+            include_same_side_splits=_include_same_side_splits,
         )
     except Exception as exc:
         raise RuntimeError(
@@ -362,6 +1222,7 @@ def _build_overlay_execution_plan(
             row_isolated=_row_isolated,
             left_geometry_source_rows=_left_geometry_source_rows,
             right_geometry_source_rows=_right_geometry_source_rows,
+            right_geometry_broadcast=_right_segment_broadcast is not None,
         )
     except Exception as exc:
         raise RuntimeError(
@@ -377,68 +1238,239 @@ def _build_overlay_execution_plan(
 
 
 def _materialize_overlay_execution_plan(
-    plan: OverlayExecutionPlan,
+    plan: (
+        OverlayExecutionPlan
+        | PagedOverlayExecutionPlan
+        | ComponentOverlayExecutionPlan
+        | MicrocellOverlayExecutionPlan
+    ),
     *,
     operation: str,
     requested: ExecutionMode,
     preserve_row_count: int | None = None,
+    valid_empty_rows=None,
 ) -> tuple[OwnedGeometryArray, ExecutionMode]:
-    d_selected_face_indices = _select_overlay_face_indices_gpu(plan.faces, operation=operation)
-    try:
-        if requested is ExecutionMode.GPU:
-            result = _build_polygon_output_from_faces_gpu(
-                plan.half_edge_graph,
-                plan.faces,
-                d_selected_face_indices,
-                preserve_row_count=preserve_row_count,
+    if isinstance(plan, MicrocellOverlayExecutionPlan):
+        if preserve_row_count is not None and preserve_row_count != 1:
+            raise ValueError("microcell overlay plan represents exactly one logical output row")
+        from vibespatial.overlay.contraction import overlay_contraction_owned
+
+        result = overlay_contraction_owned(
+            plan.left,
+            plan.right,
+            operation=operation,
+            dispatch_mode=plan.dispatch_mode,
+        )
+        return result, ExecutionMode.GPU
+
+    if isinstance(plan, ComponentOverlayExecutionPlan):
+        if preserve_row_count is not None and preserve_row_count != 1:
+            raise ValueError("component overlay plan represents exactly one logical output row")
+        component_plan = _build_overlay_execution_plan(
+            plan.left,
+            plan.right,
+            dispatch_mode=plan.dispatch_mode,
+            _row_isolated=True,
+            _same_row_span_summary=(
+                plan.max_left_segments_per_component,
+                plan.max_right_segments_per_component,
+                plan.component_count - 1,
+            ),
+            _include_same_side_splits=plan.include_same_side_splits,
+            _allow_component_decomposition=False,
+        )
+        component_result, selected = _materialize_overlay_execution_plan(
+            component_plan,
+            operation=operation,
+            requested=requested,
+            preserve_row_count=plan.component_count,
+            valid_empty_rows=valid_empty_rows,
+        )
+        packed = _pack_disjoint_component_result(component_result)
+        component_remnants = getattr(
+            component_result,
+            "_polygon_intersection_lower_dimensional_remnant",
+            None,
+        )
+        if operation == "intersection" and component_remnants is not None:
+            packed._polygon_intersection_lower_dimensional_remnant = cp.any(
+                cp.asarray(component_remnants, dtype=cp.bool_)
+            ).reshape(1)
+            packed_remnants = _pack_disjoint_component_remnants(component_result)
+            if packed_remnants is not None:
+                packed._polygon_intersection_lower_dimensional_parts = packed_remnants
+        return packed, selected
+
+    if isinstance(plan, PagedOverlayExecutionPlan):
+        if preserve_row_count is not None and preserve_row_count != plan.row_count:
+            raise ValueError(
+                "paged row-isolated overlay preserve_row_count must match the "
+                f"planned row count ({plan.row_count}), got {preserve_row_count}"
             )
-            if result is None:
-                raise RuntimeError(
-                    "GPU face assembly returned None (device state unavailable) "
-                    "despite GPU execution mode being requested"
+        page_results: list[OwnedGeometryArray] = []
+        selected = ExecutionMode.GPU
+        right_source_rows = (
+            plan.right_segment_source_rows
+            if plan.right_segment_source_rows is not None
+            else plan.right_geometry_source_rows
+        )
+        for page_index in range(plan.page_count):
+            row_start, row_end = plan.row_span(page_index)
+            page_row_count = row_end - row_start
+            d_left_rows = cp.arange(row_start, row_end, dtype=cp.int64)
+            page_left = plan.left._device_indexed_take(
+                d_left_rows,
+                assume_unique_indices=True,
+            )
+            if plan.right_segment_broadcast is not None:
+                d_right_rows = cp.arange(plan.right.row_count, dtype=cp.int64)
+                page_right = plan.right
+                page_broadcast = DeviceBroadcastSegmentRelation(
+                    physical_segments=(
+                        plan.right_segment_broadcast.physical_segments
+                    ),
+                    logical_row_count=page_row_count,
                 )
-            return result, ExecutionMode.GPU
+            else:
+                page_broadcast = None
+                if right_source_rows is None:
+                    d_right_rows = cp.arange(row_start, row_end, dtype=cp.int64)
+                else:
+                    d_right_source_rows = cp.asarray(right_source_rows, dtype=cp.int32)
+                    d_right_rows = cp.flatnonzero(
+                        (d_right_source_rows >= np.int32(row_start))
+                        & (d_right_source_rows < np.int32(row_end))
+                    ).astype(cp.int64, copy=False)
+                page_right = plan.right._device_indexed_take(
+                    d_right_rows,
+                    assume_unique_indices=True,
+                )
 
-        gpu_result: OwnedGeometryArray | None = None
-        gpu_failed = False
-        gpu_fail_reason = ""
-        try:
-            gpu_result = _build_polygon_output_from_faces_gpu(
-                plan.half_edge_graph,
-                plan.faces,
-                d_selected_face_indices,
-                preserve_row_count=preserve_row_count,
+            def _page_source_rows(
+                source_rows,
+                *,
+                page_rows=d_right_rows,
+                source_row_start=row_start,
+            ):
+                if source_rows is None:
+                    return None
+                return (
+                    cp.asarray(source_rows, dtype=cp.int32)[page_rows] - np.int32(source_row_start)
+                ).astype(cp.int32, copy=False)
+
+            page = _build_overlay_execution_plan(
+                page_left,
+                page_right,
+                dispatch_mode=plan.dispatch_mode,
+                _cached_right_segments=(
+                    None
+                    if page_broadcast is None
+                    else page_broadcast.physical_segments
+                ),
+                _right_segment_broadcast=page_broadcast,
+                _row_isolated=True,
+                _use_same_row_fast_path=plan.use_same_row_fast_path,
+                _same_row_single_group=page_row_count == 1,
+                _same_row_span_summary=(
+                    plan.max_left_segments_per_row,
+                    plan.max_right_segments_per_row,
+                    page_row_count - 1,
+                ),
+                _include_same_side_splits=plan.include_same_side_splits,
+                _left_geometry_source_rows=None,
+                _right_geometry_source_rows=_page_source_rows(plan.right_geometry_source_rows),
+                _right_segment_source_rows=_page_source_rows(plan.right_segment_source_rows),
+                _allow_row_paging=False,
+                _allow_component_decomposition=plan.allow_component_decomposition,
             )
-            if gpu_result is None:
-                gpu_failed = True
-                gpu_fail_reason = "GPU face assembly unavailable (no device state)"
-        except Exception as exc:
-            gpu_failed = True
-            gpu_fail_reason = f"GPU face assembly raised {type(exc).__name__}: {exc}"
-
-        if gpu_failed:
-            record_fallback_event(
-                surface="overlay.gpu._overlay_owned",
-                reason=gpu_fail_reason,
-                detail=f"operation={operation}",
+            if not isinstance(
+                page,
+                (
+                    OverlayExecutionPlan,
+                    ComponentOverlayExecutionPlan,
+                    MicrocellOverlayExecutionPlan,
+                ),
+            ):
+                raise RuntimeError("row-isolated topology page nested paging")
+            page_result, page_selected = _materialize_overlay_execution_plan(
+                page,
+                operation=operation,
                 requested=requested,
-                selected=ExecutionMode.CPU,
-                pipeline="overlay",
-                d2h_transfer=True,
+                preserve_row_count=(page_row_count if preserve_row_count is not None else None),
+                valid_empty_rows=(
+                    None
+                    if valid_empty_rows is None
+                    else cp.asarray(valid_empty_rows, dtype=cp.bool_)[row_start:row_end]
+                ),
             )
-            selected_face_indices = overlay_device_to_host(
-                d_selected_face_indices,
-                reason="overlay gpu CPU fallback selected-face indices export",
-                dtype=np.int64,
+            page_results.append(page_result)
+            if page_selected is ExecutionMode.CPU:
+                selected = ExecutionMode.CPU
+            del page, page_left, page_right
+            maybe_trim_pool_memory()
+        result = OwnedGeometryArray.concat(page_results)
+        if preserve_row_count is not None and result.row_count != preserve_row_count:
+            raise RuntimeError(
+                "paged row-isolated overlay assembly changed row cardinality: "
+                f"expected {preserve_row_count}, got {result.row_count}"
             )
-            result = _build_polygon_output_from_faces(
-                plan.half_edge_graph, plan.faces, selected_face_indices,
-            )
-            return result, ExecutionMode.CPU
+        if operation == "intersection":
+            page_remnants = [
+                getattr(page_result, "_polygon_intersection_lower_dimensional_remnant", None)
+                for page_result in page_results
+            ]
+            if all(mask is not None for mask in page_remnants):
+                result._polygon_intersection_lower_dimensional_remnant = cp.concatenate(
+                    [cp.asarray(mask, dtype=cp.bool_) for mask in page_remnants]
+                )
+            page_parts = [
+                getattr(
+                    page_result,
+                    "_polygon_intersection_lower_dimensional_parts",
+                    None,
+                )
+                for page_result in page_results
+            ]
+            if all(parts is not None for parts in page_parts):
+                part_counts = {len(parts) for parts in page_parts}
+                if len(part_counts) == 1:
+                    result._polygon_intersection_lower_dimensional_parts = tuple(
+                        OwnedGeometryArray.concat(
+                            [parts[part_index] for parts in page_parts]
+                        )
+                        for part_index in range(next(iter(part_counts)))
+                    )
+        return result, selected
 
-        return gpu_result, ExecutionMode.GPU  # type: ignore[return-value]
+    from vibespatial.overlay.faces import _select_overlay_face_selection_gpu
+
+    selected_faces = _select_overlay_face_selection_gpu(
+        plan.faces,
+        operation=operation,
+    )
+    try:
+        result = _build_polygon_output_from_faces_gpu(
+            plan.half_edge_graph,
+            plan.faces,
+            selected_faces,
+            preserve_row_count=preserve_row_count,
+            d_valid_empty_rows=valid_empty_rows,
+        )
+        if result is None:
+            raise RuntimeError("admitted GPU overlay face assembly returned no device result")
+        if operation == "intersection" and plan.row_isolated:
+            remnant_result = _intersection_lower_dimensional_remnants(
+                plan,
+                selected_faces,
+                row_count=(result.row_count if preserve_row_count is None else preserve_row_count),
+            )
+            if remnant_result is not None:
+                remnant_mask, remnant_parts = remnant_result
+                result._polygon_intersection_lower_dimensional_remnant = remnant_mask
+                result._polygon_intersection_lower_dimensional_parts = remnant_parts
+        return result, ExecutionMode.GPU
     finally:
-        del d_selected_face_indices
+        del selected_faces
         maybe_trim_pool_memory()
 
 
@@ -447,30 +1479,24 @@ def _expand_group_pair_positions(group_starts, group_ends, *, total_count: int |
 
     Physical shape: device grouped-span expansion.  When the caller already
     knows the selected pair cardinality from a native relation/candidate
-    buffer, pass it as ``total_count`` so allocation does not require a device
-    sum scalar fence.
+    buffer and must pass it as ``total_count``. Device grouped spans are not an
+    allocation boundary.
     """
     if cp is not None and hasattr(group_starts, "__cuda_array_interface__"):
         d_group_starts = cp.asarray(group_starts, dtype=cp.int64)
         d_group_ends = cp.asarray(group_ends, dtype=cp.int64)
         if int(d_group_starts.size) == 0:
             return cp.empty(0, dtype=cp.int64)
+        if total_count is None:
+            raise ValueError("device grouped pair-position expansion requires relation cardinality")
         d_counts = (d_group_ends - d_group_starts).astype(cp.int64, copy=False)
-        total = (
-            int(total_count)
-            if total_count is not None
-            else overlay_int_scalar(
-                cp.sum(d_counts, dtype=cp.int64),
-                reason="overlay grouped pair-position total allocation fence",
-            )
-        )
+        total = int(total_count)
         if total == 0:
             return cp.empty(0, dtype=cp.int64)
         d_offsets = cp.cumsum(d_counts, dtype=cp.int64) - d_counts
         d_positions = cp.arange(total, dtype=cp.int64)
-        d_group_ids = (
-            cp.searchsorted(d_offsets + d_counts, d_positions, side="right")
-            .astype(cp.int64, copy=False)
+        d_group_ids = cp.searchsorted(d_offsets + d_counts, d_positions, side="right").astype(
+            cp.int64, copy=False
         )
         return (
             d_positions
@@ -500,7 +1526,10 @@ def overlay_intersection_owned(
     _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray:
     return _overlay_owned(
-        left, right, operation="intersection", dispatch_mode=dispatch_mode,
+        left,
+        right,
+        operation="intersection",
+        dispatch_mode=dispatch_mode,
         _cached_right_segments=_cached_right_segments,
     )
 
@@ -513,7 +1542,10 @@ def overlay_union_owned(
     _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray:
     return _overlay_owned(
-        left, right, operation="union", dispatch_mode=dispatch_mode,
+        left,
+        right,
+        operation="union",
+        dispatch_mode=dispatch_mode,
         _cached_right_segments=_cached_right_segments,
     )
 
@@ -526,7 +1558,10 @@ def overlay_difference_owned(
     _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray:
     return _overlay_owned(
-        left, right, operation="difference", dispatch_mode=dispatch_mode,
+        left,
+        right,
+        operation="difference",
+        dispatch_mode=dispatch_mode,
         _cached_right_segments=_cached_right_segments,
     )
 
@@ -539,7 +1574,10 @@ def overlay_symmetric_difference_owned(
     _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray:
     return _overlay_owned(
-        left, right, operation="symmetric_difference", dispatch_mode=dispatch_mode,
+        left,
+        right,
+        operation="symmetric_difference",
+        dispatch_mode=dispatch_mode,
         _cached_right_segments=_cached_right_segments,
     )
 
@@ -552,7 +1590,10 @@ def overlay_identity_owned(
     _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray:
     return _overlay_owned(
-        left, right, operation="identity", dispatch_mode=dispatch_mode,
+        left,
+        right,
+        operation="identity",
+        dispatch_mode=dispatch_mode,
         _cached_right_segments=_cached_right_segments,
     )
 
@@ -564,16 +1605,21 @@ def _overlay_owned(
     operation: str,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     _cached_right_segments: DeviceSegmentTable | None = None,
+    _right_segment_broadcast: DeviceBroadcastSegmentRelation | None = None,
     _row_isolated: bool = False,
+    _left_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
+    _right_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
+    _right_segment_source_rows: cp.ndarray | np.ndarray | None = None,
+    _include_same_side_splits: bool = False,
 ) -> OwnedGeometryArray:
-    requested = dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
-    _polygonal_families = {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
-    polygon_only = (
-        set(left.families) <= _polygonal_families
-        and set(right.families) <= _polygonal_families
+    requested = (
+        dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
     )
+    polygon_only = _logical_polygonal_only(left) and _logical_polygonal_only(right)
     if not polygon_only:
-        raise NotImplementedError("GPU overlay owned operations currently support polygon/multipolygon inputs")
+        raise NotImplementedError(
+            "GPU overlay owned operations currently support polygon/multipolygon inputs"
+        )
 
     if requested is ExecutionMode.CPU:
         # CPU-only mode: explicit CPU request, Shapely operations
@@ -586,9 +1632,15 @@ def _overlay_owned(
         elif operation == "difference":
             values = shapely.difference(left_values, right_values).tolist()  # CPU-only mode
         elif operation == "symmetric_difference":
-            values = shapely.symmetric_difference(left_values, right_values).tolist()  # CPU-only mode
+            values = shapely.symmetric_difference(
+                left_values, right_values
+            ).tolist()  # CPU-only mode
         elif operation == "identity":
-            values = [geometry for geometry in left_values.tolist() if geometry is not None and not geometry.is_empty]
+            values = [
+                geometry
+                for geometry in left_values.tolist()
+                if geometry is not None and not geometry.is_empty
+            ]
         else:
             raise ValueError(f"unsupported overlay operation: {operation}")
         result = from_shapely_geometries(
@@ -641,10 +1693,13 @@ def _overlay_owned(
         right,
         dispatch_mode=ExecutionMode.GPU,
         _cached_right_segments=_cached_right_segments,
+        _right_segment_broadcast=_right_segment_broadcast,
         _row_isolated=_row_isolated,
-        _use_same_row_fast_path=(
-            True if operation == "intersection" and _row_isolated else None
-        ),
+        _use_same_row_fast_path=(True if operation == "intersection" and _row_isolated else None),
+        _left_geometry_source_rows=_left_geometry_source_rows,
+        _right_geometry_source_rows=_right_geometry_source_rows,
+        _right_segment_source_rows=_right_segment_source_rows,
+        _include_same_side_splits=_include_same_side_splits,
     )
     result, face_assembly_mode = _materialize_overlay_execution_plan(
         plan,
@@ -664,1018 +1719,6 @@ def _overlay_owned(
     return result
 
 
-def spatial_overlay_owned(
-    left: OwnedGeometryArray,
-    right: OwnedGeometryArray,
-    *,
-    how: str = "intersection",
-    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
-) -> OwnedGeometryArray:
-    """Spatial overlay: intersect each left geometry with spatially overlapping right geometries.
-
-    Unlike :func:`overlay_intersection_owned` which does row-matched pairwise overlay
-    (left[0] vs right[0], left[1] vs right[1], ...), this function performs a spatial
-    join to discover which (left_i, right_j) pairs overlap, then runs pairwise overlay
-    on each discovered pair, and assembles the results.
-
-    This implements the GeoPandas ``overlay(left, right, how=...)`` semantics on GPU,
-    following ADR-0016 (8-stage overlay pipeline) and ADR-0012 (two-layer architecture).
-
-    Parameters
-    ----------
-    left : OwnedGeometryArray
-        Left geometry array (e.g. 10K vegetation polygons).
-    right : OwnedGeometryArray
-        Right geometry array (e.g. 1 dissolved corridor, or 1K zoning polygons).
-    how : str
-        Overlay operation: "intersection", "union", "difference", "symmetric_difference".
-    dispatch_mode : ExecutionMode
-        Execution mode for the pairwise overlay step.
-
-    Returns
-    -------
-    OwnedGeometryArray
-        Result geometries from all overlapping pairs, with empty/null results filtered out.
-    """
-    from vibespatial.spatial.indexing import generate_bounds_pairs
-
-    requested = dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
-
-    # Stage 1: Spatial join — find candidate (left_i, right_j) pairs via MBR overlap.
-    # Uses the GPU sweep-plane kernel when geometry count exceeds threshold (ADR-0033 Tier 1).
-    candidate_pairs = generate_bounds_pairs(left, right)
-    if candidate_pairs.count == 0:
-        result = from_shapely_geometries([shapely.Point()])
-        result = result.take(np.asarray([], dtype=np.int64))
-        result.runtime_history.append(
-            RuntimeSelection(
-                requested=requested,
-                selected=ExecutionMode.CPU,
-                reason=f"spatial_overlay {how}: no candidate pairs found",
-            )
-        )
-        return result
-
-    # lyy.32: Keep spatial join pair indices on GPU when device-resident.
-    # When candidate_pairs has device indices (GPU spatial join), all sorting,
-    # grouping, and subset selection is done with CuPy on device.  Device
-    # index arrays are passed directly to take() which routes to device_take(),
-    # avoiding D->H->D round-trips.  When device indices are not available
-    # (CPU spatial join), falls back to the existing numpy path.
-    _pairs_on_device = (
-        cp is not None
-        and candidate_pairs.device_left_indices is not None
-        and candidate_pairs.device_right_indices is not None
-    )
-
-    if _pairs_on_device:
-        # Device path: all grouping operations stay on GPU.
-        d_left_indices = candidate_pairs.device_left_indices
-        d_right_indices = candidate_pairs.device_right_indices
-
-        # Ensure int64 for CuPy argsort stability and take() compatibility.
-        d_left_indices = d_left_indices.astype(cp.int64, copy=False)
-        d_right_indices = d_right_indices.astype(cp.int64, copy=False)
-
-        # Sort pairs by left index for grouping.  CuPy argsort is
-        # stable by default (mergesort), preserving relative order
-        # within each group.
-        d_sort_order = cp.argsort(d_left_indices)
-        d_left_indices = d_left_indices[d_sort_order]
-        d_right_indices = d_right_indices[d_sort_order]
-
-        d_unique_left, d_group_starts = cp.unique(d_left_indices, return_index=True)
-        d_group_ends = cp.append(d_group_starts[1:], cp.array([d_left_indices.size], dtype=d_group_starts.dtype))
-        d_unique_right = cp.unique(d_right_indices)
-
-        # take() with CuPy indices routes to device_take() — zero-copy.
-        left_subset = left.take(d_unique_left) if int(d_unique_left.size) < left.row_count else left
-        right_subset = right.take(d_unique_right) if int(d_unique_right.size) < right.row_count else right
-
-        # Remap right indices from original row space to right_subset row space.
-        d_right_remap = cp.empty(right.row_count, dtype=cp.int64)
-        d_right_remap[d_unique_right] = cp.arange(int(d_unique_right.size), dtype=cp.int64)
-        d_right_subset_indices = d_right_remap[d_right_indices]
-
-        # Keep group boundaries on device — they are small O(unique_left)
-        # arrays used for filtering in the containment/SH bypass paths.
-        # They are materialised to host lazily right before the per-group
-        # Python loop or segmented_union_all call (FIX-09: ZCOPY001).
-        group_starts = d_group_starts  # device CuPy array
-        group_ends = d_group_ends  # device CuPy array
-        unique_left = d_unique_left  # device array for take()
-        right_subset_indices = d_right_subset_indices  # device array for take()
-
-        # Host copies for Shapely fallback path (lazy — only materialised if
-        # owned-dispatch fails).  These are set after the owned-dispatch
-        # try/except block when needed.
-        left_indices = None  # deferred; materialised in fallback
-        right_indices = None
-    else:
-        # CPU path: pair indices are already on host.
-        left_indices = candidate_pairs.left_indices
-        right_indices = candidate_pairs.right_indices
-
-        # Sort pairs by left index for grouping.
-        sort_order = np.argsort(left_indices, kind="mergesort")
-        left_indices = left_indices[sort_order]
-        right_indices = right_indices[sort_order]
-
-        unique_left, group_starts = np.unique(left_indices, return_index=True)
-        group_ends = np.append(group_starts[1:], len(left_indices))
-
-        unique_right = np.unique(right_indices)
-
-        # take() operates at buffer level — no Shapely materialization.
-        left_subset = left.take(unique_left) if len(unique_left) < left.row_count else left
-        right_subset = right.take(unique_right) if len(unique_right) < right.row_count else right
-
-        # Remap right indices from original row space to right_subset row space.
-        right_remap = np.empty(right.row_count, dtype=np.intp)
-        right_remap[unique_right] = np.arange(len(unique_right))
-        right_subset_indices = right_remap[right_indices]
-
-    # Strategy detection: detect workload shape and select the overlay strategy.
-    # broadcast_right + intersection: containment bypass (lyy.16) + batched SH
-    # clip (lyy.18) reduce work before per-group overlay.  Other strategies
-    # fall through to the existing per-group path.
-    from vibespatial.overlay.strategies import (
-        OverlayExecutionFamily,
-        select_overlay_strategy,
-    )
-
-    strategy = select_overlay_strategy(
-        left, right, how,
-        candidate_pair_count=candidate_pairs.count,
-    )
-
-    record_dispatch_event(
-        surface="geopandas.spatial_overlay",
-        operation=f"spatial_overlay_{how}",
-        implementation=f"spatial_overlay_{strategy.name}",
-        reason=strategy.reason,
-        detail=strategy.telemetry_detail(
-            left_rows=left.row_count,
-            right_rows=right.row_count,
-            candidate_pair_count=candidate_pairs.count,
-        ),
-        requested=requested,
-        selected=ExecutionMode.GPU if cp is not None else ExecutionMode.CPU,
-    )
-
-    # Strategy-specific implementations.
-    # lyy.16/lyy.11: containment/disjointness bypass for broadcast_right.
-    #   intersection: contained -> pass-through, disjoint -> skip.
-    #   difference: contained -> empty, disjoint -> pass-through.
-    # lyy.18: batched SH clip for boundary-crossing simple polygons.
-    _containment_result: OwnedGeometryArray | None = None
-    _containment_remainder_mask: cp.ndarray | None = None  # type: ignore[name-defined]
-    _sh_clip_result: OwnedGeometryArray | None = None
-
-    _broadcast_right_families = {
-        OverlayExecutionFamily.BROADCAST_RIGHT_INTERSECTION,
-        OverlayExecutionFamily.BROADCAST_RIGHT_DIFFERENCE,
-    }
-    if strategy.execution_family in _broadcast_right_families and cp is not None:
-        try:
-            _containment_result, _containment_remainder_mask = (
-                _containment_bypass_gpu(left_subset, right_subset, how)
-            )
-        except Exception:
-            # If containment bypass fails, fall through to per-group.
-            logger.debug(
-                "lyy.16 containment bypass failed, falling through to overlay",
-                exc_info=True,
-            )
-            _containment_result = None
-            _containment_remainder_mask = None
-
-        if _containment_remainder_mask is not None:
-            # Some polygons need overlay — filter left_subset to remainder only.
-            # Rebuild group structures for the remainder polygons.
-            d_remainder_indices = cp.flatnonzero(_containment_remainder_mask).astype(cp.int64)
-            left_subset = left_subset.take(d_remainder_indices)
-
-            # Rebuild pair grouping: filter pairs to only reference remainder rows.
-            # The remainder_mask is over the original left_subset row space.
-            # We need to remap unique_left, group_starts, group_ends to the
-            # filtered left_subset.
-            if _pairs_on_device:
-                # d_left_indices are in original left row space.  d_unique_left
-                # maps to left_subset row space (0..len(unique_left)-1).
-                # We need to filter to rows where remainder_mask is True.
-                #
-                # Approach: rebuild grouping from scratch for the filtered pairs.
-                # Only pairs whose left_subset row is in the remainder survive.
-
-                # Build a mapping: old left_subset row -> new left_subset row.
-                # _containment_remainder_mask is a bool mask over old left_subset.
-                d_old_to_new = cp.full(int(_containment_remainder_mask.size), -1, dtype=cp.int64)
-                d_old_to_new[d_remainder_indices] = cp.arange(int(d_remainder_indices.size), dtype=cp.int64)
-
-                # Filter groups: each group corresponds to one unique_left row
-                # in the old left_subset.  If that row is in the remainder, keep
-                # the group; remap its grp_idx to the new left_subset space.
-                # unique_left[grp_idx] is the original left row; grp_idx is
-                # the old left_subset row.
-                d_grp_mask = _containment_remainder_mask[
-                    cp.arange(len(group_starts), dtype=cp.int64)
-                ]
-                new_group_indices = cp.flatnonzero(d_grp_mask)
-
-                # FIX-09: index device arrays directly — no D2H for
-                # group boundary filtering.
-                group_starts = group_starts[new_group_indices]
-                group_ends = group_ends[new_group_indices]
-                unique_left = unique_left[new_group_indices]
-
-                # right_subset_indices are unchanged — they reference right_subset
-                # rows which are not affected by left filtering.
-            else:
-                # CPU path: rebuild grouping.
-                h_remainder_mask = (
-                    overlay_device_to_host(
-                        _containment_remainder_mask,
-                        reason="overlay containment CPU regroup remainder-mask export",
-                        dtype=bool,
-                    )
-                    if cp is not None
-                    else _containment_remainder_mask
-                )
-                old_to_new = np.full(len(h_remainder_mask), -1, dtype=np.int64)
-                h_remainder_indices = np.flatnonzero(h_remainder_mask)
-                old_to_new[h_remainder_indices] = np.arange(len(h_remainder_indices), dtype=np.int64)
-
-                grp_mask = h_remainder_mask[np.arange(len(group_starts))]
-                new_grp_indices = np.flatnonzero(grp_mask)
-                group_starts = group_starts[new_grp_indices]
-                group_ends = group_ends[new_grp_indices]
-                unique_left = unique_left[new_grp_indices]
-
-        elif _containment_result is not None and _containment_remainder_mask is None:
-            # ALL polygons were bypassed — no overlay needed.
-            # Skip the entire per-group processing.
-            result = _containment_result
-            result.runtime_history.append(
-                RuntimeSelection(
-                    requested=requested,
-                    selected=ExecutionMode.GPU,
-                    reason=(
-                        f"spatial_overlay {how}: all polygons bypassed "
-                        f"(containment/disjointness bypass)"
-                    ),
-                )
-            )
-            return result
-
-        # lyy.18: Batched SH clip for boundary-crossing simple polygons.
-        # After containment bypass, left_subset contains only remainder
-        # polygons.  Check if the clip polygon (right_subset) is SH-eligible.
-        # If so, batch-clip all SH-eligible remainder polygons in a single
-        # polygon_intersection kernel launch, further reducing the number of
-        # polygons that fall through to the expensive per-group overlay.
-        # SH clip is only applicable to intersection (clipping semantics).
-        if (
-            strategy.execution_family is OverlayExecutionFamily.BROADCAST_RIGHT_INTERSECTION
-            and left_subset.row_count > 0
-        ):
-            try:
-                clip_eligible, clip_vert_count = _is_clip_polygon_sh_eligible(right_subset)
-                if clip_eligible:
-                    sh_eligible_mask, _complex_mask = _classify_remainder_sh_eligible(
-                        left_subset, clip_vert_count,
-                    )
-                    n_sh = int(sh_eligible_mask.sum())
-
-                    if n_sh > 0:
-                        _sh_clip_result = _batched_sh_clip(
-                            left_subset, right_subset, sh_eligible_mask,
-                        )
-
-                        if _sh_clip_result is not None and n_sh < left_subset.row_count:
-                            # Some polygons were SH-clipped; filter left_subset
-                            # and grouping structures to only the complex remainder.
-                            d_complex_indices = cp.asarray(
-                                np.flatnonzero(~sh_eligible_mask)
-                            ).astype(cp.int64)
-                            left_subset = left_subset.take(d_complex_indices)
-
-                            # Rebuild grouping for the reduced left_subset.
-                            if _pairs_on_device:
-                                # complex_mask[i] is True for old left_subset
-                                # rows that are NOT SH-eligible.  Rebuild the
-                                # old-to-new mapping for group filtering.
-                                d_old_to_new_sh = cp.full(
-                                    len(sh_eligible_mask), -1, dtype=cp.int64,
-                                )
-                                d_old_to_new_sh[d_complex_indices] = cp.arange(
-                                    int(d_complex_indices.size), dtype=cp.int64,
-                                )
-                                d_sh_grp_mask = cp.asarray(~sh_eligible_mask)[
-                                    cp.arange(len(group_starts), dtype=cp.int64)
-                                ]
-                                new_grp_sh = cp.flatnonzero(d_sh_grp_mask)
-                                # FIX-09: index device arrays directly.
-                                group_starts = group_starts[new_grp_sh]
-                                group_ends = group_ends[new_grp_sh]
-                                unique_left = unique_left[new_grp_sh]
-                            else:
-                                h_complex_mask = ~sh_eligible_mask
-                                old_to_new_sh = np.full(
-                                    len(sh_eligible_mask), -1, dtype=np.int64,
-                                )
-                                h_complex_indices = np.flatnonzero(h_complex_mask)
-                                old_to_new_sh[h_complex_indices] = np.arange(
-                                    len(h_complex_indices), dtype=np.int64,
-                                )
-                                grp_mask_sh = h_complex_mask[
-                                    np.arange(len(group_starts))
-                                ]
-                                new_grp_sh = np.flatnonzero(grp_mask_sh)
-                                group_starts = group_starts[new_grp_sh]
-                                group_ends = group_ends[new_grp_sh]
-                                unique_left = unique_left[new_grp_sh]
-
-                        elif _sh_clip_result is not None:
-                            # ALL remainder polygons were SH-clipped.
-                            # No overlay needed for any polygon.
-                            left_subset = left_subset.take(
-                                np.asarray([], dtype=np.int64)
-                            )
-                            group_starts = group_starts[:0]
-                            group_ends = group_ends[:0]
-                            if _pairs_on_device:
-                                unique_left = unique_left[:0]
-                            else:
-                                unique_left = unique_left[:0]
-
-                    else:
-                        logger.debug(
-                            "lyy.18 SH batch clip: clip polygon eligible but "
-                            "no remainder polygons qualify (all have holes or "
-                            "too many vertices)"
-                        )
-                else:
-                    logger.debug(
-                        "lyy.18 SH batch clip: clip polygon not SH-eligible "
-                        "(holes or >%d vertices) -- skipping SH tier",
-                        64,
-                    )
-            except Exception:
-                logger.debug(
-                    "lyy.18 SH batch clip failed, falling through to overlay",
-                    exc_info=True,
-                )
-                _sh_clip_result = None
-
-    elif strategy.name == "broadcast_left":
-        pass  # fall through to per_group
-
-    # Release GPU pool memory after containment bypass and SH batch clip:
-    # bounds check, PIP, and clip kernels produce large intermediates that
-    # are no longer needed before the per-group overlay loop.
-    maybe_trim_pool_memory()
-
-    # Stage 2: Per-left-group processing.
-    #
-    # Previous approach gathered ALL pairs into a single batch and ran one
-    # global binary_constructive_owned call.  This caused two bugs:
-    #   Bug 1 (O(n**2) scaling): segment candidate generation used a GLOBAL
-    #     sort-sweep so segments from independent geometry pairs
-    #     cross-contaminated, producing O(n**2) segment comparisons.
-    #   Bug 2 (incorrect difference): computed L_i - R_j per pair instead of
-    #     L_i - union(R_j for all j overlapping L_i), yielding multiple
-    #     partial-difference fragments per left geometry.
-    #
-    # Fix: group pairs by left index and process each left geometry
-    # independently.  For difference/symmetric_difference, union all right
-    # neighbours first via segmented_union_all (matching the approach in
-    # _overlay_difference in api/tools/overlay.py).  For intersection/union,
-    # process per-pair within each group to keep segment sets isolated.
-    #
-    # Performance: selective materialization (ADR-0005).
-    # take() subsets participating rows at buffer level — no Shapely
-    # round-trip.  Per-group calls each handle O(1) segment pairs, giving
-    # overall O(N) scaling instead of O(N**2).
-
-    # Remap left indices: unique_left[i] -> i (left_subset row space).
-    # left_subset row i corresponds to unique_left[i] in the original array.
-    # For per-group processing we iterate over groups 0..len(unique_left)-1.
-
-    # ------------------------------------------------------------------
-    # Owned-dispatch path: per-left-group processing via binary_constructive_owned.
-    # For difference/symmetric_difference, uses segmented_union_all to union
-    # right neighbours before computing the set operation — matching the
-    # correct semantics of L_i - union(R_j for all j).
-    # ------------------------------------------------------------------
-    _used_owned_dispatch = False
-    try:
-        from vibespatial.constructive.binary_constructive import binary_constructive_owned
-
-        # Force GPU dispatch when a GPU runtime is available: the spatial
-        # overlay pipeline has already committed to GPU for spatial join
-        # and pair generation.  The pairwise constructive step must also
-        # use GPU to avoid the 50K CONSTRUCTIVE crossover threshold
-        # routing small pair batches to CPU (which triggers a fallback
-        # event per batch and forces a D->H->D round-trip through Shapely).
-        _pairwise_selection = plan_dispatch_selection(
-            kernel_name="overlay_pairwise",
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            row_count=candidate_pairs.count,
-            requested_mode=ExecutionMode.GPU if _pairs_on_device else requested,
-            gpu_available=cp is not None,
-            current_residency=(
-                Residency.DEVICE if _pairs_on_device else combined_residency(left, right)
-            ),
-        )
-        _pairwise_mode = _pairwise_selection.selected
-
-        if strategy.execution_family is OverlayExecutionFamily.GROUPED_UNION:
-            # Union all right neighbours per left group, then compute one
-            # set operation per unique left geometry.
-            # This mirrors the approach in _overlay_difference (api/tools/overlay.py).
-            from vibespatial.kernels.constructive.segmented_union import (
-                segmented_union_all,
-            )
-
-            # Build CSR-style group offsets for segmented_union_all.
-            # segmented_union_all expects host numpy offsets.
-            # FIX-09: when pairs are on device, materialise group_starts
-            # to host here (single bulk D2H for small metadata).
-            if _pairs_on_device:
-                h_group_starts = overlay_device_to_host(
-                    group_starts,
-                    reason="overlay grouped-union segmented offsets export",
-                    dtype=np.int64,
-                )
-                n_rsi = int(right_subset_indices.shape[0])
-            else:
-                h_group_starts = group_starts  # already host numpy
-                n_rsi = len(right_subset_indices)
-            group_offsets = np.empty(len(h_group_starts) + 1, dtype=np.int64)
-            group_offsets[:-1] = h_group_starts
-            group_offsets[-1] = n_rsi
-
-            right_gathered = right_subset.take(right_subset_indices)
-            right_unions = segmented_union_all(right_gathered, group_offsets)
-
-            # left_subset has one row per unique left geometry, aligned with
-            # right_unions (one unioned geometry per group).
-            result_owned = binary_constructive_owned(
-                how, left_subset, right_unions,
-                dispatch_mode=_pairwise_mode,
-            )
-
-        elif strategy.execution_family in {
-            OverlayExecutionFamily.COVERAGE_UNION,
-            OverlayExecutionFamily.GENERIC_RECONSTRUCTION,
-        } and how in ("intersection", "union"):
-            # Batch all surviving pairs into one row-isolated overlay plan.
-            # This keeps per-pair topology isolated without materializing
-            # group boundaries to host or iterating group-by-group in Python.
-            if _pairs_on_device:
-                d_pair_positions = _expand_group_pair_positions(
-                    group_starts,
-                    group_ends,
-                    total_count=int(right_subset_indices.shape[0]),
-                )
-                if int(d_pair_positions.size) == 0:
-                    result_owned = left.take(d_pair_positions)
-                else:
-                    left_pairs = left.take(d_left_indices[d_pair_positions])
-                    right_pairs = right.take(d_right_indices[d_pair_positions])
-                    result_owned = _overlay_owned(
-                        left_pairs,
-                        right_pairs,
-                        operation=how,
-                        dispatch_mode=_pairwise_mode,
-                        _row_isolated=True,
-                    )
-            else:
-                h_pair_positions = _expand_group_pair_positions(group_starts, group_ends)
-                if int(h_pair_positions.size) == 0:
-                    result_owned = left.take(h_pair_positions)
-                else:
-                    left_pairs = left.take(left_indices[h_pair_positions])
-                    right_pairs = right.take(right_indices[h_pair_positions])
-                    result_owned = _overlay_owned(
-                        left_pairs,
-                        right_pairs,
-                        operation=how,
-                        dispatch_mode=_pairwise_mode,
-                        _row_isolated=True,
-                    )
-        else:
-            # Legacy per-group path for shapes that still need group-managed
-            # control flow (currently broadcast-right variants plus grouped
-            # difference / symmetric_difference).
-            result_parts: list[OwnedGeometryArray] = []
-            _xp = cp if _pairs_on_device else np  # array module for index construction
-
-            # lyy.15: Cache right-side segment extraction for broadcast_right.
-            # In the N-vs-1 pattern, the right geometry (corridor) is identical
-            # for every pair.  Pre-extract its segments ONCE and reuse across
-            # all iterations, avoiding redundant _extract_segments_gpu calls
-            # (2 per iteration: once in build_gpu_split_events, once in
-            # classify_segment_intersections).
-            _cached_right_segs: DeviceSegmentTable | None = None
-            _is_broadcast_right_overlay = (
-                strategy.execution_family in _broadcast_right_families
-                and right_subset.row_count == 1
-                and cp is not None
-            )
-            if _is_broadcast_right_overlay and len(unique_left) > 1:
-                try:
-                    _cached_right_segs = _extract_segments_gpu(right_subset)
-                    logger.debug(
-                        "lyy.15: cached right-side segments (%d segments) "
-                        "for %d per-group iterations",
-                        _cached_right_segs.count, len(unique_left),
-                    )
-                except Exception:
-                    logger.debug(
-                        "lyy.15: right-side segment caching failed, "
-                        "falling through to per-iteration extraction",
-                        exc_info=True,
-                    )
-                    _cached_right_segs = None
-
-            # lyy.21: Batched overlay for broadcast_right many-vs-one.
-            #
-            # When all pairs share the same right polygon (broadcast_right),
-            # gather all complex left polygons and dispatch them in a single
-            # binary_constructive_owned call.  Each row is still processed
-            # independently (per-row isolation) because
-            # binary_constructive_owned routes to _overlay_owned which runs
-            # the 8-stage pipeline per-pair.
-            #
-            # Optimization: for broadcast_right with a single right polygon,
-            # call _overlay_owned directly per pair, bypassing the per-
-            # iteration overhead of binary_constructive_owned dispatch
-            # (workload detection, SH kernel pre-flight, dispatch selection,
-            # precision planning).  Host state for right_subset is
-            # materialised once before the loop.
-            #
-            # Cross-contamination guard: per-pair isolation is maintained
-            # because each _overlay_owned call operates on exactly one
-            # (L_i, R_0) pair.  Segments from pair i never interact with
-            # segments from pair j.
-            try:
-                # lyy.22: Stream pool for per-group overlay.
-                #
-                # Create a bounded pool of CUDA streams and assign each
-                # overlay pair to a stream in round-robin order.  Each
-                # pair's GPU work (CuPy operations) is issued on its
-                # assigned stream.  Results are collected after all pairs
-                # are dispatched, with per-stream synchronization.
-                #
-                # IMPORTANT: non_blocking=False (default) is required.
-                # See _OVERLAY_STREAM_POOL_SIZE comment for rationale.
-                _n_groups = len(unique_left)
-                _pool_size = min(_OVERLAY_STREAM_POOL_SIZE, _n_groups)
-                _use_stream_pool = cp is not None and _n_groups > 1 and _pool_size > 0
-                if _use_stream_pool:
-                    _stream_pool = [
-                        cp.cuda.Stream(non_blocking=False)
-                        for _ in range(_pool_size)
-                    ]
-                    logger.debug(
-                        "lyy.22: created stream pool with %d streams "
-                        "for %d per-group iterations",
-                        len(_stream_pool), _n_groups,
-                    )
-                else:
-                    _stream_pool = None
-
-                # FIX-09: materialise group boundaries to host once
-                # right before the per-group Python loop.  This is the
-                # only D2H for these arrays; all upstream filtering
-                # (containment bypass, SH bypass) operated on device.
-                def _host_group_boundaries(values):
-                    if cp is not None and hasattr(values, "__cuda_array_interface__"):
-                        host_values = overlay_device_to_host(
-                            cp.asarray(values),
-                            reason="overlay per-group loop boundary metadata export",
-                            dtype=np.int64,
-                        )
-                        return np.asarray(host_values, dtype=np.int64).tolist()
-                    return np.asarray(values, dtype=np.int64).tolist()
-
-                _group_ranges = list(
-                    zip(
-                        _host_group_boundaries(group_starts),
-                        _host_group_boundaries(group_ends),
-                    )
-                )
-
-                if _is_broadcast_right_overlay and _n_groups > 0:
-                    # Materialise right host state once outside the loop.
-                    # _overlay_owned calls _ensure_host_state on both
-                    # inputs; doing it here for right avoids N redundant
-                    # no-op calls.
-                    right_subset._ensure_host_state()
-
-                    # lyy.22: Dispatch all pairs across the stream pool,
-                    # collecting (stream, result) futures for deferred
-                    # synchronization.
-                    _futures: list[tuple] = []
-                    for grp_idx, (start, end) in enumerate(_group_ranges):
-                        n_pairs = end - start
-                        _stream = _stream_pool[grp_idx % len(_stream_pool)] if _stream_pool else None
-                        with (_stream if _stream is not None else contextlib.nullcontext()):
-                            left_row = left_subset.take(
-                                _xp.array([grp_idx], dtype=_xp.int64)
-                            )
-                            if n_pairs == 1:
-                                # Common case: one pair (L_i, R_0).
-                                # Call _overlay_owned directly, bypassing
-                                # binary_constructive_owned dispatch overhead.
-                                grp_result = _overlay_owned(
-                                    left_row, right_subset,
-                                    operation=how,
-                                    dispatch_mode=_pairwise_mode,
-                                    _cached_right_segments=_cached_right_segs,
-                                )
-                            else:
-                                # Multiple right neighbours: replicate left
-                                # row and use binary_constructive_owned for
-                                # the full dispatch (rare in broadcast_right).
-                                right_rows = right_subset.take(
-                                    right_subset_indices[start:end]
-                                )
-                                left_replicated = left_row.take(
-                                    _xp.zeros(n_pairs, dtype=_xp.int64)
-                                )
-                                grp_result = binary_constructive_owned(
-                                    how, left_replicated, right_rows,
-                                    dispatch_mode=_pairwise_mode,
-                                    _cached_right_segments=_cached_right_segs,
-                                )
-                            _futures.append((_stream, grp_result))
-
-                    # lyy.22: Synchronize per stream and collect results.
-                    # Each stream is synced at most once (the first time
-                    # we encounter a result from it), which guarantees
-                    # all prior work on that stream has completed.
-                    _synced_streams: set[int] = set()
-                    for _stream, grp_result in _futures:
-                        if _stream is not None:
-                            _sid = id(_stream)
-                            if _sid not in _synced_streams:
-                                _stream.synchronize()
-                                _synced_streams.add(_sid)
-                        result_parts.append(grp_result)
-
-                else:
-                    # General case: multiple right neighbours per group,
-                    # or non-broadcast_right strategy.
-                    _futures_gen: list[tuple] = []
-                    for grp_idx, (start, end) in enumerate(_group_ranges):
-                        n_pairs = end - start
-                        _stream = _stream_pool[grp_idx % len(_stream_pool)] if _stream_pool else None
-                        with (_stream if _stream is not None else contextlib.nullcontext()):
-                            left_row = left_subset.take(
-                                _xp.array([grp_idx], dtype=_xp.int64)
-                            )
-                            right_rows = right_subset.take(
-                                right_subset_indices[start:end]
-                            )
-                            # Replicate left row to match the number of
-                            # right neighbours.
-                            if n_pairs > 1:
-                                left_replicated = left_row.take(
-                                    _xp.zeros(n_pairs, dtype=_xp.int64)
-                                )
-                            else:
-                                left_replicated = left_row
-                            grp_result = binary_constructive_owned(
-                                how, left_replicated, right_rows,
-                                dispatch_mode=_pairwise_mode,
-                                _cached_right_segments=_cached_right_segs,
-                            )
-                            _futures_gen.append((_stream, grp_result))
-
-                    # lyy.22: Synchronize per stream and collect results.
-                    _synced_streams_gen: set[int] = set()
-                    for _stream, grp_result in _futures_gen:
-                        if _stream is not None:
-                            _sid = id(_stream)
-                            if _sid not in _synced_streams_gen:
-                                _stream.synchronize()
-                                _synced_streams_gen.add(_sid)
-                        result_parts.append(grp_result)
-            finally:
-                # lyy.15: Free cached right-side segments after all
-                # iterations (or on exception).
-                if _cached_right_segs is not None:
-                    _rt = get_cuda_runtime()
-                    _rt.free(_cached_right_segs.x0)
-                    _rt.free(_cached_right_segs.y0)
-                    _rt.free(_cached_right_segs.x1)
-                    _rt.free(_cached_right_segs.y1)
-                    _rt.free(_cached_right_segs.row_indices)
-                    _rt.free(_cached_right_segs.segment_indices)
-                    if _cached_right_segs.part_indices is not None:
-                        _rt.free(_cached_right_segs.part_indices)
-                    if _cached_right_segs.ring_indices is not None:
-                        _rt.free(_cached_right_segs.ring_indices)
-                    _cached_right_segs = None
-                # lyy.22: Destroy stream pool to avoid resource leaks.
-                # CuPy streams are lightweight (~1-2us each) but should
-                # still be cleaned up.
-                if _stream_pool is not None:
-                    for _s in _stream_pool:
-                        # CuPy streams do not require explicit destruction;
-                        # they are released when garbage collected.  We
-                        # synchronize each one to ensure all dispatched work
-                        # is complete before leaving the finally block.
-                        try:
-                            _s.synchronize()
-                        except Exception:
-                            pass
-                    _stream_pool = None
-
-            if result_parts:
-                result_owned = OwnedGeometryArray.concat(result_parts)
-            else:
-                result_owned = from_shapely_geometries([shapely.Point()])
-                result_owned = result_owned.take(np.asarray([], dtype=np.int64))
-
-        # Release GPU pool memory after per-group overlay loop: each
-        # iteration's split events, half-edge graphs, and face tables
-        # leave freed-but-cached blocks in the CuPy pool.
-        maybe_trim_pool_memory()
-
-        # Filter empty/null using device owned metadata when available. This
-        # keeps grouped overlay output in the selected execution family instead
-        # of crossing to host only to build a row keep mask.
-        result = _filter_non_empty_owned_device(result_owned)
-        if result is None:
-            result_owned._ensure_host_state()
-            non_empty = result_owned.validity.copy()
-            for family, buf in result_owned.families.items():
-                family_rows = (result_owned.tags == FAMILY_TAGS[family])
-                non_empty[family_rows] &= ~buf.empty_mask[
-                    result_owned.family_row_offsets[family_rows]
-                ]
-            keep_indices = np.flatnonzero(non_empty)
-            if keep_indices.size == 0:
-                result = from_shapely_geometries([shapely.Point()])
-                result = result.take(np.asarray([], dtype=np.int64))
-            else:
-                result = result_owned.take(keep_indices)
-
-        # lyy.16 + lyy.18: Combine bypass results with overlay results.
-        result = _combine_bypass_results(
-            _containment_result, _sh_clip_result, result,
-        )
-
-        _used_owned_dispatch = True
-    except (NotImplementedError, ImportError, ValueError):
-        _used_owned_dispatch = False
-
-    if not _used_owned_dispatch:
-        # lyy.32: When owned dispatch failed and pairs were on device,
-        # materialise grouping arrays to host for the Shapely fallback path.
-        # This D->H transfer is acceptable because the Shapely path already
-        # materialises the full geometries to host below.
-        if _pairs_on_device:
-            left_indices = overlay_device_to_host(
-                d_left_indices,
-                reason="overlay Shapely fallback left-pair indices export",
-                dtype=np.int64,
-            )
-            right_indices = overlay_device_to_host(
-                d_right_indices,
-                reason="overlay Shapely fallback right-pair indices export",
-                dtype=np.int64,
-            )
-            group_starts = overlay_device_to_host(
-                d_group_starts,
-                reason="overlay Shapely fallback group-start metadata export",
-                dtype=np.int64,
-            )
-            group_ends = overlay_device_to_host(
-                d_group_ends,
-                reason="overlay Shapely fallback group-end metadata export",
-                dtype=np.int64,
-            )
-            unique_left = overlay_device_to_host(
-                d_unique_left,
-                reason="overlay Shapely fallback unique-left metadata export",
-                dtype=np.int64,
-            )
-            right_subset_indices = overlay_device_to_host(
-                d_right_subset_indices,
-                reason="overlay Shapely fallback right-subset metadata export",
-                dtype=np.int64,
-            )
-
-        # Phase 24: Record fallback event for spatial overlay CPU path.
-        record_fallback_event(
-            surface=f"geopandas.spatial_overlay.{how}",
-            reason="owned-path dispatch failed, falling back to Shapely",
-            detail=f"how={how}, pairs={len(left_indices)}",
-            requested=requested,
-            selected=ExecutionMode.CPU,
-            pipeline="spatial_overlay_owned",
-            d2h_transfer=True,
-        )
-        # Shapely fallback: materialize participating rows for validation + clipping.
-        left_shapely_orig = np.asarray(left_subset.to_shapely(), dtype=object)
-        right_shapely_orig = np.asarray(right_subset.to_shapely(), dtype=object)
-
-        # Validate input geometries ONCE before replication (ADR-0019).
-        # This avoids running make_valid on 10K replicated copies of the same
-        # invalid geometry. Validate on the (smaller) subset, then gather.
-        left_invalid_mask = ~np.asarray(shapely.is_valid(left_shapely_orig), dtype=bool)
-        right_invalid_mask = ~np.asarray(shapely.is_valid(right_shapely_orig), dtype=bool)
-        if np.any(left_invalid_mask):
-            left_shapely_orig[left_invalid_mask] = shapely.make_valid(left_shapely_orig[left_invalid_mask])
-        if np.any(right_invalid_mask):
-            right_shapely_orig[right_invalid_mask] = shapely.make_valid(right_shapely_orig[right_invalid_mask])
-
-    if not _used_owned_dispatch:
-        # Shapely fast paths and general case (only when owned dispatch failed).
-
-        # Fast path: many-vs-one intersection with clip_by_rect (ADR-0033 Tier 2).
-        _used_clip_by_rect = False
-        if how == "intersection" and right.row_count == 1:
-            right_geom = right_shapely_orig[0]
-            if right_geom is not None and right_geom.geom_type == "Polygon" and not right_geom.is_empty:
-                coords = np.asarray(right_geom.exterior.coords)
-                if len(coords) == 5:
-                    xs, ys = coords[:4, 0], coords[:4, 1]
-                    x_vals = np.unique(xs)
-                    y_vals = np.unique(ys)
-                    if len(x_vals) == 2 and len(y_vals) == 2 and len(right_geom.interiors) == 0:
-                        xmin, xmax = float(x_vals[0]), float(x_vals[1])
-                        ymin, ymax = float(y_vals[0]), float(y_vals[1])
-                        # Clip all participating left geometries against the rectangle.
-                        result_geoms = shapely.clip_by_rect(left_shapely_orig, xmin, ymin, xmax, ymax)
-                        _used_clip_by_rect = True
-
-        # Fast path: many-vs-one intersection with GPU centroid pre-filter.
-        _used_centroid_filter = False
-        if (not _used_clip_by_rect
-                and how == "intersection"
-                and right.row_count == 1
-                and left.row_count >= 100
-                and _has_polygonal_families(left)):
-            right_geom = right_shapely_orig[0]
-            if right_geom is not None and not right_geom.is_empty:
-                from vibespatial.constructive.polygon import polygon_centroids_owned
-                from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
-                _centroid_selection = plan_dispatch_selection(
-                    kernel_name="polygon_centroid",
-                    kernel_class=KernelClass.METRIC,
-                    row_count=left_subset.row_count,
-                    geometry_families=tuple(
-                        sorted(family.value for family in left_subset.families)
-                    ),
-                    mixed_geometry=len(left_subset.families) > 1,
-                    current_residency=left_subset.residency,
-                    requested_mode=ExecutionMode.GPU,
-                    gpu_available=cp is not None,
-                )
-                if _centroid_selection.selected is ExecutionMode.GPU:
-                    cx, cy = polygon_centroids_owned(left_subset)
-                    centroids = shapely.points(cx, cy)
-                    inside_mask = np.asarray(shapely.within(centroids, right_geom), dtype=bool)
-                    mask_bounds = right_geom.bounds
-                    left_bounds = compute_geometry_bounds(left_subset)
-                    inside_idx = np.flatnonzero(inside_mask)
-                    if inside_idx.size > 0:
-                        bbox_fully_inside = (
-                            (left_bounds[inside_idx, 0] >= mask_bounds[0])
-                            & (left_bounds[inside_idx, 1] >= mask_bounds[1])
-                            & (left_bounds[inside_idx, 2] <= mask_bounds[2])
-                            & (left_bounds[inside_idx, 3] >= mask_bounds[1])
-                        )
-                        fully_inside_rows = inside_idx[bbox_fully_inside]
-                    else:
-                        fully_inside_rows = np.asarray([], dtype=np.intp)
-                    all_rows = np.arange(left_subset.row_count)
-                    need_clip_rows = np.setdiff1d(all_rows, fully_inside_rows)
-                    if need_clip_rows.size < left_subset.row_count:
-                        result_parts_shapely: list = []
-                        if fully_inside_rows.size > 0:
-                            result_parts_shapely.extend(left_shapely_orig[fully_inside_rows].tolist())
-                        if need_clip_rows.size > 0:
-                            clip_left = left_shapely_orig[need_clip_rows]
-                            clip_right = np.full(len(need_clip_rows), right_geom, dtype=object)
-                            clipped = shapely.intersection(clip_left, clip_right)
-                            result_parts_shapely.extend(clipped.tolist())
-                        result_geoms = np.asarray(result_parts_shapely, dtype=object)
-                        _used_centroid_filter = True
-
-        if not _used_clip_by_rect and not _used_centroid_filter:
-            # Per-left-group Shapely path: process each left geometry against
-            # its overlapping right neighbours independently.  For difference,
-            # this computes L_i - union(R_j) to produce correct results.
-            if how == "difference":
-                result_list: list = []
-                for grp_idx in range(len(unique_left)):
-                    start, end = group_starts[grp_idx], group_ends[grp_idx]
-                    left_geom = left_shapely_orig[grp_idx]
-                    right_neighbors = right_shapely_orig[right_subset_indices[start:end]]
-                    if len(right_neighbors) == 1:
-                        right_union = right_neighbors[0]
-                    else:
-                        right_union = shapely.union_all(right_neighbors)
-                    diff = shapely.difference(np.array([left_geom], dtype=object),
-                                              np.array([right_union], dtype=object))
-                    result_list.append(diff[0])
-                result_geoms = np.asarray(result_list, dtype=object) if result_list else np.asarray([], dtype=object)
-            elif how == "symmetric_difference":
-                result_list = []
-                for grp_idx in range(len(unique_left)):
-                    start, end = group_starts[grp_idx], group_ends[grp_idx]
-                    left_geom = left_shapely_orig[grp_idx]
-                    right_neighbors = right_shapely_orig[right_subset_indices[start:end]]
-                    if len(right_neighbors) == 1:
-                        right_union = right_neighbors[0]
-                    else:
-                        right_union = shapely.union_all(right_neighbors)
-                    sd = shapely.symmetric_difference(
-                        np.array([left_geom], dtype=object),
-                        np.array([right_union], dtype=object),
-                    )
-                    result_list.append(sd[0])
-                result_geoms = np.asarray(result_list, dtype=object) if result_list else np.asarray([], dtype=object)
-            elif how == "intersection":
-                # Per-pair intersection: L_i intersect R_j for each pair.
-                result_list = []
-                for grp_idx in range(len(unique_left)):
-                    start, end = group_starts[grp_idx], group_ends[grp_idx]
-                    left_geom = left_shapely_orig[grp_idx]
-                    right_neighbors = right_shapely_orig[right_subset_indices[start:end]]
-                    left_arr = np.full(len(right_neighbors), left_geom, dtype=object)
-                    inter = shapely.intersection(left_arr, right_neighbors)
-                    result_list.extend(inter.tolist())
-                result_geoms = np.asarray(result_list, dtype=object) if result_list else np.asarray([], dtype=object)
-            elif how == "union":
-                # Per-pair union: L_i union R_j for each pair.
-                result_list = []
-                for grp_idx in range(len(unique_left)):
-                    start, end = group_starts[grp_idx], group_ends[grp_idx]
-                    left_geom = left_shapely_orig[grp_idx]
-                    right_neighbors = right_shapely_orig[right_subset_indices[start:end]]
-                    left_arr = np.full(len(right_neighbors), left_geom, dtype=object)
-                    unions = shapely.union(left_arr, right_neighbors)
-                    result_list.extend(unions.tolist())
-                result_geoms = np.asarray(result_list, dtype=object) if result_list else np.asarray([], dtype=object)
-            else:
-                raise ValueError(f"unsupported spatial overlay operation: {how}")
-
-    if not _used_owned_dispatch:
-        # Stage 3: Filter out empty/null results (Shapely path only).
-        # The owned-dispatch path does its own filtering above.
-        result_arr = np.asarray(result_geoms, dtype=object) if not isinstance(result_geoms, np.ndarray) else result_geoms
-        non_null = result_arr != None  # noqa: E711 — intentional identity check for numpy
-        non_empty_mask = np.zeros(len(result_arr), dtype=bool)
-        if np.any(non_null):
-            non_empty_mask[non_null] = ~shapely.is_empty(result_arr[non_null])
-        candidates = result_arr[non_empty_mask]
-
-        # Check for GeometryCollections that need flattening
-        valid_geoms = []
-        has_collections = False
-        for g in candidates:
-            if g.geom_type == "GeometryCollection":
-                has_collections = True
-                parts = shapely.get_parts(np.asarray([g], dtype=object))
-                for part in parts:
-                    if part.geom_type in (
-                        "Point", "LineString", "Polygon",
-                        "MultiPoint", "MultiLineString", "MultiPolygon",
-                    ) and not part.is_empty:
-                        valid_geoms.append(part)
-            else:
-                valid_geoms.append(g)
-
-        if not has_collections:
-            valid_geoms = list(candidates)
-
-        if not valid_geoms:
-            result = from_shapely_geometries([shapely.Point()])
-            result = result.take(np.asarray([], dtype=np.int64))
-        else:
-            result = from_shapely_geometries(valid_geoms)
-
-        # lyy.16 + lyy.18: Combine bypass results with Shapely fallback results.
-        result = _combine_bypass_results(
-            _containment_result, _sh_clip_result, result,
-        )
-
-    result.runtime_history.append(
-        RuntimeSelection(
-            requested=requested,
-            selected=ExecutionMode.GPU if candidate_pairs.pairs_examined > 0 and cp is not None else ExecutionMode.CPU,
-            reason=(
-                f"spatial_overlay {how}: {candidate_pairs.count} candidate pairs from "
-                f"{left.row_count}x{right.row_count} inputs"
-            ),
-        )
-    )
-    return result
+# The geometry-only surface uses the same relation/grouped physical model as
+# public overlay while this module continues to own pairwise topology plans.
+from vibespatial.overlay.spatial_overlay import spatial_overlay_owned  # noqa: E402, F401

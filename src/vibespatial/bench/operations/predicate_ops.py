@@ -1,4 +1,5 @@
 """Predicate operation benchmarks: gpu-pip, binary-predicates, gpu-predicates, point-predicates."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -117,17 +118,24 @@ def bench_gpu_pip(
             d_t = runtime.from_host(_tags)
             d_f = runtime.from_host(_fro)
             d_state = OwnedGeometryDeviceState(
-                validity=d_v, tags=d_t, family_row_offsets=d_f,
+                validity=d_v,
+                tags=d_t,
+                family_row_offsets=d_f,
                 families=dict(polygons_owned.device_state.families),
             )
             polygons_owned = OwnedGeometryArray(
-                validity=_validity, tags=_tags, family_row_offsets=_fro,
+                validity=_validity,
+                tags=_tags,
+                family_row_offsets=_fro,
                 families=polygons_owned.families,
-                residency=Residency.DEVICE, device_state=d_state,
+                residency=Residency.DEVICE,
+                device_state=d_state,
             )
         else:
             polygons_owned = OwnedGeometryArray(
-                validity=_validity, tags=_tags, family_row_offsets=_fro,
+                validity=_validity,
+                tags=_tags,
+                family_row_offsets=_fro,
                 families=polygons_owned.families,
                 residency=Residency.HOST,
             )
@@ -164,12 +172,16 @@ def bench_gpu_pip(
     cpu_values = np.asarray(cpu_result, dtype=object)
 
     start = perf_counter()
-    cold_gpu_result = point_in_polygon(points_owned, polygons_owned, dispatch_mode=ExecutionMode.GPU)
+    cold_gpu_result = point_in_polygon(
+        points_owned, polygons_owned, dispatch_mode=ExecutionMode.GPU
+    )
     cold_gpu_elapsed_seconds = perf_counter() - start
     cold_gpu_values = np.asarray(cold_gpu_result, dtype=object)
 
     start = perf_counter()
-    warm_gpu_result = point_in_polygon(points_owned, polygons_owned, dispatch_mode=ExecutionMode.GPU)
+    warm_gpu_result = point_in_polygon(
+        points_owned, polygons_owned, dispatch_mode=ExecutionMode.GPU
+    )
     warm_gpu_elapsed_seconds = perf_counter() - start
     warm_gpu_values = np.asarray(warm_gpu_result, dtype=object)
     gpu_substage_timings = get_last_gpu_substage_timings()
@@ -178,7 +190,10 @@ def bench_gpu_pip(
         raise RuntimeError("cold GPU point_in_polygon result diverged from CPU result")
     if not np.array_equal(warm_gpu_values, cpu_values):
         raise RuntimeError("warm GPU point_in_polygon result diverged from CPU result")
-    if shapely_true_rows is not None and int(np.count_nonzero(cpu_values == True)) != shapely_true_rows:  # noqa: E712
+    if (
+        shapely_true_rows is not None
+        and int(np.count_nonzero(cpu_values)) != shapely_true_rows
+    ):
         raise RuntimeError("CPU point_in_polygon result diverged from Shapely covers baseline")
 
     timing = timing_from_samples([warm_gpu_elapsed_seconds])

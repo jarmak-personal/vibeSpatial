@@ -46,7 +46,8 @@ _disk_cache_writes_disabled = False
 def _is_host_array_like(value: Any) -> bool:
     """Return True for host-backed array objects accepted by CCCL value init."""
     return hasattr(value, "__array_interface__") and not hasattr(
-        value, "__cuda_array_interface__",
+        value,
+        "__cuda_array_interface__",
     )
 
 
@@ -73,6 +74,7 @@ def _get_cache_dir() -> pathlib.Path:
 def _cccl_version() -> str:
     try:
         import importlib.metadata
+
         return importlib.metadata.version("cuda-cccl")
     except Exception:
         return "unknown"
@@ -82,6 +84,7 @@ def _cccl_version() -> str:
 def _compute_capability() -> tuple[int, int]:
     try:
         import cupy as cp
+
         dev = cp.cuda.Device()
         return dev.compute_capability
     except Exception:
@@ -102,13 +105,13 @@ def _libcuda():
     #     void**, unsigned int, CUlibraryOption*, void**, unsigned int)
     lib.cuLibraryLoadData.argtypes = [
         ctypes.POINTER(ctypes.c_void_p),  # library
-        ctypes.c_void_p,                   # code
-        ctypes.c_void_p,                   # jitOptions (NULL)
-        ctypes.c_void_p,                   # jitOptionsValues (NULL)
-        ctypes.c_uint,                     # numJitOptions (0)
-        ctypes.c_void_p,                   # libraryOptions (NULL)
-        ctypes.c_void_p,                   # libraryOptionValues (NULL)
-        ctypes.c_uint,                     # numLibraryOptions (0)
+        ctypes.c_void_p,  # code
+        ctypes.c_void_p,  # jitOptions (NULL)
+        ctypes.c_void_p,  # jitOptionsValues (NULL)
+        ctypes.c_uint,  # numJitOptions (0)
+        ctypes.c_void_p,  # libraryOptions (NULL)
+        ctypes.c_void_p,  # libraryOptionValues (NULL)
+        ctypes.c_uint,  # numLibraryOptions (0)
     ]
     lib.cuLibraryLoadData.restype = ctypes.c_int
 
@@ -144,8 +147,14 @@ def _cu_library_load_data(cubin_bytes: bytes) -> tuple[ctypes.c_void_p, Any]:
     cubin_buf = ctypes.create_string_buffer(cubin_bytes)
     library = ctypes.c_void_p()
     err = _libcuda().cuLibraryLoadData(
-        ctypes.byref(library), cubin_buf,
-        None, None, 0, None, None, 0,
+        ctypes.byref(library),
+        cubin_buf,
+        None,
+        None,
+        0,
+        None,
+        None,
+        0,
     )
     if err != 0:
         raise RuntimeError(f"cuLibraryLoadData failed with error {err}")
@@ -156,12 +165,12 @@ def _cu_library_get_kernel(library: ctypes.c_void_p, name: str) -> ctypes.c_void
     """Get a CUkernel handle from a CUlibrary by entry-point name."""
     kernel = ctypes.c_void_p()
     err = _libcuda().cuLibraryGetKernel(
-        ctypes.byref(kernel), library, name.encode(),
+        ctypes.byref(kernel),
+        library,
+        name.encode(),
     )
     if err != 0:
-        raise RuntimeError(
-            f"cuLibraryGetKernel failed for '{name}' with error {err}"
-        )
+        raise RuntimeError(f"cuLibraryGetKernel failed for '{name}' with error {err}")
     return kernel
 
 
@@ -175,6 +184,7 @@ def _libcccl():
     """Load the CCCL C parallel shared library."""
     # The library is loaded through cuda.compute bindings; find its path
     import cuda.compute._bindings as _b
+
     bindings_path = pathlib.Path(_b.__file__)
     # _bindings_impl.so is in cu{12,13}/, libcccl is in cu{12,13}/cccl/
     cccl_dir = bindings_path.parent / "cccl"
@@ -325,22 +335,45 @@ class CcclBinarySearchBuild(ctypes.Structure):
 
 # Map of family name → (struct_type, kernel_field_names)
 _BASE_FAMILY_STRUCTS: dict[str, tuple[type, list[str]]] = {
-    "reduce_into": (CcclReduceBuild, [
-        "single_tile_kernel", "single_tile_second_kernel",
-        "reduction_kernel", "nondeterministic_atomic_kernel",
-    ]),
+    "reduce_into": (
+        CcclReduceBuild,
+        [
+            "single_tile_kernel",
+            "single_tile_second_kernel",
+            "reduction_kernel",
+            "nondeterministic_atomic_kernel",
+        ],
+    ),
     "segmented_reduce": (CcclSegReduceBuild, ["segmented_reduce_kernel"]),
-    "radix_sort": (CcclRadixSortBuild, [
-        "single_tile_kernel", "upsweep_kernel", "alt_upsweep_kernel",
-        "scan_bins_kernel", "downsweep_kernel", "alt_downsweep_kernel",
-        "histogram_kernel", "exclusive_sum_kernel", "onesweep_kernel",
-    ]),
-    "merge_sort": (CcclMergeSortBuild, [
-        "block_sort_kernel", "partition_kernel", "merge_kernel",
-    ]),
-    "unique_by_key": (CcclUniqueByKeyBuild, [
-        "compact_init_kernel", "sweep_kernel",
-    ]),
+    "radix_sort": (
+        CcclRadixSortBuild,
+        [
+            "single_tile_kernel",
+            "upsweep_kernel",
+            "alt_upsweep_kernel",
+            "scan_bins_kernel",
+            "downsweep_kernel",
+            "alt_downsweep_kernel",
+            "histogram_kernel",
+            "exclusive_sum_kernel",
+            "onesweep_kernel",
+        ],
+    ),
+    "merge_sort": (
+        CcclMergeSortBuild,
+        [
+            "block_sort_kernel",
+            "partition_kernel",
+            "merge_kernel",
+        ],
+    ),
+    "unique_by_key": (
+        CcclUniqueByKeyBuild,
+        [
+            "compact_init_kernel",
+            "sweep_kernel",
+        ],
+    ),
     "lower_bound": (CcclBinarySearchBuild, ["kernel"]),
     "upper_bound": (CcclBinarySearchBuild, ["kernel"]),
 }
@@ -377,13 +410,13 @@ def _normalize_cubin(cubin: bytes) -> bytes:
     8-character hex session hash per build.  We zero all occurrences to
     make the CUBIN content-addressable.
     """
-    pattern = rb'_INTERNAL_\w+?_([0-9a-fA-F]{8})_'
+    pattern = rb"_INTERNAL_\w+?_([0-9a-fA-F]{8})_"
     hashes = set(re.findall(pattern, cubin))
     if len(hashes) != 1:
         # Can't normalize (unexpected pattern), return as-is
         return cubin
     session_hash = hashes.pop()
-    return cubin.replace(session_hash, b'0' * len(session_hash))
+    return cubin.replace(session_hash, b"0" * len(session_hash))
 
 
 # ---------------------------------------------------------------------------
@@ -397,20 +430,20 @@ def _extract_kernel_names(cubin: bytes) -> list[str]:
     Returns names of symbols with STT_FUNC type and STB_GLOBAL binding
     that are defined (section index != SHN_UNDEF).
     """
-    if len(cubin) < 64 or cubin[:4] != b'\x7fELF':
+    if len(cubin) < 64 or cubin[:4] != b"\x7fELF":
         return []
 
     # Parse ELF64 header
-    (ei_class,) = pystruct.unpack_from('B', cubin, 4)
+    (ei_class,) = pystruct.unpack_from("B", cubin, 4)
     if ei_class != 2:  # Must be 64-bit
         return []
 
-    (ei_data,) = pystruct.unpack_from('B', cubin, 5)
-    endian = '<' if ei_data == 1 else '>'
+    (ei_data,) = pystruct.unpack_from("B", cubin, 5)
+    endian = "<" if ei_data == 1 else ">"
 
-    e_shoff = pystruct.unpack_from(f'{endian}Q', cubin, 40)[0]
-    e_shentsize = pystruct.unpack_from(f'{endian}H', cubin, 58)[0]
-    e_shnum = pystruct.unpack_from(f'{endian}H', cubin, 60)[0]
+    e_shoff = pystruct.unpack_from(f"{endian}Q", cubin, 40)[0]
+    e_shentsize = pystruct.unpack_from(f"{endian}H", cubin, 58)[0]
+    e_shnum = pystruct.unpack_from(f"{endian}H", cubin, 60)[0]
 
     if e_shoff == 0 or e_shnum == 0:
         return []
@@ -425,12 +458,12 @@ def _extract_kernel_names(cubin: bytes) -> list[str]:
         sh_base = e_shoff + i * e_shentsize
         if sh_base + e_shentsize > len(cubin):
             break
-        sh_type = pystruct.unpack_from(f'{endian}I', cubin, sh_base + 4)[0]
+        sh_type = pystruct.unpack_from(f"{endian}I", cubin, sh_base + 4)[0]
         if sh_type == 2:  # SHT_SYMTAB
-            sh_offset = pystruct.unpack_from(f'{endian}Q', cubin, sh_base + 24)[0]
-            sh_size = pystruct.unpack_from(f'{endian}Q', cubin, sh_base + 32)[0]
-            sh_link = pystruct.unpack_from(f'{endian}I', cubin, sh_base + 40)[0]
-            sh_entsize = pystruct.unpack_from(f'{endian}Q', cubin, sh_base + 56)[0]
+            sh_offset = pystruct.unpack_from(f"{endian}Q", cubin, sh_base + 24)[0]
+            sh_size = pystruct.unpack_from(f"{endian}Q", cubin, sh_base + 32)[0]
+            sh_link = pystruct.unpack_from(f"{endian}I", cubin, sh_base + 40)[0]
+            sh_entsize = pystruct.unpack_from(f"{endian}Q", cubin, sh_base + 56)[0]
             symtab_off = sh_offset
             symtab_size = sh_size
             symtab_entsize = sh_entsize if sh_entsize else 24
@@ -438,7 +471,7 @@ def _extract_kernel_names(cubin: bytes) -> list[str]:
             # Get linked string table
             str_base = e_shoff + sh_link * e_shentsize
             if str_base + e_shentsize <= len(cubin):
-                strtab_off = pystruct.unpack_from(f'{endian}Q', cubin, str_base + 24)[0]
+                strtab_off = pystruct.unpack_from(f"{endian}Q", cubin, str_base + 24)[0]
             break
 
     if symtab_off == 0 or strtab_off == 0:
@@ -450,9 +483,9 @@ def _extract_kernel_names(cubin: bytes) -> list[str]:
         sym_base = symtab_off + i * symtab_entsize
         if sym_base + symtab_entsize > len(cubin):
             break
-        st_name = pystruct.unpack_from(f'{endian}I', cubin, sym_base)[0]
-        st_info = pystruct.unpack_from('B', cubin, sym_base + 4)[0]
-        st_shndx = pystruct.unpack_from(f'{endian}H', cubin, sym_base + 6)[0]
+        st_name = pystruct.unpack_from(f"{endian}I", cubin, sym_base)[0]
+        st_info = pystruct.unpack_from("B", cubin, sym_base + 4)[0]
+        st_shndx = pystruct.unpack_from(f"{endian}H", cubin, sym_base + 6)[0]
 
         st_type = st_info & 0xF
         st_bind = st_info >> 4
@@ -462,8 +495,8 @@ def _extract_kernel_names(cubin: bytes) -> list[str]:
             # Read null-terminated string from strtab
             name_start = strtab_off + st_name
             if name_start < len(cubin):
-                name_end = cubin.index(b'\x00', name_start)
-                name = cubin[name_start:name_end].decode('ascii', errors='replace')
+                name_end = cubin.index(b"\x00", name_start)
+                name = cubin[name_start:name_end].decode("ascii", errors="replace")
                 if name:
                     names.append(name)
     return names
@@ -477,6 +510,7 @@ def _extract_kernel_names(cubin: bytes) -> list[str]:
 @dataclass
 class CacheEntry:
     """Serializable cache entry for a single CCCL spec."""
+
     spec_name: str
     family: str
     cubin_bytes: bytes
@@ -501,7 +535,7 @@ def _find_build_data_offset(build_result_obj: Any, expected_cubin_size: int) -> 
     basic_size = type(build_result_obj).__basicsize__
     scan_bytes = min(basic_size + 64, 512)
     raw = bytes((ctypes.c_char * scan_bytes).from_address(obj_addr))
-    target = pystruct.pack('<Q', expected_cubin_size)
+    target = pystruct.pack("<Q", expected_cubin_size)
     idx = raw.find(target)
     if idx < 0:
         raise ValueError(
@@ -522,7 +556,7 @@ def _read_build_struct(build_result_obj: Any, struct_type: type, cubin_size: int
 def _read_runtime_policy(policy_ptr: int) -> bytes:
     """Read runtime_policy bytes using malloc_usable_size to determine size."""
     if not policy_ptr:
-        return b''
+        return b""
     try:
         usable_size = _libc().malloc_usable_size(policy_ptr)
         if usable_size == 0 or usable_size > 4096:
@@ -530,7 +564,7 @@ def _read_runtime_policy(policy_ptr: int) -> bytes:
             usable_size = min(usable_size, 4096) if usable_size else 256
         return bytes((ctypes.c_char * usable_size).from_address(policy_ptr))
     except Exception:
-        return b''
+        return b""
 
 
 def _map_kernel_names(
@@ -589,7 +623,9 @@ def extract_cache_entry(
 
         # Read the C struct from the Cython object (auto-detect offset)
         struct_data = _read_build_struct(
-            build_result, struct_type, len(cubin_bytes),
+            build_result,
+            struct_type,
+            len(cubin_bytes),
         )
 
         # Extract kernel names from CUBIN ELF
@@ -597,7 +633,10 @@ def extract_cache_entry(
 
         # Map names to struct fields
         kernel_mapping = _map_kernel_names(
-            struct_data.library, elf_names, struct_data, kernel_fields,
+            struct_data.library,
+            elf_names,
+            struct_data,
+            kernel_fields,
         )
 
         if len(kernel_mapping) < len(kernel_fields):
@@ -608,23 +647,25 @@ def extract_cache_entry(
                     kernel_mapping[f] = ""
 
         # Read runtime_policy bytes
-        policy_ptr = getattr(struct_data, 'runtime_policy', 0)
+        policy_ptr = getattr(struct_data, "runtime_policy", 0)
         policy_bytes = _read_runtime_policy(policy_ptr)
 
         # Collect all scalar metadata from the struct
         metadata: dict[str, Any] = {}
         for field_name, field_type in struct_type._fields_:
-            if field_name in ('cubin', 'cubin_size', 'library', 'runtime_policy'):
+            if field_name in ("cubin", "cubin_size", "library", "runtime_policy"):
                 continue
             if field_name in kernel_fields:
                 continue
             val = getattr(struct_data, field_name)
             if isinstance(val, CcclTypeInfo):
                 metadata[field_name] = {
-                    'size': val.size, 'alignment': val.alignment, 'type': val.type,
+                    "size": val.size,
+                    "alignment": val.alignment,
+                    "type": val.type,
                 }
             else:
-                metadata[field_name] = int(val) if hasattr(val, '__int__') else val
+                metadata[field_name] = int(val) if hasattr(val, "__int__") else val
 
         return CacheEntry(
             spec_name=spec_name,
@@ -647,7 +688,7 @@ def extract_cache_entry(
 class ReconstructedBuild:
     """Holds a reconstructed ctypes build result and its backing resources."""
 
-    __slots__ = ('_refs', 'struct')
+    __slots__ = ("_refs", "struct")
 
     def __init__(self, struct: Any, refs: list[Any]):
         self.struct = struct
@@ -693,14 +734,14 @@ def reconstruct_build(entry: CacheEntry) -> ReconstructedBuild:
         setattr(build, field_name, handle)
 
     # Set runtime_policy (if the struct has the field)
-    if hasattr(build, 'runtime_policy'):
+    if hasattr(build, "runtime_policy"):
         build.runtime_policy = policy_ptr
 
     # Set scalar metadata
     for field_name, value in entry.metadata.items():
-        if isinstance(value, dict) and 'size' in value:
+        if isinstance(value, dict) and "size" in value:
             # CcclTypeInfo
-            ti = CcclTypeInfo(value['size'], value['alignment'], value['type'])
+            ti = CcclTypeInfo(value["size"], value["alignment"], value["type"])
             setattr(build, field_name, ti)
         else:
             setattr(build, field_name, value)
@@ -791,8 +832,7 @@ def _cache_key(spec_name: str, cubin_bytes: bytes) -> str:
     normalized = _normalize_cubin(cubin_bytes)
     cubin_hash = hashlib.sha256(normalized).hexdigest()[:12]
     return (
-        f"{_CACHE_FORMAT_VERSION}-sm{cc[0]}{cc[1]}"
-        f"-cccl{_cccl_version()}-{spec_name}-{cubin_hash}"
+        f"{_CACHE_FORMAT_VERSION}-sm{cc[0]}{cc[1]}-cccl{_cccl_version()}-{spec_name}-{cubin_hash}"
     )
 
 
@@ -807,13 +847,15 @@ def _serialize_cache_entry(entry: CacheEntry) -> bytes:
         "policy_size": len(entry.runtime_policy_bytes),
     }
     header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    return b"".join([
-        _CACHE_MAGIC,
-        pystruct.pack("<I", len(header_bytes)),
-        header_bytes,
-        entry.cubin_bytes,
-        entry.runtime_policy_bytes,
-    ])
+    return b"".join(
+        [
+            _CACHE_MAGIC,
+            pystruct.pack("<I", len(header_bytes)),
+            header_bytes,
+            entry.cubin_bytes,
+            entry.runtime_policy_bytes,
+        ]
+    )
 
 
 def _deserialize_cache_entry(data: bytes) -> CacheEntry | None:
@@ -884,7 +926,7 @@ def _read_cache_entry(spec_name: str) -> CacheEntry | None:
 
     try:
         for path in cache_dir.iterdir():
-            if path.name.startswith(prefix) and path.name.endswith('.cache'):
+            if path.name.startswith(prefix) and path.name.endswith(".cache"):
                 data = path.read_bytes()
                 entry = _deserialize_cache_entry(data)
                 if entry is not None and entry.spec_name == spec_name:
@@ -903,7 +945,7 @@ def _delete_cache_entry(spec_name: str) -> None:
     prefix = f"{_CACHE_FORMAT_VERSION}-sm{cc[0]}{cc[1]}-cccl{_cccl_version()}-{spec_name}-"
     try:
         for path in cache_dir.iterdir():
-            if path.name.startswith(prefix) and path.name.endswith('.cache'):
+            if path.name.startswith(prefix) and path.name.endswith(".cache"):
                 path.unlink(missing_ok=True)
     except OSError:
         pass
@@ -925,10 +967,11 @@ class _CachedAlgorithm:
     serialises concurrent callers.
     """
 
-    __slots__ = ('_build', '_call_lock', '_spec_name')
+    __slots__ = ("_build", "_call_lock", "_spec_name")
 
     def __init__(self, build: ReconstructedBuild, spec_name: str):
         import threading
+
         self._build = build
         self._call_lock = threading.Lock()
         self._spec_name = spec_name
@@ -948,15 +991,15 @@ class _CachedScanReduce(_CachedAlgorithm):
     """
 
     __slots__ = (
-        '_cfunc',
-        '_d_in_cccl',
-        '_d_out_cccl',
-        '_init_cccl',
-        '_iter_size',
-        '_op_adapter',
-        '_op_cccl',
-        '_op_size',
-        '_value_size',
+        "_cfunc",
+        "_d_in_cccl",
+        "_d_out_cccl",
+        "_init_cccl",
+        "_iter_size",
+        "_op_adapter",
+        "_op_cccl",
+        "_op_size",
+        "_value_size",
     )
 
     def __init__(
@@ -991,20 +1034,27 @@ class _CachedScanReduce(_CachedAlgorithm):
         lib = _libcccl()
         self._cfunc = getattr(lib, c_func_name)
         self._cfunc.argtypes = [
-            BuildT,                               # build result (by value)
-            ctypes.c_void_p,                       # temp_storage
-            ctypes.POINTER(ctypes.c_size_t),       # temp_storage_nbytes
-            IterT,                                 # d_in
-            IterT,                                 # d_out
-            ctypes.c_uint64,                       # num_items
-            OpT,                                   # op
-            ValT,                                  # init_value
-            ctypes.c_void_p,                       # stream
+            BuildT,  # build result (by value)
+            ctypes.c_void_p,  # temp_storage
+            ctypes.POINTER(ctypes.c_size_t),  # temp_storage_nbytes
+            IterT,  # d_in
+            IterT,  # d_out
+            ctypes.c_uint64,  # num_items
+            OpT,  # op
+            ValT,  # init_value
+            ctypes.c_void_p,  # stream
         ]
         self._cfunc.restype = ctypes.c_int
 
     def __call__(
-        self, temp_storage, d_in, d_out, op, num_items, init_value, stream=None,
+        self,
+        temp_storage,
+        d_in,
+        d_out,
+        op,
+        num_items,
+        init_value,
+        stream=None,
     ):
         with self._call_lock:
             from cuda.compute._cccl_interop import (
@@ -1020,7 +1070,7 @@ class _CachedScanReduce(_CachedAlgorithm):
             op_adapter = make_op_adapter(op)
             _refresh_cached_op_state(op_adapter, self._op_cccl)
 
-            if hasattr(self._init_cccl, 'state') and init_value is not None:
+            if hasattr(self._init_cccl, "state") and init_value is not None:
                 if _is_host_array_like(init_value):
                     self._init_cccl.state = to_cccl_value_state(init_value)
 
@@ -1049,9 +1099,7 @@ class _CachedScanReduce(_CachedAlgorithm):
                 ctypes.c_void_p(stream_handle) if stream_handle else ctypes.c_void_p(0),
             )
             if err != 0:
-                raise RuntimeError(
-                    f"CCCL cached {self._spec_name} compute failed with error {err}"
-                )
+                raise RuntimeError(f"CCCL cached {self._spec_name} compute failed with error {err}")
             return temp_bytes.value
 
 
@@ -1063,22 +1111,30 @@ class _CachedSegmentedReduce(_CachedAlgorithm):
     """
 
     __slots__ = (
-        '_cfunc',
-        '_d_ends_cccl',
-        '_d_in_cccl',
-        '_d_out_cccl',
-        '_d_starts_cccl',
-        '_init_cccl',
-        '_iter_size',
-        '_op_adapter',
-        '_op_cccl',
-        '_op_size',
-        '_value_size',
+        "_cfunc",
+        "_d_ends_cccl",
+        "_d_in_cccl",
+        "_d_out_cccl",
+        "_d_starts_cccl",
+        "_init_cccl",
+        "_iter_size",
+        "_op_adapter",
+        "_op_cccl",
+        "_op_size",
+        "_value_size",
     )
 
     def __init__(
-        self, build, spec_name, d_in_cccl, d_out_cccl,
-        d_starts_cccl, d_ends_cccl, op_cccl, init_cccl, op_adapter,
+        self,
+        build,
+        spec_name,
+        d_in_cccl,
+        d_out_cccl,
+        d_starts_cccl,
+        d_ends_cccl,
+        op_cccl,
+        init_cccl,
+        op_adapter,
     ):
         super().__init__(build, spec_name)
         self._d_in_cccl = d_in_cccl
@@ -1101,15 +1157,31 @@ class _CachedSegmentedReduce(_CachedAlgorithm):
         lib = _libcccl()
         self._cfunc = lib.cccl_device_segmented_reduce
         self._cfunc.argtypes = [
-            BuildT, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
-            IterT, IterT, ctypes.c_uint64,
-            IterT, IterT, OpT, ValT, ctypes.c_void_p,
+            BuildT,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            IterT,
+            IterT,
+            ctypes.c_uint64,
+            IterT,
+            IterT,
+            OpT,
+            ValT,
+            ctypes.c_void_p,
         ]
         self._cfunc.restype = ctypes.c_int
 
     def __call__(
-        self, temp_storage, d_in, d_out, d_starts, d_ends, op,
-        num_segments, init_value, stream=None,
+        self,
+        temp_storage,
+        d_in,
+        d_out,
+        d_starts,
+        d_ends,
+        op,
+        num_segments,
+        init_value,
+        stream=None,
     ):
         with self._call_lock:
             from cuda.compute._cccl_interop import set_cccl_iterator_state, to_cccl_value_state
@@ -1139,7 +1211,8 @@ class _CachedSegmentedReduce(_CachedAlgorithm):
 
             err = self._cfunc(
                 self._build.struct,
-                ctypes.c_void_p(d_temp), ctypes.byref(temp_bytes),
+                ctypes.c_void_p(d_temp),
+                ctypes.byref(temp_bytes),
                 IterT.from_buffer_copy(self._d_in_cccl.as_bytes()),
                 IterT.from_buffer_copy(self._d_out_cccl.as_bytes()),
                 ctypes.c_uint64(num_segments),
@@ -1150,9 +1223,7 @@ class _CachedSegmentedReduce(_CachedAlgorithm):
                 ctypes.c_void_p(stream_handle) if stream_handle else ctypes.c_void_p(0),
             )
             if err != 0:
-                raise RuntimeError(
-                    f"CCCL cached {self._spec_name} compute failed with error {err}"
-                )
+                raise RuntimeError(f"CCCL cached {self._spec_name} compute failed with error {err}")
             return temp_bytes.value
 
 
@@ -1165,17 +1236,23 @@ class _CachedBinarySearch(_CachedAlgorithm):
     """
 
     __slots__ = (
-        '_cfunc',
-        '_d_data_cccl',
-        '_d_out_cccl',
-        '_d_values_cccl',
-        '_iter_size',
-        '_op_cccl',
-        '_op_size',
+        "_cfunc",
+        "_d_data_cccl",
+        "_d_out_cccl",
+        "_d_values_cccl",
+        "_iter_size",
+        "_op_cccl",
+        "_op_size",
     )
 
     def __init__(
-        self, build, spec_name, d_data_cccl, d_values_cccl, d_out_cccl, op_cccl,
+        self,
+        build,
+        spec_name,
+        d_data_cccl,
+        d_values_cccl,
+        d_out_cccl,
+        op_cccl,
     ):
         super().__init__(build, spec_name)
         self._d_data_cccl = d_data_cccl
@@ -1193,13 +1270,25 @@ class _CachedBinarySearch(_CachedAlgorithm):
         lib = _libcccl()
         self._cfunc = lib.cccl_device_binary_search
         self._cfunc.argtypes = [
-            BuildT, IterT, ctypes.c_uint64,
-            IterT, ctypes.c_uint64, IterT, OpT, ctypes.c_void_p,
+            BuildT,
+            IterT,
+            ctypes.c_uint64,
+            IterT,
+            ctypes.c_uint64,
+            IterT,
+            OpT,
+            ctypes.c_void_p,
         ]
         self._cfunc.restype = ctypes.c_int
 
     def __call__(
-        self, temp_storage, d_data, d_values, d_out, num_items, num_values,
+        self,
+        temp_storage,
+        d_data,
+        d_values,
+        d_out,
+        num_items,
+        num_values,
         stream=None,
     ):
         with self._call_lock:
@@ -1229,9 +1318,7 @@ class _CachedBinarySearch(_CachedAlgorithm):
                 ctypes.c_void_p(stream_handle) if stream_handle else ctypes.c_void_p(0),
             )
             if err != 0:
-                raise RuntimeError(
-                    f"CCCL cached {self._spec_name} compute failed with error {err}"
-                )
+                raise RuntimeError(f"CCCL cached {self._spec_name} compute failed with error {err}")
             return 0
 
 
@@ -1243,20 +1330,24 @@ class _CachedRadixSort(_CachedAlgorithm):
     """
 
     __slots__ = (
-        '_cfunc',
-        '_d_keys_in_cccl',
-        '_d_keys_out_cccl',
-        '_d_vals_in_cccl',
-        '_d_vals_out_cccl',
-        '_decomposer_cccl',
-        '_iter_size',
-        '_op_size',
+        "_cfunc",
+        "_d_keys_in_cccl",
+        "_d_keys_out_cccl",
+        "_d_vals_in_cccl",
+        "_d_vals_out_cccl",
+        "_decomposer_cccl",
+        "_iter_size",
+        "_op_size",
     )
 
     def __init__(
-        self, build, spec_name,
-        d_keys_in_cccl, d_keys_out_cccl,
-        d_vals_in_cccl, d_vals_out_cccl,
+        self,
+        build,
+        spec_name,
+        d_keys_in_cccl,
+        d_keys_out_cccl,
+        d_vals_in_cccl,
+        d_vals_out_cccl,
         decomposer_cccl,
     ):
         super().__init__(build, spec_name)
@@ -1276,16 +1367,32 @@ class _CachedRadixSort(_CachedAlgorithm):
         lib = _libcccl()
         self._cfunc = lib.cccl_device_radix_sort
         self._cfunc.argtypes = [
-            BuildT, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
-            IterT, IterT, IterT, IterT, OpT,
-            ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
-            ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.c_void_p,
+            BuildT,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            IterT,
+            IterT,
+            IterT,
+            IterT,
+            OpT,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_bool,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_void_p,
         ]
         self._cfunc.restype = ctypes.c_int
 
     def __call__(
-        self, temp_storage, d_keys_in, d_keys_out, d_vals_in, d_vals_out,
-        num_items, stream=None,
+        self,
+        temp_storage,
+        d_keys_in,
+        d_keys_out,
+        d_vals_in,
+        d_vals_out,
+        num_items,
+        stream=None,
     ):
         with self._call_lock:
             from cuda.compute._cccl_interop import set_cccl_iterator_state
@@ -1313,23 +1420,22 @@ class _CachedRadixSort(_CachedAlgorithm):
 
             err = self._cfunc(
                 self._build.struct,
-                ctypes.c_void_p(d_temp), ctypes.byref(temp_bytes),
+                ctypes.c_void_p(d_temp),
+                ctypes.byref(temp_bytes),
                 IterT.from_buffer_copy(self._d_keys_in_cccl.as_bytes()),
                 IterT.from_buffer_copy(self._d_keys_out_cccl.as_bytes()),
                 IterT.from_buffer_copy(self._d_vals_in_cccl.as_bytes()),
                 IterT.from_buffer_copy(self._d_vals_out_cccl.as_bytes()),
                 OpT.from_buffer_copy(self._decomposer_cccl.as_bytes()),
                 ctypes.c_size_t(num_items),
-                ctypes.c_int(0),       # begin_bit
-                ctypes.c_int(end_bit), # end_bit
+                ctypes.c_int(0),  # begin_bit
+                ctypes.c_int(end_bit),  # end_bit
                 ctypes.c_bool(False),  # is_overwrite_okay
                 ctypes.byref(selector),
                 ctypes.c_void_p(stream_handle) if stream_handle else ctypes.c_void_p(0),
             )
             if err != 0:
-                raise RuntimeError(
-                    f"CCCL cached {self._spec_name} compute failed with error {err}"
-                )
+                raise RuntimeError(f"CCCL cached {self._spec_name} compute failed with error {err}")
             return temp_bytes.value
 
 
@@ -1341,22 +1447,27 @@ class _CachedMergeSort(_CachedAlgorithm):
     """
 
     __slots__ = (
-        '_cfunc',
-        '_d_keys_in_cccl',
-        '_d_keys_out_cccl',
-        '_d_vals_in_cccl',
-        '_d_vals_out_cccl',
-        '_iter_size',
-        '_op_adapter',
-        '_op_cccl',
-        '_op_size',
+        "_cfunc",
+        "_d_keys_in_cccl",
+        "_d_keys_out_cccl",
+        "_d_vals_in_cccl",
+        "_d_vals_out_cccl",
+        "_iter_size",
+        "_op_adapter",
+        "_op_cccl",
+        "_op_size",
     )
 
     def __init__(
-        self, build, spec_name,
-        d_keys_in_cccl, d_vals_in_cccl,
-        d_keys_out_cccl, d_vals_out_cccl,
-        op_cccl, op_adapter,
+        self,
+        build,
+        spec_name,
+        d_keys_in_cccl,
+        d_vals_in_cccl,
+        d_keys_out_cccl,
+        d_vals_out_cccl,
+        op_cccl,
+        op_adapter,
     ):
         super().__init__(build, spec_name)
         self._d_keys_in_cccl = d_keys_in_cccl
@@ -1376,15 +1487,29 @@ class _CachedMergeSort(_CachedAlgorithm):
         lib = _libcccl()
         self._cfunc = lib.cccl_device_merge_sort
         self._cfunc.argtypes = [
-            BuildT, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
-            IterT, IterT, IterT, IterT,
-            ctypes.c_uint64, OpT, ctypes.c_void_p,
+            BuildT,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            IterT,
+            IterT,
+            IterT,
+            IterT,
+            ctypes.c_uint64,
+            OpT,
+            ctypes.c_void_p,
         ]
         self._cfunc.restype = ctypes.c_int
 
     def __call__(
-        self, temp_storage, d_keys_in, d_vals_in, d_keys_out, d_vals_out,
-        op, num_items, stream=None,
+        self,
+        temp_storage,
+        d_keys_in,
+        d_vals_in,
+        d_keys_out,
+        d_vals_out,
+        op,
+        num_items,
+        stream=None,
     ):
         with self._call_lock:
             from cuda.compute._cccl_interop import set_cccl_iterator_state
@@ -1411,7 +1536,8 @@ class _CachedMergeSort(_CachedAlgorithm):
 
             err = self._cfunc(
                 self._build.struct,
-                ctypes.c_void_p(d_temp), ctypes.byref(temp_bytes),
+                ctypes.c_void_p(d_temp),
+                ctypes.byref(temp_bytes),
                 IterT.from_buffer_copy(self._d_keys_in_cccl.as_bytes()),
                 IterT.from_buffer_copy(self._d_vals_in_cccl.as_bytes()),
                 IterT.from_buffer_copy(self._d_keys_out_cccl.as_bytes()),
@@ -1421,9 +1547,7 @@ class _CachedMergeSort(_CachedAlgorithm):
                 ctypes.c_void_p(stream_handle) if stream_handle else ctypes.c_void_p(0),
             )
             if err != 0:
-                raise RuntimeError(
-                    f"CCCL cached {self._spec_name} compute failed with error {err}"
-                )
+                raise RuntimeError(f"CCCL cached {self._spec_name} compute failed with error {err}")
             return temp_bytes.value
 
 
@@ -1435,23 +1559,29 @@ class _CachedUniqueByKey(_CachedAlgorithm):
     """
 
     __slots__ = (
-        '_cfunc',
-        '_d_count_cccl',
-        '_d_keys_in_cccl',
-        '_d_keys_out_cccl',
-        '_d_vals_in_cccl',
-        '_d_vals_out_cccl',
-        '_iter_size',
-        '_op_adapter',
-        '_op_cccl',
-        '_op_size',
+        "_cfunc",
+        "_d_count_cccl",
+        "_d_keys_in_cccl",
+        "_d_keys_out_cccl",
+        "_d_vals_in_cccl",
+        "_d_vals_out_cccl",
+        "_iter_size",
+        "_op_adapter",
+        "_op_cccl",
+        "_op_size",
     )
 
     def __init__(
-        self, build, spec_name,
-        d_keys_in_cccl, d_vals_in_cccl,
-        d_keys_out_cccl, d_vals_out_cccl, d_count_cccl,
-        op_cccl, op_adapter,
+        self,
+        build,
+        spec_name,
+        d_keys_in_cccl,
+        d_vals_in_cccl,
+        d_keys_out_cccl,
+        d_vals_out_cccl,
+        d_count_cccl,
+        op_cccl,
+        op_adapter,
     ):
         super().__init__(build, spec_name)
         self._d_keys_in_cccl = d_keys_in_cccl
@@ -1472,15 +1602,31 @@ class _CachedUniqueByKey(_CachedAlgorithm):
         lib = _libcccl()
         self._cfunc = lib.cccl_device_unique_by_key
         self._cfunc.argtypes = [
-            BuildT, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
-            IterT, IterT, IterT, IterT, IterT, OpT,
-            ctypes.c_size_t, ctypes.c_void_p,
+            BuildT,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            IterT,
+            IterT,
+            IterT,
+            IterT,
+            IterT,
+            OpT,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
         ]
         self._cfunc.restype = ctypes.c_int
 
     def __call__(
-        self, temp_storage, d_keys_in, d_vals_in, d_keys_out, d_vals_out,
-        d_count, op, num_items, stream=None,
+        self,
+        temp_storage,
+        d_keys_in,
+        d_vals_in,
+        d_keys_out,
+        d_vals_out,
+        d_count,
+        op,
+        num_items,
+        stream=None,
     ):
         with self._call_lock:
             from cuda.compute._cccl_interop import set_cccl_iterator_state
@@ -1508,7 +1654,8 @@ class _CachedUniqueByKey(_CachedAlgorithm):
 
             err = self._cfunc(
                 self._build.struct,
-                ctypes.c_void_p(d_temp), ctypes.byref(temp_bytes),
+                ctypes.c_void_p(d_temp),
+                ctypes.byref(temp_bytes),
                 IterT.from_buffer_copy(self._d_keys_in_cccl.as_bytes()),
                 IterT.from_buffer_copy(self._d_vals_in_cccl.as_bytes()),
                 IterT.from_buffer_copy(self._d_keys_out_cccl.as_bytes()),
@@ -1519,11 +1666,8 @@ class _CachedUniqueByKey(_CachedAlgorithm):
                 ctypes.c_void_p(stream_handle) if stream_handle else ctypes.c_void_p(0),
             )
             if err != 0:
-                raise RuntimeError(
-                    f"CCCL cached {self._spec_name} compute failed with error {err}"
-                )
+                raise RuntimeError(f"CCCL cached {self._spec_name} compute failed with error {err}")
             return temp_bytes.value
-
 
     # ---------------------------------------------------------------------------
     # Public API — called from cccl_precompile.py
@@ -1582,7 +1726,7 @@ def _cached_spec_name_set() -> frozenset[str]:
             fname = path.name
             if fname.startswith(prefix) and fname.endswith(suffix):
                 # Filename: {prefix}{spec_name}-{cubin_hash_12}.cache
-                rest = fname[len(prefix):-len(suffix)]
+                rest = fname[len(prefix) : -len(suffix)]
                 # spec_name is everything before the last '-' (the hash)
                 dash_idx = rest.rfind("-")
                 if dash_idx > 0:
@@ -1608,7 +1752,7 @@ def clear_cache() -> int:
     count = 0
     try:
         for path in cache_dir.iterdir():
-            if path.suffix == '.cache':
+            if path.suffix == ".cache":
                 path.unlink(missing_ok=True)
                 count += 1
     except OSError:
@@ -1626,7 +1770,7 @@ def cache_stats() -> dict[str, Any]:
             "total_bytes": 0,
             "enabled": _cccl_cache_enabled(),
         }
-    files = [f for f in cache_dir.iterdir() if f.suffix == '.cache']
+    files = [f for f in cache_dir.iterdir() if f.suffix == ".cache"]
     return {
         "directory": str(cache_dir),
         "file_count": len(files),

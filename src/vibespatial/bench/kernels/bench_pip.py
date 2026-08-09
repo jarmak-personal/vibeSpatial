@@ -5,6 +5,7 @@ Requires cuda-bench: pip install cuda-bench[cu12]
 Usage (standalone):
     python bench_pip.py --scale 100000 --output-json results.json
 """
+
 from __future__ import annotations
 
 import argparse
@@ -38,9 +39,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     polygons = np.resize(
         np.asarray(
-            list(generate_polygons(
-                SyntheticSpec("polygon", "regular-grid", count=polygon_base_count, seed=1, vertices=5)
-            ).geometries),
+            list(
+                generate_polygons(
+                    SyntheticSpec(
+                        "polygon", "regular-grid", count=polygon_base_count, seed=1, vertices=5
+                    )
+                ).geometries
+            ),
             dtype=object,
         ),
         args.scale,
@@ -64,9 +69,7 @@ def main(argv: list[str] | None = None) -> int:
     b = bench.register(pip_bench)
     b.add_int64_axis("NumElements", [args.scale])
 
-    bench.run_all_benchmarks(
-        ["--json", str(args.output_json)]
-    )
+    bench.run_all_benchmarks(["--json", str(args.output_json)])
     return 0
 
 

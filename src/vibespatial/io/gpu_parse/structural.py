@@ -10,6 +10,7 @@ nesting structure of the document.
 Both functions operate on device-resident byte arrays and return
 device-resident results with zero host materialization.
 """
+
 from __future__ import annotations
 
 import ctypes
@@ -99,10 +100,12 @@ from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 # Default JSON depth source for warmup (most common case)
 _DEFAULT_DEPTH_SOURCE = _build_depth_source("{[", "}]")
 
-request_nvrtc_warmup([
-    ("structural-quote-toggle", _QUOTE_TOGGLE_SOURCE, _QUOTE_TOGGLE_NAMES),
-    ("structural-depth-{[-}]", _DEFAULT_DEPTH_SOURCE, _DEPTH_DELTAS_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("structural-quote-toggle", _QUOTE_TOGGLE_SOURCE, _QUOTE_TOGGLE_NAMES),
+        ("structural-depth-{[-}]", _DEFAULT_DEPTH_SOURCE, _DEPTH_DELTAS_NAMES),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +168,9 @@ def quote_parity(d_bytes: cp.ndarray) -> cp.ndarray:
 
     # Compile (cached via SHA1 of source)
     kernels = compile_kernel_group(
-        "structural-quote-toggle", _QUOTE_TOGGLE_SOURCE, _QUOTE_TOGGLE_NAMES,
+        "structural-quote-toggle",
+        _QUOTE_TOGGLE_SOURCE,
+        _QUOTE_TOGGLE_NAMES,
     )
 
     # Allocate toggle output on device
@@ -270,9 +275,7 @@ def bracket_depth(
             f"got {len(open_chars)} and {len(close_chars)}"
         )
     if len(open_chars) > 8:
-        raise ValueError(
-            f"Maximum 8 bracket characters supported, got {len(open_chars)}"
-        )
+        raise ValueError(f"Maximum 8 bracket characters supported, got {len(open_chars)}")
 
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
@@ -287,7 +290,8 @@ def bracket_depth(
 
     # Launch with occupancy-based config
     grid, block = runtime.launch_config(
-        kernels["compute_depth_deltas"], n,
+        kernels["compute_depth_deltas"],
+        n,
     )
     runtime.launch(
         kernels["compute_depth_deltas"],

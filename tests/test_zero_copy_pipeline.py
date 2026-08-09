@@ -77,6 +77,7 @@ def test_convex_hull_gpu_has_no_raw_cupy_scalar_syncs() -> None:
 class TestBuildDeviceResidentOwned:
     """Tests for build_device_resident_owned factory."""
 
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
     def test_basic_construction(self):
         """build_device_resident_owned -> to_shapely produces correct geometries."""
         from vibespatial.geometry.owned import build_device_resident_owned
@@ -128,6 +129,7 @@ class TestBuildDeviceResidentOwned:
         assert geoms[2].x == 5.0
         assert geoms[2].y == 6.0
 
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
     def test_family_has_rows_device_resident_polygon(self):
         """family_has_rows returns True for device-resident Polygon family.
 
@@ -400,6 +402,7 @@ class TestPropertyKernels:
         assert not result[0]
         assert result[1]
 
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
     def test_get_xy_device_resident_no_host_materialize(self):
         """get_x/y_owned reads from device buffers without populating host stubs."""
         from vibespatial.constructive.properties import get_x_owned, get_y_owned
@@ -731,7 +734,8 @@ class TestZeroCopyChains:
 
     Row counts are chosen to exceed AUTO crossover thresholds so that
     the adaptive dispatcher selects GPU for each operation:
-    - COARSE (translate, reverse, simplify, segmentize, convex_hull, envelope): >= 1,000 rows
+    - COARSE (translate, reverse, simplify, convex_hull, envelope): >= 1,000 rows
+    - CONSTRUCTIVE (segmentize and geometry-producing kernels): policy threshold
     - METRIC (centroid): >= 5,000 rows
     - CONSTRUCTIVE (orient, boundary): >= 50,000 rows — too high for fast
       tests, so those operations use _owned calls with explicit GPU dispatch
@@ -812,9 +816,9 @@ class TestZeroCopyChains:
     def test_segmentize_simplify_reverse(self):
         """segmentize -> simplify -> reverse keeps geometry on device.
 
-        Segmentize has a dynamic output-coordinate count, so it admits one
-        named scalar allocation fence.  The chain must not materialize
-        coordinates or row metadata.
+        Segmentize has a dynamic output-coordinate count, so it emits one
+        exact allocation packet after all family scans. The chain must not
+        materialize coordinates or row metadata.
         """
         from vibespatial.api.geometry_array import GeometryArray
         from vibespatial.runtime.execution_trace import assert_no_transfers
@@ -841,10 +845,10 @@ class TestZeroCopyChains:
         assert [(transfer.trigger, transfer.reason) for transfer in d2h] == [
             (
                 "cuda-runtime-copy-async",
-                "segmentize output-coordinate allocation fence",
+                "segmentize exact output allocation packet",
             )
         ]
-        assert sum(transfer.bytes_transferred for transfer in d2h) <= 8
+        assert sum(transfer.bytes_transferred for transfer in d2h) <= 16
 
         assert rev._owned is not None
         assert rev._owned.residency == Residency.DEVICE

@@ -274,14 +274,21 @@ def test_clip_then_buffer_gpu_stays_device_resident_until_materialization() -> N
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
 
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+
     points = from_shapely_geometries([Point(0, 0), Point(1, 1), Point(3, 3), Point(1.5, 0.5)])
     clipped = clip_points_rect_owned(points, 0.0, 0.0, 1.5, 1.5, dispatch_mode=ExecutionMode.GPU)
+    reset_d2h_transfer_count()
     buffered = point_buffer_owned_array(clipped, 1.0, quad_segs=1, dispatch_mode=ExecutionMode.GPU)
+    runtime_reasons = {event.reason for event in get_d2h_transfer_events(clear=True)}
 
     assert clipped.residency is Residency.DEVICE
     assert buffered.residency is Residency.DEVICE
     assert clipped.families[next(iter(clipped.families))].host_materialized is False
     assert buffered.families[next(iter(buffered.families))].host_materialized is False
+    assert "point buffer validity admission scalar fence" not in runtime_reasons
+    assert "point buffer family-tag admission scalar fence" not in runtime_reasons
+    assert "point buffer empty-point admission scalar fence" not in runtime_reasons
 
     expected = [
         Polygon(((1.0, 0.0), (0.0, -1.0), (-1.0, 0.0), (0.0, 1.0), (1.0, 0.0))),
@@ -289,6 +296,33 @@ def test_clip_then_buffer_gpu_stays_device_resident_until_materialization() -> N
         Polygon(((2.5, 0.5), (1.5, -0.5), (0.5, 0.5), (1.5, 1.5), (2.5, 0.5))),
     ]
     _assert_geometries_equal(buffered.to_shapely(), expected)
+
+
+@pytest.mark.gpu
+def test_public_centroid_buffer_preserves_point_trust_metadata() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.io.geoarrow import geoseries_from_owned
+
+    polygons = from_shapely_geometries(
+        [
+            Polygon(((0, 0), (2, 0), (2, 2), (0, 2), (0, 0))),
+            Polygon(((3, 0), (5, 0), (5, 2), (3, 2), (3, 0))),
+        ],
+        residency=Residency.DEVICE,
+    )
+    series = geoseries_from_owned(polygons, crs="EPSG:3857")
+
+    reset_d2h_transfer_count()
+    buffered = series.centroid.buffer(1.0, quad_segs=1)
+    runtime_reasons = {event.reason for event in get_d2h_transfer_events(clear=True)}
+
+    assert buffered.values._owned.residency is Residency.DEVICE
+    assert "point buffer validity admission scalar fence" not in runtime_reasons
+    assert "point buffer family-tag admission scalar fence" not in runtime_reasons
+    assert "point buffer empty-point admission scalar fence" not in runtime_reasons
 
 
 @pytest.mark.gpu
@@ -310,11 +344,37 @@ def test_point_owned_from_xy_device_keeps_structural_metadata_on_device() -> Non
     assert owned._validity is None
     assert owned._tags is None
     assert owned._family_row_offsets is None
+    assert owned.device_state.trusted_all_valid is True
+    assert owned.device_state.trusted_homogeneous_family is GeometryFamily.POINT
+    assert owned.device_state.trusted_all_non_empty is True
 
     point_dev_buf = owned.device_state.families[GeometryFamily.POINT]
     assert isinstance(point_dev_buf.geometry_offsets, cp.ndarray)
     assert isinstance(point_dev_buf.empty_mask, cp.ndarray)
     assert isinstance(point_dev_buf.bounds, cp.ndarray)
+
+
+@pytest.mark.gpu
+def test_device_take_preserves_point_trust_metadata() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    owned = point_owned_from_xy_device(
+        np.asarray([0.0, 2.0, 4.0], dtype=np.float64),
+        np.asarray([1.0, 3.0, 5.0], dtype=np.float64),
+    )
+
+    subset = owned.take(cp.asarray([2, 0], dtype=cp.int64))
+
+    assert subset.residency is Residency.DEVICE
+    assert subset.device_state is not None
+    assert subset.device_state.trusted_all_valid is True
+    assert subset.device_state.trusted_homogeneous_family is GeometryFamily.POINT
+    assert subset.device_state.trusted_all_non_empty is True
 
 
 @pytest.mark.gpu

@@ -8,7 +8,9 @@ from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 # NVRTC kernel source
 # ---------------------------------------------------------------------------
 
-_AFFINE_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_AFFINE_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + r"""
 extern "C" __global__ void affine_transform_coords(
     const double* __restrict__ x_in,
     const double* __restrict__ y_in,
@@ -28,6 +30,7 @@ extern "C" __global__ void affine_transform_coords(
     y_out[i] = d * xi + e * yi + yoff;
 }}
 """
+)
 _AFFINE_KERNEL_NAMES = ("affine_transform_coords",)
 _AFFINE_FP64 = _AFFINE_KERNEL_SOURCE.format(compute_type="double")
 _AFFINE_FP32 = _AFFINE_KERNEL_SOURCE.format(compute_type="float")

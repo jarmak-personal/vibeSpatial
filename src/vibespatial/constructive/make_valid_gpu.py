@@ -5,18 +5,19 @@ contiguous batch and processed through the GPU repair pipeline together,
 eliminating the per-polygon Python loop. shapely.polygonize and
 shapely.make_valid are no longer used in the primary GPU path.
 
-Pipeline stages (batched across all invalid polygons):
-  Phase A: GPU self-intersection detection (extract ring segments, classify pairs)
-  Phase B: Simple repair kernels (close rings, remove duplicate vertices, fix orientation)
-  Phase C: Self-intersection splitting (count/scatter split events, sort, dedup, rebuild)
-  Phase D: Re-polygonization (half-edges, face walk, face containment, assembly)
-  Phase E: Output assembly (build OwnedGeometryArray, convert to Shapely)
+Pipeline stages (batched across invalid polygon rows):
+  Phase A: capacity-backed ring closure, duplicate removal, and orientation
+  Phase B: canonical OGC device validity rowset
+  Phase C: shared overlay sweep, streamed split events, and complete-row paging
+  Phase D: positive bounded-face polygonization and sparse repaired-row scatter
+  Phase E: native area/lower-dimensional composition for terminal export
 
 All kernels use fp64 compute (CONSTRUCTIVE class per ADR-0002).
 Tier 1: NVRTC for geometry-specific work.
 Tier 3a: CCCL for scan/sort/compact.
 Tier 2: CuPy for element-wise ops.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -29,51 +30,40 @@ from vibespatial.constructive.make_valid_gpu_kernels import (
 )
 from vibespatial.cuda.cccl_precompile import request_warmup
 from vibespatial.cuda.cccl_primitives import (
-    compact_indices,
     exclusive_sum,
     segmented_reduce_sum,
-    sort_pairs,
 )
 
-request_warmup([
-    "exclusive_scan_i32", "exclusive_scan_i64",
-    "select_i32", "select_i64",
-    "radix_sort_i32_i32", "radix_sort_u64_i32",
-    "segmented_reduce_sum_f64",
-])
+request_warmup(
+    [
+        "exclusive_scan_i32",
+        "exclusive_scan_i64",
+        "select_i32",
+        "select_i64",
+        "radix_sort_i32_i32",
+        "radix_sort_u64_i32",
+        "segmented_reduce_sum_f64",
+    ]
+)
 from vibespatial.cuda._runtime import (  # noqa: E402
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
     compile_kernel_group,
-    count_scatter_total,
     get_cuda_runtime,
 )
-from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema  # noqa: E402
+from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
 from vibespatial.geometry.owned import (  # noqa: E402
     FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
+    DeviceFixedGeometrySizeMetadata,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
-    concat_owned_scatter,
-)
-from vibespatial.overlay.assemble import (  # noqa: E402
-    _build_polygon_output_from_faces_gpu,
-)
-from vibespatial.overlay.gpu import (  # noqa: E402
-    _gpu_face_walk,
-    build_gpu_half_edge_graph,
-)
-from vibespatial.overlay.types import (  # noqa: E402
-    AtomicEdgeDeviceState,
-    AtomicEdgeTable,
-    OverlayFaceDeviceState,
-    OverlayFaceTable,
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
 from vibespatial.runtime.adaptive import plan_dispatch_selection  # noqa: E402
+from vibespatial.runtime.crossover import estimate_segment_pair_work_from_owned  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
-from vibespatial.runtime.residency import Residency  # noqa: E402
 
 try:
     import cupy as cp
@@ -82,9 +72,11 @@ except ModuleNotFoundError:  # pragma: no cover
 
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("make-valid-repair", _REPAIR_KERNEL_SOURCE, _REPAIR_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("make-valid-repair", _REPAIR_KERNEL_SOURCE, _REPAIR_KERNEL_NAMES),
+    ]
+)
 
 
 def _compile_repair_kernels():
@@ -94,38 +86,30 @@ def _compile_repair_kernels():
 def _planned_make_valid_runtime_selection(
     *,
     kernel_name: str,
-    row_count: int,
+    owned: OwnedGeometryArray,
+    selected_row_count: int,
     reason: str,
 ) -> RuntimeSelection:
     selection = plan_dispatch_selection(
         kernel_name=kernel_name,
         kernel_class=KernelClass.CONSTRUCTIVE,
-        row_count=row_count,
+        row_count=selected_row_count,
+        work_estimate=estimate_segment_pair_work_from_owned(
+            owned,
+            selected_row_count=selected_row_count,
+            output_row_count=selected_row_count,
+            primary_unit_name="make-valid-repair-segment-pair",
+        ),
         requested_mode=ExecutionMode.GPU,
         gpu_available=cp is not None,
     )
     return replace(selection.runtime_selection, reason=reason)
 
 
-def _make_valid_int_scalar(value: object, *, reason: str) -> int:
-    host = get_cuda_runtime().copy_device_to_host(
-        cp.asarray(value).reshape(1),
-        reason=reason,
-    )
-    return int(np.asarray(host).reshape(-1)[0])
-
-
-def _make_valid_bool_scalar(value: object, *, reason: str) -> bool:
-    host = get_cuda_runtime().copy_device_to_host(
-        cp.asarray(value).reshape(1),
-        reason=reason,
-    )
-    return bool(np.asarray(host).reshape(-1)[0])
-
-
 # ---------------------------------------------------------------------------
 # Phase B: Simple repair operations
 # ---------------------------------------------------------------------------
+
 
 def _gpu_close_rings(
     d_x: cp.ndarray,
@@ -147,44 +131,59 @@ def _gpu_close_rings(
     grid, block = runtime.launch_config(kernels["check_ring_closure"], ring_count)
     runtime.launch(
         kernels["check_ring_closure"],
-        grid=grid, block=block,
+        grid=grid,
+        block=block,
         params=(
             (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_needs_close), ring_count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         ),
     )
-
-    # Early exit if no rings need closure.
-    if _make_valid_int_scalar(
-        cp.count_nonzero(d_needs_close),
-        reason="make-valid ring-closure count scalar fence",
-    ) == 0:
-        return d_x, d_y, d_ring_offsets
 
     # --- Step 2: Compute new ring sizes and offsets on device (Tier 2: CuPy) ---
     d_sizes = d_ring_offsets[1:] - d_ring_offsets[:-1]
     d_new_sizes = d_sizes + d_needs_close
     d_new_offsets = cp.zeros(ring_count + 1, dtype=cp.int32)
     d_new_offsets[1:] = cp.cumsum(d_new_sizes)
-    total_new = _make_valid_int_scalar(
-        d_new_offsets[-1],
-        reason="make-valid ring-closure output-size scalar fence",
-    )
 
-    # --- Step 3: Copy vertices + append closure vertex where needed (Tier 1) ---
-    d_out_x = cp.empty(total_new, dtype=cp.float64)
-    d_out_y = cp.empty(total_new, dtype=cp.float64)
+    # --- Step 3: Copy into a capacity-backed ring carrier (Tier 1) ---
+    # Every ring can add at most one coordinate. The device offsets carry the
+    # logical coordinate length, so allocation never needs a host total.
+    coordinate_capacity = int(d_x.size) + ring_count
+    d_out_x = cp.empty(coordinate_capacity, dtype=cp.float64)
+    d_out_y = cp.empty(coordinate_capacity, dtype=cp.float64)
 
     grid, block = runtime.launch_config(kernels["close_rings"], ring_count)
     runtime.launch(
         kernels["close_rings"],
-        grid=grid, block=block,
+        grid=grid,
+        block=block,
         params=(
-            (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_needs_close),
-             ptr(d_new_offsets), ptr(d_out_x), ptr(d_out_y), ring_count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(d_x),
+                ptr(d_y),
+                ptr(d_ring_offsets),
+                ptr(d_needs_close),
+                ptr(d_new_offsets),
+                ptr(d_out_x),
+                ptr(d_out_y),
+                ring_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         ),
     )
     return d_out_x, d_out_y, d_new_offsets
@@ -201,7 +200,7 @@ def _gpu_remove_duplicate_vertices(
 
     Tier 1: flag_duplicate_vertices NVRTC kernel (1 thread/vertex).
     Tier 2: CuPy searchsorted for vertex-to-ring mapping, fancy indexing for compaction.
-    Tier 3a: CCCL compact_indices for keep-mask compaction, segmented_reduce_sum
+    Tier 3a: CCCL scan plus segmented_reduce_sum for capacity-backed compaction
     for per-ring kept counts.  All device-resident, no host copy.
     """
     runtime = get_cuda_runtime()
@@ -212,45 +211,85 @@ def _gpu_remove_duplicate_vertices(
 
     # --- GPU-resident vertex-to-ring mapping (Tier 2: CuPy searchsorted) ---
     d_vertex_ids = cp.arange(vertex_count, dtype=cp.int32)
-    d_vertex_ring_ids = cp.searchsorted(
-        d_ring_offsets[1:], d_vertex_ids, side="right"
-    ).astype(cp.int32)
+    d_vertex_ring_ids = cp.searchsorted(d_ring_offsets[1:], d_vertex_ids, side="right").astype(
+        cp.int32
+    )
 
     # --- Flag duplicates via NVRTC kernel (Tier 1) ---
     d_keep = cp.empty(vertex_count, dtype=cp.uint8)
     grid, block = runtime.launch_config(kernels["flag_duplicate_vertices"], vertex_count)
     runtime.launch(
         kernels["flag_duplicate_vertices"],
-        grid=grid, block=block,
+        grid=grid,
+        block=block,
         params=(
-            (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_vertex_ring_ids),
-             ptr(d_keep), vertex_count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(d_x),
+                ptr(d_y),
+                ptr(d_ring_offsets),
+                ptr(d_vertex_ring_ids),
+                ptr(d_keep),
+                ring_count,
+                vertex_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+            ),
         ),
     )
-    # Early exit if no duplicates found.
-    kept_count = _make_valid_int_scalar(
-        cp.count_nonzero(d_keep),
-        reason="make-valid duplicate-vertex kept-count scalar fence",
+    # --- Capacity-backed compaction (Tier 3a scan + Tier 1 scatter) ---
+    # Retain coordinate capacity and let rebuilt ring offsets define the active
+    # prefix. This avoids a kept-count allocation fence and remains consumable
+    # by downstream offset-shaped geometry kernels.
+    d_keep_i32 = d_keep.astype(cp.int32)
+    d_keep_positions = exclusive_sum(d_keep_i32, synchronize=False)
+    new_x = cp.empty(vertex_count, dtype=cp.float64)
+    new_y = cp.empty(vertex_count, dtype=cp.float64)
+    scatter_kernel = kernels["scatter_kept_vertices"]
+    scatter_grid, scatter_block = runtime.launch_config(
+        scatter_kernel,
+        vertex_count,
     )
-    if kept_count == vertex_count:
-        return d_x, d_y, d_ring_offsets
-
-    # --- GPU-resident compaction (Tier 3a: CCCL compact_indices) ---
-    compact_result = compact_indices(d_keep)
-    d_kept_indices = compact_result.values.astype(cp.int64)
-
-    new_x = d_x[d_kept_indices]
-    new_y = d_y[d_kept_indices]
+    runtime.launch(
+        scatter_kernel,
+        grid=scatter_grid,
+        block=scatter_block,
+        params=(
+            (
+                ptr(d_x),
+                ptr(d_y),
+                ptr(d_keep),
+                ptr(d_keep_positions),
+                ptr(new_x),
+                ptr(new_y),
+                vertex_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
 
     # --- GPU-resident ring offset rebuild ---
     # Per-ring kept count via segmented reduce (Tier 3a: CCCL)
-    d_keep_i32 = d_keep.astype(cp.int32)
     d_starts = d_ring_offsets[:-1]
     d_ends = d_ring_offsets[1:]
     seg_result = segmented_reduce_sum(
-        d_keep_i32, d_starts, d_ends,
+        d_keep_i32,
+        d_starts,
+        d_ends,
         num_segments=ring_count,
         synchronize=False,
     )
@@ -295,12 +334,18 @@ def _gpu_fix_ring_orientation(
         grid, block = runtime.launch_config(kernels["compute_ring_shoelace"], safe_count)
         runtime.launch(
             kernels["compute_ring_shoelace"],
-            grid=grid, block=block,
+            grid=grid,
+            block=block,
             params=(
-                (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_cross),
-                 ring_count, safe_count),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+                (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_cross), ring_count, safe_count),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
 
@@ -312,7 +357,9 @@ def _gpu_fix_ring_orientation(
     d_starts = d_ring_offsets[:-1]
     d_ends = d_ring_offsets[1:]
     seg_result = segmented_reduce_sum(
-        d_cross, d_starts, d_ends,
+        d_cross,
+        d_starts,
+        d_ends,
         num_segments=ring_count,
         synchronize=False,
     )
@@ -320,34 +367,33 @@ def _gpu_fix_ring_orientation(
 
     # --- Step 3: Classify exterior vs hole and build reversal mask (Tier 2: CuPy) ---
     d_ring_ids = cp.arange(ring_count, dtype=cp.int32)
-    d_poly_of_ring = cp.searchsorted(
-        d_geom_offsets[1:], d_ring_ids, side="right"
-    ).astype(cp.int32)
+    d_poly_of_ring = cp.searchsorted(d_geom_offsets[1:], d_ring_ids, side="right").astype(cp.int32)
     d_first_ring_of_poly = d_geom_offsets[d_poly_of_ring]
-    d_is_exterior = (d_ring_ids == d_first_ring_of_poly)
+    d_is_exterior = d_ring_ids == d_first_ring_of_poly
 
     # Exterior should be CCW (positive area); hole should be CW (negative area)
     d_needs_reverse = (
-        (d_is_exterior & (d_ring_areas < 0))
-        | (~d_is_exterior & (d_ring_areas > 0))
+        (d_is_exterior & (d_ring_areas < 0)) | (~d_is_exterior & (d_ring_areas > 0))
     ).astype(cp.uint8)
 
-    # Early exit if no rings need reversal.
-    if _make_valid_int_scalar(
-        cp.count_nonzero(d_needs_reverse),
-        reason="make-valid ring-orientation reversal-count scalar fence",
-    ) == 0:
-        return d_x, d_y
-
-    # --- Step 4: Reverse coordinates for wrong-orientation rings (Tier 1: NVRTC) ---
+    # --- Step 4: Reverse only flagged rings (Tier 1: NVRTC) ---
+    # The kernel already treats the mask as its admission carrier. Launching it
+    # over ring rows is cheaper than synchronizing a device reduction merely to
+    # discover that the mask is empty.
     grid, block = runtime.launch_config(kernels["reverse_ring_coords"], ring_count)
     runtime.launch(
         kernels["reverse_ring_coords"],
-        grid=grid, block=block,
+        grid=grid,
+        block=block,
         params=(
             (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_needs_reverse), ring_count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         ),
     )
     # No explicit sync needed -- caller will either launch more same-stream
@@ -359,548 +405,64 @@ def _gpu_fix_ring_orientation(
 # Phase A + C: Self-intersection detection and splitting
 # ---------------------------------------------------------------------------
 
-def _extract_ring_segments_gpu(
-    d_x: cp.ndarray,
-    d_y: cp.ndarray,
-    d_ring_offsets: cp.ndarray,
-    ring_count: int,
-    kernels: dict,
-) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
-    """Extract consecutive vertex pairs as flat segment table from ring coords.
-
-    GPU-resident: seg_counts via CuPy element-wise (Tier 2), seg_offsets via
-    CuPy cumsum (Tier 4), then one NVRTC kernel thread per segment (Tier 1).
-
-    Returns (seg_x0, seg_y0, seg_x1, seg_y1, seg_ring_ids) on device.
-    """
-    runtime = get_cuda_runtime()
-    ptr = runtime.pointer
-
-    # --- Compute seg_counts and seg_offsets on device (Tier 2: CuPy) ---
-    d_ring_sizes = d_ring_offsets[1:] - d_ring_offsets[:-1]
-    d_seg_counts = cp.maximum(d_ring_sizes - 1, 0).astype(cp.int32)
-    d_seg_offsets = cp.zeros(ring_count + 1, dtype=cp.int32)
-    d_seg_offsets[1:] = cp.cumsum(d_seg_counts)
-    total_segments = int(d_seg_offsets[-1])
-
-    if total_segments == 0:
-        empty = cp.empty(0, dtype=cp.float64)
-        return empty, empty, empty, empty, cp.empty(0, dtype=cp.int32)
-
-    d_seg_x0 = cp.empty(total_segments, dtype=cp.float64)
-    d_seg_y0 = cp.empty(total_segments, dtype=cp.float64)
-    d_seg_x1 = cp.empty(total_segments, dtype=cp.float64)
-    d_seg_y1 = cp.empty(total_segments, dtype=cp.float64)
-    d_seg_ring_ids = cp.empty(total_segments, dtype=cp.int32)
-
-    kernel = kernels["extract_ring_segments"]
-    grid, block = runtime.launch_config(kernel, total_segments)
-    runtime.launch(
-        kernel,
-        grid=grid, block=block,
-        params=(
-            (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_seg_offsets),
-             ptr(d_seg_x0), ptr(d_seg_y0), ptr(d_seg_x1), ptr(d_seg_y1),
-             ptr(d_seg_ring_ids), ring_count, total_segments),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
-        ),
-    )
-
-    return d_seg_x0, d_seg_y0, d_seg_x1, d_seg_y1, d_seg_ring_ids
-
-
-def _detect_intra_ring_intersections(
-    d_seg_x0: cp.ndarray,
-    d_seg_y0: cp.ndarray,
-    d_seg_x1: cp.ndarray,
-    d_seg_y1: cp.ndarray,
-    d_seg_ring_ids: cp.ndarray,
-    total_segments: int,
-    ring_count: int,
-    d_ring_offsets: cp.ndarray,
-    kernels: dict,
-) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
-    """Detect self-intersections within each ring using segment pair classification.
-
-    GPU-resident: per-ring segment counts via cp.bincount (Tier 2), pair counts
-    via CuPy element-wise (Tier 2), pair offsets via CuPy cumsum (Tier 4),
-    pair generation via NVRTC kernel (Tier 1), classification via
-    classify_segment_pairs_v2 (Tier 1).
-
-    Returns (seg_a_ids, seg_b_ids, kinds, point_x, point_y) as device
-    (CuPy) arrays.  Only returns pairs with kind != 0 (actual intersections).
-    """
-    if total_segments < 2:
-        empty_i32 = cp.empty(0, dtype=cp.int32)
-        empty_f64 = cp.empty(0, dtype=cp.float64)
-        empty_i8 = cp.empty(0, dtype=cp.int8)
-        return empty_i32, empty_i32, empty_i8, empty_f64, empty_f64
-
-    runtime = get_cuda_runtime()
-    ptr = runtime.pointer
-
-    # --- GPU-resident segment offset table per ring (Tier 2: CuPy) ---
-    d_ring_seg_counts = cp.bincount(d_seg_ring_ids, minlength=ring_count).astype(cp.int32)
-    d_seg_offsets = cp.zeros(ring_count + 1, dtype=cp.int32)
-    d_seg_offsets[1:] = cp.cumsum(d_ring_seg_counts)
-
-    # --- Compute pair counts per ring on device (Tier 2: CuPy) ---
-    # For ring with k segments: pairs = k*(k-1)/2 - k (all pairs minus adjacent minus wrap)
-    d_k = d_ring_seg_counts.astype(cp.int64)
-    d_pair_counts = cp.maximum(d_k * (d_k - 1) // 2 - d_k, 0).astype(cp.int32)
-
-    d_pair_offsets = cp.zeros(ring_count + 1, dtype=cp.int32)
-    d_pair_offsets[1:] = cp.cumsum(d_pair_counts)
-    total_pairs = int(d_pair_offsets[-1])
-
-    if total_pairs == 0:
-        empty_i32 = cp.empty(0, dtype=cp.int32)
-        empty_f64 = cp.empty(0, dtype=cp.float64)
-        empty_i8 = cp.empty(0, dtype=cp.int8)
-        return empty_i32, empty_i32, empty_i8, empty_f64, empty_f64
-
-    # --- Generate pairs on GPU (Tier 1: NVRTC, 1 thread per pair) ---
-    d_left_lookup = cp.empty(total_pairs, dtype=cp.int32)
-    d_right_lookup = cp.empty(total_pairs, dtype=cp.int32)
-
-    pair_kernel = kernels["generate_intra_ring_pairs"]
-    grid_gen, block_gen = runtime.launch_config(pair_kernel, total_pairs)
-    runtime.launch(
-        pair_kernel,
-        grid=grid_gen, block=block_gen,
-        params=(
-            (ptr(d_pair_offsets), ptr(d_seg_offsets),
-             ptr(d_ring_seg_counts), ptr(d_left_lookup),
-             ptr(d_right_lookup), ring_count, total_pairs),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_I32, KERNEL_PARAM_I32),
-        ),
-    )
-
-    # --- Classify segment pairs (Tier 1: NVRTC) ---
-    # Uses on-GPU Shewchuk adaptive refinement (no ambiguous output)
-    from vibespatial.spatial.segment_primitives import _classify_kernels
-
-    pair_count = total_pairs
-    d_out_kind = cp.zeros(pair_count, dtype=cp.int8)
-    d_out_px = cp.zeros(pair_count, dtype=cp.float64)
-    d_out_py = cp.zeros(pair_count, dtype=cp.float64)
-    d_out_ox0 = cp.zeros(pair_count, dtype=cp.float64)
-    d_out_oy0 = cp.zeros(pair_count, dtype=cp.float64)
-    d_out_ox1 = cp.zeros(pair_count, dtype=cp.float64)
-    d_out_oy1 = cp.zeros(pair_count, dtype=cp.float64)
-
-    seg_kernels = _classify_kernels("double")
-    classify_kernel = seg_kernels["classify_segment_pairs_v2"]
-    grid, block = runtime.launch_config(classify_kernel, pair_count)
-    runtime.launch(
-        classify_kernel,
-        grid=grid, block=block,
-        params=(
-            (ptr(d_left_lookup), ptr(d_right_lookup),
-             ptr(d_seg_x0), ptr(d_seg_y0), ptr(d_seg_x1), ptr(d_seg_y1),
-             ptr(d_seg_x0), ptr(d_seg_y0), ptr(d_seg_x1), ptr(d_seg_y1),
-             ptr(d_out_kind), ptr(d_out_px), ptr(d_out_py),
-             ptr(d_out_ox0), ptr(d_out_oy0), ptr(d_out_ox1), ptr(d_out_oy1),
-             pair_count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_I32),
-        ),
-    )
-    # No sync needed -- CuPy ops below run on same null stream.
-
-    # Filter hits on device (Tier 2: CuPy boolean mask + fancy indexing)
-    d_hit_mask = d_out_kind != 0
-    d_hit_indices = cp.flatnonzero(d_hit_mask)
-    if d_hit_indices.size == 0:
-        empty_i32 = cp.empty(0, dtype=cp.int32)
-        empty_f64 = cp.empty(0, dtype=cp.float64)
-        empty_i8 = cp.empty(0, dtype=cp.int8)
-        return empty_i32, empty_i32, empty_i8, empty_f64, empty_f64
-
-    return (
-        d_left_lookup[d_hit_indices],
-        d_right_lookup[d_hit_indices],
-        d_out_kind[d_hit_indices],
-        d_out_px[d_hit_indices],
-        d_out_py[d_hit_indices],
-    )
-
-
-def _split_self_intersections_gpu(
-    d_x: cp.ndarray,
-    d_y: cp.ndarray,
-    d_ring_offsets: cp.ndarray,
-    ring_count: int,
-    kernels: dict,
-) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, bool]:
-    """Detect and split self-intersections. Returns new x, y, ring_offsets, had_splits.
-
-    GPU-resident: segment extraction via NVRTC (Tier 1), pair generation via
-    NVRTC (Tier 1), dedup via CuPy mask (Tier 2), split counts via
-    cp.bincount (Tier 2), ring sizes via segmented_reduce_sum (Tier 3a).
-    """
-    # Phase A: Extract segments and detect intersections (GPU-resident)
-    d_seg_x0, d_seg_y0, d_seg_x1, d_seg_y1, d_seg_ring_ids = \
-        _extract_ring_segments_gpu(d_x, d_y, d_ring_offsets, ring_count, kernels)
-    total_segments = int(d_seg_x0.size)
-
-    d_seg_a, d_seg_b, d_kinds, d_px, d_py = _detect_intra_ring_intersections(
-        d_seg_x0, d_seg_y0, d_seg_x1, d_seg_y1, d_seg_ring_ids,
-        total_segments, ring_count, d_ring_offsets, kernels,
-    )
-
-    if d_seg_a.size == 0:
-        return d_x, d_y, d_ring_offsets, False
-
-    # Phase C: Count and scatter split events
-    runtime = get_cuda_runtime()
-    ptr = runtime.pointer
-    pair_count = int(d_seg_a.size)
-    d_event_counts = cp.zeros(pair_count, dtype=cp.int32)
-
-    count_kernel = kernels["count_self_split_events"]
-    grid_count, block_count = runtime.launch_config(count_kernel, pair_count)
-    runtime.launch(
-        count_kernel,
-        grid=grid_count, block=block_count,
-        params=(
-            (ptr(d_kinds), ptr(d_event_counts), pair_count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-        ),
-    )
-
-    d_event_offsets = exclusive_sum(d_event_counts, synchronize=False)
-    total_events = count_scatter_total(
-        runtime,
-        d_event_counts,
-        d_event_offsets,
-        reason="make-valid self-split event allocation fence",
-    )
-    if total_events == 0:
-        return d_x, d_y, d_ring_offsets, False
-
-    d_out_seg_ids = cp.empty(total_events, dtype=cp.int32)
-    d_out_t = cp.empty(total_events, dtype=cp.float64)
-    d_out_x = cp.empty(total_events, dtype=cp.float64)
-    d_out_y = cp.empty(total_events, dtype=cp.float64)
-    d_out_key = cp.empty(total_events, dtype=cp.uint64)
-
-    scatter_kernel = kernels["scatter_self_split_events"]
-    grid_scatter, block_scatter = runtime.launch_config(scatter_kernel, pair_count)
-    runtime.launch(
-        scatter_kernel,
-        grid=grid_scatter, block=block_scatter,
-        params=(
-            (ptr(d_seg_a), ptr(d_seg_b), ptr(d_kinds), ptr(d_px), ptr(d_py),
-             ptr(d_seg_x0), ptr(d_seg_y0), ptr(d_seg_x1), ptr(d_seg_y1),
-             ptr(d_event_offsets),
-             ptr(d_out_seg_ids), ptr(d_out_t), ptr(d_out_x), ptr(d_out_y),
-             ptr(d_out_key), pair_count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-        ),
-    )
-
-    # Sort once, keep the permutation, and gather all payload columns from it.
-    d_indices = cp.arange(total_events, dtype=cp.int32)
-    idx_sort = sort_pairs(d_out_key, d_indices, synchronize=False)
-    d_sorted_keys = idx_sort.keys
-    d_perm = idx_sort.values
-    d_perm_i64 = d_perm.astype(cp.int64)
-
-    d_sorted_seg_ids = d_out_seg_ids[d_perm_i64]
-    d_sorted_t = d_out_t[d_perm_i64]
-    d_sorted_x = d_out_x[d_perm_i64]
-    d_sorted_y = d_out_y[d_perm_i64]
-
-    # --- Phase 9: GPU-resident dedup by first-occurrence mask ---
-    if total_events > 1:
-        d_mask = cp.ones(total_events, dtype=cp.bool_)
-        d_mask[1:] = d_sorted_keys[1:] != d_sorted_keys[:-1]
-        keep_idx = cp.flatnonzero(d_mask).astype(cp.int64)
-        unique_count = int(keep_idx.size)
-        if unique_count < total_events:
-            d_sorted_seg_ids = d_sorted_seg_ids[keep_idx]
-            d_sorted_t = d_sorted_t[keep_idx]
-            d_sorted_x = d_sorted_x[keep_idx]
-            d_sorted_y = d_sorted_y[keep_idx]
-            total_events = int(keep_idx.size)
-
-    if total_events == 0:
-        return d_x, d_y, d_ring_offsets, False
-
-    # --- Phase 9: GPU-resident per-segment split counts (cp.bincount) ---
-    d_seg_split_counts = cp.bincount(
-        d_sorted_seg_ids, minlength=total_segments
-    ).astype(cp.int32)
-    d_seg_split_offsets = exclusive_sum(d_seg_split_counts, synchronize=False)
-
-    # --- Phase 9: GPU-resident ring size computation ---
-    # ring_seg_offsets and ring_seg_counts via device ops
-    d_ring_seg_counts = cp.bincount(d_seg_ring_ids, minlength=ring_count).astype(cp.int32)
-    d_ring_seg_offsets = exclusive_sum(d_ring_seg_counts, synchronize=False)
-
-    # Per-ring extra splits = sum of seg_split_counts for segments in that ring
-    # Use segmented_reduce_sum on d_seg_split_counts grouped by ring
-    d_seg_starts = d_ring_seg_offsets.copy()
-    d_seg_ends = d_seg_starts + d_ring_seg_counts
-    seg_extra_result = segmented_reduce_sum(
-        d_seg_split_counts.astype(cp.float64),
-        d_seg_starts, d_seg_ends,
-        num_segments=ring_count,
-        synchronize=False,
-    )
-    d_extra_per_ring = seg_extra_result.values.astype(cp.int32)
-
-    # New ring size: n_segs original start vertices + extra splits + 1 closing vertex
-    d_new_ring_sizes = d_ring_seg_counts + d_extra_per_ring + 1
-    d_new_ring_offsets = cp.zeros(ring_count + 1, dtype=cp.int32)
-    d_new_ring_offsets[1:] = cp.cumsum(d_new_ring_sizes)
-    total_new = int(d_new_ring_offsets[-1])
-
-    # Launch rebuild kernel (all arrays already device-resident)
-    d_new_x = cp.empty(total_new, dtype=cp.float64)
-    d_new_y = cp.empty(total_new, dtype=cp.float64)
-
-    rebuild_kernel = kernels["rebuild_ring_coords"]
-    ring_grid, ring_block = runtime.launch_config(rebuild_kernel, ring_count)
-    runtime.launch(
-        rebuild_kernel,
-        grid=ring_grid, block=ring_block,
-        params=(
-            (ptr(d_x), ptr(d_y), ptr(d_ring_offsets),
-             ptr(d_sorted_seg_ids), ptr(d_sorted_x), ptr(d_sorted_y), ptr(d_sorted_t),
-             ptr(d_seg_split_offsets), ptr(d_seg_split_counts),
-             ptr(d_new_ring_offsets), ptr(d_ring_seg_offsets),
-             ptr(d_new_x), ptr(d_new_y),
-             ring_count, total_segments),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_I32, KERNEL_PARAM_I32),
-        ),
-    )
-    # No sync needed -- caller uses device arrays on same null stream.
-    return d_new_x, d_new_y, d_new_ring_offsets, True
-
 
 # ---------------------------------------------------------------------------
 # Phase D + E: Re-polygonization and output assembly
 # ---------------------------------------------------------------------------
 
-def _atomic_edges_from_rings(
-    d_x: cp.ndarray,
-    d_y: cp.ndarray,
-    d_ring_offsets: cp.ndarray,
-    d_geom_offsets: cp.ndarray,
-    ring_count: int,
-    polygon_count: int,
-    runtime_selection: RuntimeSelection,
-) -> AtomicEdgeTable:
-    """Build an AtomicEdgeTable from split ring coordinates (Part A).
 
-    Bridges make_valid's split-ring output to overlay's reconstruction input.
-    Each ring segment (consecutive vertex pair) becomes a directed edge pair
-    (forward + reverse), matching the overlay pipeline's atomic edge format.
-
-    All computation uses CuPy vectorised operations (Tier 2, fp64).
-    """
-    # Compute segments per ring: for a ring with n vertices, n-1 segments
-    d_ring_sizes = d_ring_offsets[1:] - d_ring_offsets[:-1]
-    d_seg_counts = cp.maximum(d_ring_sizes - 1, 0).astype(cp.int32)
-    d_seg_offsets = cp.zeros(ring_count + 1, dtype=cp.int32)
-    d_seg_offsets[1:] = cp.cumsum(d_seg_counts)
-    total_segments = int(d_seg_offsets[-1])
-
-    if total_segments == 0:
-        empty_d_i32 = cp.empty(0, dtype=cp.int32)
-        empty_d_i8 = cp.empty(0, dtype=cp.int8)
-        empty_d_f64 = cp.empty(0, dtype=cp.float64)
-        return AtomicEdgeTable(
-            left_segment_count=0, right_segment_count=0,
-            runtime_selection=runtime_selection,
-            device_state=AtomicEdgeDeviceState(
-                source_segment_ids=empty_d_i32, direction=empty_d_i8,
-                src_x=empty_d_f64, src_y=empty_d_f64,
-                dst_x=empty_d_f64, dst_y=empty_d_f64,
-                row_indices=empty_d_i32, part_indices=empty_d_i32,
-                ring_indices=empty_d_i32, source_side=empty_d_i8,
-            ),
-            _count=0,
-        )
-
-    # Expand segments: for each segment, find its ring and local index
-    d_seg_ids = cp.arange(total_segments, dtype=cp.int32)
-    d_ring_of_seg = cp.searchsorted(
-        d_seg_offsets[1:], d_seg_ids, side="right"
-    ).astype(cp.int32)
-    d_local_seg = d_seg_ids - d_seg_offsets[d_ring_of_seg]
-    d_v = d_ring_offsets[d_ring_of_seg] + d_local_seg
-
-    # Forward edges: src = v[i], dst = v[i+1]
-    d_fwd_src_x = d_x[d_v]
-    d_fwd_src_y = d_y[d_v]
-    d_fwd_dst_x = d_x[d_v + 1]
-    d_fwd_dst_y = d_y[d_v + 1]
-
-    # Reverse edges: src = v[i+1], dst = v[i]
-    d_rev_src_x = d_fwd_dst_x
-    d_rev_src_y = d_fwd_dst_y
-    d_rev_dst_x = d_fwd_src_x
-    d_rev_dst_y = d_fwd_src_y
-
-    # Interleave forward and reverse: edge 2k = forward, edge 2k+1 = reverse
-    total_atomic = total_segments * 2
-    d_src_x = cp.empty(total_atomic, dtype=cp.float64)
-    d_src_y = cp.empty(total_atomic, dtype=cp.float64)
-    d_dst_x = cp.empty(total_atomic, dtype=cp.float64)
-    d_dst_y = cp.empty(total_atomic, dtype=cp.float64)
-    d_src_x[0::2] = d_fwd_src_x
-    d_src_x[1::2] = d_rev_src_x
-    d_src_y[0::2] = d_fwd_src_y
-    d_src_y[1::2] = d_rev_src_y
-    d_dst_x[0::2] = d_fwd_dst_x
-    d_dst_x[1::2] = d_rev_dst_x
-    d_dst_y[0::2] = d_fwd_dst_y
-    d_dst_y[1::2] = d_rev_dst_y
-
-    # Source segment IDs: forward and reverse share the same segment ID
-    d_source_seg_ids = cp.empty(total_atomic, dtype=cp.int32)
-    d_source_seg_ids[0::2] = d_seg_ids
-    d_source_seg_ids[1::2] = d_seg_ids
-
-    # Direction: +1 for forward, -1 for reverse
-    d_direction = cp.empty(total_atomic, dtype=cp.int8)
-    d_direction[0::2] = 1
-    d_direction[1::2] = -1
-
-    # Map segments to polygon indices via geom_offsets
-    d_poly_of_ring = cp.searchsorted(
-        d_geom_offsets[1:], d_ring_of_seg, side="right"
-    ).astype(cp.int32)
-    d_row_indices = cp.empty(total_atomic, dtype=cp.int32)
-    d_row_indices[0::2] = d_poly_of_ring
-    d_row_indices[1::2] = d_poly_of_ring
-
-    # Ring indices
-    d_ring_indices = cp.empty(total_atomic, dtype=cp.int32)
-    d_ring_indices[0::2] = d_ring_of_seg
-    d_ring_indices[1::2] = d_ring_of_seg
-
-    # Source side: all left (1) since we have one geometry
-    d_source_side = cp.ones(total_atomic, dtype=cp.int8)
-
-    # Part indices: same as row indices for simple polygons
-    d_part_indices = d_row_indices.copy()
-
-    # Build AtomicEdgeTable with device-primary storage.
-    # build_gpu_half_edge_graph reads device_state metadata directly,
-    # so no D->H transfers needed here.  Host arrays lazily materialized.
-    return AtomicEdgeTable(
-        left_segment_count=total_segments,
-        right_segment_count=0,
-        runtime_selection=runtime_selection,
-        device_state=AtomicEdgeDeviceState(
-            source_segment_ids=d_source_seg_ids,
-            direction=d_direction,
-            src_x=d_src_x, src_y=d_src_y,
-            dst_x=d_dst_x, dst_y=d_dst_y,
-            row_indices=d_row_indices,
-            part_indices=d_part_indices,
-            ring_indices=d_ring_indices,
-            source_side=d_source_side,
-        ),
-        _count=total_atomic,
-    )
-
-
-def _repolygonize_from_split_rings(
-    d_x: cp.ndarray,
-    d_y: cp.ndarray,
-    d_ring_offsets: cp.ndarray,
-    d_geom_offsets: cp.ndarray,
-    ring_count: int,
-    polygon_count: int,
-    runtime_selection: RuntimeSelection | None = None,
+def _repolygonize_owned_rows_via_overlay(
+    source: OwnedGeometryArray,
 ) -> OwnedGeometryArray | None:
-    """Re-polygonize from split ring coordinates using GPU overlay pipeline (Part B).
+    """Polygonize invalid rows through the shared bounded overlay topology plan."""
+    if source.row_count == 0 or source.device_state is None:
+        return None
 
-    Replaces the prior Shapely CPU polygonize with the fully GPU-parallel
-    half-edge graph / face walk / face assembly from overlay_gpu.py.
+    from vibespatial.geometry.owned import build_empty_polygon_rows_device
+    from vibespatial.overlay.gpu import (
+        _build_overlay_execution_plan,
+        _materialize_overlay_execution_plan,
+    )
 
-    Returns an OwnedGeometryArray (device-resident per ADR-0005), or None
-    if the GPU pipeline produces no valid faces.
-    """
-    if runtime_selection is None:
-        runtime_selection = _planned_make_valid_runtime_selection(
-            kernel_name="make_valid_repolygonize",
-            row_count=polygon_count,
-            reason="make_valid GPU repolygonize",
+    # A whole-batch segment count is a conservative per-row span proof. It may
+    # choose one complete logical row per topology page, but never requires a
+    # row-shaped max-span reduction or host metadata export.
+    max_segment_span = 0
+    state = source._ensure_device_state(preserve_indexed_view=True)
+    for family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
+        buffer = state.families.get(family)
+        if buffer is None or buffer.ring_offsets is None:
+            continue
+        max_segment_span += max(
+            int(buffer.x.size) - (int(buffer.ring_offsets.size) - 1),
+            0,
         )
-
-    # Step 1: Build AtomicEdgeTable from split ring coordinates
-    atomic_edges = _atomic_edges_from_rings(
-        d_x, d_y, d_ring_offsets, d_geom_offsets,
-        ring_count, polygon_count, runtime_selection,
-    )
-    if atomic_edges.count == 0:
+    if max_segment_span == 0:
         return None
 
-    # Step 2: Build half-edge graph
-    half_edge_graph = build_gpu_half_edge_graph(atomic_edges, isolate_rows=True)
-    if half_edge_graph.edge_count == 0:
-        return None
-
-    # Step 3: Face walk to extract faces
-    (face_offsets, face_edge_ids, bounded_mask, signed_area,
-     centroid_x, centroid_y, label_x, label_y, face_count) = _gpu_face_walk(half_edge_graph)
-
-    if face_count == 0:
-        return None
-
-    # Step 4: Select bounded positive-area faces (no coverage labeling needed)
-    # For make_valid, we want all bounded faces with positive area — these
-    # are the valid polygon faces extracted from the self-intersection split.
-    d_select_mask = (bounded_mask != 0) & (signed_area > 0)
-    selected_face_indices = cp.flatnonzero(d_select_mask).astype(cp.int32)
-
-    if int(selected_face_indices.size) == 0:
-        return None
-
-    # Build OverlayFaceTable for the assembly function
-    faces = OverlayFaceTable(
-        runtime_selection=runtime_selection,
-        device_state=OverlayFaceDeviceState(
-            face_offsets=face_offsets,
-            face_edge_ids=face_edge_ids,
-            bounded_mask=bounded_mask,
-            signed_area=signed_area,
-            centroid_x=centroid_x,
-            centroid_y=centroid_y,
-            left_covered=cp.ones(face_count, dtype=cp.int8),
-            right_covered=cp.zeros(face_count, dtype=cp.int8),
+    empty_right = build_empty_polygon_rows_device(source.row_count)
+    plan = _build_overlay_execution_plan(
+        source,
+        empty_right,
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+        _use_same_row_fast_path=True,
+        _same_row_single_group=source.row_count == 1,
+        _same_row_span_summary=(
+            max_segment_span,
+            0,
+            source.row_count - 1,
         ),
-        _face_count=face_count,
+        _include_same_side_splits=True,
     )
-
-    # Step 5: Assemble output polygons from selected faces
-    result = _build_polygon_output_from_faces_gpu(
-        half_edge_graph, faces, selected_face_indices,
-        preserve_row_count=polygon_count,
+    result, selected = _materialize_overlay_execution_plan(
+        plan,
+        operation="polygonize",
+        requested=ExecutionMode.GPU,
+        preserve_row_count=source.row_count,
     )
+    if selected is not ExecutionMode.GPU:
+        raise RuntimeError("make-valid polygonize topology left GPU execution")
     return result
 
 
@@ -908,21 +470,29 @@ def _repolygonize_from_split_rings(
 # Main GPU repair entry point
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class GPURepairResult:
-    """Result of GPU make_valid repair."""
+    """Complete device-resident result of GPU make_valid repair."""
+
     repaired_owned: OwnedGeometryArray | None  # device-resident merged result
     repaired_count: int
     gpu_phases_used: tuple[str, ...]
-    still_invalid_rows: np.ndarray  # global row indices GPU couldn't fix
 
 
 def _extract_batch_coords_device(
     d_buffer,
-    invalid_family_rows: np.ndarray,
+    invalid_family_rows,
     *,
     host_buffer: FamilyGeometryBuffer | None = None,
-) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray] | None:
+) -> tuple[
+    cp.ndarray,
+    cp.ndarray,
+    cp.ndarray,
+    cp.ndarray,
+    cp.ndarray,
+    DeviceFixedGeometrySizeMetadata | None,
+] | None:
     """Device-side extraction of invalid polygon coordinates into contiguous batch.
 
     Like _extract_batch_coords but operates entirely on device arrays via
@@ -934,19 +504,73 @@ def _extract_batch_coords_device(
     if invalid_family_rows.size == 0:
         return None
 
-    d_rows = cp.asarray(invalid_family_rows.astype(np.int32))
+    d_rows = cp.asarray(invalid_family_rows, dtype=cp.int32)
+    host_family_rows = (
+        np.asarray(invalid_family_rows, dtype=np.int32)
+        if isinstance(invalid_family_rows, np.ndarray)
+        else None
+    )
+    d_sorted_rows = cp.sort(d_rows)
+    d_unique_starts = cp.empty(d_sorted_rows.size, dtype=cp.bool_)
+    d_unique_starts[0] = True
+    d_unique_starts[1:] = d_sorted_rows[1:] != d_sorted_rows[:-1]
+
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+
+    unique_selection = NativeDeviceSelection.from_mask(d_unique_starts)
+    d_unique_active = unique_selection.active_capacity_mask()
+    d_unique_rows = unique_selection.gather_capacity(
+        d_sorted_rows,
+        fill_value=0,
+    ).astype(cp.int32, copy=False)
     taken = _device_take_family_buffer(
         d_buffer,
         GeometryFamily.POLYGON,
-        d_rows,
+        d_unique_rows,
         host_buffer=host_buffer,
-        host_family_rows=invalid_family_rows,
+        host_family_rows=host_family_rows,
+        assume_unique_indices=True,
+        active_row_count=unique_selection.logical_count,
+        active_row_mask=d_unique_active,
     )
 
     if taken.x.size == 0:
         return None
 
-    return taken.x, taken.y, taken.ring_offsets, taken.geometry_offsets
+    repaired_fixed_size = None
+    if taken.fixed_size is not None:
+        ring_bound = taken.fixed_size.max_first_level_count_per_row
+        coord_bound = taken.fixed_size.max_coord_count_per_row
+        if ring_bound is not None and coord_bound is not None:
+            repaired_fixed_size = DeviceFixedGeometrySizeMetadata(
+                max_first_level_count_per_row=int(ring_bound),
+                max_coord_count_per_row=int(coord_bound) + int(ring_bound),
+            )
+
+    source_row_count = int(d_buffer.geometry_offsets.size) - 1
+    capacity = int(d_rows.size)
+    d_lanes = cp.arange(capacity, dtype=cp.int64)
+    d_lookup_destinations = cp.where(
+        d_unique_active,
+        d_unique_rows.astype(cp.int64, copy=False),
+        cp.int64(source_row_count) + d_lanes,
+    )
+    d_unique_lanes_by_source = cp.full(
+        source_row_count + capacity,
+        -1,
+        dtype=cp.int64,
+    )
+    d_unique_lanes_by_source[d_lookup_destinations] = d_lanes
+    d_original_to_unique = d_unique_lanes_by_source[d_rows.astype(cp.int64, copy=False)]
+
+    return (
+        taken.x,
+        taken.y,
+        taken.ring_offsets,
+        taken.geometry_offsets,
+        d_original_to_unique,
+        repaired_fixed_size,
+    )
 
 
 def _build_batch_repaired_device(
@@ -957,13 +581,14 @@ def _build_batch_repaired_device(
     ring_count: int,
     polygon_count: int,
     runtime_selection: RuntimeSelection,
+    fixed_size: DeviceFixedGeometrySizeMetadata | None = None,
 ) -> OwnedGeometryArray | None:
     """Build a device-resident OwnedGeometryArray from batch device coordinates.
 
-    Device-resident replacement for _build_batch_repaired_owned. Filters
-    degenerate rings (< 4 vertices) on device and produces a device-resident
-    result via build_device_resident_owned. No D->H transfer for coordinate data.
+    Filters degenerate rings (< 4 vertices) on device and emits the repaired
+    carrier directly through ``build_device_resident_owned``.
     """
+    from vibespatial.api._native_rowset import NativeDeviceSelection
     from vibespatial.geometry.owned import (
         DeviceFamilyGeometryBuffer,
         build_device_resident_owned,
@@ -975,38 +600,40 @@ def _build_batch_repaired_device(
     # Filter degenerate rings on device (< 4 vertices)
     d_ring_lens = d_ring_offsets[1:] - d_ring_offsets[:-1]
     d_valid_rings = d_ring_lens >= 4
-
-    if not _make_valid_bool_scalar(
-        cp.any(d_valid_rings),
-        reason="make-valid repaired-ring validity scalar fence",
-    ):
-        return None
-
-    d_valid_ring_indices = cp.flatnonzero(d_valid_rings).astype(cp.int32)
-    valid_ring_count = int(d_valid_ring_indices.size)
-
-    if valid_ring_count == 0:
-        return None
+    ring_selection = NativeDeviceSelection.from_mask(d_valid_rings)
+    d_valid_ring_indices = ring_selection.safe_capacity_positions().astype(
+        cp.int32,
+        copy=False,
+    )
+    d_active_rings = ring_selection.active_capacity_mask()
 
     # Gather valid ring coordinate ranges and build new ring offsets
-    from vibespatial.geometry.owned import _device_gather_offset_slices
+    from vibespatial.geometry.owned import _device_gather_xy_offset_slices
 
-    coords_2d = (
-        cp.column_stack([d_x, d_y])
-        if d_x.size
-        else cp.empty((0, 2), dtype=cp.float64)
+    new_x, new_y, new_ring_offsets = _device_gather_xy_offset_slices(
+        d_x,
+        d_y,
+        d_ring_offsets,
+        d_valid_ring_indices,
+        allocation_capacity=int(d_x.size),
+        active_row_count=ring_selection.logical_count,
     )
-    gathered_coords, new_ring_offsets = _device_gather_offset_slices(
-        coords_2d, d_ring_offsets, d_valid_ring_indices,
-    )
-    new_x = gathered_coords[:, 0].copy() if gathered_coords.size else cp.empty(0, dtype=cp.float64)
-    new_y = gathered_coords[:, 1].copy() if gathered_coords.size else cp.empty(0, dtype=cp.float64)
 
     # Build new geom offsets: count valid rings per polygon
-    d_poly_of_ring = cp.searchsorted(
-        d_geom_offsets[1:], d_valid_ring_indices, side="right",
+    d_source_poly_of_ring = cp.searchsorted(
+        d_geom_offsets[1:],
+        cp.arange(ring_count, dtype=cp.int32),
+        side="right",
     ).astype(cp.int32)
-    d_rings_per_poly = cp.bincount(d_poly_of_ring, minlength=polygon_count).astype(cp.int32)
+    d_poly_of_ring = ring_selection.gather_capacity(
+        d_source_poly_of_ring,
+        fill_value=0,
+    ).astype(cp.int32, copy=False)
+    d_rings_per_poly = cp.bincount(
+        d_poly_of_ring,
+        weights=d_active_rings.astype(cp.int32),
+        minlength=polygon_count,
+    ).astype(cp.int32)
     new_geom_offsets = cp.zeros(polygon_count + 1, dtype=cp.int32)
     cp.cumsum(d_rings_per_poly, out=new_geom_offsets[1:])
 
@@ -1024,6 +651,7 @@ def _build_batch_repaired_device(
             empty_mask=~d_poly_valid,
             ring_offsets=new_ring_offsets,
             bounds=None,
+            fixed_size=fixed_size,
         ),
     }
     result = build_device_resident_owned(
@@ -1035,40 +663,49 @@ def _build_batch_repaired_device(
         execution_mode="gpu",
     )
     result.runtime_history.append(runtime_selection)
+    if fixed_size is not None and fixed_size.max_coord_count_per_row is not None:
+        result._active_family_row_segment_capacity_bound = int(
+            fixed_size.max_coord_count_per_row
+        )
     return result
 
 
-def _build_polygon_rows_from_ring_indices_gpu(
+def _build_polygon_rows_from_ring_selection_gpu(
     d_x: cp.ndarray,
     d_y: cp.ndarray,
     d_ring_offsets: cp.ndarray,
     d_ring_rows: cp.ndarray,
     *,
+    logical_count,
+    d_active_rows: cp.ndarray,
     kernels: dict,
     orient_as_exterior: bool,
+    coord_capacity_per_row: int | None = None,
 ) -> OwnedGeometryArray | None:
-    """Build one single-ring polygon row per selected ring on device."""
-    from vibespatial.geometry.owned import _device_gather_offset_slices
+    """Build one single-ring polygon row per selection-capacity lane."""
+    from vibespatial.geometry.owned import _device_gather_xy_offset_slices
 
+    d_ring_rows = cp.asarray(d_ring_rows, dtype=cp.int64)
+    d_active_rows = cp.asarray(d_active_rows, dtype=cp.bool_)
     row_count = int(d_ring_rows.size)
     if row_count == 0:
         return None
+    if int(d_active_rows.size) != row_count:
+        raise ValueError("make-valid ring positions and active mask must align")
 
-    coords = (
-        cp.column_stack([d_x, d_y])
-        if int(d_x.size) > 0
-        else cp.empty((0, 2), dtype=cp.float64)
+    coord_capacity = (
+        int(d_x.size)
+        if coord_capacity_per_row is None
+        else row_count * int(coord_capacity_per_row)
     )
-    gathered_coords, new_ring_offsets = _device_gather_offset_slices(
-        coords,
+    new_x, new_y, new_ring_offsets = _device_gather_xy_offset_slices(
+        d_x,
+        d_y,
         d_ring_offsets,
-        d_ring_rows.astype(cp.int64, copy=False),
+        d_ring_rows,
+        allocation_capacity=coord_capacity,
+        active_row_count=logical_count,
     )
-    if int(gathered_coords.size) == 0:
-        return None
-
-    new_x = gathered_coords[:, 0].copy()
-    new_y = gathered_coords[:, 1].copy()
     new_geom_offsets = cp.arange(row_count + 1, dtype=cp.int32)
     if orient_as_exterior:
         new_x, new_y = _gpu_fix_ring_orientation(
@@ -1088,14 +725,22 @@ def _build_polygon_rows_from_ring_indices_gpu(
                 x=new_x,
                 y=new_y,
                 geometry_offsets=new_geom_offsets,
-                empty_mask=cp.zeros(row_count, dtype=cp.bool_),
+                empty_mask=~d_active_rows,
                 ring_offsets=new_ring_offsets,
                 bounds=None,
+                fixed_size=DeviceFixedGeometrySizeMetadata(
+                    max_first_level_count_per_row=1,
+                    max_coord_count_per_row=(
+                        coord_capacity_per_row
+                        if coord_capacity_per_row is not None
+                        else int(d_x.size)
+                    ),
+                ),
             )
         },
         row_count=row_count,
         tags=cp.full(row_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=cp.int8),
-        validity=cp.ones(row_count, dtype=cp.bool_),
+        validity=d_active_rows,
         family_row_offsets=cp.arange(row_count, dtype=cp.int32),
         execution_mode="gpu",
     )
@@ -1106,48 +751,72 @@ def _build_hole_ring_polygons_gpu(
     d_y: cp.ndarray,
     d_ring_offsets: cp.ndarray,
     d_geom_offsets: cp.ndarray,
-    d_problem_rows: cp.ndarray,
+    problem_selection,
     *,
     kernels: dict,
+    coord_capacity_per_row: int | None = None,
 ) -> tuple[OwnedGeometryArray, cp.ndarray] | None:
-    """Explode selected polygon holes into valid single-ring polygon rows."""
-    problem_count = int(d_problem_rows.size)
-    if problem_count == 0:
+    """Explode selected polygon holes at physical ring capacity."""
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+
+    if not isinstance(problem_selection, NativeDeviceSelection):
+        raise TypeError("make-valid hole builder requires NativeDeviceSelection")
+    if problem_selection.capacity == 0:
         return None
 
-    d_ring_starts = d_geom_offsets[d_problem_rows.astype(cp.int64, copy=False)]
-    d_ring_ends = d_geom_offsets[d_problem_rows.astype(cp.int64, copy=False) + 1]
-    d_hole_counts = cp.maximum(d_ring_ends - d_ring_starts - 1, 0).astype(
+    ring_count = int(d_ring_offsets.size) - 1
+    polygon_count = int(d_geom_offsets.size) - 1
+    if ring_count <= 0 or polygon_count <= 0:
+        return None
+    if problem_selection.source_row_count != polygon_count:
+        raise ValueError("make-valid problem selection source domain mismatch")
+
+    # Project the compact-prefix lane id back to the polygon source domain.
+    # Inactive lanes target scratch rows so duplicate safe positions cannot
+    # overwrite an active source mapping.
+    problem_capacity = problem_selection.capacity
+    d_problem_active = problem_selection.active_capacity_mask()
+    d_problem_lanes = cp.arange(problem_capacity, dtype=cp.int32)
+    d_problem_destinations = cp.where(
+        d_problem_active,
+        problem_selection.safe_capacity_positions(),
+        cp.int64(polygon_count) + d_problem_lanes.astype(cp.int64),
+    )
+    d_problem_local_extended = cp.full(
+        polygon_count + problem_capacity,
+        -1,
+        dtype=cp.int32,
+    )
+    d_problem_local_extended[d_problem_destinations] = d_problem_lanes
+    d_problem_local_rows = d_problem_local_extended[:polygon_count]
+
+    d_ring_rows = cp.arange(ring_count, dtype=cp.int32)
+    d_polygon_rows = cp.searchsorted(
+        d_geom_offsets[1:],
+        d_ring_rows,
+        side="right",
+    ).astype(cp.int32, copy=False)
+    d_ring_source_rows = d_problem_local_rows[d_polygon_rows]
+    d_is_hole = d_ring_rows > d_geom_offsets[d_polygon_rows]
+    hole_selection = NativeDeviceSelection.from_mask((d_ring_source_rows >= 0) & d_is_hole)
+    d_source_rows = hole_selection.gather_capacity(
+        d_ring_source_rows,
+        fill_value=0,
+    ).astype(
         cp.int32,
         copy=False,
     )
-    total_holes = _make_valid_int_scalar(
-        cp.sum(d_hole_counts),
-        reason="make-valid touching-hole ring-count scalar fence",
-    )
-    if total_holes == 0:
-        return None
 
-    d_hole_offsets = exclusive_sum(d_hole_counts, synchronize=False)
-    d_hole_ends = d_hole_offsets + d_hole_counts
-    d_positions = cp.arange(total_holes, dtype=cp.int32)
-    d_source_rows = cp.searchsorted(
-        d_hole_ends,
-        d_positions,
-        side="right",
-    ).astype(cp.int32, copy=False)
-    d_local_hole = d_positions - d_hole_offsets[d_source_rows]
-    d_hole_ring_rows = (
-        d_ring_starts[d_source_rows] + 1 + d_local_hole
-    ).astype(cp.int32, copy=False)
-
-    hole_owned = _build_polygon_rows_from_ring_indices_gpu(
+    hole_owned = _build_polygon_rows_from_ring_selection_gpu(
         d_x,
         d_y,
         d_ring_offsets,
-        d_hole_ring_rows,
+        hole_selection.safe_capacity_positions(),
+        logical_count=hole_selection.logical_count,
+        d_active_rows=hole_selection.active_capacity_mask(),
         kernels=kernels,
         orient_as_exterior=True,
+        coord_capacity_per_row=coord_capacity_per_row,
     )
     if hole_owned is None:
         return None
@@ -1161,7 +830,7 @@ def _repair_touching_hole_rings_gpu(
 ) -> tuple[OwnedGeometryArray, bool]:
     """Canonicalize invalid polygons whose hole rings touch or overlap.
 
-    Physical shape: compact post-repair invalid polygon rows -> ring rows ->
+    Physical shape: selected post-repair invalid polygon rows -> ring capacity ->
     grouped hole coverage union -> row-aligned exterior-minus-holes difference.
     This repairs inter-ring topology without materializing Shapely geometries.
     """
@@ -1186,27 +855,32 @@ def _repair_touching_hole_rings_gpu(
     d_geom_offsets = cp.asarray(poly_buf.geometry_offsets, dtype=cp.int32)
     d_ring_counts = d_geom_offsets[1:] - d_geom_offsets[:-1]
     d_problem_mask = (
-        (~d_valid_flags)
-        & cp.asarray(state.validity, dtype=cp.bool_)
-        & (d_ring_counts > 1)
+        (~d_valid_flags) & cp.asarray(state.validity, dtype=cp.bool_) & (d_ring_counts > 1)
     )
-    problem_count = _make_valid_int_scalar(
-        cp.count_nonzero(d_problem_mask),
-        reason="make-valid touching-hole problem-row count scalar fence",
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+
+    problem_selection = NativeDeviceSelection.from_mask(d_problem_mask)
+    problem_capacity = problem_selection.capacity
+    fixed_size = poly_buf.fixed_size
+    coord_capacity_per_row = (
+        None
+        if fixed_size is None
+        else fixed_size.max_coord_count_per_row
     )
-    if problem_count == 0:
-        return batch_result, False
 
-    d_problem_rows = cp.flatnonzero(d_problem_mask).astype(cp.int32, copy=False)
-    d_exterior_ring_rows = d_geom_offsets[d_problem_rows.astype(cp.int64, copy=False)]
-
-    exterior_owned = _build_polygon_rows_from_ring_indices_gpu(
+    d_exterior_ring_rows = d_geom_offsets[problem_selection.safe_capacity_positions()].astype(
+        cp.int64, copy=False
+    )
+    exterior_owned = _build_polygon_rows_from_ring_selection_gpu(
         cp.asarray(poly_buf.x),
         cp.asarray(poly_buf.y),
         cp.asarray(poly_buf.ring_offsets, dtype=cp.int32),
         d_exterior_ring_rows,
+        logical_count=problem_selection.logical_count,
+        d_active_rows=problem_selection.active_capacity_mask(),
         kernels=kernels,
         orient_as_exterior=True,
+        coord_capacity_per_row=coord_capacity_per_row,
     )
     if exterior_owned is None:
         return batch_result, False
@@ -1216,8 +890,9 @@ def _repair_touching_hole_rings_gpu(
         cp.asarray(poly_buf.y),
         cp.asarray(poly_buf.ring_offsets, dtype=cp.int32),
         d_geom_offsets,
-        d_problem_rows,
+        problem_selection,
         kernels=kernels,
+        coord_capacity_per_row=coord_capacity_per_row,
     )
     if hole_parts is None:
         return batch_result, False
@@ -1231,12 +906,12 @@ def _repair_touching_hole_rings_gpu(
     hole_union = _dispatch_grouped_polygon_known_coverage_union_gpu(
         hole_owned,
         d_hole_source_rows,
-        output_row_count=problem_count,
+        output_row_count=problem_capacity,
         dispatch_mode=ExecutionMode.GPU,
         assume_all_valid=True,
         assume_source_rows_valid=True,
     )
-    if hole_union is None or hole_union.row_count != problem_count:
+    if hole_union is None or hole_union.row_count != problem_capacity:
         return batch_result, False
 
     repaired = binary_constructive_owned(
@@ -1244,38 +919,34 @@ def _repair_touching_hole_rings_gpu(
         exterior_owned,
         hole_union,
         dispatch_mode=ExecutionMode.GPU,
-        _prefer_rowwise_polygon_difference_overlay=True,
-        _skip_polygon_contraction=True,
     )
-    if repaired is None or repaired.row_count != problem_count:
+    if repaired is None or repaired.row_count != problem_capacity:
         return batch_result, False
 
     from vibespatial.constructive.measurement import _area_gpu_device_fp64
 
-    d_input_area = _area_gpu_device_fp64(batch_result)[
-        d_problem_rows.astype(cp.int64, copy=False)
-    ]
+    d_input_area = problem_selection.gather_capacity(
+        _area_gpu_device_fp64(batch_result),
+        fill_value=0.0,
+    )
     d_repaired_area = _area_gpu_device_fp64(repaired)
     d_area_tolerance = cp.maximum(cp.abs(d_input_area) * 1.0e-9, 1.0e-9)
-    area_mismatch_count = _make_valid_int_scalar(
-        cp.count_nonzero(cp.abs(d_input_area - d_repaired_area) > d_area_tolerance),
-        reason="make-valid touching-hole area-preservation count scalar fence",
-    )
-    if area_mismatch_count != 0:
-        return batch_result, False
-
     d_repaired_valid_flags = cp.asarray(
         validity_expression_owned(repaired, exact_collinearity=True).values,
         dtype=cp.bool_,
     )
-    invalid_repaired_count = _make_valid_int_scalar(
-        cp.count_nonzero(~d_repaired_valid_flags),
-        reason="make-valid touching-hole repaired-validity count scalar fence",
+    d_accepted = problem_selection.active_capacity_mask() & (
+        (cp.abs(d_input_area - d_repaired_area) <= d_area_tolerance) & d_repaired_valid_flags
     )
-    if invalid_repaired_count != 0:
-        return batch_result, False
 
-    scattered = concat_owned_scatter(batch_result, repaired, d_problem_rows)
+    from vibespatial.geometry.owned import device_scatter_owned_capacity_selection
+
+    scattered = device_scatter_owned_capacity_selection(
+        batch_result,
+        repaired,
+        problem_selection,
+        active_mask=d_accepted,
+    )
     return scattered, True
 
 
@@ -1283,377 +954,197 @@ def _device_scatter_repaired(
     original_owned: OwnedGeometryArray,
     repaired_batch: OwnedGeometryArray,
     family_name: str,
-    invalid_family_rows: np.ndarray,
-    fam_to_global: dict[int, int],
+    invalid_family_rows,
+    invalid_global_rows,
 ) -> OwnedGeometryArray:
-    """Merge repaired polygon family buffer back into original on device.
+    """Scatter an aligned repaired batch through native row indirection."""
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+    from vibespatial.geometry.owned import device_scatter_owned_capacity_selection
 
-    Takes the original device-resident OwnedGeometryArray and the batch
-    repair result, then produces a new device-resident OwnedGeometryArray
-    where repaired rows are scattered back into the correct positions.
-    Uses existing _device_take_family_buffer and
-    _concat_device_family_buffers from owned.py for all buffer work.
-    No D->H coordinate transfers.
-    """
-    from vibespatial.geometry.owned import (
-        _concat_device_family_buffers,
-        _device_take_family_buffer,
-        build_device_resident_owned,
-    )
-
-    ds = (
-        original_owned.device_state
-        if original_owned.device_state is not None
-        else original_owned._ensure_device_state()
-    )
-    family = GeometryFamily(family_name)
-    family_tag = FAMILY_TAGS[family_name]
-    orig_d_buf = ds.families[family]
-    orig_polygon_count = int(orig_d_buf.geometry_offsets.size) - 1
-
-    # Build the set of valid (non-repaired) family rows
-    invalid_set = set(invalid_family_rows.tolist())
-    valid_family_rows = np.array(
-        [i for i in range(orig_polygon_count) if i not in invalid_set],
-        dtype=np.int32,
-    )
-
-    # Take valid rows from original, repaired rows from batch
-    bufs_to_concat = []
-    valid_count = 0
-
-    if valid_family_rows.size > 0:
-        d_valid_rows = cp.asarray(valid_family_rows)
-        valid_buf = _device_take_family_buffer(
-            orig_d_buf,
-            family,
-            d_valid_rows,
-            host_buffer=original_owned.families.get(family),
-            host_family_rows=valid_family_rows,
-        )
-        bufs_to_concat.append(valid_buf)
-        valid_count = int(valid_buf.geometry_offsets.size) - 1
-
-    # Get the repaired batch's device family buffers.
-    # Repair can change family: a self-intersecting Polygon becomes a
-    # MultiPolygon after repolygonization. Collect buffers from ALL
-    # families present in the repaired batch.
-    repair_ds = repaired_batch.device_state if repaired_batch.device_state is not None else None
-    if repair_ds is None and hasattr(repaired_batch, '_ensure_device_state'):
-        repaired_batch._ensure_device_state()
-        repair_ds = repaired_batch.device_state
-
-    # Collect per-family repair buffers and their row counts
-    repair_families: dict[GeometryFamily, object] = {}
-    if repair_ds is not None:
-        for rfam, rbuf in repair_ds.families.items():
-            rfam_count = int(rbuf.geometry_offsets.size) - 1 if rbuf.geometry_offsets is not None else 0
-            if rfam_count > 0:
-                repair_families[rfam] = rbuf
-
-    # Same-family repair buffer (polygon -> polygon)
-    same_family_buf = repair_families.get(family)
-    if same_family_buf is not None:
-        bufs_to_concat.append(same_family_buf)
-
-    if not bufs_to_concat and not repair_families:
-        return original_owned
-
-    # Build new device families
-    new_device_families = {}
-    for fam, d_buf in ds.families.items():
-        if fam == family:
-            # Merge valid original rows + same-family repair rows
-            if bufs_to_concat:
-                new_device_families[fam] = _concat_device_family_buffers(family, bufs_to_concat)
-            else:
-                # All original rows were invalid and none repaired to same family
-                # Only add if valid_count > 0
-                if valid_count > 0:
-                    new_device_families[fam] = bufs_to_concat[0] if bufs_to_concat else d_buf
-        else:
-            new_device_families[fam] = d_buf
-
-    # Cross-family repair: if repair produced geometries in a different family
-    # (e.g., Polygon input -> MultiPolygon output), add those to the
-    # appropriate family buffer.
-    for rfam, rbuf in repair_families.items():
-        if rfam == family:
-            continue  # already handled above
-        if rfam in new_device_families:
-            # Append to existing family buffer
-            new_device_families[rfam] = _concat_device_family_buffers(
-                rfam, [new_device_families[rfam], rbuf],
-            )
-        else:
-            new_device_families[rfam] = rbuf
-
-    # Rebuild metadata on device so the merged result stays fully device-resident.
-    d_tags = cp.asarray(ds.tags).copy()
-    d_validity = cp.asarray(ds.validity).copy()
-    d_fro = cp.asarray(ds.family_row_offsets).copy()
-
-    if repaired_batch.row_count != invalid_family_rows.size:
+    d_invalid_family_rows = cp.asarray(invalid_family_rows, dtype=cp.int32)
+    d_invalid_global_rows = cp.asarray(invalid_global_rows, dtype=cp.int64)
+    invalid_count = int(d_invalid_family_rows.size)
+    if int(d_invalid_global_rows.size) != invalid_count:
+        raise ValueError("make_valid family/global repair rowsets must align")
+    if repaired_batch.row_count != invalid_count:
         raise RuntimeError(
             "make_valid repaired batch lost input row alignment "
             f"({repaired_batch.row_count} repaired rows for "
-            f"{invalid_family_rows.size} invalid source rows)"
+            f"{invalid_count} invalid source rows)"
         )
-
-    # Build old->new position mapping for the original family
-    old_to_new = cp.full(orig_polygon_count, -1, dtype=cp.int32)
-    if valid_family_rows.size > 0:
-        d_valid_family_rows = cp.asarray(valid_family_rows, dtype=cp.int32)
-        old_to_new[d_valid_family_rows] = cp.arange(d_valid_family_rows.size, dtype=cp.int32)
-
-    # Remap untouched rows from the source family into the compacted merged buffer.
-    source_globals = cp.flatnonzero(ds.tags == family_tag)
-    if int(source_globals.size) > 0:
-        source_old_offsets = ds.family_row_offsets[source_globals]
-        valid_idx = (source_old_offsets >= 0) & (source_old_offsets < orig_polygon_count)
-        d_fro[source_globals[valid_idx]] = old_to_new[source_old_offsets[valid_idx]]
-
-    # Scatter repaired rows back using the repaired batch's own row metadata.
-    repair_ds = repaired_batch.device_state if repaired_batch.device_state is not None else repaired_batch._ensure_device_state()
-    d_repair_tags = cp.asarray(repair_ds.tags)
-    d_repair_validity = cp.asarray(repair_ds.validity)
-    d_repair_fro = cp.asarray(repair_ds.family_row_offsets)
-    d_invalid_globals = cp.asarray(
-        [fam_to_global[int(rr)] for rr in invalid_family_rows],
-        dtype=cp.int32,
+    selection = NativeDeviceSelection(
+        positions=d_invalid_global_rows,
+        logical_count=cp.asarray([invalid_count], dtype=cp.int64),
+        source_row_count=original_owned.row_count,
+        ordered=True,
+        unique=True,
     )
-
-    d_tags[d_invalid_globals] = d_repair_tags
-    d_validity[d_invalid_globals] = d_repair_validity
-
-    family_base_offsets: dict[GeometryFamily, int] = {}
-    for repair_family in repair_families.keys():
-        if repair_family == family:
-            family_base_offsets[repair_family] = valid_count
-        elif repair_family in ds.families:
-            family_base_offsets[repair_family] = int(ds.families[repair_family].geometry_offsets.size) - 1
-        else:
-            family_base_offsets[repair_family] = 0
-
-    for repair_family, base_offset in family_base_offsets.items():
-        family_mask = d_repair_tags == FAMILY_TAGS[repair_family]
-        if _make_valid_bool_scalar(
-            cp.any(family_mask),
-            reason="make-valid repaired-family remap scalar fence",
-        ):
-            d_fro[d_invalid_globals[family_mask]] = (
-                d_repair_fro[family_mask] + np.int32(base_offset)
-            )
-
-    return build_device_resident_owned(
-        device_families=new_device_families,
-        row_count=original_owned.row_count,
-        tags=d_tags,
-        validity=d_validity,
-        family_row_offsets=d_fro,
-        execution_mode="gpu",
+    return device_scatter_owned_capacity_selection(
+        original_owned,
+        repaired_batch,
+        selection,
     )
 
 
-def _build_batch_repaired_owned(
-    d_x: cp.ndarray,
-    d_y: cp.ndarray,
-    d_ring_offsets: cp.ndarray,
-    d_geom_offsets: cp.ndarray,
-    ring_count: int,
-    polygon_count: int,
-    runtime_selection: RuntimeSelection,
-) -> OwnedGeometryArray | None:
-    """Build an OwnedGeometryArray from batch device coordinates.
-
-    Used when Phase B repairs (close/dedup/orient) were sufficient and no
-    self-intersection splitting was needed. Transfers coordinates to host
-    in bulk (single D2H per array) and builds GeoArrow polygon buffers.
-    """
-    runtime = get_cuda_runtime()
-    h_x = runtime.copy_device_to_host(
-        d_x,
-        reason="make-valid batch polygon x-coordinate host export",
-    ).astype(np.float64, copy=False)
-    h_y = runtime.copy_device_to_host(
-        d_y,
-        reason="make-valid batch polygon y-coordinate host export",
-    ).astype(np.float64, copy=False)
-    h_ro = runtime.copy_device_to_host(
-        d_ring_offsets,
-        reason="make-valid batch polygon ring-offset host export",
-    ).astype(np.int32, copy=False)
-    h_go = runtime.copy_device_to_host(
-        d_geom_offsets,
-        reason="make-valid batch polygon geometry-offset host export",
-    ).astype(np.int32, copy=False)
-
-    if h_x.size == 0 or polygon_count == 0:
+def _scatter_valid_repaired_batch(
+    original_owned: OwnedGeometryArray,
+    repaired_batch: OwnedGeometryArray | None,
+    family_name: str,
+    invalid_family_rows,
+    invalid_global_rows,
+) -> tuple[OwnedGeometryArray, object] | None:
+    """Validate and scatter one aligned repair batch at input-row capacity."""
+    if repaired_batch is None:
         return None
 
-    # Filter degenerate rings (< 4 vertices) on host in bulk
-    ring_lens = np.diff(h_ro)
-    valid_rings = ring_lens >= 4
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+    from vibespatial.constructive.validity import validity_expression_owned
+    from vibespatial.geometry.owned import device_scatter_owned_capacity_selection
 
-    if not np.any(valid_rings):
-        return None
-
-    # Build per-polygon ring counts and validity
-    validity = np.ones(polygon_count, dtype=bool)
-    tags = np.full(polygon_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=np.int8)
-    family_row_offsets = np.arange(polygon_count, dtype=np.int32)
-
-    # Rebuild ring/geom offsets filtering invalid rings
-    new_ring_offsets_list = []
-    new_geom_offsets = [0]
-    new_x_chunks = []
-    new_y_chunks = []
-    coord_cursor = 0
-
-    for p in range(polygon_count):
-        r_start = int(h_go[p])
-        r_end = int(h_go[p + 1])
-        poly_ring_count = 0
-        for r in range(r_start, r_end):
-            if valid_rings[r]:
-                c_start = int(h_ro[r])
-                c_end = int(h_ro[r + 1])
-                new_ring_offsets_list.append(coord_cursor)
-                new_x_chunks.append(h_x[c_start:c_end])
-                new_y_chunks.append(h_y[c_start:c_end])
-                coord_cursor += c_end - c_start
-                poly_ring_count += 1
-        if poly_ring_count == 0:
-            validity[p] = False
-        new_geom_offsets.append(len(new_ring_offsets_list))
-
-    new_ring_offsets_list.append(coord_cursor)
-
-    if coord_cursor == 0:
-        return None
-
-    out_x = np.concatenate(new_x_chunks) if new_x_chunks else np.empty(0, dtype=np.float64)
-    out_y = np.concatenate(new_y_chunks) if new_y_chunks else np.empty(0, dtype=np.float64)
-    out_ring_offsets = np.asarray(new_ring_offsets_list, dtype=np.int32)
-    out_geom_offsets = np.asarray(new_geom_offsets, dtype=np.int32)
-
-    # Compute per-polygon bounds via vectorised operations
-    bounds = np.empty((polygon_count, 4), dtype=np.float64)
-    for p in range(polygon_count):
-        gr_start = int(out_geom_offsets[p])
-        gr_end = int(out_geom_offsets[p + 1])
-        if gr_start >= gr_end or not validity[p]:
-            bounds[p] = (0.0, 0.0, 0.0, 0.0)
-            continue
-        c_start = int(out_ring_offsets[gr_start])
-        c_end = int(out_ring_offsets[gr_end])
-        bounds[p] = (
-            out_x[c_start:c_end].min(),
-            out_y[c_start:c_end].min(),
-            out_x[c_start:c_end].max(),
-            out_y[c_start:c_end].max(),
+    d_batch_valid = cp.asarray(
+        validity_expression_owned(
+            repaired_batch,
+            exact_collinearity=True,
+        ).values,
+        dtype=cp.bool_,
+    )
+    d_invalid_family_rows = cp.asarray(invalid_family_rows, dtype=cp.int32)
+    d_invalid_global_rows = cp.asarray(invalid_global_rows, dtype=cp.int64)
+    capacity = int(d_invalid_global_rows.size)
+    if int(d_invalid_family_rows.size) != capacity:
+        raise ValueError("make_valid family/global repair rowsets must align")
+    if repaired_batch.row_count != capacity:
+        raise RuntimeError(
+            "make_valid repaired batch lost input row capacity "
+            f"({repaired_batch.row_count} repaired rows for {capacity} lanes)"
         )
 
-    families = {
-        GeometryFamily.POLYGON: FamilyGeometryBuffer(
-            family=GeometryFamily.POLYGON,
-            schema=get_geometry_buffer_schema(GeometryFamily.POLYGON),
-            row_count=polygon_count,
-            x=out_x,
-            y=out_y,
-            geometry_offsets=out_geom_offsets,
-            empty_mask=~validity,
-            ring_offsets=out_ring_offsets,
-            bounds=bounds,
+    selection = NativeDeviceSelection(
+        positions=d_invalid_global_rows,
+        logical_count=cp.asarray([capacity], dtype=cp.int64),
+        source_row_count=original_owned.row_count,
+        ordered=True,
+        unique=True,
+    )
+
+    return (
+        device_scatter_owned_capacity_selection(
+            original_owned,
+            repaired_batch,
+            selection,
+            active_mask=d_batch_valid,
         ),
-    }
-    return OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-        families=families,
-        residency=Residency.HOST,
-        runtime_history=[runtime_selection],
+        selection.source_mask(active_mask=d_batch_valid),
     )
 
 
-def _extract_batch_coords(
-    buffer: FamilyGeometryBuffer,
-    geom_offsets: np.ndarray,
-    ring_offsets: np.ndarray,
-    invalid_family_rows: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    """Extract coordinates for all invalid polygons into contiguous batch arrays.
-
-    Returns (batch_x, batch_y, batch_ring_offsets, batch_geom_offsets) as
-    host NumPy arrays ready for device upload, or None if no data.
-    """
-    if invalid_family_rows.size == 0:
+def _repair_multipolygon_rows_grouped_device(
+    owned: OwnedGeometryArray,
+    invalid_global_rows,
+) -> OwnedGeometryArray | None:
+    """Repair multipart polygon rows as grouped polygon-part topology."""
+    d_invalid_global_rows = cp.asarray(invalid_global_rows, dtype=cp.int64)
+    if int(d_invalid_global_rows.size) == 0:
         return None
 
-    # Vectorised ring/coord range extraction for all invalid polygons
-    r_starts = geom_offsets[invalid_family_rows]      # first ring index per polygon
-    r_ends = geom_offsets[invalid_family_rows + 1]    # one-past-last ring index
-    ring_counts_per_poly = r_ends - r_starts
+    from vibespatial.api._native_grouped import NativeGroupedSelection
+    from vibespatial.constructive.binary_constructive import (
+        _explode_polygonal_rows_to_polygon_capacity_gpu,
+    )
+    from vibespatial.constructive.make_valid_pipeline import make_valid_owned
+    from vibespatial.cuda.cccl_primitives import PairSortStrategy, sort_pairs
+    from vibespatial.geometry.owned import build_empty_polygon_rows_device
+    from vibespatial.kernels.constructive.segmented_union import (
+        segmented_union_all_device_grouped,
+    )
+    from vibespatial.runtime.precision import (
+        CompensationMode,
+        KernelClass,
+        PrecisionMode,
+        PrecisionPlan,
+        RefinementMode,
+    )
 
-    # Skip polygons with zero rings
-    has_rings = ring_counts_per_poly > 0
-    if not np.any(has_rings):
+    selected = owned.device_take(d_invalid_global_rows)
+    if selected.is_indexed_view:
+        selected = selected.physicalize_device_rows(allow_capacity_allocation=True)
+    polygon_parts = _explode_polygonal_rows_to_polygon_capacity_gpu(selected)
+    if polygon_parts is None or polygon_parts.capacity == 0:
         return None
 
-    # Build batch ring offsets: for each polygon, remap its ring offsets to
-    # be relative to the batch coordinate array.
-    batch_ring_list = []
-    batch_geom_list = [0]
-    coord_cursor = 0
-
-    for i in range(invalid_family_rows.size):
-        rs = int(r_starts[i])
-        re = int(r_ends[i])
-        if rs >= re:
-            batch_geom_list.append(len(batch_ring_list))
-            continue
-        local_ring_offs = ring_offsets[rs:re + 1]
-        coord_start = int(local_ring_offs[0])
-        local_ring_offs_rebased = local_ring_offs - coord_start + coord_cursor
-        batch_ring_list.extend(local_ring_offs_rebased[:-1].tolist())
-        coord_cursor = int(local_ring_offs_rebased[-1])
-        batch_geom_list.append(len(batch_ring_list))
-
-    # Sentinel for ring_offsets
-    batch_ring_list.append(coord_cursor)
-    batch_ring_offsets = np.asarray(batch_ring_list, dtype=np.int32)
-    batch_geom_offsets = np.asarray(batch_geom_list, dtype=np.int32)
-    total_coords = coord_cursor
-
-    if total_coords == 0:
+    part_repair = make_valid_owned(
+        owned=polygon_parts.geometry,
+        method="structure",
+        keep_collapsed=True,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    repaired_parts = part_repair.owned
+    if repaired_parts is None or repaired_parts.row_count != polygon_parts.capacity:
         return None
 
-    # Gather coordinates: extract slices for each invalid polygon
-    batch_x = np.empty(total_coords, dtype=np.float64)
-    batch_y = np.empty(total_coords, dtype=np.float64)
-    buf_x = np.asarray(buffer.x, dtype=np.float64)
-    buf_y = np.asarray(buffer.y, dtype=np.float64)
+    part_capacity = polygon_parts.capacity
+    d_part_source_rows = cp.asarray(polygon_parts.source_rows, dtype=cp.int32)
+    grouped_parts = NativeGroupedSelection(
+        selection=polygon_parts.selection,
+        group_codes=d_part_source_rows,
+        group_count=selected.row_count,
+    )
+    d_group_sizes = grouped_parts.reduce_numeric(
+        cp.ones(part_capacity, dtype=cp.int32),
+        "count",
+    ).values.astype(cp.int64, copy=False)
+    d_active = polygon_parts.selection.active_capacity_mask()
+    # The grouped reducer accepts observed groups only. Capacity lanes after the
+    # active part prefix are invalid geometry rows, so place them at the tail of
+    # group zero instead of declaring a potentially zero-length sentinel group.
+    # Seed selection ignores invalid rows and every declared group remains
+    # structurally nonempty.
+    d_sort_groups = cp.where(
+        d_active,
+        d_part_source_rows,
+        cp.int32(0),
+    ).astype(cp.uint64, copy=False)
+    d_sort_keys = (d_sort_groups << cp.uint64(32)) | cp.arange(part_capacity, dtype=cp.uint64)
+    d_order = sort_pairs(
+        d_sort_keys,
+        cp.arange(part_capacity, dtype=cp.int32),
+        strategy=PairSortStrategy.RADIX,
+        synchronize=False,
+    ).values.astype(cp.int64, copy=False)
 
-    dst = 0
-    for i in range(invalid_family_rows.size):
-        rs = int(r_starts[i])
-        re = int(r_ends[i])
-        if rs >= re:
-            continue
-        c_start = int(ring_offsets[rs])
-        c_end = int(ring_offsets[re])
-        n = c_end - c_start
-        batch_x[dst:dst + n] = buf_x[c_start:c_end]
-        batch_y[dst:dst + n] = buf_y[c_start:c_end]
-        dst += n
-
-    return batch_x, batch_y, batch_ring_offsets, batch_geom_offsets
+    d_group_sizes[0] += (
+        cp.int64(part_capacity) - cp.asarray(polygon_parts.logical_count, dtype=cp.int64)[0]
+    )
+    d_group_offsets = cp.empty(selected.row_count + 1, dtype=cp.int64)
+    d_group_offsets[0] = 0
+    cp.cumsum(d_group_sizes, out=d_group_offsets[1:])
+    ordered_parts = repaired_parts._device_indexed_take(d_order)
+    empty_output = build_empty_polygon_rows_device(selected.row_count)
+    grouped_result = segmented_union_all_device_grouped(
+        ordered_parts,
+        d_group_offsets,
+        cp.arange(selected.row_count, dtype=cp.int64),
+        output_row_count=selected.row_count,
+        precision_plan=PrecisionPlan(
+            storage_precision=PrecisionMode.FP64,
+            compute_precision=PrecisionMode.FP64,
+            kernel_class=KernelClass.CONSTRUCTIVE,
+            compensation=CompensationMode.NONE,
+            refinement=RefinementMode.NONE,
+            center_coordinates=False,
+            reason="multipart make-valid uses grouped constructive fp64",
+        ),
+        empty_output=empty_output,
+        all_groups_observed=False,
+    )
+    if grouped_result is None or grouped_result.row_count != selected.row_count:
+        return None
+    return grouped_result
 
 
 def gpu_repair_invalid_polygons(
     owned: OwnedGeometryArray,
-    invalid_rows: np.ndarray,
+    invalid_rows: object,
     geometries: np.ndarray | None = None,
     *,
     method: str = "linework",
@@ -1662,17 +1153,15 @@ def gpu_repair_invalid_polygons(
     """GPU-resident batch repair of invalid polygon geometries (Phase 16).
 
     Implements the full make_valid pipeline on GPU with batch processing:
-    1. Collect all invalid polygon coordinates into one contiguous batch
-    2. Phase B: Close rings, remove duplicates, fix orientation (batched)
-    3. Phase A+C: Detect and split self-intersections (batched)
-    4. Phase D: Re-polygonize via overlay half-edge/face-walk pipeline (batched)
-    5. Merge repaired rows back into original owned array on device
+    1. Collect invalid polygon coordinates into a device repair batch.
+    2. Normalize rings through capacity-backed closure/dedup/orientation.
+    3. Select still-invalid rows with the canonical OGC validity expression.
+    4. Polygonize those rows through shared paged overlay topology.
+    5. Merge valid repaired rows back into original logical order on device.
 
-    When ``owned.device_state`` is available, the coordinate pipeline stays
-    device-resident.  Only compact invalid-row/family-row fences are copied to
-    host for batch assembly; full routing metadata and coordinates are not
-    exported.  The result carries ``repaired_owned`` so callers can stay on
-    device (ADR-0005).
+    When ``owned.device_state`` is available, the coordinate pipeline and its
+    compact logical/family rowsets stay device-resident. The result carries a
+    complete ``repaired_owned`` array so callers can stay on device (ADR-0005).
 
     Returns None if GPU repair is not applicable (no GPU, no polygon families,
     or CuPy not available).
@@ -1689,6 +1178,7 @@ def gpu_repair_invalid_polygons(
         return None
 
     from vibespatial.runtime import has_gpu_runtime
+
     if not has_gpu_runtime():
         return None
 
@@ -1697,11 +1187,10 @@ def gpu_repair_invalid_polygons(
             repaired_owned=owned,
             repaired_count=0,
             gpu_phases_used=(),
-            still_invalid_rows=np.asarray([], dtype=np.int32),
         )
 
-    # Only repair polygon family rows on GPU; non-polygon invalids are
-    # collected into still_invalid_rows for the caller to handle.
+    # Only polygon families have a native repair implementation. Unsupported
+    # invalid families make the complete native operation inapplicable.
     polygon_families = set()
     for family_name in ("polygon", "multipolygon"):
         if family_name in owned.families:
@@ -1710,152 +1199,95 @@ def gpu_repair_invalid_polygons(
     if not polygon_families:
         return None
 
-    # Compile repair kernels
-    try:
-        kernels = _compile_repair_kernels()
-    except Exception:
-        return None
+    # Compilation/runtime failures after native admission are unexpected and
+    # propagate atomically. Structural inapplicability returns above.
+    kernels = _compile_repair_kernels()
 
-    # Determine whether we can repair directly from device buffers.  The host
-    # family buffers on device-resident owned arrays may be metadata stubs until
-    # explicit materialization, so per-family sizing below must read from the
-    # device buffer whenever it exists.
-    device_state = owned.device_state
+    # GPU repair has one physical input contract. Host-owned callers upload once
+    # here; all family routing and nested gathers below consume device metadata.
+    device_state = owned._ensure_device_state(preserve_indexed_view=True)
 
     runtime_sel = _planned_make_valid_runtime_selection(
         kernel_name="make_valid_gpu_batch_repair",
-        row_count=int(invalid_rows.size),
+        owned=owned,
+        selected_row_count=int(invalid_rows.size),
         reason="make_valid GPU batch repair pipeline (Phase 16)",
     )
 
     phases_used: list[str] = []
-    gpu_repaired_count = 0
-    repaired_global_rows: set[int] = set()
+    d_repaired_global_mask = cp.zeros(owned.row_count, dtype=cp.bool_)
     # Start with the original owned; each family merge updates it
     merged_owned = owned
 
     for family_name in polygon_families:
         family = GeometryFamily(family_name)
         buffer = owned.families[family]
-        d_buf = (
-            device_state.families.get(family)
-            if device_state is not None
-            else None
-        )
-        use_device_path = d_buf is not None
-        if use_device_path:
-            if d_buf.ring_offsets is None or d_buf.geometry_offsets is None:
-                continue
-            polygon_count = int(d_buf.geometry_offsets.size) - 1
-        else:
-            if not hasattr(buffer, "ring_offsets") or buffer.ring_offsets is None:
-                continue
-            polygon_count = (
-                int(buffer.geometry_offsets.size) - 1
-                if hasattr(buffer, "geometry_offsets")
-                else 0
-            )
+        d_buf = device_state.families.get(family)
+        if d_buf is None or d_buf.ring_offsets is None or d_buf.geometry_offsets is None:
+            continue
+        polygon_count = int(d_buf.geometry_offsets.size) - 1
         if polygon_count <= 0:
             continue
 
-        # Map compact invalid rows to family rows.  For device-resident inputs
-        # this uses only the compact invalid row set plus device routing
-        # metadata, then exports compact family-row mappings for the repair
-        # batch.  Do not touch owned.tags/family_row_offsets here; those lazily
+        # Map compact invalid rows to aligned logical and family device rowsets.
+        # Do not touch owned.tags/family_row_offsets here; those lazily
         # materialize full host metadata on Native* paths.
         family_tag = FAMILY_TAGS[family]
-        if use_device_path:
-            runtime = get_cuda_runtime()
-            d_invalid_rows = cp.asarray(
-                np.ascontiguousarray(invalid_rows, dtype=np.int32),
-            )
-            d_tags = cp.asarray(device_state.tags)
-            d_family_row_offsets = cp.asarray(device_state.family_row_offsets)
-            d_family_mask = d_tags[d_invalid_rows] == np.int8(family_tag)
-            d_global_invalid = d_invalid_rows[d_family_mask].astype(cp.int32, copy=False)
-            if int(d_global_invalid.size) == 0:
-                continue
-            d_fam_row_offsets = d_family_row_offsets[d_global_invalid].astype(
-                cp.int32,
-                copy=False,
-            )
-            d_valid_fro = (d_fam_row_offsets >= 0) & (d_fam_row_offsets < polygon_count)
-            d_global_invalid = d_global_invalid[d_valid_fro].astype(cp.int32, copy=False)
-            d_fam_row_offsets = d_fam_row_offsets[d_valid_fro].astype(cp.int32, copy=False)
-            if int(d_global_invalid.size) == 0:
-                continue
-
-            d_invalid_family_rows = cp.unique(d_fam_row_offsets).astype(
-                cp.int32,
-                copy=False,
-            )
-            invalid_family_rows = np.asarray(
-                runtime.copy_device_to_host(
-                    d_invalid_family_rows,
-                    reason="make-valid device invalid-family-row compact fence",
-                ),
-                dtype=np.int32,
-            )
-            global_invalid = np.asarray(
-                runtime.copy_device_to_host(
-                    d_global_invalid,
-                    reason="make-valid device invalid-global-row compact fence",
-                ),
-                dtype=np.int32,
-            )
-            fam_row_offsets = np.asarray(
-                runtime.copy_device_to_host(
-                    d_fam_row_offsets,
-                    reason="make-valid device invalid-family-offset compact fence",
-                ),
-                dtype=np.int32,
-            )
-        else:
-            tag_match = owned.tags == family_tag
-            invalid_mask = np.zeros(len(owned.tags), dtype=bool)
-            invalid_mask[invalid_rows] = True
-            global_invalid = np.flatnonzero(tag_match & invalid_mask)
-        if global_invalid.size == 0:
+        d_invalid_rows = cp.asarray(invalid_rows, dtype=cp.int32)
+        d_tags = cp.asarray(device_state.tags)
+        d_family_row_offsets = cp.asarray(device_state.family_row_offsets)
+        d_family_mask = d_tags[d_invalid_rows] == np.int8(family_tag)
+        d_global_invalid = d_invalid_rows[d_family_mask].astype(cp.int32, copy=False)
+        if int(d_global_invalid.size) == 0:
+            continue
+        d_fam_row_offsets = d_family_row_offsets[d_global_invalid].astype(
+            cp.int32,
+            copy=False,
+        )
+        d_valid_fro = (d_fam_row_offsets >= 0) & (d_fam_row_offsets < polygon_count)
+        d_global_invalid = d_global_invalid[d_valid_fro].astype(cp.int32, copy=False)
+        d_fam_row_offsets = d_fam_row_offsets[d_valid_fro].astype(cp.int32, copy=False)
+        if int(d_global_invalid.size) == 0:
             continue
 
-        if not use_device_path:
-            fam_row_offsets = owned.family_row_offsets[global_invalid]
-            valid_fro = (fam_row_offsets >= 0) & (fam_row_offsets < polygon_count)
-            global_invalid = global_invalid[valid_fro]
-            fam_row_offsets = fam_row_offsets[valid_fro]
-            if global_invalid.size == 0:
-                continue
-            invalid_family_rows = np.unique(fam_row_offsets)
+        d_invalid_family_rows = d_fam_row_offsets.astype(
+            cp.int32,
+            copy=False,
+        )
 
-        # Unique family rows and their global row mapping.
-        fam_to_global = {}
-        for gi, fro in zip(global_invalid, fam_row_offsets):
-            fam_to_global.setdefault(int(fro), int(gi))
+        if family is GeometryFamily.MULTIPOLYGON:
+            batch_result = _repair_multipolygon_rows_grouped_device(
+                merged_owned,
+                d_global_invalid,
+            )
+            scattered = _scatter_valid_repaired_batch(
+                merged_owned,
+                batch_result,
+                family_name,
+                d_invalid_family_rows,
+                d_global_invalid,
+            )
+            if scattered is not None:
+                merged_owned, d_scattered_global_mask = scattered
+                d_repaired_global_mask |= d_scattered_global_mask
+                phases_used.append("grouped_multipart_topology")
+            continue
 
-        if use_device_path:
-            # --- Device-resident path: compact row-index fences only ---
-            batch = _extract_batch_coords_device(
-                d_buf,
-                invalid_family_rows,
-                host_buffer=buffer,
-            )
-            if batch is None:
-                continue
-            d_x, d_y, d_ring_offsets, d_geom_offsets = batch
-        else:
-            # --- Host fallback path (no device_state) ---
-            ring_offsets = np.asarray(buffer.ring_offsets, dtype=np.int32)
-            geom_offsets = np.asarray(buffer.geometry_offsets, dtype=np.int32)
-            batch = _extract_batch_coords(
-                buffer, geom_offsets, ring_offsets, invalid_family_rows,
-            )
-            if batch is None:
-                continue
-            batch_x, batch_y, batch_ring_offsets, batch_geom_offsets = batch
-            d_x = cp.asarray(np.ascontiguousarray(batch_x))
-            d_y = cp.asarray(np.ascontiguousarray(batch_y))
-            d_ring_offsets = cp.asarray(batch_ring_offsets)
-            d_geom_offsets = cp.asarray(batch_geom_offsets)
+        batch = _extract_batch_coords_device(
+            d_buf,
+            d_invalid_family_rows,
+            host_buffer=buffer,
+        )
+        if batch is None:
+            continue
+        (
+            d_x,
+            d_y,
+            d_ring_offsets,
+            d_geom_offsets,
+            d_original_to_unique,
+            repaired_fixed_size,
+        ) = batch
 
         batch_ring_count = d_ring_offsets.size - 1
         batch_poly_count = d_geom_offsets.size - 1
@@ -1865,48 +1297,49 @@ def gpu_repair_invalid_polygons(
 
         # --- Step 2: Phase B — batched simple repair ---
         d_x, d_y, d_ring_offsets = _gpu_close_rings(
-            d_x, d_y, d_ring_offsets,
-            batch_ring_count, kernels,
+            d_x,
+            d_y,
+            d_ring_offsets,
+            batch_ring_count,
+            kernels,
         )
         phases_used.append("close_rings")
 
         d_x, d_y, d_ring_offsets = _gpu_remove_duplicate_vertices(
-            d_x, d_y, d_ring_offsets,
-            batch_ring_count, kernels,
+            d_x,
+            d_y,
+            d_ring_offsets,
+            batch_ring_count,
+            kernels,
         )
         phases_used.append("remove_duplicates")
 
         d_x, d_y = _gpu_fix_ring_orientation(
-            d_x, d_y, d_ring_offsets,
-            d_geom_offsets, batch_ring_count, batch_poly_count, kernels,
+            d_x,
+            d_y,
+            d_ring_offsets,
+            d_geom_offsets,
+            batch_ring_count,
+            batch_poly_count,
+            kernels,
         )
         phases_used.append("fix_orientation")
 
-        # --- Step 3: Phase A+C — batched intersection detection + splitting ---
-        d_x, d_y, d_ring_offsets, had_splits = \
-            _split_self_intersections_gpu(
-                d_x, d_y, d_ring_offsets,
-                batch_ring_count, kernels,
-            )
-        if had_splits:
-            phases_used.append("split_intersections")
+        batch_result = _build_batch_repaired_device(
+            d_x,
+            d_y,
+            d_ring_offsets,
+            d_geom_offsets,
+            batch_ring_count,
+            batch_poly_count,
+            runtime_sel,
+            repaired_fixed_size,
+        )
 
-        # --- Step 4: Phase D — batched repolygonization ---
-        if had_splits:
-            batch_ring_count = d_ring_offsets.size - 1
-            batch_result = _repolygonize_from_split_rings(
-                d_x, d_y, d_ring_offsets,
-                d_geom_offsets, batch_ring_count, batch_poly_count,
-                runtime_selection=runtime_sel,
-            )
-            phases_used.append("repolygonize")
-        else:
-            # No self-intersections — simple repairs were sufficient.
-            batch_result = _build_batch_repaired_device(
-                d_x, d_y, d_ring_offsets, d_geom_offsets,
-                batch_ring_count, batch_poly_count, runtime_sel,
-            )
-
+        # Preserve the original shell/hole semantics before generic face
+        # polygonization. Polygonizing adjacent invalid holes can emit only
+        # the exterior face, after which the hole rings are no longer
+        # available for the grouped union and exterior-difference repair.
         if batch_result is not None:
             batch_result, repaired_touching_holes = _repair_touching_hole_rings_gpu(
                 batch_result,
@@ -1915,57 +1348,84 @@ def gpu_repair_invalid_polygons(
             if repaired_touching_holes:
                 phases_used.append("repair_touching_holes")
 
+        # Invalid simple-repair rows use the same sweep, streamed split-event,
+        # half-edge, and complete-row paging carriers as overlay. This replaces
+        # the old make-valid-specific quadratic pair matrix and contiguous
+        # split/rebuild allocation.
+        if batch_result is not None:
+            from vibespatial.api._native_rowset import NativeDeviceSelection
+            from vibespatial.constructive.validity import validity_expression_owned
+            from vibespatial.geometry.owned import device_mask_owned_capacity
+
+            batch_state = batch_result._ensure_device_state(preserve_indexed_view=True)
+            d_topology_mask = (
+                ~cp.asarray(
+                    validity_expression_owned(
+                        batch_result,
+                        exact_collinearity=True,
+                    ).values,
+                    dtype=cp.bool_,
+                )
+            ) & cp.asarray(batch_state.validity, dtype=cp.bool_)
+            topology_selection = NativeDeviceSelection.from_mask(d_topology_mask)
+            topology_count = get_cuda_runtime().copy_device_to_host(
+                topology_selection.logical_count,
+                reason="make-valid topology plan admission scalar fence",
+            )
+            if int(np.asarray(topology_count, dtype=np.int64)[0]) > 0:
+                topology_source = device_mask_owned_capacity(
+                    batch_result,
+                    d_topology_mask,
+                )
+                topology_repaired = _repolygonize_owned_rows_via_overlay(topology_source)
+                topology_scattered = _scatter_valid_repaired_batch(
+                    batch_result,
+                    topology_repaired,
+                    GeometryFamily.POLYGON.value,
+                    cp.arange(batch_result.row_count, dtype=cp.int32),
+                    cp.arange(batch_result.row_count, dtype=cp.int64),
+                )
+                if topology_scattered is not None:
+                    batch_result, _ = topology_scattered
+                    phases_used.append("overlay_topology_polygonize")
+
         # --- Step 5: Merge repaired batch back into owned on device ---
         if batch_result is not None:
-            from vibespatial.constructive.validity import validity_expression_owned
-
-            d_batch_valid = cp.asarray(
-                validity_expression_owned(
-                    batch_result,
-                    exact_collinearity=True,
-                ).values,
-                dtype=cp.bool_,
+            batch_result = batch_result._device_indexed_take(
+                d_original_to_unique,
+                assume_unique_indices=False,
             )
-            valid_repair_count = _make_valid_int_scalar(
-                cp.count_nonzero(d_batch_valid),
-                reason="make-valid repaired-batch valid-count scalar fence",
-            )
-            if valid_repair_count == 0:
-                continue
-            if valid_repair_count != batch_result.row_count:
-                d_valid_batch_rows = cp.flatnonzero(d_batch_valid).astype(
-                    cp.int32,
-                    copy=False,
-                )
-                valid_batch_rows = np.asarray(
-                    get_cuda_runtime().copy_device_to_host(
-                        d_valid_batch_rows,
-                        reason="make-valid repaired-batch valid-row compact fence",
-                    ),
-                    dtype=np.int32,
-                )
-                batch_result = batch_result.take(d_valid_batch_rows)
-                invalid_family_rows = invalid_family_rows[valid_batch_rows]
+        scattered = _scatter_valid_repaired_batch(
+            merged_owned,
+            batch_result,
+            family_name,
+            d_invalid_family_rows,
+            d_global_invalid,
+        )
+        if scattered is not None:
+            merged_owned, d_scattered_global_mask = scattered
+            d_repaired_global_mask |= d_scattered_global_mask
 
-            merged_owned = _device_scatter_repaired(
-                merged_owned, batch_result, family_name,
-                invalid_family_rows, fam_to_global,
-            )
-            gpu_repaired_count += int(invalid_family_rows.size)
-            for fro in invalid_family_rows:
-                g = fam_to_global.get(int(fro))
-                if g is not None:
-                    repaired_global_rows.add(g)
-
-    # Collect rows that GPU couldn't fix explicitly (e.g. non-polygon families)
-    still_invalid = np.asarray(
-        [int(r) for r in invalid_rows if r not in repaired_global_rows],
-        dtype=np.int32,
+    # A repair carrier is atomic: never expose a partly repaired array for a
+    # caller to patch row-by-row on the host. The public dispatcher owns the
+    # observable whole-operation decline when any requested row remains.
+    d_invalid_rows = cp.asarray(invalid_rows, dtype=cp.int64)
+    d_requested_mask = cp.zeros(owned.row_count, dtype=cp.bool_)
+    d_requested_mask[d_invalid_rows] = True
+    d_complete = cp.asarray(
+        cp.all((~d_requested_mask) | d_repaired_global_mask),
+        dtype=cp.bool_,
+    ).reshape(1)
+    complete = get_cuda_runtime().copy_device_to_host(
+        d_complete,
+        reason="make-valid atomic repair completion admission scalar fence",
     )
+    if not bool(np.asarray(complete, dtype=bool)[0]):
+        return None
 
+    repaired_count = int(invalid_rows.size)
     return GPURepairResult(
         repaired_owned=merged_owned,
-        repaired_count=gpu_repaired_count,
+        repaired_count=repaired_count,
         gpu_phases_used=tuple(set(phases_used)),
-        still_invalid_rows=still_invalid,
     )

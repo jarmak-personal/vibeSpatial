@@ -111,12 +111,7 @@ def evaluate_point_within_bounds(
     x = point_coords[:, 0]
     y = point_coords[:, 1]
     bounds = right.bounds
-    inside = (
-        (bounds[:, 0] <= x)
-        & (x <= bounds[:, 2])
-        & (bounds[:, 1] <= y)
-        & (y <= bounds[:, 3])
-    )
+    inside = (bounds[:, 0] <= x) & (x <= bounds[:, 2]) & (bounds[:, 1] <= y) & (y <= bounds[:, 3])
     result[value_mask & inside] = True
     return result
 

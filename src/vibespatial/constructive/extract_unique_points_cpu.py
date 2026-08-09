@@ -14,8 +14,12 @@ from vibespatial.runtime.precision import KernelClass
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.CPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("shapely", "constructive", "extract_unique_points"),
@@ -23,8 +27,5 @@ from vibespatial.runtime.precision import KernelClass
 def _extract_unique_points_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     """Compute extract_unique_points via Shapely."""
     geoms = owned.to_shapely()
-    results = [
-        shapely.extract_unique_points(g) if g is not None else None
-        for g in geoms
-    ]
+    results = [shapely.extract_unique_points(g) if g is not None else None for g in geoms]
     return from_shapely_geometries(results)

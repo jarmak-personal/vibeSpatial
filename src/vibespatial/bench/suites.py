@@ -1,4 +1,5 @@
 """Predefined benchmark suite definitions for vsbench CLI."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -84,14 +84,19 @@ def _compute_geometry_bounds_cpu_vectorized(geometry_array: OwnedGeometryArray):
     return _compute_geometry_bounds_cpu_vectorized_host(geometry_array)
 
 
-
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
 if cp is not None:
-    request_nvrtc_warmup([
-        ("geometry-bounds", _BOUNDS_KERNEL_SOURCE, _BOUNDS_KERNEL_NAMES),
-        ("geometry-bounds-cooperative", _BOUNDS_COOPERATIVE_KERNEL_SOURCE, _BOUNDS_COOPERATIVE_KERNEL_NAMES),
-    ])
+    request_nvrtc_warmup(
+        [
+            ("geometry-bounds", _BOUNDS_KERNEL_SOURCE, _BOUNDS_KERNEL_NAMES),
+            (
+                "geometry-bounds-cooperative",
+                _BOUNDS_COOPERATIVE_KERNEL_SOURCE,
+                _BOUNDS_COOPERATIVE_KERNEL_NAMES,
+            ),
+        ]
+    )
 
 
 def _has_host_routing_metadata(geometry_array: OwnedGeometryArray) -> bool:
@@ -158,7 +163,14 @@ def _launch_family_bounds_kernel(
                 ptr(device_buffer.bounds),
                 row_count,
             ),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
     elif family is GeometryFamily.POLYGON:
         params = (
@@ -242,6 +254,17 @@ def _avg_coords_per_geometry(buffer: FamilyGeometryBuffer) -> float:
     return float(len(buffer.x)) / float(buffer.row_count)
 
 
+def _device_buffer_row_count(buffer: DeviceFamilyGeometryBuffer) -> int:
+    return max(int(buffer.geometry_offsets.size) - 1, 0)
+
+
+def _avg_coords_per_device_geometry(buffer: DeviceFamilyGeometryBuffer) -> float:
+    row_count = _device_buffer_row_count(buffer)
+    if row_count == 0:
+        return 0.0
+    return float(int(buffer.x.size)) / float(row_count)
+
+
 def _launch_family_bounds_cooperative(
     family: GeometryFamily,
     device_buffer: DeviceFamilyGeometryBuffer,
@@ -321,12 +344,18 @@ def _compute_geometry_bounds_gpu_impl(
     compute_type: str = "double",
     *,
     materialize_host: bool = True,
+    preserve_indexed_view: bool = False,
 ):
     if cp is None:  # pragma: no cover - exercised on CPU-only installs
         raise RuntimeError("CuPy is not installed; GPU bounds execution is unavailable")
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
-    state = geometry_array._ensure_device_state()
+    state = geometry_array._ensure_device_state(
+        preserve_indexed_view=preserve_indexed_view,
+    )
+    preserving_indexed_view = preserve_indexed_view and getattr(
+        geometry_array, "is_indexed_view", False
+    )
     if state.row_bounds is not None:
         if materialize_host:
             if _has_host_routing_metadata(geometry_array):
@@ -346,27 +375,62 @@ def _compute_geometry_bounds_gpu_impl(
     try:
         for family, device_buffer in state.families.items():
             if device_buffer.bounds is None:
-                host_buffer = geometry_array.families[family]
-                device_buffer.bounds = runtime.allocate((host_buffer.row_count, 4), cp.float64)
+                host_buffer = (
+                    geometry_array.families[family] if family in geometry_array.families else None
+                )
+                family_row_count = (
+                    int(host_buffer.row_count)
+                    if host_buffer is not None
+                    else _device_buffer_row_count(device_buffer)
+                )
+                device_buffer.bounds = runtime.allocate((family_row_count, 4), cp.float64)
                 temp_bounds.append((family, device_buffer, device_buffer.bounds))
                 # Use cooperative (block-per-geometry) kernel when family supports it
                 # and geometries are complex enough to benefit from warp-level reduction.
                 use_cooperative = (
                     family in _cooperative_families
-                    and _avg_coords_per_geometry(host_buffer) >= _COOPERATIVE_BOUNDS_THRESHOLD
+                    and (
+                        _avg_coords_per_geometry(host_buffer)
+                        if host_buffer is not None
+                        else _avg_coords_per_device_geometry(device_buffer)
+                    )
+                    >= _COOPERATIVE_BOUNDS_THRESHOLD
                 )
                 if use_cooperative:
                     _launch_family_bounds_cooperative(
-                        family, device_buffer,
-                        row_count=host_buffer.row_count,
+                        family,
+                        device_buffer,
+                        row_count=family_row_count,
                         compute_type=compute_type,
                     )
                 else:
                     _launch_family_bounds_kernel(
-                        family, device_buffer,
-                        row_count=host_buffer.row_count,
+                        family,
+                        device_buffer,
+                        row_count=family_row_count,
                         compute_type=compute_type,
                     )
+        if len(state.families) == 1:
+            family, device_buffer = next(iter(state.families.items()))
+            host_buffer = (
+                geometry_array.families[family] if family in geometry_array.families else None
+            )
+            if (
+                not preserving_indexed_view
+                and host_buffer is not None
+                and int(host_buffer.row_count) == int(geometry_array.row_count)
+                and device_buffer.bounds is not None
+            ):
+                state.row_bounds = device_buffer.bounds
+                if materialize_host:
+                    bounds = runtime.copy_device_to_host(
+                        state.row_bounds,
+                        reason="geometry analysis homogeneous row-bounds host export",
+                    )
+                    if _has_host_routing_metadata(geometry_array):
+                        geometry_array.cache_bounds(bounds)
+                    return bounds
+                return cp.asarray(state.row_bounds)
         out_bounds = runtime.allocate((geometry_array.row_count, 4), cp.float64)
         try:
             kernel = _bounds_kernels(compute_type)["scatter_mixed_bounds"]
@@ -375,12 +439,24 @@ def _compute_geometry_bounds_gpu_impl(
                     ptr(state.validity),
                     ptr(state.tags),
                     ptr(state.family_row_offsets),
-                    0 if GeometryFamily.POINT not in state.families else ptr(state.families[GeometryFamily.POINT].bounds),
-                    0 if GeometryFamily.LINESTRING not in state.families else ptr(state.families[GeometryFamily.LINESTRING].bounds),
-                    0 if GeometryFamily.POLYGON not in state.families else ptr(state.families[GeometryFamily.POLYGON].bounds),
-                    0 if GeometryFamily.MULTIPOINT not in state.families else ptr(state.families[GeometryFamily.MULTIPOINT].bounds),
-                    0 if GeometryFamily.MULTILINESTRING not in state.families else ptr(state.families[GeometryFamily.MULTILINESTRING].bounds),
-                    0 if GeometryFamily.MULTIPOLYGON not in state.families else ptr(state.families[GeometryFamily.MULTIPOLYGON].bounds),
+                    0
+                    if GeometryFamily.POINT not in state.families
+                    else ptr(state.families[GeometryFamily.POINT].bounds),
+                    0
+                    if GeometryFamily.LINESTRING not in state.families
+                    else ptr(state.families[GeometryFamily.LINESTRING].bounds),
+                    0
+                    if GeometryFamily.POLYGON not in state.families
+                    else ptr(state.families[GeometryFamily.POLYGON].bounds),
+                    0
+                    if GeometryFamily.MULTIPOINT not in state.families
+                    else ptr(state.families[GeometryFamily.MULTIPOINT].bounds),
+                    0
+                    if GeometryFamily.MULTILINESTRING not in state.families
+                    else ptr(state.families[GeometryFamily.MULTILINESTRING].bounds),
+                    0
+                    if GeometryFamily.MULTIPOLYGON not in state.families
+                    else ptr(state.families[GeometryFamily.MULTIPOLYGON].bounds),
                     ptr(out_bounds),
                     geometry_array.row_count,
                 ),
@@ -418,8 +494,9 @@ def _compute_geometry_bounds_gpu_impl(
         # Cache per-row device bounds instead of freeing — avoids
         # recomputation for subsequent device-side bbox queries (dwithin).
         state.row_bounds = out_bounds
-        for family, _, device_bounds in temp_bounds:
-            geometry_array.cache_device_bounds(family, device_bounds)
+        if not preserve_indexed_view:
+            for family, _, device_bounds in temp_bounds:
+                geometry_array.cache_device_bounds(family, device_bounds)
         if materialize_host:
             if _has_host_routing_metadata(geometry_array):
                 geometry_array.cache_bounds(bounds)
@@ -453,6 +530,7 @@ def compute_geometry_bounds_device(
     geometry_array: OwnedGeometryArray,
     *,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
+    preserve_indexed_view: bool = False,
 ):
     """Return per-row bounds as a device array without forcing a D2H copy."""
     normalize_precision_mode(precision)
@@ -483,21 +561,29 @@ def compute_geometry_bounds_device(
         requested=precision,
     )
     try:
-        geometry_array.move_to(
-            Residency.DEVICE,
-            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-            reason="compute_geometry_bounds_device selected GPU execution",
-        )
+        if (
+            preserve_indexed_view
+            and getattr(geometry_array, "is_indexed_view", False)
+            and geometry_array.residency is Residency.DEVICE
+        ):
+            geometry_array._ensure_device_state(preserve_indexed_view=True)
+        else:
+            geometry_array.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason="compute_geometry_bounds_device selected GPU execution",
+            )
         d_bounds = _compute_geometry_bounds_gpu_impl(
             geometry_array,
             compute_type="double",
             materialize_host=False,
+            preserve_indexed_view=preserve_indexed_view,
         )
     except Exception as exc:
         record_fallback_event(
             surface="geopandas.array.bounds",
             reason="GPU device-bounds kernel failed; device-only caller cannot fall back to CPU bounds",
-            detail=f"rows={row_count}",
+            detail=f"rows={row_count}, error={type(exc).__name__}: {exc}",
             requested=ExecutionMode.GPU,
             selected=ExecutionMode.CPU,
         )
@@ -548,12 +634,24 @@ def compute_geometry_bounds(
         # and fp32 rounding can shrink bounds, causing false negatives in spatial filtering.
         # The precision plan is still consulted for observability/diagnostics.
         try:
-            geometry_array.move_to(
-                Residency.DEVICE,
-                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                reason="compute_geometry_bounds selected GPU execution",
+            preserve_indexed_view = bool(
+                geometry_array.residency is Residency.DEVICE
+                and getattr(geometry_array, "is_indexed_view", False)
             )
-            result = _compute_geometry_bounds_gpu(geometry_array, compute_type="double")
+            if preserve_indexed_view:
+                geometry_array._ensure_device_state(preserve_indexed_view=True)
+                result = _compute_geometry_bounds_gpu_impl(
+                    geometry_array,
+                    compute_type="double",
+                    preserve_indexed_view=True,
+                )
+            else:
+                geometry_array.move_to(
+                    Residency.DEVICE,
+                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                    reason="compute_geometry_bounds selected GPU execution",
+                )
+                result = _compute_geometry_bounds_gpu(geometry_array, compute_type="double")
         except Exception:
             record_fallback_event(
                 surface="geopandas.array.bounds",
@@ -608,7 +706,9 @@ def compute_total_bounds(
 ) -> tuple[float, float, float, float]:
     normalize_precision_mode(precision)
     dispatch_mode = _resolve_bounds_dispatch_mode(dispatch_mode)
-    bounds = compute_geometry_bounds(geometry_array, dispatch_mode=dispatch_mode, precision=precision)
+    bounds = compute_geometry_bounds(
+        geometry_array, dispatch_mode=dispatch_mode, precision=precision
+    )
     return compute_total_bounds_from_bounds(bounds)
 
 

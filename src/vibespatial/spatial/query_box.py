@@ -22,13 +22,17 @@ from vibespatial.cuda._runtime import (  # noqa: E402
     get_cuda_runtime,
 )
 from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
-from vibespatial.geometry.owned import OwnedGeometryArray  # noqa: E402
+from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray  # noqa: E402
 from vibespatial.kernels.core.geometry_analysis import (  # noqa: E402
     compute_geometry_bounds,
     compute_geometry_bounds_device,
 )
 from vibespatial.kernels.core.spatial_query_kernels import _spatial_query_kernels  # noqa: E402
 from vibespatial.runtime import has_gpu_runtime  # noqa: E402
+from vibespatial.runtime.crossover import (  # noqa: E402
+    PhysicalWorkEstimate,
+    estimate_spatial_index_work_from_owned,
+)
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
 from vibespatial.runtime.residency import Residency, TransferTrigger  # noqa: E402
 
@@ -62,6 +66,11 @@ def _query_regular_grid_point_index(
         row_count=query_owned.row_count,
         gpu_available=has_gpu_runtime(),
         current_residency=query_owned.residency,
+        work_estimate=estimate_spatial_index_work_from_owned(
+            query_owned,
+            output_row_count=query_owned.row_count * 4,
+            primary_unit_name="point-grid-candidate",
+        ),
     )
     if selection.selected is not ExecutionMode.GPU:
         return None
@@ -76,8 +85,6 @@ def _query_regular_grid_point_index(
     point_buffer = state.families[GeometryFamily.POINT]
     device_right = runtime.allocate((query_owned.row_count * 4,), np.int32)
     device_counts = runtime.allocate((query_owned.row_count,), np.uint8)
-    device_counts_i32 = None
-    device_offsets = None
     device_left_out = None
     device_right_out = None
     try:
@@ -121,49 +128,17 @@ def _query_regular_grid_point_index(
         )
         grid, block = runtime.launch_config(kernel, query_owned.row_count)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        device_counts_i32 = device_counts.astype(np.int32)
-        device_offsets = exclusive_sum(device_counts_i32)
-        total_pairs = (
-            count_scatter_total(
-                runtime,
-                device_counts_i32,
-                device_offsets,
-                reason="spatial query regular-grid point-pair allocation fence",
-            )
-            if query_owned.row_count
-            else 0
-        )
+        flat_slots = compact_indices((device_right >= 0).ravel()).values
+        total_pairs = int(flat_slots.size)
         if total_pairs == 0:
-            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
+            return _DeviceCandidates(
+                d_left=cp.empty(0, dtype=cp.int32),
+                d_right=cp.empty(0, dtype=cp.int32),
+                total_pairs=0,
+            )
 
-        device_left_out = runtime.allocate((total_pairs,), np.int32)
-        device_right_out = runtime.allocate((total_pairs,), np.int32)
-        scatter_kernel = _spatial_query_kernels()["point_regular_grid_scatter_pairs"]
-        scatter_params = (
-            (
-                ptr(device_right),
-                ptr(device_offsets),
-                ptr(device_counts_i32),
-                ptr(device_left_out),
-                ptr(device_right_out),
-                query_owned.row_count,
-            ),
-            (
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_I32,
-            ),
-        )
-        scatter_grid, scatter_block = runtime.launch_config(scatter_kernel, query_owned.row_count)
-        runtime.launch(
-            scatter_kernel,
-            grid=scatter_grid,
-            block=scatter_block,
-            params=scatter_params,
-        )
+        device_left_out = (flat_slots // np.int32(4)).astype(cp.int32, copy=False)
+        device_right_out = device_right[flat_slots].astype(cp.int32, copy=False)
         # Return device-resident candidates (ADR-0005: no mid-pipeline D→H).
         result = _DeviceCandidates(
             d_left=device_left_out,
@@ -177,17 +152,16 @@ def _query_regular_grid_point_index(
     finally:
         runtime.free(device_right)
         runtime.free(device_counts)
-        runtime.free(device_counts_i32)
-        runtime.free(device_offsets)
         runtime.free(device_left_out)
         runtime.free(device_right_out)
 
 
 def _query_regular_grid_rect_box_index(
     flat_index,
-    query_bounds: np.ndarray | None,
+    query_bounds: object | None,
     *,
     predicate: str | None,
+    max_cells_per_query: int | None = None,
 ) -> _DeviceCandidates | tuple[np.ndarray, np.ndarray] | None:
     metadata = getattr(flat_index, "regular_grid", None)
     if metadata is None or predicate not in (None, "intersects"):
@@ -202,15 +176,28 @@ def _query_regular_grid_rect_box_index(
     selection = plan_dispatch_selection(
         kernel_name="bbox_overlap_candidates",
         kernel_class=KernelClass.COARSE,
-        row_count=query_count * flat_index.size,
+        row_count=query_count,
         gpu_available=has_gpu_runtime(),
         current_residency=flat_index.geometry_array.residency,
+        work_estimate=PhysicalWorkEstimate.for_candidate_pairs(
+            row_count=query_count,
+            candidate_pair_count=query_count * flat_index.size,
+            primary_unit_name="bbox-candidate-pair",
+        ),
     )
     if selection.selected is not ExecutionMode.GPU:
         return None
 
     runtime = get_cuda_runtime()
-    device_query_bounds = runtime.from_host(np.ascontiguousarray(query_bounds, dtype=np.float64).ravel())
+    owns_device_query_bounds = False
+    if cp is not None and hasattr(query_bounds, "__cuda_array_interface__"):
+        device_query_bounds = cp.asarray(query_bounds, dtype=cp.float64)
+        device_query_bounds = cp.ascontiguousarray(device_query_bounds).reshape(-1)
+    else:
+        device_query_bounds = runtime.from_host(
+            np.ascontiguousarray(query_bounds, dtype=np.float64).ravel(),
+        )
+        owns_device_query_bounds = True
     device_counts = runtime.allocate((query_count,), np.int32)
     device_offsets = None
     device_left = None
@@ -218,6 +205,72 @@ def _query_regular_grid_rect_box_index(
     try:
         kernels = _spatial_query_kernels()
         ptr = runtime.pointer
+
+        if (
+            max_cells_per_query is not None
+            and max_cells_per_query > 0
+            and cp is not None
+            and hasattr(device_query_bounds, "__cuda_array_interface__")
+        ):
+            capacity = int(query_count) * int(max_cells_per_query)
+            device_left = runtime.allocate((capacity,), np.int32)
+            device_right = runtime.allocate((capacity,), np.int32)
+            scatter_params = (
+                (
+                    ptr(device_query_bounds),
+                    metadata.origin_x,
+                    metadata.origin_y,
+                    metadata.cell_width,
+                    metadata.cell_height,
+                    metadata.cols,
+                    metadata.rows,
+                    metadata.size,
+                    int(max_cells_per_query),
+                    ptr(device_left),
+                    ptr(device_right),
+                    query_count,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
+            )
+            scatter_grid, scatter_block = runtime.launch_config(
+                kernels["regular_grid_box_overlap_scatter_fixed"],
+                query_count,
+            )
+            runtime.launch(
+                kernels["regular_grid_box_overlap_scatter_fixed"],
+                grid=scatter_grid,
+                block=scatter_block,
+                params=scatter_params,
+            )
+            flat_slots = compact_indices((device_right >= 0).ravel()).values
+            total_pairs = int(flat_slots.size)
+            if total_pairs == 0:
+                return _DeviceCandidates(
+                    d_left=cp.empty(0, dtype=cp.int32),
+                    d_right=cp.empty(0, dtype=cp.int32),
+                    total_pairs=0,
+                )
+            device_left_out = device_left[flat_slots].astype(cp.int32, copy=False)
+            device_right_out = device_right[flat_slots].astype(cp.int32, copy=False)
+            result = _DeviceCandidates(
+                d_left=device_left_out,
+                d_right=device_right_out,
+                total_pairs=total_pairs,
+            )
+            return result
 
         count_params = (
             (
@@ -245,7 +298,9 @@ def _query_regular_grid_rect_box_index(
                 KERNEL_PARAM_I32,
             ),
         )
-        count_grid, count_block = runtime.launch_config(kernels["regular_grid_box_overlap_count"], query_count)
+        count_grid, count_block = runtime.launch_config(
+            kernels["regular_grid_box_overlap_count"], query_count
+        )
         runtime.launch(
             kernels["regular_grid_box_overlap_count"],
             grid=count_grid,
@@ -300,7 +355,9 @@ def _query_regular_grid_rect_box_index(
                 KERNEL_PARAM_I32,
             ),
         )
-        scatter_grid, scatter_block = runtime.launch_config(kernels["regular_grid_box_overlap_scatter"], query_count)
+        scatter_grid, scatter_block = runtime.launch_config(
+            kernels["regular_grid_box_overlap_scatter"], query_count
+        )
         runtime.launch(
             kernels["regular_grid_box_overlap_scatter"],
             grid=scatter_grid,
@@ -319,7 +376,8 @@ def _query_regular_grid_rect_box_index(
         device_right = None
         return result
     finally:
-        runtime.free(device_query_bounds)
+        if owns_device_query_bounds:
+            runtime.free(device_query_bounds)
         runtime.free(device_counts)
         runtime.free(device_offsets)
         runtime.free(device_left)
@@ -345,7 +403,9 @@ def _is_axis_aligned_box(geometry: BaseGeometry) -> bool:
     return all(same_x ^ same_y for same_x, same_y in zip(edge_same_x, edge_same_y, strict=True))
 
 
-def _coords_form_axis_aligned_box(xs: np.ndarray, ys: np.ndarray) -> tuple[float, float, float, float] | None:
+def _coords_form_axis_aligned_box(
+    xs: np.ndarray, ys: np.ndarray
+) -> tuple[float, float, float, float] | None:
     if xs.size != 5 or ys.size != 5:
         return None
     minx = float(xs.min())
@@ -440,36 +500,81 @@ def _extract_box_query_bounds_shapely(query_values: np.ndarray) -> np.ndarray | 
     return bounds
 
 
-def _extract_owned_polygon_box_bounds(query_owned: OwnedGeometryArray) -> np.ndarray | None:
-    if GeometryFamily.POLYGON not in query_owned.families or len(query_owned.families) != 1:
-        return None
-    polygon_buffer = query_owned.families[GeometryFamily.POLYGON]
-    if polygon_buffer.ring_offsets is None:
-        return None
-
+def _extract_owned_polygon_box_bounds(
+    query_owned: OwnedGeometryArray,
+    *,
+    return_device: bool = False,
+) -> object | None:
     n = query_owned.row_count
     if n == 0:
+        if return_device and cp is not None and query_owned.residency is Residency.DEVICE:
+            return cp.empty((0, 4), dtype=cp.float64)
         return np.full((0, 4), np.nan, dtype=np.float64)
 
-    # Vectorized check: all polygons must have exactly 1 ring.
-    geo_offsets = polygon_buffer.geometry_offsets
-    ring_counts = geo_offsets[1:] - geo_offsets[:-1]
-    if not np.all(ring_counts == 1):
-        return None
+    if cp is not None and query_owned.residency is Residency.DEVICE:
+        state = query_owned._ensure_device_state(preserve_indexed_view=True)
+        polygon_state = state.families.get(GeometryFamily.POLYGON)
+        if polygon_state is None or polygon_state.ring_offsets is None:
+            return None
+        metadata_polygon_only = (
+            not query_owned.is_indexed_view
+            and GeometryFamily.POLYGON in query_owned.families
+            and len(query_owned.families) == 1
+            and int(query_owned.families[GeometryFamily.POLYGON].row_count) == n
+        )
+        if int(getattr(polygon_state, "dense_single_ring_width", 0) or 0) == 5 and bool(
+            getattr(polygon_state, "axis_aligned_rectangles", False)
+        ):
+            d_row_offsets = cp.asarray(state.family_row_offsets).astype(cp.int32, copy=False)
+            d_polygon_rows = d_row_offsets.astype(cp.int64, copy=False)
+            d_tags = cp.asarray(state.tags).astype(cp.int8, copy=False)
+            polygon_tag = np.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
+            if not metadata_polygon_only:
+                if not _device_scalar_bool(
+                    cp.all((d_tags == polygon_tag) & (d_polygon_rows >= 0)),
+                    reason="spatial query polygon-box active polygon rowset scalar fence",
+                ):
+                    return None
 
-    # Vectorized check: all rings must have exactly 5 coords.
-    ring_offsets = polygon_buffer.ring_offsets
-    coord_counts = ring_offsets[1:] - ring_offsets[:-1]
-    if coord_counts.size != n or not np.all(coord_counts == 5):
-        return None
+            d_source_bounds = None
+            if polygon_state.bounds is not None:
+                d_source_bounds = cp.asarray(polygon_state.bounds)
+                if (
+                    d_source_bounds.ndim != 2
+                    or int(d_source_bounds.shape[1]) != 4
+                    or int(d_source_bounds.shape[0]) <= 0
+                ):
+                    d_source_bounds = None
 
-    if (
-        cp is not None
-        and query_owned.residency is Residency.DEVICE
-    ):
-        state = query_owned._ensure_device_state()
-        polygon_state = state.families[GeometryFamily.POLYGON]
-        if polygon_state.ring_offsets is None:
+            if d_source_bounds is not None:
+                d_bounds = d_source_bounds[d_polygon_rows].reshape(n, 4)
+            else:
+                d_coord_offsets = (
+                    d_polygon_rows[:, None] * 5 + cp.arange(5, dtype=cp.int64)[None, :]
+                )
+                d_x = cp.asarray(polygon_state.x)[d_coord_offsets]
+                d_y = cp.asarray(polygon_state.y)[d_coord_offsets]
+                d_bounds = cp.column_stack(
+                    (
+                        cp.min(d_x[:, :4], axis=1),
+                        cp.min(d_y[:, :4], axis=1),
+                        cp.max(d_x[:, :4], axis=1),
+                        cp.max(d_y[:, :4], axis=1),
+                    )
+                ).astype(cp.float64, copy=False)
+
+            d_empty_mask = cp.asarray(polygon_state.empty_mask).astype(cp.bool_, copy=False)
+            d_valid = cp.asarray(state.validity).astype(cp.bool_, copy=False)
+            d_valid = d_valid & ~d_empty_mask[d_polygon_rows]
+            d_bounds = cp.where(d_valid[:, None], d_bounds, cp.nan)
+            if return_device:
+                return d_bounds
+            return get_cuda_runtime().copy_device_to_host(
+                d_bounds,
+                reason="spatial query polygon-box bounds host export",
+            )
+
+        if not metadata_polygon_only:
             return None
 
         d_geom_starts = cp.asarray(polygon_state.geometry_offsets[:-1]).astype(cp.int32, copy=False)
@@ -500,14 +605,15 @@ def _extract_owned_polygon_box_bounds(query_owned: OwnedGeometryArray) -> np.nda
         d_maxx = d_bounds[:, 2][:, None]
         d_maxy = d_bounds[:, 3][:, None]
         d_tol = 1e-9 * cp.maximum(
-            cp.maximum(cp.abs(d_bounds[:, 2] - d_bounds[:, 0]), cp.abs(d_bounds[:, 3] - d_bounds[:, 1])),
+            cp.maximum(
+                cp.abs(d_bounds[:, 2] - d_bounds[:, 0]), cp.abs(d_bounds[:, 3] - d_bounds[:, 1])
+            ),
             1.0,
         )
         d_tol_2d = d_tol[:, None]
 
-        closed = (
-            (cp.abs(d_x[:, 0] - d_x[:, -1]) <= d_tol)
-            & (cp.abs(d_y[:, 0] - d_y[:, -1]) <= d_tol)
+        closed = (cp.abs(d_x[:, 0] - d_x[:, -1]) <= d_tol) & (
+            cp.abs(d_y[:, 0] - d_y[:, -1]) <= d_tol
         )
         x_at_min_or_max = (cp.abs(d_x - d_minx) <= d_tol_2d) | (cp.abs(d_x - d_maxx) <= d_tol_2d)
         y_at_min_or_max = (cp.abs(d_y - d_miny) <= d_tol_2d) | (cp.abs(d_y - d_maxy) <= d_tol_2d)
@@ -530,10 +636,33 @@ def _extract_owned_polygon_box_bounds(query_owned: OwnedGeometryArray) -> np.nda
         d_empty_mask = cp.asarray(polygon_state.empty_mask).astype(cp.bool_, copy=False)
         d_valid = d_valid & ~d_empty_mask[d_polygon_rows]
         d_bounds = cp.where(d_valid[:, None], d_bounds, cp.nan)
+        if return_device:
+            return d_bounds
         return get_cuda_runtime().copy_device_to_host(
             d_bounds,
             reason="spatial query polygon-box bounds host export",
         )
+
+    if GeometryFamily.POLYGON not in query_owned.families or len(query_owned.families) != 1:
+        return None
+    polygon_buffer = query_owned.families[GeometryFamily.POLYGON]
+    if polygon_buffer.ring_offsets is None:
+        return None
+
+    # Vectorized check: all polygons must have exactly 1 ring.
+    geo_offsets = polygon_buffer.geometry_offsets
+    ring_counts = geo_offsets[1:] - geo_offsets[:-1]
+    if not np.all(ring_counts == 1):
+        return None
+
+    # Vectorized check: all rings must have exactly 5 coords.
+    ring_offsets = polygon_buffer.ring_offsets
+    coord_counts = ring_offsets[1:] - ring_offsets[:-1]
+    if coord_counts.size != n or not np.all(coord_counts == 5):
+        return None
+
+    if return_device:
+        return None
 
     # Structural checks above use only offsets (available on host even for
     # device-resident OGAs).  Coordinate verification needs x/y buffers;
@@ -560,8 +689,12 @@ def _extract_owned_polygon_box_bounds(query_owned: OwnedGeometryArray) -> np.nda
 
     # All coords must be at min or max x/y.
     tol_2d = tol[:, None]
-    x_at_min_or_max = (np.abs(all_x - minx[:, None]) <= tol_2d) | (np.abs(all_x - maxx[:, None]) <= tol_2d)
-    y_at_min_or_max = (np.abs(all_y - miny[:, None]) <= tol_2d) | (np.abs(all_y - maxy[:, None]) <= tol_2d)
+    x_at_min_or_max = (np.abs(all_x - minx[:, None]) <= tol_2d) | (
+        np.abs(all_x - maxx[:, None]) <= tol_2d
+    )
+    y_at_min_or_max = (np.abs(all_y - miny[:, None]) <= tol_2d) | (
+        np.abs(all_y - maxy[:, None]) <= tol_2d
+    )
     if not np.all(x_at_min_or_max):
         return None
     if not np.all(y_at_min_or_max):
@@ -588,10 +721,26 @@ def _extract_owned_polygon_box_bounds(query_owned: OwnedGeometryArray) -> np.nda
 def _extract_box_query_bounds_from_owned(
     predicate: str | None,
     query_owned: OwnedGeometryArray,
-) -> np.ndarray | None:
+    *,
+    return_device: bool = False,
+) -> object | None:
     if predicate is None:
-        return compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode(query_owned))
-    return _extract_owned_polygon_box_bounds(query_owned)
+        if return_device:
+            if cp is None or query_owned.residency is not Residency.DEVICE:
+                return None
+            compute_geometry_bounds_device(query_owned)
+            state = query_owned._ensure_device_state()
+            if state.row_bounds is None:
+                return None
+            return cp.asarray(state.row_bounds).reshape(query_owned.row_count, 4)
+        return compute_geometry_bounds(
+            query_owned,
+            dispatch_mode=_gpu_bounds_dispatch_mode(query_owned),
+        )
+    return _extract_owned_polygon_box_bounds(
+        query_owned,
+        return_device=return_device,
+    )
 
 
 def _point_box_predicate_mode(predicate: str | None) -> int | None:
@@ -627,10 +776,15 @@ def _query_point_tree_box_index(
         selection = plan_dispatch_selection(
             kernel_name="point_box_query",
             kernel_class=KernelClass.COARSE,
-            row_count=tree_owned.row_count * query_row_count,
+            row_count=query_row_count,
             requested_mode=ExecutionMode.GPU if force_gpu else ExecutionMode.AUTO,
             gpu_available=has_gpu_runtime(),
             current_residency=tree_owned.residency,
+            work_estimate=PhysicalWorkEstimate.for_candidate_pairs(
+                row_count=query_row_count,
+                candidate_pair_count=tree_owned.row_count * query_row_count,
+                primary_unit_name="point-box-candidate",
+            ),
         )
     except RuntimeError:
         return None
@@ -728,10 +882,15 @@ def _query_point_tree_box_row_positions_device(
         selection = plan_dispatch_selection(
             kernel_name="point_box_query",
             kernel_class=KernelClass.COARSE,
-            row_count=tree_owned.row_count,
+            row_count=1,
             requested_mode=ExecutionMode.GPU if force_gpu else ExecutionMode.AUTO,
             gpu_available=has_gpu_runtime(),
             current_residency=tree_owned.residency,
+            work_estimate=PhysicalWorkEstimate.for_candidate_pairs(
+                row_count=1,
+                candidate_pair_count=tree_owned.row_count,
+                primary_unit_name="point-box-candidate",
+            ),
         )
     except RuntimeError:
         return None

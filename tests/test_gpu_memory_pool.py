@@ -71,8 +71,8 @@ def test_oom_callback_time_reset(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_cupy_fallback_when_rmm_unavailable(monkeypatch) -> None:
-    """When rmm is None, runtime falls back to CuPy memory pool."""
+def test_memory_pool_configuration_waits_for_active_context(monkeypatch) -> None:
+    """Importable CuPy must not install an allocator before context creation."""
     import vibespatial.cuda._runtime as rt_mod
 
     # Monkeypatch rmm to None at the module level
@@ -80,9 +80,10 @@ def test_cupy_fallback_when_rmm_unavailable(monkeypatch) -> None:
     monkeypatch.setattr(rt_mod, "rmm_cupy_allocator", None)
 
     runtime = rt_mod.CudaDriverRuntime()
-    # Should use CuPy pool (or "none" if CuPy is not available)
-    assert runtime._memory_backend in ("cupy", "none")
+    assert runtime._memory_backend == "none"
+    assert runtime._memory_pool is None
     assert runtime._rmm_mr is None
+    assert runtime._memory_pool_configured is False
 
 
 # ---------------------------------------------------------------------------
@@ -90,23 +91,22 @@ def test_cupy_fallback_when_rmm_unavailable(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_memory_pool_stats_cupy_backend_returns_expected_keys(monkeypatch) -> None:
+def test_memory_pool_stats_cupy_backend_returns_expected_keys() -> None:
     """CuPy backend stats include used_bytes, total_bytes, free_bytes."""
     import vibespatial.cuda._runtime as rt_mod
 
-    monkeypatch.setattr(rt_mod, "rmm", None)
-    monkeypatch.setattr(rt_mod, "rmm_cupy_allocator", None)
-
-    runtime = rt_mod.CudaDriverRuntime()
+    pool = SimpleNamespace(
+        used_bytes=lambda: 11,
+        total_bytes=lambda: 29,
+        free_bytes=lambda: 18,
+    )
+    runtime = rt_mod.CudaDriverRuntime.__new__(rt_mod.CudaDriverRuntime)
+    runtime._memory_backend = "cupy"
+    runtime._memory_pool = pool
+    runtime._rmm_mr = None
     stats = runtime.memory_pool_stats()
 
-    if runtime._memory_backend == "cupy":
-        assert "used_bytes" in stats
-        assert "total_bytes" in stats
-        assert "free_bytes" in stats
-    else:
-        # No CuPy available — stats should be empty dict
-        assert stats == {}
+    assert stats == {"used_bytes": 11, "total_bytes": 29, "free_bytes": 18}
 
 
 def test_memory_pool_stats_no_backend_returns_empty() -> None:
@@ -152,16 +152,20 @@ def test_maybe_trim_pool_memory_respects_env_opt_in(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_free_pool_memory_cupy_backend_does_not_raise(monkeypatch) -> None:
+def test_free_pool_memory_cupy_backend_does_not_raise() -> None:
     """free_pool_memory should not raise with CuPy backend."""
     import vibespatial.cuda._runtime as rt_mod
 
-    monkeypatch.setattr(rt_mod, "rmm", None)
-    monkeypatch.setattr(rt_mod, "rmm_cupy_allocator", None)
-
-    runtime = rt_mod.CudaDriverRuntime()
-    # Should not raise regardless of backend
+    calls: list[str] = []
+    runtime = rt_mod.CudaDriverRuntime.__new__(rt_mod.CudaDriverRuntime)
+    runtime._memory_backend = "cupy"
+    runtime._memory_pool = SimpleNamespace(
+        free_all_blocks=lambda: calls.append("free"),
+    )
+    runtime._rmm_mr = None
     runtime.free_pool_memory()
+
+    assert calls == ["free"]
 
 
 def test_free_pool_memory_no_backend_does_not_raise() -> None:

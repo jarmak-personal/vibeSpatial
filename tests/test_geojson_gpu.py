@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from vibespatial import has_gpu_runtime
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.io.geojson import (
     plan_geojson_ingest,
@@ -18,7 +19,7 @@ from vibespatial.runtime.residency import Residency
 try:
     import cupy as cp
 
-    HAS_GPU = True
+    HAS_GPU = has_gpu_runtime()
 except (ImportError, ModuleNotFoundError):
     HAS_GPU = False
 
@@ -128,6 +129,25 @@ def test_correctness_against_fast_json(tmp_path):
 
 
 @needs_gpu
+def test_gpu_polygon_parse_seeds_native_family_and_validity_proofs(tmp_path):
+    features = [
+        _make_polygon_feature(_simple_square(0.0, 0.0), {"id": 1}),
+        _make_polygon_feature(_simple_square(1.0, 1.0), {"id": 2}),
+    ]
+    fc = _make_feature_collection(features)
+    path = tmp_path / "proofs.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    state = batch.geometry.device_state
+
+    assert state is not None
+    assert state.trusted_all_valid is True
+    assert state.trusted_homogeneous_family is GeometryFamily.POLYGON
+    assert state.trusted_polygonal_only is True
+
+
+@needs_gpu
 def test_gpu_byte_classify_supports_in_memory_text_source() -> None:
     fc = _make_feature_collection([
         _make_point_feature([0.5, 1.5], {"id": 1}),
@@ -173,8 +193,6 @@ def test_gpu_byte_classify_point_fast_path_skips_generic_numeric_pipeline(monkey
     def _fail(*_args, **_kwargs):
         raise AssertionError("homogeneous point GeoJSON should bypass the generic structural pipeline")
 
-    monkeypatch.setattr(io_geojson_gpu, "quote_parity", _fail)
-    monkeypatch.setattr(io_geojson_gpu, "bracket_depth", _fail)
     monkeypatch.setattr(io_geojson_gpu, "_coord_key_kernels", _fail)
     monkeypatch.setattr(io_geojson_gpu, "_type_key_kernels", _fail)
     monkeypatch.setattr(io_geojson_gpu, "_classify_type_kernels", _fail)
@@ -216,8 +234,6 @@ def test_gpu_byte_classify_point_fast_path_ignores_escaped_geometry_text(monkeyp
     def _fail(*_args, **_kwargs):
         raise AssertionError("escaped property text should not force the generic structural pipeline")
 
-    monkeypatch.setattr(io_geojson_gpu, "quote_parity", _fail)
-    monkeypatch.setattr(io_geojson_gpu, "bracket_depth", _fail)
     monkeypatch.setattr(io_geojson_gpu, "_coord_key_kernels", _fail)
     monkeypatch.setattr(io_geojson_gpu, "_type_key_kernels", _fail)
     monkeypatch.setattr(io_geojson_gpu, "_classify_type_kernels", _fail)
@@ -240,7 +256,60 @@ def test_gpu_byte_classify_point_fast_path_ignores_escaped_geometry_text(monkeyp
 
 
 @needs_gpu
-def test_geojson_compact_point_scalar_fence_is_runtime_observable() -> None:
+def test_gpu_byte_classify_point_fast_path_ignores_property_geometry_key() -> None:
+    fc = _make_feature_collection([
+        _make_point_feature(
+            [0.5, 1.5],
+            {"geometry": {"type": "Point", "coordinates": [99.0, 100.0]}},
+        ),
+        _make_point_feature([2.5, 3.5], {"id": 2}),
+    ])
+    payload = json.dumps(fc).encode("utf-8")
+
+    batch = read_geojson_owned(payload, prefer="gpu-byte-classify", track_properties=False)
+    materialized = batch.geometry.to_shapely()
+
+    assert batch.geometry.row_count == 2
+    np.testing.assert_allclose(
+        np.asarray([geom.x for geom in materialized], dtype=np.float64),
+        np.asarray([0.5, 2.5], dtype=np.float64),
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        np.asarray([geom.y for geom in materialized], dtype=np.float64),
+        np.asarray([1.5, 3.5], dtype=np.float64),
+        atol=1e-12,
+    )
+
+
+@needs_gpu
+def test_gpu_byte_classify_point_fast_path_preserves_decimal_float_bits() -> None:
+    text = """{"type":"FeatureCollection","features":[
+{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[27.81,-82.496]}},
+{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[27.810000000000002,-82.41799999999999]}},
+{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1.5e-4,79097.48514162877e-2]}}
+]}"""
+
+    batch = read_geojson_owned(text, prefer="gpu-byte-classify", track_properties=False)
+    materialized = batch.geometry.to_shapely()
+    actual = [(geom.x, geom.y) for geom in materialized]
+    expected = [
+        (27.81, -82.496),
+        (27.810000000000002, -82.41799999999999),
+        (1.5e-4, 79097.48514162877e-2),
+    ]
+
+    assert [
+        (float(x).hex(), float(y).hex())
+        for x, y in actual
+    ] == [
+        (float(x).hex(), float(y).hex())
+        for x, y in expected
+    ]
+
+
+@needs_gpu
+def test_geojson_compact_point_validity_admission_stays_device_resident() -> None:
     from vibespatial.cuda._runtime import (
         get_d2h_transfer_events,
         reset_d2h_transfer_count,
@@ -257,7 +326,8 @@ def test_geojson_compact_point_scalar_fence_is_runtime_observable() -> None:
     reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
 
     assert batch.geometry.device_state is not None
-    assert "geojson compact point validity scalar fence" in reasons
+    assert "geojson compact point validity scalar fence" not in reasons
+    assert "pylibcudf geometry validity-count scalar fence" not in reasons
 
 
 @needs_gpu
@@ -278,8 +348,8 @@ def test_geojson_generic_scalar_fences_are_runtime_observable() -> None:
     reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
 
     assert batch.geometry.device_state is not None
-    assert "geojson unsupported geometry-count scalar fence" in reasons
-    assert "geojson geometry family-domain scalar fence" in reasons
+    assert "geojson geometry family-summary scalar fence" in reasons
+    assert "geojson unsupported geometry-count scalar fence" not in reasons
 
 
 @needs_gpu
@@ -608,7 +678,7 @@ def test_hybrid_properties_materialize_host_state_lazily(monkeypatch, tmp_path):
     assert props[1]["id"] == 2
     assert props[1]["name"] == "beta"
     assert fromfile_calls == 1
-    assert asnumpy_calls == 2
+    assert asnumpy_calls == 1
 
 
 @needs_gpu

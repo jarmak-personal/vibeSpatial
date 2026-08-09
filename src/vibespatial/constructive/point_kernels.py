@@ -124,4 +124,9 @@ extern "C" __global__ void point_subset_gather(
   out_y[row] = point_y[coord];
 }
 """
-_POINT_CONSTRUCTIVE_KERNEL_NAMES = ("point_rect_mask", "point_buffer_quad1", "point_buffer_round", "point_subset_gather")
+_POINT_CONSTRUCTIVE_KERNEL_NAMES = (
+    "point_rect_mask",
+    "point_buffer_quad1",
+    "point_buffer_round",
+    "point_subset_gather",
+)

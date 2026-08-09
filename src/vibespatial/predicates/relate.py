@@ -38,6 +38,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_pairwise_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
@@ -283,7 +284,10 @@ def _evaluate_gpu_relate(
         if pr_mask.any():
             rows = gpu_rows[pr_mask]
             loc = classify_point_region_gpu(
-                rows, left, right, region_family=region_family,
+                rows,
+                left,
+                right,
+                region_family=region_family,
             )
             strings = _location_to_point_polygon_de9im(loc, point_on_left=True)
             out[rows] = strings
@@ -292,7 +296,10 @@ def _evaluate_gpu_relate(
         if rp_mask.any():
             rows = gpu_rows[rp_mask]
             loc = classify_point_region_gpu(
-                rows, right, left, region_family=region_family,
+                rows,
+                right,
+                left,
+                region_family=region_family,
             )
             strings = _location_to_point_polygon_de9im(loc, point_on_left=False)
             out[rows] = strings
@@ -365,9 +372,7 @@ def relate_de9im(
         return np.empty(0, dtype=object)
 
     requested_mode = (
-        dispatch_mode
-        if isinstance(dispatch_mode, ExecutionMode)
-        else ExecutionMode(dispatch_mode)
+        dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
     )
 
     selection = plan_dispatch_selection(
@@ -376,6 +381,12 @@ def relate_de9im(
         row_count=row_count,
         requested_mode=requested_mode,
         current_residency=combined_residency(left, right),
+        work_estimate=estimate_pairwise_work_from_owned(
+            left,
+            right,
+            output_row_count=row_count,
+            primary_unit_name="de9im-pair-coordinate",
+        ),
     )
 
     # Build null mask from validity.
@@ -572,7 +583,8 @@ def relate_pattern_match(
 
     # Compute DE-9IM strings via the existing relate_de9im infrastructure.
     de9im_strings = relate_de9im(
-        left, right,
+        left,
+        right,
         dispatch_mode=dispatch_mode,
         precision=precision,
     )

@@ -52,6 +52,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import StrictNativeFallbackError, record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
@@ -63,9 +64,11 @@ logger = logging.getLogger(__name__)
 # Background precompilation (ADR-0034)
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("remove-repeated-fp64", _REMOVE_REPEATED_FP64, _REMOVE_REPEATED_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("remove-repeated-fp64", _REMOVE_REPEATED_FP64, _REMOVE_REPEATED_KERNEL_NAMES),
+    ]
+)
 
 from vibespatial.cuda.cccl_precompile import request_warmup  # noqa: E402
 
@@ -75,6 +78,7 @@ request_warmup(["exclusive_scan_i32"])
 # ---------------------------------------------------------------------------
 # GPU implementation: per-family remove_repeated_points
 # ---------------------------------------------------------------------------
+
 
 def _remove_repeated_family_gpu(runtime, device_buf, family, tolerance):
     """GPU remove_repeated_points for one family.
@@ -106,7 +110,9 @@ def _remove_repeated_family_gpu(runtime, device_buf, family, tolerance):
 
     # 2. Launch mark kernel (Tier 1 NVRTC, 1 thread per span)
     kernels = compile_kernel_group(
-        "remove-repeated-fp64", _REMOVE_REPEATED_FP64, _REMOVE_REPEATED_KERNEL_NAMES,
+        "remove-repeated-fp64",
+        _REMOVE_REPEATED_FP64,
+        _REMOVE_REPEATED_KERNEL_NAMES,
     )
     kernel = kernels["remove_repeated_points_mark"]
 
@@ -117,12 +123,20 @@ def _remove_repeated_family_gpu(runtime, device_buf, family, tolerance):
     ptr = runtime.pointer
     params = (
         (
-            ptr(device_buf.x), ptr(device_buf.y), ptr(d_span_offsets),
-            ptr(d_keep), tolerance_sq, span_count,
+            ptr(device_buf.x),
+            ptr(device_buf.y),
+            ptr(d_span_offsets),
+            ptr(d_keep),
+            tolerance_sq,
+            span_count,
         ),
         (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_I32,
         ),
     )
     grid, block = runtime.launch_config(kernel, span_count)
@@ -221,13 +235,17 @@ def _remove_repeated_family_gpu(runtime, device_buf, family, tolerance):
 # GPU dispatch variant (registered)
 # ---------------------------------------------------------------------------
 
+
 @register_kernel_variant(
     "remove_repeated_points",
     "gpu-cuda-python",
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "linestring", "multilinestring", "polygon", "multipolygon",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("cuda-python", "constructive", "remove_repeated_points"),
@@ -248,7 +266,10 @@ def _remove_repeated_points_gpu(owned, tolerance):
             new_device_families[family] = device_buf
             continue
         new_device_families[family] = _remove_repeated_family_gpu(
-            runtime, device_buf, family, tolerance,
+            runtime,
+            device_buf,
+            family,
+            tolerance,
         )
 
     tags, validity, family_row_offsets = forward_result_metadata(owned)
@@ -266,6 +287,7 @@ def _remove_repeated_points_gpu(owned, tolerance):
 # ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
+
 
 def remove_repeated_points_owned(
     owned: OwnedGeometryArray,
@@ -305,6 +327,11 @@ def remove_repeated_points_owned(
         kernel_name="remove_repeated_points",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            primary_unit_name="remove-repeated-points-coordinate",
+        ),
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=owned.residency,

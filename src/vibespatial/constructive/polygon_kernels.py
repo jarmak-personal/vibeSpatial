@@ -6,7 +6,9 @@ from vibespatial.cuda.device_functions.signed_area import SIGNED_AREA_DEVICE
 from vibespatial.cuda.device_functions.strip_closure import STRIP_CLOSURE_DEVICE
 from vibespatial.cuda.preamble import PRECISION_PREAMBLE, SPATIAL_TOLERANCE_PREAMBLE
 
-_POLYGON_BUFFER_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
+_POLYGON_BUFFER_KERNEL_SOURCE = (
+    SPATIAL_TOLERANCE_PREAMBLE
+    + r"""
 #define PI 3.14159265358979323846
 #define EPSILON VS_SPATIAL_EPSILON
 
@@ -298,9 +300,12 @@ extern "C" __global__ void polygon_buffer_ring_scatter(
     pos++;
 }
 """
+)
 POLYGON_BUFFER_GPU_THRESHOLD = 50_000
 _POLYGON_BUFFER_KERNEL_NAMES = ("polygon_buffer_ring_count", "polygon_buffer_ring_scatter")
-_RING_WINDING_KERNEL_SOURCE = SIGNED_AREA_DEVICE + r"""
+_RING_WINDING_KERNEL_SOURCE = (
+    SIGNED_AREA_DEVICE
+    + r"""
 extern "C" __global__ void compute_ring_winding(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -323,6 +328,7 @@ extern "C" __global__ void compute_ring_winding(
     ring_winding[ring] = area2 > 0.0 ? 1.0 : -1.0;
 }
 """
+)
 _RING_WINDING_KERNEL_NAMES = ("compute_ring_winding",)
 # ---------------------------------------------------------------------------
 # GPU Polygon Centroid Kernel (NVRTC Tier 1)
@@ -332,7 +338,10 @@ _RING_WINDING_KERNEL_NAMES = ("compute_ring_winding",)
 # Ring centroid coordinates are orientation-invariant; we therefore weight the
 # first ring of each polygon part by +abs(area) and later rings by -abs(area).
 
-_POLYGON_CENTROID_KERNEL_SOURCE = PRECISION_PREAMBLE + STRIP_CLOSURE_DEVICE + r"""
+_POLYGON_CENTROID_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + STRIP_CLOSURE_DEVICE
+    + r"""
 __device__ int polygon_centroid_ring_terms(
     const double* x,
     const double* y,
@@ -561,6 +570,7 @@ extern "C" __global__ void multipolygon_centroid(
     }}
 }}
 """
+)
 _POLYGON_CENTROID_KERNEL_NAMES = ("polygon_centroid", "multipolygon_centroid")
 _POLYGON_CENTROID_FP64_SOURCE = _POLYGON_CENTROID_KERNEL_SOURCE.format(compute_type="double")
 _POLYGON_CENTROID_FP32_SOURCE = _POLYGON_CENTROID_KERNEL_SOURCE.format(compute_type="float")

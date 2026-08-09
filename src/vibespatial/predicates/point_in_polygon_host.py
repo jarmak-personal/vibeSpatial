@@ -145,7 +145,9 @@ def select_gpu_strategy(
     return "fused"
 
 
-def compute_pip_center(points: OwnedGeometryArray, right_array: OwnedGeometryArray) -> tuple[float, float]:
+def compute_pip_center(
+    points: OwnedGeometryArray, right_array: OwnedGeometryArray
+) -> tuple[float, float]:
     all_x: list[np.ndarray] = []
     all_y: list[np.ndarray] = []
     for owned in (points, right_array):

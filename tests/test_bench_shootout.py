@@ -52,18 +52,16 @@ def test_vsbench_shootout_directory_smoke(capsys: pytest.CaptureFixture[str]) ->
         name for name, status in statuses_by_script.items() if status == "[ERR]"
     }
 
-    # These canaries intentionally stay red until the underlying public-path
-    # parity gaps are fixed in the library. When those fixes land, update
-    # the GPU-visible branch and tighten the benchmark back to all-green.
-    assert exit_code == 1
     assert len(lines) == len(expected_scripts)
     assert set(statuses_by_script) == expected_scripts_by_name
     if gpu_visible:
-        assert failures == {"transit_service_gap.py"}
+        assert exit_code == 0
+        assert failures == set()
     else:
         # Without a visible GPU this smoke test validates CLI shape. Exact
         # cold-start failures are environment-sensitive because each script
         # decides whether it can retry through an in-process GPU-visible path.
+        assert exit_code == 1
         assert "transit_service_gap.py" in failures
         assert failures <= expected_scripts_by_name
     assert {

@@ -9,7 +9,10 @@ from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_
 from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
 
 _SEGMENT_DISTANCE_KERNEL_SOURCE = (
-    POINT_ON_SEGMENT_DEVICE + POINT_IN_RING_BOUNDARY_DEVICE + SPATIAL_TOLERANCE_PREAMBLE + """
+    POINT_ON_SEGMENT_DEVICE
+    + POINT_IN_RING_BOUNDARY_DEVICE
+    + SPATIAL_TOLERANCE_PREAMBLE
+    + """
 #if !defined(INFINITY)
 #define INFINITY __longlong_as_double(0x7FF0000000000000LL)
 #endif
@@ -486,7 +489,8 @@ extern "C" __global__ __launch_bounds__(256, 4) void distance_mpg_mpg_from_owned
   }
   out[i] = sqrt(best);
 }
-""")
+"""
+)
 
 _SEGMENT_DISTANCE_KERNEL_NAMES = (
     "distance_ls_ls_from_owned",

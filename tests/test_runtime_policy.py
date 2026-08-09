@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from vibespatial import (
@@ -9,9 +10,18 @@ from vibespatial import (
     DispatchDecision,
     ExecutionMode,
     KernelClass,
+    PhysicalWorkEstimate,
     Residency,
     TransferTrigger,
     default_crossover_policy,
+    estimate_grouped_work_from_owned,
+    estimate_pairwise_product_work_from_owned,
+    estimate_pairwise_work_from_owned,
+    estimate_part_pair_work_from_owned,
+    estimate_physical_work_from_owned,
+    estimate_segment_pair_work_from_owned,
+    estimate_spatial_index_work_from_owned,
+    select_dispatch_for_estimate,
     select_dispatch_for_rows,
     select_residency_plan,
 )
@@ -263,6 +273,296 @@ def test_no_workload_shape_uses_original_threshold() -> None:
         gpu_available=True,
     )
     assert decision_above is DispatchDecision.GPU
+
+
+def test_physical_work_estimate_dispatches_on_candidate_pairs() -> None:
+    policy = default_crossover_policy("point_in_polygon", KernelClass.PREDICATE)
+    estimate = PhysicalWorkEstimate(
+        row_count=10,
+        candidate_pair_count=10_000,
+        primary_unit_count=10_000,
+        primary_unit_name="candidate-pair",
+    )
+
+    decision = select_dispatch_for_estimate(
+        requested_mode=ExecutionMode.AUTO,
+        work_estimate=estimate,
+        policy=policy,
+        gpu_available=True,
+    )
+
+    assert decision is DispatchDecision.GPU
+
+
+def test_physical_work_estimate_dispatches_on_relation_pairs() -> None:
+    policy = default_crossover_policy("predicate_refine", KernelClass.PREDICATE)
+    estimate = PhysicalWorkEstimate.for_relation_pairs(
+        row_count=8,
+        relation_pair_count=10_000,
+        primary_unit_name="refine-relation-pair",
+    )
+
+    decision = select_dispatch_for_estimate(
+        requested_mode=ExecutionMode.AUTO,
+        work_estimate=estimate,
+        policy=policy,
+        gpu_available=True,
+    )
+
+    assert decision is DispatchDecision.GPU
+    assert estimate.dispatch_unit_name() == "refine-relation-pair"
+
+
+@pytest.mark.parametrize(
+    ("constructor", "pair_keyword"),
+    [
+        (PhysicalWorkEstimate.for_candidate_pairs, "candidate_pair_count"),
+        (PhysicalWorkEstimate.for_relation_pairs, "relation_pair_count"),
+    ],
+)
+def test_pair_estimates_include_output_and_temporary_byte_pressure(
+    constructor,
+    pair_keyword: str,
+) -> None:
+    estimate = constructor(
+        row_count=2,
+        **{pair_keyword: 3},
+        output_byte_count=64_000,
+        temporary_byte_count=256_000,
+    )
+
+    assert estimate.dispatch_unit_count() == 2_000
+
+
+def test_owned_physical_work_estimate_uses_columnar_shape_metadata() -> None:
+    class _Buffer:
+        x = np.arange(12)
+        ring_offsets = np.array([0, 5, 12])
+
+    class _Owned:
+        row_count = 2
+        families = {"polygon": _Buffer()}
+
+    estimate = estimate_physical_work_from_owned(
+        _Owned(),
+        candidate_pair_count=7,
+    )
+
+    assert estimate.row_count == 2
+    assert estimate.coordinate_count == 12
+    assert estimate.segment_count == 12
+    assert estimate.ring_count == 2
+    assert estimate.candidate_pair_count == 7
+
+
+def test_owned_physical_work_estimate_scales_indexed_base_shape_to_logical_rows() -> None:
+    class _Buffer:
+        x = np.arange(40)
+        ring_offsets = np.arange(9)
+
+    class _Base:
+        row_count = 8
+
+    class _IndexedOwned:
+        row_count = 20
+        families = {"polygon": _Buffer()}
+        is_indexed_view = True
+        _base = _Base()
+
+    estimate = estimate_physical_work_from_owned(_IndexedOwned())
+
+    assert estimate.coordinate_count == 100
+    assert estimate.segment_count == 100
+    assert estimate.ring_count == 20
+
+
+def test_spatial_index_work_estimate_dispatches_on_columnar_shape() -> None:
+    class _Buffer:
+        x = np.arange(12)
+        ring_offsets = np.array([0, 5, 12])
+
+    class _Owned:
+        row_count = 2
+        families = {"polygon": _Buffer()}
+
+    estimate = estimate_spatial_index_work_from_owned(_Owned())
+
+    assert estimate.row_count == 2
+    assert estimate.coordinate_count == 12
+    assert estimate.segment_count == 12
+    assert estimate.dispatch_unit_count() == 12
+    assert estimate.dispatch_unit_name() == "spatial-index-unit"
+
+
+def test_owned_physical_work_estimate_prefers_authoritative_device_buffers() -> None:
+    class _HostStub:
+        x = np.empty(0)
+        ring_offsets = None
+
+    class _DeviceBuffer:
+        x = np.arange(25)
+        ring_offsets = np.arange(0, 26, 5)
+
+    class _DeviceState:
+        families = {"polygon": _DeviceBuffer()}
+
+    class _Owned:
+        row_count = 5
+        families = {"polygon": _HostStub()}
+        device_state = _DeviceState()
+        is_indexed_view = False
+
+    estimate = estimate_physical_work_from_owned(_Owned())
+
+    assert estimate.coordinate_count == 25
+    assert estimate.segment_count == 25
+    assert estimate.ring_count == 5
+    assert estimate.dispatch_unit_count() == 25
+
+
+def test_segment_pair_work_estimate_preserves_quadratic_geometry_shape() -> None:
+    class _Buffer:
+        x = np.arange(22)
+        geometry_offsets = np.array([0, 11, 22])
+
+    class _Owned:
+        row_count = 2
+        families = {"line": _Buffer()}
+        is_indexed_view = False
+
+    estimate = estimate_segment_pair_work_from_owned(_Owned())
+
+    assert estimate.coordinate_count == 22
+    assert estimate.segment_pair_count == 90
+    assert estimate.dispatch_unit_count() == 90
+    assert estimate.dispatch_unit_name() == "segment-pair"
+    assert "segment_pairs=90" in estimate.telemetry_detail()
+
+
+def test_pairwise_product_work_estimate_uses_aligned_coordinate_products() -> None:
+    class _LeftBuffer:
+        x = np.arange(20)
+
+    class _RightBuffer:
+        x = np.arange(12)
+
+    class _Left:
+        row_count = 4
+        families = {"line": _LeftBuffer()}
+
+    class _Right:
+        row_count = 4
+        families = {"line": _RightBuffer()}
+
+    estimate = estimate_pairwise_product_work_from_owned(
+        _Left(),
+        _Right(),
+        pair_unit="coordinate",
+    )
+
+    assert estimate.coordinate_pair_count == 60
+    assert estimate.dispatch_unit_count() == 60
+    assert estimate.dispatch_unit_name() == "coordinate-pair"
+
+
+def test_part_pair_work_estimate_tracks_component_endpoint_graph() -> None:
+    class _Buffer:
+        x = np.arange(16)
+        geometry_offsets = np.array([0, 4, 8])
+        part_offsets = np.arange(9) * 2
+
+    class _Owned:
+        row_count = 2
+        families = {"multiline": _Buffer()}
+        is_indexed_view = False
+
+    estimate = estimate_part_pair_work_from_owned(_Owned())
+
+    assert estimate.part_count == 8
+    assert estimate.part_pair_count == 12
+    assert estimate.dispatch_unit_count() == 16
+    assert "part_pairs=12" in estimate.telemetry_detail()
+
+
+def test_grouped_work_estimate_dispatches_on_segment_shape() -> None:
+    class _Grouped:
+        resolved_group_count = 4
+
+    class _Buffer:
+        x = np.arange(60_000)
+        ring_offsets = np.arange(0, 60_001, 5)
+
+    class _Owned:
+        row_count = 8
+        families = {"polygon": _Buffer()}
+
+    estimate = estimate_grouped_work_from_owned(_Owned(), grouped=_Grouped())
+
+    assert estimate.row_count == 8
+    assert estimate.group_count == 4
+    assert estimate.output_row_count == 4
+    assert estimate.segment_count == 60_000
+    assert estimate.dispatch_unit_name() == "grouped-segment"
+    assert "groups=4" in estimate.telemetry_detail()
+
+    decision = select_dispatch_for_estimate(
+        requested_mode=ExecutionMode.AUTO,
+        work_estimate=estimate,
+        policy=default_crossover_policy("grouped_union", KernelClass.CONSTRUCTIVE),
+        gpu_available=True,
+    )
+
+    assert decision is DispatchDecision.GPU
+
+
+def test_pairwise_work_estimate_multiplies_broadcast_right_shape() -> None:
+    class _LeftBuffer:
+        x = np.arange(10)
+
+    class _RightBuffer:
+        x = np.arange(3)
+
+    class _Left:
+        row_count = 4
+        families = {"linestring": _LeftBuffer()}
+
+    class _Right:
+        row_count = 1
+        families = {"polygon": _RightBuffer()}
+
+    estimate = estimate_pairwise_work_from_owned(
+        _Left(),
+        _Right(),
+        workload=WorkloadShape.BROADCAST_RIGHT,
+    )
+
+    assert estimate.row_count == 4
+    assert estimate.coordinate_count == 22
+    assert estimate.segment_count == 22
+    assert estimate.output_row_count == 4
+    assert estimate.dispatch_unit_count() == 22
+
+
+def test_plan_dispatch_selection_reports_physical_work_unit_reason() -> None:
+    estimate = PhysicalWorkEstimate(
+        row_count=10,
+        candidate_pair_count=9_999,
+        primary_unit_count=9_999,
+        primary_unit_name="candidate-pair",
+    )
+
+    plan = plan_dispatch_selection(
+        kernel_name="point_in_polygon",
+        kernel_class=KernelClass.PREDICATE,
+        row_count=10,
+        requested_mode=ExecutionMode.AUTO,
+        gpu_available=True,
+        work_estimate=estimate,
+    )
+
+    assert plan.selected is ExecutionMode.CPU
+    assert plan.reason == "GPU runtime available; below 10000-candidate-pair crossover"
+    assert any("candidate_pairs=9999" in detail for detail in plan.diagnostics)
 
 
 def test_broadcast_fallback_when_broadcast_min_rows_is_none() -> None:

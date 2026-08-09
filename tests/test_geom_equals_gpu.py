@@ -4,10 +4,10 @@ Verifies correctness against Shapely oracle for all geometry families,
 null handling, mixed-family arrays, rotated rings, reversed linestrings,
 and the GeoPandas surface API dispatch.
 
-geom_equals composes normalize + equals_exact(tolerance=1e-12) to implement
-topological equality.  Two geometries are topologically equal if their
-boundaries, interiors, and exteriors coincide — regardless of vertex
-ordering or ring start point.
+geom_equals evaluates mutual topological coverage with explicit empty-set
+handling. Two geometries are topologically equal if their boundaries,
+interiors, and exteriors coincide, regardless of coordinate ordering,
+redundant vertices, or multi-part representation.
 """
 
 from __future__ import annotations
@@ -22,10 +22,13 @@ from shapely.geometry import (
     MultiPolygon,
     Point,
     Polygon,
+    box,
 )
 
 import vibespatial
+from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.residency import Residency
 from vibespatial.testing import (
     build_owned as _make_owned,
 )
@@ -34,6 +37,8 @@ from vibespatial.testing import (
 )
 
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
+
+
 def _shapely_equals(left_geoms, right_geoms):
     """Shapely oracle: topological equality."""
     left_arr = np.asarray(left_geoms, dtype=object)
@@ -45,6 +50,7 @@ def _shapely_equals(left_geoms, right_geoms):
 # Point family
 # ---------------------------------------------------------------------------
 
+
 @requires_gpu
 def test_identical_points(make_owned):
     """Identical points should return True."""
@@ -54,6 +60,7 @@ def test_identical_points(make_owned):
     right = make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(geoms, geoms)
     np.testing.assert_array_equal(result, expected)
@@ -70,6 +77,7 @@ def test_different_points(make_owned):
     right = make_owned(right_geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(left_geoms, right_geoms)
     np.testing.assert_array_equal(result, expected)
@@ -80,6 +88,7 @@ def test_different_points(make_owned):
 # LineString family
 # ---------------------------------------------------------------------------
 
+
 @requires_gpu
 def test_identical_linestrings(make_owned):
     """Identical linestrings should return True."""
@@ -89,6 +98,7 @@ def test_identical_linestrings(make_owned):
     right = make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(geoms, geoms)
     np.testing.assert_array_equal(result, expected)
@@ -110,6 +120,7 @@ def test_reversed_linestrings(make_owned):
     right = make_owned(right_geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(left_geoms, right_geoms)
     np.testing.assert_array_equal(result, expected)
@@ -125,6 +136,7 @@ def test_different_linestrings(make_owned):
     right = make_owned(right_geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(left_geoms, right_geoms)
     np.testing.assert_array_equal(result, expected)
@@ -135,18 +147,17 @@ def test_different_linestrings(make_owned):
 # Polygon family
 # ---------------------------------------------------------------------------
 
+
 @requires_gpu
 def test_identical_polygons(make_owned):
     """Identical polygons should return True."""
     n = 1200
-    geoms = [
-        Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)])
-        for i in range(n)
-    ]
+    geoms = [Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)]) for i in range(n)]
     left = make_owned(geoms)
     right = make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(geoms, geoms)
     np.testing.assert_array_equal(result, expected)
@@ -161,19 +172,14 @@ def test_rotated_ring_polygons(make_owned):
     after normalization (ring rotation to lex-min vertex).
     """
     n = 1200
-    left_geoms = [
-        Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)])
-        for i in range(n)
-    ]
+    left_geoms = [Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)]) for i in range(n)]
     # Same polygon, but ring starts at a different vertex
-    right_geoms = [
-        Polygon([(i + 1, 0), (i + 1, 1), (i, 1), (i, 0), (i + 1, 0)])
-        for i in range(n)
-    ]
+    right_geoms = [Polygon([(i + 1, 0), (i + 1, 1), (i, 1), (i, 0), (i + 1, 0)]) for i in range(n)]
     left = make_owned(left_geoms)
     right = make_owned(right_geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(left_geoms, right_geoms)
     np.testing.assert_array_equal(result, expected)
@@ -190,6 +196,7 @@ def test_polygons_with_holes(make_owned):
     right = make_owned(geoms_with_hole)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(geoms_with_hole, geoms_with_hole)
     np.testing.assert_array_equal(result, expected)
@@ -208,6 +215,7 @@ def test_polygons_with_vs_without_holes():
     right = _make_owned(right_geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(left_geoms, right_geoms)
     np.testing.assert_array_equal(result, expected)
@@ -218,6 +226,7 @@ def test_polygons_with_vs_without_holes():
 # Multi* families
 # ---------------------------------------------------------------------------
 
+
 @requires_gpu
 def test_identical_multipoints():
     """Identical MultiPoints should return True."""
@@ -227,6 +236,7 @@ def test_identical_multipoints():
     right = _make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(geoms, geoms)
     np.testing.assert_array_equal(result, expected)
@@ -237,14 +247,12 @@ def test_identical_multipoints():
 def test_identical_multilinestrings():
     """Identical MultiLineStrings should return True."""
     n = 1200
-    geoms = [
-        MultiLineString([[(i, 0), (i + 1, 1)], [(i + 2, 0), (i + 3, 1)]])
-        for i in range(n)
-    ]
+    geoms = [MultiLineString([[(i, 0), (i + 1, 1)], [(i + 2, 0), (i + 3, 1)]]) for i in range(n)]
     left = _make_owned(geoms)
     right = _make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(geoms, geoms)
     np.testing.assert_array_equal(result, expected)
@@ -256,25 +264,56 @@ def test_identical_multipolygons():
     """Identical MultiPolygons should return True."""
     n = 1200
     geoms = [
-        MultiPolygon([
-            ([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)], []),
-            ([(i + 2, 0), (i + 3, 0), (i + 3, 1), (i + 2, 1), (i + 2, 0)], []),
-        ])
+        MultiPolygon(
+            [
+                ([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)], []),
+                ([(i + 2, 0), (i + 3, 0), (i + 3, 1), (i + 2, 1), (i + 2, 0)], []),
+            ]
+        )
         for i in range(n)
     ]
     left = _make_owned(geoms)
     right = _make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(geoms, geoms)
     np.testing.assert_array_equal(result, expected)
     assert result.all()
 
 
+@requires_gpu
+def test_topological_equality_ignores_redundant_vertices_and_part_order():
+    """Native equality compares point sets, not normalized buffer structure."""
+    left_geoms = [
+        LineString([(0, 0), (2, 0)]),
+        LineString([(3, 0), (4, 1), (5, 0)]),
+        MultiPoint([(0, 0), (1, 1)]),
+        MultiPolygon([box(0, 0, 1, 1), box(2, 2, 3, 3)]),
+    ]
+    right_geoms = [
+        LineString([(0, 0), (1, 0), (2, 0)]),
+        MultiLineString([[(3, 0), (4, 1), (5, 0)]]),
+        MultiPoint([(1, 1), (0, 0)]),
+        MultiPolygon([box(2, 2, 3, 3), box(0, 0, 1, 1)]),
+    ]
+
+    from vibespatial.geometry.equality import geom_equals_owned
+
+    result = geom_equals_owned(
+        _make_owned(left_geoms),
+        _make_owned(right_geoms),
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    np.testing.assert_array_equal(result, _shapely_equals(left_geoms, right_geoms))
+    assert result.all()
+
+
 # ---------------------------------------------------------------------------
 # Null handling
 # ---------------------------------------------------------------------------
+
 
 @requires_gpu
 def test_null_geometries_return_false():
@@ -285,6 +324,7 @@ def test_null_geometries_return_false():
     right = _make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(geoms, geoms)
     np.testing.assert_array_equal(result, expected)
@@ -305,6 +345,7 @@ def test_null_vs_non_null():
     right = _make_owned(right_geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(left_geoms, right_geoms)
     np.testing.assert_array_equal(result, expected)
@@ -317,6 +358,7 @@ def test_null_vs_non_null():
 # ---------------------------------------------------------------------------
 # Mixed families
 # ---------------------------------------------------------------------------
+
 
 @requires_gpu
 def test_mixed_families_equal():
@@ -337,6 +379,7 @@ def test_mixed_families_equal():
     right = _make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(geoms, geoms)
     np.testing.assert_array_equal(result, expected)
@@ -353,6 +396,7 @@ def test_type_mismatch_returns_false():
     right = _make_owned(right_geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right, dispatch_mode=ExecutionMode.GPU)
     expected = _shapely_equals(left_geoms, right_geoms)
     np.testing.assert_array_equal(result, expected)
@@ -363,12 +407,14 @@ def test_type_mismatch_returns_false():
 # Row count validation
 # ---------------------------------------------------------------------------
 
+
 def test_mismatched_row_count_raises():
     """Different row counts should raise ValueError."""
     left = _make_owned([Point(0, 0), Point(1, 1)])
     right = _make_owned([Point(0, 0)])
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     with pytest.raises(ValueError, match="same row count"):
         geom_equals_owned(left, right)
 
@@ -376,6 +422,7 @@ def test_mismatched_row_count_raises():
 # ---------------------------------------------------------------------------
 # CPU fallback
 # ---------------------------------------------------------------------------
+
 
 def test_cpu_fallback():
     """CPU path should match Shapely output."""
@@ -385,6 +432,7 @@ def test_cpu_fallback():
     right = _make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right)
     expected = _shapely_equals(geoms, geoms)
     np.testing.assert_array_equal(result, expected)
@@ -394,18 +442,13 @@ def test_cpu_fallback():
 def test_cpu_fallback_rotated_rings():
     """CPU fallback should handle rotated polygon rings correctly."""
     n = 100
-    left_geoms = [
-        Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)])
-        for i in range(n)
-    ]
-    right_geoms = [
-        Polygon([(i + 1, 0), (i + 1, 1), (i, 1), (i, 0), (i + 1, 0)])
-        for i in range(n)
-    ]
+    left_geoms = [Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)]) for i in range(n)]
+    right_geoms = [Polygon([(i + 1, 0), (i + 1, 1), (i, 1), (i, 0), (i + 1, 0)]) for i in range(n)]
     left = _make_owned(left_geoms)
     right = _make_owned(right_geoms)
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right)
     expected = _shapely_equals(left_geoms, right_geoms)
     np.testing.assert_array_equal(result, expected)
@@ -415,6 +458,7 @@ def test_cpu_fallback_rotated_rings():
 # Edge cases
 # ---------------------------------------------------------------------------
 
+
 @requires_gpu
 def test_empty_array():
     """Empty arrays should return empty result."""
@@ -422,18 +466,36 @@ def test_empty_array():
     right = _make_owned([])
 
     from vibespatial.geometry.equality import geom_equals_owned
+
     result = geom_equals_owned(left, right)
     assert result.shape == (0,)
     assert result.dtype == bool
+
+
+@requires_gpu
+def test_empty_geometries_are_equal_across_supported_families():
+    """All valid empty geometries represent the same empty point set."""
+    left_geoms = [Point(), LineString(), Polygon()]
+    right_geoms = [Polygon(), Point(), MultiPoint([])]
+
+    from vibespatial.geometry.equality import geom_equals_owned
+
+    result = geom_equals_owned(
+        _make_owned(left_geoms),
+        _make_owned(right_geoms),
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    np.testing.assert_array_equal(result, np.ones(3, dtype=bool))
 
 
 # ---------------------------------------------------------------------------
 # GeoPandas surface API dispatch
 # ---------------------------------------------------------------------------
 
+
 @requires_gpu
 def test_geopandas_geoseries_dispatch():
-    """GeoSeries.geom_equals should route through normalize-then-compare path."""
+    """GeoSeries.geom_equals should route through native mutual coverage."""
     import geopandas
 
     n = 1200
@@ -497,20 +559,53 @@ def test_geopandas_rotated_rings():
     import geopandas
 
     n = 1200
-    left_geoms = [
-        Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)])
-        for i in range(n)
-    ]
-    right_geoms = [
-        Polygon([(i + 1, 0), (i + 1, 1), (i, 1), (i, 0), (i + 1, 0)])
-        for i in range(n)
-    ]
+    left_geoms = [Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)]) for i in range(n)]
+    right_geoms = [Polygon([(i + 1, 0), (i + 1, 1), (i, 1), (i, 0), (i + 1, 0)]) for i in range(n)]
     gs_left = geopandas.GeoSeries(left_geoms)
     gs_right = geopandas.GeoSeries(right_geoms)
 
     result = gs_left.geom_equals(gs_right, align=False)
     expected = _shapely_equals(left_geoms, right_geoms)
     np.testing.assert_array_equal(result.values, expected)
+
+
+@requires_gpu
+def test_indexed_multipolygon_equality_survives_terminal_host_materialization():
+    """Indexed device rows retain correct normalization after host export."""
+    cp = pytest.importorskip("cupy")
+    first = Polygon([(0, 0), (2, 0), (2, 2), (0, 2), (0, 0)])
+    second = Polygon([(4, 0), (6, 0), (6, 2), (4, 2), (4, 0)])
+    rotated_first = Polygon([(2, 0), (2, 2), (0, 2), (0, 0), (2, 0)])
+    rotated_second = Polygon([(6, 0), (6, 2), (4, 2), (4, 0), (6, 0)])
+
+    root = from_shapely_geometries(
+        [MultiPolygon([first, second]), MultiPolygon([second, first])],
+        residency=Residency.DEVICE,
+    )
+    indexed = root._device_indexed_take(
+        cp.asarray([1, 0], dtype=cp.int64),
+        assume_unique_indices=True,
+    )
+    expected = from_shapely_geometries(
+        [
+            MultiPolygon([rotated_second, rotated_first]),
+            MultiPolygon([rotated_first, rotated_second]),
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    # A terminal export may populate compact host family buffers while the
+    # native indexed carrier remains rooted in the original device buffers.
+    indexed.to_shapely()
+
+    from vibespatial.geometry.equality import geom_equals_owned
+
+    result = geom_equals_owned(
+        indexed,
+        expected,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    np.testing.assert_array_equal(result, np.ones(2, dtype=bool))
 
 
 @requires_gpu
@@ -560,10 +655,12 @@ def test_geopandas_multilinestring_z_geom_equals_ignores_extra_ordinates():
 # Predicate dispatch wiring
 # ---------------------------------------------------------------------------
 
+
 @requires_gpu
 def test_binary_predicate_dispatch_wiring():
     """equals should be registered in supports_binary_predicate."""
     from vibespatial.predicates.binary import supports_binary_predicate
+
     assert supports_binary_predicate("equals")
 
 
@@ -571,4 +668,5 @@ def test_binary_predicate_dispatch_wiring():
 def test_special_predicate_registration():
     """equals should be in _SPECIAL_PREDICATES."""
     from vibespatial.predicates.binary import _SPECIAL_PREDICATES
+
     assert "equals" in _SPECIAL_PREDICATES

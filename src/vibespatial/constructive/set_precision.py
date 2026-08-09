@@ -37,6 +37,10 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import (
+    estimate_physical_work_from_owned,
+    estimate_segment_pair_work_from_owned,
+)
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
@@ -47,6 +51,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Stage 1: CuPy coordinate quantization (Tier 2 element-wise)
 # ---------------------------------------------------------------------------
+
 
 def _quantize_family_coords(device_buf: DeviceFamilyGeometryBuffer, grid_size: float):
     """Snap all coordinates in a family buffer to grid_size multiples.
@@ -75,6 +80,9 @@ def _quantize_family_coords(device_buf: DeviceFamilyGeometryBuffer, grid_size: f
         part_offsets=device_buf.part_offsets,
         ring_offsets=device_buf.ring_offsets,
         bounds=None,  # invalidated — coordinates changed
+        dense_single_ring_width=device_buf.dense_single_ring_width,
+        axis_aligned_rectangles=device_buf.axis_aligned_rectangles,
+        fixed_size=device_buf.fixed_size,
     )
 
 
@@ -84,7 +92,7 @@ def _quantize_owned(owned: OwnedGeometryArray, grid_size: float) -> OwnedGeometr
     Point/MultiPoint families are quantized like any other family.
     Returns a new device-resident OwnedGeometryArray.
     """
-    d_state = owned._ensure_device_state()
+    d_state = owned._ensure_device_state(preserve_indexed_view=True)
 
     new_device_families = {}
     for family, device_buf in d_state.families.items():
@@ -96,7 +104,7 @@ def _quantize_owned(owned: OwnedGeometryArray, grid_size: float) -> OwnedGeometr
 
     tags, validity, family_row_offsets = forward_result_metadata(owned)
 
-    return build_device_resident_owned(
+    result = build_device_resident_owned(
         device_families=new_device_families,
         row_count=owned.row_count,
         tags=tags,
@@ -104,11 +112,22 @@ def _quantize_owned(owned: OwnedGeometryArray, grid_size: float) -> OwnedGeometr
         family_row_offsets=family_row_offsets,
         execution_mode="gpu",
     )
+    if result.device_state is not None:
+        result.device_state.trusted_all_valid = d_state.trusted_all_valid
+        result.device_state.trusted_homogeneous_family = d_state.trusted_homogeneous_family
+        result.device_state.trusted_all_non_empty = d_state.trusted_all_non_empty
+        result.device_state.trusted_polygonal_only = (
+            True if d_state.trusted_polygonal_only is True else None
+        )
+        result.device_state.trusted_unique_family_rows = d_state.trusted_unique_family_rows
+        result.device_state.trusted_family_domain = d_state.trusted_family_domain
+    return result
 
 
 # ---------------------------------------------------------------------------
 # GPU dispatch variant (registered)
 # ---------------------------------------------------------------------------
+
 
 @register_kernel_variant(
     "set_precision",
@@ -116,8 +135,12 @@ def _quantize_owned(owned: OwnedGeometryArray, grid_size: float) -> OwnedGeometr
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("cuda-python", "constructive", "set_precision"),
@@ -142,7 +165,9 @@ def _set_precision_gpu(owned: OwnedGeometryArray, grid_size: float, mode: str):
     )
 
     deduped = remove_repeated_points_owned(
-        quantized, tolerance=0.0, dispatch_mode=ExecutionMode.GPU,
+        quantized,
+        tolerance=0.0,
+        dispatch_mode=ExecutionMode.GPU,
     )
 
     if mode == "keep_collapsed":
@@ -209,9 +234,7 @@ def set_precision_owned(
         New geometry array with snapped coordinates.
     """
     if mode not in _VALID_MODES:
-        raise ValueError(
-            f"Invalid mode {mode!r}. Must be one of {sorted(_VALID_MODES)}."
-        )
+        raise ValueError(f"Invalid mode {mode!r}. Must be one of {sorted(_VALID_MODES)}.")
 
     row_count = owned.row_count
     if row_count == 0:
@@ -221,10 +244,24 @@ def set_precision_owned(
     if grid_size == 0:
         return owned
 
+    work_estimate = (
+        estimate_segment_pair_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            primary_unit_name="set-precision-topology-segment-pair",
+        )
+        if mode == "valid_output"
+        else estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            primary_unit_name="set-precision-coordinate",
+        )
+    )
     selection = plan_dispatch_selection(
         kernel_name="set_precision",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
+        work_estimate=work_estimate,
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=owned.residency,
@@ -246,10 +283,7 @@ def set_precision_owned(
                 operation="set_precision",
                 implementation="gpu_cupy_quantize",
                 reason=f"GPU CuPy quantization + {mode} pipeline",
-                detail=(
-                    f"rows={row_count}, grid_size={grid_size}, "
-                    f"mode={mode}, precision=fp64"
-                ),
+                detail=(f"rows={row_count}, grid_size={grid_size}, mode={mode}, precision=fp64"),
                 requested=dispatch_mode,
                 selected=ExecutionMode.GPU,
             )

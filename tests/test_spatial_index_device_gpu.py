@@ -19,8 +19,9 @@ from vibespatial.kernels.core.geometry_analysis import (
     compute_geometry_bounds,
     compute_geometry_bounds_device,
 )
-from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
 from vibespatial.runtime.residency import Residency
+from vibespatial.spatial.indexing import build_flat_spatial_index
 from vibespatial.spatial.query import (
     build_owned_spatial_index,
     query_spatial_index,
@@ -501,3 +502,80 @@ def test_device_query_large_correctness():
     # For brute-force, should be exact match.
     if "brute" in execution.reason:
         assert gpu_pairs == cpu_pairs
+
+
+@requires_gpu
+def test_bounded_many_by_few_device_query_avoids_pair_count_fence():
+    """Bounded N*M brute force compacts a pair mask without scalarizing output size."""
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    tree_geoms = _make_random_boxes(7, seed=71, extent=20.0, size=3.0)
+    query_geoms = _make_random_boxes(128, seed=72, extent=20.0, size=3.0)
+
+    tree_owned, flat_index = build_owned_spatial_index(tree_geoms)
+    query_owned = from_shapely_geometries(query_geoms, residency=Residency.DEVICE)
+    query_bounds = compute_geometry_bounds_device(query_owned)
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    cands, execution = spatial_index_device_query(flat_index, query_bounds)
+    events = get_d2h_transfer_events(clear=True)
+
+    assert execution.selected is ExecutionMode.GPU
+    assert cands is not None
+    assert "brute-force" in execution.reason
+    assert not any(
+        event.reason == "device spatial-index candidate-pair allocation fence"
+        for event in events
+    )
+
+
+@requires_gpu
+def test_device_bounds_only_index_feeds_bounded_query_without_metadata_fences():
+    """Small device joins can consume bounds without building Morton metadata."""
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    tree_owned = from_shapely_geometries(
+        _make_random_boxes(7, seed=81, extent=20.0, size=3.0),
+        residency=Residency.DEVICE,
+    )
+    query_owned = from_shapely_geometries(
+        _make_random_boxes(128, seed=82, extent=20.0, size=3.0),
+        residency=Residency.DEVICE,
+    )
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="test device-bounds-only spatial index",
+        ),
+        device_bounds_only=True,
+    )
+    query_bounds = compute_geometry_bounds_device(query_owned)
+    cands, execution = spatial_index_device_query(flat_index, query_bounds)
+    events = get_d2h_transfer_events(clear=True)
+
+    assert execution.selected is ExecutionMode.GPU
+    assert cands is not None
+    assert flat_index.device_bounds is not None
+    assert flat_index.device_order is None
+    assert flat_index.device_morton_keys is None
+    assert not any(
+        event.reason
+        in {
+            "spatial index regular-grid summary scalar fence",
+            "flat spatial index device total-bounds scalar fence",
+            "device spatial-index candidate-pair allocation fence",
+        }
+        for event in events
+    )

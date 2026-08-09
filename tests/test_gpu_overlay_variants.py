@@ -78,6 +78,48 @@ def test_gpu_overlay_difference_matches_shapely() -> None:
 
 
 @pytest.mark.gpu
+def test_spatial_overlay_grouped_difference_keeps_device_group_offsets() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.runtime.residency import Residency
+
+    left_geometry = box(0, 0, 10, 10)
+    right_geometries = [box(2, 2, 4, 8), box(6, 2, 8, 8)]
+    left = from_shapely_geometries(
+        [left_geometry],
+        residency=Residency.DEVICE,
+    )
+    right = from_shapely_geometries(
+        right_geometries,
+        residency=Residency.DEVICE,
+    )
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    actual = spatial_overlay_owned(
+        left,
+        right,
+        how="difference",
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert actual.residency is Residency.DEVICE
+    assert actual.row_count == 1
+    assert "overlay grouped-union segmented offsets export" not in reasons
+    expected = shapely.difference(
+        left_geometry,
+        shapely.union_all(np.asarray(right_geometries, dtype=object)),
+    )
+    _assert_geometry_lists_equal(actual.to_shapely(), [expected])
+
+
+@pytest.mark.gpu
 def test_gpu_overlay_symmetric_difference_groups_row_outputs_into_multipolygon() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")

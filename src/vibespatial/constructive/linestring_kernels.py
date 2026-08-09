@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
 
-_LINESTRING_BUFFER_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
+_LINESTRING_BUFFER_KERNEL_SOURCE = (
+    SPATIAL_TOLERANCE_PREAMBLE
+    + r"""
 #define PI 3.14159265358979323846
 #define EPSILON VS_SPATIAL_EPSILON
 
@@ -593,5 +595,6 @@ extern "C" __global__ void linestring_buffer_scatter(
     pos++;
 }
 """
+)
 LINESTRING_BUFFER_GPU_THRESHOLD = 5_000
 _LINESTRING_BUFFER_KERNEL_NAMES = ("linestring_buffer_count", "linestring_buffer_scatter")

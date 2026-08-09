@@ -37,10 +37,7 @@ class StrictApiMatrixReport:
         return {
             "fixture": self.fixture,
             "geometry_types": list(self.geometry_types),
-            "calls": {
-                result.surface: result.to_dict()
-                for result in self.calls
-            },
+            "calls": {result.surface: result.to_dict() for result in self.calls},
         }
 
 
@@ -76,8 +73,7 @@ def run_strict_api_matrix(
     geometry_types: tuple[str, ...] = (),
 ) -> StrictApiMatrixReport:
     results = tuple(
-        capture_strict_api_call(surface, lambda fn=fn: fn(target))
-        for surface, fn in calls.items()
+        capture_strict_api_call(surface, lambda fn=fn: fn(target)) for surface, fn in calls.items()
     )
     return StrictApiMatrixReport(
         fixture=fixture,

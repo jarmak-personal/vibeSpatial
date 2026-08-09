@@ -14,12 +14,12 @@ except ImportError:  # pragma: no cover - script execution path
 
 
 REQUIRED_ROUTING_SECTIONS = ("Intent", "Request Signals", "Open First", "Verify", "Risks")
-HEADER_SCAN_EXCLUDED_DIRS = {".git", ".venv", "docs/_build"}
+HEADER_SCAN_EXCLUDED_DIRS = {".git", ".venv", ".worktrees"}
 
 
 def _is_header_scan_excluded(relative_path: str) -> bool:
     parts = set(Path(relative_path).parts)
-    if parts & {".git", ".venv"}:
+    if parts & HEADER_SCAN_EXCLUDED_DIRS:
         return True
     return relative_path.startswith("docs/_build/")
 

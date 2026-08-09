@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
 
-_INDEXING_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + """
+_INDEXING_KERNEL_SOURCE = (
+    SPATIAL_TOLERANCE_PREAMBLE
+    + """
 extern "C" __device__ unsigned long long spread_bits_32(unsigned int value) {
   unsigned long long x = (unsigned long long) value;
   x = (x | (x << 16)) & 0x0000FFFF0000FFFFULL;
@@ -736,6 +738,7 @@ extern "C" __global__ void sweep_sorted_mbr_overlap(
   if (pass_number == 0) counts[i] = pair_count;
 }
 """
+)
 
 _INDEXING_KERNEL_NAMES = (
     "morton_keys_from_bounds",

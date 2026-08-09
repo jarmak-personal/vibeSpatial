@@ -2,8 +2,8 @@
 
 Provides:
   - disjoint_subset_union_all: geometry collection assembly (no Boolean ops)
-  - union_all_gpu: tree-reduction global union via pairwise overlay_union
-  - coverage_union_all_gpu: coverage-optimized union (non-overlapping input)
+  - union_all_gpu: native one-group constructive union
+  - coverage_union_all_gpu: native one-group coverage union
   - intersection_all_gpu: tree-reduction global intersection with early termination
   - unary_union_gpu: thin wrapper -> union_all_gpu
 
@@ -23,13 +23,11 @@ For mixed families, falls back to Shapely CPU path.
 ADR-0002: CONSTRUCTIVE class -- fp64, no precision downgrade (coordinates are
           exact subsets, no new coordinates created).
 ADR-0033: Disjoint subset: pure CuPy buffer manipulation (Tier 2).
-          Tree-reduction: orchestrates Tier 1 overlay pipeline pairwise.
+          Grouped union: orchestrates the Tier 1 grouped overlay pipeline.
 """
 
 from __future__ import annotations
 
-import logging
-import math
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -39,7 +37,6 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
-from vibespatial.constructive.binary_constructive_cpu import binary_constructive_cpu
 from vibespatial.constructive.union_all_cpu import (
     empty_owned,
     reduce_all_cpu,
@@ -50,7 +47,6 @@ from vibespatial.constructive.union_all_kernels import (
 )
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
-from vibespatial.geometry.geometry_analysis_host import compute_geometry_bounds_cpu_vectorized
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
@@ -61,9 +57,9 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
-from vibespatial.runtime.config import OVERLAY_GPU_FAILURE_THRESHOLD
+from vibespatial.runtime.crossover import estimate_spatial_index_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
-from vibespatial.runtime.fallbacks import StrictNativeFallbackError, record_fallback_event
+from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.residency import (
@@ -74,8 +70,7 @@ from vibespatial.runtime.residency import (
 
 if TYPE_CHECKING:
     from vibespatial.geometry.owned import OwnedGeometryDeviceState
-
-logger = logging.getLogger(__name__)
+    from vibespatial.runtime.precision import PrecisionPlan
 
 # Merge groups: families that can be collapsed into a single multi-type.
 _MERGE_TARGETS: dict[GeometryFamily, GeometryFamily] = {
@@ -87,26 +82,25 @@ _MERGE_TARGETS: dict[GeometryFamily, GeometryFamily] = {
     GeometryFamily.MULTIPOLYGON: GeometryFamily.MULTIPOLYGON,
 }
 
-_BBOX_INTERACTION_DEVICE_PAIR_LIMIT = 4096
-_SPATIAL_LOCALIZE_MIN_ROWS = 128
+_BBOX_INTERACTION_DENSE_PAIR_WORK_LIMIT = 16_777_216
 _POLYGON_ASSEMBLY_FULL_VALIDITY_MAX_RINGS = 4
 _POLYGON_ASSEMBLY_FULL_VALIDITY_MAX_COORDS = 512
 
-request_nvrtc_warmup([
-    (
-        "union-all-bbox-interaction",
-        BBOX_INTERACTION_KERNEL_SOURCE,
-        BBOX_INTERACTION_KERNEL_NAMES,
-    ),
-])
+request_nvrtc_warmup(
+    [
+        (
+            "union-all-bbox-interaction",
+            BBOX_INTERACTION_KERNEL_SOURCE,
+            BBOX_INTERACTION_KERNEL_NAMES,
+        ),
+    ]
+)
 
 
 def _union_all_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
     from vibespatial.cuda._runtime import get_cuda_runtime
 
-    return np.asarray(
-        get_cuda_runtime().copy_device_to_host(device_array, reason=reason)
-    )
+    return np.asarray(get_cuda_runtime().copy_device_to_host(device_array, reason=reason))
 
 
 def _union_all_bool_scalar(value: object, *, reason: str) -> bool:
@@ -118,10 +112,7 @@ def _union_all_int_scalar(value: object, *, reason: str) -> int:
 
 
 def _polygon_assembly_needs_full_validity_scan(result: OwnedGeometryArray) -> bool:
-    try:
-        state = result._ensure_device_state() if result.device_state is not None else None
-    except Exception:
-        state = None
+    state = result._ensure_device_state() if result.device_state is not None else None
 
     ring_count = 0
     coord_count = 0
@@ -202,7 +193,6 @@ def _polygon_inputs_have_bbox_interactions_requiring_exact_union(
     if not _polygonal_family_only(owned):
         return False
     if cp is not None and getattr(owned, "device_state", None) is not None:
-        from vibespatial.cuda._runtime import get_cuda_runtime
         from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
 
         d_validity = cp.asarray(owned._ensure_device_state().validity).astype(
@@ -217,15 +207,7 @@ def _polygon_inputs_have_bbox_interactions_requiring_exact_union(
         )
         if device_result is not None:
             return device_result
-        d_bounds = d_bounds[d_validity]
-        d_finite = cp.isfinite(d_bounds).all(axis=1)
-        d_bounds = d_bounds[d_finite]
-        if int(d_bounds.shape[0]) <= 1:
-            return False
-        bounds = get_cuda_runtime().copy_device_to_host(
-            d_bounds,
-            reason="union_all bbox-interaction candidate bounds fence",
-        )
+        return True
     else:
         if int(np.count_nonzero(owned.validity)) <= 1:
             return False
@@ -262,6 +244,55 @@ def _polygon_inputs_have_bbox_interactions_requiring_exact_union(
                 return True
         active.append(int(current))
     return False
+
+
+def _try_polygon_coverage_union_for_bbox_interactions(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str,
+) -> OwnedGeometryArray | None:
+    """Return a noded coverage union when a device area proof admits it.
+
+    For polygon interiors with multiplicity ``m``, source area sums integrate
+    ``m`` while odd-parity boundary assembly integrates ``m % 2``.  The two
+    areas are equal exactly when no positive-area overlap exists.  This admits
+    shared and partially shared boundaries without running one dense geometry-
+    pair predicate or weakening the exact-union contract.
+    """
+    if cp is None or owned.device_state is None or owned.row_count <= 1:
+        return None
+
+    from vibespatial.constructive.binary_constructive import (
+        _dispatch_grouped_polygon_known_coverage_union_gpu,
+    )
+    from vibespatial.constructive.measurement import _area_gpu_device_fp64
+
+    requested = (
+        dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
+    )
+    candidate = _dispatch_grouped_polygon_known_coverage_union_gpu(
+        owned,
+        cp.zeros(owned.row_count, dtype=cp.int32),
+        output_row_count=1,
+        dispatch_mode=(ExecutionMode.GPU if requested is ExecutionMode.AUTO else requested),
+        assume_source_rows_valid=True,
+        d_valid_empty_rows=cp.ones(1, dtype=cp.bool_),
+    )
+    if candidate is None or candidate.row_count != 1:
+        return None
+
+    source_area = cp.sum(_area_gpu_device_fp64(owned), dtype=cp.float64)
+    candidate_area = _area_gpu_device_fp64(candidate)[0]
+    area_scale = cp.maximum(cp.maximum(cp.abs(source_area), cp.abs(candidate_area)), 1.0)
+    admitted = _union_all_bool_scalar(
+        cp.abs(source_area - candidate_area)
+        <= (area_scale * cp.float64(1.0e-12) + cp.float64(1.0e-9)),
+        reason="union_all noded-coverage area-proof scalar fence",
+    )
+    if not admitted:
+        return None
+    candidate._native_grouped_union_implementation = "gpu_noded_coverage_union_with_area_proof"
+    return candidate
 
 
 def _polygonal_family_only(owned: OwnedGeometryArray) -> bool:
@@ -315,8 +346,6 @@ def _device_polygon_bbox_interactions_requiring_exact_union(
         return None
     if row_count <= 1:
         return False
-    if row_count > _BBOX_INTERACTION_DEVICE_PAIR_LIMIT:
-        return None
 
     from vibespatial.cuda._runtime import (
         KERNEL_PARAM_I32,
@@ -324,6 +353,30 @@ def _device_polygon_bbox_interactions_requiring_exact_union(
         get_cuda_runtime,
         make_kernel_cache_key,
     )
+
+    d_bounds = cp.asarray(d_bounds, dtype=cp.float64)
+    d_validity = cp.asarray(d_validity, dtype=cp.bool_)
+    d_admitted = cp.flatnonzero(d_validity & cp.isfinite(d_bounds).all(axis=1)).astype(
+        cp.int64, copy=False
+    )
+    admitted_count = int(d_admitted.size)
+    if admitted_count <= 1:
+        return False
+
+    d_admitted_bounds = d_bounds[d_admitted]
+    dense_pair_work = admitted_count * admitted_count
+    use_dense_matrix = dense_pair_work <= _BBOX_INTERACTION_DENSE_PAIR_WORK_LIMIT
+    if use_dense_matrix:
+        d_xmin = cp.ascontiguousarray(d_admitted_bounds[:, 0])
+        d_ymin = cp.ascontiguousarray(d_admitted_bounds[:, 1])
+        d_xmax = cp.ascontiguousarray(d_admitted_bounds[:, 2])
+        d_ymax = cp.ascontiguousarray(d_admitted_bounds[:, 3])
+    else:
+        d_order = cp.argsort(d_admitted_bounds[:, 0]).astype(cp.int64, copy=False)
+        d_xmin = cp.ascontiguousarray(d_admitted_bounds[d_order, 0])
+        d_ymin = cp.ascontiguousarray(d_admitted_bounds[d_order, 1])
+        d_xmax = cp.ascontiguousarray(d_admitted_bounds[d_order, 2])
+        d_ymax = cp.ascontiguousarray(d_admitted_bounds[d_order, 3])
 
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
@@ -336,24 +389,32 @@ def _device_polygon_bbox_interactions_requiring_exact_union(
         kernel_names=BBOX_INTERACTION_KERNEL_NAMES,
     )
     d_result = cp.zeros(1, dtype=cp.int32)
-    block = (16, 16, 1)
-    grid = (
-        (row_count + block[0] - 1) // block[0],
-        (row_count + block[1] - 1) // block[1],
-        1,
-    )
+    kernel = kernels["bbox_any_overlap_dense" if use_dense_matrix else "bbox_any_overlap_sorted"]
+    if use_dense_matrix:
+        block = (16, 16, 1)
+        grid = (
+            (admitted_count + block[0] - 1) // block[0],
+            (admitted_count + block[1] - 1) // block[1],
+            1,
+        )
+    else:
+        grid, block = runtime.launch_config(kernel, admitted_count)
     runtime.launch(
-        kernels["bbox_any_overlap"],
+        kernel,
         grid=grid,
         block=block,
         params=(
             (
-                ptr(d_bounds),
-                ptr(d_validity),
+                ptr(d_xmin),
+                ptr(d_ymin),
+                ptr(d_xmax),
+                ptr(d_ymax),
                 ptr(d_result),
-                row_count,
+                admitted_count,
             ),
             (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
@@ -366,138 +427,6 @@ def _device_polygon_bbox_interactions_requiring_exact_union(
         reason="union_all bbox-interaction overlap scalar fence",
     )
     return bool(int(summary[0]))
-
-
-def _compute_union_bounds_host(owned: OwnedGeometryArray) -> np.ndarray | None:
-    """Return host bounds only when the host shape is already available.
-
-    The bbox component/coloring optimizers below are host control-flow shapes.
-    Exporting a device-only row-bounds matrix just to feed that optional
-    optimizer is the wrong Native* boundary; device-only inputs should let the
-    normal native union path continue instead.
-    """
-    host_ready = (
-        getattr(owned, "_validity", None) is not None
-        and getattr(owned, "_tags", None) is not None
-        and getattr(owned, "_family_row_offsets", None) is not None
-        and all(buffer.host_materialized for buffer in owned.families.values())
-    )
-    if not host_ready:
-        return None
-    try:
-        return np.asarray(compute_geometry_bounds_cpu_vectorized(owned), dtype=np.float64)
-    except Exception:
-        logger.debug("polygon union bounds computation failed", exc_info=True)
-        return None
-
-
-def _bbox_overlap_components(bounds: np.ndarray) -> list[np.ndarray]:
-    row_count = int(bounds.shape[0])
-    if row_count == 0:
-        return []
-
-    parent = np.arange(row_count, dtype=np.int32)
-
-    def _find(value: int) -> int:
-        root = value
-        while int(parent[root]) != root:
-            root = int(parent[root])
-        while int(parent[value]) != value:
-            next_value = int(parent[value])
-            parent[value] = root
-            value = next_value
-        return root
-
-    def _union(left: int, right: int) -> None:
-        left_root = _find(left)
-        right_root = _find(right)
-        if left_root != right_root:
-            parent[right_root] = left_root
-
-    order = np.argsort(bounds[:, 0], kind="stable")
-    active: list[int] = []
-    for current in order.astype(np.intp, copy=False):
-        xmin = bounds[current, 0]
-        ymin = bounds[current, 1]
-        ymax = bounds[current, 3]
-        active = [other for other in active if bounds[other, 2] >= xmin]
-        for other in active:
-            if bounds[other, 1] <= ymax and bounds[other, 3] >= ymin:
-                _union(int(current), int(other))
-        active.append(int(current))
-
-    groups: dict[int, list[int]] = {}
-    for row in range(row_count):
-        groups.setdefault(_find(row), []).append(row)
-    return [np.asarray(rows, dtype=np.int64) for rows in groups.values()]
-
-
-def _bbox_disjoint_color_groups(bounds: np.ndarray) -> list[np.ndarray]:
-    row_count = int(bounds.shape[0])
-    if row_count == 0:
-        return []
-
-    order = np.argsort(bounds[:, 0], kind="stable")
-    color_bounds: list[list[int]] = []
-    color_rows: list[list[int]] = []
-
-    for row in order.astype(np.intp, copy=False):
-        xmin, ymin, xmax, ymax = bounds[row]
-        selected_color: int | None = None
-        for color_index, active_bounds in enumerate(color_bounds):
-            conflicts = False
-            kept_bounds: list[int] = []
-            for other in active_bounds:
-                other_bounds = bounds[int(other)]
-                if other_bounds[2] >= xmin:
-                    kept_bounds.append(other)
-                    if other_bounds[1] <= ymax and other_bounds[3] >= ymin:
-                        conflicts = True
-            color_bounds[color_index] = kept_bounds
-            if not conflicts:
-                selected_color = color_index
-                break
-        if selected_color is None:
-            color_bounds.append([])
-            color_rows.append([])
-            selected_color = len(color_rows) - 1
-        color_bounds[selected_color].append(int(row))
-        color_rows[selected_color].append(int(row))
-
-    return [np.asarray(rows, dtype=np.int64) for rows in color_rows if rows]
-
-
-def _spatially_localize_polygon_union_inputs(
-    owned: OwnedGeometryArray,
-) -> OwnedGeometryArray:
-    """Reorder polygon rows so nearby inputs union in early tree-reduce rounds.
-
-    Arbitrary input order can create large, fragmented intermediates very early
-    in the exact-union tree reduction. Sorting by coarse spatial position keeps
-    the first reduction rounds local, which substantially reduces downstream
-    overlay complexity on corridor/network workloads.
-    """
-    if (
-        cp is None
-        or owned.row_count < _SPATIAL_LOCALIZE_MIN_ROWS
-        or not _polygonal_family_only(owned)
-    ):
-        return owned
-
-    try:
-        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
-
-        bounds = cp.asarray(compute_geometry_bounds_device(owned))
-        if int(bounds.shape[0]) != owned.row_count:
-            return owned
-        order = cp.lexsort(cp.stack([bounds[:, 1], bounds[:, 0]])).astype(cp.int64)
-        return owned.take(order)
-    except Exception:
-        logger.debug(
-            "spatially local polygon union ordering failed; keeping input order",
-            exc_info=True,
-        )
-        return owned
 
 
 # ---------------------------------------------------------------------------
@@ -549,126 +478,83 @@ def disjoint_subset_union_all_owned(
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=combined_residency(owned),
+        work_estimate=estimate_spatial_index_work_from_owned(
+            owned,
+            output_row_count=1,
+            primary_unit_name="union-segment",
+        ),
     )
 
-    if _polygon_inputs_have_bbox_interactions_requiring_exact_union(owned):
-        try:
-            result = union_all_gpu_owned(
-                owned,
-                dispatch_mode=dispatch_mode,
-                precision=precision,
-            )
-            record_dispatch_event(
-                surface="constructive.disjoint_subset_union_all",
-                operation="disjoint_subset_union_all",
-                implementation="exact_union_for_interacting_polygon_subsets",
-                reason=(
-                    "polygon bounding boxes touch or overlap; routed to exact "
-                    "GPU union instead of disjoint assembly"
-                ),
-                requested=dispatch_mode,
-                selected=(
-                    ExecutionMode.GPU
-                    if result.residency is Residency.DEVICE
-                    else ExecutionMode.CPU
-                ),
-            )
-            return result
-        except StrictNativeFallbackError:
-            raise
-        except Exception:
-            logger.debug(
-                "exact disjoint-subset polygon union failed, falling back to CPU",
-                exc_info=True,
-            )
-            record_fallback_event(
-                surface="constructive.disjoint_subset_union_all",
-                reason=(
-                    "polygon bounding boxes touch or overlap; exact "
-                    "disjoint-subset union required"
-                ),
-                requested=dispatch_mode,
-                selected=ExecutionMode.CPU,
-                d2h_transfer=owned.residency is Residency.DEVICE,
-            )
-            return None
+    bbox_interactions = _polygon_inputs_have_bbox_interactions_requiring_exact_union(owned)
+    coverage_result = (
+        _try_polygon_coverage_union_for_bbox_interactions(
+            owned,
+            dispatch_mode=dispatch_mode,
+        )
+        if bbox_interactions
+        else None
+    )
+    if coverage_result is not None:
+        record_dispatch_event(
+            surface="constructive.disjoint_subset_union_all",
+            operation="disjoint_subset_union_all",
+            implementation="gpu_noded_coverage_union_with_area_proof",
+            reason=(
+                "noded boundary assembly and fp64 area identity proved that "
+                "interacting polygon subsets have disjoint interiors"
+            ),
+            requested=dispatch_mode,
+            selected=ExecutionMode.GPU,
+        )
+        return coverage_result
+    if bbox_interactions:
+        result = union_all_gpu_owned(
+            owned,
+            dispatch_mode=dispatch_mode,
+            precision=precision,
+        )
+        record_dispatch_event(
+            surface="constructive.disjoint_subset_union_all",
+            operation="disjoint_subset_union_all",
+            implementation="exact_union_for_interacting_polygon_subsets",
+            reason=(
+                "polygon bounding boxes touch or overlap; routed to exact "
+                "grouped union instead of disjoint assembly"
+            ),
+            requested=dispatch_mode,
+            selected=(
+                ExecutionMode.GPU if result.residency is Residency.DEVICE else ExecutionMode.CPU
+            ),
+        )
+        return result
 
     if selection.selected is ExecutionMode.GPU and cp is not None:
         precision_plan = selection.precision_plan  # noqa: F841 — called for ADR-0002 observability side-effects
-        try:
-            result = _disjoint_subset_union_all_gpu(owned)
-            if result is not None:
-                implementation = "disjoint_subset_union_all_gpu"
-                if _polygon_assembly_result_is_invalid(result):
-                    from vibespatial.constructive.make_valid_gpu import (
-                        gpu_repair_invalid_polygons,
-                    )
-
-                    repair = gpu_repair_invalid_polygons(
-                        result,
-                        np.arange(result.row_count, dtype=np.int32),
-                    )
-                    if (
-                        repair is not None
-                        and repair.repaired_owned is not None
-                        and repair.still_invalid_rows.size == 0
-                    ):
-                        result = repair.repaired_owned
-                if _polygon_assembly_result_is_invalid(result):
-                    try:
-                        result = _tree_reduce_global(owned, "union")
-                        implementation = (
-                            "exact_union_for_invalid_disjoint_subset_assembly_gpu"
-                        )
-                    except StrictNativeFallbackError:
-                        raise
-                    except Exception:
-                        logger.debug(
-                            "exact GPU union for invalid disjoint-subset assembly failed",
-                            exc_info=True,
-                        )
-                        _gpu_fallback_reason = (
-                            "GPU disjoint-subset assembly produced invalid polygon topology"
-                        )
-                        result = None
-                if result is not None:
-                    if _polygon_assembly_result_is_invalid(result):
-                        _gpu_fallback_reason = (
-                            "GPU exact union produced invalid polygon topology"
-                        )
-                        result = None
-                    else:
-                        record_dispatch_event(
-                            surface="constructive.disjoint_subset_union_all",
-                            operation="disjoint_subset_union_all",
-                            implementation=implementation,
-                            reason=selection.reason,
-                            requested=dispatch_mode,
-                            selected=ExecutionMode.GPU,
-                        )
-                        return result
-                # Invalid assembled polygon topology needs an exact path, not
-                # the host-side assembly fallback below.
+        result = _disjoint_subset_union_all_gpu(owned)
+        if result is not None:
+            if _polygon_assembly_result_is_invalid(result):
                 record_fallback_event(
                     surface="constructive.disjoint_subset_union_all",
-                    reason=_gpu_fallback_reason,
+                    reason=(
+                        "GPU disjoint-subset assembly produced invalid polygon "
+                        "topology; native disjoint admission declined"
+                    ),
                     requested=dispatch_mode,
                     selected=ExecutionMode.CPU,
                     d2h_transfer=owned.residency is Residency.DEVICE,
                 )
                 return None
-            # Mixed families -- GPU path returns None; fall through to
-            # CPU path below.  Fallback event is recorded AFTER CPU
-            # execution succeeds, not before.
-            _gpu_fallback_reason = "mixed families not supported on GPU"
-        except StrictNativeFallbackError:
-            raise
-        except Exception:
-            logger.debug(
-                "disjoint_subset_union_all GPU failed, falling back to CPU",
-                exc_info=True,
+            record_dispatch_event(
+                surface="constructive.disjoint_subset_union_all",
+                operation="disjoint_subset_union_all",
+                implementation="disjoint_subset_union_all_gpu",
+                reason=selection.reason,
+                requested=dispatch_mode,
+                selected=ExecutionMode.GPU,
             )
-            _gpu_fallback_reason = "GPU exception"
+            return result
+        # Mixed families are structurally unsupported by the disjoint assembler.
+        _gpu_fallback_reason = "mixed families not supported on GPU"
     else:
         _gpu_fallback_reason = "GPU not selected"
 
@@ -713,8 +599,12 @@ def disjoint_subset_union_all_owned(
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=False,
     tags=("cupy", "constructive", "union_all"),
@@ -1009,8 +899,12 @@ def _empty_result() -> OwnedGeometryArray:
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.CPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("shapely", "constructive", "union_all"),
@@ -1156,9 +1050,7 @@ def _assemble_multilinestring_host(
             all_x.append(buf.x)
             all_y.append(buf.y)
             part_offset_arrays.append(buf.part_offsets)
-            part_counts.append(
-                int(buf.part_offsets[-1]) if buf.part_offsets.size > 0 else 0
-            )
+            part_counts.append(int(buf.part_offsets[-1]) if buf.part_offsets.size > 0 else 0)
 
     if not all_x:
         return empty_owned()
@@ -1205,9 +1097,7 @@ def _assemble_multipolygon_host(
                 int(buf.geometry_offsets[-1]) if buf.geometry_offsets.size > 0 else 0
             )
             ring_offset_arrays.append(buf.ring_offsets)
-            ring_counts.append(
-                int(buf.ring_offsets[-1]) if buf.ring_offsets.size > 0 else 0
-            )
+            ring_counts.append(int(buf.ring_offsets[-1]) if buf.ring_offsets.size > 0 else 0)
 
     if GeometryFamily.MULTIPOLYGON in families:
         buf = owned.families[GeometryFamily.MULTIPOLYGON]
@@ -1215,13 +1105,9 @@ def _assemble_multipolygon_host(
             all_x.append(buf.x)
             all_y.append(buf.y)
             part_offset_arrays.append(buf.part_offsets)
-            part_counts.append(
-                int(buf.part_offsets[-1]) if buf.part_offsets.size > 0 else 0
-            )
+            part_counts.append(int(buf.part_offsets[-1]) if buf.part_offsets.size > 0 else 0)
             ring_offset_arrays.append(buf.ring_offsets)
-            ring_counts.append(
-                int(buf.ring_offsets[-1]) if buf.ring_offsets.size > 0 else 0
-            )
+            ring_counts.append(int(buf.ring_offsets[-1]) if buf.ring_offsets.size > 0 else 0)
 
     if not all_x:
         return empty_owned()
@@ -1229,11 +1115,10 @@ def _assemble_multipolygon_host(
     merged_x = np.concatenate(all_x) if len(all_x) > 1 else all_x[0]
     merged_y = np.concatenate(all_y) if len(all_y) > 1 else all_y[0]
     merged_ring_offsets = _chain_host_offset_arrays(ring_offset_arrays, ring_counts)
-    merged_part_ring_counts = [
-        int(po[-1]) if po.size > 0 else 0 for po in part_offset_arrays
-    ]
+    merged_part_ring_counts = [int(po[-1]) if po.size > 0 else 0 for po in part_offset_arrays]
     merged_part_offsets = _chain_host_offset_arrays(
-        part_offset_arrays, merged_part_ring_counts,
+        part_offset_arrays,
+        merged_part_ring_counts,
     )
     total_parts = int(merged_part_offsets.size) - 1
 
@@ -1370,10 +1255,15 @@ def _take_valid_nonempty_rows(
     owned: OwnedGeometryArray,
     *,
     reason: str,
+    retain_device_capacity: bool = False,
 ) -> OwnedGeometryArray:
     """Drop null/empty rows using owned routing metadata, not Shapely export."""
     keep_mask = _owned_valid_nonempty_mask(owned)
     if cp is not None and hasattr(keep_mask, "__cuda_array_interface__"):
+        if retain_device_capacity:
+            from vibespatial.geometry.owned import device_mask_owned_capacity
+
+            return device_mask_owned_capacity(owned, keep_mask)
         keep_count = _union_all_int_scalar(
             cp.count_nonzero(keep_mask),
             reason=reason,
@@ -1398,7 +1288,6 @@ def _tree_reduce_global(
     op: str,
     *,
     early_termination_on_empty: bool = False,
-    skip_polygon_contraction: bool = False,
 ) -> OwnedGeometryArray:
     """Binary-tree reduction of all rows in *owned* via overlay pipeline.
 
@@ -1431,12 +1320,9 @@ def _tree_reduce_global(
 
     current = owned
 
-    rounds = 0
-    max_rounds = int(math.ceil(math.log2(max(current.row_count, 2)))) + 2
-    consecutive_gpu_failures = 0
-    while current.row_count > 1 and rounds < max_rounds:
+    while current.row_count > 1:
         pair_count = current.row_count // 2
-        left_indices = (xp.arange(pair_count, dtype=xp.int64) * 2)
+        left_indices = xp.arange(pair_count, dtype=xp.int64) * 2
         right_indices = left_indices + 1
 
         carry_row: OwnedGeometryArray | None = None
@@ -1447,25 +1333,12 @@ def _tree_reduce_global(
         left_batch = current.take(left_indices)
         right_batch = current.take(right_indices)
 
-        gpu_ok = False
-        if consecutive_gpu_failures < OVERLAY_GPU_FAILURE_THRESHOLD:
-            try:
-                next_round = binary_constructive_owned(
-                    op,
-                    left_batch,
-                    right_batch,
-                    dispatch_mode=ExecutionMode.GPU,
-                    _skip_polygon_contraction=skip_polygon_contraction,
-                )
-                gpu_ok = True
-                consecutive_gpu_failures = 0
-            except StrictNativeFallbackError:
-                raise
-            except Exception:
-                consecutive_gpu_failures += 1
-
-        if not gpu_ok:
-            next_round = binary_constructive_cpu(op, left_batch, right_batch)
+        next_round = binary_constructive_owned(
+            op,
+            left_batch,
+            right_batch,
+            dispatch_mode=ExecutionMode.GPU,
+        )
 
         if early_termination_on_empty and not _all_owned_rows_nonempty(next_round):
             return empty_owned()
@@ -1477,83 +1350,51 @@ def _tree_reduce_global(
 
         del current, left_batch, right_batch, next_round, carry_row
         current = reduced
-        rounds += 1
 
     return current
 
 
-def _try_exact_union_disjoint_bbox_components(
+def _native_grouped_polygon_union_all(
     owned: OwnedGeometryArray,
     *,
-    precision: PrecisionMode | str,
-) -> OwnedGeometryArray | None:
-    if owned.row_count <= 2 or not _polygonal_family_only(owned):
-        return None
+    precision_plan: PrecisionPlan,
+) -> OwnedGeometryArray:
+    """Lower global polygon union to one device `NativeGrouped` segment."""
+    if cp is None:  # pragma: no cover - GPU dispatch requires CuPy
+        raise RuntimeError("CuPy is required for native grouped polygon union")
 
-    bounds = _compute_union_bounds_host(owned)
-    if bounds is None or int(bounds.shape[0]) != owned.row_count:
-        return None
-    finite = np.isfinite(bounds).all(axis=1)
-    if not bool(np.all(finite)):
-        return None
-
-    components = _bbox_overlap_components(bounds)
-    if len(components) <= 1:
-        return None
-
-    partials: list[OwnedGeometryArray] = []
-    for rows in components:
-        component = owned.take(rows.astype(np.int64, copy=False))
-        if component.row_count == 1:
-            partials.append(component)
-            continue
-        partials.append(_tree_reduce_global(component, "union"))
-
-    reduced = disjoint_subset_union_all_owned(
-        OwnedGeometryArray.concat(partials),
-        dispatch_mode=ExecutionMode.GPU,
-        precision=precision,
+    from vibespatial.api._native_grouped import NativeGrouped
+    from vibespatial.kernels.constructive.segmented_union import (
+        segmented_union_all_device_grouped,
     )
-    if reduced is not None:
-        return reduced
-    return _tree_reduce_global(OwnedGeometryArray.concat(partials), "union")
 
-
-def _try_exact_union_bbox_disjoint_color_subsets(
-    owned: OwnedGeometryArray,
-    *,
-    precision: PrecisionMode | str,
-) -> OwnedGeometryArray | None:
-    if owned.row_count < 16 or not _polygonal_family_only(owned):
-        return None
-
-    bounds = _compute_union_bounds_host(owned)
-    if bounds is None or int(bounds.shape[0]) != owned.row_count:
-        return None
-    finite = np.isfinite(bounds).all(axis=1)
-    if not bool(np.all(finite)):
-        return None
-
-    color_groups = _bbox_disjoint_color_groups(bounds)
-    if len(color_groups) <= 1 or len(color_groups) >= owned.row_count:
-        return None
-    if len(color_groups) * 4 > owned.row_count:
-        return None
-
-    partials: list[OwnedGeometryArray] = []
-    for rows in color_groups:
-        subset = owned.take(rows.astype(np.int64, copy=False))
-        partial = disjoint_subset_union_all_owned(
-            subset,
-            dispatch_mode=ExecutionMode.GPU,
-            precision=precision,
-        )
-        if partial is None:
-            return None
-        partials.append(partial)
-
-    localized = _spatially_localize_polygon_union_inputs(OwnedGeometryArray.concat(partials))
-    return _tree_reduce_global(localized, "union")
+    device_owned = owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="union_all native grouped constructive input",
+    )
+    row_count = device_owned.row_count
+    grouped = NativeGrouped.from_sorted_offsets(
+        cp.asarray([0, row_count], dtype=cp.int64),
+        row_count=row_count,
+        all_groups_observed=True,
+        group_size_min=row_count,
+        group_size_max=row_count,
+    )
+    reduced = segmented_union_all_device_grouped(
+        device_owned,
+        grouped.group_offsets,
+        grouped.group_ids,
+        output_row_count=1,
+        precision_plan=precision_plan,
+        empty_output=_empty_owned_like(device_owned),
+        all_groups_observed=grouped.all_groups_observed,
+        group_size_min=grouped.group_size_min,
+        group_size_max=grouped.group_size_max,
+    )
+    if reduced is None or reduced.row_count != 1:
+        raise RuntimeError("native grouped polygon union did not produce one output row")
+    return reduced
 
 
 # ---------------------------------------------------------------------------
@@ -1563,15 +1404,19 @@ def _try_exact_union_bbox_disjoint_color_subsets(
 
 @register_kernel_variant(
     "union_all_gpu",
-    "gpu-tree-reduce",
+    "native-grouped-constructive",
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
-    tags=("constructive", "union_all", "gpu", "tree-reduce"),
+    tags=("constructive", "union_all", "gpu", "native-grouped"),
 )
 def union_all_gpu_owned(
     owned: OwnedGeometryArray,
@@ -1579,9 +1424,8 @@ def union_all_gpu_owned(
     grid_size: float | None = None,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
-    _skip_polygon_contraction: bool = False,
 ) -> OwnedGeometryArray:
-    """GPU tree-reduction global union of all rows into a single geometry.
+    """GPU global union of all rows into a single geometry.
 
     When *grid_size* is set, applies set_precision to the input first
     (snapping coordinates to the grid) before performing the union.
@@ -1615,6 +1459,11 @@ def union_all_gpu_owned(
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=combined_residency(owned),
+        work_estimate=estimate_spatial_index_work_from_owned(
+            owned,
+            output_row_count=1,
+            primary_unit_name="union-segment",
+        ),
     )
 
     precision_plan = selection.precision_plan
@@ -1625,11 +1474,15 @@ def union_all_gpu_owned(
 
         owned = set_precision_owned(owned, grid_size, mode="valid_output")
 
-    # Filter null and empty rows without forcing device-backed routing metadata
-    # to host-visible geometry objects.
+    polygonal_gpu = (
+        selection.selected is ExecutionMode.GPU and cp is not None and _polygonal_family_only(owned)
+    )
+    # Polygon grouped union consumes validity at full row capacity. Generic
+    # nonpolygon tree reduction still requires a compact binary input set.
     owned = _take_valid_nonempty_rows(
         owned,
         reason="union_all valid-nonempty row count scalar fence",
+        retain_device_capacity=polygonal_gpu,
     )
 
     # Single valid row -> identity.
@@ -1645,81 +1498,32 @@ def union_all_gpu_owned(
         return owned
 
     if selection.selected is ExecutionMode.GPU and cp is not None:
-        try:
-            owned = _spatially_localize_polygon_union_inputs(owned)
-            result = _try_exact_union_disjoint_bbox_components(
+        if polygonal_gpu:
+            result = _native_grouped_polygon_union_all(
                 owned,
-                precision=precision,
+                precision_plan=precision_plan,
             )
-            if result is not None:
-                record_dispatch_event(
-                    surface="constructive.union_all_gpu",
-                    operation="union_all",
-                    implementation="gpu_bbox_component_decomposition",
-                    reason=selection.reason,
-                    detail=(
-                        f"rows={row_count}, "
-                        f"precision={precision_plan.compute_precision.value}"
-                    ),
-                    requested=selection.requested,
-                    selected=ExecutionMode.GPU,
-                )
-                return result
-            result = _try_exact_union_bbox_disjoint_color_subsets(
-                owned,
-                precision=precision,
+            implementation = getattr(
+                result,
+                "_native_grouped_union_implementation",
+                "native_grouped_overlay_union_plan",
             )
-            if result is not None:
-                record_dispatch_event(
-                    surface="constructive.union_all_gpu",
-                    operation="union_all",
-                    implementation="gpu_bbox_disjoint_color_compression",
-                    reason=selection.reason,
-                    detail=(
-                        f"rows={row_count}, "
-                        f"precision={precision_plan.compute_precision.value}"
-                    ),
-                    requested=selection.requested,
-                    selected=ExecutionMode.GPU,
-                )
-                return result
+        else:
             result = _tree_reduce_global(
                 owned,
                 "union",
-                skip_polygon_contraction=_skip_polygon_contraction,
             )
-            record_dispatch_event(
-                surface="constructive.union_all_gpu",
-                operation="union_all",
-                implementation="gpu_tree_reduce_overlay",
-                reason=selection.reason,
-                detail=(
-                    f"rows={row_count}, "
-                    f"precision={precision_plan.compute_precision.value}"
-                ),
-                requested=selection.requested,
-                selected=ExecutionMode.GPU,
-            )
-            return result
-        except StrictNativeFallbackError:
-            raise
-        except Exception as exc:
-            logger.debug(
-                "union_all_gpu tree reduction failed, falling back to CPU",
-                exc_info=True,
-            )
-            record_fallback_event(
-                surface="constructive.union_all_gpu",
-                reason="GPU tree reduction failed",
-                detail=(
-                    f"rows={row_count}, "
-                    f"precision={precision_plan.compute_precision.value}, "
-                    f"error={type(exc).__name__}"
-                ),
-                requested=selection.requested,
-                selected=ExecutionMode.CPU,
-                d2h_transfer=owned.residency is Residency.DEVICE,
-            )
+            implementation = "gpu_pairwise_nonpolygon_union"
+        record_dispatch_event(
+            surface="constructive.union_all_gpu",
+            operation="union_all",
+            implementation=implementation,
+            reason=selection.reason,
+            detail=(f"rows={row_count}, precision={precision_plan.compute_precision.value}"),
+            requested=selection.requested,
+            selected=ExecutionMode.GPU,
+        )
+        return result
 
     # CPU fallback: Shapely union_all.
     record_dispatch_event(
@@ -1740,12 +1544,12 @@ def union_all_gpu_owned(
 
 @register_kernel_variant(
     "coverage_union_all_gpu",
-    "gpu-tree-reduce",
+    "native-grouped-constructive",
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=("polygon", "multipolygon"),
     supports_mixed=False,
-    tags=("constructive", "coverage_union_all", "gpu", "tree-reduce"),
+    tags=("constructive", "coverage_union_all", "gpu", "native-grouped"),
 )
 def coverage_union_all_gpu_owned(
     owned: OwnedGeometryArray,
@@ -1755,11 +1559,9 @@ def coverage_union_all_gpu_owned(
 ) -> OwnedGeometryArray:
     """GPU coverage-optimized union for non-overlapping input.
 
-    Since the input is assumed to be non-overlapping (coverage property),
-    the binary union of any pair will not produce new intersection vertices.
-    This uses the same tree-reduction as union_all_gpu; the coverage
-    property simply means the overlay is cheaper (no self-intersections
-    to resolve).
+    The input is lowered to the same one-group constructive carrier as
+    ``union_all_gpu_owned``. Coverage/disjoint proofs can therefore select
+    direct device assembly without changing the execution topology.
 
     Parameters
     ----------
@@ -1787,14 +1589,24 @@ def coverage_union_all_gpu_owned(
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=combined_residency(owned),
+        work_estimate=estimate_spatial_index_work_from_owned(
+            owned,
+            output_row_count=1,
+            primary_unit_name="union-segment",
+        ),
     )
 
     precision_plan = selection.precision_plan
 
-    # Filter null and empty rows without forcing a full device metadata export.
+    polygonal_gpu = selection.selected is ExecutionMode.GPU and cp is not None
+    if polygonal_gpu and not _polygonal_family_only(owned):
+        raise RuntimeError("coverage_union_all native GPU path requires polygon rows")
+    # Coverage union is polygon-only, so its grouped reducer consumes the
+    # validity mask directly at source-row capacity.
     owned = _take_valid_nonempty_rows(
         owned,
         reason="coverage_union_all valid-nonempty row count scalar fence",
+        retain_device_capacity=polygonal_gpu,
     )
 
     if owned.row_count == 1:
@@ -1809,44 +1621,24 @@ def coverage_union_all_gpu_owned(
         return owned
 
     if selection.selected is ExecutionMode.GPU and cp is not None:
-        try:
-            owned = _spatially_localize_polygon_union_inputs(owned)
-            # Coverage union uses the same tree reduction as regular union.
-            # The coverage property (non-overlapping input) means the overlay
-            # pipeline processes simpler topology, but the algorithm is identical.
-            result = _tree_reduce_global(owned, "union")
-            record_dispatch_event(
-                surface="constructive.coverage_union_all_gpu",
-                operation="coverage_union_all",
-                implementation="gpu_tree_reduce_overlay",
-                reason=selection.reason,
-                detail=(
-                    f"rows={row_count}, "
-                    f"precision={precision_plan.compute_precision.value}"
-                ),
-                requested=selection.requested,
-                selected=ExecutionMode.GPU,
-            )
-            return result
-        except StrictNativeFallbackError:
-            raise
-        except Exception as exc:
-            logger.debug(
-                "coverage_union_all_gpu tree reduction failed, falling back to CPU",
-                exc_info=True,
-            )
-            record_fallback_event(
-                surface="constructive.coverage_union_all_gpu",
-                reason="GPU tree reduction failed",
-                detail=(
-                    f"rows={row_count}, "
-                    f"precision={precision_plan.compute_precision.value}, "
-                    f"error={type(exc).__name__}"
-                ),
-                requested=selection.requested,
-                selected=ExecutionMode.CPU,
-                d2h_transfer=owned.residency is Residency.DEVICE,
-            )
+        result = _native_grouped_polygon_union_all(
+            owned,
+            precision_plan=precision_plan,
+        )
+        record_dispatch_event(
+            surface="constructive.coverage_union_all_gpu",
+            operation="coverage_union_all",
+            implementation=getattr(
+                result,
+                "_native_grouped_union_implementation",
+                "native_grouped_overlay_union_plan",
+            ),
+            reason=selection.reason,
+            detail=(f"rows={row_count}, precision={precision_plan.compute_precision.value}"),
+            requested=selection.requested,
+            selected=ExecutionMode.GPU,
+        )
+        return result
 
     # CPU fallback: Shapely coverage_union_all.
     record_dispatch_event(
@@ -1871,8 +1663,12 @@ def coverage_union_all_gpu_owned(
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("constructive", "intersection_all", "gpu", "tree-reduce"),
@@ -1914,6 +1710,11 @@ def intersection_all_gpu_owned(
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=combined_residency(owned),
+        work_estimate=estimate_spatial_index_work_from_owned(
+            owned,
+            output_row_count=1,
+            primary_unit_name="intersection-segment",
+        ),
     )
 
     precision_plan = selection.precision_plan
@@ -1938,42 +1739,21 @@ def intersection_all_gpu_owned(
         return owned
 
     if selection.selected is ExecutionMode.GPU and cp is not None:
-        try:
-            result = _tree_reduce_global(
-                owned, "intersection", early_termination_on_empty=True,
-            )
-            record_dispatch_event(
-                surface="constructive.intersection_all_gpu",
-                operation="intersection_all",
-                implementation="gpu_tree_reduce_overlay",
-                reason=selection.reason,
-                detail=(
-                    f"rows={row_count}, "
-                    f"precision={precision_plan.compute_precision.value}"
-                ),
-                requested=selection.requested,
-                selected=ExecutionMode.GPU,
-            )
-            return result
-        except StrictNativeFallbackError:
-            raise
-        except Exception as exc:
-            logger.debug(
-                "intersection_all_gpu tree reduction failed, falling back to CPU",
-                exc_info=True,
-            )
-            record_fallback_event(
-                surface="constructive.intersection_all_gpu",
-                reason="GPU tree reduction failed",
-                detail=(
-                    f"rows={row_count}, "
-                    f"precision={precision_plan.compute_precision.value}, "
-                    f"error={type(exc).__name__}"
-                ),
-                requested=selection.requested,
-                selected=ExecutionMode.CPU,
-                d2h_transfer=owned.residency is Residency.DEVICE,
-            )
+        result = _tree_reduce_global(
+            owned,
+            "intersection",
+            early_termination_on_empty=True,
+        )
+        record_dispatch_event(
+            surface="constructive.intersection_all_gpu",
+            operation="intersection_all",
+            implementation="gpu_pairwise_intersection",
+            reason=selection.reason,
+            detail=(f"rows={row_count}, precision={precision_plan.compute_precision.value}"),
+            requested=selection.requested,
+            selected=ExecutionMode.GPU,
+        )
+        return result
 
     # CPU fallback: Shapely intersection_all.
     record_dispatch_event(
@@ -1998,8 +1778,12 @@ def intersection_all_gpu_owned(
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("constructive", "unary_union", "gpu", "tree-reduce"),

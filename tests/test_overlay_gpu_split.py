@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import importlib
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 import pytest
-from shapely.geometry import LineString, Polygon, box
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon, box
 
 from vibespatial import (
     ExecutionMode,
@@ -15,10 +16,328 @@ from vibespatial import (
     has_gpu_runtime,
 )
 from vibespatial.overlay.graph import _largest_power_of_two_block_size
+from vibespatial.overlay.types import (
+    ComponentOverlayExecutionPlan,
+    MicrocellOverlayExecutionPlan,
+    PagedOverlayExecutionPlan,
+)
 
 
 def _group_point_counts(source_segment_ids: np.ndarray) -> Counter[int]:
     return Counter(int(value) for value in source_segment_ids.tolist())
+
+
+def test_row_isolated_topology_page_shape_uses_live_event_work() -> None:
+    from vibespatial.overlay.gpu import _row_isolated_topology_page_shape
+
+    shape = _row_isolated_topology_page_shape(
+        row_count=10,
+        max_left_segments_per_row=4,
+        max_right_segments_per_row=4,
+        include_same_side_splits=False,
+        live_event_budget=500,
+    )
+
+    assert shape.worst_live_events_per_row == 80
+    assert shape.rows_per_page == 6
+    assert shape.page_count == 2
+    assert shape.row_spans() == ((0, 6), (6, 10))
+    assert not shape.single_row_oversized
+
+
+def test_row_isolated_topology_page_shape_accounts_for_same_side_events() -> None:
+    from vibespatial.overlay.gpu import _row_isolated_topology_page_shape
+
+    shape = _row_isolated_topology_page_shape(
+        row_count=3,
+        max_left_segments_per_row=3,
+        max_right_segments_per_row=2,
+        include_same_side_splits=True,
+        live_event_budget=49,
+    )
+
+    assert shape.worst_live_events_per_row == 50
+    assert shape.rows_per_page == 1
+    assert shape.page_count == 3
+    assert shape.single_row_oversized
+
+
+def test_paged_overlay_plan_keeps_page_boundaries_algebraic() -> None:
+    plan = PagedOverlayExecutionPlan(
+        left=object(),
+        right=object(),
+        row_count=1_000_001,
+        rows_per_page=100_000,
+        max_left_segments_per_row=4,
+        max_right_segments_per_row=4,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert plan.page_count == 11
+    assert plan.row_span(0) == (0, 100_000)
+    assert plan.row_span(10) == (1_000_000, 1_000_001)
+    assert not hasattr(plan, "page_row_offsets")
+
+
+def test_split_consumes_classified_candidate_pages_without_relation_concat() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    split_source = (repo_root / "src/vibespatial/overlay/split.py").read_text()
+    primitive_source = (repo_root / "src/vibespatial/spatial/segment_primitives.py").read_text()
+
+    assert "_classified_page_consumer=_consume_classified_page" in split_source
+    assert "_classified_page_consumer=_consume_right_right_page" in split_source
+    assert "_classified_page_consumer=_consume_side_page" in split_source
+    assert "concatenate_paged_segment_intersections_device" not in split_source
+    assert "_emit_pair_split_event_batch" in split_source
+    assert "_merge_sorted_split_event_runs" in split_source
+    assert "overlay.split.external_merge_events" in split_source
+    assert "overlay.split.concat_events" not in split_source
+    assert "_stable_radix_order_pass" in split_source
+    assert "cp.lexsort" not in split_source
+    assert "cp.stack" not in split_source
+    assert "bool(cp.any(should_update))" not in split_source
+    assert "_classified_page_consumer(classified)" in primitive_source
+
+
+def test_oversized_single_row_plan_uses_strict_interval_components() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    gpu_source = (repo_root / "src/vibespatial/overlay/gpu.py").read_text()
+
+    assert "ComponentOverlayExecutionPlan" in gpu_source
+    assert "MicrocellOverlayExecutionPlan" in gpu_source
+    assert "d_sorted_xmin[1:] > d_prefix_xmax[:-1]" in gpu_source
+    assert "_pack_polygon_parts_by_component" in gpu_source
+    assert "_pack_disjoint_component_result" in gpu_source
+    assert "single_row_interval_component_topology_gpu" in gpu_source
+    assert "single_row_connected_microcell_boundary_graph_gpu" in gpu_source
+    component_start = gpu_source.index("def _single_row_interval_components(")
+    component_end = gpu_source.index("\ndef ", component_start + 1)
+    component_source = gpu_source[component_start:component_end]
+    pack_start = gpu_source.index("def _pack_polygon_parts_by_component(")
+    pack_end = gpu_source.index("\ndef ", pack_start + 1)
+    pack_source = gpu_source[pack_start:pack_end]
+    result_pack_start = gpu_source.index("def _pack_disjoint_component_result(")
+    result_pack_end = gpu_source.index("\ndef ", result_pack_start + 1)
+    result_pack_source = gpu_source[result_pack_start:result_pack_end]
+    assert "_explode_polygonal_rows_to_polygon_capacity_gpu" in component_source
+    assert "physicalize_device_rows" not in component_source
+    assert "cp.flatnonzero" not in component_source
+    assert "_explode_polygonal_rows_to_polygons_gpu" not in component_source
+    assert "NativeGroupedSelection" in pack_source
+    assert "polygon_parts.selection.active_capacity_mask()" in pack_source
+    assert "_assemble_sorted_polygon_part_capacity_gpu" in pack_source
+    assert "polygon_parts.ring_capacity" in pack_source
+    assert "polygon_parts.coord_capacity" in pack_source
+    assert "physicalize_device_rows" not in pack_source
+    assert "assume_disjoint=True" in result_pack_source
+    assert "_explode_polygonal_rows_to_polygons_gpu" not in result_pack_source
+
+
+def test_microcell_overlay_plan_is_a_single_row_native_carrier() -> None:
+    plan = MicrocellOverlayExecutionPlan(
+        left=object(),
+        right=object(),
+        max_left_segments=100,
+        max_right_segments=200,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert plan.row_isolated
+    assert plan.max_left_segments == 100
+    assert plan.max_right_segments == 200
+
+
+def test_device_concat_uses_active_offset_carriers_without_scalar_exports() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    owned_source = (repo_root / "src/vibespatial/geometry/owned.py").read_text()
+    device_concat = owned_source.split("def _concat_device_family_buffers(", 1)[1].split(
+        "def _concat_family_buffers(", 1
+    )[0]
+
+    assert "_concat_device_xy_compact" in device_concat
+    assert "_device_offset_terminal_counts" in device_concat
+    assert "int(b.geometry_offsets[-1])" not in device_concat
+    assert "int(b.part_offsets[-1])" not in device_concat
+    assert "int(b.ring_offsets[-1])" not in device_concat
+
+
+@pytest.mark.gpu
+def test_gpu_row_isolated_topology_pages_preserve_complete_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    overlay_gpu = importlib.import_module("vibespatial.overlay.gpu")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    monkeypatch.setattr(overlay_gpu, "_compute_live_split_event_budget", lambda: 80)
+    left = from_shapely_geometries([box(0, 0, 4, 4), box(10, 0, 14, 4), box(20, 0, 24, 4)])
+    right = from_shapely_geometries([box(2, 2, 6, 6), box(12, 2, 16, 6), box(22, 2, 26, 6)])
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    plan = overlay_gpu._build_overlay_execution_plan(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+        _same_row_span_summary=(4, 4, 2),
+    )
+    events = get_d2h_transfer_events(clear=True)
+
+    assert isinstance(plan, PagedOverlayExecutionPlan)
+    assert plan.rows_per_page == 1
+    assert plan.page_count == 3
+    assert [plan.row_span(index) for index in range(plan.page_count)] == [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+    ]
+    assert plan.row_isolated
+    assert events == []
+
+    result, selected = overlay_gpu._materialize_overlay_execution_plan(
+        plan,
+        operation="intersection",
+        requested=ExecutionMode.GPU,
+        preserve_row_count=3,
+    )
+    expected = [
+        left_geom.intersection(right_geom)
+        for left_geom, right_geom in zip(
+            left.to_shapely(),
+            right.to_shapely(),
+            strict=True,
+        )
+    ]
+    assert selected is ExecutionMode.GPU
+    assert result.row_count == 3
+    assert all(
+        actual.normalize().equals_exact(wanted.normalize(), tolerance=1.0e-9)
+        for actual, wanted in zip(result.to_shapely(), expected, strict=True)
+    )
+
+
+@pytest.mark.gpu
+def test_gpu_oversized_single_row_uses_interval_component_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    overlay_gpu = importlib.import_module("vibespatial.overlay.gpu")
+
+    monkeypatch.setattr(overlay_gpu, "_compute_live_split_event_budget", lambda: 80)
+    left_geom = MultiPolygon([box(0, 0, 4, 4), box(100, 0, 104, 4)])
+    right_geom = MultiPolygon([box(2, 2, 6, 6), box(102, 2, 106, 6)])
+    left = from_shapely_geometries([left_geom])
+    right = from_shapely_geometries([right_geom])
+
+    plan = overlay_gpu._build_overlay_execution_plan(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+        _same_row_span_summary=(8, 8, 0),
+    )
+
+    assert isinstance(plan, ComponentOverlayExecutionPlan)
+    assert plan.component_count == 2
+    result, selected = overlay_gpu._materialize_overlay_execution_plan(
+        plan,
+        operation="intersection",
+        requested=ExecutionMode.GPU,
+        preserve_row_count=1,
+    )
+    assert selected is ExecutionMode.GPU
+    assert result.row_count == 1
+    assert result.to_shapely()[0].equals(left_geom.intersection(right_geom))
+
+
+@pytest.mark.gpu
+def test_gpu_oversized_connected_single_row_uses_microcell_boundary_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    overlay_gpu = importlib.import_module("vibespatial.overlay.gpu")
+
+    monkeypatch.setattr(overlay_gpu, "_compute_live_split_event_budget", lambda: 80)
+    left_geom = Polygon([(0, 0), (4, 0), (8, 0), (8, 4), (8, 8), (4, 8), (0, 8), (0, 4)])
+    right_geom = Polygon([(2, -1), (6, -1), (10, -1), (10, 3), (10, 7), (6, 7), (2, 7), (2, 3)])
+    left = from_shapely_geometries([left_geom])
+    right = from_shapely_geometries([right_geom])
+
+    plan = overlay_gpu._build_overlay_execution_plan(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+        _same_row_span_summary=(8, 8, 0),
+    )
+
+    assert isinstance(plan, MicrocellOverlayExecutionPlan)
+    result, selected = overlay_gpu._materialize_overlay_execution_plan(
+        plan,
+        operation="intersection",
+        requested=ExecutionMode.GPU,
+        preserve_row_count=1,
+    )
+    assert selected is ExecutionMode.GPU
+    assert result.to_shapely()[0].equals(left_geom.intersection(right_geom))
+
+
+@pytest.mark.gpu
+def test_gpu_oversized_grouped_difference_uses_interval_component_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+    import shapely
+
+    overlay_gpu = importlib.import_module("vibespatial.overlay.gpu")
+
+    monkeypatch.setattr(overlay_gpu, "_compute_live_split_event_budget", lambda: 80)
+    left_geom = MultiPolygon([box(0, 0, 10, 10), box(100, 0, 110, 10)])
+    right_geoms = [
+        box(2, -1, 6, 8),
+        box(4, 2, 8, 11),
+        box(102, -1, 106, 8),
+        box(104, 2, 108, 11),
+    ]
+    left = from_shapely_geometries([left_geom])
+    right = from_shapely_geometries(right_geoms)
+    d_group_rows = cp.zeros(len(right_geoms), dtype=cp.int32)
+
+    plan = overlay_gpu._build_overlay_execution_plan(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+        _same_row_span_summary=(8, 16, 0),
+        _right_geometry_source_rows=d_group_rows,
+        _right_segment_source_rows=d_group_rows,
+    )
+
+    assert isinstance(plan, ComponentOverlayExecutionPlan)
+    assert plan.component_count == 2
+    assert plan.include_same_side_splits
+    result, selected = overlay_gpu._materialize_overlay_execution_plan(
+        plan,
+        operation="difference",
+        requested=ExecutionMode.GPU,
+        preserve_row_count=1,
+    )
+    expected = left_geom.difference(shapely.union_all(right_geoms))
+    assert selected is ExecutionMode.GPU
+    assert result.to_shapely()[0].equals(expected)
 
 
 @pytest.mark.gpu
@@ -44,6 +363,115 @@ def test_gpu_split_events_and_atomic_edges_for_proper_cross() -> None:
 
 
 @pytest.mark.gpu
+def test_gpu_endpoint_only_split_events_retain_output_allocations() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    left = from_shapely_geometries(
+        [LineString([(0.0, 0.0), (1.0, 0.0)])],
+    )
+    right = from_shapely_geometries(
+        [LineString([(0.0, 2.0), (1.0, 2.0)])],
+    )
+    split_events = build_gpu_split_events(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    device = split_events.device_state
+    output_pointers = {
+        int(cp.asarray(array).data.ptr)
+        for array in (
+            device.source_segment_ids,
+            device.t,
+            device.x,
+            device.y,
+        )
+    }
+    pressure = []
+    for _ in range(16):
+        pressure.extend(
+            (
+                cp.full(split_events.count, -7, dtype=cp.int32),
+                cp.full(split_events.count, 13, dtype=cp.uint64),
+                cp.full(split_events.count, cp.nan, dtype=cp.float64),
+            )
+        )
+    pressure_pointers = {int(array.data.ptr) for array in pressure}
+
+    assert output_pointers.isdisjoint(pressure_pointers)
+    assert cp.array_equal(device.source_segment_ids, cp.asarray([0, 0, 1, 1]))
+    assert cp.allclose(device.t, cp.asarray([0.0, 1.0, 0.0, 1.0]))
+    assert cp.allclose(device.x, cp.asarray([0.0, 1.0, 0.0, 1.0]))
+    assert cp.allclose(device.y, cp.asarray([0.0, 0.0, 2.0, 2.0]))
+
+
+@pytest.mark.gpu
+def test_gpu_split_events_page_classification_before_global_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    import vibespatial.spatial.segment_primitives as segment_primitives
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    monkeypatch.setattr(segment_primitives, "_compute_max_batch_pairs", lambda: 4)
+    left = from_shapely_geometries(
+        [
+            MultiLineString(
+                [
+                    [(0, 1), (4, 1)],
+                    [(0, 2), (4, 2)],
+                    [(0, 3), (4, 3)],
+                ]
+            )
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            MultiLineString(
+                [
+                    [(1, 0), (1, 4)],
+                    [(2, 0), (2, 4)],
+                    [(3, 0), (3, 4)],
+                ]
+            )
+        ]
+    )
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    split_events = build_gpu_split_events(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        require_same_row=True,
+        use_same_row_fast_path=False,
+    )
+    events = get_d2h_transfer_events(clear=True)
+
+    assert split_events.device_state is not None
+    d_source_ids = cp.asarray(split_events.device_state.source_segment_ids, dtype=cp.int32)
+    d_t = cp.asarray(split_events.device_state.t, dtype=cp.float64)
+    assert bool(
+        cp.all(
+            (d_source_ids[1:] > d_source_ids[:-1])
+            | ((d_source_ids[1:] == d_source_ids[:-1]) & (d_t[1:] >= d_t[:-1]))
+        )
+    )
+    assert split_events.count == 30
+    assert events == []
+
+
+@pytest.mark.gpu
 def test_gpu_atomic_edges_derive_pair_count_from_split_event_cardinality() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
@@ -62,14 +490,42 @@ def test_gpu_atomic_edges_derive_pair_count_from_split_event_cardinality() -> No
     events = get_d2h_transfer_events(clear=True)
 
     expected_pairs = (
-        split_events.count
-        - split_events.left_segment_count
-        - split_events.right_segment_count
+        split_events.count - split_events.left_segment_count - split_events.right_segment_count
     )
     assert atomic_edges.count == expected_pairs * 2
     assert "overlay split atomic-edge pair-count allocation fence" not in {
         event.reason for event in events
     }
+
+
+@pytest.mark.gpu
+def test_gpu_atomic_edges_can_preserve_source_representative_orientation() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.overlay.split import build_gpu_atomic_edges as build_atomic_edges
+
+    descending = from_shapely_geometries([LineString([(2, 2), (0, 0)])])
+    split_events = build_gpu_split_events(
+        descending,
+        descending,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    canonical = build_atomic_edges(split_events)
+    source_oriented = build_atomic_edges(
+        split_events,
+        preserve_source_orientation=True,
+    )
+
+    canonical_device = canonical.device_state
+    source_device = source_oriented.device_state
+    assert canonical_device is not None
+    assert source_device is not None
+    assert cp.asnumpy(canonical_device.src_x[0::2]).tolist() == [0.0]
+    assert cp.asnumpy(canonical_device.dst_x[0::2]).tolist() == [2.0]
+    assert cp.asnumpy(source_device.src_x[0::2]).tolist() == [2.0]
+    assert cp.asnumpy(source_device.dst_x[0::2]).tolist() == [0.0]
 
 
 @pytest.mark.gpu
@@ -86,7 +542,9 @@ def test_gpu_split_events_and_atomic_edges_for_touch_and_overlap() -> None:
 
     overlap_left = from_shapely_geometries([LineString([(0, 0), (5, 0)])])
     overlap_right = from_shapely_geometries([LineString([(2, 0), (7, 0)])])
-    overlap_events = build_gpu_split_events(overlap_left, overlap_right, dispatch_mode=ExecutionMode.GPU)
+    overlap_events = build_gpu_split_events(
+        overlap_left, overlap_right, dispatch_mode=ExecutionMode.GPU
+    )
     overlap_edges = build_gpu_atomic_edges(overlap_events)
     assert _group_point_counts(overlap_events.source_segment_ids) == Counter({0: 3, 1: 3})
     assert overlap_edges.count == 6
@@ -114,7 +572,9 @@ def test_gpu_split_events_dedup_sorted_runs_without_unique_by_key_primitive(
     overlap_left = from_shapely_geometries([LineString([(0, 0), (5, 0)])])
     overlap_right = from_shapely_geometries([LineString([(2, 0), (7, 0)])])
 
-    overlap_events = build_gpu_split_events(overlap_left, overlap_right, dispatch_mode=ExecutionMode.GPU)
+    overlap_events = build_gpu_split_events(
+        overlap_left, overlap_right, dispatch_mode=ExecutionMode.GPU
+    )
 
     assert _group_point_counts(overlap_events.source_segment_ids) == Counter({0: 3, 1: 3})
     assert np.allclose(overlap_events.x[:3], [0.0, 2.0, 5.0])
@@ -161,9 +621,7 @@ def test_gpu_split_events_preserve_polygon_hole_ring_metadata() -> None:
 
 
 @pytest.mark.gpu
-def test_gpu_atomic_edges_use_dense_metadata_lookup_without_sort_pairs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_gpu_atomic_edges_use_dense_metadata_lookup_without_sort_pairs() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
 
@@ -173,11 +631,7 @@ def test_gpu_atomic_edges_use_dense_metadata_lookup_without_sort_pairs(
     right = from_shapely_geometries([Polygon([(2, -1), (5, -1), (5, 3), (2, 3), (2, -1)])])
     split_events = build_gpu_split_events(left, right, dispatch_mode=ExecutionMode.GPU)
 
-    monkeypatch.setattr(
-        split_module,
-        "sort_pairs",
-        lambda *args, **kwargs: pytest.fail("build_gpu_atomic_edges should not sort source ids"),
-    )
+    assert not hasattr(split_module, "sort_pairs")
 
     atomic_edges = build_gpu_atomic_edges(split_events)
 
@@ -227,11 +681,7 @@ def test_grouped_right_right_split_events_use_original_right_rows() -> None:
     )
 
     base_endpoint_count = 2 * (split_events.left_segment_count + split_events.right_segment_count)
-    right_extra = (
-        (split_events.source_side == 2)
-        & (split_events.t > 0.0)
-        & (split_events.t < 1.0)
-    )
+    right_extra = (split_events.source_side == 2) & (split_events.t > 0.0) & (split_events.t < 1.0)
 
     assert split_events.count > base_endpoint_count
     assert right_extra.any()

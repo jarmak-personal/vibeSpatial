@@ -1,4 +1,5 @@
 """vsbench shootout — run a user script with geopandas then vibespatial."""
+
 from __future__ import annotations
 
 import io
@@ -601,6 +602,7 @@ with open(result_path, "w") as f:
 # Result dataclasses
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class ShootoutRun:
     """Timing result from one backend of a shootout."""
@@ -660,6 +662,7 @@ class ShootoutResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _find_uv() -> str | None:
     return shutil.which("uv")
 
@@ -709,7 +712,7 @@ def _extract_fingerprint(stdout: str) -> str | None:
     """Extract the SHOOTOUT_FINGERPRINT line from captured stdout."""
     for line in stdout.splitlines():
         if line.startswith(_FINGERPRINT_PREFIX):
-            return line[len(_FINGERPRINT_PREFIX):].strip()
+            return line[len(_FINGERPRINT_PREFIX) :].strip()
     return None
 
 
@@ -726,7 +729,7 @@ def _load_script_sections(script: Path) -> tuple[object, object, object, str, in
     return (
         compile(text[:start], str(script), "exec"),
         compile(timed_source, str(script), "exec"),
-        compile(text[end + len(_TIMED_END_MARKER):], str(script), "exec"),
+        compile(text[end + len(_TIMED_END_MARKER) :], str(script), "exec"),
         timed_source,
         timed_line_offset,
     )
@@ -829,6 +832,7 @@ def _infer_physical_shapes(script: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 # Harness runner
 # ---------------------------------------------------------------------------
+
 
 def _run_harness(
     *,
@@ -1030,6 +1034,7 @@ def _should_retry_vibespatial_in_process(run: ShootoutRun) -> bool:
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def run_shootout(
     script_path: Path,
     *,
@@ -1074,10 +1079,15 @@ def run_shootout(
             with_args.extend(["--with", dep])
         py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
         gpd_cmd = [
-            uv, "run", "--isolated", "--no-project",
-            "--python", py_ver,
+            uv,
+            "run",
+            "--isolated",
+            "--no-project",
+            "--python",
+            py_ver,
             *with_args,
-            "--", "python",
+            "--",
+            "python",
         ]
 
     gpd_env = os.environ.copy()

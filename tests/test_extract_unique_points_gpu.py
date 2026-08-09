@@ -7,6 +7,8 @@ reference implementation across all 6 geometry families, edge cases
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import shapely
 from shapely.geometry import (
@@ -29,6 +31,34 @@ def _has_gpu():
 
 
 requires_gpu = pytest.mark.skipif(not _has_gpu(), reason="GPU not available")
+
+
+def test_extract_unique_points_uses_native_capacity_carriers() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source = (
+        repo_root / "src/vibespatial/constructive/extract_unique_points.py"
+    ).read_text()
+    gpu_start = source.index("def _extract_unique_points_gpu(")
+    gpu_end = source.index("\ndef ", gpu_start + 1)
+    gpu_source = source[gpu_start:gpu_end]
+    repair_start = source.index("def degenerate_line_centroids_owned_capacity(")
+    repair_end = source.index("\ndef ", repair_start + 1)
+    repair_source = source[repair_start:repair_end]
+
+    assert "OwnedGeometryArray._indexed_view(" in gpu_source
+    assert "_deduplicate_row_candidate_capacity(" in gpu_source
+    assert "np.flatnonzero" not in gpu_source
+    assert "cp.flatnonzero" not in gpu_source
+    assert "count_scatter_total" not in gpu_source
+    assert ".synchronize(" not in gpu_source
+    assert ".get(" not in gpu_source
+    assert "part_offsets.size" in repair_source
+    assert "count_degenerate_line_candidates" in repair_source
+    assert "scatter_degenerate_line_candidates" in repair_source
+    assert 'kernels["mean_unique_coords"]' in repair_source
+    assert "device_take(" not in repair_source
+    assert "cp.flatnonzero" not in repair_source
+    assert ".synchronize(" not in repair_source
 
 
 def _to_owned(geoms):
@@ -212,6 +242,31 @@ def test_multilinestring():
 
     result = extract_unique_points_owned(owned, dispatch_mode=ExecutionMode.GPU)
     _compare_extract_unique_points(geoms, result)
+
+
+@requires_gpu
+def test_degenerate_multiline_centroid_averages_unique_part_points():
+    """Collapsed parts at distinct points repair to their unique-point mean."""
+    import cupy as cp
+
+    from vibespatial.constructive.extract_unique_points import (
+        degenerate_line_centroids_owned_capacity,
+    )
+
+    geoms = [
+        MultiLineString([
+            [(0.0, 0.0), (0.0, 0.0)],
+            [(2.0, 0.0), (2.0, 0.0)],
+            [(2.0, 0.0), (2.0, 0.0)],
+        ])
+    ]
+    result = degenerate_line_centroids_owned_capacity(
+        _to_owned(geoms),
+        cp.asarray([True]),
+    )
+
+    actual = result.to_shapely()[0]
+    assert actual.equals_exact(Point(1.0, 0.0), tolerance=0.0)
 
 
 # ---------------------------------------------------------------------------

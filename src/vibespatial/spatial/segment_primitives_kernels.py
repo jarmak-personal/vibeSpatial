@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
+from vibespatial.cuda.device_functions.intersection_point import (
+    INTERSECTION_POINT_DEVICE,
+)
 from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
 from vibespatial.cuda.device_functions.segment_crossing import SEGMENT_CROSSING_DEVICE
 from vibespatial.geometry.buffers import GeometryFamily
@@ -128,7 +131,9 @@ scatter_segments(
     double* __restrict__ out_y0,
     double* __restrict__ out_x1,
     double* __restrict__ out_y1,
-    const int n_valid
+    const int n_valid,
+    const int tier_start,
+    const int tier_width
 ) {{{{
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_valid) return;
@@ -145,15 +150,18 @@ scatter_segments(
         const int cs = geom_off[fam_row];
         const int ce = geom_off[fam_row + 1];
         for (int c = cs; c < ce - 1; ++c) {{{{
-            out_row_idx[write_pos] = global_row;
-            out_seg_idx[write_pos] = seg_idx++;
-            out_part_idx[write_pos] = 0;
-            out_ring_idx[write_pos] = 0;
-            out_x0[write_pos] = x[c];
-            out_y0[write_pos] = y[c];
-            out_x1[write_pos] = x[c + 1];
-            out_y1[write_pos] = y[c + 1];
-            ++write_pos;
+            if (seg_idx >= tier_start && seg_idx < tier_start + tier_width) {{{{
+                out_row_idx[write_pos] = global_row;
+                out_seg_idx[write_pos] = seg_idx;
+                out_part_idx[write_pos] = 0;
+                out_ring_idx[write_pos] = 0;
+                out_x0[write_pos] = x[c];
+                out_y0[write_pos] = y[c];
+                out_x1[write_pos] = x[c + 1];
+                out_y1[write_pos] = y[c + 1];
+                ++write_pos;
+            }}}}
+            ++seg_idx;
         }}}}
     }}}} else if (family == FAMILY_POLYGON) {{{{
         const int rs = geom_off[fam_row];
@@ -163,15 +171,18 @@ scatter_segments(
             const int cs = ring_off[ri];
             const int ce = ring_off[ri + 1];
             for (int c = cs; c < ce - 1; ++c) {{{{
-                out_row_idx[write_pos] = global_row;
-                out_seg_idx[write_pos] = seg_idx++;
-                out_part_idx[write_pos] = 0;
-                out_ring_idx[write_pos] = ring_local;
-                out_x0[write_pos] = x[c];
-                out_y0[write_pos] = y[c];
-                out_x1[write_pos] = x[c + 1];
-                out_y1[write_pos] = y[c + 1];
-                ++write_pos;
+                if (seg_idx >= tier_start && seg_idx < tier_start + tier_width) {{{{
+                    out_row_idx[write_pos] = global_row;
+                    out_seg_idx[write_pos] = seg_idx;
+                    out_part_idx[write_pos] = 0;
+                    out_ring_idx[write_pos] = ring_local;
+                    out_x0[write_pos] = x[c];
+                    out_y0[write_pos] = y[c];
+                    out_x1[write_pos] = x[c + 1];
+                    out_y1[write_pos] = y[c + 1];
+                    ++write_pos;
+                }}}}
+                ++seg_idx;
             }}}}
         }}}}
     }}}} else if (family == FAMILY_MULTILINESTRING) {{{{
@@ -182,15 +193,18 @@ scatter_segments(
             const int cs = part_off[pi];
             const int ce = part_off[pi + 1];
             for (int c = cs; c < ce - 1; ++c) {{{{
-                out_row_idx[write_pos] = global_row;
-                out_seg_idx[write_pos] = seg_idx++;
-                out_part_idx[write_pos] = part_local;
-                out_ring_idx[write_pos] = -1;
-                out_x0[write_pos] = x[c];
-                out_y0[write_pos] = y[c];
-                out_x1[write_pos] = x[c + 1];
-                out_y1[write_pos] = y[c + 1];
-                ++write_pos;
+                if (seg_idx >= tier_start && seg_idx < tier_start + tier_width) {{{{
+                    out_row_idx[write_pos] = global_row;
+                    out_seg_idx[write_pos] = seg_idx;
+                    out_part_idx[write_pos] = part_local;
+                    out_ring_idx[write_pos] = -1;
+                    out_x0[write_pos] = x[c];
+                    out_y0[write_pos] = y[c];
+                    out_x1[write_pos] = x[c + 1];
+                    out_y1[write_pos] = y[c + 1];
+                    ++write_pos;
+                }}}}
+                ++seg_idx;
             }}}}
         }}}}
     }}}} else if (family == FAMILY_MULTIPOLYGON) {{{{
@@ -205,15 +219,18 @@ scatter_segments(
                 const int cs = ring_off[ri];
                 const int ce = ring_off[ri + 1];
                 for (int c = cs; c < ce - 1; ++c) {{{{
-                    out_row_idx[write_pos] = global_row;
-                    out_seg_idx[write_pos] = seg_idx++;
-                    out_part_idx[write_pos] = polygon_local;
-                    out_ring_idx[write_pos] = ring_local;
-                    out_x0[write_pos] = x[c];
-                    out_y0[write_pos] = y[c];
-                    out_x1[write_pos] = x[c + 1];
-                    out_y1[write_pos] = y[c + 1];
-                    ++write_pos;
+                    if (seg_idx >= tier_start && seg_idx < tier_start + tier_width) {{{{
+                        out_row_idx[write_pos] = global_row;
+                        out_seg_idx[write_pos] = seg_idx;
+                        out_part_idx[write_pos] = polygon_local;
+                        out_ring_idx[write_pos] = ring_local;
+                        out_x0[write_pos] = x[c];
+                        out_y0[write_pos] = y[c];
+                        out_x1[write_pos] = x[c + 1];
+                        out_y1[write_pos] = y[c + 1];
+                        ++write_pos;
+                    }}}}
+                    ++seg_idx;
                 }}}}
             }}}}
         }}}}
@@ -238,98 +255,9 @@ __device__ inline compute_t abs_ct(compute_t value) {{{{
     return value < (compute_t)0.0 ? -value : value;
 }}}}
 
-typedef struct {{
-    double hi;
-    double lo;
-}} vs_dd;
-
-__device__ inline vs_dd vs_dd_normalize(double hi, double lo) {{{{
-    double s, e;
-    vs_two_sum(hi, lo, s, e);
-    vs_dd out;
-    out.hi = s;
-    out.lo = e;
-    return out;
-}}}}
-
-__device__ inline vs_dd vs_dd_from_double(double value) {{{{
-    vs_dd out;
-    out.hi = value;
-    out.lo = 0.0;
-    return out;
-}}}}
-
-__device__ inline vs_dd vs_dd_add(vs_dd a, vs_dd b) {{{{
-    double s, e;
-    vs_two_sum(a.hi, b.hi, s, e);
-    return vs_dd_normalize(s, a.lo + b.lo + e);
-}}}}
-
-__device__ inline vs_dd vs_dd_sub(vs_dd a, vs_dd b) {{{{
-    double s, e;
-    vs_two_sum(a.hi, -b.hi, s, e);
-    return vs_dd_normalize(s, a.lo - b.lo + e);
-}}}}
-
-__device__ inline vs_dd vs_dd_mul_double(vs_dd a, double b) {{{{
-    double p, e;
-    vs_two_product(a.hi, b, p, e);
-    return vs_dd_normalize(p, e + a.lo * b);
-}}}}
-
-__device__ inline vs_dd vs_dd_mul_diff(double ax, double by, double ay, double bx) {{{{
-    double p1, e1, p2, e2, s, e;
-    vs_two_product(ax, by, p1, e1);
-    vs_two_product(ay, bx, p2, e2);
-    vs_two_sum(p1, -p2, s, e);
-    return vs_dd_normalize(s, e1 - e2 + e);
-}}}}
-
-__device__ inline double vs_dd_div(vs_dd num, vs_dd den) {{{{
-    const double q1 = num.hi / den.hi;
-    vs_dd rem1 = vs_dd_sub(num, vs_dd_mul_double(den, q1));
-    const double q2 = rem1.hi / den.hi;
-    vs_dd rem2 = vs_dd_sub(rem1, vs_dd_mul_double(den, q2));
-    const double q3 = rem2.hi / den.hi;
-    return (q1 + q2) + q3;
-}}}}
-
-__device__ inline int vs_proper_intersection_point_dd(
-    double ax,
-    double ay,
-    double bx,
-    double by,
-    double cx,
-    double cy,
-    double dx,
-    double dy,
-    double* out_x,
-    double* out_y
-) {{{{
-    vs_dd denominator = vs_dd_mul_diff(ax - bx, cy - dy, ay - by, cx - dx);
-    if (denominator.hi == 0.0 && denominator.lo == 0.0) {{{{
-        return 0;
-    }}}}
-
-    vs_dd left_det = vs_dd_mul_diff(ax, by, ay, bx);
-    vs_dd right_det = vs_dd_mul_diff(cx, dy, cy, dx);
-
-    vs_dd num_x = vs_dd_sub(
-        vs_dd_mul_double(left_det, cx - dx),
-        vs_dd_mul_double(right_det, ax - bx)
-    );
-    vs_dd num_y = vs_dd_sub(
-        vs_dd_mul_double(left_det, cy - dy),
-        vs_dd_mul_double(right_det, ay - by)
-    );
-
-    *out_x = vs_dd_div(num_x, denominator);
-    *out_y = vs_dd_div(num_y, denominator);
-    return 1;
-}}}}
-
 /* orient2d predicate provided by ORIENT2D_DEVICE (vs_orient2d) */
 /* collinear containment provided by SEGMENT_CROSSING_DEVICE (vs_point_on_segment_collinear) */
+/* intersection point provided by INTERSECTION_POINT_DEVICE */
 
 /* Classification codes */
 #define CLASS_DISJOINT 0
@@ -635,68 +563,23 @@ _SEGMENT_CLASSIFY_KERNEL_NAMES = ("classify_segment_pairs_v2",)
 # entirely on device, avoiding the D->H->D ping-pong.
 # ---------------------------------------------------------------------------
 
-_CANDIDATE_SCATTER_KERNEL_SOURCE = """
+_SAME_ROW_CANDIDATE_KERNEL_SOURCE = """
 extern "C" __global__ void __launch_bounds__(256, 4)
-scatter_candidate_pairs(
-    const long long* __restrict__ cand_offsets,
-    const int* __restrict__ range_start,
-    const int* __restrict__ range_end,
-    const int* __restrict__ sorted_right_idx,
-    int* __restrict__ out_left,
-    int* __restrict__ out_right,
-    const int n_left
-) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_left) return;
-
-    const int rs = range_start[i];
-    const int re = range_end[i];
-    int write_pos = (int)cand_offsets[i];
-
-    for (int j = rs; j < re; ++j) {
-        out_left[write_pos] = i;
-        out_right[write_pos] = sorted_right_idx[j];
-        ++write_pos;
-    }
-}
-
-// Batched variant: processes left segments [left_start, left_start+batch_size).
-// Write positions are shifted by -offset_base so output starts at index 0.
-extern "C" __global__ void __launch_bounds__(256, 4)
-scatter_candidate_pairs_batch(
-    const long long* __restrict__ cand_offsets,
-    const int* __restrict__ range_start,
-    const int* __restrict__ range_end,
-    const int* __restrict__ sorted_right_idx,
-    int* __restrict__ out_left,
-    int* __restrict__ out_right,
-    const int left_start,
-    const int batch_size,
-    const long long offset_base
-) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= batch_size) return;
-
-    const int i = left_start + tid;
-    const int rs = range_start[i];
-    const int re = range_end[i];
-    int write_pos = (int)(cand_offsets[i] - offset_base);
-
-    for (int j = rs; j < re; ++j) {
-        out_left[write_pos] = i;
-        out_right[write_pos] = sorted_right_idx[j];
-        ++write_pos;
-    }
-}
-
-// Fixed-capacity batch variant: each left segment owns right_capacity slots.
-// Unused slots remain sentinel-filled by the caller and are compacted on device.
-// This avoids a scalar total-count fence for large-but-bounded sweep batches.
-extern "C" __global__ void __launch_bounds__(256, 4)
-scatter_candidate_pairs_capacity_batch(
-    const int* __restrict__ range_start,
-    const int* __restrict__ range_end,
-    const int* __restrict__ sorted_right_idx,
+scatter_same_row_overlap_candidates_capacity(
+    const int* __restrict__ left_rows,
+    const double* __restrict__ left_x0,
+    const double* __restrict__ left_y0,
+    const double* __restrict__ left_x1,
+    const double* __restrict__ left_y1,
+    const int* __restrict__ right_row_starts,
+    const int* __restrict__ right_row_ends,
+    const double* __restrict__ right_x0,
+    const double* __restrict__ right_y0,
+    const double* __restrict__ right_x1,
+    const double* __restrict__ right_y1,
+    const int* __restrict__ upper_left_rows,
+    const int* __restrict__ upper_right_rows,
+    const int use_upper_rows,
     int* __restrict__ out_left,
     int* __restrict__ out_right,
     const int left_start,
@@ -704,140 +587,26 @@ scatter_candidate_pairs_capacity_batch(
     const int right_capacity
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= batch_size) return;
-
-    const int i = left_start + tid;
-    const int rs = range_start[i];
-    const int re = range_end[i];
-    int write_pos = tid * right_capacity;
-
-    for (int j = rs; j < re; ++j) {
-        out_left[write_pos] = i;
-        out_right[write_pos] = sorted_right_idx[j];
-        ++write_pos;
-    }
-}
-"""
-
-_CANDIDATE_SCATTER_KERNEL_NAMES = (
-    "scatter_candidate_pairs",
-    "scatter_candidate_pairs_batch",
-    "scatter_candidate_pairs_capacity_batch",
-)
-
-
-# ---------------------------------------------------------------------------
-# Same-row candidate kernels: warp-cooperative MBR overlap generation for
-# aligned workloads that require row isolation.
-# ---------------------------------------------------------------------------
-
-_SAME_ROW_CANDIDATE_KERNEL_SOURCE = """
-extern "C" __global__ void __launch_bounds__(256, 4)
-count_same_row_overlap_candidates(
-    const int* __restrict__ left_rows,
-    const double* __restrict__ left_x0,
-    const double* __restrict__ left_y0,
-    const double* __restrict__ left_x1,
-    const double* __restrict__ left_y1,
-    const int* __restrict__ right_row_starts,
-    const int* __restrict__ right_row_ends,
-    const double* __restrict__ right_x0,
-    const double* __restrict__ right_y0,
-    const double* __restrict__ right_x1,
-    const double* __restrict__ right_y1,
-    int* __restrict__ out_counts,
-    const int n_left
-) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    if (warp >= n_left) return;
+    if (warp >= batch_size) return;
 
-    const int row = left_rows[warp];
-    const int rs = right_row_starts[row];
-    const int re = right_row_ends[row];
-
-    if (rs < 0 || re <= rs) {
-        if (lane == 0) out_counts[warp] = 0;
-        return;
-    }
-
-    const double lx0 = left_x0[warp];
-    const double ly0 = left_y0[warp];
-    const double lx1 = left_x1[warp];
-    const double ly1 = left_y1[warp];
-    const double lminx = fmin(lx0, lx1);
-    const double lmaxx = fmax(lx0, lx1);
-    const double lminy = fmin(ly0, ly1);
-    const double lmaxy = fmax(ly0, ly1);
-
-    int count = 0;
-    for (int base = rs; base < re; base += 32) {
-        const int ridx = base + lane;
-        int hit = 0;
-        if (ridx < re) {
-            const double rx0 = right_x0[ridx];
-            const double ry0 = right_y0[ridx];
-            const double rx1 = right_x1[ridx];
-            const double ry1 = right_y1[ridx];
-            const double rminx = fmin(rx0, rx1);
-            const double rmaxx = fmax(rx0, rx1);
-            const double rminy = fmin(ry0, ry1);
-            const double rmaxy = fmax(ry0, ry1);
-            hit = (lminx <= rmaxx) && (lmaxx >= rminx) &&
-                  (lminy <= rmaxy) && (lmaxy >= rminy);
-        }
-        const unsigned mask = __ballot_sync(0xFFFFFFFFu, hit);
-        if (lane == 0) {
-            count += __popc(mask);
-        }
-    }
-
-    if (lane == 0) out_counts[warp] = count;
-}
-
-extern "C" __global__ void __launch_bounds__(256, 4)
-scatter_same_row_overlap_candidates(
-    const int* __restrict__ left_rows,
-    const double* __restrict__ left_x0,
-    const double* __restrict__ left_y0,
-    const double* __restrict__ left_x1,
-    const double* __restrict__ left_y1,
-    const int* __restrict__ right_row_starts,
-    const int* __restrict__ right_row_ends,
-    const double* __restrict__ right_x0,
-    const double* __restrict__ right_y0,
-    const double* __restrict__ right_x1,
-    const double* __restrict__ right_y1,
-    const long long* __restrict__ cand_offsets,
-    int* __restrict__ out_left,
-    int* __restrict__ out_right,
-    const int n_left
-) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
-    if (warp >= n_left) return;
-
-    const int row = left_rows[warp];
+    const int left_idx = left_start + warp;
+    const int row = left_rows[left_idx];
     const int rs = right_row_starts[row];
     const int re = right_row_ends[row];
     if (rs < 0 || re <= rs) return;
 
-    const double lx0 = left_x0[warp];
-    const double ly0 = left_y0[warp];
-    const double lx1 = left_x1[warp];
-    const double ly1 = left_y1[warp];
+    const double lx0 = left_x0[left_idx];
+    const double ly0 = left_y0[left_idx];
+    const double lx1 = left_x1[left_idx];
+    const double ly1 = left_y1[left_idx];
     const double lminx = fmin(lx0, lx1);
     const double lmaxx = fmax(lx0, lx1);
     const double lminy = fmin(ly0, ly1);
     const double lmaxy = fmax(ly0, ly1);
-    int base_write = 0;
+    const int base_write = warp * right_capacity;
     int written = 0;
-    if (lane == 0) {
-        base_write = (int)cand_offsets[warp];
-    }
-    base_write = __shfl_sync(0xFFFFFFFFu, base_write, 0);
 
     for (int base = rs; base < re; base += 32) {
         const int ridx = base + lane;
@@ -853,6 +622,9 @@ scatter_same_row_overlap_candidates(
             const double rmaxy = fmax(ry0, ry1);
             hit = (lminx <= rmaxx) && (lmaxx >= rminx) &&
                   (lminy <= rmaxy) && (lmaxy >= rminy);
+            if (hit && use_upper_rows != 0 && upper_left_rows[left_idx] >= upper_right_rows[ridx]) {
+                hit = 0;
+            }
         }
 
         const unsigned mask = __ballot_sync(0xFFFFFFFFu, hit);
@@ -867,22 +639,179 @@ scatter_same_row_overlap_candidates(
         }
         chunk_base = __shfl_sync(0xFFFFFFFFu, chunk_base, 0);
         if (hit) {
-            out_left[chunk_base + prefix] = warp;
+            out_left[chunk_base + prefix] = left_idx;
             out_right[chunk_base + prefix] = ridx;
         }
     }
 }
 """
 
-_SAME_ROW_CANDIDATE_KERNEL_NAMES = (
-    "count_same_row_overlap_candidates",
-    "scatter_same_row_overlap_candidates",
+_SAME_ROW_CANDIDATE_KERNEL_NAMES = ("scatter_same_row_overlap_candidates_capacity",)
+
+
+_SWEEP_CANDIDATE_KERNEL_SOURCE = r"""
+__device__ __forceinline__ int sweep_candidate_overlaps(
+    const int left_idx,
+    const int right_idx,
+    const double* left_minx,
+    const double* left_maxx,
+    const double* left_miny,
+    const double* left_maxy,
+    const double* right_minx,
+    const double* right_maxx,
+    const double* right_miny,
+    const double* right_maxy,
+    const int* left_rows,
+    const int* right_rows,
+    const int require_same_row,
+    const unsigned char* outlier_mask,
+    const int exclude_outliers,
+    const int* upper_left_rows,
+    const int* upper_right_rows,
+    const int use_upper_rows
+) {
+    if (
+        left_minx[left_idx] > right_maxx[right_idx]
+        || left_maxx[left_idx] < right_minx[right_idx]
+        || left_miny[left_idx] > right_maxy[right_idx]
+        || left_maxy[left_idx] < right_miny[right_idx]
+    ) return 0;
+    if (require_same_row && left_rows[left_idx] != right_rows[right_idx]) return 0;
+    if (exclude_outliers && outlier_mask[right_idx]) return 0;
+    if (use_upper_rows && upper_left_rows[left_idx] >= upper_right_rows[right_idx]) return 0;
+    return 1;
+}
+
+extern "C" __global__ void __launch_bounds__(128, 4)
+count_sweep_overlap_candidates(
+    const long long* range_start,
+    const long long* range_end,
+    const int* sorted_right_idx,
+    const double* left_minx,
+    const double* left_maxx,
+    const double* left_miny,
+    const double* left_maxy,
+    const double* right_minx,
+    const double* right_maxx,
+    const double* right_miny,
+    const double* right_maxy,
+    const int* left_rows,
+    const int* right_rows,
+    const int require_same_row,
+    const unsigned char* outlier_mask,
+    const int exclude_outliers,
+    const int* upper_left_rows,
+    const int* upper_right_rows,
+    const int use_upper_rows,
+    const int left_start,
+    const int batch_size,
+    const int range_offset,
+    const int range_capacity,
+    int* out_counts
+) {
+    const int local = blockIdx.x;
+    if (local >= batch_size) return;
+    const int left_idx = left_start + local;
+    const long long base = range_start[left_idx];
+    const long long start = base + (long long)range_offset;
+    const long long stop = min(
+        range_end[left_idx],
+        start + (long long)range_capacity
+    );
+    unsigned int local_count = 0;
+    for (long long pos = start + threadIdx.x; pos < stop; pos += blockDim.x) {
+        const int right_idx = sorted_right_idx[pos];
+        local_count += (unsigned int)sweep_candidate_overlaps(
+            left_idx, right_idx,
+            left_minx, left_maxx, left_miny, left_maxy,
+            right_minx, right_maxx, right_miny, right_maxy,
+            left_rows, right_rows, require_same_row,
+            outlier_mask, exclude_outliers,
+            upper_left_rows, upper_right_rows, use_upper_rows
+        );
+    }
+    if (local_count) atomicAdd((unsigned int*)&out_counts[local], local_count);
+}
+
+extern "C" __global__ void __launch_bounds__(128, 4)
+scatter_sweep_overlap_candidates(
+    const long long* range_start,
+    const long long* range_end,
+    const int* sorted_right_idx,
+    const double* left_minx,
+    const double* left_maxx,
+    const double* left_miny,
+    const double* left_maxy,
+    const double* right_minx,
+    const double* right_maxx,
+    const double* right_miny,
+    const double* right_maxy,
+    const int* left_rows,
+    const int* right_rows,
+    const int require_same_row,
+    const unsigned char* outlier_mask,
+    const int exclude_outliers,
+    const int* upper_left_rows,
+    const int* upper_right_rows,
+    const int use_upper_rows,
+    const int* selected_left_indices,
+    const int selected_count,
+    const int range_offset,
+    const int range_capacity,
+    const int tier_start,
+    const int tier_width,
+    int* out_left,
+    int* out_right
+) {
+    const int local = blockIdx.x;
+    if (local >= selected_count) return;
+    const int lane = threadIdx.x & 31;
+    const int left_idx = selected_left_indices[local];
+    const long long base = range_start[left_idx];
+    const long long start = base + (long long)range_offset;
+    const long long stop = min(
+        range_end[left_idx],
+        start + (long long)range_capacity
+    );
+    int written = 0;
+    for (long long base_pos = start; base_pos < stop; base_pos += 32) {
+        const long long pos = base_pos + lane;
+        int hit = 0;
+        int right_idx = -1;
+        if (pos < stop) {
+            right_idx = sorted_right_idx[pos];
+            hit = sweep_candidate_overlaps(
+                left_idx, right_idx,
+                left_minx, left_maxx, left_miny, left_maxy,
+                right_minx, right_maxx, right_miny, right_maxy,
+                left_rows, right_rows, require_same_row,
+                outlier_mask, exclude_outliers,
+                upper_left_rows, upper_right_rows, use_upper_rows
+            );
+        }
+        const unsigned int hit_mask = __ballot_sync(0xFFFFFFFFu, hit);
+        const int prefix = __popc(hit_mask & ((1u << lane) - 1));
+        const int ordinal = written + prefix;
+        if (hit && ordinal >= tier_start && ordinal < tier_start + tier_width) {
+            const int output = local * tier_width + ordinal - tier_start;
+            out_left[output] = left_idx;
+            out_right[output] = right_idx;
+        }
+        written += __popc(hit_mask);
+    }
+}
+"""
+
+_SWEEP_CANDIDATE_KERNEL_NAMES = (
+    "count_sweep_overlap_candidates",
+    "scatter_sweep_overlap_candidates",
 )
 
 
 # ---------------------------------------------------------------------------
 # Format-string generators (produce CUDA C++ from templates)
 # ---------------------------------------------------------------------------
+
 
 def format_extract_source(compute_type: str = "double") -> str:
     """Format the segment extraction kernel source with the given compute type."""
@@ -906,7 +835,7 @@ def format_classify_source(compute_type: str = "double") -> str:
         compute_type=compute_type,
         errbound_val=f"{errbound:.20e}",
     )
-    return ORIENT2D_DEVICE + SEGMENT_CROSSING_DEVICE + formatted
+    return ORIENT2D_DEVICE + SEGMENT_CROSSING_DEVICE + INTERSECTION_POINT_DEVICE + formatted
 
 
 # Pre-formatted kernel sources for warmup

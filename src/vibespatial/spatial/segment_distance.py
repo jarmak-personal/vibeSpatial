@@ -26,13 +26,17 @@ from vibespatial.spatial.segment_distance_kernels import (  # noqa: E402
     _SEGMENT_DISTANCE_KERNEL_SOURCE,
 )
 
-request_nvrtc_warmup([
-    ("segment-distance", _SEGMENT_DISTANCE_KERNEL_SOURCE, _SEGMENT_DISTANCE_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("segment-distance", _SEGMENT_DISTANCE_KERNEL_SOURCE, _SEGMENT_DISTANCE_KERNEL_NAMES),
+    ]
+)
 
 
 def _segment_distance_kernels():
-    return compile_kernel_group("segment-distance", _SEGMENT_DISTANCE_KERNEL_SOURCE, _SEGMENT_DISTANCE_KERNEL_NAMES)
+    return compile_kernel_group(
+        "segment-distance", _SEGMENT_DISTANCE_KERNEL_SOURCE, _SEGMENT_DISTANCE_KERNEL_NAMES
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -154,10 +158,14 @@ def compute_segment_distance_gpu(
     right_args, right_types = _family_args(right_state, canonical[1], runtime)
 
     # Tail: left_idx, right_idx, out, exclusive, pair_count.
-    tail_args = [ptr(eff_left), ptr(eff_right), ptr(d_distances),
-                 1 if exclusive else 0, pair_count]
-    tail_types = [KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                  KERNEL_PARAM_I32, KERNEL_PARAM_I32]
+    tail_args = [ptr(eff_left), ptr(eff_right), ptr(d_distances), 1 if exclusive else 0, pair_count]
+    tail_types = [
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_I32,
+    ]
 
     all_args = tuple(left_args + right_args + tail_args)
     all_types = tuple(left_types + right_types + tail_types)

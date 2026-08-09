@@ -9,7 +9,7 @@ from vibespatial.runtime.precision import KernelClass, PrecisionMode, normalize_
     "point_bounds",
     "cpu",
     kernel_class=KernelClass.PREDICATE,
-    geometry_families=('point', 'polygon'),
+    geometry_families=("point", "polygon"),
     execution_modes=(ExecutionMode.CPU,),
     supports_mixed=False,
 )

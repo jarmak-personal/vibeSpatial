@@ -369,3 +369,12 @@ class TestCCCLDeferredDiskLoading:
         precompiler = CCCLPrecompiler(max_workers=1)
         assert precompiler._executor is None
         precompiler.shutdown()  # should not raise
+
+    def test_shutdown_quiesces_active_compiler_workers(self):
+        precompiler = CCCLPrecompiler(max_workers=1)
+        executor = precompiler._ensure_executor()
+
+        with patch.object(executor, "shutdown") as shutdown:
+            precompiler.shutdown()
+
+        shutdown.assert_called_once_with(wait=True, cancel_futures=True)

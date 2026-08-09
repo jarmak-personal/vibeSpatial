@@ -104,8 +104,7 @@ def transform_coordinates_inplace(
     n = len(d_x)
     if n != len(d_y):
         raise ValueError(
-            f"Coordinate arrays must have equal length: "
-            f"len(d_x)={n}, len(d_y)={len(d_y)}"
+            f"Coordinate arrays must have equal length: len(d_x)={n}, len(d_y)={len(d_y)}"
         )
     if n == 0:
         return

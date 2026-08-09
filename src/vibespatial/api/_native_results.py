@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -16,27 +16,29 @@ from vibespatial.api._native_result_core import (
     GeometryNativeResult,
     NativeAttributeTable,
     NativeGeometryColumn,
+    NativeGeometryComposition,
+    NativeGeometryCompositionPart,
     NativeGeometryProvenance,
     NativeReadProvenance,
     NativeTabularResult,
+    NativeTabularSelection,
+    _copy_public_frame_attrs,
     _host_array,
     _is_admissible_pandas_numeric_series,
     _materialize_attribute_geometry_frame,
     _replace_geometry_column_preserving_backing,
     _set_active_geometry_name,
+    _take_pandas_frame_rows,
     native_attribute_table_from_arrow_table,  # noqa: F401
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.config import SPATIAL_EPSILON
-from vibespatial.runtime.fallbacks import record_fallback_event
+from vibespatial.runtime.fallbacks import StrictNativeFallbackError
 from vibespatial.runtime.residency import Residency, combined_residency
 
 if TYPE_CHECKING:
     from vibespatial.api.geodataframe import GeoDataFrame
     from vibespatial.api.geoseries import GeoSeries
-
-
-_PUBLIC_SJOIN_PANDAS_EXPORT_MAX_ROWS = 50_000
 
 
 def _index_array_size(values: Any) -> int:
@@ -47,6 +49,70 @@ def _index_array_size(values: Any) -> int:
     if size is not None:
         return int(size)
     return len(values)
+
+
+
+
+def _geometry_composition_from_owned_parts_at_capacity(
+    capacity_parts,
+    *,
+    row_count: int,
+    crs,
+    trusted_all_ogc_valid: bool | None = None,
+):
+    """Map concrete native geometry parts into a fixed logical row capacity.
+
+    Unlike sparse composition, output rows already address the final capacity.
+    Dynamic cardinality remains in the caller's ``NativeDeviceSelection``;
+    composition therefore needs no unique-row pass or host-visible count.
+    """
+    if int(row_count) < 0:
+        raise ValueError("geometry composition row capacity must be non-negative")
+    if not capacity_parts:
+        return None
+    return GeometryNativeResult.from_composition(
+        NativeGeometryComposition(
+            parts=tuple(
+                NativeGeometryCompositionPart(
+                    geometry=GeometryNativeResult.from_owned(part_owned, crs=crs),
+                    output_rows=part_rows,
+                )
+                for part_owned, part_rows in capacity_parts
+            ),
+            row_count=int(row_count),
+            crs=crs,
+            trusted_all_ogc_valid=trusted_all_ogc_valid,
+        ),
+        crs=crs,
+    )
+
+
+def _ordered_geometry_collection_from_owned_parts_at_capacity(
+    capacity_parts,
+    *,
+    row_count: int,
+    crs,
+):
+    """Map ordered concrete geometry slots into terminal GeometryCollections."""
+    if int(row_count) < 0:
+        raise ValueError("geometry collection row capacity must be non-negative")
+    if not capacity_parts:
+        return None
+    return GeometryNativeResult.from_composition(
+        NativeGeometryComposition(
+            parts=tuple(
+                NativeGeometryCompositionPart(
+                    geometry=GeometryNativeResult.from_owned(part_owned, crs=crs),
+                    output_rows=part_rows,
+                    collection_position=position,
+                )
+                for position, (part_owned, part_rows) in enumerate(capacity_parts)
+            ),
+            row_count=int(row_count),
+            crs=crs,
+        ),
+        crs=crs,
+    )
 
 
 def _cached_geometry_metadata(geometry: GeometryNativeResult):
@@ -95,6 +161,7 @@ class RelationIndexResult:
 
     left_indices: Any
     right_indices: Any
+    broadcast_right_value: int | None = None
 
     def to_host(
         self,
@@ -105,17 +172,23 @@ class RelationIndexResult:
         dtype=np.int32,
         strict_disallowed: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
-        return (
-            _pairwise_index_to_host(
-                self.left_indices,
-                side="left",
-                surface=surface,
-                operation=operation,
-                reason=reason,
+        left = _pairwise_index_to_host(
+            self.left_indices,
+            side="left",
+            surface=surface,
+            operation=operation,
+            reason=reason,
+            dtype=dtype,
+            strict_disallowed=strict_disallowed,
+        )
+        if self.broadcast_right_value is not None:
+            right = np.full(
+                left.shape,
+                int(self.broadcast_right_value),
                 dtype=dtype,
-                strict_disallowed=strict_disallowed,
-            ),
-            _pairwise_index_to_host(
+            )
+        else:
+            right = _pairwise_index_to_host(
                 self.right_indices,
                 side="right",
                 surface=surface,
@@ -123,12 +196,14 @@ class RelationIndexResult:
                 reason=reason,
                 dtype=dtype,
                 strict_disallowed=strict_disallowed,
-            ),
-        )
+            )
+        return left, right
 
     @property
     def size(self) -> int:
         left_size = _index_array_size(self.left_indices)
+        if self.broadcast_right_value is not None:
+            return left_size
         right_size = _index_array_size(self.right_indices)
         if left_size != right_size:
             raise ValueError(
@@ -397,7 +472,22 @@ def _drop_private_attribute_columns(attributes: pd.DataFrame) -> pd.DataFrame:
 
 
 def _same_index_with_names(left: pd.Index, right: pd.Index) -> bool:
-    return bool(left.equals(right) and list(left.names) == list(right.names))
+    if left is right:
+        return True
+    if len(left) != len(right) or list(left.names) != list(right.names):
+        return False
+    left_values = getattr(left, "_values", None)
+    right_values = getattr(right, "_values", None)
+    left_native = left_values.__class__.__name__ == "NativeIndexLabelsArray"
+    right_native = right_values.__class__.__name__ == "NativeIndexLabelsArray"
+    if left_native or right_native:
+        if left_native and right_native:
+            return bool(
+                getattr(left_values, "index_plan", None)
+                is getattr(right_values, "index_plan", None)
+            )
+        return False
+    return bool(left.equals(right))
 
 
 def _reduction_source_column_map(columns) -> dict[Any, Any]:
@@ -659,8 +749,16 @@ def _native_pairwise_attribute_table(
     left_attrs.columns = left_columns
     right_attrs.columns = right_columns
 
-    left_projected = left_attrs._reindex_with_indexers({0: (out_index, h_left_idx)})
-    right_projected = right_attrs._reindex_with_indexers({0: (out_index, h_right_idx)})
+    left_projected = _terminal_take_attribute_frame_rows(
+        left_attrs,
+        h_left_idx,
+        index=out_index,
+    )
+    right_projected = _terminal_take_attribute_frame_rows(
+        right_attrs,
+        h_right_idx,
+        index=out_index,
+    )
     return _native_attribute_table_from_projected_frames(
         [left_projected, right_projected],
         index_override=out_index,
@@ -711,8 +809,16 @@ def _project_pairwise_attribute_frame(
     left_attrs.columns = left_columns
     right_attrs.columns = right_columns
 
-    left_projected = left_attrs._reindex_with_indexers({0: (out_index, h_left_idx)})
-    right_projected = right_attrs._reindex_with_indexers({0: (out_index, h_right_idx)})
+    left_projected = _terminal_take_attribute_frame_rows(
+        left_attrs,
+        h_left_idx,
+        index=out_index,
+    )
+    right_projected = _terminal_take_attribute_frame_rows(
+        right_attrs,
+        h_right_idx,
+        index=out_index,
+    )
     concat_kwargs = {} if PANDAS_GE_30 else {"copy": False}
     return pd.concat([left_projected, right_projected], axis=1, **concat_kwargs)
 
@@ -809,10 +915,16 @@ def _single_index_reset_column_name(
 def _has_secondary_geometry_columns(df: GeoDataFrame, geometry_name: str) -> bool:
     from vibespatial.api.geo_base import _is_geometry_like_dtype
 
-    non_geometry = df.drop(geometry_name, axis=1)
-    if non_geometry.shape[1] == 0:
-        return False
-    return bool(np.asarray(non_geometry.dtypes.map(_is_geometry_like_dtype), dtype=bool).any())
+    for column in df.columns:
+        if column == geometry_name:
+            continue
+        try:
+            dtype = pd.DataFrame.__getitem__(df, column).dtype
+        except Exception:
+            return True
+        if _is_geometry_like_dtype(dtype):
+            return True
+    return False
 
 
 def _native_relation_join_parts_fast_pandas_inner(
@@ -824,6 +936,7 @@ def _native_relation_join_parts_fast_pandas_inner(
     lsuffix: str,
     rsuffix: str,
     on_attribute=None,
+    geometry_result: GeometryNativeResult | None = None,
 ) -> tuple[
     NativeAttributeTable,
     GeometryNativeResult,
@@ -884,8 +997,11 @@ def _native_relation_join_parts_fast_pandas_inner(
 
     frames: list[pd.DataFrame] = []
     if left_attr_df.shape[1] > 0:
-        left_projected = left_attr_df.take(l_take)
-        left_projected.index = joined_index
+        left_projected = _take_pandas_frame_rows(
+            left_attr_df,
+            l_take,
+            index=joined_index,
+        )
         left_projected.columns = left_output_columns
         frames.append(left_projected)
 
@@ -898,8 +1014,11 @@ def _native_relation_join_parts_fast_pandas_inner(
         )
     )
     if right_attr_df.shape[1] > 0:
-        right_projected = right_attr_df.take(r_take)
-        right_projected.index = joined_index
+        right_projected = _take_pandas_frame_rows(
+            right_attr_df,
+            r_take,
+            index=joined_index,
+        )
         right_projected.columns = right_output_columns[1:]
         frames.append(right_projected)
 
@@ -907,13 +1026,14 @@ def _native_relation_join_parts_fast_pandas_inner(
     attributes = pd.concat(frames, axis=1, **concat_kwargs)
     attributes.index = joined_index
 
-    geometry_values = left_df.geometry.values.take(l_take)
-    geometry_result = GeometryNativeResult.from_values(
-        geometry_values,
-        crs=left_df.crs,
-        index=joined_index,
-        name=left_geometry_name,
-    )
+    if geometry_result is None:
+        geometry_values = left_df.geometry.values.take(l_take)
+        geometry_result = GeometryNativeResult.from_values(
+            geometry_values,
+            crs=left_df.crs,
+            index=joined_index,
+            name=left_geometry_name,
+        )
 
     left_column_iter = iter(left_output_columns)
     column_order: list[Any] = []
@@ -1409,10 +1529,6 @@ def _relation_join_export_result_to_native_frame_state_device(
         return None
     if left_state.secondary_geometry or right_state.secondary_geometry:
         return None
-    if _has_secondary_geometry_columns(result.left_df, left_geometry_name):
-        return None
-    if _has_secondary_geometry_columns(result.right_df, right_geometry_name):
-        return None
 
     left_owned = getattr(left_state.geometry, "owned", None)
     if left_owned is None or getattr(left_owned, "residency", None) is not Residency.DEVICE:
@@ -1442,7 +1558,12 @@ def _relation_join_export_result_to_native_frame_state_device(
         if len(table.columns) == 0:
             return True
         if hasattr(row_positions, "__cuda_array_interface__"):
-            return table.device_table is not None or table.arrow_table is not None
+            return (
+                table.device_table is not None
+                or table.arrow_table is not None
+                or table.dataframe is not None
+                or table.loader is not None
+            )
         return True
 
     def _can_gather_from_device_positions(table: NativeAttributeTable) -> bool:
@@ -1539,6 +1660,13 @@ def _relation_join_export_result_to_native_frame_state_device(
         unique=False,
         strict_disallowed=strict_index_materialization,
     )
+    if left_state.index_plan.admits_unique_label_selection:
+        index_plan = index_plan.with_selection(
+            left_indices,
+            source_token=left_state.lineage_token,
+            source_row_count=left_state.row_count,
+            unique=False,
+        )
     column_order: list[Any] = []
     left_column_iter = iter(left_output_columns)
     for column_name in result.left_df.columns:
@@ -1580,6 +1708,194 @@ def _relation_join_export_result_to_native_frame_state_device(
     )
 
 
+def _relation_join_terminal_indices_to_host(
+    relation: RelationIndexResult,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Copy relation pair rows for the terminal public GeoDataFrame export."""
+    if len(relation) == 0:
+        return (
+            np.empty(0, dtype=np.intp),
+            np.empty(0, dtype=np.intp),
+        )
+
+    def _copy(values, *, side: str) -> np.ndarray:
+        if hasattr(values, "__cuda_array_interface__"):
+            from vibespatial.cuda._runtime import get_cuda_runtime
+
+            return get_cuda_runtime().copy_device_to_host(
+                values,
+                reason=f"relation join terminal {side} rows export",
+            ).astype(np.intp, copy=False)
+        return np.asarray(values, dtype=np.intp)
+
+    left = _copy(relation.left_indices, side="left")
+    if relation.broadcast_right_value is not None:
+        right = np.full(
+            left.shape,
+            int(relation.broadcast_right_value),
+            dtype=np.intp,
+        )
+    else:
+        right = _copy(relation.right_indices, side="right")
+    return left, right
+
+
+def _relation_join_terminal_distances_to_host(values) -> np.ndarray | None:
+    if values is None:
+        return None
+    if hasattr(values, "__cuda_array_interface__"):
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        return get_cuda_runtime().copy_device_to_host(
+            values,
+            reason="relation join terminal distance column export",
+        ).astype(np.float64, copy=False)
+    return np.asarray(values, dtype=np.float64)
+
+
+def _relation_join_terminal_geodataframe_materializer(
+    export_result: RelationJoinExportResult,
+):
+    def _materialize(native_result: NativeTabularResult, _attributes):
+        relation = export_result.relation_result.relation
+        relation_indices = _relation_join_terminal_indices_to_host(relation)
+        relation_distances = _relation_join_terminal_distances_to_host(
+            export_result.relation_result.distances,
+        )
+        if (
+            export_result.predicate == "intersects"
+            and export_result.relation_result.distances is None
+            and not export_result.on_attribute
+        ):
+            from vibespatial.api.tools._pair_cache import cache_intersection_pairs
+
+            cache_intersection_pairs(
+                export_result.left_df,
+                export_result.right_df,
+                relation_indices[0],
+                relation_indices[1],
+            )
+
+        fast_parts = None
+        if export_result.how == "inner":
+            fast_parts = _native_relation_join_parts_fast_pandas_inner(
+                export_result.left_df,
+                export_result.right_df,
+                relation_indices,
+                relation_distances,
+                lsuffix=export_result.lsuffix,
+                rsuffix=export_result.rsuffix,
+                on_attribute=export_result.on_attribute,
+                geometry_result=native_result.geometry,
+            )
+        if fast_parts is None:
+            fast_parts = _native_relation_join_parts(
+                export_result.left_df,
+                export_result.right_df,
+                relation_indices,
+                relation_distances,
+                how=export_result.how,
+                lsuffix=export_result.lsuffix,
+                rsuffix=export_result.rsuffix,
+                on_attribute=export_result.on_attribute,
+                attribute_storage="pandas",
+            )
+        (
+            public_attributes,
+            public_geometry,
+            geometry_name,
+            _crs,
+            column_order,
+            secondary_geometry,
+            distances,
+        ) = fast_parts
+        if export_result.distance_col is not None:
+            public_attributes = public_attributes.with_column(
+                export_result.distance_col,
+                distances,
+            )
+            column_order = tuple([*column_order, export_result.distance_col])
+
+        frame = _materialize_attribute_geometry_frame(
+            public_attributes,
+            (
+                NativeGeometryColumn(geometry_name, public_geometry),
+                *secondary_geometry,
+            ),
+            geometry_name=geometry_name,
+            column_order=column_order,
+        )
+        from vibespatial.api._native_state import (
+            attach_native_state_from_native_tabular_result,
+        )
+
+        attach_native_state_from_native_tabular_result(
+            frame,
+            replace(
+                native_result,
+                column_order=tuple(frame.columns),
+            ),
+        )
+        return frame
+
+    return _materialize
+
+
+def _relation_join_export_result_to_terminal_public_native_tabular_result(
+    result: RelationJoinExportResult,
+) -> NativeTabularResult:
+    relation = result.relation_result.relation
+    relation_indices = _relation_join_terminal_indices_to_host(relation)
+    relation_distances = _relation_join_terminal_distances_to_host(
+        result.relation_result.distances,
+    )
+    if (
+        result.predicate == "intersects"
+        and result.relation_result.distances is None
+        and not result.on_attribute
+    ):
+        from vibespatial.api.tools._pair_cache import cache_intersection_pairs
+
+        cache_intersection_pairs(
+            result.left_df,
+            result.right_df,
+            relation_indices[0],
+            relation_indices[1],
+        )
+
+    (
+        attributes,
+        geometry,
+        geometry_name,
+        _crs,
+        column_order,
+        secondary_geometry,
+        distances,
+    ) = _native_relation_join_parts(
+        result.left_df,
+        result.right_df,
+        relation_indices,
+        relation_distances,
+        how=result.how,
+        lsuffix=result.lsuffix,
+        rsuffix=result.rsuffix,
+        on_attribute=result.on_attribute,
+        attribute_storage="pandas",
+    )
+    if result.distance_col is not None:
+        attributes = attributes.with_column(result.distance_col, distances)
+        column_order = tuple([*column_order, result.distance_col])
+    return NativeTabularResult(
+        attributes=attributes,
+        geometry=geometry,
+        geometry_name=geometry_name,
+        column_order=column_order,
+        attrs=_copy_public_frame_attrs(result.left_df) or None,
+        secondary_geometry=secondary_geometry,
+        geometry_metadata=_cached_geometry_metadata(geometry),
+    )
+
+
 @dataclass(frozen=True)
 class RelationJoinExportResult:
     """Deferred GeoPandas export wrapper for relation joins."""
@@ -1604,33 +1920,28 @@ class RelationJoinExportResult:
             on_attribute=self.on_attribute,
         )
 
-    def _prefer_pandas_public_export(self) -> bool:
-        """Return whether public GeoDataFrame export should use pandas assembly.
-
-        The device-native joined-frame route avoids host relation export, but
-        public GeoDataFrame materialization still has to export the index and
-        attributes.  For small and medium relation outputs, measured shootout
-        costs are lower if we cross the public relation boundary directly and
-        skip the device-table-to-Arrow public export.
-        """
-        try:
-            pair_count = len(self.relation_result.relation)
-        except Exception:
-            return False
-        return pair_count <= _PUBLIC_SJOIN_PANDAS_EXPORT_MAX_ROWS
-
     def to_geodataframe(self) -> GeoDataFrame:
-        if not self._prefer_pandas_public_export():
-            state = _relation_join_export_result_to_native_frame_state_device(
-                self,
-                strict_index_materialization=False,
-            )
-            if state is not None:
-                return state.to_native_tabular_result().to_geodataframe()
-        return _relation_join_export_result_to_native_tabular_result(
+        state = _relation_join_export_result_to_native_frame_state_device(
             self,
-            attribute_storage="pandas",
-        ).to_geodataframe()
+            strict_index_materialization=False,
+        )
+        if state is not None:
+            from vibespatial.api.geodataframe import _public_frame_from_native_state
+
+            frame = _public_frame_from_native_state(
+                self.left_df,
+                state,
+                geometry_column=state.geometry_name,
+            )
+            if frame is not None:
+                if self.left_df.attrs:
+                    frame.attrs.update(self.left_df.attrs)
+                return frame
+        return (
+            _relation_join_export_result_to_terminal_public_native_tabular_result(
+                self,
+            ).to_geodataframe()
+        )
 
     def to_native_tabular_result(
         self,
@@ -1655,10 +1966,9 @@ class RelationJoinExportResult:
         attribute_storage: str = "arrow",
     ):
         """Return the private joined-frame carrier without GeoDataFrame export."""
-        if attribute_storage == "device":
-            state = _relation_join_export_result_to_native_frame_state_device(self)
-            if state is not None:
-                return state
+        state = _relation_join_export_result_to_native_frame_state_device(self)
+        if state is not None:
+            return state
         return self.to_native_tabular_result(
             attribute_storage=attribute_storage,
         ).to_native_frame_state()
@@ -1828,7 +2138,8 @@ class LeftConstructiveResult:
     """Constructive result that preserves a subset of left-hand rows."""
 
     geometry: GeometryNativeResult
-    row_positions: np.ndarray
+    row_positions: Any
+    rowset: Any | None = None
 
     def to_geodataframe(self, df: GeoDataFrame) -> GeoDataFrame:
         attrs = df.iloc[np.asarray(self.row_positions, dtype=np.intp)].copy()
@@ -1997,7 +2308,7 @@ def _default_constructive_source_rows(row_count: int, *, prefer_device: bool):
 
 def _owned_row_family_tags(owned):
     if getattr(owned, "residency", None) is Residency.DEVICE:
-        state = owned._ensure_device_state()
+        state = owned._ensure_device_state(preserve_indexed_view=True)
         return state.tags
     return owned.tags
 
@@ -2077,20 +2388,23 @@ def _polygonal_parts_constructive_to_native_tabular_result(
     source_rows=None,
     source_tokens: tuple[str, ...] = (),
     attrs: dict[str, Any] | None = None,
-) -> NativeTabularResult:
+) -> NativeTabularResult | NativeTabularSelection:
     """Lower non-row-aligned polygonal part output to the native boundary."""
     from vibespatial.constructive.binary_constructive import (
-        _explode_polygonal_rows_to_polygons_gpu,
+        _explode_polygonal_rows_to_polygon_capacity_gpu,
     )
 
-    exploded = _explode_polygonal_rows_to_polygons_gpu(owned)
+    exploded = _explode_polygonal_rows_to_polygon_capacity_gpu(owned)
     prefer_device = getattr(owned, "residency", None) is Residency.DEVICE
     if exploded is None:
         row_count = 0
         geometry = _empty_geometry_native_result(geometry_name=geometry_name, crs=crs)
         part_source_rows = None
+        selection = None
     else:
-        parts, part_source_rows = exploded
+        parts = exploded.geometry
+        part_source_rows = exploded.source_rows
+        selection = exploded.selection
         row_count = int(parts.row_count)
         geometry = GeometryNativeResult.from_owned(parts, crs=crs)
 
@@ -2101,7 +2415,7 @@ def _polygonal_parts_constructive_to_native_tabular_result(
         output_row_count=row_count,
         prefer_device=prefer_device,
     )
-    return NativeTabularResult(
+    capacity_result = NativeTabularResult(
         attributes=NativeAttributeTable(dataframe=pd.DataFrame(index=pd.RangeIndex(row_count))),
         geometry=geometry,
         geometry_name=geometry_name,
@@ -2115,6 +2429,12 @@ def _polygonal_parts_constructive_to_native_tabular_result(
             source_tokens=source_tokens,
         ),
         geometry_metadata=_cached_geometry_metadata(geometry),
+    )
+    if selection is None:
+        return capacity_result
+    return NativeTabularSelection(
+        capacity_result=capacity_result,
+        selection=selection,
     )
 
 
@@ -2127,20 +2447,23 @@ def _point_parts_constructive_to_native_tabular_result(
     source_rows=None,
     source_tokens: tuple[str, ...] = (),
     attrs: dict[str, Any] | None = None,
-) -> NativeTabularResult:
+) -> NativeTabularResult | NativeTabularSelection:
     """Lower non-row-aligned point part output to the native boundary."""
     from vibespatial.constructive.binary_constructive import (
-        _explode_point_rows_to_points_gpu,
+        _explode_point_rows_to_point_capacity_gpu,
     )
 
-    exploded = _explode_point_rows_to_points_gpu(owned)
+    exploded = _explode_point_rows_to_point_capacity_gpu(owned)
     prefer_device = getattr(owned, "residency", None) is Residency.DEVICE
     if exploded is None:
         row_count = 0
         geometry = _empty_geometry_native_result(geometry_name=geometry_name, crs=crs)
         part_source_rows = None
+        selection = None
     else:
-        parts, part_source_rows = exploded
+        parts = exploded.geometry
+        part_source_rows = exploded.source_rows
+        selection = exploded.selection
         row_count = int(parts.row_count)
         geometry = GeometryNativeResult.from_owned(parts, crs=crs)
 
@@ -2151,7 +2474,7 @@ def _point_parts_constructive_to_native_tabular_result(
         output_row_count=row_count,
         prefer_device=prefer_device,
     )
-    return NativeTabularResult(
+    capacity_result = NativeTabularResult(
         attributes=NativeAttributeTable(dataframe=pd.DataFrame(index=pd.RangeIndex(row_count))),
         geometry=geometry,
         geometry_name=geometry_name,
@@ -2165,6 +2488,12 @@ def _point_parts_constructive_to_native_tabular_result(
             source_tokens=source_tokens,
         ),
         geometry_metadata=_cached_geometry_metadata(geometry),
+    )
+    if selection is None:
+        return capacity_result
+    return NativeTabularSelection(
+        capacity_result=capacity_result,
+        selection=selection,
     )
 
 
@@ -2177,20 +2506,23 @@ def _lineal_parts_constructive_to_native_tabular_result(
     source_rows=None,
     source_tokens: tuple[str, ...] = (),
     attrs: dict[str, Any] | None = None,
-) -> NativeTabularResult:
+) -> NativeTabularResult | NativeTabularSelection:
     """Lower non-row-aligned lineal part output to the native boundary."""
     from vibespatial.constructive.binary_constructive import (
-        _explode_lineal_rows_to_lines_gpu,
+        _explode_lineal_rows_to_line_capacity_gpu,
     )
 
-    exploded = _explode_lineal_rows_to_lines_gpu(owned)
+    exploded = _explode_lineal_rows_to_line_capacity_gpu(owned)
     prefer_device = getattr(owned, "residency", None) is Residency.DEVICE
     if exploded is None:
         row_count = 0
         geometry = _empty_geometry_native_result(geometry_name=geometry_name, crs=crs)
         part_source_rows = None
+        selection = None
     else:
-        parts, part_source_rows = exploded
+        parts = exploded.geometry
+        part_source_rows = exploded.source_rows
+        selection = exploded.selection
         row_count = int(parts.row_count)
         geometry = GeometryNativeResult.from_owned(parts, crs=crs)
 
@@ -2201,7 +2533,7 @@ def _lineal_parts_constructive_to_native_tabular_result(
         output_row_count=row_count,
         prefer_device=prefer_device,
     )
-    return NativeTabularResult(
+    capacity_result = NativeTabularResult(
         attributes=NativeAttributeTable(dataframe=pd.DataFrame(index=pd.RangeIndex(row_count))),
         geometry=geometry,
         geometry_name=geometry_name,
@@ -2215,6 +2547,12 @@ def _lineal_parts_constructive_to_native_tabular_result(
             source_tokens=source_tokens,
         ),
         geometry_metadata=_cached_geometry_metadata(geometry),
+    )
+    if selection is None:
+        return capacity_result
+    return NativeTabularSelection(
+        capacity_result=capacity_result,
+        selection=selection,
     )
 
 
@@ -2237,6 +2575,7 @@ def _grouped_constructive_to_native_tabular_result(
     geometry_name: str,
     as_index: bool,
     provenance: NativeGeometryProvenance | None = None,
+    cache_geometry_metadata: bool = True,
 ) -> NativeTabularResult:
     attributes = NativeAttributeTable.from_value(attributes)
     leading_columns: list[str] = []
@@ -2251,17 +2590,32 @@ def _grouped_constructive_to_native_tabular_result(
         geometry_name=geometry_name,
         column_order=tuple([*leading_columns, geometry_name, *trailing_columns]),
         provenance=provenance,
-        geometry_metadata=_cached_geometry_metadata(geometry),
+        geometry_metadata=(
+            _cached_geometry_metadata(geometry)
+            if cache_geometry_metadata
+            else None
+        ),
     )
 
 
 def _rename_native_tabular_result(
-    result: NativeTabularResult,
+    result: NativeTabularResult | NativeTabularSelection,
     mapping: dict[str, str] | None,
     *,
     geometry_name: str | None = None,
     attrs: dict[str, Any] | None = None,
-) -> NativeTabularResult:
+) -> NativeTabularResult | NativeTabularSelection:
+    if isinstance(result, NativeTabularSelection):
+        return replace(
+            result,
+            capacity_result=_rename_native_tabular_result(
+                result.capacity_result,
+                mapping,
+                geometry_name=geometry_name,
+                attrs=attrs,
+            ),
+        )
+
     renamed_attributes = (
         result.attributes.rename_columns(mapping)
         if mapping
@@ -2392,6 +2746,118 @@ def _pairwise_constructive_native_state_attribute_parts(
     return attributes, (), column_order
 
 
+def _terminal_pairwise_attribute_rows_to_host(row_positions, *, side: str) -> np.ndarray:
+    if hasattr(row_positions, "__cuda_array_interface__"):
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        return get_cuda_runtime().copy_device_to_host(
+            row_positions,
+            reason=f"overlay terminal pairwise {side} attribute rows export",
+        ).astype(np.intp, copy=False)
+    return np.asarray(row_positions, dtype=np.intp)
+
+
+def _terminal_take_attribute_frame_rows(
+    frame: pd.DataFrame,
+    row_positions,
+    *,
+    index: pd.Index,
+) -> pd.DataFrame:
+    """Project terminal public attributes without pandas private block reindexing."""
+    return _take_pandas_frame_rows(frame, row_positions, index=index)
+
+
+def _pairwise_constructive_dataframe_attribute_parts(
+    *,
+    relation: RelationIndexResult,
+    left_df: GeoDataFrame,
+    right_df: GeoDataFrame,
+    geometry_name: str,
+) -> tuple[NativeAttributeTable, tuple[NativeGeometryColumn, ...], tuple[Any, ...]] | None:
+    """Defer pandas-backed pairwise attributes behind the terminal export boundary."""
+    if _has_secondary_geometry_columns(left_df, left_df._geometry_column_name):
+        return None
+    if _has_secondary_geometry_columns(right_df, right_df._geometry_column_name):
+        return None
+
+    row_count = len(relation)
+    out_index = pd.RangeIndex(row_count)
+    left_attrs = left_df.drop(left_df._geometry_column_name, axis=1).copy(deep=False)
+    right_attrs = right_df.drop(right_df._geometry_column_name, axis=1).copy(deep=False)
+    left_columns, right_columns = _process_column_names_with_suffix(
+        left_attrs.columns,
+        right_attrs.columns,
+        ("1", "2"),
+        left_attrs,
+        right_attrs,
+    )
+    left_attrs.columns = left_columns
+    right_attrs.columns = right_columns
+    output_columns = tuple([*left_columns, *right_columns])
+    if not output_columns:
+        return NativeAttributeTable(dataframe=pd.DataFrame(index=out_index)), (), (
+            geometry_name,
+        )
+
+    left_positions = relation.left_indices
+    right_positions = relation.right_indices
+    broadcast_right = relation.broadcast_right_value
+    left_table = NativeAttributeTable(dataframe=left_attrs).promote_numeric_to_device()
+    right_table = NativeAttributeTable(dataframe=right_attrs).promote_numeric_to_device()
+    if left_table is not None and right_table is not None:
+        left_projected = left_table.take(left_positions, preserve_index=False)
+        right_projected = right_table.take(right_positions, preserve_index=False)
+        combined = NativeAttributeTable.combine_columns(
+            [left_projected, right_projected],
+            index_override=out_index,
+        )
+        if combined is not None:
+            return combined, (), tuple([*combined.columns, geometry_name])
+
+    def _load() -> pd.DataFrame:
+        h_left_idx = _terminal_pairwise_attribute_rows_to_host(
+            left_positions,
+            side="left",
+        )
+        if broadcast_right is not None:
+            h_right_idx = np.full(
+                h_left_idx.shape,
+                int(broadcast_right),
+                dtype=np.intp,
+            )
+        else:
+            h_right_idx = _terminal_pairwise_attribute_rows_to_host(
+                right_positions,
+                side="right",
+            )
+        left_projected = _terminal_take_attribute_frame_rows(
+            left_attrs,
+            h_left_idx,
+            index=out_index,
+        )
+        right_projected = _terminal_take_attribute_frame_rows(
+            right_attrs,
+            h_right_idx,
+            index=out_index,
+        )
+        concat_kwargs = {} if PANDAS_GE_30 else {"copy": False}
+        combined = pd.concat([left_projected, right_projected], axis=1, **concat_kwargs)
+        if not combined.index.equals(out_index):
+            combined = combined.copy(deep=False)
+            combined.index = out_index
+        return combined
+
+    return (
+        NativeAttributeTable.from_loader(
+            _load,
+            index_override=out_index,
+            columns=output_columns,
+        ),
+        (),
+        tuple([*output_columns, geometry_name]),
+    )
+
+
 def _pairwise_constructive_to_native_tabular_result(
     *,
     geometry: GeometryNativeResult,
@@ -2411,6 +2877,13 @@ def _pairwise_constructive_to_native_tabular_result(
         right_df=right_df,
         geometry_name=geometry_name,
     )
+    if native_parts is None:
+        native_parts = _pairwise_constructive_dataframe_attribute_parts(
+            relation=relation,
+            left_df=left_df,
+            right_df=right_df,
+            geometry_name=geometry_name,
+        )
     if native_parts is None:
         h_left_idx, h_right_idx = relation.to_host(
             surface="vibespatial.api._native_results._pairwise_constructive_to_native_tabular_result",
@@ -2432,8 +2905,16 @@ def _pairwise_constructive_to_native_tabular_result(
         left_attrs.columns = left_columns
         right_attrs.columns = right_columns
 
-        left_projected = left_attrs._reindex_with_indexers({0: (out_index, h_left_idx)})
-        right_projected = right_attrs._reindex_with_indexers({0: (out_index, h_right_idx)})
+        left_projected = _terminal_take_attribute_frame_rows(
+            left_attrs,
+            h_left_idx,
+            index=out_index,
+        )
+        right_projected = _terminal_take_attribute_frame_rows(
+            right_attrs,
+            h_right_idx,
+            index=out_index,
+        )
         attributes, secondary_geometry, column_order = _projected_frames_to_native_tabular_parts(
             [left_projected, right_projected],
             index_override=out_index,
@@ -2536,11 +3017,26 @@ def _relation_constructive_attribute_parts(
             left_positions = cp.asarray(left_positions, dtype=cp.int64)
             right_positions = cp.asarray(right_positions, dtype=cp.int64)
 
+    if hasattr(left_positions, "__cuda_array_interface__"):
+        if left_attrs.device_table is None and left_attrs.arrow_table is None:
+            promoted = left_attrs.promote_numeric_to_device()
+            if promoted is not None:
+                left_attrs = promoted
+        if right_attrs.device_table is None and right_attrs.arrow_table is None:
+            promoted = right_attrs.promote_numeric_to_device()
+            if promoted is not None:
+                right_attrs = promoted
+
     def _can_gather(table: NativeAttributeTable, row_positions) -> bool:
         if len(table.columns) == 0:
             return True
         if hasattr(row_positions, "__cuda_array_interface__"):
-            return table.device_table is not None or table.arrow_table is not None
+            return (
+                table.device_table is not None
+                or table.arrow_table is not None
+                or table.dataframe is not None
+                or table.loader is not None
+            )
         return True
 
     if not _can_gather(left_attrs, left_positions) or not _can_gather(
@@ -2587,6 +3083,56 @@ def _relation_constructive_attribute_parts(
     return combined, tuple([*combined.columns, geometry_name])
 
 
+def _relation_constructive_capacity_result(
+    *,
+    op: str,
+    relation,
+    constructed,
+    left_state,
+    right_state,
+    geometry_name: str,
+    frame_attrs: dict[str, Any] | None,
+) -> NativeTabularResult:
+    """Assemble a pair-capacity constructive result without pair compaction."""
+    pair_capacity = len(relation)
+    if int(constructed.row_count) != pair_capacity:
+        raise ValueError(
+            "relation constructive output row count must match relation pair capacity"
+        )
+    geometry = (
+        constructed.with_crs(left_state.geometry.crs)
+        if isinstance(constructed, GeometryNativeResult)
+        else GeometryNativeResult.from_owned(
+            constructed,
+            crs=left_state.geometry.crs,
+        )
+    )
+    attributes, column_order = _relation_constructive_attribute_parts(
+        relation=relation,
+        left_state=left_state,
+        right_state=right_state,
+        geometry_name=geometry_name,
+    )
+    return NativeTabularResult(
+        attributes=attributes,
+        geometry=geometry,
+        geometry_name=geometry_name,
+        column_order=column_order,
+        attrs=frame_attrs,
+        provenance=NativeGeometryProvenance(
+            operation=f"relation_{op}",
+            row_count=pair_capacity,
+            left_rows=relation.left_indices,
+            right_rows=relation.right_indices,
+            source_tokens=(
+                left_state.lineage_token,
+                right_state.lineage_token,
+            ),
+        ),
+        geometry_metadata=_cached_geometry_metadata(geometry),
+    )
+
+
 def _relation_constructive_to_native_tabular_result(
     *,
     op: str,
@@ -2607,52 +3153,95 @@ def _relation_constructive_to_native_tabular_result(
     carriers can be taken without hidden device pair materialization.
     """
     _validate_relation_constructive_state(relation, left_state, right_state)
-    left_owned = getattr(left_state.geometry, "owned", None)
-    right_owned = getattr(right_state.geometry, "owned", None)
+    left_owned = left_state.geometry.cached_owned()
+    right_owned = right_state.geometry.cached_owned()
     if left_owned is None or right_owned is None:
         return None
 
-    left_pairs = left_owned.take(relation.left_indices)
-    right_pairs = right_owned.take(relation.right_indices)
-    from vibespatial.constructive.binary_constructive import binary_constructive_owned
+    def _take_relation_owned(owned, indices):
+        if hasattr(indices, "__cuda_array_interface__"):
+            return owned.device_take(indices)
+        return owned.take(np.asarray(indices, dtype=np.int64))
 
-    constructed = binary_constructive_owned(
+    left_pairs = _take_relation_owned(left_owned, relation.left_indices)
+    right_pairs = _take_relation_owned(right_owned, relation.right_indices)
+    from vibespatial.constructive.binary_constructive import binary_constructive_native
+
+    constructed = binary_constructive_native(
         op,
         left_pairs,
         right_pairs,
         dispatch_mode=dispatch_mode,
-        _allow_rectangle_intersection_fast_path=False,
     )
-    pair_count = len(relation)
-    if int(constructed.row_count) != int(pair_count):
-        raise ValueError(
-            "relation constructive output row count must match relation pair count"
-        )
-    crs = left_state.geometry.crs
-    geometry = GeometryNativeResult.from_owned(constructed, crs=crs)
-    attributes, column_order = _relation_constructive_attribute_parts(
+    return _relation_constructive_capacity_result(
+        op=op,
         relation=relation,
+        constructed=constructed,
         left_state=left_state,
         right_state=right_state,
         geometry_name=geometry_name,
+        frame_attrs=frame_attrs,
     )
-    return NativeTabularResult(
-        attributes=attributes,
-        geometry=geometry,
-        geometry_name=geometry_name,
-        column_order=column_order,
-        attrs=frame_attrs,
-        provenance=NativeGeometryProvenance(
-            operation=f"relation_{op}",
-            row_count=pair_count,
-            left_rows=relation.left_indices,
-            right_rows=relation.right_indices,
-            source_tokens=(
-                left_state.lineage_token,
-                right_state.lineage_token,
-            ),
+
+
+def _relation_selection_constructive_to_native_tabular_result(
+    *,
+    op: str,
+    relation_selection,
+    left_state,
+    right_state,
+    geometry_name: str = "geometry",
+    frame_attrs: dict[str, Any] | None = None,
+) -> NativeTabularSelection | None:
+    """Lower a dynamic device relation through pair-capacity construction."""
+    relation = relation_selection.relation
+    _validate_relation_constructive_state(relation, left_state, right_state)
+    left_owned = left_state.geometry.cached_owned()
+    right_owned = right_state.geometry.cached_owned()
+    if left_owned is None or right_owned is None:
+        return None
+
+    physicalized = relation_selection.physicalize_geometries(
+        left_owned,
+        right_owned,
+    )
+    constructed = physicalized.constructive_native(
+        op,
+    )
+    selection = relation_selection.selection
+    capacity_relation = replace(
+        relation,
+        left_indices=selection.gather_capacity(
+            relation.left_indices,
+            fill_value=0,
         ),
-        geometry_metadata=_cached_geometry_metadata(geometry),
+        right_indices=selection.gather_capacity(
+            relation.right_indices,
+            fill_value=0,
+        ),
+        distances=(
+            None
+            if relation.distances is None
+            else selection.gather_capacity(
+                relation.distances,
+                fill_value=0,
+            )
+        ),
+        sorted_by_left=False,
+        left_group_offsets=None,
+    )
+    capacity_result = _relation_constructive_capacity_result(
+        op=op,
+        relation=capacity_relation,
+        constructed=constructed.geometry,
+        left_state=left_state,
+        right_state=right_state,
+        geometry_name=geometry_name,
+        frame_attrs=frame_attrs,
+    )
+    return NativeTabularSelection(
+        capacity_result=capacity_result,
+        selection=selection.as_capacity_prefix(),
     )
 
 
@@ -2692,8 +3281,10 @@ def _left_constructive_to_native_tabular_result(
     row_positions = np.asarray(row_positions, dtype=np.intp)
     row_count = int(row_positions.size)
     source_attrs = df.drop(df._geometry_column_name, axis=1).copy(deep=False)
-    projected = source_attrs._reindex_with_indexers(
-        {0: (pd.RangeIndex(len(row_positions)), row_positions)}
+    projected = _terminal_take_attribute_frame_rows(
+        source_attrs,
+        row_positions,
+        index=pd.RangeIndex(row_count),
     )
     attributes, secondary_geometry, _column_order = _projected_frames_to_native_tabular_parts(
         [projected],
@@ -2738,6 +3329,50 @@ def _left_constructive_to_native_tabular_result(
             source_rows=row_positions,
         ),
         geometry_metadata=_cached_geometry_metadata(geometry),
+    )
+
+
+def _left_constructive_capacity_to_native_tabular_result(
+    *,
+    geometry: GeometryNativeResult,
+    df: GeoDataFrame,
+    geometry_name: str,
+) -> NativeTabularResult:
+    """Replace geometry across the full left-row capacity without row export."""
+    row_count = int(geometry.row_count)
+    if row_count != len(df):
+        raise ValueError(
+            "left constructive capacity geometry must match the source row count"
+        )
+
+    from vibespatial.api._native_state import get_native_state
+
+    state = get_native_state(df)
+    if (
+        state is not None
+        and state.row_count == row_count
+        and state.geometry_name == df._geometry_column_name
+        and geometry_name == state.geometry_name
+    ):
+        capacity_result = state.to_native_tabular_result()
+        return replace(
+            capacity_result,
+            geometry=geometry,
+            attrs=df.attrs.copy() or None,
+            provenance=NativeGeometryProvenance(
+                operation="left_constructive_capacity",
+                row_count=row_count,
+                source_rows=np.arange(row_count, dtype=np.int64),
+                source_tokens=(state.lineage_token,),
+            ),
+            geometry_metadata=_cached_geometry_metadata(geometry),
+        )
+
+    return _left_constructive_to_native_tabular_result(
+        geometry=geometry,
+        row_positions=np.arange(row_count, dtype=np.intp),
+        df=df,
+        geometry_name=geometry_name,
     )
 
 
@@ -2819,8 +3454,29 @@ def _assemble_indexed_owned_parts(index_oga_pairs, row_count: int):
         if len(indices) == row_count and np.array_equal(indices, np.arange(row_count)):
             return oga
 
-    all_indices = np.concatenate([idx for idx, _ in index_oga_pairs]).astype(np.intp, copy=False)
     concat_result = OwnedGeometryArray.concat([oga for _, oga in index_oga_pairs])
+    if any(hasattr(idx, "__cuda_array_interface__") for idx, _ in index_oga_pairs):
+        import cupy as cp
+
+        from vibespatial.runtime.residency import Residency, TransferTrigger
+
+        if concat_result.residency is not Residency.DEVICE:
+            concat_result = concat_result.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason="native indexed owned assembly promoted mixed chunks to device",
+            )
+        d_all_indices = cp.concatenate(
+            [cp.asarray(idx, dtype=cp.int64) for idx, _ in index_oga_pairs],
+        )
+        d_inverse_perm = cp.empty(row_count, dtype=cp.int64)
+        d_inverse_perm[d_all_indices] = cp.arange(
+            int(d_all_indices.size),
+            dtype=cp.int64,
+        )
+        return concat_result.device_take(d_inverse_perm)
+
+    all_indices = np.concatenate([idx for idx, _ in index_oga_pairs]).astype(np.intp, copy=False)
     inverse_perm = np.empty(row_count, dtype=np.intp)
     inverse_perm[all_indices] = np.arange(len(all_indices), dtype=np.intp)
     return concat_result.take(inverse_perm)
@@ -2901,13 +3557,365 @@ def _clip_project_source_attributes(
     )
 
 
+def _clip_attributes_support_device_row_take(attributes: NativeAttributeTable) -> bool:
+    if attributes.parts is not None:
+        return all(
+            _clip_attributes_support_device_row_take(part)
+            for part in attributes.parts
+        )
+    if attributes.dataframe is not None or attributes.loader is not None:
+        return True
+    if attributes.device_table is None and attributes.arrow_table is None:
+        return len(attributes.columns) == 0
+    try:
+        import cupy  # noqa: F401
+        import pylibcudf  # noqa: F401
+    except ModuleNotFoundError:
+        return False
+    return True
+
+
+def _clip_terminal_source_rows_to_host(row_positions, *, row_count: int) -> np.ndarray:
+    """Return source rows for the explicit public clip export boundary."""
+    if row_count == 0:
+        return np.empty(0, dtype=np.intp)
+    if hasattr(row_positions, "__cuda_array_interface__"):
+        return _host_array(
+            row_positions,
+            dtype=np.intp,
+            strict_disallowed=False,
+            surface="vibespatial.api.clip_terminal_source_attributes",
+            operation="clip_terminal_source_rows_to_host",
+            reason="clip terminal source attribute rows export",
+            detail=f"rows={row_count}",
+        )
+    positions = np.asarray(row_positions)
+    if positions.dtype == bool:
+        positions = np.flatnonzero(positions)
+    return np.asarray(positions, dtype=np.intp)
+
+
+def _clip_public_source_attribute_frame_if_host_public(
+    source,
+    *,
+    geometry_name: str,
+    expected_columns: tuple[Any, ...],
+) -> pd.DataFrame | None:
+    """Return public source attributes without invoking native projection hooks."""
+    if not hasattr(source, "_geometry_column_name"):
+        return None
+    if source._geometry_column_name != geometry_name:
+        return None
+    if any(column not in source.columns for column in expected_columns):
+        return None
+
+    try:
+        from vibespatial.api._native_public_arrays import (
+            NativeAttributeColumnArray,
+            NativeIndexLabelsArray,
+            NativeNumericExpressionArray,
+        )
+    except Exception:
+        native_index_label_array_types: tuple[type, ...] = ()
+        native_public_arrays: tuple[type, ...] = ()
+    else:
+        native_index_label_array_types = (NativeIndexLabelsArray,)
+        native_public_arrays = (
+            NativeAttributeColumnArray,
+            NativeNumericExpressionArray,
+        )
+
+    index_values = getattr(getattr(source, "index", None), "_values", None)
+    if isinstance(index_values, native_index_label_array_types):
+        return None
+
+    columns: dict[Any, Any] = {}
+    for column in expected_columns:
+        try:
+            series = pd.DataFrame.__getitem__(source, column)
+        except Exception:
+            return None
+        if isinstance(getattr(series, "array", None), native_public_arrays):
+            return None
+        columns[column] = series
+    return pd.DataFrame(columns, index=source.index, copy=False)
+
+
+@dataclass(frozen=True)
+class _ClipTerminalSourceAttributeMaterializer:
+    """Row-selectable terminal assembler over public source attributes."""
+
+    source: Any
+    row_positions: Any
+
+    def take(self, row_positions):
+        source_positions = self.row_positions
+        if hasattr(source_positions, "__cuda_array_interface__") or hasattr(
+            row_positions,
+            "__cuda_array_interface__",
+        ):
+            import cupy as cp
+
+            selected = cp.asarray(source_positions, dtype=cp.int64)[
+                cp.asarray(row_positions, dtype=cp.int64)
+            ]
+        else:
+            selected = np.asarray(source_positions, dtype=np.int64)[
+                np.asarray(row_positions, dtype=np.int64)
+            ]
+        return replace(self, row_positions=selected)
+
+    def __call__(self, result, _attributes):
+        def _default_terminal_export():
+            return replace(
+                result,
+                terminal_geodataframe_materializer=None,
+                terminal_geodataframe_materializer_owns_export=False,
+            ).to_geodataframe()
+
+        source = self.source
+        if not hasattr(source, "_geometry_column_name"):
+            return _default_terminal_export()
+        if source._geometry_column_name != result.geometry_name:
+            return _default_terminal_export()
+        try:
+            row_count = len(result.attributes)
+            source_rows = _clip_terminal_source_rows_to_host(
+                self.row_positions,
+                row_count=row_count,
+            )
+            if int(source_rows.size) != int(row_count):
+                return _default_terminal_export()
+
+            expected_columns = tuple(
+                NativeAttributeTable.from_value(result.attributes).columns,
+            )
+            source_attributes = _clip_public_source_attribute_frame_if_host_public(
+                source,
+                geometry_name=result.geometry_name,
+                expected_columns=expected_columns,
+            )
+            if source_attributes is None:
+                return _default_terminal_export()
+            if tuple(source_attributes.columns) != expected_columns:
+                if any(column not in source_attributes.columns for column in expected_columns):
+                    return _default_terminal_export()
+                source_attributes = source_attributes.loc[:, list(expected_columns)]
+
+            public_index = source.index.take(source_rows)
+            projected = _terminal_take_attribute_frame_rows(
+                source_attributes,
+                source_rows,
+                index=public_index,
+            )
+
+            public_attributes = NativeAttributeTable(dataframe=projected)
+            frame = _materialize_attribute_geometry_frame(
+                public_attributes,
+                result.geometry_columns,
+                geometry_name=result.geometry_name,
+                column_order=result.resolved_column_order,
+            )
+            from vibespatial.api._native_state import (
+                attach_native_state_from_native_tabular_result,
+            )
+
+            native_attributes = NativeAttributeTable.from_value(
+                result.attributes,
+            ).with_index(public_index)
+            attach_native_state_from_native_tabular_result(
+                frame,
+                replace(
+                    result,
+                    attributes=native_attributes,
+                    column_order=tuple(frame.columns),
+                ),
+            )
+            return frame
+        except Exception:
+            return _default_terminal_export()
+
+
+def _clip_terminal_source_attribute_materializer(source, row_positions):
+    """Build a row-selectable public clip terminal attribute assembler."""
+    return _ClipTerminalSourceAttributeMaterializer(source, row_positions)
+
+
+def _clip_should_use_terminal_source_attribute_materializer(
+    source,
+    *,
+    geometry_name: str,
+    expected_columns: tuple[Any, ...],
+) -> bool:
+    """Return True when the source frame is already cheap public host data."""
+    try:
+        from vibespatial.api._native_state import get_native_state
+
+        source_state = get_native_state(source)
+    except Exception:
+        source_state = None
+
+    if source_state is not None:
+        attributes = getattr(source_state, "attributes", None)
+        if any(
+            getattr(attributes, attr, None) is not None
+            for attr in ("device_table", "arrow_table", "parts")
+        ):
+            return False
+        index_plan = getattr(source_state, "index_plan", None)
+        if getattr(index_plan, "kind", None) == "device-labels" and isinstance(
+            getattr(getattr(source, "index", None), "_values", None),
+            pd.api.extensions.ExtensionArray,
+        ):
+            return False
+
+    source_attrs = _clip_public_source_attribute_frame_if_host_public(
+        source,
+        geometry_name=geometry_name,
+        expected_columns=expected_columns,
+    )
+    if source_attrs is None:
+        return False
+    return tuple(source_attrs.columns) == tuple(expected_columns)
+
+
+def _clip_native_tabular_result_with_terminal_source_attributes(
+    result: NativeTabularResult,
+    source,
+    row_positions,
+) -> NativeTabularResult:
+    """Attach the clip source-attribute terminal materializer to a result."""
+    return replace(
+        result,
+        terminal_geodataframe_materializer=(
+            _clip_terminal_source_attribute_materializer(
+                source,
+                row_positions,
+            )
+        ),
+        terminal_geodataframe_materializer_owns_export=True,
+    )
+
+
+def _clip_native_tabular_result_from_rowset(
+    source,
+    *,
+    geometry_name: str,
+    geometry: GeometryNativeResult,
+    rowset,
+    keep_geom_type: bool,
+    repaired_mask=None,
+) -> NativeTabularResult | None:
+    if rowset is None or not getattr(rowset, "is_device", False):
+        return None
+    source_is_frame = hasattr(source, "_geometry_column_name")
+    if source_is_frame and source._geometry_column_name != geometry_name:
+        return None
+
+    from vibespatial.api._native_state import get_native_state
+
+    source_state = get_native_state(source)
+    if source_state is None or source_state.geometry_name != geometry_name:
+        return None
+    if source_state.secondary_geometry or (
+        source_is_frame
+        and _has_secondary_geometry_columns(
+            source,
+            geometry_name,
+        )
+    ):
+        return None
+    if source_state.index_plan.kind not in {
+        "range",
+        "device-labels",
+        "host-labels",
+        "host-labels-take",
+    }:
+        return None
+    if (
+        rowset.source_row_count is not None
+        and int(rowset.source_row_count) != int(source_state.row_count)
+    ):
+        return None
+    if (
+        rowset.source_token is not None
+        and rowset.source_token != source_state.lineage_token
+    ):
+        return None
+    if int(geometry.row_count) != len(rowset):
+        return None
+
+    attributes = NativeAttributeTable.from_value(source_state.attributes)
+    expected_columns = (
+        tuple(column for column in source.columns if column != geometry_name)
+        if source_is_frame
+        else ()
+    )
+    if tuple(attributes.columns) != expected_columns:
+        projected = attributes.project_columns(expected_columns)
+        if projected is None:
+            return None
+        attributes = projected
+    if not _clip_attributes_support_device_row_take(attributes):
+        return None
+
+    if rowset.identity and len(rowset) == int(source_state.row_count):
+        taken_attributes = attributes
+        index_plan = source_state.index_plan
+    else:
+        taken_attributes = attributes.take(rowset.positions, preserve_index=False)
+        index_plan = source_state.index_plan.take(
+            rowset.positions,
+            preserve_index=True,
+            unique=rowset.unique,
+        )
+    source_frame_attrs = getattr(source, "attrs", None)
+    result_attrs = (
+        source_frame_attrs.copy()
+        if isinstance(source_frame_attrs, dict) and source_frame_attrs
+        else None
+    )
+    native_result = NativeTabularResult(
+        attributes=taken_attributes,
+        geometry=geometry,
+        geometry_name=geometry_name,
+        column_order=_clip_source_column_order(
+            source,
+            geometry_name=geometry_name,
+            attributes=taken_attributes,
+        ),
+        attrs=result_attrs,
+        provenance=NativeGeometryProvenance(
+            operation="clip",
+            row_count=len(rowset),
+            source_rows=rowset.positions,
+            repaired_mask=repaired_mask,
+            source_tokens=(source_state.lineage_token,),
+            keep_geom_type_applied=keep_geom_type,
+        ),
+        geometry_metadata=_cached_geometry_metadata(geometry),
+        index_plan=index_plan,
+    )
+    if source_is_frame and _clip_should_use_terminal_source_attribute_materializer(
+        source,
+        geometry_name=geometry_name,
+        expected_columns=tuple(taken_attributes.columns),
+    ):
+        return _clip_native_tabular_result_with_terminal_source_attributes(
+            native_result,
+            source,
+            rowset.positions,
+        )
+    return native_result
+
+
 def _clip_owned_geometry_native_result(result, *, crs):
     from vibespatial.api.geometry_array import GeometryArray
     from vibespatial.geometry.owned import FAMILY_TAGS, GeometryFamily, OwnedGeometryArray
     from vibespatial.runtime.residency import Residency
 
     if not result.parts or not all(part.geometry.owned is not None for part in result.parts):
-        return None, None, None
+        return None, None, None, None, None
 
     row_parts = [np.asarray(part.row_positions, dtype=np.intp) for part in result.parts]
     owned_parts = [part.geometry.owned for part in result.parts]
@@ -2916,6 +3924,86 @@ def _clip_owned_geometry_native_result(result, *, crs):
         for owned in owned_parts
     )
     row_positions = np.concatenate(row_parts) if row_parts else np.empty(0, dtype=np.intp)
+
+    def _combined_part_rowset():
+        part_rowsets = [getattr(part, "rowset", None) for part in result.parts]
+        if not part_rowsets or any(
+            owned.residency is not Residency.DEVICE for owned in owned_parts
+        ):
+            return None
+        try:
+            import cupy as cp
+        except ModuleNotFoundError:
+            return None
+        from vibespatial.api._native_rowset import NativeRowSet
+        from vibespatial.api._native_state import get_native_state
+
+        source_state = get_native_state(result.source)
+        source_token = (
+            None if source_state is None else source_state.lineage_token
+        )
+        source_row_count = (
+            len(result.source) if source_state is None else source_state.row_count
+        )
+        positions_parts = []
+        ordered = True
+        unique = len(part_rowsets) == 1
+        for part, rowset in zip(result.parts, part_rowsets, strict=True):
+            if rowset is None or not getattr(rowset, "is_device", False):
+                positions_parts.append(
+                    cp.asarray(part.row_positions, dtype=cp.int64)
+                )
+                continue
+            if (
+                rowset.source_token is not None
+                and source_token is not None
+                and rowset.source_token != source_token
+            ):
+                return None
+            if (
+                rowset.source_row_count is not None
+                and int(rowset.source_row_count) != int(source_row_count)
+            ):
+                return None
+            if source_token is None:
+                source_token = rowset.source_token
+            positions_parts.append(cp.asarray(rowset.positions, dtype=cp.int64))
+            ordered &= bool(rowset.ordered)
+            unique &= bool(rowset.unique)
+
+        if len(positions_parts) == 1:
+            positions = positions_parts[0]
+        else:
+            positions = cp.concatenate(positions_parts)
+        return NativeRowSet.from_positions(
+            positions,
+            source_token=source_token,
+            source_row_count=source_row_count,
+            ordered=ordered,
+            unique=unique,
+            identity=False,
+        )
+
+    def _take_combined_rowset(rowset, take_rows, *, ordered: bool):
+        if rowset is None or not getattr(rowset, "is_device", False):
+            return None
+        try:
+            import cupy as cp
+        except ModuleNotFoundError:
+            return None
+        from vibespatial.api._native_rowset import NativeRowSet
+
+        d_take_rows = cp.asarray(take_rows, dtype=cp.int64)
+        return NativeRowSet.from_positions(
+            cp.asarray(rowset.positions, dtype=cp.int64)[d_take_rows],
+            source_token=rowset.source_token,
+            source_row_count=rowset.source_row_count,
+            ordered=ordered,
+            unique=rowset.unique,
+            identity=False,
+        )
+
+    combined_rowset = _combined_part_rowset()
     combined_owned = (
         owned_parts[0]
         if len(owned_parts) == 1
@@ -2952,15 +4040,22 @@ def _clip_owned_geometry_native_result(result, *, crs):
                 d_state = owned.device_state
                 d_keep = d_state.validity.astype(cp.bool_, copy=True)
                 for family, d_buf in d_state.families.items():
-                    d_family_rows = cp.flatnonzero(
-                        d_keep & (d_state.tags == FAMILY_TAGS[family])
-                    ).astype(cp.int64, copy=False)
-                    if int(d_family_rows.size) == 0:
+                    d_family_mask = d_keep & (
+                        d_state.tags == FAMILY_TAGS[family]
+                    )
+                    if int(d_buf.empty_mask.size) == 0:
+                        d_keep &= ~d_family_mask
                         continue
-                    d_local_rows = d_state.family_row_offsets[d_family_rows]
-                    d_keep[d_family_rows] &= ~d_buf.empty_mask[
-                        d_local_rows.astype(cp.int64, copy=False)
-                    ].astype(cp.bool_, copy=False)
+                    d_local_rows = cp.where(
+                        d_family_mask,
+                        d_state.family_row_offsets,
+                        cp.int32(0),
+                    ).astype(cp.int64, copy=False)
+                    d_family_nonempty = ~d_buf.empty_mask[d_local_rows].astype(
+                        cp.bool_,
+                        copy=False,
+                    )
+                    d_keep &= ~d_family_mask | d_family_nonempty
                 return _host_array(
                     d_keep,
                     dtype=bool,
@@ -2977,6 +4072,326 @@ def _clip_owned_geometry_native_result(result, *, crs):
             dtype=bool,
         )
 
+    def _valid_nonempty_device_mask(owned):
+        if owned.residency is not Residency.DEVICE or owned.device_state is None:
+            return None
+        try:
+            import cupy as cp
+        except ModuleNotFoundError:  # pragma: no cover - guarded by residency
+            return None
+
+        d_state = owned.device_state
+        d_keep = d_state.validity.astype(cp.bool_, copy=True)
+        for family, d_buf in d_state.families.items():
+            d_family_mask = d_keep & (d_state.tags == FAMILY_TAGS[family])
+            if int(d_buf.empty_mask.size) == 0:
+                d_keep &= ~d_family_mask
+                continue
+            d_local_rows = cp.where(
+                d_family_mask,
+                d_state.family_row_offsets,
+                cp.int32(0),
+            ).astype(cp.int64, copy=False)
+            d_family_nonempty = ~d_buf.empty_mask[d_local_rows].astype(
+                cp.bool_,
+                copy=False,
+            )
+            d_keep &= ~d_family_mask | d_family_nonempty
+        return d_keep
+
+    def _source_keep_geom_type_category():
+        """Classify the source family for native keep-geometry-type cleanup."""
+        source = result.source
+        geometry = source.geometry if hasattr(source, "geometry") else source
+        values = getattr(geometry, "values", geometry)
+        source_owned = getattr(values, "_owned", None)
+        if source_owned is None:
+            return None
+
+        from vibespatial.geometry.owned import TAG_FAMILIES
+
+        polygon_tags = {
+            FAMILY_TAGS[GeometryFamily.POLYGON],
+            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+        }
+        line_tags = {
+            FAMILY_TAGS[GeometryFamily.LINESTRING],
+            FAMILY_TAGS[GeometryFamily.MULTILINESTRING],
+        }
+        point_tags = {
+            FAMILY_TAGS[GeometryFamily.POINT],
+            FAMILY_TAGS[GeometryFamily.MULTIPOINT],
+        }
+
+        if source_owned.residency is Residency.DEVICE and source_owned.device_state is not None:
+            state = source_owned._ensure_device_state(preserve_indexed_view=True)
+            trusted_family = state.trusted_homogeneous_family
+            if trusted_family in {
+                GeometryFamily.POLYGON,
+                GeometryFamily.MULTIPOLYGON,
+            }:
+                return "polygon"
+            if trusted_family in {
+                GeometryFamily.LINESTRING,
+                GeometryFamily.MULTILINESTRING,
+            }:
+                return "line"
+            if trusted_family in {
+                GeometryFamily.POINT,
+                GeometryFamily.MULTIPOINT,
+            }:
+                return "point"
+            if state.trusted_polygonal_only is True:
+                return "polygon"
+
+            family_domain = state.trusted_family_domain
+            if family_domain is not None:
+                domain_categories = {
+                    "polygon"
+                    if family in {
+                        GeometryFamily.POLYGON,
+                        GeometryFamily.MULTIPOLYGON,
+                    }
+                    else "line"
+                    if family in {
+                        GeometryFamily.LINESTRING,
+                        GeometryFamily.MULTILINESTRING,
+                    }
+                    else "point"
+                    for family in family_domain
+                }
+                if len(domain_categories) == 1:
+                    return next(iter(domain_categories))
+
+            host_validity = getattr(source_owned, "_validity", None)
+            host_tags = getattr(source_owned, "_tags", None)
+            if (
+                host_validity is not None
+                and host_tags is not None
+                and int(host_validity.size) == int(source_owned.row_count)
+                and int(host_tags.size) == int(source_owned.row_count)
+            ):
+                valid_tags = np.asarray(host_tags, dtype=np.int8)[
+                    np.asarray(host_validity, dtype=np.bool_)
+                ]
+                categories = np.asarray(
+                    [
+                        np.isin(valid_tags, list(polygon_tags)).any(),
+                        np.isin(valid_tags, list(line_tags)).any(),
+                        np.isin(valid_tags, list(point_tags)).any(),
+                    ],
+                    dtype=bool,
+                )
+            else:
+                categories = None
+
+            if categories is None:
+                try:
+                    import cupy as cp
+                except ModuleNotFoundError:  # pragma: no cover - guarded by residency
+                    return None
+
+                d_tags = cp.asarray(state.tags)
+                d_validity = cp.asarray(state.validity).astype(cp.bool_, copy=False)
+                category_probe = cp.stack(
+                    (
+                        cp.any(
+                            d_validity
+                            & cp.isin(d_tags, cp.asarray(list(polygon_tags), dtype=cp.int8)),
+                        ),
+                        cp.any(
+                            d_validity
+                            & cp.isin(d_tags, cp.asarray(list(line_tags), dtype=cp.int8)),
+                        ),
+                        cp.any(
+                            d_validity
+                            & cp.isin(d_tags, cp.asarray(list(point_tags), dtype=cp.int8)),
+                        ),
+                    ),
+                ).astype(cp.bool_, copy=False)
+                categories = _host_array(
+                    category_probe,
+                    dtype=bool,
+                    strict_disallowed=False,
+                    surface=(
+                        "vibespatial.api._native_results."
+                        "_clip_constructive_parts_to_native_tabular_result"
+                    ),
+                    operation="clip_keep_geom_type_source_family_probe",
+                    reason="clip keep-geometry-type source family scalar fence",
+                    detail="bytes=3",
+                ).astype(bool, copy=False)
+        else:
+            tags = np.asarray(source_owned.tags, dtype=np.int8)
+            validity = np.asarray(source_owned.validity, dtype=bool)
+            valid_tags = tags[validity]
+            if valid_tags.size == 0:
+                return None
+            categories = np.asarray(
+                [
+                    np.isin(valid_tags, list(polygon_tags)).any(),
+                    np.isin(valid_tags, list(line_tags)).any(),
+                    np.isin(valid_tags, list(point_tags)).any(),
+                ],
+                dtype=bool,
+            )
+            if np.any(
+                [
+                    TAG_FAMILIES.get(int(tag)) is None
+                    for tag in np.unique(valid_tags)
+                ],
+            ):
+                return None
+
+        if int(np.count_nonzero(categories)) > 1:
+            warnings.warn(
+                "keep_geom_type can not be called on a mixed type GeoDataFrame.",
+                stacklevel=3,
+            )
+            return "mixed"
+        if categories[0]:
+            return "polygon"
+        if categories[1]:
+            return "line"
+        if categories[2]:
+            return "point"
+        return None
+
+    def _device_keep_geom_type_cleanup_mask(owned, d_active, repaired_mask):
+        if not result.keep_geom_type:
+            return d_active, repaired_mask
+        if owned.residency is not Residency.DEVICE or owned.device_state is None:
+            return None
+        try:
+            import cupy as cp
+        except ModuleNotFoundError:  # pragma: no cover - guarded by residency
+            return None
+
+        category = _source_keep_geom_type_category()
+        if category is None:
+            return None
+        if category == "mixed":
+            return d_active, repaired_mask
+
+        state = owned._ensure_device_state()
+        d_tags = cp.asarray(state.tags)
+        d_validity = cp.asarray(state.validity).astype(cp.bool_, copy=False)
+        if category == "polygon":
+            d_category = d_validity & (
+                (d_tags == FAMILY_TAGS[GeometryFamily.POLYGON])
+                | (d_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
+            )
+        elif category == "line":
+            d_category = d_validity & (
+                (d_tags == FAMILY_TAGS[GeometryFamily.LINESTRING])
+                | (d_tags == FAMILY_TAGS[GeometryFamily.MULTILINESTRING])
+            )
+        else:
+            d_category = d_validity & (
+                (d_tags == FAMILY_TAGS[GeometryFamily.POINT])
+                | (d_tags == FAMILY_TAGS[GeometryFamily.MULTIPOINT])
+            )
+        return d_active & d_category, repaired_mask
+
+    def _device_semantic_cleanup_owned(owned, rowset):
+        if rowset is None or not getattr(rowset, "is_device", False):
+            return None
+        if owned.residency is not Residency.DEVICE or owned.device_state is None:
+            return None
+        try:
+            import cupy as cp
+        except ModuleNotFoundError:  # pragma: no cover - guarded by residency
+            return None
+
+        repaired_mask = None
+        d_keep = _valid_nonempty_device_mask(owned)
+        if d_keep is None:
+            return None
+
+        if (
+            not result.clipping_by_rectangle
+            and result.has_non_point_candidates
+            and owned.row_count > 0
+        ):
+            from vibespatial.constructive.measurement import (
+                _area_gpu_device_fp64,
+                _length_gpu_device_fp64,
+            )
+            from vibespatial.geometry.buffers import GeometryFamily
+            from vibespatial.kernels.core.geometry_analysis import (
+                compute_geometry_bounds_device,
+            )
+
+            device_state = owned._ensure_device_state()
+            d_tags = cp.asarray(device_state.tags)
+            d_validity = cp.asarray(device_state.validity).astype(cp.bool_, copy=False)
+            d_polygon_mask = d_keep & d_validity & (
+                (d_tags == FAMILY_TAGS[GeometryFamily.POLYGON])
+                | (d_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
+            )
+            if any(
+                family in device_state.families
+                for family in (
+                    GeometryFamily.POLYGON,
+                    GeometryFamily.MULTIPOLYGON,
+                )
+            ):
+                d_area = _area_gpu_device_fp64(owned)
+                d_nonpositive = d_polygon_mask & ~(
+                    cp.isfinite(d_area) & (d_area > 0.0)
+                )
+                d_bounds = compute_geometry_bounds_device(owned)
+                d_width = cp.abs(d_bounds[:, 2] - d_bounds[:, 0])
+                d_height = cp.abs(d_bounds[:, 3] - d_bounds[:, 1])
+                d_pointlike = (
+                    d_nonpositive
+                    & (d_width <= SPATIAL_EPSILON)
+                    & (d_height <= SPATIAL_EPSILON)
+                )
+                d_keep &= ~d_nonpositive | d_pointlike
+
+            d_line_mask = d_keep & d_validity & (
+                (d_tags == FAMILY_TAGS[GeometryFamily.LINESTRING])
+                | (d_tags == FAMILY_TAGS[GeometryFamily.MULTILINESTRING])
+            )
+            if any(
+                family in device_state.families
+                for family in (
+                    GeometryFamily.LINESTRING,
+                    GeometryFamily.MULTILINESTRING,
+                )
+            ):
+                d_lengths = _length_gpu_device_fp64(owned)
+                d_degenerate_mask = (
+                    d_line_mask & cp.isfinite(d_lengths) & (d_lengths == 0.0)
+                )
+                from vibespatial.constructive.extract_unique_points import (
+                    degenerate_line_centroids_owned_capacity,
+                )
+                from vibespatial.geometry.owned import (
+                    device_select_owned_capacity_partitions,
+                )
+
+                repaired_owned = degenerate_line_centroids_owned_capacity(
+                    owned,
+                    d_degenerate_mask,
+                )
+                owned = device_select_owned_capacity_partitions(
+                    owned,
+                    [(repaired_owned, d_degenerate_mask)],
+                )
+                repaired_mask = d_degenerate_mask
+
+        keep_geom_cleanup = _device_keep_geom_type_cleanup_mask(
+            owned,
+            d_keep,
+            repaired_mask,
+        )
+        if keep_geom_cleanup is None:
+            return None
+        d_keep, repaired_mask = keep_geom_cleanup
+        return owned, rowset, repaired_mask, d_keep
+
     if row_positions.size > 1:
         reorder = _reorder_concat_positions(
             row_positions,
@@ -2985,6 +4400,37 @@ def _clip_owned_geometry_native_result(result, *, crs):
         if not np.array_equal(reorder, np.arange(reorder.size, dtype=reorder.dtype)):
             row_positions = row_positions[reorder]
             combined_owned = _take_owned_rows(combined_owned, reorder)
+            combined_rowset = _take_combined_rowset(
+                combined_rowset,
+                reorder,
+                ordered=True,
+            )
+
+    needs_device_cleanup = (not semantic_cleanup_done) or result.keep_geom_type
+    device_cleanup = None if not needs_device_cleanup else _device_semantic_cleanup_owned(
+        combined_owned,
+        combined_rowset,
+    )
+    if device_cleanup is not None:
+        combined_owned, combined_rowset, repaired_mask, d_keep = device_cleanup
+        if initial_residency is Residency.DEVICE and combined_owned.residency is not Residency.DEVICE:
+            from vibespatial.runtime.residency import TransferTrigger
+
+            combined_owned = combined_owned.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason=(
+                    "clip native-tabular boundary restored device-backed output after "
+                    "device semantic cleanup"
+                ),
+            )
+        return (
+            GeometryNativeResult.from_owned(combined_owned, crs=crs),
+            None,
+            repaired_mask,
+            combined_rowset,
+            d_keep,
+        )
 
     geometry_array = None
     if not semantic_cleanup_done:
@@ -2993,6 +4439,11 @@ def _clip_owned_geometry_native_result(result, *, crs):
             keep_rows = np.flatnonzero(keep).astype(np.intp, copy=False)
             row_positions = row_positions[keep_rows]
             combined_owned = _take_owned_rows(combined_owned, keep_rows)
+            combined_rowset = _take_combined_rowset(
+                combined_rowset,
+                keep_rows,
+                ordered=True,
+            )
             geometry_array = None
 
     repaired_mask = None
@@ -3037,6 +4488,11 @@ def _clip_owned_geometry_native_result(result, *, crs):
                 keep_rows = np.flatnonzero(keep).astype(np.intp, copy=False)
                 row_positions = row_positions[keep_rows]
                 combined_owned = _take_owned_rows(combined_owned, keep_rows)
+                combined_rowset = _take_combined_rowset(
+                    combined_rowset,
+                    keep_rows,
+                    ordered=True,
+                )
                 geometry_array = None
                 tags = np.asarray(combined_owned.tags, dtype=np.int8)
 
@@ -3058,7 +4514,7 @@ def _clip_owned_geometry_native_result(result, *, crs):
                 repaired = geometry_array.take(degenerate_rows).make_valid()
                 repaired_owned = getattr(repaired, "_owned", None)
                 if repaired_owned is None or repaired_owned.row_count != degenerate_rows.size:
-                    return None, None, None
+                    return None, None, None, None, None
                 keep_rows = np.flatnonzero(~degenerate).astype(np.intp, copy=False)
                 index_oga_pairs = []
                 if keep_rows.size:
@@ -3083,7 +4539,13 @@ def _clip_owned_geometry_native_result(result, *, crs):
             ),
         )
 
-    return GeometryNativeResult.from_owned(combined_owned, crs=crs), row_positions, repaired_mask
+    return (
+        GeometryNativeResult.from_owned(combined_owned, crs=crs),
+        row_positions,
+        repaired_mask,
+        combined_rowset,
+        None,
+    )
 
 
 def _clip_constructive_parts_to_native_tabular_result(
@@ -3095,7 +4557,7 @@ def _clip_constructive_parts_to_native_tabular_result(
     has_non_point_candidates: bool,
     keep_geom_type: bool,
     spatial_materializer: Callable[[], Any] | None = None,
-) -> NativeTabularResult:
+) -> NativeTabularResult | NativeTabularSelection:
     if not parts:
         if hasattr(source, "_geometry_column_name"):
             geometry_name = source._geometry_column_name
@@ -3107,7 +4569,7 @@ def _clip_constructive_parts_to_native_tabular_result(
             row_positions=np.empty(0, dtype=np.intp),
         )
         geometry = _empty_geometry_native_result(geometry_name=geometry_name, crs=source.crs)
-        return NativeTabularResult(
+        capacity_result = NativeTabularResult(
             attributes=attributes,
             geometry=geometry,
             geometry_name=geometry_name,
@@ -3125,6 +4587,7 @@ def _clip_constructive_parts_to_native_tabular_result(
             ),
             geometry_metadata=_cached_geometry_metadata(geometry),
         )
+        return capacity_result
 
     if len(parts) == 1 and not has_non_point_candidates and not keep_geom_type:
         part = parts[0]
@@ -3133,12 +4596,21 @@ def _clip_constructive_parts_to_native_tabular_result(
             geometry_name = source._geometry_column_name
         else:
             geometry_name = getattr(source, "name", None) or "geometry"
+        native_rowset_result = _clip_native_tabular_result_from_rowset(
+            source,
+            geometry_name=geometry_name,
+            geometry=part.geometry,
+            rowset=getattr(part, "rowset", None),
+            keep_geom_type=keep_geom_type,
+        )
+        if native_rowset_result is not None:
+            return native_rowset_result
         attributes = _clip_project_source_attributes(
             source,
             geometry_name=geometry_name,
             row_positions=row_positions,
         )
-        return NativeTabularResult(
+        capacity_result = NativeTabularResult(
             attributes=attributes,
             geometry=part.geometry,
             geometry_name=geometry_name,
@@ -3156,63 +4628,99 @@ def _clip_constructive_parts_to_native_tabular_result(
             ),
             geometry_metadata=_cached_geometry_metadata(part.geometry),
         )
+        return capacity_result
 
-    if not keep_geom_type:
-        geometry_name = (
-            source._geometry_column_name
-            if hasattr(source, "_geometry_column_name")
-            else getattr(source, "name", None) or "geometry"
+    geometry_name = (
+        source._geometry_column_name
+        if hasattr(source, "_geometry_column_name")
+        else getattr(source, "name", None) or "geometry"
+    )
+    owned_result = _clip_owned_geometry_native_result(
+        SimpleNamespace(
+            source=source,
+            parts=parts,
+            ordered_row_positions=ordered_row_positions,
+            clipping_by_rectangle=clipping_by_rectangle,
+            has_non_point_candidates=has_non_point_candidates,
+            keep_geom_type=keep_geom_type,
+        ),
+        crs=source.crs,
+    )
+    (
+        owned_geometry,
+        owned_rows,
+        repaired_mask,
+        owned_rowset,
+        owned_selection_mask,
+    ) = owned_result
+    if owned_geometry is not None and (owned_rows is not None or owned_rowset is not None):
+        native_rowset_result = _clip_native_tabular_result_from_rowset(
+            source,
+            geometry_name=geometry_name,
+            geometry=owned_geometry,
+            rowset=owned_rowset,
+            repaired_mask=repaired_mask,
+            keep_geom_type=keep_geom_type,
         )
-        owned_geometry, owned_rows, repaired_mask = _clip_owned_geometry_native_result(
-            SimpleNamespace(
-                source=source,
-                parts=parts,
-                ordered_row_positions=ordered_row_positions,
-                clipping_by_rectangle=clipping_by_rectangle,
-                has_non_point_candidates=has_non_point_candidates,
-                keep_geom_type=keep_geom_type,
-            ),
-            crs=source.crs,
+        if native_rowset_result is not None:
+            if owned_selection_mask is None:
+                return native_rowset_result
+            from vibespatial.api._native_rowset import NativeDeviceSelection
+
+            return NativeTabularSelection(
+                capacity_result=native_rowset_result,
+                selection=NativeDeviceSelection.from_mask(
+                    owned_selection_mask,
+                ),
+            )
+        if owned_rows is None and owned_rowset is not None:
+            owned_rows = owned_rowset.to_host_positions(
+                surface=(
+                    "vibespatial.api._native_results."
+                    "_clip_constructive_parts_to_native_tabular_result"
+                ),
+                strict_disallowed=False,
+            ).astype(np.intp, copy=False)
+        attributes = _clip_project_source_attributes(
+            source,
+            geometry_name=geometry_name,
+            row_positions=owned_rows,
         )
-        if owned_geometry is not None and owned_rows is not None:
-            attributes = _clip_project_source_attributes(
+        capacity_result = NativeTabularResult(
+            attributes=attributes,
+            geometry=owned_geometry,
+            geometry_name=geometry_name,
+            column_order=_clip_source_column_order(
                 source,
                 geometry_name=geometry_name,
-                row_positions=owned_rows,
-            )
-            return NativeTabularResult(
                 attributes=attributes,
-                geometry=owned_geometry,
-                geometry_name=geometry_name,
-                column_order=_clip_source_column_order(
-                    source,
-                    geometry_name=geometry_name,
-                    attributes=attributes,
-                ),
-                attrs=source.attrs.copy() or None,
-                provenance=NativeGeometryProvenance(
-                    operation="clip",
-                    row_count=int(np.asarray(owned_rows).size),
-                    source_rows=owned_rows,
-                    repaired_mask=repaired_mask,
-                    keep_geom_type_applied=keep_geom_type,
-                ),
-                geometry_metadata=_cached_geometry_metadata(owned_geometry),
-            )
+            ),
+            attrs=source.attrs.copy() or None,
+            provenance=NativeGeometryProvenance(
+                operation="clip",
+                row_count=int(np.asarray(owned_rows).size),
+                source_rows=owned_rows,
+                repaired_mask=repaired_mask,
+                keep_geom_type_applied=keep_geom_type,
+            ),
+            geometry_metadata=_cached_geometry_metadata(owned_geometry),
+        )
+        if owned_selection_mask is None:
+            return capacity_result
+        from vibespatial.api._native_rowset import NativeDeviceSelection
 
-        if any(part.geometry.owned is not None for part in parts):
-            record_fallback_event(
-                surface="geopandas.clip",
-                reason="clip native-tabular export requires host semantic cleanup before materialization",
-                detail=(
-                    "owned clip rows could not be preserved in the native boundary, so "
-                    "host shapely/object cleanup is the explicit export fallback"
-                ),
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.CPU,
-                pipeline="clip.to_native_tabular_result",
-                d2h_transfer=True,
-            )
+        return NativeTabularSelection(
+            capacity_result=capacity_result,
+            selection=NativeDeviceSelection.from_mask(owned_selection_mask),
+        )
+
+    owned_parts_present = any(part.geometry.owned is not None for part in parts)
+    if owned_parts_present:
+        raise StrictNativeFallbackError(
+            "clip native-tabular owned assembly declined before host semantic cleanup"
+        )
+
+    if not keep_geom_type:
         row_parts: list[np.ndarray] = []
         geometry_parts: list[np.ndarray] = []
         for part in parts:
@@ -3337,7 +4845,9 @@ def _clip_constructive_parts_to_native_tabular_result(
     return _spatial_to_native_tabular_result(clipped)
 
 
-def _clip_native_result_to_native_tabular_result(result) -> NativeTabularResult:
+def _clip_native_result_to_native_tabular_result(
+    result,
+) -> NativeTabularResult | NativeTabularSelection:
     return _clip_constructive_parts_to_native_tabular_result(
         source=result.source,
         parts=result.parts,
@@ -3378,6 +4888,23 @@ def _relation_join_export_result_to_native_tabular_result(
             dtype=np.intp,
         )
         relation_distances = result.relation_result.to_host_distances()
+        if (
+            result.predicate == "intersects"
+            and result.relation_result.distances is None
+            and not result.on_attribute
+        ):
+            # If sjoin produced device relation pairs, the pre-export cache
+            # intentionally did not force an extra host copy. At this public
+            # export boundary the relation indices are already host-visible, so
+            # seed the overlay cache without adding another transfer.
+            from vibespatial.api.tools._pair_cache import cache_intersection_pairs
+
+            cache_intersection_pairs(
+                result.left_df,
+                result.right_df,
+                relation_indices[0],
+                relation_indices[1],
+            )
 
     attributes, geometry, geometry_name, _crs, column_order, secondary_geometry, distances = _native_relation_join_parts(
         result.left_df,
@@ -3431,6 +4958,12 @@ def _concat_geometry_result_sequence(
 ) -> GeometryNativeResult:
     if not geometries:
         return _empty_geometry_native_result(geometry_name=geometry_name, crs=crs)
+
+    if any(geometry.composition is not None for geometry in geometries):
+        return GeometryNativeResult.from_composition(
+            NativeGeometryComposition.concat(geometries, crs=crs),
+            crs=crs,
+        )
 
     if all(geometry.owned is not None for geometry in geometries):
         owned_arrays = [geometry.owned for geometry in geometries]
@@ -3487,14 +5020,14 @@ def _concat_geometry_native_results(
 
 
 def _concat_native_tabular_results(
-    results: list[NativeTabularResult],
+    results: list[NativeTabularResult | NativeTabularSelection],
     *,
     geometry_name: str,
     crs,
     attrs: dict[str, Any] | None = None,
     provenance: NativeReadProvenance | None = None,
     ignore_index: bool = True,
-) -> NativeTabularResult:
+) -> NativeTabularResult | NativeTabularSelection:
     if not results:
         return NativeTabularResult(
             attributes=pd.DataFrame(index=pd.RangeIndex(0)),
@@ -3503,6 +5036,15 @@ def _concat_native_tabular_results(
             column_order=(geometry_name,),
             attrs=attrs,
             provenance=provenance,
+        )
+    if any(isinstance(result, NativeTabularSelection) for result in results):
+        return _concat_native_tabular_selections(
+            results,
+            geometry_name=geometry_name,
+            crs=crs,
+            attrs=attrs,
+            provenance=provenance,
+            ignore_index=ignore_index,
         )
 
     if provenance is None and all(
@@ -3577,15 +5119,69 @@ def _concat_native_tabular_results(
     )
 
 
-def _symmetric_difference_native_tabular_results(
-    left_result: NativeTabularResult,
-    right_result: NativeTabularResult,
+def _concat_native_tabular_selections(
+    results: list[NativeTabularResult | NativeTabularSelection],
     *,
     geometry_name: str,
     crs,
     attrs: dict[str, Any] | None = None,
-) -> NativeTabularResult:
-    shared = set(left_result.attributes.columns) & set(right_result.attributes.columns)
+    provenance: NativeReadProvenance | None = None,
+    ignore_index: bool = True,
+) -> NativeTabularSelection:
+    """Concatenate exact and dynamic tabular partitions at device capacity."""
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+
+    capacity_results: list[NativeTabularResult] = []
+    selections: list[NativeDeviceSelection] = []
+    for result in results:
+        if isinstance(result, NativeTabularSelection):
+            if result.public_index_source_plan is not None:
+                raise ValueError(
+                    "nested dynamic tabular concat requires caller-owned index semantics"
+                )
+            capacity_results.append(result.capacity_result)
+            selections.append(result.selection)
+        else:
+            capacity_results.append(result)
+            selections.append(
+                NativeDeviceSelection.identity(len(result.attributes))
+            )
+
+    capacity_result = _concat_native_tabular_results(
+        capacity_results,
+        geometry_name=geometry_name,
+        crs=crs,
+        attrs=attrs,
+        provenance=provenance,
+        ignore_index=ignore_index,
+    )
+    return NativeTabularSelection(
+        capacity_result=capacity_result,
+        selection=NativeDeviceSelection.concatenate(selections),
+    )
+
+
+def _symmetric_difference_native_tabular_results(
+    left_result: NativeTabularResult | NativeTabularSelection,
+    right_result: NativeTabularResult | NativeTabularSelection,
+    *,
+    geometry_name: str,
+    crs,
+    attrs: dict[str, Any] | None = None,
+) -> NativeTabularResult | NativeTabularSelection:
+    left_capacity = (
+        left_result.capacity_result
+        if isinstance(left_result, NativeTabularSelection)
+        else left_result
+    )
+    right_capacity = (
+        right_result.capacity_result
+        if isinstance(right_result, NativeTabularSelection)
+        else right_result
+    )
+    shared = set(left_capacity.attributes.columns) & set(
+        right_capacity.attributes.columns
+    )
     rename1 = {column: f"{column}_1" for column in shared}
     rename2 = {column: f"{column}_2" for column in shared}
     if rename1:
@@ -3594,7 +5190,7 @@ def _symmetric_difference_native_tabular_results(
             rename1,
             geometry_name=geometry_name,
         )
-    elif left_result.geometry_name != geometry_name:
+    elif left_capacity.geometry_name != geometry_name:
         left_result = _rename_native_tabular_result(
             left_result,
             None,
@@ -3606,7 +5202,7 @@ def _symmetric_difference_native_tabular_results(
             rename2,
             geometry_name=geometry_name,
         )
-    elif right_result.geometry_name != geometry_name:
+    elif right_capacity.geometry_name != geometry_name:
         right_result = _rename_native_tabular_result(
             right_result,
             None,
@@ -3619,29 +5215,39 @@ def _symmetric_difference_native_tabular_results(
         crs=crs,
         attrs=attrs,
     )
+    merged_capacity = (
+        merged.capacity_result
+        if isinstance(merged, NativeTabularSelection)
+        else merged
+    )
     merged_column_order = tuple(
         [
             *[
                 column_name
-                for column_name in merged.resolved_column_order
+                for column_name in merged_capacity.resolved_column_order
                 if column_name != geometry_name
             ],
             geometry_name,
         ]
     )
-    return NativeTabularResult(
-        attributes=merged.attributes,
-        geometry=merged.geometry,
+    reordered = NativeTabularResult(
+        attributes=merged_capacity.attributes,
+        geometry=merged_capacity.geometry,
         geometry_name=geometry_name,
         column_order=merged_column_order,
-        attrs=merged.attrs,
-        secondary_geometry=merged.secondary_geometry,
-        provenance=merged.provenance,
-        geometry_metadata=merged.geometry_metadata,
+        attrs=merged_capacity.attrs,
+        secondary_geometry=merged_capacity.secondary_geometry,
+        provenance=merged_capacity.provenance,
+        geometry_metadata=merged_capacity.geometry_metadata,
     )
+    if isinstance(merged, NativeTabularSelection):
+        return replace(merged, capacity_result=reordered)
+    return reordered
 
 
-def _symmetric_difference_constructive_result_to_native_tabular_result(result) -> NativeTabularResult:
+def _symmetric_difference_constructive_result_to_native_tabular_result(
+    result,
+) -> NativeTabularResult | NativeTabularSelection:
     """Compatibility shim for legacy symmetric-difference wrapper lowering."""
     left_result = _left_constructive_result_to_native_tabular_result(
         result.left_result,
@@ -3653,15 +5259,22 @@ def _symmetric_difference_constructive_result_to_native_tabular_result(result) -
         df=result.right_df,
         geometry_name=result.geometry_name,
     )
+    left_capacity = (
+        left_result.capacity_result
+        if isinstance(left_result, NativeTabularSelection)
+        else left_result
+    )
     return _symmetric_difference_native_tabular_results(
         left_result,
         right_result,
         geometry_name=result.geometry_name,
-        crs=result.crs if result.crs is not None else left_result.geometry.crs,
+        crs=result.crs if result.crs is not None else left_capacity.geometry.crs,
     )
 
 
-def _concat_constructive_result_to_native_tabular_result(result) -> NativeTabularResult:
+def _concat_constructive_result_to_native_tabular_result(
+    result,
+) -> NativeTabularResult | NativeTabularSelection:
     """Compatibility shim for legacy concat wrapper lowering."""
     results = []
     for part in result.parts:
@@ -3669,19 +5282,30 @@ def _concat_constructive_result_to_native_tabular_result(result) -> NativeTabula
         if payload is None:
             payload = _spatial_to_native_tabular_result(part.to_geodataframe())
         results.append(payload)
+    first_capacity = (
+        results[0].capacity_result
+        if results and isinstance(results[0], NativeTabularSelection)
+        else (results[0] if results else None)
+    )
     return _concat_native_tabular_results(
         results,
         geometry_name=result.geometry_name,
-        crs=result.crs if result.crs is not None else (results[0].geometry.crs if results else None),
+        crs=(
+            result.crs
+            if result.crs is not None
+            else (first_capacity.geometry.crs if first_capacity is not None else None)
+        ),
         attrs=result.result_attrs,
     )
 
 
-def to_native_tabular_result(result) -> NativeTabularResult | None:
+def to_native_tabular_result(
+    result,
+) -> NativeTabularResult | NativeTabularSelection | None:
     """Convert supported native result families into the shared tabular boundary."""
     from vibespatial.api.tools.clip import ClipNativeResult
 
-    if isinstance(result, NativeTabularResult):
+    if isinstance(result, (NativeTabularResult, NativeTabularSelection)):
         return result
     if isinstance(result, GeometryNativeResult):
         return _geometry_native_result_to_native_tabular_result(result)

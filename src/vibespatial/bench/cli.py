@@ -2,6 +2,7 @@
 
 Entry point registered as ``vsbench`` in pyproject.toml.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -130,22 +131,32 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="Python script or directory of scripts",
     )
-    p_shootout.add_argument("--repeat", type=int, default=3, help="Number of timed runs (default: 3)")
+    p_shootout.add_argument(
+        "--repeat", type=int, default=3, help="Number of timed runs (default: 3)"
+    )
     p_shootout.add_argument(
         "--no-warmup",
         action="store_true",
         help="Skip the untimed script warmup run; vibespatial still precompiles the full GPU benchmark stack before timing",
     )
     p_shootout.add_argument(
-        "--baseline-python", type=str, default=None,
+        "--baseline-python",
+        type=str,
+        default=None,
         help="Python interpreter with real geopandas (skips uv isolation)",
     )
     p_shootout.add_argument(
-        "--with", action="append", dest="extra_deps",
+        "--with",
+        action="append",
+        dest="extra_deps",
         help="Extra pip dep for the geopandas env (can repeat)",
     )
-    p_shootout.add_argument("--scale", type=str, default=None, help="Data scale for scripts (e.g. 1000, 10K, 1M)")
-    p_shootout.add_argument("--timeout", type=int, default=300, help="Per-run timeout in seconds (default: 300)")
+    p_shootout.add_argument(
+        "--scale", type=str, default=None, help="Data scale for scripts (e.g. 1000, 10K, 1M)"
+    )
+    p_shootout.add_argument(
+        "--timeout", type=int, default=300, help="Per-run timeout in seconds (default: 300)"
+    )
     p_shootout.add_argument("--json", action="store_true", dest="json_output")
     p_shootout.add_argument("--quiet", action="store_true")
     p_shootout.add_argument(
@@ -162,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
 # ---------------------------------------------------------------------------
 # Common flags
 # ---------------------------------------------------------------------------
+
 
 def _add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--scale", choices=("1k", "10k", "100k", "1m"), default=None)
@@ -198,6 +210,7 @@ def _add_pipeline_profile_flags(parser: argparse.ArgumentParser) -> None:
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
+
 
 def _output_mode(args: argparse.Namespace) -> str:
     if getattr(args, "json_output", False):
@@ -241,6 +254,7 @@ def _dispatch(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Subcommand implementations
 # ---------------------------------------------------------------------------
+
 
 def _cmd_run(args: argparse.Namespace) -> int:
     from .catalog import ensure_operations_loaded, get_operation, resolve_operation_args
@@ -347,8 +361,7 @@ def _cmd_kernel(args: argparse.Namespace) -> int:
         from .nvbench_runner import run_kernel_bench
     except ImportError:
         print(
-            "cuda-bench is not installed. Install GPU deps with:\n"
-            "  uv sync --extra cu12",
+            "cuda-bench is not installed. Install GPU deps with:\n  uv sync --extra cu12",
             file=sys.stderr,
         )
         return 1

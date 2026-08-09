@@ -11,7 +11,10 @@ _PRECISION_PREAMBLE = PRECISION_PREAMBLE
 # Cooperative area kernel: 1 block per geometry (for complex polygons)
 # ---------------------------------------------------------------------------
 
-_POLYGON_AREA_COOPERATIVE_KERNEL_SOURCE = PRECISION_PREAMBLE + STRIP_CLOSURE_DEVICE + r"""
+_POLYGON_AREA_COOPERATIVE_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + STRIP_CLOSURE_DEVICE
+    + r"""
 extern "C" __global__ __launch_bounds__(256, 4)
 void polygon_area_cooperative(
     const double* __restrict__ x,
@@ -103,11 +106,15 @@ void polygon_area_cooperative(
     }}
 }}
 """
+)
 # ---------------------------------------------------------------------------
 # Area kernel: Polygon (also used by MultiPolygon per-polygon-part)
 # ---------------------------------------------------------------------------
 
-_POLYGON_AREA_KERNEL_SOURCE = PRECISION_PREAMBLE + STRIP_CLOSURE_DEVICE + r"""
+_POLYGON_AREA_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + STRIP_CLOSURE_DEVICE
+    + r"""
 extern "C" __global__ void polygon_area(
     const double* x,
     const double* y,
@@ -163,11 +170,15 @@ extern "C" __global__ void polygon_area(
     out_area[row] = (double)total_area;
 }}
 """
+)
 # ---------------------------------------------------------------------------
 # Area kernel: MultiPolygon (triple indirection: geom -> part -> ring -> coord)
 # ---------------------------------------------------------------------------
 
-_MULTIPOLYGON_AREA_KERNEL_SOURCE = PRECISION_PREAMBLE + STRIP_CLOSURE_DEVICE + r"""
+_MULTIPOLYGON_AREA_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + STRIP_CLOSURE_DEVICE
+    + r"""
 extern "C" __global__ void multipolygon_area(
     const double* x,
     const double* y,
@@ -229,6 +240,7 @@ extern "C" __global__ void multipolygon_area(
     out_area[row] = (double)total_area;
 }}
 """
+)
 # ---------------------------------------------------------------------------
 # Length kernel: shared device helper for segment distance
 # ---------------------------------------------------------------------------
@@ -258,7 +270,10 @@ __device__ void accumulate_segment_lengths(
 # Length kernel: Polygon (all rings — exterior + holes)
 # ---------------------------------------------------------------------------
 
-_POLYGON_LENGTH_KERNEL_SOURCE = PRECISION_PREAMBLE + _LENGTH_DEVICE_HELPER + r"""
+_POLYGON_LENGTH_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + _LENGTH_DEVICE_HELPER
+    + r"""
 extern "C" __global__ void polygon_length(
     const double* x,
     const double* y,
@@ -289,11 +304,15 @@ extern "C" __global__ void polygon_length(
     out_length[row] = (double)total_length;
 }}
 """
+)
 # ---------------------------------------------------------------------------
 # Length kernel: MultiPolygon (all rings of all polygon parts)
 # ---------------------------------------------------------------------------
 
-_MULTIPOLYGON_LENGTH_KERNEL_SOURCE = PRECISION_PREAMBLE + _LENGTH_DEVICE_HELPER + r"""
+_MULTIPOLYGON_LENGTH_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + _LENGTH_DEVICE_HELPER
+    + r"""
 extern "C" __global__ void multipolygon_length(
     const double* x,
     const double* y,
@@ -329,11 +348,15 @@ extern "C" __global__ void multipolygon_length(
     out_length[row] = (double)total_length;
 }}
 """
+)
 # ---------------------------------------------------------------------------
 # Length kernel: LineString (geometry_offsets -> coords)
 # ---------------------------------------------------------------------------
 
-_LINESTRING_LENGTH_KERNEL_SOURCE = PRECISION_PREAMBLE + _LENGTH_DEVICE_HELPER + r"""
+_LINESTRING_LENGTH_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + _LENGTH_DEVICE_HELPER
+    + r"""
 extern "C" __global__ void linestring_length(
     const double* x,
     const double* y,
@@ -362,11 +385,15 @@ extern "C" __global__ void linestring_length(
     out_length[row] = (double)total_length;
 }}
 """
+)
 # ---------------------------------------------------------------------------
 # Length kernel: MultiLineString (geometry_offsets -> part_offsets -> coords)
 # ---------------------------------------------------------------------------
 
-_MULTILINESTRING_LENGTH_KERNEL_SOURCE = PRECISION_PREAMBLE + _LENGTH_DEVICE_HELPER + r"""
+_MULTILINESTRING_LENGTH_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + _LENGTH_DEVICE_HELPER
+    + r"""
 extern "C" __global__ void multilinestring_length(
     const double* x,
     const double* y,
@@ -397,6 +424,7 @@ extern "C" __global__ void multilinestring_length(
     out_length[row] = (double)total_length;
 }}
 """
+)
 # ---------------------------------------------------------------------------
 # Kernel names and precompiled source variants
 # ---------------------------------------------------------------------------
@@ -410,8 +438,12 @@ _LINESTRING_LENGTH_NAMES = ("linestring_length",)
 _MULTILINESTRING_LENGTH_NAMES = ("multilinestring_length",)
 _POLYGON_AREA_FP64 = _POLYGON_AREA_KERNEL_SOURCE.format(compute_type="double")
 _POLYGON_AREA_FP32 = _POLYGON_AREA_KERNEL_SOURCE.format(compute_type="float")
-_POLYGON_AREA_COOPERATIVE_FP64 = _POLYGON_AREA_COOPERATIVE_KERNEL_SOURCE.format(compute_type="double")
-_POLYGON_AREA_COOPERATIVE_FP32 = _POLYGON_AREA_COOPERATIVE_KERNEL_SOURCE.format(compute_type="float")
+_POLYGON_AREA_COOPERATIVE_FP64 = _POLYGON_AREA_COOPERATIVE_KERNEL_SOURCE.format(
+    compute_type="double"
+)
+_POLYGON_AREA_COOPERATIVE_FP32 = _POLYGON_AREA_COOPERATIVE_KERNEL_SOURCE.format(
+    compute_type="float"
+)
 _MULTIPOLYGON_AREA_FP64 = _MULTIPOLYGON_AREA_KERNEL_SOURCE.format(compute_type="double")
 _MULTIPOLYGON_AREA_FP32 = _MULTIPOLYGON_AREA_KERNEL_SOURCE.format(compute_type="float")
 _POLYGON_LENGTH_FP64 = _POLYGON_LENGTH_KERNEL_SOURCE.format(compute_type="double")

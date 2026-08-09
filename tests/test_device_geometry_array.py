@@ -22,6 +22,7 @@ from shapely.geometry import (
 
 import vibespatial.api as geopandas
 from vibespatial.api.geometry_array import GeometryArray, GeometryDtype
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.device_array import DeviceGeometryArray, DeviceGeometryDtype
 from vibespatial.geometry.owned import (
     DiagnosticKind,
@@ -1012,6 +1013,7 @@ class TestEquality:
         assert not result.any()
 
 
+@pytest.mark.gpu
 class TestPointCoordinateProperties:
     def test_x_y_use_owned_point_buffers_without_materialization(self):
         dga = _make_device_only_dga([Point(1, 2), Point(), None, Point(3, 4)])
@@ -1465,6 +1467,53 @@ class TestConstructiveOpsReturnDGA:
         assert buffer_events
         assert buffer_events[-1].implementation == "linestring_buffer_owned_array"
         assert buffer_events[-1].selected.value == "gpu"
+
+    @pytest.mark.gpu
+    def test_indexed_polygon_buffer_ignores_unreferenced_family_backing(self):
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+
+        import cupy as cp
+
+        from vibespatial.runtime.dispatch import (
+            clear_dispatch_events,
+            get_dispatch_events,
+        )
+
+        polygon = Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)])
+        unused_multipolygon = MultiPolygon(
+            [Polygon([(10, 0), (14, 0), (14, 4), (10, 4), (10, 0)])]
+        )
+        base = from_shapely_geometries(
+            [polygon, unused_multipolygon],
+            residency=Residency.DEVICE,
+        )
+        indexed = OwnedGeometryArray._indexed_view(
+            base,
+            cp.asarray([0], dtype=cp.int64),
+            assume_unique_indices=True,
+        )
+        dga = DeviceGeometryArray._from_owned(indexed)
+
+        clear_dispatch_events()
+        geopandas.clear_fallback_events()
+        result = dga.buffer(1.0, quad_segs=2)
+
+        assert not geopandas.get_fallback_events(clear=True)
+        buffer_events = [
+            event
+            for event in get_dispatch_events(clear=True)
+            if event.surface == "DeviceGeometryArray.buffer"
+        ]
+        assert buffer_events[-1].implementation == "polygon_buffer_owned_array"
+        assert set(result._owned.families) == {GeometryFamily.POLYGON}
+        assert bool(
+            shapely.equals_exact(
+                shapely.normalize(result._owned.to_shapely()[0]),
+                shapely.normalize(shapely.buffer(polygon, 1.0, quad_segs=2)),
+                tolerance=1e-12,
+            )
+        )
 
     def test_two_point_linestring_buffer_honors_auto_crossover(self, monkeypatch):
         import vibespatial.constructive.linestring as linestring_module

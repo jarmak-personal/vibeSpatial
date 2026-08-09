@@ -30,6 +30,7 @@ Or as a context manager::
     with device_residency_guard("overlay_intersection"):
         result = overlay_intersection_gpu(polys_a, polys_b)
 """
+
 from __future__ import annotations
 
 import functools
@@ -41,6 +42,7 @@ from typing import Any
 
 class DeviceResidencyViolation(RuntimeError):
     """Raised when a D2H transfer occurs inside a guarded GPU pipeline."""
+
     pass
 
 
@@ -65,15 +67,27 @@ def _current_scope() -> str:
 # ---------------------------------------------------------------------------
 _ALLOWED_CALLERS = {
     # User-visible materialization (expected D2H)
-    "to_pandas", "to_numpy", "to_host", "__repr__", "__str__",
-    "_to_host_array", "_ensure_host_state", "to_wkt", "to_wkb",
-    "to_pylist", "tolist",
+    "to_pandas",
+    "to_numpy",
+    "to_host",
+    "__repr__",
+    "__str__",
+    "_to_host_array",
+    "_ensure_host_state",
+    "to_wkt",
+    "to_wkb",
+    "to_pylist",
+    "tolist",
     # Test oracle: needs host data to compare against shapely
-    "assert_matches_shapely", "compare_with_shapely",
-    "_compare_single", "_compare_results",
+    "assert_matches_shapely",
+    "compare_with_shapely",
+    "_compare_single",
+    "_compare_results",
     # Diagnostic / profiling (not pipeline code)
-    "record_dispatch_event", "record_fallback_event",
-    "_record", "_log_diagnostic",
+    "record_dispatch_event",
+    "record_fallback_event",
+    "_record",
+    "_log_diagnostic",
 }
 
 
@@ -92,7 +106,9 @@ def _format_violation(method_name: str, extra: str = "") -> str:
     relevant_frame = ""
     for frame_info in traceback.extract_stack():
         if "vibespatial" in frame_info.filename and "testing" not in frame_info.filename:
-            relevant_frame = f"  at {frame_info.filename}:{frame_info.lineno} in {frame_info.name}()"
+            relevant_frame = (
+                f"  at {frame_info.filename}:{frame_info.lineno} in {frame_info.name}()"
+            )
 
     msg = (
         f"DeviceResidencyViolation: {method_name} called inside guarded "
@@ -141,11 +157,7 @@ def _install_patches() -> dict[str, Any]:
 
             @functools.wraps(cp.ndarray.get)
             def _guarded_get(self: Any, *args: Any, **kwargs: Any) -> Any:
-                if (
-                    _in_guarded_scope()
-                    and self.size > 1
-                    and not _caller_is_allowed()
-                ):
+                if _in_guarded_scope() and self.size > 1 and not _caller_is_allowed():
                     raise DeviceResidencyViolation(
                         _format_violation(
                             ".get()",
@@ -165,12 +177,11 @@ def _install_patches() -> dict[str, Any]:
             def _guarded_asnumpy(a: Any, *args: Any, **kwargs: Any) -> Any:
                 if (
                     _in_guarded_scope()
-                    and hasattr(a, "size") and a.size > 1
+                    and hasattr(a, "size")
+                    and a.size > 1
                     and not _caller_is_allowed()
                 ):
-                    raise DeviceResidencyViolation(
-                        _format_violation("cupy.asnumpy()")
-                    )
+                    raise DeviceResidencyViolation(_format_violation("cupy.asnumpy()"))
                 return originals["cp_asnumpy"](a, *args, **kwargs)
 
             _guarded_asnumpy._device_guard_wrapped = True  # type: ignore[attr-defined]
@@ -191,7 +202,8 @@ def _install_patches() -> dict[str, Any]:
                 if (
                     _in_guarded_scope()
                     and hasattr(a, "__cuda_array_interface__")
-                    and hasattr(a, "size") and a.size > 1
+                    and hasattr(a, "size")
+                    and a.size > 1
                     and not _caller_is_allowed()
                 ):
                     raise DeviceResidencyViolation(
@@ -218,6 +230,7 @@ def _uninstall_patches(originals: dict[str, Any]) -> None:
 
     try:
         import cupy as cp
+
         if "cp_ndarray_get" in originals:
             cp.ndarray.get = originals["cp_ndarray_get"]  # type: ignore[method-assign]
         if "cp_asnumpy" in originals:
@@ -227,6 +240,7 @@ def _uninstall_patches(originals: dict[str, Any]) -> None:
 
     try:
         import numpy as np
+
         if "np_asarray" in originals:
             np.asarray = originals["np_asarray"]  # type: ignore[attr-defined]
     except ImportError:

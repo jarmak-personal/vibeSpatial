@@ -40,11 +40,11 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import combined_residency
 
-from .measurement import _coord_stats_from_owned
 from .polygon import (
     _POLYGON_CENTROID_KERNEL_NAMES,
     _polygon_centroids_cpu,
@@ -54,6 +54,8 @@ if TYPE_CHECKING:
     from vibespatial.runtime.precision import PrecisionMode, PrecisionPlan
 
 from vibespatial.constructive.centroid_kernels import (
+    _INDEXED_SIMPLE_CENTROID_FP32,
+    _INDEXED_SIMPLE_CENTROID_FP64,
     _LINESTRING_CENTROID_FP32,
     _LINESTRING_CENTROID_FP64,
     _MULTILINESTRING_CENTROID_FP32,
@@ -66,6 +68,8 @@ from vibespatial.constructive.centroid_kernels import (
     _POLYGON_CENTROID_COOPERATIVE_FP64,
     _POLYGON_CENTROID_FP32,
     _POLYGON_CENTROID_FP64,
+    _POLYGON_CENTROID_INDEXED_FP32,
+    _POLYGON_CENTROID_INDEXED_FP64,
 )
 
 # ---------------------------------------------------------------------------
@@ -77,31 +81,85 @@ _MULTIPOINT_CENTROID_NAMES = ("multipoint_centroid",)
 _LINESTRING_CENTROID_NAMES = ("linestring_centroid",)
 _MULTILINESTRING_CENTROID_NAMES = ("multilinestring_centroid",)
 _POLYGON_CENTROID_COOPERATIVE_NAMES = ("polygon_centroid_cooperative",)
+_INDEXED_SIMPLE_CENTROID_NAMES = (
+    "point_centroid_indexed",
+    "multipoint_centroid_indexed",
+    "linestring_centroid_indexed",
+    "multilinestring_centroid_indexed",
+)
+_POLYGON_CENTROID_INDEXED_NAMES = (
+    "polygon_centroid_indexed",
+    "multipolygon_centroid_indexed",
+)
 
 
 # Background precompilation (ADR-0034)
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("centroid-point-fp64", _POINT_CENTROID_FP64, _POINT_CENTROID_NAMES),
-    ("centroid-point-fp32", _POINT_CENTROID_FP32, _POINT_CENTROID_NAMES),
-    ("centroid-multipoint-fp64", _MULTIPOINT_CENTROID_FP64, _MULTIPOINT_CENTROID_NAMES),
-    ("centroid-multipoint-fp32", _MULTIPOINT_CENTROID_FP32, _MULTIPOINT_CENTROID_NAMES),
-    ("centroid-linestring-fp64", _LINESTRING_CENTROID_FP64, _LINESTRING_CENTROID_NAMES),
-    ("centroid-linestring-fp32", _LINESTRING_CENTROID_FP32, _LINESTRING_CENTROID_NAMES),
-    ("centroid-multilinestring-fp64", _MULTILINESTRING_CENTROID_FP64, _MULTILINESTRING_CENTROID_NAMES),
-    ("centroid-multilinestring-fp32", _MULTILINESTRING_CENTROID_FP32, _MULTILINESTRING_CENTROID_NAMES),
-    ("centroid-polygon-cooperative-fp64", _POLYGON_CENTROID_COOPERATIVE_FP64, _POLYGON_CENTROID_COOPERATIVE_NAMES),
-    ("centroid-polygon-cooperative-fp32", _POLYGON_CENTROID_COOPERATIVE_FP32, _POLYGON_CENTROID_COOPERATIVE_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("centroid-point-fp64", _POINT_CENTROID_FP64, _POINT_CENTROID_NAMES),
+        ("centroid-point-fp32", _POINT_CENTROID_FP32, _POINT_CENTROID_NAMES),
+        ("centroid-multipoint-fp64", _MULTIPOINT_CENTROID_FP64, _MULTIPOINT_CENTROID_NAMES),
+        ("centroid-multipoint-fp32", _MULTIPOINT_CENTROID_FP32, _MULTIPOINT_CENTROID_NAMES),
+        ("centroid-linestring-fp64", _LINESTRING_CENTROID_FP64, _LINESTRING_CENTROID_NAMES),
+        ("centroid-linestring-fp32", _LINESTRING_CENTROID_FP32, _LINESTRING_CENTROID_NAMES),
+        (
+            "centroid-multilinestring-fp64",
+            _MULTILINESTRING_CENTROID_FP64,
+            _MULTILINESTRING_CENTROID_NAMES,
+        ),
+        (
+            "centroid-multilinestring-fp32",
+            _MULTILINESTRING_CENTROID_FP32,
+            _MULTILINESTRING_CENTROID_NAMES,
+        ),
+        (
+            "centroid-polygon-cooperative-fp64",
+            _POLYGON_CENTROID_COOPERATIVE_FP64,
+            _POLYGON_CENTROID_COOPERATIVE_NAMES,
+        ),
+        (
+            "centroid-polygon-cooperative-fp32",
+            _POLYGON_CENTROID_COOPERATIVE_FP32,
+            _POLYGON_CENTROID_COOPERATIVE_NAMES,
+        ),
+        (
+            "centroid-indexed-simple-fp64",
+            _INDEXED_SIMPLE_CENTROID_FP64,
+            _INDEXED_SIMPLE_CENTROID_NAMES,
+        ),
+        (
+            "centroid-indexed-simple-fp32",
+            _INDEXED_SIMPLE_CENTROID_FP32,
+            _INDEXED_SIMPLE_CENTROID_NAMES,
+        ),
+        (
+            "centroid-indexed-polygon-fp64",
+            _POLYGON_CENTROID_INDEXED_FP64,
+            _POLYGON_CENTROID_INDEXED_NAMES,
+        ),
+        (
+            "centroid-indexed-polygon-fp32",
+            _POLYGON_CENTROID_INDEXED_FP32,
+            _POLYGON_CENTROID_INDEXED_NAMES,
+        ),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # Kernel compilation helpers
 # ---------------------------------------------------------------------------
 
-def _compile_kernel(name_prefix: str, fp64_source: str, fp32_source: str,
-                    kernel_names: tuple[str, ...], compute_type: str = "double"):
+
+def _compile_kernel(
+    name_prefix: str,
+    fp64_source: str,
+    fp32_source: str,
+    kernel_names: tuple[str, ...],
+    compute_type: str = "double",
+):
     return _compile_precision_kernel(
         name_prefix,
         fp64_source,
@@ -114,19 +172,29 @@ def _compile_kernel(name_prefix: str, fp64_source: str, fp32_source: str,
 def _compile_polygon_centroid_kernel(compute_type: str = "double"):
     source = _POLYGON_CENTROID_FP64 if compute_type == "double" else _POLYGON_CENTROID_FP32
     suffix = "fp64" if compute_type == "double" else "fp32"
-    return compile_kernel_group(f"polygon-centroid-{suffix}", source, _POLYGON_CENTROID_KERNEL_NAMES)
+    return compile_kernel_group(
+        f"polygon-centroid-{suffix}", source, _POLYGON_CENTROID_KERNEL_NAMES
+    )
 
 
 # ---------------------------------------------------------------------------
 # GPU implementation: Centroid
 # ---------------------------------------------------------------------------
 
+
 @register_kernel_variant(
     "geometry_centroid",
     "gpu-cuda-python",
     kernel_class=KernelClass.METRIC,
     execution_modes=(ExecutionMode.GPU,),
-    geometry_families=("point", "multipoint", "linestring", "multilinestring", "polygon", "multipolygon"),
+    geometry_families=(
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
+    ),
     supports_mixed=True,
     tags=("cuda-python", "metric", "centroid", "kahan", "centered"),
 )
@@ -173,51 +241,108 @@ def _centroid_gpu(
 
     # --- Point family ---
     _launch_point_centroid(
-        owned, runtime, tags, family_row_offsets, device_state,
-        d_cx, d_cy, center_x, center_y, compute_type,
+        owned,
+        runtime,
+        tags,
+        family_row_offsets,
+        device_state,
+        d_cx,
+        d_cy,
+        center_x,
+        center_y,
+        compute_type,
     )
 
     # --- MultiPoint family ---
     _launch_simple_centroid(
-        owned, runtime, tags, family_row_offsets, device_state,
-        d_cx, d_cy, center_x, center_y, compute_type,
-        GeometryFamily.MULTIPOINT, "multipoint_centroid",
-        _MULTIPOINT_CENTROID_FP64, _MULTIPOINT_CENTROID_FP32,
-        _MULTIPOINT_CENTROID_NAMES, "centroid-multipoint",
+        owned,
+        runtime,
+        tags,
+        family_row_offsets,
+        device_state,
+        d_cx,
+        d_cy,
+        center_x,
+        center_y,
+        compute_type,
+        GeometryFamily.MULTIPOINT,
+        "multipoint_centroid",
+        _MULTIPOINT_CENTROID_FP64,
+        _MULTIPOINT_CENTROID_FP32,
+        _MULTIPOINT_CENTROID_NAMES,
+        "centroid-multipoint",
         has_part_offsets=False,
     )
 
     # --- LineString family ---
     _launch_simple_centroid(
-        owned, runtime, tags, family_row_offsets, device_state,
-        d_cx, d_cy, center_x, center_y, compute_type,
-        GeometryFamily.LINESTRING, "linestring_centroid",
-        _LINESTRING_CENTROID_FP64, _LINESTRING_CENTROID_FP32,
-        _LINESTRING_CENTROID_NAMES, "centroid-linestring",
+        owned,
+        runtime,
+        tags,
+        family_row_offsets,
+        device_state,
+        d_cx,
+        d_cy,
+        center_x,
+        center_y,
+        compute_type,
+        GeometryFamily.LINESTRING,
+        "linestring_centroid",
+        _LINESTRING_CENTROID_FP64,
+        _LINESTRING_CENTROID_FP32,
+        _LINESTRING_CENTROID_NAMES,
+        "centroid-linestring",
         has_part_offsets=False,
     )
 
     # --- MultiLineString family ---
     _launch_simple_centroid(
-        owned, runtime, tags, family_row_offsets, device_state,
-        d_cx, d_cy, center_x, center_y, compute_type,
-        GeometryFamily.MULTILINESTRING, "multilinestring_centroid",
-        _MULTILINESTRING_CENTROID_FP64, _MULTILINESTRING_CENTROID_FP32,
-        _MULTILINESTRING_CENTROID_NAMES, "centroid-multilinestring",
+        owned,
+        runtime,
+        tags,
+        family_row_offsets,
+        device_state,
+        d_cx,
+        d_cy,
+        center_x,
+        center_y,
+        compute_type,
+        GeometryFamily.MULTILINESTRING,
+        "multilinestring_centroid",
+        _MULTILINESTRING_CENTROID_FP64,
+        _MULTILINESTRING_CENTROID_FP32,
+        _MULTILINESTRING_CENTROID_NAMES,
+        "centroid-multilinestring",
         has_part_offsets=True,
     )
 
     # --- Polygon family ---
     _launch_polygon_centroid(
-        owned, runtime, tags, family_row_offsets, device_state,
-        d_cx, d_cy, center_x, center_y, compute_type,
+        owned,
+        runtime,
+        tags,
+        family_row_offsets,
+        device_state,
+        d_cx,
+        d_cy,
+        center_x,
+        center_y,
+        compute_type,
         GeometryFamily.POLYGON,
     )
 
     # --- MultiPolygon family ---
     _launch_polygon_centroid(
-        owned, runtime, tags, family_row_offsets, device_state,
-        d_cx, d_cy, center_x, center_y, compute_type,
+        owned,
+        runtime,
+        tags,
+        family_row_offsets,
+        device_state,
+        d_cx,
+        d_cy,
+        center_x,
+        center_y,
+        compute_type,
         GeometryFamily.MULTIPOLYGON,
     )
 
@@ -233,302 +358,203 @@ def _centroid_gpu(
 
 
 def _centroid_gpu_device_fp64(owned: OwnedGeometryArray):
-    """Compute centroids into two device-resident fp64 vectors.
-
-    This is the internal NativeExpression helper.  Public ``centroid_owned``
-    keeps the point-geometry return contract, while native metric consumers
-    need row-aligned scalar vectors that never touch host routing metadata.
-    """
+    """Compute centroids directly over logical row-indirected device rows."""
+    runtime = get_cuda_runtime()
     if owned.row_count == 0:
-        runtime = get_cuda_runtime()
         return (
             runtime.allocate((0,), np.float64),
             runtime.allocate((0,), np.float64),
         )
 
-    runtime = get_cuda_runtime()
-    device_state = owned._ensure_device_state()
+    state = owned._ensure_device_state(preserve_indexed_view=True)
+    d_tags = cp.asarray(state.tags, dtype=cp.int8)
+    d_family_rows = cp.asarray(state.family_row_offsets, dtype=cp.int32)
     d_cx = cp.full(owned.row_count, cp.nan, dtype=cp.float64)
     d_cy = cp.full(owned.row_count, cp.nan, dtype=cp.float64)
-    d_tags = cp.asarray(device_state.tags)
-    d_family_row_offsets = cp.asarray(device_state.family_row_offsets)
-    center_x, center_y = 0.0, 0.0
+    center_x = 0.0
+    center_y = 0.0
+    ptr = runtime.pointer
 
-    def _scatter_family_result(family: GeometryFamily, d_family_cx, d_family_cy) -> None:
-        global_rows = cp.flatnonzero(d_tags == FAMILY_TAGS[family]).astype(
-            cp.int64,
-            copy=False,
-        )
-        if int(global_rows.size) == 0:
-            return
-        family_rows = d_family_row_offsets[global_rows].astype(cp.int64, copy=False)
-        d_cx[global_rows] = d_family_cx[family_rows]
-        d_cy[global_rows] = d_family_cy[family_rows]
-
-    def _launch_point() -> None:
-        family = GeometryFamily.POINT
-        if family not in device_state.families:
-            return
-        ds = device_state.families[family]
-        n = int(ds.empty_mask.size)
-        if n <= 0:
-            return
-        kernels = _compile_kernel(
-            "centroid-point",
-            _POINT_CENTROID_FP64,
-            _POINT_CENTROID_FP32,
-            _POINT_CENTROID_NAMES,
-            "double",
-        )
-        d_family_cx = runtime.allocate((n,), np.float64)
-        d_family_cy = runtime.allocate((n,), np.float64)
-        try:
-            ptr = runtime.pointer
-            params = (
-                (
-                    ptr(ds.x),
-                    ptr(ds.y),
-                    ptr(ds.geometry_offsets),
-                    ptr(d_family_cx),
-                    ptr(d_family_cy),
+    simple_kernels = None
+    polygon_kernels = None
+    for family, buffer in state.families.items():
+        if family in {
+            GeometryFamily.POINT,
+            GeometryFamily.MULTIPOINT,
+            GeometryFamily.LINESTRING,
+            GeometryFamily.MULTILINESTRING,
+        }:
+            if simple_kernels is None:
+                simple_kernels = _compile_kernel(
+                    "centroid-indexed-simple",
+                    _INDEXED_SIMPLE_CENTROID_FP64,
+                    _INDEXED_SIMPLE_CENTROID_FP32,
+                    _INDEXED_SIMPLE_CENTROID_NAMES,
+                    "double",
+                )
+            kernel_name = {
+                GeometryFamily.POINT: "point_centroid_indexed",
+                GeometryFamily.MULTIPOINT: "multipoint_centroid_indexed",
+                GeometryFamily.LINESTRING: "linestring_centroid_indexed",
+                GeometryFamily.MULTILINESTRING: "multilinestring_centroid_indexed",
+            }[family]
+            kernel = simple_kernels[kernel_name]
+            if family is GeometryFamily.MULTILINESTRING:
+                if buffer.part_offsets is None:
+                    continue
+                values = (
+                    ptr(buffer.x),
+                    ptr(buffer.y),
+                    ptr(buffer.part_offsets),
+                    ptr(buffer.geometry_offsets),
+                    ptr(d_tags),
+                    ptr(d_family_rows),
+                    int(FAMILY_TAGS[family]),
+                    ptr(d_cx),
+                    ptr(d_cy),
                     center_x,
                     center_y,
-                    n,
-                ),
-                (
+                    owned.row_count,
+                )
+                types = (
                     KERNEL_PARAM_PTR,
                     KERNEL_PARAM_PTR,
                     KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
                     KERNEL_PARAM_PTR,
                     KERNEL_PARAM_PTR,
                     KERNEL_PARAM_F64,
                     KERNEL_PARAM_F64,
                     KERNEL_PARAM_I32,
-                ),
-            )
-            kernel = kernels["point_centroid"]
-            grid, block = runtime.launch_config(kernel, n)
-            runtime.launch(kernel, grid=grid, block=block, params=params)
-            _scatter_family_result(family, d_family_cx, d_family_cy)
-        finally:
-            runtime.free(d_family_cx)
-            runtime.free(d_family_cy)
-
-    def _launch_simple(
-        family: GeometryFamily,
-        kernel_name: str,
-        fp64_source: str,
-        fp32_source: str,
-        kernel_names: tuple[str, ...],
-        prefix: str,
-        *,
-        has_part_offsets: bool,
-    ) -> None:
-        if family not in device_state.families:
-            return
-        ds = device_state.families[family]
-        n = int(ds.empty_mask.size)
-        if n <= 0 or (has_part_offsets and ds.part_offsets is None):
-            return
-        kernels = _compile_kernel(prefix, fp64_source, fp32_source, kernel_names, "double")
-        d_family_cx = runtime.allocate((n,), np.float64)
-        d_family_cy = runtime.allocate((n,), np.float64)
-        try:
-            ptr = runtime.pointer
-            if has_part_offsets:
-                params = (
-                    (
-                        ptr(ds.x),
-                        ptr(ds.y),
-                        ptr(ds.part_offsets),
-                        ptr(ds.geometry_offsets),
-                        ptr(d_family_cx),
-                        ptr(d_family_cy),
-                        center_x,
-                        center_y,
-                        n,
-                    ),
-                    (
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_F64,
-                        KERNEL_PARAM_F64,
-                        KERNEL_PARAM_I32,
-                    ),
                 )
             else:
-                params = (
-                    (
-                        ptr(ds.x),
-                        ptr(ds.y),
-                        ptr(ds.geometry_offsets),
-                        ptr(d_family_cx),
-                        ptr(d_family_cy),
-                        center_x,
-                        center_y,
-                        n,
-                    ),
-                    (
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_F64,
-                        KERNEL_PARAM_F64,
-                        KERNEL_PARAM_I32,
-                    ),
+                values = (
+                    ptr(buffer.x),
+                    ptr(buffer.y),
+                    ptr(buffer.geometry_offsets),
+                    ptr(d_tags),
+                    ptr(d_family_rows),
+                    int(FAMILY_TAGS[family]),
+                    ptr(d_cx),
+                    ptr(d_cy),
+                    center_x,
+                    center_y,
+                    owned.row_count,
                 )
-            kernel = kernels[kernel_name]
-            grid, block = runtime.launch_config(kernel, n)
-            runtime.launch(kernel, grid=grid, block=block, params=params)
-            _scatter_family_result(family, d_family_cx, d_family_cy)
-        finally:
-            runtime.free(d_family_cx)
-            runtime.free(d_family_cy)
-
-    def _launch_polygon(family: GeometryFamily) -> None:
-        if family not in device_state.families:
-            return
-        ds = device_state.families[family]
-        n = int(ds.empty_mask.size)
-        if n <= 0 or ds.ring_offsets is None:
-            return
-        avg_verts = int(ds.x.size) / max(n, 1)
-        use_cooperative = (
-            family is GeometryFamily.POLYGON
-            and ds.dense_single_ring_width is not None
-            and avg_verts >= 64
-        )
-        if use_cooperative:
-            kernels = _compile_kernel(
-                "centroid-polygon-cooperative",
-                _POLYGON_CENTROID_COOPERATIVE_FP64,
-                _POLYGON_CENTROID_COOPERATIVE_FP32,
-                _POLYGON_CENTROID_COOPERATIVE_NAMES,
-                "double",
-            )
-            kernel = kernels["polygon_centroid_cooperative"]
-        else:
-            kernels = _compile_polygon_centroid_kernel("double")
-            kernel = (
-                kernels["polygon_centroid"]
-                if family is GeometryFamily.POLYGON
-                else kernels["multipolygon_centroid"]
-            )
-
-        d_family_cx = runtime.allocate((n,), np.float64)
-        d_family_cy = runtime.allocate((n,), np.float64)
-        try:
-            ptr = runtime.pointer
-            if use_cooperative or family is GeometryFamily.POLYGON:
-                params = (
-                    (
-                        ptr(ds.x),
-                        ptr(ds.y),
-                        ptr(ds.ring_offsets),
-                        ptr(ds.geometry_offsets),
-                        ptr(d_family_cx),
-                        ptr(d_family_cy),
-                        center_x,
-                        center_y,
-                        n,
-                    ),
-                    (
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_F64,
-                        KERNEL_PARAM_F64,
-                        KERNEL_PARAM_I32,
-                    ),
+                types = (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_I32,
+                )
+        elif family in {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}:
+            if buffer.ring_offsets is None:
+                continue
+            if polygon_kernels is None:
+                polygon_kernels = _compile_kernel(
+                    "centroid-indexed-polygon",
+                    _POLYGON_CENTROID_INDEXED_FP64,
+                    _POLYGON_CENTROID_INDEXED_FP32,
+                    _POLYGON_CENTROID_INDEXED_NAMES,
+                    "double",
+                )
+            if family is GeometryFamily.MULTIPOLYGON:
+                if buffer.part_offsets is None:
+                    continue
+                kernel = polygon_kernels["multipolygon_centroid_indexed"]
+                values = (
+                    ptr(buffer.x),
+                    ptr(buffer.y),
+                    ptr(buffer.ring_offsets),
+                    ptr(buffer.part_offsets),
+                    ptr(buffer.geometry_offsets),
+                    ptr(d_tags),
+                    ptr(d_family_rows),
+                    int(FAMILY_TAGS[family]),
+                    ptr(d_cx),
+                    ptr(d_cy),
+                    center_x,
+                    center_y,
+                    owned.row_count,
+                )
+                types = (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_I32,
                 )
             else:
-                if ds.part_offsets is None:
-                    return
-                params = (
-                    (
-                        ptr(ds.x),
-                        ptr(ds.y),
-                        ptr(ds.ring_offsets),
-                        ptr(ds.part_offsets),
-                        ptr(ds.geometry_offsets),
-                        ptr(d_family_cx),
-                        ptr(d_family_cy),
-                        center_x,
-                        center_y,
-                        n,
-                    ),
-                    (
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_F64,
-                        KERNEL_PARAM_F64,
-                        KERNEL_PARAM_I32,
-                    ),
+                kernel = polygon_kernels["polygon_centroid_indexed"]
+                values = (
+                    ptr(buffer.x),
+                    ptr(buffer.y),
+                    ptr(buffer.ring_offsets),
+                    ptr(buffer.geometry_offsets),
+                    ptr(d_tags),
+                    ptr(d_family_rows),
+                    int(FAMILY_TAGS[family]),
+                    ptr(d_cx),
+                    ptr(d_cy),
+                    center_x,
+                    center_y,
+                    owned.row_count,
                 )
-            if use_cooperative:
-                grid = (n, 1, 1)
-                block = (256, 1, 1)
-            else:
-                grid, block = runtime.launch_config(kernel, n)
-            runtime.launch(kernel, grid=grid, block=block, params=params)
-            _scatter_family_result(family, d_family_cx, d_family_cy)
-        finally:
-            runtime.free(d_family_cx)
-            runtime.free(d_family_cy)
+                types = (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_I32,
+                )
+        else:  # pragma: no cover - GeometryFamily is exhaustively handled
+            continue
 
-    _launch_point()
-    _launch_simple(
-        GeometryFamily.MULTIPOINT,
-        "multipoint_centroid",
-        _MULTIPOINT_CENTROID_FP64,
-        _MULTIPOINT_CENTROID_FP32,
-        _MULTIPOINT_CENTROID_NAMES,
-        "centroid-multipoint",
-        has_part_offsets=False,
-    )
-    _launch_simple(
-        GeometryFamily.LINESTRING,
-        "linestring_centroid",
-        _LINESTRING_CENTROID_FP64,
-        _LINESTRING_CENTROID_FP32,
-        _LINESTRING_CENTROID_NAMES,
-        "centroid-linestring",
-        has_part_offsets=False,
-    )
-    _launch_simple(
-        GeometryFamily.MULTILINESTRING,
-        "multilinestring_centroid",
-        _MULTILINESTRING_CENTROID_FP64,
-        _MULTILINESTRING_CENTROID_FP32,
-        _MULTILINESTRING_CENTROID_NAMES,
-        "centroid-multilinestring",
-        has_part_offsets=True,
-    )
-    _launch_polygon(GeometryFamily.POLYGON)
-    _launch_polygon(GeometryFamily.MULTIPOLYGON)
+        grid, block = runtime.launch_config(kernel, owned.row_count)
+        runtime.launch(kernel, grid=grid, block=block, params=((values), types))
 
-    d_cx[~cp.asarray(device_state.validity)] = cp.nan
-    d_cy[~cp.asarray(device_state.validity)] = cp.nan
+    d_validity = cp.asarray(state.validity, dtype=cp.bool_)
+    d_cx[~d_validity] = cp.nan
+    d_cy[~d_validity] = cp.nan
     return d_cx, d_cy
 
 
 def _launch_point_centroid(
-    owned, runtime, tags, family_row_offsets, device_state,
-    d_out_cx, d_out_cy, center_x, center_y, compute_type,
+    owned,
+    runtime,
+    tags,
+    family_row_offsets,
+    device_state,
+    d_out_cx,
+    d_out_cy,
+    center_x,
+    center_y,
+    compute_type,
 ):
     """Launch point centroid kernel (identity copy).
 
@@ -541,15 +567,20 @@ def _launch_point_centroid(
     buf = owned.families[GeometryFamily.POINT]
 
     kernels = _compile_kernel(
-        "centroid-point", _POINT_CENTROID_FP64, _POINT_CENTROID_FP32,
-        _POINT_CENTROID_NAMES, compute_type,
+        "centroid-point",
+        _POINT_CENTROID_FP64,
+        _POINT_CENTROID_FP32,
+        _POINT_CENTROID_NAMES,
+        compute_type,
     )
     kernel = kernels["point_centroid"]
     global_rows = np.flatnonzero(mask)
     family_rows = family_row_offsets[global_rows]
     n = buf.row_count
 
-    needs_free = device_state is None or GeometryFamily.POINT not in (device_state.families if device_state else {})
+    needs_free = device_state is None or GeometryFamily.POINT not in (
+        device_state.families if device_state else {}
+    )
     allocated = []
     if not needs_free:
         ds = device_state.families[GeometryFamily.POINT]
@@ -566,11 +597,17 @@ def _launch_point_centroid(
     try:
         ptr = runtime.pointer
         params = (
-            (ptr(d_x), ptr(d_y), ptr(d_geom),
-             ptr(d_cx), ptr(d_cy), center_x, center_y, n),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-             KERNEL_PARAM_I32),
+            (ptr(d_x), ptr(d_y), ptr(d_geom), ptr(d_cx), ptr(d_cy), center_x, center_y, n),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -587,9 +624,22 @@ def _launch_point_centroid(
 
 
 def _launch_simple_centroid(
-    owned, runtime, tags, family_row_offsets, device_state,
-    d_out_cx, d_out_cy, center_x, center_y, compute_type,
-    family, kernel_name, fp64_source, fp32_source, kernel_names, prefix,
+    owned,
+    runtime,
+    tags,
+    family_row_offsets,
+    device_state,
+    d_out_cx,
+    d_out_cy,
+    center_x,
+    center_y,
+    compute_type,
+    family,
+    kernel_name,
+    fp64_source,
+    fp32_source,
+    kernel_names,
+    prefix,
     has_part_offsets,
 ):
     """Launch centroid kernel for MultiPoint, LineString, or MultiLineString.
@@ -603,10 +653,10 @@ def _launch_simple_centroid(
     buf = owned.families[family]
     if has_part_offsets:
         has_parts = (
-            (device_state is not None and family in device_state.families
-             and device_state.families[family].part_offsets is not None)
-            or buf.part_offsets is not None
-        )
+            device_state is not None
+            and family in device_state.families
+            and device_state.families[family].part_offsets is not None
+        ) or buf.part_offsets is not None
         if not has_parts:
             return
 
@@ -616,7 +666,9 @@ def _launch_simple_centroid(
     family_rows = family_row_offsets[global_rows]
     n = buf.row_count
 
-    needs_free = device_state is None or family not in (device_state.families if device_state else {})
+    needs_free = device_state is None or family not in (
+        device_state.families if device_state else {}
+    )
     allocated = []
     if not needs_free:
         ds = device_state.families[family]
@@ -640,19 +692,42 @@ def _launch_simple_centroid(
         ptr = runtime.pointer
         if has_part_offsets:
             params = (
-                (ptr(d_x), ptr(d_y), ptr(d_part), ptr(d_geom),
-                 ptr(d_cx), ptr(d_cy), center_x, center_y, n),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-                 KERNEL_PARAM_I32),
+                (
+                    ptr(d_x),
+                    ptr(d_y),
+                    ptr(d_part),
+                    ptr(d_geom),
+                    ptr(d_cx),
+                    ptr(d_cy),
+                    center_x,
+                    center_y,
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_I32,
+                ),
             )
         else:
             params = (
-                (ptr(d_x), ptr(d_y), ptr(d_geom),
-                 ptr(d_cx), ptr(d_cy), center_x, center_y, n),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-                 KERNEL_PARAM_I32),
+                (ptr(d_x), ptr(d_y), ptr(d_geom), ptr(d_cx), ptr(d_cy), center_x, center_y, n),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_I32,
+                ),
             )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -669,8 +744,16 @@ def _launch_simple_centroid(
 
 
 def _launch_polygon_centroid(
-    owned, runtime, tags, family_row_offsets, device_state,
-    d_out_cx, d_out_cy, center_x, center_y, compute_type,
+    owned,
+    runtime,
+    tags,
+    family_row_offsets,
+    device_state,
+    d_out_cx,
+    d_out_cy,
+    center_x,
+    center_y,
+    compute_type,
     family,
 ):
     """Launch polygon centroid kernel (Polygon or MultiPolygon).
@@ -704,8 +787,10 @@ def _launch_polygon_centroid(
     if use_cooperative:
         coop_kernels = _compile_kernel(
             "centroid-polygon-cooperative",
-            _POLYGON_CENTROID_COOPERATIVE_FP64, _POLYGON_CENTROID_COOPERATIVE_FP32,
-            _POLYGON_CENTROID_COOPERATIVE_NAMES, compute_type,
+            _POLYGON_CENTROID_COOPERATIVE_FP64,
+            _POLYGON_CENTROID_COOPERATIVE_FP32,
+            _POLYGON_CENTROID_COOPERATIVE_NAMES,
+            compute_type,
         )
         kernel = coop_kernels["polygon_centroid_cooperative"]
     else:
@@ -715,7 +800,9 @@ def _launch_polygon_centroid(
     global_rows = np.flatnonzero(mask)
     family_rows = family_row_offsets[global_rows]
 
-    needs_free = device_state is None or family not in (device_state.families if device_state else {})
+    needs_free = device_state is None or family not in (
+        device_state.families if device_state else {}
+    )
     allocated = []
     if not needs_free:
         ds = device_state.families[family]
@@ -744,20 +831,56 @@ def _launch_polygon_centroid(
         if use_cooperative or family is GeometryFamily.POLYGON:
             kernel = kernel if use_cooperative else kernels["polygon_centroid"]
             params = (
-                (ptr(d_x), ptr(d_y), ptr(d_ring), ptr(d_geom),
-                 ptr(d_cx), ptr(d_cy), center_x, center_y, n),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-                 KERNEL_PARAM_I32),
+                (
+                    ptr(d_x),
+                    ptr(d_y),
+                    ptr(d_ring),
+                    ptr(d_geom),
+                    ptr(d_cx),
+                    ptr(d_cy),
+                    center_x,
+                    center_y,
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_I32,
+                ),
             )
         else:
             kernel = kernels["multipolygon_centroid"]
             params = (
-                (ptr(d_x), ptr(d_y), ptr(d_ring), ptr(d_part), ptr(d_geom),
-                 ptr(d_cx), ptr(d_cy), center_x, center_y, n),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-                 KERNEL_PARAM_I32),
+                (
+                    ptr(d_x),
+                    ptr(d_y),
+                    ptr(d_ring),
+                    ptr(d_part),
+                    ptr(d_geom),
+                    ptr(d_cx),
+                    ptr(d_cy),
+                    center_x,
+                    center_y,
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_I32,
+                ),
             )
         if use_cooperative:
             # 1 block per geometry; fixed at 256 to match __launch_bounds__(256, 4)
@@ -783,12 +906,20 @@ def _launch_polygon_centroid(
 # CPU fallback: Centroid (NumPy, delegates to polygon_constructive for polygons)
 # ---------------------------------------------------------------------------
 
+
 @register_kernel_variant(
     "geometry_centroid",
     "cpu",
     kernel_class=KernelClass.METRIC,
     execution_modes=(ExecutionMode.CPU,),
-    geometry_families=("point", "multipoint", "linestring", "multilinestring", "polygon", "multipolygon"),
+    geometry_families=(
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
+    ),
     supports_mixed=True,
     tags=("numpy", "metric", "centroid"),
 )
@@ -960,6 +1091,7 @@ def _length_weighted_centroid(x, y, cs, ce):
 # Public dispatch API
 # ---------------------------------------------------------------------------
 
+
 def centroid_owned(
     owned: OwnedGeometryArray,
     *,
@@ -991,13 +1123,17 @@ def centroid_owned(
         kernel_name="geometry_centroid",
         kernel_class=KernelClass.METRIC,
         row_count=row_count,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            output_byte_count=row_count * 16,
+            primary_unit_name="centroid-ring-coordinate",
+        ),
         requested_mode=dispatch_mode,
         current_residency=combined_residency(owned),
     )
 
     if selection.selected is ExecutionMode.GPU:
-        max_abs, coord_min, coord_max = _coord_stats_from_owned(owned)
-        span = coord_max - coord_min if np.isfinite(coord_min) else 0.0
         # The centroid shoelace formula involves products of coordinates
         # (xi*yi1 - xi1*yi) which require constructive-level precision.
         # fp32 introduces unacceptable absolute errors even with Kahan
@@ -1008,10 +1144,16 @@ def centroid_owned(
             kernel_name="geometry_centroid",
             kernel_class=KernelClass.METRIC,
             row_count=row_count,
+            work_estimate=estimate_physical_work_from_owned(
+                owned,
+                output_row_count=row_count,
+                output_byte_count=row_count * 16,
+                primary_unit_name="centroid-ring-coordinate",
+            ),
             requested_mode=dispatch_mode,
             requested_precision=precision,
             precision_kernel_class=KernelClass.CONSTRUCTIVE,
-            coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
+            coordinate_stats=CoordinateStats(),
             current_residency=combined_residency(owned),
         )
         precision_plan = selection.precision_plan

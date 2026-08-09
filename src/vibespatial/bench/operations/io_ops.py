@@ -1,4 +1,5 @@
 """IO operation benchmarks: io-arrow, io-file, gpu-decode, mixed-layouts."""
+
 from __future__ import annotations
 
 from typing import Any

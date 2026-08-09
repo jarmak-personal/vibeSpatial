@@ -75,7 +75,9 @@ class FixtureProfileResult:
         }
 
 
-def _resolve_fixture_path(name_or_path: str | Path, *, fixture_dir: str | Path | None = None) -> Path:
+def _resolve_fixture_path(
+    name_or_path: str | Path, *, fixture_dir: str | Path | None = None
+) -> Path:
     path = Path(name_or_path)
     if path.suffix == ".parquet" or path.exists():
         return path
@@ -98,7 +100,10 @@ def _load_query_geometry(
     if query_mode == "translated-self":
         started = perf_counter()
         values = np.asarray(
-            [translate(geometry, xoff=10_000.0, yoff=10_000.0) for geometry in tree_frame.geometry.to_numpy()],
+            [
+                translate(geometry, xoff=10_000.0, yoff=10_000.0)
+                for geometry in tree_frame.geometry.to_numpy()
+            ],
             dtype=object,
         )
         query = geopandas.GeoSeries(values, crs=tree_frame.crs)
@@ -147,7 +152,9 @@ def profile_fixture_query(
 
     with _nvtx_range("fixture.query", "green"):
         started = perf_counter()
-        result = sindex.query(query_geometry, predicate=predicate, sort=sort, output_format=output_format)
+        result = sindex.query(
+            query_geometry, predicate=predicate, sort=sort, output_format=output_format
+        )
         operation_elapsed = perf_counter() - started
 
     with _nvtx_range("fixture.result_shape", "orange"):
@@ -216,7 +223,9 @@ def profile_fixture_nearest(
         operation_elapsed = perf_counter() - started
 
     with _nvtx_range("fixture.result_shape", "orange"):
-        result_pairs = _result_pair_count(result, output_format="indices", return_distance=return_distance)
+        result_pairs = _result_pair_count(
+            result, output_format="indices", return_distance=return_distance
+        )
 
     events = tuple(event.to_dict() for event in get_dispatch_events(clear=True))
     return FixtureProfileResult(
@@ -238,5 +247,7 @@ def profile_fixture_nearest(
     )
 
 
-def ensure_named_fixture(name: str, *, fixture_dir: str | Path | None = None, force: bool = False) -> Path:
+def ensure_named_fixture(
+    name: str, *, fixture_dir: str | Path | None = None, force: bool = False
+) -> Path:
     return ensure_fixture(name, fixture_dir=fixture_dir, force=force)

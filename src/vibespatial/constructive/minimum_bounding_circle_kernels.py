@@ -131,8 +131,8 @@ extern "C" __global__ void ritter_bounding_circle(
 """
 _RITTER_KERNEL_NAMES = ("ritter_bounding_circle",)
 _TESSELLATE_KERNEL_SOURCE = (
-    "\n#define N_VERTS " + str(_N_TESSELLATION_VERTS) + "\n"
-) + r"""
+    ("\n#define N_VERTS " + str(_N_TESSELLATION_VERTS) + "\n")
+    + r"""
 /* Tessellate circles to closed polygon rings.
  *
  * Each thread handles one geometry.  Output ring has N_VERTS+1 coordinates
@@ -175,4 +175,5 @@ extern "C" __global__ void tessellate_circle(
     out_y[base + N_VERTS] = out_y[base];
 }
 """
+)
 _TESSELLATE_KERNEL_NAMES = ("tessellate_circle",)

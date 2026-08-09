@@ -9,6 +9,7 @@ ADBC is an OPTIONAL dependency. All public functions return ``None`` when
 ADBC is not installed, allowing the caller to fall back to the existing
 Shapely-based path transparently.
 """
+
 from __future__ import annotations
 
 import re
@@ -29,9 +30,7 @@ if TYPE_CHECKING:
 # Helpers
 # ---------------------------------------------------------------------------
 
-_SIMPLE_TABLE_RE = re.compile(
-    r"^\s*(?:(?P<schema>[a-zA-Z_]\w*)\.)?(?P<table>[a-zA-Z_]\w*)\s*$"
-)
+_SIMPLE_TABLE_RE = re.compile(r"^\s*(?:(?P<schema>[a-zA-Z_]\w*)\.)?(?P<table>[a-zA-Z_]\w*)\s*$")
 """Matches a bare ``schema.table`` or ``table`` identifier (no SQL keywords)."""
 
 
@@ -47,10 +46,7 @@ def _wrap_sql_for_wkb(sql: str, geom_col: str) -> str:
     by ``ST_AsBinary("<geom_col>")`` and aliased to ``__vibes_wkb``.  The
     original geometry column is kept in ``*`` but we drop it post-fetch.
     """
-    return (
-        f'SELECT *, ST_AsBinary("{geom_col}") AS __vibes_wkb '
-        f"FROM ({sql}) AS __vibes_sub"
-    )
+    return f'SELECT *, ST_AsBinary("{geom_col}") AS __vibes_wkb FROM ({sql}) AS __vibes_sub'
 
 
 def _get_connection_uri(con: object) -> str | None:
@@ -85,8 +81,10 @@ def _is_postgresql_uri(uri: str) -> bool:
 
 
 def _is_sqlalchemy_like_connectable(con: object) -> bool:
-    return isinstance(con, str) or hasattr(con, "url") or (
-        hasattr(con, "engine") and hasattr(con.engine, "url")
+    return (
+        isinstance(con, str)
+        or hasattr(con, "url")
+        or (hasattr(con, "engine") and hasattr(con.engine, "url"))
     )
 
 
@@ -137,9 +135,7 @@ def _detect_crs_from_table(
         import adbc_driver_postgresql.dbapi as pg_dbapi
 
         with pg_dbapi.connect(con_uri) as conn, conn.cursor() as cur:
-            cur.execute(
-                f"SELECT Find_SRID('{schema}', '{table}', '{geom_col}')"
-            )
+            cur.execute(f"SELECT Find_SRID('{schema}', '{table}', '{geom_col}')")
             row = cur.fetchone()
             if row is not None and row[0] not in (None, 0):
                 return f"EPSG:{row[0]}"
@@ -197,9 +193,7 @@ def _arrow_table_to_native_tabular_result(
     wkb_column = table.column(geom_col).combine_chunks()
 
     # If the column is string/utf8 (hex WKB), convert to binary
-    if pa.types.is_string(wkb_column.type) or pa.types.is_large_string(
-        wkb_column.type
-    ):
+    if pa.types.is_string(wkb_column.type) or pa.types.is_large_string(wkb_column.type):
         wkb_column = pa.array(
             [bytes.fromhex(v.as_py()) if v.is_valid else None for v in wkb_column],
             type=pa.binary(),
@@ -323,10 +317,7 @@ def read_postgis_native(
         # Rename __vibes_wkb → geom_col
         idx = table.column_names.index("__vibes_wkb")
         table = table.rename_columns(
-            [
-                geom_col if i == idx else c
-                for i, c in enumerate(table.column_names)
-            ]
+            [geom_col if i == idx else c for i, c in enumerate(table.column_names)]
         )
 
     # --- assemble native result ----------------------------------------------
@@ -463,8 +454,7 @@ def to_postgis_gpu(
         import shapely
 
         wkb_list = [
-            shapely.to_wkb(g) if g is not None and not g.is_empty else None
-            for g in geom_values
+            shapely.to_wkb(g) if g is not None and not g.is_empty else None for g in geom_values
         ]
         record_fallback_event(
             surface="vibespatial.io.postgis_gpu",
@@ -524,7 +514,7 @@ def to_postgis_gpu(
             alter_sql = (
                 f'ALTER TABLE "{schema_name}"."{name}" '
                 f'ALTER COLUMN "{geom_name}" '
-                f"TYPE geometry USING ST_GeomFromWKB(\"{geom_name}\", {srid})"
+                f'TYPE geometry USING ST_GeomFromWKB("{geom_name}", {srid})'
             )
             cur.execute(alter_sql)
             conn.commit()

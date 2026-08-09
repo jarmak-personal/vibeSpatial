@@ -122,7 +122,9 @@ def _escape_osm_tag_text(value: str) -> str:
 
 
 def _osm_tag_is_ignored(key: str, ignored_keys: frozenset[str]) -> bool:
-    return key in ignored_keys or any(key.startswith(prefix) for prefix in _OSM_IGNORE_COMMON_PREFIXES)
+    return key in ignored_keys or any(
+        key.startswith(prefix) for prefix in _OSM_IGNORE_COMMON_PREFIXES
+    )
 
 
 def _compute_osm_z_order(tag_map: dict[str, str]) -> int | None:
@@ -162,7 +164,9 @@ def _compute_osm_z_order(tag_map: dict[str, str]) -> int | None:
     return rank
 
 
-def _stable_partition_columns(*, element: str, include_ids: bool, include_tags: bool) -> tuple[str, ...]:
+def _stable_partition_columns(
+    *, element: str, include_ids: bool, include_tags: bool
+) -> tuple[str, ...]:
     columns: list[str] = ["osm_element"]
     if include_ids:
         columns.append("osm_id")
@@ -202,8 +206,7 @@ def _build_osm_partition_frame(
         return pd.DataFrame(data, index=pd.RangeIndex(row_count))
 
     promoted = {
-        column_name: np.empty(row_count, dtype=object)
-        for column_name in profile.promoted_columns
+        column_name: np.empty(row_count, dtype=object) for column_name in profile.promoted_columns
     }
     other_tags = np.empty(row_count, dtype=object)
     for values in promoted.values():
@@ -220,9 +223,7 @@ def _build_osm_partition_frame(
             else:
                 if _osm_tag_is_ignored(key, profile.ignore_keys):
                     continue
-                extras.append(
-                    f'"{_escape_osm_tag_text(key)}"=>"{_escape_osm_tag_text(value)}"'
-                )
+                extras.append(f'"{_escape_osm_tag_text(key)}"=>"{_escape_osm_tag_text(value)}"')
         if profile.compute_z_order:
             z_order = _compute_osm_z_order(tag_map)
             if z_order is not None:
@@ -267,7 +268,9 @@ def _build_osm_partition_attributes(
     )
 
 
-def _rebuild_native_result(payload: NativeTabularResult, attributes: NativeAttributeTable) -> NativeTabularResult:
+def _rebuild_native_result(
+    payload: NativeTabularResult, attributes: NativeAttributeTable
+) -> NativeTabularResult:
     return NativeTabularResult(
         attributes=attributes,
         geometry=payload.geometry,
@@ -279,7 +282,9 @@ def _rebuild_native_result(payload: NativeTabularResult, attributes: NativeAttri
     )
 
 
-def _select_attribute_columns(attributes: NativeAttributeTable, keep_columns: tuple[str, ...]) -> NativeAttributeTable:
+def _select_attribute_columns(
+    attributes: NativeAttributeTable, keep_columns: tuple[str, ...]
+) -> NativeAttributeTable:
     if attributes.loader is not None:
         parent = attributes
 
@@ -305,15 +310,21 @@ def _select_attribute_columns(attributes: NativeAttributeTable, keep_columns: tu
     return NativeAttributeTable(dataframe=frame)
 
 
-def _drop_attribute_columns(payload: NativeTabularResult, drop_columns: tuple[str, ...]) -> NativeTabularResult:
-    keep_columns = tuple(column for column in payload.attributes.columns if column not in set(drop_columns))
+def _drop_attribute_columns(
+    payload: NativeTabularResult, drop_columns: tuple[str, ...]
+) -> NativeTabularResult:
+    keep_columns = tuple(
+        column for column in payload.attributes.columns if column not in set(drop_columns)
+    )
     return _rebuild_native_result(
         payload,
         _select_attribute_columns(payload.attributes, keep_columns),
     )
 
 
-def _rename_attribute_columns(payload: NativeTabularResult, mapping: dict[str, str]) -> NativeTabularResult:
+def _rename_attribute_columns(
+    payload: NativeTabularResult, mapping: dict[str, str]
+) -> NativeTabularResult:
     if not mapping:
         return payload
     attributes = payload.attributes.rename_columns(mapping)
@@ -425,12 +436,16 @@ class OsmNativeBundle:
 
         if normalized_layer == "points":
             payload = None if self.points is None else self.points.result
-            return _compat_partition_result(
-                payload,
-                element="node",
-                normalized_layer=normalized_layer,
-                n_types=1,
-            ) if compatibility else payload
+            return (
+                _compat_partition_result(
+                    payload,
+                    element="node",
+                    normalized_layer=normalized_layer,
+                    n_types=1,
+                )
+                if compatibility
+                else payload
+            )
 
         if normalized_layer in {"lines", "ways"}:
             payload = None if self.ways is None else self.ways.result
@@ -439,21 +454,29 @@ class OsmNativeBundle:
                     payload,
                     families=(GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING),
                 )
-            return _compat_partition_result(
-                payload,
-                element="way",
-                normalized_layer=normalized_layer,
-                n_types=1,
-            ) if compatibility else payload
+            return (
+                _compat_partition_result(
+                    payload,
+                    element="way",
+                    normalized_layer=normalized_layer,
+                    n_types=1,
+                )
+                if compatibility
+                else payload
+            )
 
         if normalized_layer == "relations":
             payload = None if self.relations is None else self.relations.result
-            return _compat_partition_result(
-                payload,
-                element="relation",
-                normalized_layer=normalized_layer,
-                n_types=1,
-            ) if compatibility else payload
+            return (
+                _compat_partition_result(
+                    payload,
+                    element="relation",
+                    normalized_layer=normalized_layer,
+                    n_types=1,
+                )
+                if compatibility
+                else payload
+            )
 
         if normalized_layer == "multipolygons":
             results: list[NativeTabularResult] = []
@@ -469,7 +492,9 @@ class OsmNativeBundle:
                         element="way",
                         normalized_layer=normalized_layer,
                         n_types=1,
-                    ) if compatibility else way_payload
+                    )
+                    if compatibility
+                    else way_payload
                 )
             relation_payload = None if self.relations is None else self.relations.result
             if relation_payload is not None:
@@ -479,7 +504,9 @@ class OsmNativeBundle:
                         element="relation",
                         normalized_layer=normalized_layer,
                         n_types=1,
-                    ) if compatibility else relation_payload
+                    )
+                    if compatibility
+                    else relation_payload
                 )
             if not results:
                 return None
@@ -499,7 +526,9 @@ class OsmNativeBundle:
                     element="node",
                     normalized_layer=normalized_layer,
                     n_types=len(self.partitions),
-                ) if compatibility else self.points.result
+                )
+                if compatibility
+                else self.points.result
             )
         if self.ways is not None:
             results.append(
@@ -508,7 +537,9 @@ class OsmNativeBundle:
                     element="way",
                     normalized_layer=normalized_layer,
                     n_types=len(self.partitions),
-                ) if compatibility else self.ways.result
+                )
+                if compatibility
+                else self.ways.result
             )
         if self.relations is not None:
             results.append(
@@ -517,7 +548,9 @@ class OsmNativeBundle:
                     element="relation",
                     normalized_layer=normalized_layer,
                     n_types=len(self.partitions),
-                ) if compatibility else self.relations.result
+                )
+                if compatibility
+                else self.relations.result
             )
         if not results:
             return None

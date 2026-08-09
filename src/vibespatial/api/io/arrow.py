@@ -5,7 +5,7 @@ from typing import Literal, get_args
 
 import numpy as np
 import shapely
-from pandas import DataFrame, Series
+from pandas import DataFrame, RangeIndex, Series
 
 import vibespatial.api as geopandas
 from vibespatial.api import GeoDataFrame
@@ -137,6 +137,208 @@ def _get_geometry_types(series):
     return sorted([_geometry_type_names[idx] for idx in geometry_types])
 
 
+_VIBESPATIAL_METADATA_KEY = "vibespatial"
+_VIBESPATIAL_SHAPE_PROOF_KEY = "shape_proof"
+_REGULAR_GRID_RECT_PROOF_KIND = "regular_grid_rect"
+_REGULAR_GRID_RECT_PROOF_VERSION = 1
+
+
+def _shape_proof_metadata_from_device_owned(owned) -> dict | None:
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    state = getattr(owned, "device_state", None)
+    if state is None or GeometryFamily.POLYGON not in getattr(state, "families", {}):
+        return None
+    if set(getattr(state, "families", {}).keys()) != {GeometryFamily.POLYGON}:
+        return None
+    polygon_buffer = state.families[GeometryFamily.POLYGON]
+    proof = getattr(polygon_buffer, "regular_grid_rect", None)
+    if proof is None or int(proof.size) != int(getattr(owned, "row_count", -1)):
+        return None
+    if (
+        int(getattr(polygon_buffer, "dense_single_ring_width", 0) or 0) != 5
+        or not bool(getattr(polygon_buffer, "axis_aligned_rectangles", False))
+    ):
+        return None
+    return {
+        "kind": _REGULAR_GRID_RECT_PROOF_KIND,
+        "version": _REGULAR_GRID_RECT_PROOF_VERSION,
+        "origin_x": float(proof.origin_x),
+        "origin_y": float(proof.origin_y),
+        "cell_width": float(proof.cell_width),
+        "cell_height": float(proof.cell_height),
+        "cols": int(proof.cols),
+        "rows": int(proof.rows),
+        "size": int(proof.size),
+        "total_bounds": [float(value) for value in proof.total_bounds],
+    }
+
+
+def _regular_grid_rect_shape_proof_metadata(series, geometry_types) -> dict | None:
+    """Return a validated regular-grid rectangle proof for GeoParquet metadata.
+
+    The proof is terminal-export metadata: device-owned arrays reuse an
+    existing trusted native proof, while host GeoSeries are validated against
+    their public Shapely coordinates before the proof is serialized.
+    """
+    from vibespatial.geometry.device_array import DeviceGeometryArray
+    from vibespatial.geometry.owned import OwnedGeometryArray
+
+    arr = series.array
+    owned = arr.to_owned() if isinstance(arr, DeviceGeometryArray) else getattr(arr, "_owned", None)
+    if isinstance(owned, OwnedGeometryArray):
+        metadata = _shape_proof_metadata_from_device_owned(owned)
+        if metadata is not None:
+            return metadata
+        if isinstance(arr, DeviceGeometryArray):
+            return None
+
+    if geometry_types != ["Polygon"]:
+        return None
+    row_count = len(series)
+    if row_count <= 1:
+        return None
+
+    values = np.asarray(series.array, dtype=object)
+    if values.size != row_count:
+        return None
+    try:
+        if np.any(shapely.is_missing(values)) or np.any(shapely.is_empty(values)):
+            return None
+        if np.any(shapely.get_type_id(values) != 3):
+            return None
+        if np.any(shapely.get_num_interior_rings(values) != 0):
+            return None
+        if np.any(shapely.get_num_coordinates(values) != 5):
+            return None
+        bounds_frame = series.bounds
+        bounds = np.asarray(
+            bounds_frame[["minx", "miny", "maxx", "maxy"]],
+            dtype=np.float64,
+        )
+    except Exception:
+        return None
+    if bounds.shape != (row_count, 4) or np.isnan(bounds).any():
+        return None
+
+    widths = bounds[:, 2] - bounds[:, 0]
+    heights = bounds[:, 3] - bounds[:, 1]
+    if np.any(widths <= 0.0) or np.any(heights <= 0.0):
+        return None
+    cell_width = float(widths[0])
+    cell_height = float(heights[0])
+    tol_scale = max(abs(cell_width), abs(cell_height), 1.0)
+    if np.any(np.abs(widths - cell_width) > 1e-9 * tol_scale):
+        return None
+    if np.any(np.abs(heights - cell_height) > 1e-9 * tol_scale):
+        return None
+
+    origin_x = float(bounds[:, 0].min())
+    origin_y = float(bounds[:, 1].min())
+    cols = int(np.rint((bounds[:, 0].max() - origin_x) / cell_width)) + 1
+    rows = int(np.rint((bounds[:, 1].max() - origin_y) / cell_height)) + 1
+    if cols <= 0 or rows <= 0:
+        return None
+    col_index = np.rint((bounds[:, 0] - origin_x) / cell_width).astype(
+        np.int64,
+        copy=False,
+    )
+    row_index = np.rint((bounds[:, 1] - origin_y) / cell_height).astype(
+        np.int64,
+        copy=False,
+    )
+    if np.any(col_index < 0) or np.any(col_index >= cols):
+        return None
+    if np.any(row_index < 0) or np.any(row_index >= rows):
+        return None
+    expected_index = row_index * np.int64(cols) + col_index
+    if not np.array_equal(expected_index, np.arange(row_count, dtype=np.int64)):
+        return None
+
+    try:
+        coords = shapely.get_coordinates(values)
+    except Exception:
+        return None
+    if coords.shape != (row_count * 5, 2):
+        return None
+    ring_x = np.ascontiguousarray(coords[:, 0].reshape(row_count, 5), dtype=np.float64)
+    ring_y = np.ascontiguousarray(coords[:, 1].reshape(row_count, 5), dtype=np.float64)
+    x_is_min = np.abs(ring_x - bounds[:, 0:1]) <= 1e-9 * tol_scale
+    x_is_max = np.abs(ring_x - bounds[:, 2:3]) <= 1e-9 * tol_scale
+    y_is_min = np.abs(ring_y - bounds[:, 1:2]) <= 1e-9 * tol_scale
+    y_is_max = np.abs(ring_y - bounds[:, 3:4]) <= 1e-9 * tol_scale
+    if not np.all(x_is_min | x_is_max):
+        return None
+    if not np.all(y_is_min | y_is_max):
+        return None
+    if not np.all(np.abs(ring_x[:, 0] - ring_x[:, -1]) <= 1e-9 * tol_scale):
+        return None
+    if not np.all(np.abs(ring_y[:, 0] - ring_y[:, -1]) <= 1e-9 * tol_scale):
+        return None
+    if not np.all(x_is_min[:, :4].sum(axis=1) == 2):
+        return None
+    if not np.all(x_is_max[:, :4].sum(axis=1) == 2):
+        return None
+    if not np.all(y_is_min[:, :4].sum(axis=1) == 2):
+        return None
+    if not np.all(y_is_max[:, :4].sum(axis=1) == 2):
+        return None
+    edge_same_x = np.abs(ring_x[:, 1:] - ring_x[:, :-1]) <= 1e-9 * tol_scale
+    edge_same_y = np.abs(ring_y[:, 1:] - ring_y[:, :-1]) <= 1e-9 * tol_scale
+    if not np.all(np.logical_xor(edge_same_x, edge_same_y)):
+        return None
+
+    return {
+        "kind": _REGULAR_GRID_RECT_PROOF_KIND,
+        "version": _REGULAR_GRID_RECT_PROOF_VERSION,
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+        "cell_width": cell_width,
+        "cell_height": cell_height,
+        "cols": int(cols),
+        "rows": int(rows),
+        "size": int(row_count),
+        "total_bounds": [
+            float(bounds[:, 0].min()),
+            float(bounds[:, 1].min()),
+            float(bounds[:, 2].max()),
+            float(bounds[:, 3].max()),
+        ],
+    }
+
+
+def _geometry_metadata_bbox(
+    series,
+    shape_proof: dict | None,
+    *,
+    require_device_bbox: bool,
+) -> list[float] | None:
+    """Return GeoParquet bbox metadata from proof/cache or an explicit export."""
+    from vibespatial.geometry.device_array import DeviceGeometryArray
+
+    arr = series.array
+    if isinstance(arr, DeviceGeometryArray):
+        if shape_proof is not None:
+            total_bounds = shape_proof.get("total_bounds")
+            if isinstance(total_bounds, (list, tuple)) and len(total_bounds) == 4:
+                return [float(value) for value in total_bounds]
+        try:
+            from vibespatial.api._native_state import get_native_state
+
+            state = get_native_state(series)
+        except Exception:
+            state = None
+        metadata = getattr(state, "geometry_metadata_cache", None)
+        total_bounds = getattr(metadata, "total_bounds", None)
+        if total_bounds is not None:
+            return [float(value) for value in total_bounds]
+        if require_device_bbox:
+            return [float(value) for value in series.total_bounds.tolist()]
+        return None
+
+    return [float(value) for value in series.total_bounds.tolist()]
+
+
 def _create_geometry_metadata(
     geometry_columns,
     *,
@@ -144,10 +346,9 @@ def _create_geometry_metadata(
     schema_version=None,
     geometry_encoding=None,
     write_covering_bbox=False,
+    require_device_bbox=False,
 ):
     """Create GeoParquet metadata from geometry columns without a GeoDataFrame."""
-    from vibespatial.geometry.device_array import DeviceGeometryArray
-
     if schema_version is None:
         if geometry_encoding and any(
             encoding != "WKB" for encoding in geometry_encoding.values()
@@ -163,8 +364,6 @@ def _create_geometry_metadata(
 
     column_metadata = {}
     for col, series in geometry_columns.items():
-        arr = series.array
-
         geometry_types = _get_geometry_types(series)
         if schema_version[0] == "0":
             geometry_types_name = "geometry_type"
@@ -191,11 +390,18 @@ def _create_geometry_metadata(
             geometry_types_name: geometry_types,
         }
 
-        if isinstance(arr, DeviceGeometryArray):
-            bbox = np.asarray(arr.total_bounds, dtype=np.float64).tolist()
-        else:
-            bbox = series.total_bounds.tolist()
-        if np.isfinite(bbox).all():
+        shape_proof = _regular_grid_rect_shape_proof_metadata(series, geometry_types)
+        if shape_proof is not None:
+            column_metadata[col][_VIBESPATIAL_METADATA_KEY] = {
+                _VIBESPATIAL_SHAPE_PROOF_KEY: shape_proof,
+            }
+
+        bbox = _geometry_metadata_bbox(
+            series,
+            shape_proof,
+            require_device_bbox=require_device_bbox,
+        )
+        if bbox is not None and np.isfinite(bbox).all():
             column_metadata[col]["bbox"] = bbox
 
         if write_covering_bbox:
@@ -249,6 +455,7 @@ def _create_metadata(
         schema_version=schema_version,
         geometry_encoding=geometry_encoding,
         write_covering_bbox=write_covering_bbox,
+        require_device_bbox=True,
     )
 
 
@@ -440,6 +647,7 @@ def _native_tabular_to_arrow(
     geometry_encoding="WKB",
     schema_version=None,
     write_covering_bbox=None,
+    force_device_geometry_encode: bool = False,
 ):
     from pyarrow import StructArray
 
@@ -467,15 +675,12 @@ def _native_tabular_to_arrow(
         geometry_encoding=geometry_encoding,
         interleaved=False,
         include_z=None,
+        force_device_geometry_encode=force_device_geometry_encode,
     )
-    attributes = payload.attributes_for_export(
-        surface="vibespatial.api.io.arrow._native_tabular_to_arrow",
-        include_index=index is not False,
-        strict_disallowed=False,
-    )
+    metadata_index = RangeIndex(payload.geometry.row_count)
     geometry_series_by_name = {
         geometry_column.name: geometry_column.geometry.to_geoseries(
-            index=attributes.index,
+            index=metadata_index,
             name=geometry_column.name,
         )
         for geometry_column in payload.geometry_columns

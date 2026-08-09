@@ -9,7 +9,7 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 import shapely
-from shapely.geometry import GeometryCollection, LineString, Point, Polygon, box
+from shapely.geometry import GeometryCollection, LineString, MultiPolygon, Point, Polygon, box
 
 import vibespatial.api as geopandas
 from vibespatial import (
@@ -22,7 +22,7 @@ from vibespatial import (
 from vibespatial.api._native_grouped import NativeGrouped, NativeGroupedAttributeReduction
 from vibespatial.api._native_result_core import NativeAttributeTable
 from vibespatial.api._native_results import GeometryNativeResult, NativeTabularResult
-from vibespatial.api._native_state import NativeFrameState, attach_native_state
+from vibespatial.api._native_state import NativeFrameState, attach_native_state, get_native_state
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.testing import assert_geodataframe_equal
 from vibespatial.bench.pipeline import _dissolve_join_heavy_groups, _regular_polygons_frame
@@ -75,9 +75,27 @@ def test_dissolve_fusion_plan_persists_final_frame_only() -> None:
     assert fusion.stages[-1].steps[-1].output_name == "dissolved_frame"
 
 
+def test_public_dissolve_exports_grouped_attributes_with_pandas_dtypes() -> None:
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": [0, 0, 1],
+            "label": pd.Series(["alpha", "beta", "gamma"], dtype="string"),
+            "geometry": [box(0, 0, 1, 1), box(1, 0, 2, 1), box(4, 0, 5, 1)],
+        }
+    )
+
+    result = frame.dissolve("group", aggfunc="first")
+
+    assert result["label"].dtype == frame["label"].dtype
+    assert result["label"].tolist() == ["alpha", "gamma"]
+    assert get_native_state(result) is not None
+
+
 def test_execute_grouped_union_emits_empty_geometry_for_unobserved_group() -> None:
     geometries = [Point(0, 0), Point(1, 1)]
-    grouped = execute_grouped_union(geometries, [pd.Index([0]).to_numpy(), pd.Index([], dtype="int64").to_numpy()])
+    grouped = execute_grouped_union(
+        geometries, [pd.Index([0]).to_numpy(), pd.Index([], dtype="int64").to_numpy()]
+    )
 
     assert grouped.group_count == 2
     assert grouped.empty_groups == 1
@@ -188,10 +206,22 @@ def test_grouped_union_payload_device_repair_gate_avoids_host_metadata(
 
     assert payload.geometry.owned is not None
     assert payload.repaired is False
-    assert reasons == ["dissolve grouped-union repair-needed count fence"]
+    assert reasons == []
     assert payload.geometry.owned._validity is None
     assert payload.geometry.owned._tags is None
     assert payload.geometry.owned._family_row_offsets is None
+
+
+def test_grouped_union_repair_gate_returns_sparse_invalid_rows() -> None:
+    owned = from_shapely_geometries(
+        [box(0, 0, 1, 1), box(2, 0, 3, 1), box(4, 0, 5, 1)],
+        residency=Residency.HOST,
+    )
+    owned._cached_is_valid_mask = np.asarray([True, False, True], dtype=bool)
+
+    invalid_rows = dissolve_module._device_grouped_union_invalid_rows(owned)
+
+    assert invalid_rows.tolist() == [1]
 
 
 @pytest.mark.gpu
@@ -310,55 +340,16 @@ def test_cached_device_row_bounds_public_export_avoids_host_metadata_cache(
     assert owned._family_row_offsets is None
 
 
-@pytest.mark.gpu
-def test_union_bounds_host_helper_declines_device_only_bounds_export() -> None:
-    if not has_gpu_runtime():
-        pytest.skip("CUDA runtime not available")
-
-    from vibespatial.constructive.union_all import _compute_union_bounds_host
-    from vibespatial.cuda._runtime import (
-        get_d2h_transfer_events,
-        reset_d2h_transfer_count,
+def test_union_all_has_no_host_bounds_probe() -> None:
+    source = (
+        Path(__file__)
+        .resolve()
+        .parents[1]
+        .joinpath("src/vibespatial/constructive/union_all.py")
+        .read_text()
     )
 
-    left = from_shapely_geometries([box(0, 0, 1, 1)], residency=Residency.DEVICE)
-    right = from_shapely_geometries([box(2, 0, 3, 1)], residency=Residency.DEVICE)
-    device_only = OwnedGeometryArray.concat([left, right])
-    reset_d2h_transfer_count()
-
-    bounds = _compute_union_bounds_host(device_only)
-    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
-
-    assert bounds is None
-    assert reasons == []
-    assert device_only.residency is Residency.DEVICE
-    assert device_only._validity is None
-
-
-@pytest.mark.gpu
-def test_union_bounds_host_helper_uses_materialized_host_mirror_without_d2h() -> None:
-    if not has_gpu_runtime():
-        pytest.skip("CUDA runtime not available")
-
-    from vibespatial.constructive.union_all import _compute_union_bounds_host
-    from vibespatial.cuda._runtime import (
-        get_d2h_transfer_events,
-        reset_d2h_transfer_count,
-    )
-
-    owned = from_shapely_geometries(
-        [box(0, 0, 1, 1), box(2, 0, 3, 1)],
-        residency=Residency.DEVICE,
-    )
-    reset_d2h_transfer_count()
-
-    bounds = _compute_union_bounds_host(owned)
-    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
-
-    assert bounds is not None
-    assert bounds.tolist() == [[0.0, 0.0, 1.0, 1.0], [2.0, 0.0, 3.0, 1.0]]
-    assert reasons == []
-    assert owned.residency is Residency.DEVICE
+    assert "_compute_union_bounds_host" not in source
 
 
 @pytest.mark.gpu
@@ -387,6 +378,56 @@ def test_union_all_bbox_interaction_proof_uses_scalar_device_fence() -> None:
     assert _polygon_inputs_have_bbox_interactions_requiring_exact_union(owned) is True
     reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
 
+    assert reasons == ["union_all bbox-interaction overlap scalar fence"]
+
+
+def test_union_all_bbox_interaction_has_no_large_batch_host_crossover() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "src" / "vibespatial" / "constructive" / "union_all.py").read_text()
+    kernels = (root / "src" / "vibespatial" / "constructive" / "union_all_kernels.py").read_text()
+
+    assert "_BBOX_INTERACTION_DEVICE_PAIR_LIMIT" not in source
+    assert "union_all bbox-interaction candidate bounds fence" not in source
+    assert "bbox_any_overlap_sorted" in kernels
+    assert "const double* __restrict__ xmin" in kernels
+
+
+@pytest.mark.gpu
+def test_union_all_large_bbox_interaction_proof_stays_scalar_device_shaped() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    from vibespatial.constructive.union_all import (
+        _device_polygon_bbox_interactions_requiring_exact_union,
+    )
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    row_count = 5_000
+    xmin = cp.arange(row_count, dtype=cp.float64) * 2.0
+    d_bounds = cp.column_stack((xmin, cp.zeros(row_count), xmin + 1.0, cp.ones(row_count)))
+    d_validity = cp.ones(row_count, dtype=cp.bool_)
+    reset_d2h_transfer_count()
+
+    assert not _device_polygon_bbox_interactions_requiring_exact_union(
+        d_bounds,
+        d_validity,
+        row_count=row_count,
+    )
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    assert reasons == ["union_all bbox-interaction overlap scalar fence"]
+
+    d_bounds[-1] = cp.asarray([0.5, 0.25, 1.5, 0.75], dtype=cp.float64)
+    reset_d2h_transfer_count()
+    assert _device_polygon_bbox_interactions_requiring_exact_union(
+        d_bounds,
+        d_validity,
+        row_count=row_count,
+    )
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
     assert reasons == ["union_all bbox-interaction overlap scalar fence"]
 
 
@@ -454,7 +495,7 @@ def test_grouped_union_invalid_recompute_valid_device_rows_avoids_host_metadata(
     reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
 
     assert result is owned
-    assert reasons == ["dissolve grouped-union repair-needed count fence"]
+    assert reasons == []
     assert result._validity is None
     assert result._tags is None
     assert result._family_row_offsets is None
@@ -467,8 +508,9 @@ def test_grouped_union_invalid_recompute_uses_gpu_make_valid_before_host_recompu
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
 
-    from vibespatial.constructive import make_valid_pipeline as make_valid_module
-    from vibespatial.constructive.make_valid_pipeline import MakeValidResult
+    from vibespatial.constructive import make_valid_gpu as make_valid_module
+
+    cp = pytest.importorskip("cupy")
 
     owned = from_shapely_geometries(
         [box(0, 0, 1, 1), box(0.5, 0.5, 1.5, 1.5)],
@@ -476,30 +518,39 @@ def test_grouped_union_invalid_recompute_uses_gpu_make_valid_before_host_recompu
     )
     repair_needed_calls = 0
 
-    def _repair_needed(_owned):
+    def _invalid_rows(_owned, *, exact_collinearity=False):
         nonlocal repair_needed_calls
+        assert exact_collinearity is True
         repair_needed_calls += 1
-        return repair_needed_calls == 1
+        if repair_needed_calls == 1:
+            return cp.asarray([0], dtype=cp.int64)
+        return cp.empty(0, dtype=cp.int64)
 
-    def _fake_make_valid_owned(*, owned, dispatch_mode, **_kwargs):
+    def _fake_gpu_repair_invalid_polygons(
+        owned,
+        invalid_rows,
+        *,
+        method,
+        keep_collapsed,
+    ):
         assert owned is not None
-        assert dispatch_mode is ExecutionMode.GPU
-        return MakeValidResult(
-            row_count=owned.row_count,
-            valid_rows=np.empty(0, dtype=np.int64),
-            repaired_rows=np.asarray([0], dtype=np.int64),
-            null_rows=np.empty(0, dtype=np.int64),
-            method="linework",
-            keep_collapsed=True,
-            owned=owned,
-            selected=ExecutionMode.GPU,
+        assert invalid_rows.size == 1
+        assert method == "linework"
+        assert keep_collapsed is True
+        return SimpleNamespace(
+            repaired_owned=owned,
+            repaired_count=1,
         )
 
     def _fail_host_recompute(*_args, **_kwargs):
         raise AssertionError("GPU make-valid repair should avoid Shapely recompute")
 
-    monkeypatch.setattr(dissolve_module, "_device_grouped_union_repair_needed", _repair_needed)
-    monkeypatch.setattr(make_valid_module, "make_valid_owned", _fake_make_valid_owned)
+    monkeypatch.setattr(dissolve_module, "_device_grouped_union_invalid_rows", _invalid_rows)
+    monkeypatch.setattr(
+        make_valid_module,
+        "gpu_repair_invalid_polygons",
+        _fake_gpu_repair_invalid_polygons,
+    )
     monkeypatch.setattr(dissolve_module.shapely, "union_all", _fail_host_recompute)
 
     with strict_native_environment():
@@ -510,7 +561,8 @@ def test_grouped_union_invalid_recompute_uses_gpu_make_valid_before_host_recompu
             group_count=2,
         )
 
-    assert result is owned
+    assert result.row_count == owned.row_count
+    assert result.residency is Residency.DEVICE
     assert repair_needed_calls == 2
 
 
@@ -693,7 +745,201 @@ def test_execute_grouped_union_codes_device_unary_uses_native_grouped_union() ->
 
 
 @pytest.mark.gpu
-def test_execute_grouped_union_codes_large_regular_grid_disjoint_coverage_uses_named_native_fences() -> None:
+def test_execute_native_grouped_union_device_disjoint_subset_uses_native_grouped_carrier() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    geoms = [
+        box(0.0, 0.0, 1.0, 1.0),
+        box(2.0, 0.0, 3.0, 1.0),
+        box(10.0, 0.0, 11.0, 1.0),
+        box(12.0, 0.0, 13.0, 1.0),
+    ]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_sorted_offsets(
+        cp.asarray([0, 2, 4], dtype=cp.int64),
+        row_count=owned.row_count,
+        source_token="device-disjoint-test",
+    )
+    clear_dispatch_events()
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method=DissolveUnionMethod.DISJOINT_SUBSET,
+        owned=owned,
+    )
+    events = get_dispatch_events(clear=True)
+
+    assert result is not None
+    assert result.geometries is None
+    assert result.owned is not None
+    assert result.owned.residency is Residency.DEVICE
+    assert result.owned.row_count == 2
+    assert any(
+        event.implementation == "native_grouped_disjoint_subset_device_assembly" for event in events
+    )
+
+    actual = np.asarray(result.owned.to_shapely(), dtype=object)
+    expected = [
+        shapely.disjoint_subset_union_all(np.asarray(geoms[:2], dtype=object)),
+        shapely.disjoint_subset_union_all(np.asarray(geoms[2:], dtype=object)),
+    ]
+    assert all(
+        shapely.normalize(got).equals_exact(shapely.normalize(want), tolerance=1.0e-9)
+        for got, want in zip(actual, expected, strict=True)
+    )
+
+
+@pytest.mark.gpu
+def test_native_grouped_unary_union_uses_grouped_disjoint_pack_above_global_cap() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    group_count = 260
+    geoms = []
+    for group in range(group_count):
+        x0 = float(group * 10)
+        geoms.append(box(x0, 0.0, x0 + 1.0, 1.0))
+        geoms.append(box(x0 + 3.0, 0.0, x0 + 4.0, 1.0))
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_sorted_offsets(
+        cp.arange(group_count + 1, dtype=cp.int64) * np.int64(2),
+        row_count=owned.row_count,
+        source_token="device-disjoint-pack-test",
+        all_groups_observed=True,
+        group_size_min=2,
+        group_size_max=2,
+    )
+    clear_dispatch_events()
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method=DissolveUnionMethod.UNARY,
+        owned=owned,
+    )
+    events = get_dispatch_events(clear=True)
+
+    assert result is not None
+    assert result.owned is not None
+    assert result.owned.residency is Residency.DEVICE
+    assert result.owned.row_count == group_count
+    assert any(event.implementation == "native_grouped_disjoint_pack_union" for event in events)
+    assert not any(event.implementation == "native_grouped_overlay_union_plan" for event in events)
+
+    actual = np.asarray(result.owned.to_shapely(), dtype=object)
+    for group in (0, group_count // 2, group_count - 1):
+        start = group * 2
+        expected = shapely.union_all(np.asarray(geoms[start : start + 2], dtype=object))
+        assert shapely.normalize(actual[group]).equals_exact(
+            shapely.normalize(expected),
+            tolerance=1.0e-9,
+        )
+
+
+@pytest.mark.gpu
+def test_execute_native_grouped_union_disjoint_proof_skips_scalar_admissions() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    geoms = [
+        box(0.0, 0.0, 1.0, 1.0),
+        box(2.0, 0.0, 3.0, 1.0),
+        box(10.0, 0.0, 11.0, 1.0),
+        box(12.0, 0.0, 13.0, 1.0),
+    ]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_sorted_offsets(
+        cp.asarray([0, 2, 4], dtype=cp.int64),
+        row_count=owned.row_count,
+        source_token="device-disjoint-proof-test",
+        all_groups_observed=True,
+        group_size_min=2,
+        group_size_max=2,
+        strictly_disjoint_group_bounds=True,
+    )
+    reset_d2h_transfer_count()
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method=DissolveUnionMethod.DISJOINT_SUBSET,
+        owned=owned,
+    )
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert result is not None
+    assert result.geometries is None
+    assert result.owned is not None
+    assert "dissolve disjoint-subset admissibility scalar fence" not in reasons
+    assert "dissolve disjoint-subset small-pairwise scalar fence" not in reasons
+    assert "dissolve disjoint-subset pair-separation scalar fence" not in reasons
+    assert reasons == []
+
+
+@pytest.mark.gpu
+def test_execute_grouped_union_codes_device_unary_groups_all_rest_segments() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+
+    geoms = [
+        box(0.0, 0.0, 1.0, 1.0),
+        box(1.0, 0.0, 2.0, 1.0),
+        box(2.0, 0.0, 3.0, 1.0),
+        box(10.0, 0.0, 11.0, 1.0),
+        box(11.0, 0.0, 12.0, 1.0),
+        box(12.0, 0.0, 13.0, 1.0),
+    ]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    clear_materialization_events()
+
+    grouped = dissolve_module.execute_grouped_union_codes(
+        (),
+        cp.asarray([0, 0, 0, 1, 1, 1], dtype=cp.int32),
+        group_count=2,
+        method=DissolveUnionMethod.UNARY,
+        owned=owned,
+    )
+
+    assert grouped is not None
+    assert grouped.geometries is None
+    assert grouped.owned is not None
+    assert grouped.owned.residency is Residency.DEVICE
+    assert grouped.owned.row_count == 2
+    assert get_materialization_events(clear=True) == []
+
+    actual = grouped.owned.to_shapely()
+    expected = [
+        shapely.union_all(np.asarray(geoms[:3], dtype=object)),
+        shapely.union_all(np.asarray(geoms[3:], dtype=object)),
+    ]
+    assert shapely.area(shapely.symmetric_difference(actual[0], expected[0])) == 0.0
+    assert shapely.area(shapely.symmetric_difference(actual[1], expected[1])) == 0.0
+
+
+@pytest.mark.gpu
+def test_execute_grouped_union_codes_large_regular_grid_disjoint_coverage_uses_named_native_fences() -> (
+    None
+):
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
     cp = pytest.importorskip("cupy")
@@ -744,20 +990,13 @@ def test_execute_grouped_union_codes_large_regular_grid_disjoint_coverage_uses_n
     expected = [
         shapely.coverage_union_all(
             np.asarray(
-                [
-                    geom
-                    for index, geom in enumerate(geoms)
-                    if row_group_codes[index] == group_index
-                ],
+                [geom for index, geom in enumerate(geoms) if row_group_codes[index] == group_index],
                 dtype=object,
             )
         )
         for group_index in range(group_count)
     ]
-    assert all(
-        bool(shapely.equals(got, want))
-        for got, want in zip(actual, expected, strict=True)
-    )
+    assert all(bool(shapely.equals(got, want)) for got, want in zip(actual, expected, strict=True))
 
 
 @pytest.mark.gpu
@@ -840,10 +1079,14 @@ def test_grouped_coverage_edge_union_device_codes_marks_unobserved_groups_empty(
     assert "owned geometry device-take nested slice-size allocation fence" not in reasons
 
     actual = np.asarray(grouped.owned.to_shapely(), dtype=object)
-    assert shapely.equals(actual[0], shapely.coverage_union_all(np.asarray(geoms[:2], dtype=object)))
+    assert shapely.equals(
+        actual[0], shapely.coverage_union_all(np.asarray(geoms[:2], dtype=object))
+    )
     assert actual[1] is not None and actual[1].is_empty
     assert actual[2] is not None and actual[2].is_empty
-    assert shapely.equals(actual[1:], np.asarray([GeometryCollection(), GeometryCollection()], dtype=object)).tolist() == [
+    assert shapely.equals(
+        actual[1:], np.asarray([GeometryCollection(), GeometryCollection()], dtype=object)
+    ).tolist() == [
         True,
         True,
     ]
@@ -945,20 +1188,11 @@ def test_grouped_disjoint_subset_legacy_gpu_seeds_complex_exact_union_cache() ->
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
 
-    nybb_path = (
-        Path(__file__).parent
-        / "upstream"
-        / "geopandas"
-        / "tests"
-        / "data"
-        / "nybb_16a.zip"
-    )
+    nybb_path = Path(__file__).parent / "upstream" / "geopandas" / "tests" / "data" / "nybb_16a.zip"
     if not nybb_path.is_file():
         pytest.skip("NYBB dataset not found")
 
-    frame = geopandas.read_file(f"zip://{nybb_path}")[
-        ["geometry", "BoroName", "BoroCode"]
-    ]
+    frame = geopandas.read_file(f"zip://{nybb_path}")[["geometry", "BoroName", "BoroCode"]]
     frame = frame.rename(columns={"geometry": "myshapes"}).set_geometry("myshapes")
     owned = from_shapely_geometries(list(frame.geometry), residency=Residency.DEVICE)
     group_positions = [
@@ -977,6 +1211,61 @@ def test_grouped_disjoint_subset_legacy_gpu_seeds_complex_exact_union_cache() ->
     cache = getattr(grouped.owned, "_cached_is_valid_mask", None)
     assert cache is not None
     assert cache.tolist() == [True, True]
+
+
+@pytest.mark.gpu
+def test_disjoint_subset_union_nodes_partial_shared_boundary_before_area_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import vibespatial.constructive.union_all as union_all_module
+
+    geoms = [
+        box(0.0, 0.0, 2.0, 1.0),
+        box(2.0, 0.25, 3.0, 0.75),
+    ]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+
+    def _fail_exact(*_args, **_kwargs):
+        raise AssertionError("interior-disjoint coverage must not reopen full union")
+
+    monkeypatch.setattr(union_all_module, "union_all_gpu_owned", _fail_exact)
+    result = union_all_module.disjoint_subset_union_all_owned(owned)
+
+    assert result is not None
+    assert getattr(result, "_native_grouped_union_implementation", None) == (
+        "gpu_noded_coverage_union_with_area_proof"
+    )
+    actual = result.to_shapely()[0]
+    expected = shapely.union_all(np.asarray(geoms, dtype=object))
+    assert shapely.is_valid(actual)
+    assert shapely.equals(actual, expected)
+
+
+@pytest.mark.gpu
+def test_disjoint_subset_union_area_proof_rejects_positive_area_overlap() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import vibespatial.constructive.union_all as union_all_module
+
+    geoms = [box(0.0, 0.0, 2.0, 2.0), box(1.0, 1.0, 3.0, 3.0)]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+
+    coverage = union_all_module._try_polygon_coverage_union_for_bbox_interactions(
+        owned,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    result = union_all_module.disjoint_subset_union_all_owned(owned)
+
+    assert coverage is None
+    assert result is not None
+    actual = result.to_shapely()[0]
+    expected = shapely.union_all(np.asarray(geoms, dtype=object))
+    assert shapely.is_valid(actual)
+    assert shapely.equals(actual, expected)
 
 
 def test_evaluate_geopandas_dissolve_matches_current_categorical_semantics() -> None:
@@ -1115,13 +1404,8 @@ def test_evaluate_geopandas_dissolve_uses_native_grouped_numeric_reducers(
     )
     events = geopandas.get_dispatch_events(clear=True)
 
-    assert reducer_calls == [
-        (("value", "flag"), {"value": "sum", "flag": "sum"})
-    ]
-    assert any(
-        event.implementation == "native_grouped_numeric_reducers"
-        for event in events
-    )
+    assert reducer_calls == [(("value", "flag"), {"value": "sum", "flag": "sum"})]
+    assert any(event.implementation == "native_grouped_numeric_reducers" for event in events)
     assert_geodataframe_equal(result, expected)
 
 
@@ -1210,9 +1494,7 @@ def test_reduce_native_grouped_dissolve_attributes_uses_device_non_numeric_take_
         {
             "name": pa.array(["alpha", "bravo", "charlie", "delta"], type=pa.string()),
             "when": pa.array(
-                pd.to_datetime(
-                    ["2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04"]
-                ),
+                pd.to_datetime(["2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04"]),
                 type=pa.timestamp("us"),
             ),
         }
@@ -1998,9 +2280,7 @@ def test_evaluate_geopandas_dissolve_custom_object_key_uses_pandas_policy(
                 dtype=object,
             ),
             "value": [1, 2, 3],
-            "geometry": geopandas.array.from_wkt(
-                ["POINT (0 0)", "POINT (1 1)", "POINT (2 2)"]
-            ),
+            "geometry": geopandas.array.from_wkt(["POINT (0 0)", "POINT (1 1)", "POINT (2 2)"]),
         }
     )
     expected = frame.dissolve(
@@ -2312,9 +2592,7 @@ def test_evaluate_geopandas_dissolve_device_nullable_boolean_key_uses_device_gro
     ]
     reference = geopandas.GeoDataFrame(
         {
-            "group": pd.Series(
-                pd.array([True, pd.NA, False, True], dtype="boolean")
-            ),
+            "group": pd.Series(pd.array([True, pd.NA, False, True], dtype="boolean")),
             "value": [10, 3, 1, 20],
             "geometry": geoms,
         }
@@ -2801,12 +3079,8 @@ def test_evaluate_geopandas_dissolve_device_nullable_boolean_multi_key_uses_devi
     ]
     reference = geopandas.GeoDataFrame(
         {
-            "zone": pd.Series(
-                pd.array([True, pd.NA, False, True], dtype="boolean")
-            ),
-            "kind": pd.Series(
-                pd.array([False, True, False, pd.NA], dtype="boolean")
-            ),
+            "zone": pd.Series(pd.array([True, pd.NA, False, True], dtype="boolean")),
+            "kind": pd.Series(pd.array([False, True, False, pd.NA], dtype="boolean")),
             "value": [10, 3, 1, 20],
             "geometry": geoms,
         }
@@ -2853,7 +3127,9 @@ def test_evaluate_geopandas_dissolve_device_nullable_boolean_multi_key_uses_devi
         return real_reduce(self, columns, reducers)
 
     def _fail_groupby(*_args, **_kwargs):
-        raise AssertionError("nullable bool device multi-key dissolve should not call pandas groupby")
+        raise AssertionError(
+            "nullable bool device multi-key dissolve should not call pandas groupby"
+        )
 
     monkeypatch.setattr(NativeGrouped, "reduce_numeric_columns", _record_reduce)
     monkeypatch.setattr(pd.DataFrame, "groupby", _fail_groupby)
@@ -3317,12 +3593,12 @@ def test_unary_dissolve_does_not_rewrite_overlapping_polygon_groups() -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU runtime not available")
 
-    geoms = [
-        box(float(i) * 0.5, 0.0, float(i) * 0.5 + 1.0, 1.0)
-        for i in range(50)
-    ]
+    geoms = [box(float(i) * 0.5, 0.0, float(i) * 0.5 + 1.0, 1.0) for i in range(50)]
     frame = geopandas.GeoDataFrame(
-        {"group": np.zeros(len(geoms), dtype=np.int32), "value": np.arange(len(geoms), dtype=np.int32)},
+        {
+            "group": np.zeros(len(geoms), dtype=np.int32),
+            "value": np.arange(len(geoms), dtype=np.int32),
+        },
         geometry=geopandas.GeoSeries(
             DeviceGeometryArray._from_owned(
                 from_shapely_geometries(geoms, residency=Residency.DEVICE),
@@ -3417,7 +3693,11 @@ def test_benchmark_dissolve_pipeline_reports_group_count() -> None:
     )
 
     benchmark = benchmark_dissolve_pipeline(
-        frame, by="group", dataset="points", iterations=1, warmup=0,
+        frame,
+        by="group",
+        dataset="points",
+        iterations=1,
+        warmup=0,
     )
 
     assert benchmark.rows == 4
@@ -3442,7 +3722,9 @@ def test_execute_grouped_union_codes_avoids_geometry_array_materialization_for_o
     assert owned is not None
 
     def _fail(*_args, **_kwargs):
-        raise AssertionError("owned unary grouped union should not materialize the full GeometryArray")
+        raise AssertionError(
+            "owned unary grouped union should not materialize the full GeometryArray"
+        )
 
     monkeypatch.setattr(GeometryArray, "__array__", _fail, raising=False)
 
@@ -3498,6 +3780,136 @@ def test_execute_native_grouped_union_consumes_native_grouped_offsets_for_owned_
     assert result.empty_groups == 0
     assert result.owned is not None
     assert result.geometries is None
+
+
+@pytest.mark.gpu
+def test_native_grouped_union_dense_host_codes_feed_disjoint_pack_metadata() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    owned = from_shapely_geometries(
+        [
+            box(0.0, 0.0, 1.0, 1.0),
+            box(10.0, 0.0, 11.0, 1.0),
+            box(20.0, 0.0, 21.0, 1.0),
+            box(30.0, 0.0, 31.0, 1.0),
+            box(40.0, 0.0, 41.0, 1.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_dense_codes(
+        np.asarray([0, 0, 1, 2, 1], dtype=np.int32),
+        group_count=3,
+    )
+
+    assert grouped.group_size_max == 2
+
+    geopandas.clear_dispatch_events()
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="unary",
+        owned=owned,
+    )
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result is not None
+    assert result.owned is not None
+    assert result.geometries is None
+    assert any(event.implementation == "native_grouped_disjoint_pack_union" for event in events)
+
+
+@pytest.mark.gpu
+def test_native_grouped_union_preserves_disjoint_near_degenerate_polygon() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    tiny = Polygon(
+        [
+            (673.205080756887, 400.0),
+            (673.205080756888, 400.0),
+            (673.205080756888, 400.000000000001),
+            (673.205080756887, 400.0),
+        ]
+    )
+    geoms = [box(540.0, 370.0, 640.0, 450.0), tiny]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_dense_codes(
+        np.asarray([0, 0], dtype=np.int32),
+        group_count=1,
+    )
+
+    geopandas.clear_fallback_events()
+    if hasattr(geopandas, "clear_dispatch_events"):
+        geopandas.clear_dispatch_events()
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=None,
+        method="unary",
+        owned=owned,
+    )
+
+    assert geopandas.get_fallback_events(clear=True) == []
+    assert result is not None
+    assert result.owned is not None
+    out = result.owned.to_shapely()[0]
+    expected = shapely.union_all(np.asarray(geoms, dtype=object))
+    assert out.bounds[2] == pytest.approx(expected.bounds[2])
+    assert out.convex_hull.area == pytest.approx(expected.convex_hull.area)
+    assert any(
+        event.implementation == "native_grouped_disjoint_pack_union"
+        for event in geopandas.get_dispatch_events(clear=True)
+    )
+
+
+@pytest.mark.gpu
+def test_native_grouped_union_positive_area_sliver_uses_grouped_disjoint_pack() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    sliver = Polygon(
+        [
+            (4.0, 0.0),
+            (4.000001, 0.0),
+            (4.0, 0.000001),
+            (4.0, 0.0),
+        ]
+    )
+    assert 0.0 < shapely.area(sliver) <= dissolve_module.SPATIAL_EPSILON
+    values = [box(0.0, 0.0, 1.0, 1.0), box(2.0, 0.0, 3.0, 1.0), sliver]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_dense_codes(
+        cp.zeros(len(values), dtype=cp.int32),
+        group_count=1,
+        all_groups_observed=True,
+        group_size_min=len(values),
+        group_size_max=len(values),
+    )
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="unary",
+        owned=owned,
+    )
+
+    assert result is not None
+    assert result.owned is not None
+    assert (
+        getattr(result.owned, "_native_grouped_union_implementation", None)
+        == "native_grouped_disjoint_pack_partition_union"
+    )
+    actual = result.owned.to_shapely()[0]
+    expected = shapely.union_all(np.asarray(values, dtype=object))
+    assert shapely.area(shapely.symmetric_difference(actual, expected)) == pytest.approx(0.0)
+    assert shapely.area(shapely.convex_hull(actual)) == pytest.approx(
+        shapely.area(shapely.convex_hull(expected)),
+    )
 
 
 @pytest.mark.gpu
@@ -3637,7 +4049,9 @@ def test_execute_native_grouped_union_consumes_device_codes_for_owned_coverage(
     )
 
     def _fail(*_args, **_kwargs):
-        raise AssertionError("device NativeGrouped coverage union should not host-normalize group codes")
+        raise AssertionError(
+            "device NativeGrouped coverage union should not host-normalize group codes"
+        )
 
     monkeypatch.setattr(dissolve_module, "_group_non_empty_counts", _fail)
 
@@ -3716,6 +4130,58 @@ def test_execute_native_grouped_union_all_valid_cache_avoids_group_scalar_fences
 
 
 @pytest.mark.gpu
+def test_execute_native_grouped_union_all_invalid_capacity_stays_device_native() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.geometry.owned import (
+        device_mask_owned_capacity,
+        device_valid_nonempty_mask,
+    )
+
+    owned = from_shapely_geometries(
+        [
+            box(0.0, 0.0, 1.0, 1.0),
+            box(10.0, 0.0, 11.0, 1.0),
+            box(10.5, 0.0, 11.5, 1.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+    masked = device_mask_owned_capacity(owned, cp.zeros(owned.row_count, dtype=cp.bool_))
+    grouped = NativeGrouped.from_sorted_offsets(
+        cp.asarray([0, 1, 3], dtype=cp.int64),
+        row_count=owned.row_count,
+        all_groups_observed=True,
+        group_size_min=1,
+        group_size_max=2,
+    )
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="unary",
+        owned=masked,
+    )
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert result is not None
+    assert result.group_count == 2
+    assert result.owned is not None
+    assert result.owned.residency is Residency.DEVICE
+    state = result.owned._ensure_device_state(preserve_indexed_view=True)
+    assert bool(cp.all(state.validity))
+    assert not bool(cp.any(device_valid_nonempty_mask(result.owned)))
+    assert get_materialization_events(clear=True) == []
+    assert not reasons
+
+
+@pytest.mark.gpu
 def test_execute_native_grouped_union_host_validity_proof_avoids_valid_count_fence() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
@@ -3757,31 +4223,598 @@ def test_execute_native_grouped_union_host_validity_proof_avoids_valid_count_fen
 
 
 @pytest.mark.gpu
+def test_device_take_preserves_all_valid_proof_for_native_grouped_union() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    values = [
+        box(0.0, 0.0, 1.0, 1.0),
+        box(0.5, 0.0, 1.5, 1.0),
+        box(10.0, 0.0, 11.0, 1.0),
+        box(10.5, 0.0, 11.5, 1.0),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    subset = owned.device_take(cp.asarray([0, 1, 2, 3], dtype=cp.int64))
+    grouped = NativeGrouped.from_dense_codes(
+        cp.asarray([0, 0, 1, 1], dtype=cp.int32),
+        group_count=2,
+    )
+    reset_d2h_transfer_count()
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="unary",
+        owned=subset,
+    )
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert result is not None
+    assert result.group_count == 2
+    assert result.non_empty_groups == 2
+    assert result.empty_groups == 0
+    assert result.owned is not None
+    assert result.owned.residency is Residency.DEVICE
+    assert "overlay dissolve native grouped-union valid-row count fence" not in reasons
+    assert "overlay dissolve native grouped-union nonempty-group count fence" not in reasons
+
+
+@pytest.mark.gpu
+def test_native_grouped_union_singleton_identity_preserves_row_indirection() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    values = [
+        Polygon([(0.0, 0.0), (3.0, 0.0), (3.0, 3.0), (0.0, 0.0)]),
+        Polygon(
+            [(10.0, 0.0), (14.0, 0.0), (14.0, 4.0), (10.0, 0.0)],
+            [[(11.0, 1.0), (12.0, 1.0), (12.0, 2.0), (11.0, 1.0)]],
+        ),
+        MultiPolygon(
+            [
+                Polygon([(20.0, 0.0), (21.0, 0.0), (21.0, 1.0), (20.0, 0.0)]),
+                Polygon([(22.0, 0.0), (23.0, 0.0), (23.0, 1.0), (22.0, 0.0)]),
+            ]
+        ),
+        Polygon([(30.0, 0.0), (31.0, 0.0), (31.0, 1.0), (30.0, 0.0)]),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    reordered = owned.device_take(cp.asarray([1, 2, 0, 3], dtype=cp.int64))
+    assert reordered.is_indexed_view
+    grouped = NativeGrouped.from_dense_codes(
+        cp.asarray([0, 1, 2, 3], dtype=cp.int32),
+        group_count=4,
+        all_groups_observed=True,
+        group_size_min=1,
+        group_size_max=1,
+    )
+    reset_d2h_transfer_count()
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="unary",
+        owned=reordered,
+    )
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert result is not None
+    assert result.owned is not None
+    assert result.owned.is_indexed_view
+    assert (
+        getattr(result.owned, "_native_grouped_union_implementation", None)
+        == "native_grouped_singleton_identity_union"
+    )
+    assert "owned geometry device-take nested slice-size allocation fence" not in reasons
+    assert "owned geometry device-take slice-size allocation fence" not in reasons
+
+
+@pytest.mark.gpu
+def test_execute_native_grouped_union_host_codes_device_owned_uses_native_carrier(
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import vibespatial.kernels.constructive.segmented_union as segmented_union_module
+
+    values = [
+        box(0.0, 0.0, 1.0, 1.0),
+        box(0.5, 0.0, 1.5, 1.0),
+        box(10.0, 0.0, 11.0, 1.0),
+        box(10.5, 0.0, 11.5, 1.0),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_dense_codes(
+        np.asarray([0, 0, 1, 1], dtype=np.int32),
+        group_count=2,
+    )
+
+    def _fail_segmented_union_all(*_args, **_kwargs):
+        raise AssertionError("host-code device grouped union must use native carrier")
+
+    monkeypatch.setattr(
+        segmented_union_module,
+        "segmented_union_all",
+        _fail_segmented_union_all,
+    )
+    geopandas.clear_dispatch_events()
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="unary",
+        owned=owned,
+    )
+    dispatch_events = geopandas.get_dispatch_events(clear=True)
+
+    assert result is not None
+    assert result.owned is not None
+    assert result.owned.residency is Residency.DEVICE
+    assert any(
+        event.implementation
+        in {
+            "native_grouped_overlay_union_plan",
+            "native_grouped_device_pairwise_tree_union",
+            "native_grouped_rectangle_strip_union",
+            "native_grouped_rectangle_strip_partition_union",
+            "native_grouped_disjoint_pack_partition_union",
+        }
+        for event in dispatch_events
+    )
+    actual = np.asarray(result.owned.to_shapely(), dtype=object)
+    expected = [
+        shapely.union_all(np.asarray(values[:2], dtype=object)),
+        shapely.union_all(np.asarray(values[2:], dtype=object)),
+    ]
+    assert bool(shapely.equals(actual[0], expected[0]))
+    assert bool(shapely.equals(actual[1], expected[1]))
+
+
+@pytest.mark.gpu
+def test_execute_native_grouped_union_prefers_grouped_overlay_plan_for_overlaps() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    values = [
+        Polygon([(0.0, 0.0), (3.0, 0.0), (1.5, 2.0), (0.0, 0.0)]),
+        Polygon([(1.0, -0.2), (4.0, -0.2), (2.5, 2.2), (1.0, -0.2)]),
+        Polygon([(2.0, 0.1), (5.0, 0.1), (3.5, 2.1), (2.0, 0.1)]),
+        Polygon([(10.0, 0.0), (13.0, 0.0), (11.5, 2.0), (10.0, 0.0)]),
+        Polygon([(11.0, -0.2), (14.0, -0.2), (12.5, 2.2), (11.0, -0.2)]),
+        Polygon([(12.0, 0.1), (15.0, 0.1), (13.5, 2.1), (12.0, 0.1)]),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_dense_codes(
+        cp.asarray([0, 0, 0, 1, 1, 1], dtype=cp.int32),
+        group_count=2,
+    )
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="unary",
+        owned=owned,
+    )
+
+    assert result is not None
+    assert result.owned is not None
+    assert getattr(result.owned, "_native_grouped_union_implementation", None) in {
+        "native_grouped_overlay_union_plan",
+        "native_grouped_overlay_union_plan_mixed_degenerate_pairwise",
+    }
+    actual = np.asarray(result.owned.to_shapely(), dtype=object)
+    expected = [
+        shapely.union_all(np.asarray(values[:3], dtype=object)),
+        shapely.union_all(np.asarray(values[3:], dtype=object)),
+    ]
+    assert bool(shapely.is_valid(actual).all())
+    assert shapely.area(shapely.symmetric_difference(actual[0], expected[0])) == pytest.approx(0.0)
+    assert shapely.area(shapely.symmetric_difference(actual[1], expected[1])) == pytest.approx(0.0)
+
+
+@pytest.mark.gpu
+def test_native_grouped_union_splits_overlapping_nonseed_members() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    values = [
+        box(0.0, 0.0, 1.0, 1.0),
+        box(10.0, 0.0, 12.0, 2.0),
+        box(11.0, 0.0, 13.0, 2.0),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_dense_codes(
+        cp.zeros(len(values), dtype=cp.int32),
+        group_count=1,
+    )
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="unary",
+        owned=owned,
+    )
+
+    assert result is not None
+    assert result.owned is not None
+    assert getattr(result.owned, "_native_grouped_union_implementation", None) in {
+        "native_grouped_overlay_union_plan",
+        "native_grouped_overlay_union_plan_mixed_degenerate_pairwise",
+    }
+    actual = result.owned.to_shapely()[0]
+    expected = shapely.union_all(np.asarray(values, dtype=object))
+    assert shapely.is_valid(actual)
+    assert shapely.equals(actual, expected)
+
+
+@pytest.mark.gpu
+def test_native_grouped_union_resolves_collapsed_triangle_face_coverage() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    values = [
+        MultiPolygon(
+            [
+                Polygon(
+                    [
+                        (780.0, 590.0),
+                        (780.0, 583.2685564925192),
+                        (782.5116250684673, 583.6695836409644),
+                        (784.4604284565498, 587.6245920319477),
+                        (786.5271606630206, 582.6688642367599),
+                        (786.7692540869118, 582.9489629706218),
+                        (786.879087668319, 584.0164294642864),
+                        (786.5876592030364, 584.0080913740769),
+                        (786.299321872665, 590.0),
+                        (780.0, 590.0),
+                    ]
+                ),
+                Polygon(
+                    [
+                        (787.0222109887794, 584.0205243805326),
+                        (787.1878569706536, 583.4332807015311),
+                        (787.7124901638854, 584.0402740299919),
+                        (787.0222109887794, 584.0205243805326),
+                    ]
+                ),
+            ]
+        ),
+        MultiPolygon(
+            [
+                Polygon(
+                    [
+                        (786.1651378875935, 590.0),
+                        (784.9364055555279, 586.4832671269147),
+                        (786.6982284043847, 582.2586682964808),
+                        (786.879087668319, 584.0164294642864),
+                        (786.5876592030364, 584.0080913740769),
+                        (786.299321872665, 590.0),
+                        (786.1651378875935, 590.0),
+                    ]
+                ),
+                Polygon(
+                    [
+                        (787.0222109887794, 584.0205243805326),
+                        (788.156295070867, 580.0),
+                        (790.0, 580.0),
+                        (790.0, 584.1057222124479),
+                        (787.0222109887794, 584.0205243805326),
+                    ]
+                ),
+            ]
+        ),
+        MultiPolygon(
+            [
+                Polygon(
+                    [
+                        (784.665512077896, 590.0),
+                        (784.5224222293724, 587.4759398446234),
+                        (786.6982284043847, 582.2586682964808),
+                        (786.879087668319, 584.0164294642864),
+                        (786.5876592030364, 584.0080913740769),
+                        (786.299321872665, 590.0),
+                        (784.665512077896, 590.0),
+                    ]
+                ),
+                Polygon(
+                    [
+                        (787.0222109887794, 584.0205243805326),
+                        (788.156295070867, 580.0),
+                        (790.0, 580.0),
+                        (790.0, 584.1057222124479),
+                        (787.0222109887794, 584.0205243805326),
+                    ]
+                ),
+            ]
+        ),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_dense_codes(
+        cp.zeros(len(values), dtype=cp.int32),
+        group_count=1,
+        all_groups_observed=True,
+        group_size_min=len(values),
+        group_size_max=len(values),
+    )
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="unary",
+        owned=owned,
+    )
+
+    assert result is not None
+    assert result.owned is not None
+    actual = result.owned.to_shapely()[0]
+    expected = shapely.union_all(np.asarray(values, dtype=object))
+    assert shapely.is_valid(actual)
+    assert shapely.area(shapely.symmetric_difference(actual, expected)) == pytest.approx(0.0)
+
+
+@pytest.mark.gpu
+def test_grouped_union_residual_repair_uses_coverage_merge_carrier() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.kernels.constructive import segmented_union as segmented_union_module
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    inputs = from_shapely_geometries(
+        [box(0.0, 0.0, 1.0, 1.0), box(1.0, 0.0, 2.0, 1.0)],
+        residency=Residency.DEVICE,
+    )
+    candidate = from_shapely_geometries(
+        [box(0.0, 0.0, 1.0, 1.0)],
+        residency=Residency.DEVICE,
+    )
+    seed_all_validity_cache(inputs)
+    seed_all_validity_cache(candidate)
+    failure = segmented_union_module._grouped_union_failure_from_mask(
+        cp.asarray([False, True], dtype=cp.bool_),
+        cp.asarray([0, 0], dtype=cp.int64),
+        output_row_count=1,
+    )
+
+    clear_dispatch_events()
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    repaired = segmented_union_module._repair_grouped_union_uncovered_rows_device(
+        candidate,
+        inputs,
+        failure,
+        output_row_count=1,
+        empty_output=dissolve_module._empty_polygon_rows_device(1),
+        stage="test_residual_repair",
+    )
+    events = get_dispatch_events(clear=True)
+    runtime_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert repaired is not None
+    assert repaired.residency is Residency.DEVICE
+    assert repaired.row_count == 1
+    assert any(
+        event.implementation == "native_grouped_overlay_union_residual_coverage_merge"
+        for event in events
+    )
+    assert not any(
+        event.implementation == "single_row_direct_union_residual_proof_gpu" for event in events
+    )
+    assert not any("area-equivalence scalar fence" in reason for reason in runtime_reasons)
+    assert "grouped polygon coverage-union segment-count fence" not in runtime_reasons
+    actual = repaired.to_shapely()[0]
+    expected = box(0.0, 0.0, 2.0, 1.0)
+    assert shapely.area(shapely.symmetric_difference(actual, expected)) == pytest.approx(0.0)
+
+
+@pytest.mark.gpu
+def test_grouped_union_constructive_coverage_keeps_positive_area_slivers() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.kernels.constructive import segmented_union as segmented_union_module
+
+    sliver_width = 1.0e-7
+    inputs = from_shapely_geometries(
+        [
+            box(0.0, 0.0, 1.0, 1.0),
+            box(1.0 - sliver_width, 0.0, 1.0 + sliver_width, 1.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+    candidate = from_shapely_geometries(
+        [box(0.0, 0.0, 1.0, 1.0)],
+        residency=Residency.DEVICE,
+    )
+    seed_all_validity_cache(inputs)
+    seed_all_validity_cache(candidate)
+
+    failure = segmented_union_module._grouped_union_coverage_failure_device(
+        candidate,
+        inputs,
+        cp.asarray([0, 2], dtype=cp.int64),
+        cp.asarray([0], dtype=cp.int64),
+        output_row_count=1,
+        stage="test_positive_area_sliver",
+        group_size_max=2,
+        source_segment_span_max=4,
+    )
+
+    assert failure is not None
+    assert failure.residuals is not None
+    assert int(cp.asnumpy(failure.failed_selection.logical_count)[0]) == 1
+
+
+@pytest.mark.gpu
+def test_grouped_overlay_union_plan_keeps_repair_gate_live(monkeypatch) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    values = [
+        Polygon([(0.0, 0.0), (3.0, 0.0), (1.5, 2.0), (0.0, 0.0)]),
+        Polygon([(1.0, -0.2), (4.0, -0.2), (2.5, 2.2), (1.0, -0.2)]),
+        Polygon([(2.0, 0.1), (5.0, 0.1), (3.5, 2.1), (2.0, 0.1)]),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_dense_codes(
+        cp.zeros(len(values), dtype=cp.int32),
+        group_count=1,
+    )
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="unary",
+        owned=owned,
+    )
+    assert result is not None
+    assert result.owned is not None
+    assert getattr(result.owned, "_native_grouped_union_implementation", None) in {
+        "native_grouped_overlay_union_plan",
+        "native_grouped_overlay_union_plan_mixed_degenerate_pairwise",
+    }
+
+    calls = 0
+
+    def _repair_probe(_owned, *, exact_collinearity=False):
+        nonlocal calls
+        assert exact_collinearity is True
+        calls += 1
+        return cp.empty(0, dtype=cp.int64)
+
+    monkeypatch.setattr(
+        dissolve_module,
+        "_device_grouped_union_invalid_rows",
+        _repair_probe,
+    )
+    payload = dissolve_module._grouped_union_geometry_payload(
+        result,
+        geometry_name="geometry",
+        crs="EPSG:3857",
+    )
+
+    assert payload.geometry.owned is result.owned
+    assert calls == 1
+
+
+@pytest.mark.gpu
+def test_native_grouped_union_degenerate_area_declines_grouped_overlay_plan() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    values = [
+        box(0.0, 0.0, 1.0, 1.0),
+        box(0.5, 0.0, 1.5, 1.0),
+        Polygon([(10.0, 0.0), (11.0, 0.0), (10.5, 1.0e-14), (10.0, 0.0)]),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_dense_codes(
+        cp.zeros(len(values), dtype=cp.int32),
+        group_count=1,
+    )
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="unary",
+        owned=owned,
+    )
+
+    assert result is not None
+    assert result.owned is not None
+    assert (
+        getattr(result.owned, "_native_grouped_union_implementation", None)
+        != "native_grouped_overlay_union_plan"
+    )
+    actual = result.owned.to_shapely()[0]
+    expected = shapely.union_all(np.asarray(values, dtype=object))
+    assert shapely.area(shapely.symmetric_difference(actual, expected)) == pytest.approx(0.0)
+    assert shapely.area(shapely.convex_hull(actual)) == pytest.approx(
+        shapely.area(shapely.convex_hull(expected)),
+    )
+
+
+@pytest.mark.gpu
+def test_native_grouped_union_splits_degenerate_groups_without_declining_overlay_plan() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    values = [
+        Polygon([(0.0, 0.0), (3.0, 0.0), (1.5, 2.0), (0.0, 0.0)]),
+        Polygon([(1.0, -0.2), (4.0, -0.2), (2.5, 2.2), (1.0, -0.2)]),
+        Polygon([(2.0, 0.1), (5.0, 0.1), (3.5, 2.1), (2.0, 0.1)]),
+        box(10.0, 0.0, 11.0, 1.0),
+        box(10.5, 0.0, 11.5, 1.0),
+        Polygon([(20.0, 0.0), (21.0, 0.0), (20.5, 1.0e-14), (20.0, 0.0)]),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_dense_codes(
+        cp.asarray([0, 0, 0, 1, 1, 1], dtype=cp.int32),
+        group_count=2,
+    )
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="unary",
+        owned=owned,
+    )
+
+    assert result is not None
+    assert result.owned is not None
+    assert (
+        getattr(result.owned, "_native_grouped_union_implementation", None)
+        == "native_grouped_overlay_union_plan_mixed_degenerate_pairwise"
+    )
+    actual = np.asarray(result.owned.to_shapely(), dtype=object)
+    expected = [
+        shapely.union_all(np.asarray(values[:3], dtype=object)),
+        shapely.union_all(np.asarray(values[3:], dtype=object)),
+    ]
+    for got, want in zip(actual, expected, strict=True):
+        assert shapely.area(shapely.symmetric_difference(got, want)) == pytest.approx(0.0)
+        assert shapely.area(shapely.convex_hull(got)) == pytest.approx(
+            shapely.area(shapely.convex_hull(want)),
+        )
+
+
+@pytest.mark.gpu
 def test_execute_grouped_union_codes_batches_multi_group_unary_on_gpu(
     monkeypatch,
 ) -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
 
-    import vibespatial.constructive.binary_constructive as binary_constructive_module
     import vibespatial.constructive.union_all as union_all_module
 
     def _fail_serial_union_all(*_args, **_kwargs):
         raise AssertionError("multi-group unary dissolve should not run serial union_all per group")
 
     monkeypatch.setattr(union_all_module, "union_all_gpu_owned", _fail_serial_union_all)
-    real_binary_constructive_owned = binary_constructive_module.binary_constructive_owned
-    skip_contraction_flags = []
-
-    def _record_binary_constructive_owned(*args, **kwargs):
-        skip_contraction_flags.append(kwargs.get("_skip_polygon_contraction"))
-        return real_binary_constructive_owned(*args, **kwargs)
-
-    monkeypatch.setattr(
-        binary_constructive_module,
-        "binary_constructive_owned",
-        _record_binary_constructive_owned,
-    )
 
     values = [
         *[box(float(i) * 0.5, 0, float(i) * 0.5 + 1.0, 1.0) for i in range(12)],
@@ -3791,7 +4824,9 @@ def test_execute_grouped_union_codes_batches_multi_group_unary_on_gpu(
 
     class ExplodingGeometries:
         def __array__(self, dtype=None):
-            raise AssertionError("owned unary grouped union should not materialize geometry objects")
+            raise AssertionError(
+                "owned unary grouped union should not materialize geometry objects"
+            )
 
     grouped = dissolve_module.execute_grouped_union_codes(
         ExplodingGeometries(),
@@ -3805,7 +4840,6 @@ def test_execute_grouped_union_codes_batches_multi_group_unary_on_gpu(
     assert grouped.geometries is None
     assert grouped.owned is not None
     assert grouped.owned.row_count == 2
-    assert all(flag is True for flag in skip_contraction_flags)
 
     actual = np.asarray(grouped.owned.to_shapely(), dtype=object)
     expected = [
@@ -3817,13 +4851,209 @@ def test_execute_grouped_union_codes_batches_multi_group_unary_on_gpu(
 
 
 @pytest.mark.gpu
-def test_small_grouped_constructive_reduce_batches_many_tiny_groups_on_gpu(
-    monkeypatch,
-) -> None:
+def test_execute_native_grouped_union_rectangle_strips_use_direct_carrier() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
 
-    import vibespatial.kernels.constructive.segmented_union as segmented_union_module
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    group_sizes = np.asarray([2, 3, 4, 5, 6, 7, 8, 2], dtype=np.int32)
+    group_offsets = np.concatenate(
+        [np.asarray([0], dtype=np.int32), np.cumsum(group_sizes, dtype=np.int32)]
+    )
+    values = []
+    for group_index, group_size in enumerate(group_sizes):
+        x0 = float(group_index) * 20.0
+        for row in range(int(group_size)):
+            left = x0 + float(row) * 0.45
+            values.append(box(left, 0.0, left + 1.0, 1.0))
+
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_sorted_offsets(
+        cp.asarray(group_offsets, dtype=cp.int64),
+        row_count=owned.row_count,
+        source_token="test-rectangle-strip-groups",
+        all_groups_observed=True,
+        group_size_min=int(group_sizes.min()),
+        group_size_max=int(group_sizes.max()),
+    )
+
+    geopandas.clear_dispatch_events()
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    with assert_zero_d2h_transfers():
+        result = dissolve_module.execute_native_grouped_union(
+            grouped,
+            _geometries=(),
+            method="unary",
+            owned=owned,
+        )
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result is not None
+    assert result.owned is not None
+    assert result.owned.residency is Residency.DEVICE
+    assert any(
+        event.implementation
+        in {
+            "native_grouped_rectangle_strip_union",
+            "native_grouped_rectangle_strip_partition_union",
+        }
+        for event in events
+    )
+
+    actual = np.asarray(result.owned.to_shapely(), dtype=object)
+    expected = [
+        shapely.union_all(np.asarray(values[int(start) : int(end)], dtype=object))
+        for start, end in zip(group_offsets[:-1], group_offsets[1:], strict=True)
+    ]
+    for got, want in zip(actual, expected, strict=True):
+        assert bool(
+            shapely.normalize(got).equals_exact(
+                shapely.normalize(want),
+                tolerance=1.0e-9,
+            )
+        )
+        assert shapely.area(shapely.symmetric_difference(got, want)) == pytest.approx(
+            0.0,
+            abs=1.0e-9,
+        )
+
+
+@pytest.mark.gpu
+def test_grouped_union_partitions_rectangle_strips_from_exact_groups() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    values = [
+        box(0.0, 0.0, 1.0, 1.0),
+        box(0.5, 0.0, 1.5, 1.0),
+        box(10.0, 0.0, 12.0, 1.0),
+        box(11.0, 0.5, 13.0, 2.0),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_sorted_offsets(
+        cp.asarray([0, 2, 4], dtype=cp.int64),
+        row_count=owned.row_count,
+        source_token="mixed-rectangle-strip-partition-test",
+        all_groups_observed=True,
+        group_size_min=2,
+        group_size_max=2,
+    )
+
+    clear_dispatch_events()
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="unary",
+        owned=owned,
+    )
+    events = get_dispatch_events(clear=True)
+
+    assert result is not None
+    assert result.owned is not None
+    assert (
+        getattr(result.owned, "_device_scatter_implementation", None)
+        == "device_capacity_partition_selection"
+    )
+    assert any(
+        event.implementation == "native_grouped_rectangle_strip_partition_union" for event in events
+    )
+    actual = np.asarray(result.owned.to_shapely(), dtype=object)
+    expected = [
+        shapely.union_all(np.asarray(values[:2], dtype=object)),
+        shapely.union_all(np.asarray(values[2:], dtype=object)),
+    ]
+    for got, want in zip(actual, expected, strict=True):
+        assert got.is_valid
+        assert shapely.normalize(got).equals_exact(
+            shapely.normalize(want),
+            tolerance=1.0e-9,
+        )
+
+
+@pytest.mark.gpu
+def test_rectangle_strip_union_uses_active_polygon_rows_from_mixed_indexed_view() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    strip_values = [
+        box(0.0, 0.0, 1.0, 1.0),
+        box(0.5, 0.0, 1.5, 1.0),
+        box(10.0, 0.0, 11.0, 1.0),
+        box(10.5, 0.0, 11.5, 1.0),
+    ]
+    source = from_shapely_geometries(
+        [
+            strip_values[0],
+            strip_values[1],
+            MultiPolygon([box(50.0, 0.0, 51.0, 1.0)]),
+            strip_values[2],
+            strip_values[3],
+        ],
+        residency=Residency.DEVICE,
+    )
+    owned = source.device_take(cp.asarray([0, 1, 3, 4], dtype=cp.int64))
+    seed_all_validity_cache(owned)
+    grouped = NativeGrouped.from_sorted_offsets(
+        cp.asarray([0, 2, 4], dtype=cp.int64),
+        row_count=owned.row_count,
+        source_token="mixed-indexed-rectangle-strip-test",
+        all_groups_observed=True,
+        group_size_min=2,
+        group_size_max=2,
+    )
+    clear_dispatch_events()
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="unary",
+        owned=owned,
+    )
+    events = get_dispatch_events(clear=True)
+
+    assert result is not None
+    assert result.owned is not None
+    assert any(
+        event.implementation
+        in {
+            "native_grouped_rectangle_strip_union",
+            "native_grouped_rectangle_strip_partition_union",
+        }
+        for event in events
+    )
+    assert not any(event.implementation == "native_grouped_overlay_union_plan" for event in events)
+    actual = np.asarray(result.owned.to_shapely(), dtype=object)
+    expected = [
+        shapely.union_all(np.asarray(strip_values[:2], dtype=object)),
+        shapely.union_all(np.asarray(strip_values[2:], dtype=object)),
+    ]
+    for got, want in zip(actual, expected, strict=True):
+        assert shapely.normalize(got).equals_exact(
+            shapely.normalize(want),
+            tolerance=1.0e-9,
+        )
+
+
+@pytest.mark.gpu
+def test_small_grouped_constructive_reduce_batches_many_tiny_groups_on_gpu() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
 
     group_sizes = np.asarray([2, 3, 4, 5, 6, 7, 8, 2], dtype=np.int32)
     group_offsets = np.concatenate(
@@ -3838,11 +5068,6 @@ def test_small_grouped_constructive_reduce_batches_many_tiny_groups_on_gpu(
 
     owned = from_shapely_geometries(values, residency=Residency.DEVICE)
 
-    def _fail_serial(*_args, **_kwargs):
-        raise AssertionError("many small grouped reductions should batch, not dispatch per group")
-
-    monkeypatch.setattr(segmented_union_module, "_segmented_union_serial_gpu", _fail_serial)
-
     geopandas.clear_dispatch_events()
     result = segmented_union_all(
         owned,
@@ -3856,15 +5081,13 @@ def test_small_grouped_constructive_reduce_batches_many_tiny_groups_on_gpu(
     assert any(
         event.surface == "segmented_union_all"
         and event.operation == "segmented_union_strategy"
-        and event.implementation == "gpu_grouped_overlay_many_small_groups"
+        and event.implementation == "gpu_native_grouped_constructive_carrier"
         for event in events
     )
 
     actual = np.asarray(result.to_shapely(), dtype=object)
     expected = [
-        shapely.union_all(
-            np.asarray(values[int(start) : int(end)], dtype=object)
-        )
+        shapely.union_all(np.asarray(values[int(start) : int(end)], dtype=object))
         for start, end in zip(group_offsets[:-1], group_offsets[1:], strict=True)
     ]
     for got, want in zip(actual, expected, strict=True):
@@ -3877,10 +5100,56 @@ def test_small_grouped_constructive_reduce_batches_many_tiny_groups_on_gpu(
         )
 
 
+def test_grouped_convex_hull_uses_polygon_part_capacity_carrier() -> None:
+    convex_hull_module = importlib.import_module("vibespatial.constructive.convex_hull")
+    source = Path(convex_hull_module.__file__).read_text()
+    function_source = source[
+        source.index("def _grouped_convex_hull_from_source_owned(") : source.index(
+            "\n\n# ---------------------------------------------------------------------------\n# Public dispatch API"
+        )
+    ]
+
+    assert "_explode_polygonal_rows_to_polygon_capacity_gpu" in function_source
+    assert "NativeGroupedSelection" in function_source
+    assert "allow_capacity_allocation=True" in function_source
+    assert "polygon_parts.selection.active_capacity_mask()" in function_source
+    assert "_explode_polygonal_rows_to_polygons_gpu" not in function_source
+    assert "cp.argsort" not in function_source
+
+
+def test_segmented_union_residual_relation_uses_polygon_part_capacity() -> None:
+    segmented_union_module = importlib.import_module(
+        "vibespatial.kernels.constructive.segmented_union"
+    )
+    source = Path(segmented_union_module.__file__).read_text()
+    start = source.index("def _failed_input_residuals_against_candidate_parts_gpu(")
+    end = source.index("\ndef ", start + 1)
+    function_source = source[start:end]
+
+    assert "_explode_polygonal_rows_to_polygon_capacity_gpu" in function_source
+    assert "candidate_part_capacity.selection.active_capacity_mask()" in function_source
+    assert "relation_capacity = failed_count * max_part_count" not in function_source
+    assert "relation_tile_slots" in function_source
+    assert "cp.nonzero(d_related)" in function_source
+    assert "_physicalize_polygon_relation_rows_device" in function_source
+    assert "grouped union residual repair admission scalar fence" not in function_source
+    assert "copy_device_to_host" not in function_source
+    assert "device_take_capacity(" in function_source
+    assert "active_pairs=device-resident" in function_source
+    assert "cp.unique(" not in function_source
+    assert "cp.flatnonzero(" not in function_source
+    assert "_explode_polygonal_rows_to_polygons_gpu" not in function_source
+
+
 @pytest.mark.gpu
 def test_public_dissolve_then_convex_hull_uses_grouped_hull_rewrite() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
 
     values = [
         *[box(float(i) * 0.55, 0.0, float(i) * 0.55 + 1.0, 1.0) for i in range(12)],
@@ -3909,7 +5178,11 @@ def test_public_dissolve_then_convex_hull_uses_grouped_hull_rewrite() -> None:
         aggfunc={"value": "sum"},
         method="unary",
     ).reset_index()
-    actual = np.asarray(dissolved.geometry.convex_hull.array, dtype=object)
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    hulls = dissolved.geometry.convex_hull
+    runtime_reasons = {event.reason for event in get_d2h_transfer_events(clear=True)}
+    actual = np.asarray(hulls.array, dtype=object)
     dispatch_events = geopandas.get_dispatch_events(clear=True)
     rewrite_events = get_rewrite_events(clear=True)
 
@@ -3919,15 +5192,71 @@ def test_public_dissolve_then_convex_hull_uses_grouped_hull_rewrite() -> None:
     ]
 
     assert any(
-        event.implementation == "grouped_dissolve_convex_hull_gpu"
-        for event in dispatch_events
+        event.implementation == "grouped_dissolve_convex_hull_gpu" for event in dispatch_events
     )
     assert any(
         event.rule_name == "R12_dissolve_grouped_union_to_grouped_convex_hull"
         for event in rewrite_events
     )
+    assert "grouped convex-hull nonempty-group scalar fence" not in runtime_reasons
+    assert "grouped convex-hull source-row group-domain scalar fence" not in runtime_reasons
     assert shapely.area(shapely.symmetric_difference(actual[0], expected[0])) == 0.0
     assert shapely.area(shapely.symmetric_difference(actual[1], expected[1])) == 0.0
+
+
+@pytest.mark.gpu
+def test_public_dissolve_defers_grouped_union_until_exact_geometry_consumer() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    values = [
+        *[box(float(i) * 0.45, 0.0, float(i) * 0.45 + 1.0, 1.0) for i in range(20)],
+        *[box(20.0 + float(i) * 0.45, 0.0, 21.0 + float(i) * 0.45, 1.0) for i in range(20)],
+    ]
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": np.repeat(np.asarray([0, 1], dtype=np.int32), 20),
+            "value": np.arange(len(values), dtype=np.int32),
+        },
+        geometry=geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(
+                from_shapely_geometries(values, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+
+    geopandas.clear_dispatch_events()
+    dissolved = frame.dissolve(by="group", aggfunc={"value": "sum"}, method="unary")
+    dissolve_events = geopandas.get_dispatch_events(clear=True)
+
+    assert any(
+        event.implementation == "lazy_native_grouped_union_carrier" for event in dissolve_events
+    )
+    assert not any(
+        event.surface == "vibespatial.overlay.dissolve.execute_native_grouped_union"
+        and event.operation == "grouped_union"
+        for event in dissolve_events
+    )
+
+    actual_area = np.asarray(dissolved.geometry.area, dtype=np.float64)
+    materialize_events = geopandas.get_dispatch_events(clear=True)
+    expected_area = np.asarray(
+        [
+            shapely.area(shapely.union_all(np.asarray(values[:20], dtype=object))),
+            shapely.area(shapely.union_all(np.asarray(values[20:], dtype=object))),
+        ],
+        dtype=np.float64,
+    )
+
+    assert np.allclose(actual_area, expected_area)
+    assert any(
+        event.surface == "vibespatial.overlay.dissolve.LazyGroupedUnionOwned"
+        and event.operation == "materialize_grouped_union"
+        for event in materialize_events
+    )
 
 
 def test_public_dissolve_matches_public_union_all_component_order_for_nybb_fixture() -> None:
@@ -3947,15 +5276,12 @@ def test_public_dissolve_matches_public_union_all_component_order_for_nybb_fixtu
     assert shapely.to_wkb(dissolved.loc[5, "myshapes"]) == shapely.to_wkb(expected)
 
 
-def test_evaluate_geopandas_dissolve_routes_small_buffered_line_unary_to_exact_cpu_rescue() -> None:
+def test_evaluate_geopandas_dissolve_routes_small_buffered_line_unary_to_grouped_union() -> None:
     frame = geopandas.GeoDataFrame(
         {
             "group": np.zeros(64, dtype=np.int32),
             "value": np.arange(64, dtype=np.int32),
-            "geometry": [
-                LineString([(float(i), 0.0), (float(i), 10.0)])
-                for i in range(64)
-            ],
+            "geometry": [LineString([(float(i), 0.0), (float(i), 10.0)]) for i in range(64)],
         },
         crs="EPSG:3857",
     )
@@ -3998,18 +5324,29 @@ def test_evaluate_geopandas_dissolve_routes_small_buffered_line_unary_to_exact_c
         event.rule_name == "R8_dissolve_buffered_lines_to_disjoint_subset"
         for event in rewrite_events
     )
-    assert any(
-        event.surface == "geopandas.geodataframe.dissolve"
-        and "small buffered-line dissolve" in event.reason
-        for event in fallback_events
-    )
+    if has_gpu_runtime():
+        assert any(
+            event.rule_name == "R12_dissolve_buffered_lines_grouped_union"
+            for event in rewrite_events
+        )
+        assert not any(
+            event.surface == "geopandas.geodataframe.dissolve"
+            and "declined the native grouped carrier" in event.reason
+            for event in fallback_events
+        )
+    else:
+        assert any(
+            event.surface == "geopandas.geodataframe.dissolve"
+            and "declined the native grouped carrier" in event.reason
+            for event in fallback_events
+        )
     actual_geom = np.asarray(actual.geometry.array, dtype=object)[0]
     expected_geom = np.asarray(expected.geometry.array, dtype=object)[0]
     assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
     assert actual.iloc[0]["value"] == expected.iloc[0]["value"]
 
 
-def test_duplicate_two_point_buffered_line_dissolve_prefers_small_cpu_rescue() -> None:
+def test_duplicate_two_point_buffered_line_dissolve_promotes_to_grouped_union() -> None:
     lines = [
         LineString([(0.0, 0.0), (10.0, 0.0)]),
         LineString([(10.0, 0.0), (0.0, 0.0)]),
@@ -4049,11 +5386,22 @@ def test_duplicate_two_point_buffered_line_dissolve_prefers_small_cpu_rescue() -
         event.rule_name == "R9_dissolve_buffered_two_point_lines_exact_union"
         for event in rewrite_events
     )
-    assert any(
-        event.surface == "geopandas.geodataframe.dissolve"
-        and "small buffered-line dissolve" in event.reason
-        for event in fallback_events
-    )
+    if has_gpu_runtime():
+        assert any(
+            event.rule_name == "R12_dissolve_buffered_lines_grouped_union"
+            for event in rewrite_events
+        )
+        assert not any(
+            event.surface == "geopandas.geodataframe.dissolve"
+            and "declined the native grouped carrier" in event.reason
+            for event in fallback_events
+        )
+    else:
+        assert any(
+            event.surface == "geopandas.geodataframe.dissolve"
+            and "declined the native grouped carrier" in event.reason
+            for event in fallback_events
+        )
     actual_geom = np.asarray(actual.geometry.array, dtype=object)[0]
     expected_geom = shapely.union_all(np.asarray(buffered.geometry.array, dtype=object))
     assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
@@ -4089,7 +5437,9 @@ def test_evaluate_geopandas_dissolve_rewrites_duplicate_two_point_buffered_lines
     buffered["geometry"] = buffered.geometry.buffer(0.5)
 
     def _fail(*_args, **_kwargs):
-        raise AssertionError("duplicate two-point buffered-line dissolve should bypass the generic grouped union path")
+        raise AssertionError(
+            "duplicate two-point buffered-line dissolve should bypass the generic grouped union path"
+        )
 
     monkeypatch.setattr(dissolve_module, "execute_grouped_union_codes", _fail)
 
@@ -4127,7 +5477,7 @@ def test_evaluate_geopandas_dissolve_rewrites_duplicate_two_point_buffered_lines
     )
     assert not any(
         event.surface == "geopandas.geodataframe.dissolve"
-        and "small buffered-line dissolve" in event.reason
+        and "declined the native grouped carrier" in event.reason
         for event in fallback_events
     )
     actual_geom = np.asarray(actual.geometry.array, dtype=object)[0]
@@ -4150,6 +5500,7 @@ def test_dedupe_two_point_linestring_rows_prefers_host_metadata_when_available(
     owned._ensure_host_state()
 
     if dissolve_module.cp is not None:
+
         def _fail(*_args, **_kwargs):
             raise AssertionError("host-materialized dedupe should not call device-side lexsort")
 
@@ -4158,7 +5509,9 @@ def test_dedupe_two_point_linestring_rows_prefers_host_metadata_when_available(
     unique_rows = dissolve_module._dedupe_two_point_linestring_rows_gpu(owned)
 
     assert unique_rows is not None
-    deduped = np.asarray(owned.take(unique_rows.astype(np.int64, copy=False)).to_shapely(), dtype=object)
+    deduped = np.asarray(
+        owned.take(unique_rows.astype(np.int64, copy=False)).to_shapely(), dtype=object
+    )
     assert deduped.shape == (3,)
 
     def _normalized_endpoints(geom) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -4179,10 +5532,7 @@ def test_buffered_two_point_line_exact_union_rewrite_accepts_large_deduped_sets(
     if not has_gpu_runtime():
         return
 
-    unique_lines = [
-        LineString([(0.0, float(i) * 4.0), (20.0, float(i) * 4.0)])
-        for i in range(66)
-    ]
+    unique_lines = [LineString([(0.0, float(i) * 4.0), (20.0, float(i) * 4.0)]) for i in range(66)]
     lines = unique_lines * 16
     frame = geopandas.GeoDataFrame(
         {
@@ -4202,7 +5552,9 @@ def test_buffered_two_point_line_exact_union_rewrite_accepts_large_deduped_sets(
     buffered["geometry"] = buffered.geometry.buffer(0.5)
 
     def _fail(*_args, **_kwargs):
-        raise AssertionError("large deduped buffered-line dissolve should bypass the generic grouped union path")
+        raise AssertionError(
+            "large deduped buffered-line dissolve should bypass the generic grouped union path"
+        )
 
     monkeypatch.setattr(dissolve_module, "_BUFFERED_LINE_EXACT_CPU_MAX_ROWS", 1)
     monkeypatch.setattr(dissolve_module, "execute_grouped_union_codes", _fail)
@@ -4233,103 +5585,96 @@ def test_buffered_two_point_line_exact_union_rewrite_accepts_large_deduped_sets(
     assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
 
 
-def test_union_small_partial_rows_gpu_matches_union_all_for_two_partials() -> None:
-    if not has_gpu_runtime():
-        return
+def test_buffered_two_point_line_rewrite_has_one_device_grouped_union_shape() -> None:
+    source = Path(dissolve_module.__file__).read_text()
+    function_start = source.index("def _maybe_execute_buffered_two_point_line_exact_union_rewrite(")
+    function_end = source.index("\ndef ", function_start + 1)
+    function_source = source[function_start:function_end]
 
-    partials = [
-        from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)], residency=Residency.DEVICE),
-        from_shapely_geometries([box(1.0, 0.0, 3.0, 2.0)], residency=Residency.DEVICE),
-    ]
+    assert "device_source_rowset_to_grouped_union" in function_source
+    assert "source_owned.device_take" in function_source
+    assert function_source.count("_reduce_buffered_line_polygons_gpu(") == 1
+    assert "overlay_device_to_host" not in function_source
+    assert "_greedy_bbox_disjoint_coloring" not in source
+    assert "_reorder_small_partial_union_groups_by_overlap" not in source
+    assert "_reduce_partial_rows_gpu" not in source
+    assert "cp.lexsort" not in source
+    assert "cp.stack(tuple(sort_keys))" not in source
+    assert "d_observed_codes.astype(cp.float64" not in source
 
-    actual = dissolve_module._union_small_partial_rows_gpu(partials)
+    dedupe_start = source.index("def _dedupe_two_point_linestring_rows_gpu(")
+    dedupe_end = source.index("\ndef ", dedupe_start + 1)
+    dedupe_source = source[dedupe_start:dedupe_end]
+    assert "_has_trusted_two_point_linestring_layout" in dedupe_source
+    assert "overlay_bool_scalar" not in dedupe_source
 
-    assert actual is not None
-    assert actual.row_count == 1
-    actual_geom = np.asarray(actual.to_shapely(), dtype=object)[0]
-    expected_geom = shapely.union_all(
-        np.asarray(
-            [partial.to_shapely()[0] for partial in partials],
-            dtype=object,
-        )
-    )
-    assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
+    reducer_start = source.index("def _reduce_buffered_line_polygons_gpu(")
+    reducer_end = source.index("\ndef ", reducer_start + 1)
+    reducer_source = source[reducer_start:reducer_end]
+    assert reducer_source.count("_regroup_native_grouped_parts_with_grouped_union_gpu(") == 1
+    assert "NativeGrouped.from_dense_sorted_offsets(" in reducer_source
+    assert "cp.flatnonzero(" not in reducer_source
+    assert "_regroup_polygonal_parts_with_grouped_union_gpu(" not in source
+    assert "except Exception" not in reducer_source
+    assert "_tree_reduce_global" not in reducer_source
+    assert "_gpu_union_group" not in source
 
-
-def test_union_small_partial_rows_gpu_defers_four_partials_to_union_all() -> None:
-    if not has_gpu_runtime():
-        return
-
-    partials = [
-        from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)], residency=Residency.DEVICE),
-        from_shapely_geometries([box(1.0, 0.0, 3.0, 2.0)], residency=Residency.DEVICE),
-        from_shapely_geometries([box(2.0, 0.0, 4.0, 2.0)], residency=Residency.DEVICE),
-        from_shapely_geometries([box(3.0, 0.0, 5.0, 2.0)], residency=Residency.DEVICE),
-    ]
-
-    assert dissolve_module._union_small_partial_rows_gpu(partials) is None
-
-
-def test_reorder_small_partial_union_groups_by_overlap_pairs_low_overlap_groups() -> None:
-    expanded_bounds = np.asarray(
-        [
-            [0.0, 0.0, 4.0, 10.0],
-            [2.0, 3.0, 12.0, 5.0],
-            [10.0, 0.0, 14.0, 10.0],
-            [2.0, 6.0, 12.0, 8.0],
-        ],
-        dtype=np.float64,
-    )
-    color_rows = [
-        np.asarray([0], dtype=np.int64),
-        np.asarray([1], dtype=np.int64),
-        np.asarray([2], dtype=np.int64),
-        np.asarray([3], dtype=np.int64),
-    ]
-
-    reordered = dissolve_module._reorder_small_partial_union_groups_by_overlap(
-        expanded_bounds,
-        color_rows,
-    )
-
-    assert [rows.tolist() for rows in reordered] == [[0], [2], [1], [3]]
+    grouped_start = source.index("def _maybe_execute_buffered_line_grouped_union_rewrite(")
+    grouped_end = source.index("\ndef ", grouped_start + 1)
+    grouped_source = source[grouped_start:grouped_end]
+    assert "except Exception" not in grouped_source
 
 
-def test_reduce_partial_rows_gpu_uses_direct_tree_reduce_for_four_partials(
+def test_lazy_grouped_union_propagates_admitted_exact_materializer_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not has_gpu_runtime():
-        return
+    source_owned = from_shapely_geometries([box(0.0, 0.0, 1.0, 1.0), box(1.0, 0.0, 2.0, 1.0)])
+    grouped = NativeGrouped.from_dense_codes(
+        np.asarray([0, 0], dtype=np.int32),
+        group_count=1,
+    )
 
-    union_all_module = importlib.import_module("vibespatial.constructive.union_all")
-
-    partials = [
-        from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)], residency=Residency.DEVICE),
-        from_shapely_geometries([box(1.0, 0.0, 3.0, 2.0)], residency=Residency.DEVICE),
-        from_shapely_geometries([box(2.0, 0.0, 4.0, 2.0)], residency=Residency.DEVICE),
-        from_shapely_geometries([box(3.0, 0.0, 5.0, 2.0)], residency=Residency.DEVICE),
-    ]
+    def _fail_exact():
+        raise RuntimeError("admitted grouped topology failed")
 
     monkeypatch.setattr(
-        union_all_module,
-        "union_all_gpu_owned",
+        dissolve_module,
+        "execute_native_grouped_union",
         lambda *_args, **_kwargs: pytest.fail(
-            "four partial rows should use direct tree reduction before generic union_all"
+            "an admitted exact materializer failure must not switch algorithms"
         ),
     )
-
-    actual = dissolve_module._reduce_partial_rows_gpu(partials)
-
-    assert actual is not None
-    assert actual.row_count == 1
-    actual_geom = np.asarray(actual.to_shapely(), dtype=object)[0]
-    expected_geom = shapely.union_all(
-        np.asarray(
-            [partial.to_shapely()[0] for partial in partials],
-            dtype=object,
-        )
+    lazy = dissolve_module.LazyGroupedUnionOwned(
+        source_owned=source_owned,
+        grouped=grouped,
+        geometries=np.asarray(source_owned.to_shapely(), dtype=object),
+        method=DissolveUnionMethod.UNARY,
+        grid_size=None,
+        geometry_name="geometry",
+        crs=None,
+        exact_materializer=_fail_exact,
     )
-    assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
+
+    with pytest.raises(RuntimeError, match="admitted grouped topology failed"):
+        lazy.to_owned()
+
+
+def test_device_grouped_union_repair_uses_atomic_native_carrier() -> None:
+    source = Path(dissolve_module.__file__).read_text()
+    helper_start = source.index("def _repair_grouped_union_invalid_subset_device(")
+    helper_end = source.index("\ndef ", helper_start + 1)
+    helper_source = source[helper_start:helper_end]
+
+    assert "gpu_repair_invalid_polygons(" in helper_source
+    assert "make_valid_owned(" not in helper_source
+    assert ".device_take(" not in helper_source
+    assert "device_concat_owned_scatter(" not in helper_source
+    assert ".to_shapely(" not in helper_source
+
+    native_start = source.index("def _execute_device_native_grouped_union(")
+    native_end = source.index("\ndef ", native_start + 1)
+    native_source = source[native_start:native_end]
+    assert "device native grouped union failed" not in native_source
 
 
 def test_evaluate_geopandas_dissolve_does_not_rewrite_polygon_buffer_unary() -> None:
@@ -4337,10 +5682,7 @@ def test_evaluate_geopandas_dissolve_does_not_rewrite_polygon_buffer_unary() -> 
         {
             "group": np.zeros(64, dtype=np.int32),
             "value": np.arange(64, dtype=np.int32),
-            "geometry": [
-                box(float(i), 0.0, float(i) + 0.5, 0.5)
-                for i in range(64)
-            ],
+            "geometry": [box(float(i), 0.0, float(i) + 0.5, 0.5) for i in range(64)],
         },
         crs="EPSG:3857",
     )
@@ -4371,10 +5713,7 @@ def test_evaluate_geopandas_dissolve_does_not_rewrite_polygon_buffer_unary() -> 
 
 @pytest.mark.gpu
 def test_device_backed_buffered_line_dissolve_preserves_owned_backing() -> None:
-    lines = [
-        LineString([(float(i), 0.0), (float(i), 10.0)])
-        for i in range(64)
-    ]
+    lines = [LineString([(float(i), 0.0), (float(i), 10.0)]) for i in range(64)]
     frame = geopandas.GeoDataFrame(
         {
             "group": np.zeros(64, dtype=np.int32),
@@ -4421,7 +5760,7 @@ def test_device_backed_buffered_line_dissolve_preserves_owned_backing() -> None:
     )
     assert not any(
         event.surface == "geopandas.geodataframe.dissolve"
-        and "small buffered-line dissolve" in event.reason
+        and "declined the native grouped carrier" in event.reason
         for event in fallback_events
     )
     actual_geom = np.asarray(result.geometry.array, dtype=object)[0]
@@ -4431,10 +5770,7 @@ def test_device_backed_buffered_line_dissolve_preserves_owned_backing() -> None:
 
 @pytest.mark.gpu
 def test_device_backed_buffered_line_dissolve_strict_native_uses_exact_gpu_rewrite() -> None:
-    lines = [
-        LineString([(float(i), 0.0), (float(i), 10.0)])
-        for i in range(64)
-    ]
+    lines = [LineString([(float(i), 0.0), (float(i), 10.0)]) for i in range(64)]
     frame = geopandas.GeoDataFrame(
         {
             "group": np.zeros(64, dtype=np.int32),
@@ -4480,13 +5816,13 @@ def test_device_backed_buffered_line_dissolve_strict_native_uses_exact_gpu_rewri
     )
     assert not any(
         event.surface == "geopandas.geodataframe.dissolve"
-        and "small buffered-line dissolve" in event.reason
+        and "declined the native grouped carrier" in event.reason
         for event in fallback_events
     )
 
 
 @pytest.mark.gpu
-def test_device_backed_multivertex_buffered_line_dissolve_uses_exact_cpu_rescue() -> None:
+def test_device_backed_multivertex_buffered_line_dissolve_defers_grouped_union_carrier() -> None:
     lines = [
         LineString(
             [
@@ -4516,6 +5852,7 @@ def test_device_backed_multivertex_buffered_line_dissolve_uses_exact_cpu_rescue(
     buffered = frame.copy()
     buffered["geometry"] = buffered.geometry.buffer(0.5)
 
+    geopandas.clear_dispatch_events()
     clear_rewrite_events()
     geopandas.clear_fallback_events()
     result = evaluate_geopandas_dissolve(
@@ -4532,16 +5869,19 @@ def test_device_backed_multivertex_buffered_line_dissolve_uses_exact_cpu_rescue(
         agg_kwargs={},
     )
     rewrite_events = get_rewrite_events(clear=True)
+    dispatch_events = geopandas.get_dispatch_events(clear=True)
     fallback_events = geopandas.get_fallback_events(clear=True)
 
-    assert not any(
-        event.rule_name == "R8_dissolve_buffered_lines_to_disjoint_subset"
-        for event in rewrite_events
-    )
     assert any(
+        event.implementation == "lazy_native_grouped_union_carrier" for event in dispatch_events
+    )
+    assert not any(
+        event.rule_name == "R12_dissolve_buffered_lines_grouped_union" for event in rewrite_events
+    )
+    assert getattr(result.geometry.values._owned, "_is_lazy_grouped_union_owned", False)
+    assert not any(
         event.surface == "geopandas.geodataframe.dissolve"
-        and "small buffered-line dissolve" in event.reason
-        and event.d2h_transfer
+        and "declined the native grouped carrier" in event.reason
         for event in fallback_events
     )
     actual_geom = np.asarray(result.geometry.array, dtype=object)[0]
@@ -4786,7 +6126,9 @@ def test_grouped_union_geometry_result_make_valid_fallback_extracts_polygonal_co
 def test_execute_grouped_union_codes_recomputes_invalid_gpu_rows_from_original_members(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    segmented_union_module = importlib.import_module("vibespatial.kernels.constructive.segmented_union")
+    segmented_union_module = importlib.import_module(
+        "vibespatial.kernels.constructive.segmented_union"
+    )
 
     geoms = [box(0.0, 0.0, 1.0, 1.0), box(1.0, 0.0, 2.0, 1.0)]
     owned = from_shapely_geometries(geoms)
@@ -4814,7 +6156,9 @@ def test_execute_grouped_union_codes_recomputes_invalid_gpu_rows_from_original_m
     assert shapely.equals(actual, expected)
 
 
-def test_execute_grouped_box_union_gpu_owned_codes_builds_device_backed_coverage_rectangles() -> None:
+def test_execute_grouped_box_union_gpu_owned_codes_builds_device_backed_coverage_rectangles() -> (
+    None
+):
     if not has_gpu_runtime():
         return
 
@@ -4844,7 +6188,10 @@ def test_execute_grouped_box_union_gpu_owned_codes_builds_device_backed_coverage
     assert grouped.geometries is None
     actual = np.asarray(grouped.owned.to_shapely(), dtype=object)
     expected = np.asarray([box(0, 0, 2, 1), box(10, 10, 12, 11)], dtype=object)
-    assert all(actual_geom.equals(expected_geom) for actual_geom, expected_geom in zip(actual, expected, strict=True))
+    assert all(
+        actual_geom.equals(expected_geom)
+        for actual_geom, expected_geom in zip(actual, expected, strict=True)
+    )
 
 
 def test_execute_grouped_box_union_gpu_owned_codes_accepts_fractional_rectangles() -> None:
@@ -5021,7 +6368,9 @@ def test_join_heavy_direct_grouped_dissolve_matches_public_coverage_dissolve(
         return real_codes(*args, **kwargs)
 
     def _fail(*_args, **_kwargs):
-        raise AssertionError("join-heavy benchmark helper should not fall back to public dissolve here")
+        raise AssertionError(
+            "join-heavy benchmark helper should not fall back to public dissolve here"
+        )
 
     monkeypatch.setattr("vibespatial.bench.pipeline.execute_grouped_union_codes", _count_codes)
     monkeypatch.setattr("vibespatial.bench.pipeline.evaluate_geopandas_dissolve", _fail)

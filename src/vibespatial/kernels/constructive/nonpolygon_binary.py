@@ -24,8 +24,6 @@ from __future__ import annotations
 import logging
 
 from vibespatial.constructive.nonpolygon_binary_output import (
-    build_device_backed_linestring_output,
-    build_device_backed_multilinestring_output,
     build_device_backed_multipoint_output,
     build_point_result_from_source,
 )
@@ -33,8 +31,6 @@ from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
     compile_kernel_group,
-    count_scatter_total,
-    count_scatter_totals,
     get_cuda_runtime,
 )
 from vibespatial.cuda.cccl_precompile import request_warmup
@@ -43,17 +39,12 @@ from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
-    NULL_TAG,
     DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
-    _device_gather_offset_slices,
     build_device_resident_owned,
+    build_null_owned_array,
 )
 from vibespatial.kernels.constructive.nonpolygon_binary_source import (
-    _LINESTRING_LINESTRING_KERNEL_NAMES,
-    _LINESTRING_LINESTRING_KERNEL_SOURCE,
-    _LINESTRING_POLYGON_KERNEL_NAMES,
-    _LINESTRING_POLYGON_KERNEL_SOURCE,
     _POINT_LINESTRING_KERNEL_NAMES,
     _POINT_LINESTRING_KERNEL_SOURCE,
 )
@@ -67,11 +58,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # ADR-0034: NVRTC precompilation at module scope
 # ---------------------------------------------------------------------------
-request_nvrtc_warmup([
-    ("point-linestring-on-line", _POINT_LINESTRING_KERNEL_SOURCE, _POINT_LINESTRING_KERNEL_NAMES),
-    ("linestring-polygon-clip", _LINESTRING_POLYGON_KERNEL_SOURCE, _LINESTRING_POLYGON_KERNEL_NAMES),
-    ("linestring-linestring-isect", _LINESTRING_LINESTRING_KERNEL_SOURCE, _LINESTRING_LINESTRING_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        (
+            "point-linestring-on-line",
+            _POINT_LINESTRING_KERNEL_SOURCE,
+            _POINT_LINESTRING_KERNEL_NAMES,
+        ),
+    ]
+)
 
 request_warmup(["exclusive_scan_i32"])
 
@@ -79,6 +74,7 @@ request_warmup(["exclusive_scan_i32"])
 # ---------------------------------------------------------------------------
 # Kernel compilation helpers
 # ---------------------------------------------------------------------------
+
 
 def _point_linestring_kernels():
     return compile_kernel_group(
@@ -88,25 +84,10 @@ def _point_linestring_kernels():
     )
 
 
-def _linestring_polygon_kernels():
-    return compile_kernel_group(
-        "linestring-polygon-clip",
-        _LINESTRING_POLYGON_KERNEL_SOURCE,
-        _LINESTRING_POLYGON_KERNEL_NAMES,
-    )
-
-
-def _linestring_linestring_kernels():
-    return compile_kernel_group(
-        "linestring-linestring-isect",
-        _LINESTRING_LINESTRING_KERNEL_SOURCE,
-        _LINESTRING_LINESTRING_KERNEL_NAMES,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Registered kernel variant (ARCH003 compliance)
 # ---------------------------------------------------------------------------
+
 
 @register_kernel_variant(
     "nonpolygon_binary_constructive",
@@ -114,7 +95,9 @@ def _linestring_linestring_kernels():
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "linestring", "multipoint",
+        "point",
+        "linestring",
+        "multipoint",
     ),
     supports_mixed=True,
     precision_modes=(PrecisionMode.AUTO, PrecisionMode.FP64),
@@ -139,6 +122,26 @@ def _nonpolygon_binary_constructive_gpu(
 # Point-Point constructive operations (Tier 2: CuPy element-wise)
 # ---------------------------------------------------------------------------
 
+
+def _logical_point_rows(owned: OwnedGeometryArray):
+    """Return logical validity and point coordinates for an indexed carrier."""
+    import cupy as cp
+
+    state = owned._ensure_device_state(preserve_indexed_view=True)
+    buffer = state.families[GeometryFamily.POINT]
+    d_family_rows = cp.asarray(state.family_row_offsets, dtype=cp.int64)
+    d_valid = cp.asarray(state.validity, dtype=cp.bool_) & (d_family_rows >= 0)
+    d_safe_rows = cp.where(d_valid, d_family_rows, cp.int64(0))
+    d_valid &= ~cp.asarray(buffer.empty_mask, dtype=cp.bool_)[d_safe_rows]
+    d_coord_indices = cp.asarray(buffer.geometry_offsets, dtype=cp.int64)[d_safe_rows]
+    return (
+        d_valid,
+        d_coord_indices,
+        cp.asarray(buffer.x),
+        cp.asarray(buffer.y),
+    )
+
+
 def point_point_intersection(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
@@ -151,20 +154,19 @@ def point_point_intersection(
     import cupy as cp
 
     n = left.row_count
-    left.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                 reason="point_point_intersection GPU")
-    right.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                  reason="point_point_intersection GPU")
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="point_point_intersection GPU",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="point_point_intersection GPU",
+    )
 
-    l_state = left.device_state
-    r_state = right.device_state
-
-    l_buf = l_state.families[GeometryFamily.POINT]
-    r_buf = r_state.families[GeometryFamily.POINT]
-
-    # Both-valid mask
-    d_l_valid = l_state.validity.astype(cp.bool_) & ~l_buf.empty_mask.astype(cp.bool_)
-    d_r_valid = r_state.validity.astype(cp.bool_) & ~r_buf.empty_mask.astype(cp.bool_)
+    d_l_valid, d_l_offsets, d_l_x, d_l_y = _logical_point_rows(left)
+    d_r_valid, d_r_offsets, d_r_x, d_r_y = _logical_point_rows(right)
     d_both_valid = d_l_valid & d_r_valid
 
     # Point coordinates: each point has exactly 1 coord at geom_offsets[i]
@@ -172,13 +174,6 @@ def point_point_intersection(
     tol = 1e-8
 
     # For valid rows, extract the coordinate index from geometry_offsets
-    d_l_offsets = cp.asarray(l_buf.geometry_offsets)
-    d_r_offsets = cp.asarray(r_buf.geometry_offsets)
-    d_l_x = cp.asarray(l_buf.x)
-    d_l_y = cp.asarray(l_buf.y)
-    d_r_x = cp.asarray(r_buf.x)
-    d_r_y = cp.asarray(r_buf.y)
-
     # Initialize match mask as False
     d_match = cp.zeros(n, dtype=cp.bool_)
 
@@ -211,29 +206,22 @@ def point_point_difference(
     """
     import cupy as cp
 
-    left.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                 reason="point_point_difference GPU")
-    right.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                  reason="point_point_difference GPU")
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="point_point_difference GPU",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="point_point_difference GPU",
+    )
 
-    l_state = left.device_state
-    r_state = right.device_state
-
-    l_buf = l_state.families[GeometryFamily.POINT]
-    r_buf = r_state.families[GeometryFamily.POINT]
-
-    d_l_valid = l_state.validity.astype(cp.bool_) & ~l_buf.empty_mask.astype(cp.bool_)
-    d_r_valid = r_state.validity.astype(cp.bool_) & ~r_buf.empty_mask.astype(cp.bool_)
+    d_l_valid, d_l_offsets, d_l_x, d_l_y = _logical_point_rows(left)
+    d_r_valid, d_r_offsets, d_r_x, d_r_y = _logical_point_rows(right)
     d_both_valid = d_l_valid & d_r_valid
 
     tol = 1e-8
-
-    d_l_offsets = cp.asarray(l_buf.geometry_offsets)
-    d_r_offsets = cp.asarray(r_buf.geometry_offsets)
-    d_l_x = cp.asarray(l_buf.x)
-    d_l_y = cp.asarray(l_buf.y)
-    d_r_x = cp.asarray(r_buf.x)
-    d_r_y = cp.asarray(r_buf.y)
 
     # Start with "keep left if left is valid"
     d_keep = d_l_valid.copy()
@@ -275,29 +263,23 @@ def point_point_union(
     import cupy as cp
 
     n = left.row_count
-    left.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                 reason="point_point_union GPU")
-    right.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                  reason="point_point_union GPU")
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="point_point_union GPU",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="point_point_union GPU",
+    )
 
-    l_state = left.device_state
-    r_state = right.device_state
-    l_buf = l_state.families[GeometryFamily.POINT]
-    r_buf = r_state.families[GeometryFamily.POINT]
-
-    d_l_valid = l_state.validity.astype(cp.bool_) & ~l_buf.empty_mask.astype(cp.bool_)
-    d_r_valid = r_state.validity.astype(cp.bool_) & ~r_buf.empty_mask.astype(cp.bool_)
+    d_l_valid, d_l_offsets, d_l_x, d_l_y = _logical_point_rows(left)
+    d_r_valid, d_r_offsets, d_r_x, d_r_y = _logical_point_rows(right)
     d_both_valid = d_l_valid & d_r_valid
     d_any_valid = d_l_valid | d_r_valid
 
     tol = 1e-8
-
-    d_l_offsets = cp.asarray(l_buf.geometry_offsets)
-    d_r_offsets = cp.asarray(r_buf.geometry_offsets)
-    d_l_x = cp.asarray(l_buf.x)
-    d_l_y = cp.asarray(l_buf.y)
-    d_r_x = cp.asarray(r_buf.x)
-    d_r_y = cp.asarray(r_buf.y)
 
     # For each row, determine output coordinate count:
     # - both valid & same: 1 point
@@ -330,29 +312,9 @@ def point_point_union(
 
     runtime = get_cuda_runtime()
     d_offsets = exclusive_sum(d_counts, synchronize=False)
-    total_coords = count_scatter_total(
-        runtime,
-        d_counts,
-        d_offsets,
-        reason="point-point constructive coordinate allocation fence",
-    )
-
-    if total_coords == 0:
-        d_empty_validity = cp.zeros(n, dtype=cp.bool_)
-        d_empty_offsets = cp.zeros(n + 1, dtype=cp.int32)
-        d_empty_x = runtime.allocate((0,), cp.float64)
-        d_empty_y = runtime.allocate((0,), cp.float64)
-        return build_device_backed_multipoint_output(
-            d_empty_x,
-            d_empty_y,
-            row_count=n,
-            validity=d_empty_validity,
-            geometry_offsets=d_empty_offsets,
-        )
-
-    # Allocate output coordinates on device
-    d_out_x = runtime.allocate((total_coords,), cp.float64)
-    d_out_y = runtime.allocate((total_coords,), cp.float64)
+    coordinate_capacity = n * 2
+    d_out_x = runtime.allocate((coordinate_capacity,), cp.float64)
+    d_out_y = runtime.allocate((coordinate_capacity,), cp.float64)
     d_out_x_cp = cp.asarray(d_out_x)
     d_out_y_cp = cp.asarray(d_out_y)
 
@@ -393,11 +355,15 @@ def point_point_union(
             d_out_y_cp[out_pos2] = d_r_y[r_ci2]
 
     d_geometry_offsets = cp.empty(n + 1, dtype=cp.int32)
-    d_geometry_offsets[:n] = d_offsets_cp
-    d_geometry_offsets[n] = total_coords
+    if n:
+        d_geometry_offsets[:n] = d_offsets_cp
+        d_geometry_offsets[n] = d_offsets_cp[-1] + d_counts[-1]
+    else:
+        d_geometry_offsets[0] = 0
 
     return build_device_backed_multipoint_output(
-        d_out_x, d_out_y,
+        d_out_x,
+        d_out_y,
         row_count=n,
         validity=d_any_valid,
         geometry_offsets=d_geometry_offsets,
@@ -417,28 +383,22 @@ def point_point_symmetric_difference(
     import cupy as cp
 
     n = left.row_count
-    left.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                 reason="point_point_symmetric_difference GPU")
-    right.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                  reason="point_point_symmetric_difference GPU")
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="point_point_symmetric_difference GPU",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="point_point_symmetric_difference GPU",
+    )
 
-    l_state = left.device_state
-    r_state = right.device_state
-    l_buf = l_state.families[GeometryFamily.POINT]
-    r_buf = r_state.families[GeometryFamily.POINT]
-
-    d_l_valid = l_state.validity.astype(cp.bool_) & ~l_buf.empty_mask.astype(cp.bool_)
-    d_r_valid = r_state.validity.astype(cp.bool_) & ~r_buf.empty_mask.astype(cp.bool_)
+    d_l_valid, d_l_offsets, d_l_x, d_l_y = _logical_point_rows(left)
+    d_r_valid, d_r_offsets, d_r_x, d_r_y = _logical_point_rows(right)
     d_both_valid = d_l_valid & d_r_valid
 
     tol = 1e-8
-
-    d_l_offsets = cp.asarray(l_buf.geometry_offsets)
-    d_r_offsets = cp.asarray(r_buf.geometry_offsets)
-    d_l_x = cp.asarray(l_buf.x)
-    d_l_y = cp.asarray(l_buf.y)
-    d_r_x = cp.asarray(r_buf.x)
-    d_r_y = cp.asarray(r_buf.y)
 
     # For symmetric difference:
     # - same coords: empty (0 points)
@@ -465,30 +425,13 @@ def point_point_symmetric_difference(
 
     runtime = get_cuda_runtime()
     d_offsets = exclusive_sum(d_counts, synchronize=False)
-    total_coords = count_scatter_total(
-        runtime,
-        d_counts,
-        d_offsets,
-        reason="point-point difference coordinate allocation fence",
-    )
 
     # Validity: row is valid if it has any output points
     d_has_output = d_counts > 0
 
-    if total_coords == 0:
-        d_empty_offsets = cp.zeros(n + 1, dtype=cp.int32)
-        d_empty_x = runtime.allocate((0,), cp.float64)
-        d_empty_y = runtime.allocate((0,), cp.float64)
-        return build_device_backed_multipoint_output(
-            d_empty_x,
-            d_empty_y,
-            row_count=n,
-            validity=d_has_output,
-            geometry_offsets=d_empty_offsets,
-        )
-
-    d_out_x = runtime.allocate((total_coords,), cp.float64)
-    d_out_y = runtime.allocate((total_coords,), cp.float64)
+    coordinate_capacity = n * 2
+    d_out_x = runtime.allocate((coordinate_capacity,), cp.float64)
+    d_out_y = runtime.allocate((coordinate_capacity,), cp.float64)
     d_out_x_cp = cp.asarray(d_out_x)
     d_out_y_cp = cp.asarray(d_out_y)
     d_offsets_cp = cp.asarray(d_offsets)
@@ -522,11 +465,15 @@ def point_point_symmetric_difference(
         d_out_y_cp[out_pos + 1] = d_r_y[r_ci]
 
     d_geometry_offsets = cp.empty(n + 1, dtype=cp.int32)
-    d_geometry_offsets[:n] = d_offsets_cp
-    d_geometry_offsets[n] = total_coords
+    if n:
+        d_geometry_offsets[:n] = d_offsets_cp
+        d_geometry_offsets[n] = d_offsets_cp[-1] + d_counts[-1]
+    else:
+        d_geometry_offsets[0] = 0
 
     return build_device_backed_multipoint_output(
-        d_out_x, d_out_y,
+        d_out_x,
+        d_out_y,
         row_count=n,
         validity=d_has_output,
         geometry_offsets=d_geometry_offsets,
@@ -536,6 +483,7 @@ def point_point_symmetric_difference(
 # ---------------------------------------------------------------------------
 # Point-LineString constructive operations (Tier 1: NVRTC kernel)
 # ---------------------------------------------------------------------------
+
 
 def point_linestring_intersection(
     points: OwnedGeometryArray,
@@ -566,10 +514,16 @@ def _point_linestring_constructive(
     import cupy as cp
 
     n = points.row_count
-    points.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                   reason=f"point_linestring_{mode} GPU")
-    linestrings.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                        reason=f"point_linestring_{mode} GPU")
+    points.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"point_linestring_{mode} GPU",
+    )
+    linestrings.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"point_linestring_{mode} GPU",
+    )
 
     pt_state = points.device_state
     ls_state = linestrings.device_state
@@ -589,14 +543,26 @@ def _point_linestring_constructive(
 
     params = (
         (
-            ptr(pt_buf.x), ptr(pt_buf.y), ptr(pt_buf.geometry_offsets),
-            ptr(ls_buf.x), ptr(ls_buf.y), ptr(ls_buf.geometry_offsets),
-            ptr(d_both_valid), ptr(d_on_line), n,
+            ptr(pt_buf.x),
+            ptr(pt_buf.y),
+            ptr(pt_buf.geometry_offsets),
+            ptr(ls_buf.x),
+            ptr(ls_buf.y),
+            ptr(ls_buf.geometry_offsets),
+            ptr(d_both_valid),
+            ptr(d_on_line),
+            n,
         ),
         (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
         ),
     )
     grid, block = runtime.launch_config(kernels["point_linestring_on_line"], n)
@@ -620,447 +586,48 @@ def _point_linestring_constructive(
 
 
 # ---------------------------------------------------------------------------
-# LineString-Polygon constructive operations (Tier 1: NVRTC kernel)
+# Lineal-Polygonal constructive operations (shared split topology)
 # ---------------------------------------------------------------------------
+
 
 def linestring_polygon_intersection(
     linestrings: OwnedGeometryArray,
     polygons: OwnedGeometryArray,
-) -> OwnedGeometryArray:
-    """LineString-Polygon intersection: clip line to inside of polygon."""
-    return _linestring_polygon_constructive(linestrings, polygons, mode=0)
+    *,
+    crs=None,
+):
+    """Intersect aligned lineal and polygonal rows through shared topology."""
+    from vibespatial.api._native_result_core import GeometryNativeResult
+    from vibespatial.constructive.line_polygon_difference import (
+        lineal_polygonal_constructive_topology_gpu,
+    )
+
+    result = lineal_polygonal_constructive_topology_gpu(
+        linestrings,
+        polygons,
+        operation="intersection",
+        dispatch_mode=ExecutionMode.GPU,
+        crs=crs,
+    )
+    if result is None or isinstance(result, GeometryNativeResult):
+        return result
+    return GeometryNativeResult.from_owned(result, crs=crs)
 
 
 def linestring_polygon_difference(
     linestrings: OwnedGeometryArray,
     polygons: OwnedGeometryArray,
-) -> OwnedGeometryArray:
-    """LineString-Polygon difference: clip line to outside of polygon."""
-    return _linestring_polygon_constructive(linestrings, polygons, mode=1)
-
-
-def _linestring_polygon_constructive(
-    linestrings: OwnedGeometryArray,
-    polygons: OwnedGeometryArray,
-    *,
-    mode: int,
-) -> OwnedGeometryArray:
-    """Common implementation for LineString-Polygon intersection/difference.
-
-    Uses two-pass count-scatter NVRTC kernels (Tier 1).
-    mode: 0 = intersection (keep inside), 1 = difference (keep outside).
-    """
-    import cupy as cp
-
-    n = linestrings.row_count
-    linestrings.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                        reason="linestring_polygon_constructive GPU")
-    polygons.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                     reason="linestring_polygon_constructive GPU")
-
-    ls_state = linestrings.device_state
-    poly_state = polygons.device_state
-
-    ls_buf = ls_state.families[GeometryFamily.LINESTRING]
-
-    # Determine polygon family
-    if GeometryFamily.POLYGON in poly_state.families:
-        poly_buf = poly_state.families[GeometryFamily.POLYGON]
-    elif GeometryFamily.MULTIPOLYGON in poly_state.families:
-        # For MultiPolygon, use the first polygon part for simplicity.
-        # A full implementation would iterate all parts.
-        poly_buf = poly_state.families[GeometryFamily.MULTIPOLYGON]
-    else:
-        d_empty_validity = cp.zeros(n, dtype=cp.bool_)
-        d_empty_offsets = cp.zeros(n + 1, dtype=cp.int32)
-        d_out_x = get_cuda_runtime().allocate((0,), cp.float64)
-        d_out_y = get_cuda_runtime().allocate((0,), cp.float64)
-        return build_device_backed_linestring_output(
-            d_out_x,
-            d_out_y,
-            row_count=n,
-            validity=d_empty_validity,
-            geometry_offsets=d_empty_offsets,
-        )
-
-    d_ls_valid = ls_state.validity.astype(cp.bool_) & ~ls_buf.empty_mask.astype(cp.bool_)
-    d_poly_valid = poly_state.validity.astype(cp.bool_) & ~poly_buf.empty_mask.astype(cp.bool_)
-    d_both_valid = (d_ls_valid & d_poly_valid).astype(cp.int32)
-
-    runtime = get_cuda_runtime()
-    kernels = _linestring_polygon_kernels()
-    ptr = runtime.pointer
-
-    if mode == 0:
-        d_counts = runtime.allocate((n,), cp.int32, zero=True)
-        count_params = (
-            (
-                ptr(ls_buf.x), ptr(ls_buf.y), ptr(ls_buf.geometry_offsets),
-                ptr(poly_buf.x), ptr(poly_buf.y),
-                ptr(poly_buf.ring_offsets), ptr(poly_buf.geometry_offsets),
-                ptr(d_both_valid), ptr(d_counts), mode, n,
-            ),
-            (
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32,
-            ),
-        )
-        grid, block = runtime.launch_config(kernels["linestring_polygon_count"], n)
-        runtime.launch(kernels["linestring_polygon_count"], grid=grid, block=block, params=count_params)
-
-        d_offsets = exclusive_sum(d_counts, synchronize=False)
-        total_verts = count_scatter_total(
-            runtime,
-            d_counts,
-            d_offsets,
-            reason="linestring-polygon constructive vertex allocation fence",
-        )
-
-        if total_verts == 0:
-            d_empty_validity = cp.zeros(n, dtype=cp.bool_)
-            d_empty_offsets = cp.zeros(n + 1, dtype=cp.int32)
-            d_out_x = runtime.allocate((0,), cp.float64)
-            d_out_y = runtime.allocate((0,), cp.float64)
-            return build_device_backed_linestring_output(
-                d_out_x, d_out_y,
-                row_count=n,
-                validity=d_empty_validity,
-                geometry_offsets=d_empty_offsets,
-            )
-
-        d_out_x = runtime.allocate((total_verts,), cp.float64)
-        d_out_y = runtime.allocate((total_verts,), cp.float64)
-
-        scatter_params = (
-            (
-                ptr(ls_buf.x), ptr(ls_buf.y), ptr(ls_buf.geometry_offsets),
-                ptr(poly_buf.x), ptr(poly_buf.y),
-                ptr(poly_buf.ring_offsets), ptr(poly_buf.geometry_offsets),
-                ptr(d_both_valid), ptr(d_offsets),
-                ptr(d_out_x), ptr(d_out_y), mode, n,
-            ),
-            (
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32,
-            ),
-        )
-        scatter_grid, scatter_block = runtime.launch_config(
-            kernels["linestring_polygon_scatter"], n,
-        )
-        runtime.launch(
-            kernels["linestring_polygon_scatter"],
-            grid=scatter_grid, block=scatter_block, params=scatter_params,
-        )
-
-        runtime.synchronize()
-
-        d_counts_cp = cp.asarray(d_counts)
-        d_offsets_cp = cp.asarray(d_offsets)
-        d_geom_offsets = cp.empty(n + 1, dtype=cp.int32)
-        d_geom_offsets[:n] = d_offsets_cp
-        d_geom_offsets[n] = total_verts
-
-        d_degenerate_line_mask = cp.zeros(n, dtype=cp.bool_)
-        d_two_coord_rows = cp.flatnonzero(d_counts_cp == 2).astype(cp.int64, copy=False)
-        if d_two_coord_rows.size > 0:
-            d_two_coord_starts = d_geom_offsets[d_two_coord_rows]
-            d_dx = d_out_x[d_two_coord_starts + 1] - d_out_x[d_two_coord_starts]
-            d_dy = d_out_y[d_two_coord_starts + 1] - d_out_y[d_two_coord_starts]
-            d_degenerate_line_mask[d_two_coord_rows] = (d_dx * d_dx + d_dy * d_dy) <= 1e-18
-
-        d_point_rows = cp.flatnonzero(
-            (d_counts_cp == 1) | d_degenerate_line_mask,
-        ).astype(cp.int64, copy=False)
-        d_line_rows = cp.flatnonzero(
-            (d_counts_cp >= 2) & ~d_degenerate_line_mask,
-        ).astype(cp.int64, copy=False)
-        point_count = int(d_point_rows.size)
-        line_count = int(d_line_rows.size)
-
-        if point_count > 0:
-            d_point_starts = d_geom_offsets[d_point_rows]
-            d_point_x = d_out_x[d_point_starts]
-            d_point_y = d_out_y[d_point_starts]
-        else:
-            d_point_x = runtime.allocate((0,), cp.float64)
-            d_point_y = runtime.allocate((0,), cp.float64)
-
-        if line_count > 0:
-            coords = (
-                cp.column_stack([d_out_x, d_out_y])
-                if total_verts
-                else cp.empty((0, 2), dtype=cp.float64)
-            )
-            gathered, d_line_geom_offsets = _device_gather_offset_slices(
-                coords, d_geom_offsets, d_line_rows,
-            )
-            d_line_x = (
-                gathered[:, 0].copy() if gathered.size else cp.empty(0, dtype=cp.float64)
-            )
-            d_line_y = (
-                gathered[:, 1].copy() if gathered.size else cp.empty(0, dtype=cp.float64)
-            )
-        else:
-            d_line_x = runtime.allocate((0,), cp.float64)
-            d_line_y = runtime.allocate((0,), cp.float64)
-            d_line_geom_offsets = cp.zeros(1, dtype=cp.int32)
-
-        d_validity = d_counts_cp > 0
-        d_tags = cp.full(n, NULL_TAG, dtype=cp.int8)
-        d_family_row_offsets = cp.full(n, -1, dtype=cp.int32)
-
-        device_families = {}
-        if point_count > 0:
-            device_families[GeometryFamily.POINT] = DeviceFamilyGeometryBuffer(
-                family=GeometryFamily.POINT,
-                x=d_point_x,
-                y=d_point_y,
-                geometry_offsets=cp.arange(point_count + 1, dtype=cp.int32),
-                empty_mask=cp.zeros(point_count, dtype=cp.bool_),
-            )
-            d_tags[d_point_rows] = FAMILY_TAGS[GeometryFamily.POINT]
-            d_family_row_offsets[d_point_rows] = cp.arange(point_count, dtype=cp.int32)
-
-        if line_count > 0:
-            device_families[GeometryFamily.LINESTRING] = DeviceFamilyGeometryBuffer(
-                family=GeometryFamily.LINESTRING,
-                x=d_line_x,
-                y=d_line_y,
-                geometry_offsets=d_line_geom_offsets,
-                empty_mask=cp.zeros(line_count, dtype=cp.bool_),
-            )
-            d_tags[d_line_rows] = FAMILY_TAGS[GeometryFamily.LINESTRING]
-            d_family_row_offsets[d_line_rows] = cp.arange(line_count, dtype=cp.int32)
-
-        return build_device_resident_owned(
-            device_families=device_families,
-            row_count=n,
-            tags=d_tags,
-            validity=d_validity,
-            family_row_offsets=d_family_row_offsets,
-            execution_mode="gpu",
-        )
-
-    d_coord_counts = runtime.allocate((n,), cp.int32, zero=True)
-    d_part_counts = runtime.allocate((n,), cp.int32, zero=True)
-
-    count_params = (
-        (
-            ptr(ls_buf.x), ptr(ls_buf.y), ptr(ls_buf.geometry_offsets),
-            ptr(poly_buf.x), ptr(poly_buf.y),
-            ptr(poly_buf.ring_offsets), ptr(poly_buf.geometry_offsets),
-            ptr(d_both_valid), ptr(d_coord_counts), ptr(d_part_counts), n,
-        ),
-        (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-        ),
-    )
-    grid, block = runtime.launch_config(kernels["linestring_polygon_difference_count"], n)
-    runtime.launch(
-        kernels["linestring_polygon_difference_count"],
-        grid=grid,
-        block=block,
-        params=count_params,
+) -> OwnedGeometryArray | None:
+    """Subtract aligned polygonal rows through shared split topology."""
+    from vibespatial.constructive.line_polygon_difference import (
+        lineal_polygonal_constructive_topology_gpu,
     )
 
-    d_coord_offsets = exclusive_sum(d_coord_counts, synchronize=False)
-    d_part_offsets = exclusive_sum(d_part_counts, synchronize=False)
-    total_verts, total_parts = count_scatter_totals(
-        runtime,
-        [
-            (d_coord_counts, d_coord_offsets),
-            (d_part_counts, d_part_offsets),
-        ],
-        reason="linestring-polygon difference totals allocation fence",
-    )
-
-    d_coord_counts_cp = cp.asarray(d_coord_counts)
-    d_part_counts_cp = cp.asarray(d_part_counts)
-    d_validity = d_both_valid.astype(cp.bool_)
-
-    if total_verts == 0 or total_parts == 0:
-        d_line_rows = cp.flatnonzero(d_validity).astype(cp.int64, copy=False)
-        line_count = int(d_line_rows.size)
-        d_empty_offsets = cp.zeros(line_count + 1, dtype=cp.int32)
-        d_out_x = runtime.allocate((0,), cp.float64)
-        d_out_y = runtime.allocate((0,), cp.float64)
-        d_tags = cp.full(n, NULL_TAG, dtype=cp.int8)
-        d_family_row_offsets = cp.full(n, -1, dtype=cp.int32)
-        if line_count > 0:
-            d_tags[d_line_rows] = FAMILY_TAGS[GeometryFamily.LINESTRING]
-            d_family_row_offsets[d_line_rows] = cp.arange(line_count, dtype=cp.int32)
-        return build_device_resident_owned(
-            device_families={
-                GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
-                    family=GeometryFamily.LINESTRING,
-                    x=d_out_x,
-                    y=d_out_y,
-                    geometry_offsets=d_empty_offsets,
-                    empty_mask=cp.ones(line_count, dtype=cp.bool_),
-                ),
-            },
-            row_count=n,
-            tags=d_tags,
-            validity=d_validity,
-            family_row_offsets=d_family_row_offsets,
-            execution_mode="gpu",
-        )
-
-    d_out_x = runtime.allocate((total_verts,), cp.float64)
-    d_out_y = runtime.allocate((total_verts,), cp.float64)
-    d_out_part_offsets = runtime.allocate((total_parts,), cp.int32, zero=True)
-
-    scatter_params = (
-        (
-            ptr(ls_buf.x), ptr(ls_buf.y), ptr(ls_buf.geometry_offsets),
-            ptr(poly_buf.x), ptr(poly_buf.y),
-            ptr(poly_buf.ring_offsets), ptr(poly_buf.geometry_offsets),
-            ptr(d_both_valid), ptr(d_coord_offsets), ptr(d_part_offsets),
-            ptr(d_out_x), ptr(d_out_y), ptr(d_out_part_offsets), n,
-        ),
-        (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-        ),
-    )
-    scatter_grid, scatter_block = runtime.launch_config(
-        kernels["linestring_polygon_difference_scatter"], n,
-    )
-    runtime.launch(
-        kernels["linestring_polygon_difference_scatter"],
-        grid=scatter_grid,
-        block=scatter_block,
-        params=scatter_params,
-    )
-    runtime.synchronize()
-
-    d_part_offsets_cp = cp.asarray(d_part_offsets)
-    d_full_geom_offsets = cp.empty(n + 1, dtype=cp.int32)
-    d_full_geom_offsets[:n] = d_part_offsets_cp
-    d_full_geom_offsets[n] = total_parts
-    d_full_part_offsets = cp.empty(total_parts + 1, dtype=cp.int32)
-    d_full_part_offsets[:total_parts] = cp.asarray(d_out_part_offsets)
-    d_full_part_offsets[total_parts] = total_verts
-
-    d_line_rows = cp.flatnonzero(d_validity & (d_part_counts_cp <= 1)).astype(cp.int64, copy=False)
-    line_count = int(d_line_rows.size)
-    d_mls_rows = cp.flatnonzero(d_validity & (d_part_counts_cp > 1)).astype(cp.int64, copy=False)
-    mls_count = int(d_mls_rows.size)
-
-    if mls_count == 0:
-        d_nonempty_line_rows = cp.flatnonzero(d_validity & (d_part_counts_cp == 1)).astype(cp.int64, copy=False)
-        d_line_coord_counts = d_coord_counts_cp[d_line_rows]
-        d_line_geom_offsets = cp.empty(line_count + 1, dtype=cp.int32)
-        d_line_geom_offsets[0] = 0
-        if line_count > 0:
-            cp.cumsum(d_line_coord_counts, out=d_line_geom_offsets[1:])
-        d_part_rows = d_full_geom_offsets[d_nonempty_line_rows].astype(cp.int64, copy=False)
-        coords = cp.column_stack([d_out_x, d_out_y]) if total_verts else cp.empty((0, 2), dtype=cp.float64)
-        gathered, _ = _device_gather_offset_slices(
-            coords, d_full_part_offsets, d_part_rows,
-        )
-        d_line_x = gathered[:, 0].copy() if gathered.size else cp.empty(0, dtype=cp.float64)
-        d_line_y = gathered[:, 1].copy() if gathered.size else cp.empty(0, dtype=cp.float64)
-        d_tags = cp.where(
-            d_validity,
-            cp.full(n, FAMILY_TAGS[GeometryFamily.LINESTRING], dtype=cp.int8),
-            cp.full(n, NULL_TAG, dtype=cp.int8),
-        )
-        d_family_row_offsets = cp.full(n, -1, dtype=cp.int32)
-        d_family_row_offsets[d_line_rows] = cp.arange(line_count, dtype=cp.int32)
-        return build_device_resident_owned(
-            device_families={
-                GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
-                    family=GeometryFamily.LINESTRING,
-                    x=d_line_x,
-                    y=d_line_y,
-                    geometry_offsets=d_line_geom_offsets,
-                    empty_mask=(d_line_coord_counts == 0),
-                ),
-            },
-            row_count=n,
-            tags=d_tags,
-            validity=d_validity,
-            family_row_offsets=d_family_row_offsets,
-            execution_mode="gpu",
-        )
-
-    if line_count == 0:
-        return build_device_backed_multilinestring_output(
-            d_out_x,
-            d_out_y,
-            row_count=n,
-            validity=d_validity,
-            geometry_offsets=d_full_geom_offsets,
-            part_offsets=d_full_part_offsets,
-        )
-
-    coords = cp.column_stack([d_out_x, d_out_y]) if total_verts else cp.empty((0, 2), dtype=cp.float64)
-    d_nonempty_line_rows = cp.flatnonzero(d_validity & (d_part_counts_cp == 1)).astype(cp.int64, copy=False)
-    d_line_part_rows = d_full_geom_offsets[d_nonempty_line_rows].astype(cp.int64, copy=False)
-    line_gathered, d_line_geom_offsets = _device_gather_offset_slices(
-        coords, d_full_part_offsets, d_line_part_rows,
-    )
-    d_line_x = line_gathered[:, 0].copy() if line_gathered.size else cp.empty(0, dtype=cp.float64)
-    d_line_y = line_gathered[:, 1].copy() if line_gathered.size else cp.empty(0, dtype=cp.float64)
-    d_line_coord_counts = d_coord_counts_cp[d_line_rows]
-    d_line_geom_offsets = cp.empty(line_count + 1, dtype=cp.int32)
-    d_line_geom_offsets[0] = 0
-    if line_count > 0:
-        cp.cumsum(d_line_coord_counts, out=d_line_geom_offsets[1:])
-
-    part_space = cp.arange(total_parts, dtype=cp.int32)
-    d_mls_parts, d_mls_geom_offsets = _device_gather_offset_slices(
-        part_space, d_full_geom_offsets, d_mls_rows,
-    )
-    d_mls_part_rows = d_mls_parts.astype(cp.int64, copy=False)
-    mls_gathered, d_mls_part_offsets = _device_gather_offset_slices(
-        coords, d_full_part_offsets, d_mls_part_rows,
-    )
-    d_mls_x = mls_gathered[:, 0].copy() if mls_gathered.size else cp.empty(0, dtype=cp.float64)
-    d_mls_y = mls_gathered[:, 1].copy() if mls_gathered.size else cp.empty(0, dtype=cp.float64)
-
-    d_tags = cp.full(n, NULL_TAG, dtype=cp.int8)
-    d_family_row_offsets = cp.full(n, -1, dtype=cp.int32)
-    d_tags[d_line_rows] = FAMILY_TAGS[GeometryFamily.LINESTRING]
-    d_family_row_offsets[d_line_rows] = cp.arange(line_count, dtype=cp.int32)
-    d_tags[d_mls_rows] = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
-    d_family_row_offsets[d_mls_rows] = cp.arange(mls_count, dtype=cp.int32)
-
-    return build_device_resident_owned(
-        device_families={
-            GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
-                family=GeometryFamily.LINESTRING,
-                x=d_line_x,
-                y=d_line_y,
-                geometry_offsets=d_line_geom_offsets,
-                empty_mask=(d_line_coord_counts == 0),
-            ),
-            GeometryFamily.MULTILINESTRING: DeviceFamilyGeometryBuffer(
-                family=GeometryFamily.MULTILINESTRING,
-                x=d_mls_x,
-                y=d_mls_y,
-                geometry_offsets=d_mls_geom_offsets,
-                part_offsets=d_mls_part_offsets,
-                empty_mask=cp.zeros(mls_count, dtype=cp.bool_),
-            ),
-        },
-        row_count=n,
-        tags=d_tags,
-        validity=d_validity,
-        family_row_offsets=d_family_row_offsets,
-        execution_mode="gpu",
+    return lineal_polygonal_constructive_topology_gpu(
+        linestrings,
+        polygons,
+        operation="difference",
+        dispatch_mode=ExecutionMode.GPU,
     )
 
 
@@ -1068,115 +635,244 @@ def _linestring_polygon_constructive(
 # LineString-LineString intersection (Tier 1: NVRTC kernel)
 # ---------------------------------------------------------------------------
 
-def linestring_linestring_intersection(
+
+def _build_compact_device_linestrings(device_x, device_y, *, row_count: int):
+    import cupy as cp
+
+    return build_device_resident_owned(
+        device_families={
+            GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.LINESTRING,
+                x=device_x,
+                y=device_y,
+                geometry_offsets=cp.arange(0, (row_count + 1) * 2, 2, dtype=cp.int32),
+                empty_mask=cp.zeros(row_count, dtype=cp.bool_),
+            ),
+        },
+        row_count=row_count,
+        tags=cp.full(row_count, FAMILY_TAGS[GeometryFamily.LINESTRING], dtype=cp.int8),
+        validity=cp.ones(row_count, dtype=cp.bool_),
+        family_row_offsets=cp.arange(row_count, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+
+
+def _build_compact_device_points(device_x, device_y, *, row_count: int):
+    import cupy as cp
+
+    return build_device_resident_owned(
+        device_families={
+            GeometryFamily.POINT: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.POINT,
+                x=device_x,
+                y=device_y,
+                geometry_offsets=cp.arange(row_count + 1, dtype=cp.int32),
+                empty_mask=cp.zeros(row_count, dtype=cp.bool_),
+            ),
+        },
+        row_count=row_count,
+        tags=cp.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=cp.int8),
+        validity=cp.ones(row_count, dtype=cp.bool_),
+        family_row_offsets=cp.arange(row_count, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+
+
+def _build_valid_empty_linestring_rows(left, right):
+    """Build row-aligned typed empties while preserving null input semantics."""
+    import cupy as cp
+
+    row_count = int(left.row_count)
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right._ensure_device_state(preserve_indexed_view=True)
+    d_validity = cp.asarray(left_state.validity, dtype=cp.bool_) & cp.asarray(
+        right_state.validity, dtype=cp.bool_
+    )
+    return build_device_resident_owned(
+        device_families={
+            GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.LINESTRING,
+                x=cp.empty(0, dtype=cp.float64),
+                y=cp.empty(0, dtype=cp.float64),
+                geometry_offsets=cp.zeros(row_count + 1, dtype=cp.int32),
+                empty_mask=cp.ones(row_count, dtype=cp.bool_),
+                bounds=None,
+            )
+        },
+        row_count=row_count,
+        tags=cp.full(
+            row_count,
+            FAMILY_TAGS[GeometryFamily.LINESTRING],
+            dtype=cp.int8,
+        ),
+        validity=d_validity,
+        family_row_offsets=cp.arange(row_count, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+
+
+def linestring_linestring_intersection_native(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
-) -> OwnedGeometryArray:
-    """LineString-LineString intersection: find intersection points.
+    *,
+    crs=None,
+):
+    """Classify aligned segment relations and assemble exact mixed results.
 
-    Returns a Point or MultiPoint per row depending on intersection count.
-    Uses two-pass count-scatter NVRTC kernels (Tier 1).
+    Physical shape: same-row segment candidate pages become point and overlap
+    capacities. Points are deduplicated by output row, overlap spans are noded
+    and deduplicated as atomic lines, and points covered by those lines are
+    removed. Mixed rows remain a native geometry composition until export.
     """
     import cupy as cp
 
-    n = left.row_count
-    left.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                 reason="linestring_linestring_intersection GPU")
-    right.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                  reason="linestring_linestring_intersection GPU")
-
-    l_state = left.device_state
-    r_state = right.device_state
-
-    l_buf = l_state.families[GeometryFamily.LINESTRING]
-    r_buf = r_state.families[GeometryFamily.LINESTRING]
-
-    d_l_valid = l_state.validity.astype(cp.bool_) & ~l_buf.empty_mask.astype(cp.bool_)
-    d_r_valid = r_state.validity.astype(cp.bool_) & ~r_buf.empty_mask.astype(cp.bool_)
-    d_both_valid = (d_l_valid & d_r_valid).astype(cp.int32)
-
-    runtime = get_cuda_runtime()
-    d_counts = runtime.allocate((n,), cp.int32, zero=True)
-
-    kernels = _linestring_linestring_kernels()
-    ptr = runtime.pointer
-
-    count_params = (
-        (
-            ptr(l_buf.x), ptr(l_buf.y), ptr(l_buf.geometry_offsets),
-            ptr(r_buf.x), ptr(r_buf.y), ptr(r_buf.geometry_offsets),
-            ptr(d_both_valid), ptr(d_counts), n,
-        ),
-        (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-        ),
+    from vibespatial.api._native_results import (
+        _geometry_composition_from_owned_parts_at_capacity,
     )
-    grid, block = runtime.launch_config(kernels["linestring_linestring_count"], n)
-    runtime.launch(
-        kernels["linestring_linestring_count"],
-        grid=grid, block=block, params=count_params,
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+    from vibespatial.constructive.binary_constructive import (
+        LinePartCapacitySelection,
+        PointPartCapacitySelection,
+    )
+    from vibespatial.constructive.grouped_mixed_union import (
+        atomic_line_union_from_part_capacity_device,
+        unique_points_from_part_capacity_device,
+    )
+    from vibespatial.geometry.owned import device_mask_owned_capacity
+    from vibespatial.spatial.segment_primitives import (
+        PagedSegmentIntersectionResult,
+        SegmentIntersectionKind,
+        SegmentIntersectionResult,
+        classify_segment_intersections,
     )
 
-    d_offsets = exclusive_sum(d_counts, synchronize=False)
-    total_points = count_scatter_total(
-        runtime,
-        d_counts,
-        d_offsets,
-        reason="linestring-linestring intersection point allocation fence",
-    )
+    if int(left.row_count) != int(right.row_count):
+        raise ValueError("line-line intersection inputs must have equal row counts")
+    row_count = int(left.row_count)
+    if row_count == 0:
+        from vibespatial.api._native_result_core import GeometryNativeResult
 
-    if total_points == 0:
-        d_empty_validity = cp.zeros(n, dtype=cp.bool_)
-        d_empty_offsets = cp.zeros(n + 1, dtype=cp.int32)
-        d_empty_x = runtime.allocate((0,), cp.float64)
-        d_empty_y = runtime.allocate((0,), cp.float64)
-        return build_device_backed_multipoint_output(
-            d_empty_x,
-            d_empty_y,
-            row_count=n,
-            validity=d_empty_validity,
-            geometry_offsets=d_empty_offsets,
+        return GeometryNativeResult.from_owned(
+            build_null_owned_array(0, residency=Residency.DEVICE),
+            crs=crs,
         )
 
-    d_out_x = runtime.allocate((total_points,), cp.float64)
-    d_out_y = runtime.allocate((total_points,), cp.float64)
+    pages = []
 
-    scatter_params = (
-        (
-            ptr(l_buf.x), ptr(l_buf.y), ptr(l_buf.geometry_offsets),
-            ptr(r_buf.x), ptr(r_buf.y), ptr(r_buf.geometry_offsets),
-            ptr(d_both_valid), ptr(d_offsets),
-            ptr(d_out_x), ptr(d_out_y), n,
-        ),
-        (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-        ),
-    )
-    scatter_grid, scatter_block = runtime.launch_config(
-        kernels["linestring_linestring_scatter"], n,
-    )
-    runtime.launch(
-        kernels["linestring_linestring_scatter"],
-        grid=scatter_grid, block=scatter_block, params=scatter_params,
-    )
+    def _retain_classified_page(page):
+        if page.count > 0:
+            pages.append(page)
 
-    runtime.synchronize()
-
-    d_offsets_cp = cp.asarray(d_offsets)
-    d_geom_offsets = cp.empty(n + 1, dtype=cp.int32)
-    d_geom_offsets[:n] = d_offsets_cp
-    d_geom_offsets[n] = total_points
-    validity = d_counts > 0
-
-    return build_device_backed_multipoint_output(
-        d_out_x, d_out_y,
-        row_count=n, validity=validity, geometry_offsets=d_geom_offsets,
+    classified = classify_segment_intersections(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        precision=PrecisionMode.FP64,
+        _require_same_row=True,
+        _collect_ambiguous_rows=False,
+        _classified_page_consumer=_retain_classified_page,
     )
+    if isinstance(classified, SegmentIntersectionResult):
+        if classified.count > 0:
+            pages.append(classified)
+    elif not isinstance(classified, PagedSegmentIntersectionResult):
+        raise RuntimeError("line-line intersection received an unknown classifier result")
+
+    empty_rows = _build_valid_empty_linestring_rows(left, right)
+    output_rows = cp.arange(row_count, dtype=cp.int64)
+    capacity_parts = [(empty_rows, output_rows)]
+    if pages:
+        states = tuple(page.device_state for page in pages)
+        if any(state is None for state in states):
+            raise RuntimeError("line-line GPU classification returned a host page")
+
+        def _concat(field):
+            values = tuple(cp.asarray(getattr(state, field)) for state in states)
+            return values[0] if len(values) == 1 else cp.concatenate(values)
+
+        d_rows = _concat("left_rows").astype(cp.int32, copy=False)
+        d_kinds = _concat("kinds").astype(cp.int8, copy=False)
+        candidate_capacity = int(d_kinds.size)
+
+        d_overlap = d_kinds == cp.int8(SegmentIntersectionKind.OVERLAP)
+        d_overlap_x = cp.empty(candidate_capacity * 2, dtype=cp.float64)
+        d_overlap_y = cp.empty(candidate_capacity * 2, dtype=cp.float64)
+        d_overlap_x[0::2] = _concat("overlap_x0")
+        d_overlap_y[0::2] = _concat("overlap_y0")
+        d_overlap_x[1::2] = _concat("overlap_x1")
+        d_overlap_y[1::2] = _concat("overlap_y1")
+        overlap_geometry = _build_compact_device_linestrings(
+            d_overlap_x,
+            d_overlap_y,
+            row_count=candidate_capacity,
+        )
+        overlap_selection = NativeDeviceSelection.from_mask(d_overlap)
+        d_overlap_active = overlap_selection.active_capacity_mask()
+        overlap_geometry = overlap_geometry._device_indexed_take(
+            overlap_selection.partition_capacity_positions(),
+            assume_unique_indices=True,
+        )._apply_row_activity(d_overlap_active)
+        d_overlap_rows = overlap_selection.gather_capacity(
+            d_rows,
+            fill_value=0,
+        ).astype(cp.int32, copy=False)
+        overlap_parts = LinePartCapacitySelection(
+            geometry=overlap_geometry,
+            source_rows=d_overlap_rows,
+            selection=overlap_selection.as_capacity_prefix(),
+            coord_capacity=candidate_capacity * 2,
+        )
+        atomic_lines = atomic_line_union_from_part_capacity_device(
+            overlap_parts,
+            d_overlap_rows,
+            output_row_count=row_count,
+        )
+        if atomic_lines is not None:
+            capacity_parts.append((atomic_lines.owned, output_rows))
+
+        d_point = (d_kinds == cp.int8(SegmentIntersectionKind.PROPER)) | (
+            d_kinds == cp.int8(SegmentIntersectionKind.TOUCH)
+        )
+        point_geometry = _build_compact_device_points(
+            _concat("point_x").astype(cp.float64, copy=False),
+            _concat("point_y").astype(cp.float64, copy=False),
+            row_count=candidate_capacity,
+        )
+        point_selection = NativeDeviceSelection.from_mask(d_point)
+        d_point_active = point_selection.active_capacity_mask()
+        point_geometry = point_geometry._device_indexed_take(
+            point_selection.partition_capacity_positions(),
+            assume_unique_indices=True,
+        )._apply_row_activity(d_point_active)
+        d_point_rows = point_selection.gather_capacity(
+            d_rows,
+            fill_value=0,
+        ).astype(cp.int32, copy=False)
+        point_parts = PointPartCapacitySelection(
+            geometry=point_geometry,
+            source_rows=d_point_rows,
+            selection=point_selection.as_capacity_prefix(),
+        )
+        points = unique_points_from_part_capacity_device(
+            point_parts,
+            d_point_rows,
+            output_row_count=row_count,
+            covering_lines=atomic_lines,
+        )
+        if points is not None:
+            point_owned, d_point_keep = points
+            capacity_parts.append(
+                (device_mask_owned_capacity(point_owned, d_point_keep), output_rows)
+            )
+
+    geometry = _geometry_composition_from_owned_parts_at_capacity(
+        tuple(capacity_parts),
+        row_count=row_count,
+        crs=crs,
+    )
+    if geometry is None:
+        raise RuntimeError("line-line intersection failed native composition")
+    return geometry
 
 
 # ---------------------------------------------------------------------------

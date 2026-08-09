@@ -188,7 +188,7 @@
     "module": "vibespatial.kernels.constructive.segmented_union",
     "tier": 3,
     "variants": [
-      "gpu-overlay-tree-reduce",
+      "gpu-native-grouped-constructive",
       "cpu"
     ]
   },

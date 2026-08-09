@@ -3,6 +3,7 @@
 Provides a single ``BenchmarkResult`` dataclass that works across both
 Tier 1 (pipeline/operation) and Tier 2 (NVBench kernel) benchmarks.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ import orjson
 # ---------------------------------------------------------------------------
 # Timing helpers
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class TimingSummary:
@@ -110,6 +112,7 @@ class KernelTimingSummary:
 # Core result
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class BenchmarkResult:
     """Unified result for any benchmark — Tier 1 or Tier 2."""
@@ -202,6 +205,7 @@ class BenchmarkResult:
 # ---------------------------------------------------------------------------
 # Suite-level wrapper
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class SuiteResult:
@@ -322,15 +326,11 @@ def benchmark_result_from_dict(payload: dict[str, Any]) -> BenchmarkResult:
             else float(payload["tier_gate_threshold"])
         ),
         tier_gate_passed=(
-            None
-            if payload.get("tier_gate_passed") is None
-            else bool(payload["tier_gate_passed"])
+            None if payload.get("tier_gate_passed") is None else bool(payload["tier_gate_passed"])
         ),
         input_format=str(payload.get("input_format", "parquet")),
         read_seconds=(
-            None
-            if payload.get("read_seconds") is None
-            else float(payload["read_seconds"])
+            None if payload.get("read_seconds") is None else float(payload["read_seconds"])
         ),
         stages=tuple(payload.get("stages", ())),
         metadata=dict(payload.get("metadata") or {}),
@@ -349,6 +349,7 @@ def suite_result_from_dict(payload: dict[str, Any]) -> SuiteResult:
 # ---------------------------------------------------------------------------
 # Helpers for building timing summaries from sample lists
 # ---------------------------------------------------------------------------
+
 
 def timing_from_samples(seconds: list[float]) -> TimingSummary:
     """Build a ``TimingSummary`` from a list of elapsed-second samples."""

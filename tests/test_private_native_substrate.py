@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import importlib
 from pathlib import Path
 
 import numpy as np
@@ -20,18 +21,20 @@ from shapely.geometry import (
 )
 
 import vibespatial.api._native_result_core as native_result_core_module
-import vibespatial.api._native_results as native_results_module
 from vibespatial.api import GeoDataFrame, GeoSeries
 from vibespatial.api._native_expression import NativeExpression
-from vibespatial.api._native_grouped import NativeGrouped
+from vibespatial.api._native_grouped import NativeGrouped, NativeGroupedSelection
 from vibespatial.api._native_metadata import NativeGeometryMetadata, NativeSpatialIndex
-from vibespatial.api._native_relation import NativeRelation
+from vibespatial.api._native_relation import NativeRelation, NativeRelationSelection
 from vibespatial.api._native_result_core import (
     GeometryNativeResult,
     NativeAttributeTable,
     NativeGeometryColumn,
+    NativeGeometryComposition,
+    NativeGeometryCompositionPart,
     NativeGeometryProvenance,
     NativeTabularResult,
+    NativeTabularSelection,
     _host_array,
     _host_row_positions,
 )
@@ -40,11 +43,20 @@ from vibespatial.api._native_results import (
     RelationIndexResult,
     RelationJoinExportResult,
     RelationJoinResult,
+    _concat_native_tabular_results,
+    _geometry_composition_from_owned_parts_at_capacity,
     _native_pairwise_attribute_table,
+    _ordered_geometry_collection_from_owned_parts_at_capacity,
     _pairwise_constructive_to_native_tabular_result,
     _relation_constructive_to_native_tabular_result,
+    _relation_selection_constructive_to_native_tabular_result,
+    _rename_native_tabular_result,
 )
-from vibespatial.api._native_rowset import NativeIndexPlan, NativeRowSet
+from vibespatial.api._native_rowset import (
+    NativeDeviceSelection,
+    NativeIndexPlan,
+    NativeRowSet,
+)
 from vibespatial.api._native_state import (
     NativeFrameState,
     attach_native_state,
@@ -213,15 +225,17 @@ def test_materialization_events_are_distinct_from_fallbacks() -> None:
 def test_native_export_boundary_records_target_and_size_contract() -> None:
     clear_materialization_events()
 
-    event = record_native_export_boundary(NativeExportBoundary(
-        surface="test.native_export",
-        operation="native_to_arrow",
-        target="arrow",
-        reason="explicit test export",
-        row_count=3,
-        byte_count=96,
-        detail="attribute_columns=2",
-    ))
+    event = record_native_export_boundary(
+        NativeExportBoundary(
+            surface="test.native_export",
+            operation="native_to_arrow",
+            target="arrow",
+            reason="explicit test export",
+            row_count=3,
+            byte_count=96,
+            detail="attribute_columns=2",
+        )
+    )
 
     assert event.boundary is MaterializationBoundary.USER_EXPORT
     assert event.operation == "native_to_arrow"
@@ -446,10 +460,7 @@ def test_pairwise_attribute_bridge_records_admitted_index_materialization(
     assert frame["value"].tolist() == [20, 10]
     assert frame["score"].tolist() == [1, 2]
     assert len(events) == 2
-    assert {
-        (event.surface, event.operation, event.strict_disallowed)
-        for event in events
-    } == {
+    assert {(event.surface, event.operation, event.strict_disallowed) for event in events} == {
         (
             "vibespatial.api._native_results._native_pairwise_attribute_table",
             "pairwise_attribute_indices_to_host",
@@ -478,6 +489,7 @@ def test_native_expression_lowers_scalar_comparison_to_rowset() -> None:
     assert expression.between(3.0, 9.0).positions.tolist() == [2, 3]
     assert expression.between(3.0, 9.0, inclusive="neither").positions.tolist() == [2]
     assert expression.equal_to(9.0).positions.tolist() == [3]
+    assert expression.equal_to_selection(9.0).positions.tolist() == [3]
     assert expression.not_equal(1.0).positions.tolist() == [2, 3]
 
     with pytest.raises(ValueError, match="finite threshold"):
@@ -492,6 +504,321 @@ def test_native_expression_lowers_scalar_comparison_to_rowset() -> None:
             values=np.asarray([1.0, 2.0], dtype=np.float64),
             source_row_count=3,
         )
+
+
+def test_native_device_selection_contract_has_no_implicit_count_fence() -> None:
+    source = Path(importlib.import_module("vibespatial.api._native_rowset").__file__).read_text()
+    method_source = source.split(
+        "    def from_mask(\n",
+        1,
+    )[1].split("\n    @property", 1)[0]
+
+    assert "cp.cumsum" in method_source
+    assert "scatter_selected_positions_i64" in method_source
+    assert "copy_device_to_host" not in method_source
+    assert ".get(" not in method_source
+    assert "int(d_logical_count" not in method_source
+    assert "selected_count + row - inclusive_offsets[row]" in source
+    assert "def partition_capacity_positions(" in source
+    prefix_source = source.split(
+        "    def as_capacity_prefix(\n",
+        1,
+    )[1].split("\n    def _host_logical_count", 1)[0]
+    assert "positions=cp.arange(self.capacity" in prefix_source
+    assert "logical_count=self.logical_count" in prefix_source
+    assert "copy_device_to_host" not in prefix_source
+    source_mask = source.split(
+        "    def source_mask(",
+        1,
+    )[1].split("\n    def as_capacity_prefix", 1)[0]
+    assert "self.active_capacity_mask()" in source_mask
+    assert "self.safe_capacity_positions()" in source_mask
+    assert "copy_device_to_host" not in source_mask
+    assert "cp.flatnonzero" not in source_mask
+
+
+def test_native_tabular_selection_contract_preserves_exact_result_invariant() -> None:
+    rowset_source = Path(
+        importlib.import_module("vibespatial.api._native_rowset").__file__
+    ).read_text()
+    concatenate_source = rowset_source.split(
+        "    def concatenate(\n",
+        1,
+    )[1].split("\n    @property", 1)[0]
+    result_source = Path(native_result_core_module.__file__).read_text()
+    result_adapter_source = Path(
+        importlib.import_module("vibespatial.api._native_results").__file__
+    ).read_text()
+    selection_source = result_source.split(
+        "class NativeTabularSelection:",
+        1,
+    )[1].split("\ndef _materialize_attribute_geometry_frame", 1)[0]
+    rename_source = result_adapter_source.split(
+        "def _rename_native_tabular_result(",
+        1,
+    )[1].split("\ndef _pairwise_constructive_native_state_attribute_parts", 1)[0]
+    concat_source = result_adapter_source.split(
+        "def _concat_native_tabular_results(",
+        1,
+    )[1].split("\ndef _concat_native_tabular_selections", 1)[0]
+
+    assert "copy_device_to_host" not in concatenate_source
+    assert ".get(" not in concatenate_source
+    assert "NativeDeviceSelection" in selection_source
+    assert "capacity_result: NativeTabularResult" in selection_source
+    assert "compact_rowset(" in selection_source
+    assert "class NativeTabularResult" not in selection_source
+    assert "isinstance(result, NativeTabularSelection)" in rename_source
+    assert "capacity_result=_rename_native_tabular_result(" in rename_source
+    assert "_concat_native_tabular_selections(" in concat_source
+
+
+def test_polygonal_part_native_result_preserves_capacity_selection() -> None:
+    source = Path(importlib.import_module("vibespatial.api._native_results").__file__).read_text()
+    producer_source = source.split(
+        "def _polygonal_parts_constructive_to_native_tabular_result(",
+        1,
+    )[1].split("\ndef ", 1)[0]
+    tag_source = source.split(
+        "def _owned_row_family_tags(",
+        1,
+    )[1].split("\ndef ", 1)[0]
+
+    assert "_explode_polygonal_rows_to_polygon_capacity_gpu" in producer_source
+    assert "NativeTabularSelection(" in producer_source
+    assert "selection=selection" in producer_source
+    assert "_explode_polygonal_rows_to_polygons_gpu" not in producer_source
+    assert "preserve_indexed_view=True" in tag_source
+
+
+def test_native_relation_selection_consumes_capacity_without_compaction() -> None:
+    source = Path(importlib.import_module("vibespatial.api._native_relation").__file__).read_text()
+    relation_selection_source = source.split(
+        "class NativeRelationSelection:",
+        1,
+    )[1].split("\n\n__all__", 1)[0]
+    producer_source = source.split(
+        "class NativeRelation:",
+        1,
+    )[1].split("\n\n@dataclass(frozen=True)\nclass NativeRelationSelection:", 1)[0]
+
+    assert "def filter_by_distance_selection(" in producer_source
+    assert "def filter_by_equal_columns_selection(" in producer_source
+    assert "NativeDeviceSelection.from_mask(" in producer_source
+    grouped_source = Path(
+        importlib.import_module("vibespatial.api._native_grouped").__file__
+    ).read_text()
+    grouped_selection_source = grouped_source.split(
+        "class NativeGroupedSelection:",
+        1,
+    )[1].split("\n\n@dataclass(frozen=True)\nclass NativeGrouped:", 1)[0]
+
+    assert "NativeGroupedSelection(" in relation_selection_source
+    assert "def physicalize_geometries(" in relation_selection_source
+    assert ".device_take_capacity(" in relation_selection_source
+    assert "def constructive_native(" in relation_selection_source
+    assert "selection.gather_capacity(" in grouped_selection_source
+    assert "selection.active_capacity_mask()" in grouped_selection_source
+    assert "compact_rowset(" not in grouped_selection_source
+    assert "copy_device_to_host" not in grouped_selection_source
+    assert "int(self.logical_count" not in grouped_selection_source
+    result_adapter_source = Path(
+        importlib.import_module("vibespatial.api._native_results").__file__
+    ).read_text()
+    selection_constructive_source = result_adapter_source.split(
+        "def _relation_selection_constructive_to_native_tabular_result(",
+        1,
+    )[1].split("\ndef _pairwise_constructive_result_to_native_tabular_result", 1)[0]
+    assert ".physicalize_geometries(" in selection_constructive_source
+    assert ".constructive_native(" in selection_constructive_source
+    assert ".gather_capacity(" in selection_constructive_source
+    assert ".as_capacity_prefix()" in selection_constructive_source
+    assert "compact_rowset(" not in selection_constructive_source
+    assert "to_host" not in selection_constructive_source
+    owned_source = Path(importlib.import_module("vibespatial.geometry.owned").__file__).read_text()
+    capacity_take_source = owned_source.split(
+        "    def device_take_capacity(",
+        1,
+    )[1].split("\n    def _physical_device_take(", 1)[0]
+    assert "copy_device_to_host" not in capacity_take_source
+    assert "cp.asnumpy" not in capacity_take_source
+
+
+@pytest.mark.gpu
+def test_native_device_selection_keeps_logical_count_on_device() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for capacity-backed selection")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    expression = NativeExpression(
+        operation="predicate.intersects",
+        values=cp.asarray([False, True, False, True, True]),
+        source_token="frame",
+        source_row_count=5,
+        dtype="bool",
+        precision="predicate",
+    )
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+
+    with assert_zero_d2h_transfers():
+        selection = expression.equal_to_selection(True)
+        gathered = selection.gather_capacity(
+            cp.asarray([10, 20, 30, 40, 50], dtype=cp.int64),
+            fill_value=-1,
+        )
+        active = selection.active_capacity_mask()
+        source_mask = selection.source_mask(
+            active_mask=cp.asarray([True, False, True, True, True]),
+        )
+
+    assert isinstance(selection, NativeDeviceSelection)
+    assert selection.capacity == 5
+    assert selection.source_token == "frame"
+    with pytest.raises(TypeError, match="logical length is device-resident"):
+        len(selection)
+    assert get_materialization_events(clear=True) == []
+    assert cp.asnumpy(selection.logical_count).tolist() == [3]
+    assert cp.asnumpy(active).tolist() == [True, True, True, False, False]
+    assert cp.asnumpy(selection.partition_capacity_positions()).tolist() == [1, 3, 4, 0, 2]
+    assert cp.asnumpy(gathered).tolist() == [20, 40, 50, -1, -1]
+    assert cp.asnumpy(source_mask).tolist() == [False, True, False, False, True]
+    reset_d2h_transfer_count()
+
+
+@pytest.mark.gpu
+def test_native_device_selection_identity_requires_stable_full_partition() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for capacity-backed selection")
+    cp = pytest.importorskip("cupy")
+
+    stable = NativeDeviceSelection.from_mask(
+        cp.asarray([True, True, True]),
+        source_row_count=3,
+        geometry_family_domain=(GeometryFamily.POLYGON,),
+        trusted_all_valid_rows=True,
+    )
+    reordered = NativeDeviceSelection(
+        positions=cp.asarray([2, 1, 0], dtype=cp.int64),
+        logical_count=cp.asarray([3], dtype=cp.int64),
+        source_row_count=3,
+        ordered=True,
+        unique=True,
+    )
+
+    stable_rows = stable.compact_rowset(strict_disallowed=False)
+    reordered_rows = reordered.compact_rowset(strict_disallowed=False)
+
+    assert stable_rows.identity is True
+    assert stable_rows.geometry_family_domain == (GeometryFamily.POLYGON,)
+    assert stable_rows.trusted_all_valid_rows is True
+    assert reordered_rows.identity is False
+
+
+@pytest.mark.gpu
+def test_native_tabular_selection_concatenates_dynamic_prefixes_without_d2h() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for dynamic tabular selection")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    def _capacity_result(values, x_offset: float) -> NativeTabularResult:
+        owned = from_shapely_geometries(
+            [Point(x_offset + index, 0.0) for index in range(len(values))],
+            residency=Residency.DEVICE,
+        )
+        return NativeTabularResult(
+            attributes=pd.DataFrame({"value": values}),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("value", "geometry"),
+        )
+
+    first = NativeTabularSelection(
+        capacity_result=_capacity_result([10, 11], 0.0),
+        selection=NativeDeviceSelection.from_mask(
+            cp.asarray([False, True]),
+            source_row_count=2,
+        ),
+    )
+    second = NativeTabularSelection(
+        capacity_result=_capacity_result([20, 21, 22], 10.0),
+        selection=NativeDeviceSelection.from_mask(
+            cp.asarray([True, False, True]),
+            source_row_count=3,
+        ),
+    )
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+
+    with assert_zero_d2h_transfers():
+        renamed = _rename_native_tabular_result(
+            first,
+            {"value": "renamed"},
+        )
+        combined = _concat_native_tabular_results(
+            [first, second],
+            geometry_name="geometry",
+            crs=None,
+        )
+
+    assert isinstance(renamed, NativeTabularSelection)
+    assert tuple(renamed.capacity_result.attributes.columns) == ("renamed",)
+    assert isinstance(combined, NativeTabularSelection)
+    assert combined.capacity == 5
+    assert get_materialization_events(clear=True) == []
+    assert cp.asnumpy(combined.logical_count).tolist() == [3]
+    assert cp.asnumpy(combined.selection.positions).tolist() == [1, 2, 4, 0, 3]
+    reset_d2h_transfer_count()
+
+
+def test_native_expression_binary_arithmetic_lowers_to_rowset() -> None:
+    wet_area = NativeExpression(
+        operation="attribute.wet_area",
+        values=np.asarray([0.2, np.nan, 4.0, 9.0], dtype=np.float64),
+        source_token="frame",
+        source_row_count=4,
+        dtype="float64",
+        precision="fp64",
+    )
+    parcel_area = NativeExpression(
+        operation="attribute.parcel_area",
+        values=np.asarray([1.0, 2.0, 2.0, 3.0], dtype=np.float64),
+        source_token="frame",
+        source_row_count=4,
+        dtype="float64",
+        precision="fp64",
+    )
+
+    ratio = wet_area / parcel_area
+
+    assert isinstance(ratio, NativeExpression)
+    assert np.allclose(
+        np.asarray(ratio.values),
+        np.asarray([0.2, np.nan, 2.0, 3.0]),
+        equal_nan=True,
+    )
+    assert ratio.source_token == "frame"
+    assert ratio.source_row_count == 4
+    assert ratio.greater_equal(2.0).positions.tolist() == [2, 3]
+    assert ratio.compare("<", 1.0).positions.tolist() == [0]
+    assert (wet_area - 1.0).greater_than(2.0).positions.tolist() == [2, 3]
+
+    mismatched = NativeExpression(
+        operation="attribute.other",
+        values=np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float64),
+        source_token="other-frame",
+        source_row_count=4,
+    )
+    assert wet_area.binary_arithmetic("/", mismatched) is None
+    assert wet_area.compare(">=", mismatched) is None
 
 
 def test_native_expression_guarded_comparison_exposes_ambiguous_rowset() -> None:
@@ -615,6 +942,109 @@ def test_native_rowset_set_algebra_preserves_source_contract() -> None:
         left.intersection(wrong_count)
     with pytest.raises(ValueError, match="within source_row_count"):
         left.union(out_of_bounds)
+    with pytest.raises(ValueError, match="within source_row_count"):
+        NativeRowSet.from_positions(
+            np.asarray([], dtype=np.int64),
+            source_token="frame",
+            source_row_count=5,
+            ordered=True,
+            unique=True,
+        ).intersection(out_of_bounds)
+
+
+def test_native_rowset_identity_to_host_positions_skips_device_copy() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device identity rowset")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+
+    rowset = NativeRowSet.from_positions(
+        cp.arange(4, dtype=cp.int64),
+        source_token="frame",
+        source_row_count=4,
+        ordered=True,
+        unique=True,
+        identity=True,
+    )
+
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+    with assert_zero_d2h_transfers():
+        positions = rowset.to_host_positions(surface="unit.identity_rowset")
+
+    assert positions.tolist() == [0, 1, 2, 3]
+    assert get_materialization_events(clear=True) == []
+
+
+def test_native_rowset_identity_set_algebra_shortcuts_preserve_device_carriers() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device identity rowset algebra")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+
+    identity_positions = cp.arange(5, dtype=cp.int64)
+    member_positions = cp.asarray([1, 3], dtype=cp.int64)
+    empty_positions = cp.asarray([], dtype=cp.int64)
+    identity = NativeRowSet.from_positions(
+        identity_positions,
+        source_token="frame",
+        source_row_count=5,
+        ordered=True,
+        unique=True,
+        identity=True,
+    )
+    members = NativeRowSet.from_positions(
+        member_positions,
+        source_token="frame",
+        source_row_count=5,
+        ordered=True,
+        unique=True,
+    )
+    empty = NativeRowSet.from_positions(
+        empty_positions,
+        source_token="frame",
+        source_row_count=5,
+        ordered=True,
+        unique=True,
+    )
+
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+    with assert_zero_d2h_transfers():
+        full_union = identity.union(members)
+        identity_intersection = identity.intersection(members)
+        empty_union = empty.union(members)
+        no_remaining = members.difference(identity)
+        still_members = members.difference(empty)
+        still_identity = identity.difference(empty)
+        empty_intersection = empty.intersection(identity)
+
+    assert full_union.positions is identity_positions
+    assert full_union.identity is True
+    assert identity_intersection.positions is member_positions
+    assert identity_intersection.identity is False
+    assert empty_union.positions is member_positions
+    assert still_identity.positions is identity_positions
+    assert still_identity.identity is True
+    assert still_members.positions is member_positions
+    assert no_remaining.is_device
+    assert len(no_remaining) == 0
+    assert empty_intersection.positions is empty_positions
+    assert get_materialization_events(clear=True) == []
 
 
 def test_native_relation_wraps_existing_pairs_without_host_materialization() -> None:
@@ -650,6 +1080,19 @@ def test_relation_index_size_rejects_mismatched_pairs_without_host_materializati
         _ = relation_result.size
 
     assert left.get_called is False
+    assert right.get_called is False
+
+
+def test_relation_index_broadcast_right_synthesizes_host_rows_without_right_export() -> None:
+    left = np.asarray([2, 0, 1], dtype=np.int32)
+    right = _ExplodingGetArray([9])
+    relation_result = RelationIndexResult(left, right, broadcast_right_value=7)
+
+    h_left, h_right = relation_result.to_host(dtype=np.intp)
+
+    assert h_left.tolist() == [2, 0, 1]
+    assert h_right.tolist() == [7, 7, 7]
+    assert relation_result.size == 3
     assert right.get_called is False
 
 
@@ -762,7 +1205,9 @@ def test_native_attribute_take_can_gather_device_positions_without_index_preserv
     assert taken.device_table.to_arrow().column(0).to_pylist() == [10, 30, 40]
 
 
-def test_native_frame_device_range_index_take_preserves_labels_without_hot_materialization() -> None:
+def test_native_frame_device_range_index_take_preserves_labels_without_hot_materialization() -> (
+    None
+):
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device native frame take")
     cp = pytest.importorskip("cupy")
@@ -776,9 +1221,7 @@ def test_native_frame_device_range_index_take_preserves_labels_without_hot_mater
     attributes = NativeAttributeTable(
         arrow_table=pa.table({"value": pa.array([10, 20, 30], type=pa.int64())})
     )
-    owned = from_shapely_geometries(
-        [Point(0, 0), Point(1, 1), Point(2, 2)]
-    ).move_to(
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1), Point(2, 2)]).move_to(
         Residency.DEVICE,
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
         reason="unit test device native frame range-index label preservation",
@@ -831,16 +1274,110 @@ def test_native_frame_device_range_index_take_preserves_labels_without_hot_mater
     assert payload.attributes.index.tolist() == [0, 1]
     assert payload.index_plan is not None
     assert payload.index_plan.kind == "device-labels"
-    assert events == []
+    assert all(event.operation != "index_plan_to_host" for event in events)
     assert d2h_events == []
 
     exported = payload.to_geodataframe()
     events = get_materialization_events(clear=True)
     d2h_events = get_d2h_transfer_events(clear=True)
+    assert all(event.operation != "index_plan_to_host" for event in events)
+    assert d2h_events == []
     assert exported.index.tolist() == [0, 2]
     assert exported["value"].tolist() == [10, 30]
+    events = get_materialization_events(clear=True)
+    d2h_events = get_d2h_transfer_events(clear=True)
     assert any(event.operation == "index_plan_to_host" for event in events)
     assert any(event.reason.endswith("::index_plan_to_host") for event in d2h_events)
+    reset_d2h_transfer_count()
+
+
+def test_geodataframe_identity_native_boolean_filter_reuses_public_frame(
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device native geom_type mask")
+    from vibespatial.api import geodataframe as geodataframe_module
+
+    owned = from_shapely_geometries(
+        [box(0.0, 0.0, 1.0, 1.0), box(1.0, 1.0, 2.0, 2.0)],
+        residency=Residency.DEVICE,
+    )
+    payload = NativeTabularResult(
+        attributes=NativeAttributeTable(dataframe=pd.DataFrame({"value": [10, 20]})),
+        geometry=GeometryNativeResult.from_owned(owned, crs=None),
+        geometry_name="geometry",
+        column_order=("value", "geometry"),
+    )
+    frame = payload.to_geodataframe()
+    mask = frame.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+    assert bool(getattr(mask.array.rowset, "identity", False))
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("identity native filter should not rebuild public frame")
+
+    monkeypatch.setattr(
+        geodataframe_module,
+        "_public_frame_from_native_state",
+        _explode,
+    )
+
+    filtered = frame[mask]
+
+    assert filtered is not frame
+    assert filtered.index.equals(frame.index)
+    assert filtered["value"].tolist() == [10, 20]
+    assert get_native_state(filtered) is not None
+
+
+def test_native_tabular_take_host_labels_keeps_numeric_attributes_device() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for host-label device-position take")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    index = pd.Index(["c", "a", "b"], name="parcel")
+    attributes = NativeAttributeTable(dataframe=pd.DataFrame({"value": [10, 20, 30]}, index=index))
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1), Point(2, 2)]).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test native tabular host-label rowset take",
+    )
+    payload = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=attributes,
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("value", "geometry"),
+        )
+    ).to_native_tabular_result()
+    row_positions = cp.asarray([2, 0], dtype=cp.int32)
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+
+    with assert_zero_d2h_transfers():
+        taken = payload.take(row_positions, preserve_index=True)
+
+    events = get_materialization_events(clear=True)
+    d2h_events = get_d2h_transfer_events(clear=True)
+    assert taken.index_plan is not None
+    assert taken.index_plan.kind == "host-labels-take"
+    assert taken.attributes.device_table is not None
+    assert events == []
+    assert d2h_events == []
+
+    exported = taken.to_geodataframe()
+    events = get_materialization_events(clear=True)
+
+    assert all(event.operation != "index_plan_take_positions_to_host" for event in events)
+    assert exported.index.tolist() == ["b", "c"]
+    events = get_materialization_events(clear=True)
+    assert exported["value"].tolist() == [30, 10]
+    assert any(event.operation == "index_plan_take_positions_to_host" for event in events)
+    assert all(event.operation != "row_positions_to_host" for event in events)
     reset_d2h_transfer_count()
 
 
@@ -918,7 +1455,142 @@ def test_native_attribute_reset_index_defers_loader_materialization() -> None:
     assert materialized.to_dict("list") == {"group": ["a", "b"], "value": [10, 20]}
 
 
-def test_native_attribute_reset_index_preserves_numeric_device_payload_without_runtime_d2h() -> None:
+def test_native_attribute_loader_take_device_positions_defers_host_normalization() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for loader-backed device-position take")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    calls = 0
+
+    def _load() -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        return pd.DataFrame({"value": [10, 20, 30]}, index=pd.RangeIndex(3))
+
+    attributes = NativeAttributeTable.from_loader(
+        _load,
+        index_override=pd.RangeIndex(3),
+        columns=("value",),
+    )
+    row_positions = cp.asarray([2, 0], dtype=cp.int64)
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        taken = attributes.take(row_positions, preserve_index=False)
+
+    assert calls == 0
+    assert taken.loader is not None
+    assert taken.index.equals(pd.RangeIndex(2))
+    assert tuple(taken.columns) == ("value",)
+    assert get_materialization_events(clear=True) == []
+    assert get_d2h_transfer_events(clear=True) == []
+
+    materialized = taken.to_pandas(copy=False)
+    events = get_materialization_events(clear=True)
+
+    assert calls == 1
+    assert materialized.index.equals(pd.RangeIndex(2))
+    assert materialized["value"].tolist() == [30, 10]
+    assert any(
+        event.operation == "row_positions_to_host" and not event.strict_disallowed
+        for event in events
+    )
+    reset_d2h_transfer_count()
+
+
+def test_native_attribute_promotion_requires_visible_gpu_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibespatial.runtime._runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "has_gpu_runtime", lambda: False)
+    attributes = NativeAttributeTable(dataframe=pd.DataFrame({"value": [10, 20, 30]}))
+
+    assert attributes.promote_numeric_to_device() is None
+
+
+def test_native_attribute_dataframe_take_device_positions_promotes_numeric_to_device() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for dataframe-backed device-position take")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    attributes = NativeAttributeTable(
+        dataframe=pd.DataFrame({"value": [10, 20, 30]}, index=pd.RangeIndex(3))
+    )
+    row_positions = cp.asarray([1, 2], dtype=cp.int64)
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        taken = attributes.take(row_positions, preserve_index=False)
+
+    assert taken.device_table is not None
+    assert taken.index.equals(pd.RangeIndex(2))
+    assert tuple(taken.columns) == ("value",)
+    assert get_materialization_events(clear=True) == []
+    assert get_d2h_transfer_events(clear=True) == []
+
+    materialized = taken.to_pandas(copy=False)
+    events = get_materialization_events(clear=True)
+
+    assert materialized.index.equals(pd.RangeIndex(2))
+    assert materialized["value"].tolist() == [20, 30]
+    assert all(event.operation != "row_positions_to_host" for event in events)
+    reset_d2h_transfer_count()
+
+
+def test_native_attribute_dataframe_take_device_positions_defers_object_columns() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for dataframe-backed device-position take")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    attributes = NativeAttributeTable(
+        dataframe=pd.DataFrame({"label": ["a", "b", "c"]}, index=pd.RangeIndex(3))
+    )
+    row_positions = cp.asarray([1, 2], dtype=cp.int64)
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        taken = attributes.take(row_positions, preserve_index=False)
+
+    assert taken.loader is not None
+    assert taken.index.equals(pd.RangeIndex(2))
+    assert tuple(taken.columns) == ("label",)
+    assert get_materialization_events(clear=True) == []
+    assert get_d2h_transfer_events(clear=True) == []
+
+    materialized = taken.to_pandas(copy=False)
+    events = get_materialization_events(clear=True)
+
+    assert materialized.index.equals(pd.RangeIndex(2))
+    assert materialized["label"].tolist() == ["b", "c"]
+    assert any(
+        event.operation == "row_positions_to_host" and not event.strict_disallowed
+        for event in events
+    )
+    reset_d2h_transfer_count()
+
+
+def test_native_attribute_reset_index_preserves_numeric_device_payload_without_runtime_d2h() -> (
+    None
+):
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device reset-index attribute contract")
     cp = pytest.importorskip("cupy")
@@ -1025,7 +1697,59 @@ def test_native_attribute_table_extracts_device_numeric_arrays_without_export() 
     assert cp.asnumpy(columns["flag"]).tolist() == [True, False, True]
 
 
-def test_native_attribute_table_project_columns_preserves_device_payload_without_runtime_d2h() -> None:
+def test_native_attribute_table_numeric_to_pandas_uses_direct_device_columns() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device attribute export contract")
+    pytest.importorskip("pylibcudf")
+    import pylibcudf as plc
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    source = pa.table(
+        {
+            "score": pa.array([1.5, 2.5, 3.5], type=pa.float32()),
+            "rows": pa.array([1, 2, 3], type=pa.int32()),
+            "flag": pa.array([True, False, True], type=pa.bool_()),
+        }
+    )
+    attributes = NativeAttributeTable(
+        device_table=plc.Table.from_arrow(source),
+        index_override=pd.Index([10, 11, 12], name="source"),
+        column_override=tuple(source.column_names),
+        schema_override=source.schema,
+    )
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    clear_materialization_events()
+
+    frame = attributes.to_pandas()
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    materializations = get_materialization_events(clear=True)
+
+    assert frame.index.tolist() == [10, 11, 12]
+    assert frame["score"].tolist() == pytest.approx([1.5, 2.5, 3.5])
+    assert frame["rows"].tolist() == [1, 2, 3]
+    assert frame["flag"].tolist() == [True, False, True]
+    assert frame["score"].dtype == np.dtype("float32")
+    assert frame["rows"].dtype == np.dtype("int32")
+    assert frame["flag"].dtype == np.dtype("bool")
+    assert reasons == [
+        "device attribute numeric column host export",
+        "device attribute numeric column host export",
+        "device attribute numeric column host export",
+    ]
+    assert [event.surface for event in materializations] == [
+        "vibespatial.api.NativeAttributeTable.to_pandas",
+    ]
+    assert materializations[0].operation == "device_numeric_attributes_to_pandas"
+
+
+def test_native_attribute_table_project_columns_preserves_device_payload_without_runtime_d2h() -> (
+    None
+):
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device attribute projection")
     cp = pytest.importorskip("cupy")
@@ -1102,16 +1826,239 @@ def test_native_attribute_table_moves_string_datetime_device_payload_without_run
 
     assert projected.device_table is not None
     assert taken.device_table is not None
+    assert taken.row_positions is not None
     assert tuple(taken.columns) == ("name", "when")
     assert taken.numeric_column_arrays(("name", "when")) is None
     assert get_materialization_events(clear=True) == []
-    exported = taken.device_table.to_arrow()
+    exported = taken.to_arrow(index=False)
     assert exported.column(0).to_pylist() == ["c", "a"]
     assert exported.column(1).to_pylist() == [
         pd.Timestamp("2020-01-03"),
         pd.Timestamp("2020-01-01"),
     ]
     reset_d2h_transfer_count()
+
+
+def test_native_attribute_string_assignment_stays_device_backed() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device attribute assignment")
+    pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+
+    from vibespatial.cuda._runtime import reset_d2h_transfer_count
+
+    owned = from_shapely_geometries(
+        [Point(0, 0), Point(1, 1), Point(2, 2)],
+        residency=Residency.DEVICE,
+    )
+    frame = GeoDataFrame(
+        {
+            "value": [10, 20, 30],
+            "geometry": DeviceGeometryArray._from_owned(owned),
+        },
+        geometry="geometry",
+    )
+    source = pa.table({"value": pa.array([10, 20, 30], type=pa.int64())})
+    native_payload = NativeTabularResult(
+        attributes=NativeAttributeTable(
+            device_table=plc.Table.from_arrow(source),
+            index_override=frame.index,
+            column_override=tuple(source.column_names),
+            schema_override=source.schema,
+        ),
+        geometry=GeometryNativeResult.from_owned(owned, crs=None),
+        geometry_name="geometry",
+        column_order=("value", "geometry"),
+        index_plan=NativeIndexPlan.from_index(frame.index),
+    )
+    from vibespatial.api._native_state import attach_native_state_from_native_tabular_result
+
+    attach_native_state_from_native_tabular_result(frame, native_payload)
+
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+    frame["region"] = pd.Series(
+        pd.array(["north", "south", "east"], dtype="string"),
+        index=frame.index,
+        name="region",
+    )
+    events = get_materialization_events(clear=True)
+    state = get_native_state(frame)
+
+    assert state is not None
+    assert state.attributes.device_table is not None
+    assert tuple(state.attributes.columns) == ("value", "region")
+    assert state.attributes.device_column_policies(("region",))["region"].category == (
+        "string-movement-only"
+    )
+    assert not any(event.d2h_transfer for event in events)
+
+
+def test_native_tabular_public_export_defers_device_attribute_columns() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for lazy device attribute export")
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+
+    from vibespatial.api._native_public_arrays import (
+        NativeAttributeColumnArray,
+        NativeIndexLabelsArray,
+        NativeNumericExpressionArray,
+    )
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    owned = from_shapely_geometries(
+        [Point(0, 0), Point(1, 1)],
+        residency=Residency.DEVICE,
+    )
+    source = pa.table(
+        {
+            "value": pa.array([10, 20], type=pa.int64()),
+            "region": pa.array(["north", "south"], type=pa.string()),
+        }
+    )
+    index_plan = NativeIndexPlan.from_index(pd.RangeIndex(10, 12, name="site")).take(
+        cp.asarray([1, 0], dtype=cp.int64),
+        preserve_index=True,
+        unique=True,
+    )
+    native_result = NativeTabularResult(
+        attributes=NativeAttributeTable(
+            device_table=plc.Table.from_arrow(source),
+            index_override=pd.RangeIndex(2),
+            column_override=tuple(source.column_names),
+            schema_override=source.schema,
+        ),
+        geometry=GeometryNativeResult.from_owned(owned, crs=None),
+        geometry_name="geometry",
+        column_order=("value", "region", "geometry"),
+        index_plan=index_plan,
+    )
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        exported = native_result.to_geodataframe()
+    events = get_materialization_events(clear=True)
+    exported_state = get_native_state(exported)
+
+    assert exported_state is not None
+    assert exported_state.attributes.device_table is not None
+    assert isinstance(getattr(exported.index, "_values", None), NativeIndexLabelsArray)
+    assert isinstance(exported["value"].array, NativeNumericExpressionArray)
+    assert isinstance(exported["region"].array, NativeAttributeColumnArray)
+    assert not any(event.operation == "device_attributes_to_arrow" for event in events)
+    assert not any(event.operation == "device_numeric_attributes_to_pandas" for event in events)
+    assert not any(event.operation == "index_plan_to_host" for event in events)
+    assert not any(event.d2h_transfer for event in events)
+
+
+def test_native_numeric_public_array_equals_numpy_backed_frame() -> None:
+    from vibespatial.api._native_expression import NativeExpression
+    from vibespatial.api._native_public_arrays import NativeNumericExpressionArray
+
+    native = pd.DataFrame(
+        {
+            "value": NativeNumericExpressionArray(
+                NativeExpression(
+                    operation="test.equals",
+                    values=np.asarray([1.0, np.nan, 3.0], dtype=np.float64),
+                    source_token=None,
+                    source_row_count=3,
+                    dtype="float64",
+                    precision="source",
+                )
+            )
+        }
+    )
+    equal = pd.DataFrame({"value": np.asarray([1.0, np.nan, 3.0])})
+    different = pd.DataFrame({"value": np.asarray([1.0, np.nan, 4.0])})
+
+    assert native.equals(equal)
+    assert not native.equals(different)
+
+
+def test_native_attribute_arrow_export_uses_physical_extension_dtypes() -> None:
+    from vibespatial.api._native_expression import NativeExpression
+    from vibespatial.api._native_public_arrays import (
+        NativeAttributeColumnArray,
+        NativeNumericExpressionArray,
+    )
+
+    source_attributes = NativeAttributeTable(
+        arrow_table=pa.table({"label": ["north", "south"]}),
+        index_override=pd.RangeIndex(2),
+    )
+    frame = pd.DataFrame(
+        {
+            "parcel_id": NativeNumericExpressionArray(
+                NativeExpression(
+                    operation="test.arrow_export",
+                    values=np.asarray([10, 20], dtype=np.int64),
+                    source_token=None,
+                    source_row_count=2,
+                    dtype="int64",
+                    precision="source",
+                )
+            ),
+            "label": NativeAttributeColumnArray(source_attributes, "label"),
+        }
+    )
+
+    exported = NativeAttributeTable(dataframe=frame).to_arrow(index=False)
+
+    assert exported.schema.field("parcel_id").type == pa.int64()
+    label_type = exported.schema.field("label").type
+    assert pa.types.is_string(label_type) or pa.types.is_large_string(label_type)
+    assert b"vibespatial_" not in (exported.schema.metadata or {}).get(b"pandas", b"")
+    assert exported.to_pandas().to_dict("list") == {
+        "parcel_id": [10, 20],
+        "label": ["north", "south"],
+    }
+
+
+def test_native_attribute_array_vector_indexing_preserves_extension_blocks() -> None:
+    from vibespatial.api._native_public_arrays import NativeAttributeColumnArray
+
+    table = NativeAttributeTable(
+        arrow_table=pa.table(
+            {
+                "value": [30, 10, 20],
+                "region": ["east", "north", "south"],
+            }
+        ),
+        index_override=pd.RangeIndex(3),
+    )
+    frame = pd.DataFrame(
+        {column: NativeAttributeColumnArray(table, column) for column in table.columns}
+    )
+
+    filtered = frame.loc[np.asarray([True, False, True])]
+    sorted_frame = filtered.sort_values("value")
+
+    assert isinstance(filtered["value"].array, NativeAttributeColumnArray)
+    assert isinstance(filtered["region"].array, NativeAttributeColumnArray)
+    assert sorted_frame["value"].tolist() == [20, 30]
+    assert sorted_frame["region"].tolist() == ["south", "east"]
+
+
+def test_native_attribute_array_fillna_detaches_from_source_table() -> None:
+    from vibespatial.api._native_public_arrays import NativeAttributeColumnArray
+
+    table = NativeAttributeTable(
+        arrow_table=pa.table({"region": ["east", None, "south"]}),
+        index_override=pd.RangeIndex(3),
+    )
+    source = pd.Series(NativeAttributeColumnArray(table, "region"))
+
+    filled = source.fillna("unknown")
+
+    assert filled.tolist() == ["east", "unknown", "south"]
+    assert source.iloc[[0, 2]].tolist() == ["east", "south"]
+    assert pd.isna(source.iloc[1])
 
 
 def test_native_attribute_table_reports_device_dtype_policies_without_runtime_d2h() -> None:
@@ -1155,9 +2102,9 @@ def test_native_attribute_table_reports_device_dtype_policies_without_runtime_d2
         numeric = attributes.numeric_column_arrays(("score", "flag"))
         nullable_numeric = attributes.numeric_column_arrays(("maybe",))
         categorical_numeric = attributes.numeric_column_arrays(("category",))
-        moved = attributes.project_columns(
-            ("maybe", "category", "name", "when")
-        ).take(cp.asarray([2, 0], dtype=cp.int32), preserve_index=False)
+        moved = attributes.project_columns(("maybe", "category", "name", "when")).take(
+            cp.asarray([2, 0], dtype=cp.int32), preserve_index=False
+        )
 
     assert policies["score"].category == "all-valid-numeric-bool"
     assert policies["score"].can_compute_numeric is True
@@ -1171,10 +2118,11 @@ def test_native_attribute_table_reports_device_dtype_policies_without_runtime_d2
     assert nullable_numeric is None
     assert categorical_numeric is None
     assert moved.device_table is not None
+    assert moved.row_positions is not None
     assert tuple(moved.columns) == ("maybe", "category", "name", "when")
     assert get_materialization_events(clear=True) == []
 
-    exported = moved.device_table.to_arrow()
+    exported = moved.to_arrow(index=False)
     assert exported.column(0).to_pylist() == [3.0, 1.0]
     assert exported.column(1).to_pylist() == ["a", "a"]
     assert exported.column(2).to_pylist() == ["z", "x"]
@@ -1185,7 +2133,9 @@ def test_native_attribute_table_reports_device_dtype_policies_without_runtime_d2
     reset_d2h_transfer_count()
 
 
-def test_native_attribute_table_grouped_device_take_columns_preserve_non_numeric_without_runtime_d2h() -> None:
+def test_native_attribute_table_grouped_device_take_columns_preserve_non_numeric_without_runtime_d2h() -> (
+    None
+):
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device grouped attribute takes")
 
@@ -1200,9 +2150,7 @@ def test_native_attribute_table_grouped_device_take_columns_preserve_non_numeric
         {
             "name": pa.array(["alpha", "bravo", "charlie", "delta"], type=pa.string()),
             "when": pa.array(
-                pd.to_datetime(
-                    ["2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04"]
-                ),
+                pd.to_datetime(["2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04"]),
                 type=pa.timestamp("us"),
             ),
             "category": pa.array(
@@ -1313,9 +2261,7 @@ def test_all_valid_single_family_owned_device_take_avoids_scalar_d2h_probes() ->
         reset_d2h_transfer_count,
     )
 
-    owned = from_shapely_geometries(
-        [Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3)]
-    )
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3)])
     owned.move_to(
         Residency.DEVICE,
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
@@ -1361,6 +2307,23 @@ def test_native_relation_derives_semijoin_antijoin_and_counts() -> None:
 
     with pytest.raises(ValueError, match="semijoin order"):
         relation.left_semijoin_rowset(order="labels")
+
+
+def test_native_relation_full_sorted_semijoin_marks_identity_rowset() -> None:
+    relation = NativeRelation(
+        left_indices=np.asarray([0, 1, 2, 3], dtype=np.int32),
+        right_indices=np.asarray([3, 1, 2, 0], dtype=np.int32),
+        left_row_count=4,
+        right_row_count=4,
+    )
+
+    right_rowset = relation.right_semijoin_rowset()
+    assert right_rowset.positions.tolist() == [0, 1, 2, 3]
+    assert right_rowset.identity is True
+
+    first_seen = relation.right_semijoin_rowset(order="first")
+    assert first_seen.positions.tolist() == [3, 1, 2, 0]
+    assert first_seen.identity is False
 
 
 def test_native_relation_reduces_opposite_side_values_by_grouped_rows() -> None:
@@ -1722,6 +2685,87 @@ def test_native_grouped_dense_codes_reject_invalid_host_codes() -> None:
         NativeGrouped.from_dense_codes([0, -2], group_count=2)
 
 
+def test_native_grouped_from_dense_codes_infers_host_size_metadata() -> None:
+    grouped = NativeGrouped.from_dense_codes(
+        np.asarray([0, 2, 0, 2, 2], dtype=np.int32),
+        group_count=3,
+    )
+
+    assert grouped.all_groups_observed is False
+    assert grouped.group_size_min == 0
+    assert grouped.group_size_max == 3
+
+    observed = NativeGrouped.from_dense_codes(
+        np.asarray([0, 1, 0, 1, 1], dtype=np.int32),
+        group_count=2,
+    )
+
+    assert observed.all_groups_observed is True
+    assert observed.group_size_min == 2
+    assert observed.group_size_max == 3
+
+
+def test_native_grouped_from_sorted_offsets_preserves_identity_order() -> None:
+    grouped = NativeGrouped.from_sorted_offsets(
+        np.asarray([0, 2, 2, 5], dtype=np.int64),
+        output_index=pd.Index(["a", "b", "c"], name="group"),
+    )
+
+    assert grouped.sorted_order_is_identity is True
+    assert grouped.resolved_group_count == 3
+    assert grouped.row_count == 5
+    assert grouped.all_groups_observed is False
+    assert grouped.group_size_min == 0
+    assert grouped.group_size_max == 3
+    np.testing.assert_array_equal(grouped.group_codes, np.asarray([0, 0, 2, 2, 2]))
+    np.testing.assert_array_equal(grouped.group_offsets, np.asarray([0, 2, 5]))
+    np.testing.assert_array_equal(grouped.group_ids, np.asarray([0, 2]))
+    np.testing.assert_array_equal(grouped.sorted_order, np.arange(5))
+
+    reduced = grouped.reduce_numeric(np.asarray([1, 2, 4, 8, 16]), "sum")
+    series = reduced.to_pandas()
+    assert series.tolist() == [3, 0, 28]
+    assert series.index.tolist() == ["a", "b", "c"]
+
+
+def test_native_grouped_dense_sorted_offsets_retain_empty_group_capacity() -> None:
+    grouped = NativeGrouped.from_dense_sorted_offsets(
+        np.asarray([0, 2, 2, 5], dtype=np.int64),
+        output_index=pd.Index(["a", "b", "c"], name="group"),
+        all_groups_observed=False,
+        group_size_min=0,
+        group_size_max=3,
+    )
+
+    assert grouped.sorted_order_is_identity is True
+    assert grouped.resolved_group_count == 3
+    assert grouped.row_count == 5
+    np.testing.assert_array_equal(grouped.group_codes, [0, 0, 2, 2, 2])
+    np.testing.assert_array_equal(grouped.group_offsets, [0, 2, 2, 5])
+    np.testing.assert_array_equal(grouped.group_ids, [0, 1, 2])
+    np.testing.assert_array_equal(grouped.sorted_order, np.arange(5))
+
+    reduced = grouped.reduce_numeric(np.asarray([1, 2, 4, 8, 16]), "sum")
+    assert reduced.to_pandas().tolist() == [3, 0, 28]
+
+
+def test_native_grouped_all_observed_sorted_offsets_skip_dynamic_compaction() -> None:
+    grouped = NativeGrouped.from_sorted_offsets(
+        np.asarray([0, 2, 5], dtype=np.int64),
+        all_groups_observed=True,
+        group_size_min=2,
+        group_size_max=3,
+    )
+    source = Path("src/vibespatial/api/_native_grouped.py").read_text()
+    branch_start = source.index("if all_groups_observed is True:")
+    branch_end = source.index("if resolved_row_count:", branch_start)
+    fixed_branch = source[branch_start:branch_end]
+
+    np.testing.assert_array_equal(grouped.group_offsets, [0, 2, 5])
+    np.testing.assert_array_equal(grouped.group_ids, [0, 1])
+    assert "xp.nonzero" not in fixed_branch.split("else:", 1)[0]
+
+
 def test_native_grouped_device_reduce_stays_device_without_runtime_d2h() -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device grouped reducer probe")
@@ -1811,6 +2855,49 @@ def test_native_grouped_device_reduce_stays_device_without_runtime_d2h() -> None
     reset_d2h_transfer_count()
 
 
+def test_native_grouped_from_device_sorted_offsets_stays_device_without_runtime_d2h() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device grouped-offset probe")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    offsets = cp.asarray([0, 2, 2, 5], dtype=cp.int64)
+    values = cp.asarray([1, 2, 4, 8, 16], dtype=cp.int64)
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        grouped = NativeGrouped.from_sorted_offsets(offsets, row_count=values.size)
+        reduced = grouped.reduce_numeric(values, "sum")
+        dense_grouped = NativeGrouped.from_dense_sorted_offsets(
+            offsets,
+            row_count=values.size,
+            all_groups_observed=False,
+            group_size_min=0,
+        )
+        dense_reduced = dense_grouped.reduce_numeric(values, "sum")
+
+    assert grouped.is_device
+    assert grouped.sorted_order_is_identity is True
+    assert reduced.is_device
+    assert get_materialization_events(clear=True) == []
+
+    np.testing.assert_array_equal(cp.asnumpy(grouped.group_codes), [0, 0, 2, 2, 2])
+    np.testing.assert_array_equal(cp.asnumpy(grouped.group_offsets), [0, 2, 5])
+    np.testing.assert_array_equal(cp.asnumpy(grouped.group_ids), [0, 2])
+    np.testing.assert_array_equal(cp.asnumpy(reduced.values), [3, 0, 28])
+    np.testing.assert_array_equal(
+        cp.asnumpy(dense_grouped.group_offsets),
+        [0, 2, 2, 5],
+    )
+    np.testing.assert_array_equal(cp.asnumpy(dense_grouped.group_ids), [0, 1, 2])
+    np.testing.assert_array_equal(cp.asnumpy(dense_reduced.values), [3, 0, 28])
+    reset_d2h_transfer_count()
+
+
 def test_native_grouped_device_export_reports_runtime_d2h() -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for grouped export D2H accounting")
@@ -1856,10 +2943,12 @@ def test_native_grouped_device_export_reports_runtime_d2h() -> None:
     assert "native_export_target=pandas-dataframe" in events[0].detail
     assert "rows=2" in events[0].detail
     d2h_events = get_d2h_transfer_events(clear=True)
-    assert sum(
-        event.reason.endswith("::grouped_attribute_reduction_to_pandas")
-        for event in d2h_events
-    ) == 2
+    assert (
+        sum(
+            event.reason.endswith("::grouped_attribute_reduction_to_pandas") for event in d2h_events
+        )
+        == 2
+    )
     reset_d2h_transfer_count()
 
 
@@ -2282,8 +3371,7 @@ def test_native_frame_state_multi_predicate_expressions_share_de9im_without_runt
 
     assert set(expressions) == {"intersects", "covered_by", "disjoint"}
     assert all(
-        expression.source_token == left_state.lineage_token
-        for expression in expressions.values()
+        expression.source_token == left_state.lineage_token for expression in expressions.values()
     )
     assert all(expression.is_device for expression in expressions.values())
     assert hit_rows.is_device
@@ -2299,7 +3387,9 @@ def test_native_frame_state_multi_predicate_expressions_share_de9im_without_runt
     reset_d2h_transfer_count()
 
 
-def test_native_point_region_predicate_expression_uses_relation_kernel_without_runtime_d2h() -> None:
+def test_native_point_region_predicate_expression_uses_relation_kernel_without_runtime_d2h() -> (
+    None
+):
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device binary predicate expression")
     cp = pytest.importorskip("cupy")
@@ -2517,6 +3607,174 @@ def test_native_multi_predicate_expressions_share_de9im_pass_without_runtime_d2h
     reset_d2h_transfer_count()
 
 
+def test_native_multi_predicate_expressions_handle_nulls_without_all_valid_fence() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device multi-predicate expressions")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.predicates.binary import binary_predicate_expressions
+
+    left = from_shapely_geometries(
+        [
+            box(0, 0, 2, 2),
+            None,
+            box(10, 10, 11, 11),
+            box(0, 0, 1, 1),
+        ],
+        residency=Residency.DEVICE,
+    )
+    right = from_shapely_geometries(
+        [
+            box(1, 1, 3, 3),
+            box(0, 0, 1, 1),
+            box(20, 20, 21, 21),
+            box(0, 0, 1, 1),
+        ],
+        residency=Residency.DEVICE,
+    )
+    left._validity = None
+    left._tags = None
+    left._family_row_offsets = None
+    right._validity = None
+    right._tags = None
+    right._family_row_offsets = None
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+
+    with assert_zero_d2h_transfers():
+        expressions = binary_predicate_expressions(
+            ("intersects", "covered_by", "disjoint"),
+            left,
+            right,
+            source_token="multi-predicate-null-token",
+        )
+        assert expressions is not None
+        hit_rows = expressions["intersects"].equal_to(True)
+        inside_rows = expressions["covered_by"].equal_to(True)
+        disjoint_rows = expressions["disjoint"].equal_to(True)
+    runtime_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert "binary predicate all-valid pair scalar fence" not in runtime_reasons
+    assert cp.asnumpy(expressions["intersects"].values).tolist() == [True, False, False, True]
+    assert cp.asnumpy(expressions["covered_by"].values).tolist() == [False, False, False, True]
+    assert cp.asnumpy(expressions["disjoint"].values).tolist() == [False, False, True, False]
+    assert cp.asnumpy(hit_rows.positions).tolist() == [0, 3]
+    assert cp.asnumpy(inside_rows.positions).tolist() == [3]
+    assert cp.asnumpy(disjoint_rows.positions).tolist() == [2]
+    reset_d2h_transfer_count()
+
+
+def test_native_multi_predicate_device_only_admission_avoids_metadata_export() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device multi-predicate expressions")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.predicates.binary import binary_predicate_expressions
+
+    left_base = from_shapely_geometries(
+        [
+            box(0, 0, 2, 2),
+            box(0, 0, 1, 1),
+            box(5, 5, 6, 6),
+        ],
+        residency=Residency.DEVICE,
+    )
+    right_base = from_shapely_geometries(
+        [
+            box(1, 1, 3, 3),
+            box(-1, -1, 2, 2),
+            box(7, 7, 8, 8),
+        ],
+        residency=Residency.DEVICE,
+    )
+    d_rows = cp.asarray([0, 1, 2], dtype=cp.int64)
+    left = left_base.device_take(d_rows)
+    right = right_base.device_take(d_rows)
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+
+    expressions = binary_predicate_expressions(
+        ("intersects", "covered_by"),
+        left,
+        right,
+        source_token="device-only-multi-predicate-token",
+    )
+    runtime_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert expressions is not None
+    assert set(expressions) == {"intersects", "covered_by"}
+    assert "binary predicate all-valid pair scalar fence" not in runtime_reasons
+    assert "binary predicate tag-pairs host export" not in runtime_reasons
+    assert not any(reason.startswith("owned geometry host metadata") for reason in runtime_reasons)
+
+
+def test_native_point_region_predicate_expression_handles_nulls_without_all_valid_fence() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device point-region expression")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.predicates.binary import binary_predicate_expression
+
+    points = from_shapely_geometries(
+        [
+            Point(1, 1),
+            None,
+            Point(3, 3),
+        ],
+        residency=Residency.DEVICE,
+    )
+    regions = from_shapely_geometries(
+        [
+            box(0, 0, 2, 2),
+            box(0, 0, 2, 2),
+            box(0, 0, 2, 2),
+        ],
+        residency=Residency.DEVICE,
+    )
+    points._validity = None
+    points._tags = None
+    points._family_row_offsets = None
+    regions._validity = None
+    regions._tags = None
+    regions._family_row_offsets = None
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+
+    with assert_zero_d2h_transfers():
+        intersects = binary_predicate_expression(
+            "intersects",
+            points,
+            regions,
+            source_token="point-region-null-token",
+        )
+        disjoint = binary_predicate_expression(
+            "disjoint",
+            points,
+            regions,
+            source_token="point-region-null-token",
+        )
+        assert intersects is not None
+        assert disjoint is not None
+        hit_rows = intersects.equal_to(True)
+        disjoint_rows = disjoint.equal_to(True)
+    runtime_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert "binary predicate all-valid pair scalar fence" not in runtime_reasons
+    assert cp.asnumpy(intersects.values).tolist() == [True, False, False]
+    assert cp.asnumpy(disjoint.values).tolist() == [False, False, True]
+    assert cp.asnumpy(hit_rows.positions).tolist() == [0]
+    assert cp.asnumpy(disjoint_rows.positions).tolist() == [2]
+    reset_d2h_transfer_count()
+
+
 def test_native_validity_expression_feeds_rowset_without_runtime_d2h() -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device validity expression")
@@ -2595,9 +3853,7 @@ def test_native_length_expression_feeds_rowset_and_grouped_consumers_without_run
     )
     state = NativeFrameState.from_native_tabular_result(
         NativeTabularResult(
-            attributes=NativeAttributeTable(
-                dataframe=pd.DataFrame({"group": [0, 0, 1]})
-            ),
+            attributes=NativeAttributeTable(dataframe=pd.DataFrame({"group": [0, 0, 1]})),
             geometry=GeometryNativeResult.from_owned(owned, crs=None),
             geometry_name="geometry",
             column_order=("group", "geometry"),
@@ -2984,7 +4240,7 @@ def test_clip_native_tabular_reuses_arrow_source_attributes() -> None:
         keep_geom_type=False,
     )
 
-    assert result.attributes.arrow_table is not None
+    assert result.attributes.arrow_table is not None or result.attributes.device_table is not None
     assert result.attributes.to_pandas()["value"].tolist() == [1, 2]
 
 
@@ -3165,7 +4421,65 @@ def test_pairwise_constructive_native_result_reuses_device_source_attributes_wit
         )
         arrays = result.attributes.numeric_column_arrays(("value", "zone"))
 
-    assert result.attributes.device_table is not None
+    assert result.attributes.parts is not None
+    assert all(part.device_table is not None for part in result.attributes.parts)
+    assert result.column_order == ("value", "zone", "geometry")
+    assert arrays is not None
+    assert cp.asnumpy(arrays["value"]).tolist() == [30, 10]
+    assert cp.asnumpy(arrays["zone"]).tolist() == [2, 1]
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_pairwise_constructive_promotes_numeric_pandas_attrs_for_device_gather() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for mixed native constructive attributes")
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    left = GeoDataFrame(
+        {
+            "value": [10, 20, 30],
+            "geometry": [box(0, 0, 1, 1), box(1, 0, 2, 1), box(2, 0, 3, 1)],
+        },
+        geometry="geometry",
+    )
+    right = GeoDataFrame(
+        {
+            "zone": [1, 2],
+            "geometry": [box(0, 0, 1, 1), box(1, 0, 3, 1)],
+        },
+        geometry="geometry",
+    )
+    _attach_native_tabular_state(left, attribute_storage="device")
+    _attach_native_tabular_state(right, attribute_storage="pandas")
+    geometry = GeometryNativeResult.from_values(
+        [box(2, 0, 3, 1), box(0, 0, 1, 1)],
+        crs=None,
+        name="geometry",
+    )
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        result = _pairwise_constructive_to_native_tabular_result(
+            geometry=geometry,
+            relation=RelationIndexResult(
+                cp.asarray([2, 0], dtype=cp.int32),
+                cp.asarray([1, 0], dtype=cp.int32),
+            ),
+            keep_geom_type_applied=False,
+            left_df=left,
+            right_df=right,
+        )
+        arrays = result.attributes.numeric_column_arrays(("value", "zone"))
+
+    assert result.attributes.parts is not None
+    assert all(part.device_table is not None for part in result.attributes.parts)
     assert result.column_order == ("value", "zone", "geometry")
     assert arrays is not None
     assert cp.asnumpy(arrays["value"]).tolist() == [30, 10]
@@ -3274,7 +4588,8 @@ def test_relation_constructive_native_result_uses_device_relation_pairs() -> Non
     assert cp.asnumpy(result.provenance.left_rows).tolist() == [0, 2]
     assert cp.asnumpy(result.provenance.right_rows).tolist() == [0, 1]
     assert state.column_order == ("value", "shared_1", "zone", "shared_2", "geometry")
-    assert state.attributes.device_table is not None
+    assert state.attributes.parts is not None
+    assert all(part.device_table is not None for part in state.attributes.parts)
     assert attribute_arrays is not None
     assert cp.asnumpy(attribute_arrays["value"]).tolist() == [10, 30]
     assert cp.asnumpy(attribute_arrays["shared_1"]).tolist() == [1, 3]
@@ -3286,6 +4601,76 @@ def test_relation_constructive_native_result_uses_device_relation_pairs() -> Non
     assert cp.asnumpy(rowset.positions).tolist() == [0, 1]
     # Polygon constructive still carries small scalar output-size/admissibility
     # fences; relation pair formatting must not add materialization.
+    assert transfer_count <= 8
+    assert transfer_bytes <= 128
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_relation_selection_constructive_keeps_pair_capacity_device_resident() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for relation selection constructive result")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_profile,
+        reset_d2h_transfer_count,
+    )
+
+    left_owned = from_shapely_geometries(
+        [
+            box(0.0, 0.0, 1.0, 1.0),
+            box(1.0, 0.0, 2.0, 1.0),
+            box(2.0, 0.0, 3.0, 1.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+    right_owned = from_shapely_geometries(
+        [
+            box(0.25, 0.25, 1.25, 1.25),
+            box(2.25, 0.25, 3.25, 1.25),
+        ],
+        residency=Residency.DEVICE,
+    )
+    left_state = NativeTabularResult(
+        attributes=pd.DataFrame({"value": [10, 20, 30]}),
+        geometry=GeometryNativeResult.from_owned(left_owned, crs=None),
+        geometry_name="geometry",
+        column_order=("value", "geometry"),
+    ).to_native_frame_state()
+    right_state = NativeTabularResult(
+        attributes=pd.DataFrame({"zone": [100, 200]}),
+        geometry=GeometryNativeResult.from_owned(right_owned, crs=None),
+        geometry_name="geometry",
+        column_order=("zone", "geometry"),
+    ).to_native_frame_state()
+    relation = NativeRelation(
+        left_indices=cp.asarray([0, 1, 2], dtype=cp.int32),
+        right_indices=cp.asarray([0, 0, 1], dtype=cp.int32),
+        left_token=left_state.lineage_token,
+        right_token=right_state.lineage_token,
+        left_row_count=left_state.row_count,
+        right_row_count=right_state.row_count,
+    )
+    relation_selection = relation.filter_pairs_selection(
+        NativeDeviceSelection.from_mask(cp.asarray([True, False, True])),
+    )
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    result = _relation_selection_constructive_to_native_tabular_result(
+        op="intersection",
+        relation_selection=relation_selection,
+        left_state=left_state,
+        right_state=right_state,
+    )
+    transfer_count, transfer_bytes, _transfer_seconds = get_d2h_transfer_profile()
+
+    assert isinstance(result, NativeTabularSelection)
+    assert result.capacity == 3
+    assert cp.asnumpy(result.logical_count).tolist() == [2]
+    assert cp.asnumpy(result.selection.positions[:2]).tolist() == [0, 1]
+    assert cp.asnumpy(result.provenance.left_rows).tolist() == [0, 2, 0]
+    assert cp.asnumpy(result.provenance.right_rows).tolist() == [0, 1, 0]
     assert transfer_count <= 8
     assert transfer_bytes <= 128
     assert get_materialization_events(clear=True) == []
@@ -3359,7 +4744,6 @@ def test_constructive_native_result_feeds_expression_consumers_with_bounded_fenc
         left,
         right,
         dispatch_mode=ExecutionMode.GPU,
-        _prefer_exact_polygon_intersection=True,
     )
     seed_homogeneous_host_metadata(constructed, GeometryFamily.POLYGON)
     seed_all_validity_cache(constructed)
@@ -3625,7 +5009,8 @@ def test_public_sindex_query_exports_indices_from_native_relation() -> None:
         if event.surface == "geopandas.sindex.query"
     ]
     materializations = [
-        event for event in get_materialization_events(clear=True)
+        event
+        for event in get_materialization_events(clear=True)
         if event.operation == "sindex_query"
     ]
 
@@ -3638,15 +5023,11 @@ def test_public_sindex_query_exports_indices_from_native_relation() -> None:
 
 def test_public_sindex_nearest_exports_indices_from_native_relation() -> None:
     tree = GeoSeries(
-        GeometryArray.from_owned(
-            from_shapely_geometries([Point(0.0, 0.0), Point(10.0, 10.0)])
-        ),
+        GeometryArray.from_owned(from_shapely_geometries([Point(0.0, 0.0), Point(10.0, 10.0)])),
         name="geometry",
     )
     query = GeoSeries(
-        GeometryArray.from_owned(
-            from_shapely_geometries([Point(0.5, 0.5), Point(10.5, 10.5)])
-        ),
+        GeometryArray.from_owned(from_shapely_geometries([Point(0.5, 0.5), Point(10.5, 10.5)])),
         name="geometry",
     )
     clear_dispatch_events()
@@ -3659,7 +5040,8 @@ def test_public_sindex_nearest_exports_indices_from_native_relation() -> None:
         if event.surface == "geopandas.sindex.nearest"
     ]
     materializations = [
-        event for event in get_materialization_events(clear=True)
+        event
+        for event in get_materialization_events(clear=True)
         if event.operation == "sindex_nearest"
     ]
 
@@ -3668,6 +5050,7 @@ def test_public_sindex_nearest_exports_indices_from_native_relation() -> None:
         "native_relation_export",
         "point_tree_gpu_knn",
         "owned_cpu_nearest",
+        "strtree_host",
     }
     assert len(materializations) == 1
     assert "native_export_target=sindex-nearest" in materializations[0].detail
@@ -3713,9 +5096,7 @@ def test_native_frame_geometry_metadata_carries_lineage_without_runtime_d2h() ->
     )
     state = NativeFrameState.from_native_tabular_result(
         NativeTabularResult(
-            attributes=NativeAttributeTable(
-                dataframe=pd.DataFrame({"value": [10, 20]})
-            ),
+            attributes=NativeAttributeTable(dataframe=pd.DataFrame({"value": [10, 20]})),
             geometry=GeometryNativeResult.from_owned(owned, crs=None),
             geometry_name="geometry",
             column_order=("value", "geometry"),
@@ -3734,7 +5115,9 @@ def test_native_frame_geometry_metadata_carries_lineage_without_runtime_d2h() ->
     reset_d2h_transfer_count()
 
 
-def test_native_frame_cached_geometry_metadata_survives_device_rowset_take_without_runtime_d2h() -> None:
+def test_native_frame_cached_geometry_metadata_survives_device_rowset_take_without_runtime_d2h() -> (
+    None
+):
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device native frame metadata take")
     cp = pytest.importorskip("cupy")
@@ -4137,9 +5520,7 @@ def test_native_relation_right_semijoin_rowset_feeds_owned_take_without_runtime_
         reset_d2h_transfer_count,
     )
 
-    owned = from_shapely_geometries(
-        [Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3)]
-    )
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3)])
     owned.move_to(
         Residency.DEVICE,
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
@@ -4236,6 +5617,7 @@ def test_native_relation_device_distance_expression_filters_without_runtime_d2h(
         rowset = expression.less_equal(2.5)
         filtered = relation.filter_pairs(rowset)
         left_min = filtered.left_reduce_distances("min")
+        left_sum = filtered.left_reduce_distances("sum")
         right_count = filtered.right_reduce_distances("count")
 
     assert expression.is_device
@@ -4250,7 +5632,242 @@ def test_native_relation_device_distance_expression_filters_without_runtime_d2h(
     assert cp.asnumpy(filtered.right_indices).tolist() == [1, 2, 3]
     assert cp.asnumpy(filtered.distances).tolist() == [1.0, 2.5, 1.5]
     assert cp.asnumpy(left_min.values).tolist() == [1.0, 2.5, 1.5]
+    assert cp.asnumpy(left_sum.values).tolist() == [1.0, 2.5, 1.5]
     assert cp.asnumpy(right_count.values).tolist() == [0, 1, 1, 1]
+    reset_d2h_transfer_count()
+
+
+def test_native_grouped_selection_reduces_capacity_without_runtime_d2h() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for capacity grouped selection")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    selection = NativeDeviceSelection.from_mask(
+        cp.asarray([True, False, True, True, False], dtype=cp.bool_),
+        source_row_count=5,
+    )
+    grouped = NativeGroupedSelection(
+        group_codes=cp.asarray([0, 0, 1, 1, 2], dtype=cp.int32),
+        selection=selection,
+        group_count=3,
+    )
+    values = cp.asarray([2.0, 20.0, 3.0, 5.0, 7.0], dtype=cp.float64)
+    flags = cp.asarray([True, False, False, True, True], dtype=cp.bool_)
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        sums = grouped.reduce_numeric(values, "sum")
+        means = grouped.reduce_numeric(values, "mean")
+        minima = grouped.reduce_numeric(values, "min")
+        maxima = grouped.reduce_numeric(values, "max")
+        any_flags = grouped.reduce_numeric(flags, "any")
+        all_flags = grouped.reduce_numeric(flags, "all")
+
+    assert grouped.capacity == 5
+    assert get_materialization_events(clear=True) == []
+    assert cp.asnumpy(sums.values).tolist() == [2.0, 8.0, 0.0]
+    np.testing.assert_allclose(
+        cp.asnumpy(means.values),
+        np.asarray([2.0, 4.0, np.nan]),
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        cp.asnumpy(minima.values),
+        np.asarray([2.0, 3.0, np.nan]),
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        cp.asnumpy(maxima.values),
+        np.asarray([2.0, 5.0, np.nan]),
+        equal_nan=True,
+    )
+    assert cp.asnumpy(any_flags.values).tolist() == [True, True, False]
+    assert cp.asnumpy(all_flags.values).tolist() == [True, False, True]
+    reset_d2h_transfer_count()
+
+
+def test_native_relation_capacity_selection_reduces_without_runtime_d2h() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for capacity relation selection")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    relation = NativeRelation(
+        left_indices=cp.asarray([0, 0, 1, 2, 2], dtype=cp.int32),
+        right_indices=cp.asarray([3, 1, 2, 0, 3], dtype=cp.int32),
+        left_token="left",
+        right_token="right",
+        predicate="nearest",
+        distances=cp.asarray([5.0, 1.0, 2.5, 7.0, 1.5], dtype=cp.float64),
+        left_row_count=3,
+        right_row_count=4,
+        sorted_by_left=True,
+    )
+    left_geometry = from_shapely_geometries(
+        [Point(0.0, 0.0), Point(10.0, 0.0), Point(20.0, 0.0)],
+        residency=Residency.DEVICE,
+    )
+    right_geometry = from_shapely_geometries(
+        [
+            Point(999.0, 0.0),
+            Point(0.0, 0.0),
+            Point(10.0, 0.0),
+            Point(20.0, 0.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+    reset_d2h_transfer_count()
+
+
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        filtered = relation.filter_by_distance_selection("<=", 2.5)
+        attribute_filtered = relation.filter_by_equal_columns_selection(
+            {"zone": cp.asarray([1, 2, 1], dtype=cp.int32)},
+            {"zone": cp.asarray([0, 1, 2, 0], dtype=cp.int32)},
+        )
+        left_min = filtered.left_reduce_distances("min")
+        left_sum = filtered.left_reduce_distances("sum")
+        right_count = filtered.right_reduce_distances("count")
+        left_matches = filtered.left_match_count_expression()
+        right_matches = filtered.right_match_count_expression()
+        attribute_left_matches = attribute_filtered.left_match_count_expression()
+        pair_geometry = filtered.physicalize_geometries(
+            left_geometry,
+            right_geometry,
+        )
+        pair_intersection = pair_geometry.constructive_native("intersection")
+
+    assert filtered.capacity == 5
+    with pytest.raises(TypeError, match="logical length is device-resident"):
+        len(filtered)
+    assert get_materialization_events(clear=True) == []
+    assert cp.asnumpy(filtered.logical_count).tolist() == [3]
+    assert cp.asnumpy(attribute_filtered.logical_count).tolist() == [2]
+    assert cp.asnumpy(left_min.values).tolist() == [1.0, 2.5, 1.5]
+    assert cp.asnumpy(left_sum.values).tolist() == [1.0, 2.5, 1.5]
+    assert cp.asnumpy(right_count.values).tolist() == [0, 1, 1, 1]
+    assert cp.asnumpy(left_matches.values).tolist() == [1, 1, 1]
+    assert cp.asnumpy(right_matches.values).tolist() == [0, 1, 1, 1]
+    assert cp.asnumpy(attribute_left_matches.values).tolist() == [1, 1, 0]
+    assert pair_geometry.capacity == 5
+    assert cp.asnumpy(pair_geometry.logical_count).tolist() == [3]
+    assert cp.asnumpy(pair_geometry.left_geometry._ensure_device_state().validity).tolist() == [
+        True,
+        True,
+        True,
+        False,
+        False,
+    ]
+    assert cp.asnumpy(pair_geometry.right_geometry._ensure_device_state().validity).tolist() == [
+        True,
+        True,
+        True,
+        False,
+        False,
+    ]
+    left_values = pair_geometry.left_geometry.to_shapely()
+    right_values = pair_geometry.right_geometry.to_shapely()
+    assert [value.x if value is not None else None for value in left_values] == [
+        0.0,
+        10.0,
+        20.0,
+        None,
+        None,
+    ]
+    assert [value.x if value is not None else None for value in right_values] == [
+        0.0,
+        10.0,
+        20.0,
+        None,
+        None,
+    ]
+    assert pair_intersection.capacity == 5
+    assert pair_intersection.geometry.owned is not None
+    assert cp.asnumpy(
+        pair_intersection.geometry.owned._ensure_device_state().validity
+    ).tolist() == [True, True, True, False, False]
+    intersection_values = pair_intersection.geometry.owned.to_shapely()
+    assert [
+        value.x if value is not None and not value.is_empty else None
+        for value in intersection_values
+    ] == [0.0, 10.0, 20.0, None, None]
+    reset_d2h_transfer_count()
+
+
+@pytest.mark.gpu
+def test_relation_selection_preserves_singular_right_constructive_carrier() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for singular-right constructive carrier")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    relation = NativeRelation(
+        left_indices=cp.asarray([0, 1], dtype=cp.int32),
+        right_indices=cp.asarray([0, 0], dtype=cp.int32),
+        left_row_count=2,
+        right_row_count=1,
+    )
+    selected = NativeRelationSelection(
+        relation=relation,
+        selection=NativeDeviceSelection.identity(2),
+    )
+    left_geometry = from_shapely_geometries(
+        [
+            Polygon([(0.0, 0.0), (2.0, 0.0), (1.0, 2.0), (0.0, 0.0)]),
+            Polygon([(3.0, 0.0), (5.0, 0.0), (4.0, 2.0), (3.0, 0.0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    right_geometry = from_shapely_geometries(
+        [
+            Polygon(
+                [
+                    (1.0, -1.0),
+                    (4.0, -1.0),
+                    (4.5, 1.0),
+                    (3.5, 3.0),
+                    (1.0, 3.0),
+                    (1.0, -1.0),
+                ]
+            )
+        ],
+        residency=Residency.DEVICE,
+    )
+    reset_d2h_transfer_count()
+    clear_dispatch_events()
+
+    with assert_zero_d2h_transfers():
+        pair_geometry = selected.physicalize_geometries(
+            left_geometry,
+            right_geometry,
+        )
+        result = pair_geometry.constructive_native("intersection")
+
+    assert pair_geometry.broadcast_right_geometry is right_geometry
+    assert result.geometry.owned is not None
+    right_value = right_geometry.to_shapely()[0]
+    expected = [
+        left.intersection(right_value) for left in left_geometry.to_shapely()
+    ]
+    actual = result.geometry.owned.to_shapely()
+    assert all(left.equals(right) for left, right in zip(actual, expected))
+    assert any(
+        event.implementation == "broadcast_right_virtual_segment_topology_gpu"
+        for event in get_dispatch_events(clear=True)
+    )
     reset_d2h_transfer_count()
 
 
@@ -4939,6 +6556,7 @@ def test_point_parts_native_result_feeds_grouped_consumer_without_public_export(
     )
     producer_events = get_d2h_transfer_events(clear=True)
 
+    assert isinstance(result, NativeTabularSelection)
     assert isinstance(result.provenance, NativeGeometryProvenance)
     assert result.provenance.operation == "point_parts"
     assert result.provenance.source_tokens == ("point-parts-source",)
@@ -4948,16 +6566,16 @@ def test_point_parts_native_result_feeds_grouped_consumer_without_public_export(
         FAMILY_TAGS[GeometryFamily.POINT],
         FAMILY_TAGS[GeometryFamily.POINT],
     ]
-    assert 1 <= len(producer_events) <= 6
-    assert sum(event.bytes_transferred for event in producer_events) <= 64
+    assert producer_events == []
 
     reset_d2h_transfer_count()
     clear_materialization_events()
     with assert_zero_d2h_transfers():
-        state = result.to_native_frame_state()
+        state = result.capacity_result.to_native_frame_state()
         centroid_x, _centroid_y = state.geometry_centroid_expressions()
-        grouped = NativeGrouped.from_dense_codes(
-            result.provenance.source_rows,
+        grouped = NativeGroupedSelection(
+            group_codes=result.provenance.source_rows,
+            selection=result.selection,
             group_count=owned.row_count,
             source_token=state.lineage_token,
         )
@@ -5002,6 +6620,7 @@ def test_polygonal_parts_native_result_feeds_grouped_consumer_without_public_exp
     )
     producer_events = get_d2h_transfer_events(clear=True)
 
+    assert isinstance(result, NativeTabularSelection)
     assert isinstance(result.provenance, NativeGeometryProvenance)
     assert result.provenance.operation == "polygonal_parts"
     assert result.provenance.source_tokens == ("polygonal-parts-source",)
@@ -5011,16 +6630,16 @@ def test_polygonal_parts_native_result_feeds_grouped_consumer_without_public_exp
         FAMILY_TAGS[GeometryFamily.POLYGON],
         FAMILY_TAGS[GeometryFamily.POLYGON],
     ]
-    assert 1 <= len(producer_events) <= 6
-    assert sum(event.bytes_transferred for event in producer_events) <= 64
+    assert producer_events == []
 
     reset_d2h_transfer_count()
     clear_materialization_events()
     with assert_zero_d2h_transfers():
-        state = result.to_native_frame_state()
+        state = result.capacity_result.to_native_frame_state()
         area = state.geometry_area_expression()
-        grouped = NativeGrouped.from_dense_codes(
-            result.provenance.source_rows,
+        grouped = NativeGroupedSelection(
+            group_codes=result.provenance.source_rows,
+            selection=result.selection,
             group_count=owned.row_count,
             source_token=state.lineage_token,
         )
@@ -5065,6 +6684,7 @@ def test_lineal_parts_native_result_feeds_grouped_consumer_without_public_export
     )
     producer_events = get_d2h_transfer_events(clear=True)
 
+    assert isinstance(result, NativeTabularSelection)
     assert isinstance(result.provenance, NativeGeometryProvenance)
     assert result.provenance.operation == "lineal_parts"
     assert result.provenance.source_tokens == ("lineal-parts-source",)
@@ -5074,16 +6694,16 @@ def test_lineal_parts_native_result_feeds_grouped_consumer_without_public_export
         FAMILY_TAGS[GeometryFamily.LINESTRING],
         FAMILY_TAGS[GeometryFamily.LINESTRING],
     ]
-    assert 1 <= len(producer_events) <= 6
-    assert sum(event.bytes_transferred for event in producer_events) <= 64
+    assert producer_events == []
 
     reset_d2h_transfer_count()
     clear_materialization_events()
     with assert_zero_d2h_transfers():
-        state = result.to_native_frame_state()
+        state = result.capacity_result.to_native_frame_state()
         length = state.geometry_length_expression()
-        grouped = NativeGrouped.from_dense_codes(
-            result.provenance.source_rows,
+        grouped = NativeGroupedSelection(
+            group_codes=result.provenance.source_rows,
+            selection=result.selection,
             group_count=owned.row_count,
             source_token=state.lineage_token,
         )
@@ -5183,6 +6803,87 @@ def test_sjoin_native_relation_uses_attached_native_state_lineage() -> None:
     ]
 
 
+def test_sjoin_native_small_device_query_skips_index_metadata_fences() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device spatial index metadata test")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    def _attach_device_owned_state(frame: GeoDataFrame) -> NativeFrameState:
+        result = NativeTabularResult(
+            attributes=NativeAttributeTable(
+                dataframe=frame.drop(columns=[frame._geometry_column_name])
+            ),
+            geometry=GeometryNativeResult.from_owned(
+                from_shapely_geometries(
+                    list(frame.geometry),
+                    residency=Residency.DEVICE,
+                ),
+                crs=frame.crs,
+            ),
+            geometry_name=frame._geometry_column_name,
+            column_order=tuple(frame.columns),
+        )
+        state = NativeFrameState.from_native_tabular_result(result)
+        attach_native_state(frame, state)
+        return state
+
+    left = GeoDataFrame(
+        {
+            "parcel": np.arange(128, dtype=np.int64),
+            "geometry": [
+                box(
+                    float(i % 16),
+                    float(i // 16),
+                    float(i % 16) + 0.75,
+                    float(i // 16) + 0.75,
+                )
+                for i in range(128)
+            ],
+        }
+    )
+    right = GeoDataFrame(
+        {
+            "zone": np.arange(7, dtype=np.int64),
+            "geometry": [box(float(i * 2), 0.0, float(i * 2) + 1.25, 8.0) for i in range(7)],
+        }
+    )
+    _attach_device_owned_state(left)
+    _attach_device_owned_state(right)
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    export_result, implementation, execution = _sjoin_export_result(
+        left,
+        right,
+        "inner",
+        "intersects",
+        None,
+        "left",
+        "right",
+        return_device=True,
+    )
+    relation = export_result.relation_result.relation
+    events = get_d2h_transfer_events(clear=True)
+
+    assert implementation == "native_spatial_index"
+    assert execution.selected is ExecutionMode.GPU
+    assert relation.left_indices.size > 0
+    assert hasattr(relation.left_indices, "__cuda_array_interface__")
+    assert hasattr(relation.right_indices, "__cuda_array_interface__")
+    assert not any(
+        event.reason
+        in {
+            "spatial index regular-grid summary scalar fence",
+            "flat spatial index device total-bounds scalar fence",
+            "device spatial-index candidate-pair allocation fence",
+        }
+        for event in events
+    )
+
+
 def test_sjoin_query_prefers_attached_native_spatial_index() -> None:
     left = GeoDataFrame(
         {
@@ -5269,7 +6970,9 @@ def test_sjoin_export_result_consumes_attached_left_state_without_joined_export(
     assert matched.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [1]
     assert unmatched.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [2]
     assert matched_right.to_native_tabular_result().attributes.to_pandas()["zone"].tolist() == ["a"]
-    assert unmatched_right.to_native_tabular_result().attributes.to_pandas()["zone"].tolist() == ["b"]
+    assert unmatched_right.to_native_tabular_result().attributes.to_pandas()["zone"].tolist() == [
+        "b"
+    ]
     assert all(
         event.surface != "vibespatial.api.NativeTabularResult.to_geodataframe"
         for event in get_materialization_events(clear=True)
@@ -5393,9 +7096,10 @@ def test_sjoin_export_result_lowers_joined_rows_to_native_frame_without_public_e
         "index_right",
         "score",
     )
-    assert joined_state.to_native_tabular_result().attributes.to_pandas()[
-        "score"
-    ].tolist() == [10.0, 5.0]
+    assert joined_state.to_native_tabular_result().attributes.to_pandas()["score"].tolist() == [
+        10.0,
+        5.0,
+    ]
     assert all(
         event.surface != "vibespatial.api.NativeTabularResult.to_geodataframe"
         for event in get_materialization_events(clear=True)
@@ -5469,7 +7173,8 @@ def test_relation_join_export_result_can_build_device_attribute_frame_with_dista
     assert payload.index_plan is not None
     assert payload.index_plan.kind == "device-labels"
     assert payload.attributes.index.equals(pd.RangeIndex(2))
-    assert attributes.device_table is not None
+    assert attributes.parts is not None
+    assert all(part.device_table is not None for part in attributes.parts)
     assert state.index_plan.kind == "device-labels"
     assert state.column_order == ("value", "geometry", "index_right", "score", "dist")
     assert arrays is not None
@@ -5621,27 +7326,30 @@ def test_public_sjoin_lowers_nonempty_relation_without_internal_pair_export(
             "nonempty relation joins should lower through device native state before terminal export"
         )
 
-    monkeypatch.setattr(
-        native_results_module,
-        "_PUBLIC_SJOIN_PANDAS_EXPORT_MAX_ROWS",
-        0,
-    )
     monkeypatch.setattr(RelationIndexResult, "to_host", _fail_relation_host_export)
     clear_materialization_events()
 
     joined = sjoin(left, right, predicate="intersects")
+    joined_state = get_native_state(joined)
+    assert joined_state is not None
+    joined_attributes = NativeAttributeTable.from_value(joined_state.attributes)
+    assert joined_attributes.parts is not None
+    assert all(part.device_table is not None for part in joined_attributes.parts)
 
     assert joined["left_value"].tolist() == [1, 2]
     assert joined["score"].tolist() == [10.0, 5.0]
     assert all(
-        event.surface != "vibespatial.api._native_results._relation_join_export_result_to_native_tabular_result"
+        event.surface
+        != "vibespatial.api._native_results._relation_join_export_result_to_native_tabular_result"
         for event in get_materialization_events(clear=True)
     )
 
 
-def test_public_sjoin_small_relation_prefers_pandas_public_export() -> None:
+def test_public_sjoin_small_relation_uses_native_frame_before_public_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if not has_gpu_runtime():
-        pytest.skip("GPU runtime required for device sjoin public export policy probe")
+        pytest.skip("GPU runtime required for device sjoin native export probe")
     pytest.importorskip("pylibcudf")
 
     left = GeoDataFrame(
@@ -5677,25 +7385,35 @@ def test_public_sjoin_small_relation_prefers_pandas_public_export() -> None:
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
         reason="unit test public sjoin small relation right geometry device export",
     )
+
+    def _fail_relation_host_export(self, **kwargs):
+        raise AssertionError(
+            "small relation joins should still lower through device native state before public export"
+        )
+
+    monkeypatch.setattr(RelationIndexResult, "to_host", _fail_relation_host_export)
     clear_materialization_events()
 
     joined = sjoin(left, right, predicate="intersects")
     events = get_materialization_events(clear=True)
+    joined_state = get_native_state(joined)
 
     assert joined["left_value"].tolist() == [1, 2]
     assert joined["score"].tolist() == [10.0, 5.0]
-    assert any(
-        event.surface
-        == "vibespatial.api._native_results._relation_join_export_result_to_native_tabular_result"
-        for event in events
-    )
+    assert joined_state is not None
+    joined_attributes = NativeAttributeTable.from_value(joined_state.attributes)
+    assert joined_attributes.parts is not None
+    assert all(part.device_table is not None for part in joined_attributes.parts)
     assert all(
-        event.surface != "vibespatial.api.NativeAttributeTable.to_arrow"
+        event.surface
+        != "vibespatial.api._native_results._relation_join_export_result_to_native_tabular_result"
         for event in events
     )
+    assert all(event.surface != "vibespatial.api.NativeAttributeTable.to_arrow" for event in events)
+    assert all(event.operation != "index_plan_to_host" for event in events)
 
 
-def test_relation_join_public_export_declines_device_path_for_public_geometry(
+def test_relation_join_public_export_keeps_device_relation_for_public_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not has_gpu_runtime():
@@ -5751,8 +7469,8 @@ def test_relation_join_public_export_declines_device_path_for_public_geometry(
         if event.surface
         == "vibespatial.api._native_results._relation_join_export_result_to_native_tabular_result"
     ]
-    assert to_host_calls == 1
-    assert len(relation_events) == 2
+    assert to_host_calls == 0
+    assert relation_events == []
     assert joined["score"].tolist() == [5.0, 10.0]
 
 
@@ -5798,11 +7516,6 @@ def test_public_sjoin_device_relation_preserves_host_label_indexes(
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
         reason="unit test public sjoin host-label right geometry device export",
     )
-    monkeypatch.setattr(
-        native_results_module,
-        "_PUBLIC_SJOIN_PANDAS_EXPORT_MAX_ROWS",
-        0,
-    )
     clear_materialization_events()
 
     joined = sjoin(left, right, predicate="intersects")
@@ -5814,8 +7527,66 @@ def test_public_sjoin_device_relation_preserves_host_label_indexes(
     ]
     assert joined.index.tolist() == [20, 10]
     assert joined["index_right"].tolist() == [300, 400]
-    assert len(index_events) == 2
-    assert all(event.strict_disallowed is False for event in index_events)
+    assert index_events == []
+
+
+def test_public_sjoin_unique_index_loc_bridge_preserves_device_rowflow() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device sjoin unique-index loc bridge")
+    pytest.importorskip("pylibcudf")
+    from vibespatial.api._native_public_arrays import NativeIndexLabelsArray
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    left = GeoDataFrame(
+        {
+            "left_value": [1, 2, 3],
+            "geometry": GeoSeries.from_wkt(
+                ["POINT (0 0)", "POINT (5 5)", "POINT (1 1)"],
+                name="geometry",
+            ),
+        }
+    )
+    right = GeoDataFrame(
+        {
+            "score": [10.0, 5.0],
+            "geometry": GeoSeries.from_wkt(
+                [
+                    "POLYGON ((-1 -1, 0.5 -1, 0.5 0.5, -1 0.5, -1 -1))",
+                    "POLYGON ((-1 -1, 2 -1, 2 2, -1 2, -1 -1))",
+                ],
+                name="geometry",
+            ),
+        }
+    )
+    left_state = _attach_owned_native_tabular_state(left, attribute_storage="device")
+    right_state = _attach_owned_native_tabular_state(right, attribute_storage="device")
+    left_state.geometry.owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test public sjoin unique loc bridge left geometry",
+    )
+    right_state.geometry.owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test public sjoin unique loc bridge right geometry",
+    )
+    joined = sjoin(left, right, predicate="intersects")
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+
+    with assert_zero_d2h_transfers():
+        candidate_rows = joined.index.unique()
+        selected = left.loc[candidate_rows].copy()
+
+    assert isinstance(getattr(candidate_rows, "array", None), NativeIndexLabelsArray)
+    selected_state = get_native_state(selected)
+    assert selected_state is not None
+    assert NativeAttributeTable.from_value(selected_state.attributes).device_table is not None
+    assert get_materialization_events(clear=True) == []
+    assert selected["left_value"].tolist() == [1, 3]
 
 
 def test_public_sjoin_empty_device_candidates_stay_device_resident(monkeypatch) -> None:
@@ -5961,19 +7732,28 @@ def test_sjoin_attribute_reducer_bridge_declines_unadmitted_sources() -> None:
         "right",
     )
 
-    assert export_result.left_reduce_right_numeric_columns(
-        {"missing_sum": "missing"},
-        {"missing_sum": "sum"},
-    ) is None
-    assert export_result.left_reduce_right_numeric_columns(
-        {"label_count": "label"},
-        {"label_count": "count"},
-    ) is None
+    assert (
+        export_result.left_reduce_right_numeric_columns(
+            {"missing_sum": "missing"},
+            {"missing_sum": "sum"},
+        )
+        is None
+    )
+    assert (
+        export_result.left_reduce_right_numeric_columns(
+            {"label_count": "label"},
+            {"label_count": "count"},
+        )
+        is None
+    )
     drop_native_state(right)
-    assert export_result.left_reduce_right_numeric_columns(
-        {"label_count": "label"},
-        {"label_count": "count"},
-    ) is None
+    assert (
+        export_result.left_reduce_right_numeric_columns(
+            {"label_count": "label"},
+            {"label_count": "count"},
+        )
+        is None
+    )
 
 
 def test_relation_export_attribute_reducer_bridge_stays_device_without_runtime_d2h() -> None:
@@ -6124,9 +7904,7 @@ def test_strict_native_disallows_hidden_device_index_plan_materialization(
     monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
     clear_materialization_events()
 
-    plan = NativeIndexPlan.from_index(
-        pd.RangeIndex(start=10, stop=20, step=2, name="site")
-    )
+    plan = NativeIndexPlan.from_index(pd.RangeIndex(start=10, stop=20, step=2, name="site"))
     taken = plan.take(cp.asarray([3, 0], dtype=cp.int32), unique=True)
 
     with pytest.raises(StrictNativeMaterializationError):
@@ -6153,9 +7931,16 @@ def test_native_index_plan_takes_host_labels_with_device_positions_explicitly() 
     )
 
     events = get_materialization_events(clear=True)
-    assert taken.kind == "host-labels"
-    assert taken.index.tolist() == [30, 20]
+    assert taken.kind == "host-labels-take"
+    assert taken.index is None
     assert taken.name == "parcel"
+    assert events == []
+
+    public_index = taken.to_public_index(strict_disallowed=False)
+    events = get_materialization_events(clear=True)
+
+    assert public_index.tolist() == [30, 20]
+    assert public_index.name == "parcel"
     assert len(events) == 1
     assert events[0].operation == "index_plan_take_positions_to_host"
     assert events[0].strict_disallowed is False
@@ -6172,8 +7957,12 @@ def test_strict_native_disallows_hidden_host_label_index_plan_take(
 
     plan = NativeIndexPlan.from_index(pd.Index([20, 10, 30], name="parcel"))
 
+    taken = plan.take(cp.asarray([2, 0], dtype=cp.int32), unique=True)
+    assert taken.kind == "host-labels-take"
+    assert get_materialization_events(clear=True) == []
+
     with pytest.raises(StrictNativeMaterializationError):
-        plan.take(cp.asarray([2, 0], dtype=cp.int32), unique=True)
+        taken.to_public_index()
 
     events = get_materialization_events(clear=True)
     assert len(events) == 1
@@ -6193,9 +7982,7 @@ def test_strict_native_defers_admitted_native_frame_index_bridge_until_export(
     attributes = NativeAttributeTable(
         arrow_table=pa.table({"value": pa.array([10, 20, 30], type=pa.int64())})
     )
-    owned = from_shapely_geometries(
-        [Point(0, 0), Point(1, 1), Point(2, 2)]
-    ).move_to(
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1), Point(2, 2)]).move_to(
         Residency.DEVICE,
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
         reason="unit test strict native admitted index bridge",
@@ -6227,8 +8014,8 @@ def test_strict_native_defers_admitted_native_frame_index_bridge_until_export(
     assert events == []
 
     exported = payload.to_geodataframe()
-    events = get_materialization_events(clear=True)
     assert exported.index.tolist() == [2, 0]
+    events = get_materialization_events(clear=True)
     index_events = [event for event in events if event.operation == "index_plan_to_host"]
     assert len(index_events) == 1
     assert index_events[0].strict_disallowed is False
@@ -6245,9 +8032,7 @@ def test_strict_native_tabular_device_take_preserves_range_index_without_host_ro
     attributes = NativeAttributeTable(
         arrow_table=pa.table({"value": pa.array([10, 20, 30], type=pa.int64())})
     )
-    owned = from_shapely_geometries(
-        [Point(0, 0), Point(1, 1), Point(2, 2)]
-    ).move_to(
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1), Point(2, 2)]).move_to(
         Residency.DEVICE,
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
         reason="unit test strict native tabular device take",
@@ -6269,12 +8054,12 @@ def test_strict_native_tabular_device_take_preserves_range_index_without_host_ro
     assert events == []
 
     exported = taken.to_geodataframe()
+    assert exported.index.tolist() == [2, 0]
     index_events = [
         event
         for event in get_materialization_events(clear=True)
         if event.operation == "index_plan_to_host"
     ]
-    assert exported.index.tolist() == [2, 0]
     assert len(index_events) == 1
     assert index_events[0].strict_disallowed is False
 
@@ -6324,6 +8109,455 @@ def test_simple_native_geodataframe_export_avoids_concat_and_constructor(
     assert getattr(exported.geometry.values, "_owned", None) is owned
     assert exported["score"].tolist() == [3, 4]
     assert exported.attrs == {"source": "native"}
+
+
+def test_native_geometry_composition_exports_concrete_and_collection_rows() -> None:
+    polygons = GeometryNativeResult.from_owned(
+        from_shapely_geometries([box(0, 0, 1, 1), box(2, 0, 3, 1)]),
+        crs=None,
+    )
+    remnants = GeometryNativeResult.from_owned(
+        from_shapely_geometries(
+            [LineString([(0, 0), (1, 0)]), Point(4, 4)],
+        ),
+        crs=None,
+    )
+    geometry = GeometryNativeResult.from_composition(
+        NativeGeometryComposition(
+            parts=(
+                NativeGeometryCompositionPart(polygons, np.asarray([0, 1])),
+                NativeGeometryCompositionPart(remnants, np.asarray([0, 2])),
+            ),
+            row_count=4,
+            crs=None,
+        ),
+        crs=None,
+    )
+
+    exported = geometry.to_geoseries(index=pd.RangeIndex(4), name="geometry")
+
+    assert exported.geom_type.iloc[:3].tolist() == [
+        "GeometryCollection",
+        "Polygon",
+        "Point",
+    ]
+    assert pd.isna(exported.geom_type.iloc[3])
+    assert [part.geom_type for part in exported.iloc[0].geoms] == [
+        "Polygon",
+        "LineString",
+    ]
+
+
+def test_native_geometry_composition_preserves_typed_empty_fallback() -> None:
+    empty_lines = GeometryNativeResult.from_owned(
+        from_shapely_geometries([LineString(), LineString(), None]),
+        crs=None,
+    )
+    points = GeometryNativeResult.from_owned(
+        from_shapely_geometries([None, Point(1, 1), None]),
+        crs=None,
+    )
+    geometry = GeometryNativeResult.from_composition(
+        NativeGeometryComposition(
+            parts=(
+                NativeGeometryCompositionPart(empty_lines, np.asarray([0, 1, 2])),
+                NativeGeometryCompositionPart(points, np.asarray([0, 1, 2])),
+            ),
+            row_count=3,
+            crs=None,
+        ),
+        crs=None,
+    )
+
+    exported = geometry.to_geoseries(index=pd.RangeIndex(3), name="geometry")
+
+    assert exported.iloc[0].geom_type == "LineString"
+    assert exported.iloc[0].is_empty
+    assert exported.iloc[1].equals(Point(1, 1))
+    assert exported.iloc[2] is None
+
+
+def test_native_ordered_geometry_collection_preserves_empty_slots() -> None:
+    forward = from_shapely_geometries(
+        [MultiLineString([[(0, 0), (1, 0)]]), MultiLineString(), None],
+    )
+    backward = from_shapely_geometries(
+        [MultiLineString(), MultiLineString([[(2, 0), (1, 0)]]), None],
+    )
+    rows = np.arange(3, dtype=np.int64)
+
+    geometry = _ordered_geometry_collection_from_owned_parts_at_capacity(
+        ((forward, rows), (backward, rows)),
+        row_count=3,
+        crs=None,
+    )
+
+    assert geometry is not None
+    assert geometry.composition is not None
+    assert [part.collection_position for part in geometry.composition.parts] == [0, 1]
+    exported = geometry.to_geoseries(index=pd.RangeIndex(3), name="geometry")
+    assert [part.geom_type for part in exported.iloc[0].geoms] == [
+        "MultiLineString",
+        "MultiLineString",
+    ]
+    assert not exported.iloc[0].geoms[0].is_empty
+    assert exported.iloc[0].geoms[1].is_empty
+    assert exported.iloc[1].geoms[0].is_empty
+    assert not exported.iloc[1].geoms[1].is_empty
+    assert exported.iloc[2] is None
+
+
+def test_native_geometry_composition_maps_parts_at_fixed_row_capacity() -> None:
+    polygons = from_shapely_geometries(
+        [box(0, 0, 1, 1), box(3, 0, 4, 1)],
+    )
+    lines = from_shapely_geometries(
+        [LineString([(0, 0), (1, 0)])],
+    )
+
+    geometry = _geometry_composition_from_owned_parts_at_capacity(
+        (
+            (polygons, np.asarray([0, 2], dtype=np.int64)),
+            (lines, np.asarray([0], dtype=np.int64)),
+        ),
+        row_count=4,
+        crs=None,
+    )
+
+    assert geometry is not None
+    assert geometry.row_count == 4
+    assert [part.geometry.row_count for part in geometry.composition.parts] == [2, 1]
+    exported = geometry.to_geoseries(index=pd.RangeIndex(4), name="geometry")
+    assert exported.geom_type.iloc[0] == "GeometryCollection"
+    assert pd.isna(exported.geom_type.iloc[1])
+    assert exported.geom_type.iloc[2] == "Polygon"
+
+
+def test_singular_device_composition_physicalizes_only_selected_spans() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for exact composition physicalization")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.geometry.owned import device_mask_owned_capacity
+
+    owned = from_shapely_geometries(
+        [box(0, 0, 1, 1), box(2, 0, 3, 1)],
+    ).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test exact composition physicalization",
+    )
+    polygon_buffer = owned.device_state.families[GeometryFamily.POLYGON]
+    polygon_buffer.x = cp.concatenate((polygon_buffer.x, cp.full(10_000, 999.0)))
+    polygon_buffer.y = cp.concatenate((polygon_buffer.y, cp.full(10_000, 999.0)))
+    first = device_mask_owned_capacity(owned, cp.asarray([True, False]))
+    second = device_mask_owned_capacity(owned, cp.asarray([False, True]))
+    rows = cp.arange(2, dtype=cp.int64)
+    composition = NativeGeometryComposition(
+        parts=(
+            NativeGeometryCompositionPart(
+                GeometryNativeResult.from_owned(first, crs=None),
+                rows,
+            ),
+            NativeGeometryCompositionPart(
+                GeometryNativeResult.from_owned(second, crs=None),
+                rows,
+            ),
+        ),
+        row_count=2,
+        crs=None,
+        trusted_all_ogc_valid=True,
+    )
+
+    reset_d2h_transfer_count()
+    physical = composition._singular_owned_device()
+    events = get_d2h_transfer_events(clear=True)
+
+    assert physical is not None
+    assert physical.is_indexed_view
+    root = physical._base
+    assert root is not None
+    root_buffer = root.device_state.families[GeometryFamily.POLYGON]
+    assert int(root_buffer.x.size) == 10
+    assert int(root_buffer.y.size) == 10
+    assert root_buffer.fixed_size.max_coord_count_per_row == 5
+    assert physical.device_state.trusted_all_ogc_valid is True
+    assert [
+        geometry.equals(expected)
+        for geometry, expected in zip(
+            physical.to_shapely(),
+            [box(0, 0, 1, 1), box(2, 0, 3, 1)],
+            strict=True,
+        )
+    ] == [True, True]
+    reasons = [event.reason for event in events]
+    assert reasons.count(
+        "native geometry composition exact physicalization allocation packet"
+    ) == 1
+
+    reset_d2h_transfer_count()
+    cached = composition._singular_owned_device()
+
+    assert cached is physical
+    assert get_d2h_transfer_events(clear=True) == []
+
+    taken = composition.take(cp.asarray([1], dtype=cp.int64), unique=True)
+    assert taken._singular_owned_device() is taken._singular_owned_cache
+    assert taken._singular_owned_cache.to_shapely()[0].equals(box(2, 0, 3, 1))
+
+    frame = NativeTabularResult(
+        attributes=pd.DataFrame({"value": [1, 2]}),
+        geometry=GeometryNativeResult.from_composition(composition, crs=None),
+        geometry_name="geometry",
+        column_order=("value", "geometry"),
+    ).to_geodataframe()
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    polygon_mask = frame.geometry.geom_type.isin({"Polygon", "MultiPolygon"})
+    filtered = frame[polygon_mask].copy()
+
+    filtered_state = get_native_state(filtered)
+    assert filtered_state is not None
+    filtered_owned = filtered_state.geometry.cached_owned()
+    assert filtered_owned is not None
+    assert set(filtered_owned.device_state.trusted_family_domain or ()) <= {
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+    }
+    assert filtered_owned.device_state.trusted_polygonal_only is True
+    assert filtered_owned.device_state.trusted_all_valid is True
+    assert get_materialization_events(clear=True) == []
+    assert get_d2h_transfer_events(clear=True) == []
+
+
+def test_native_geometry_composition_take_preserves_duplicates_and_part_order() -> None:
+    polygons = GeometryNativeResult.from_owned(
+        from_shapely_geometries([box(0, 0, 1, 1), box(2, 0, 3, 1)]),
+        crs=None,
+    )
+    lines = GeometryNativeResult.from_owned(
+        from_shapely_geometries([LineString([(0, 0), (1, 0)])]),
+        crs=None,
+    )
+    geometry = GeometryNativeResult.from_composition(
+        NativeGeometryComposition(
+            parts=(
+                NativeGeometryCompositionPart(polygons, np.asarray([0, 1])),
+                NativeGeometryCompositionPart(lines, np.asarray([0])),
+            ),
+            row_count=2,
+            crs=None,
+        ),
+        crs=None,
+    )
+
+    taken = geometry.take(np.asarray([1, 0, 0], dtype=np.int64))
+    exported = taken.to_geoseries(index=pd.RangeIndex(3), name="geometry")
+
+    assert exported.geom_type.tolist() == [
+        "Polygon",
+        "GeometryCollection",
+        "GeometryCollection",
+    ]
+    assert [part.geom_type for part in exported.iloc[1].geoms] == [
+        "Polygon",
+        "LineString",
+    ]
+    assert exported.iloc[1].equals(exported.iloc[2])
+
+
+@pytest.mark.gpu
+def test_native_geometry_composition_device_take_uses_relation_pairs() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device composition take")
+    cp = pytest.importorskip("cupy")
+
+    points = GeometryNativeResult.from_owned(
+        from_shapely_geometries(
+            [Point(0, 0), Point(1, 1), Point(2, 2)],
+            residency=Residency.DEVICE,
+        ),
+        crs=None,
+    )
+    geometry = GeometryNativeResult.from_composition(
+        NativeGeometryComposition(
+            parts=(
+                NativeGeometryCompositionPart(
+                    points,
+                    cp.asarray([0, 0, 1], dtype=cp.int64),
+                ),
+            ),
+            row_count=2,
+            crs=None,
+        ),
+        crs=None,
+    )
+
+    taken = geometry.take(cp.asarray([1, 0, 0], dtype=cp.int64))
+
+    assert taken.composition is not None
+    part = taken.composition.parts[0]
+    assert cp.asarray(part.output_rows).tolist() == [0, 1, 1, 2, 2]
+    assert part.geometry.owned is not None
+    assert part.geometry.owned.is_indexed_view
+    assert cp.asarray(part.geometry.owned._index_map).tolist() == [2, 0, 1, 0, 1]
+
+
+@pytest.mark.gpu
+def test_native_geometry_composition_empty_device_take_drops_part_capacity() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device composition take")
+    cp = pytest.importorskip("cupy")
+
+    geometry = GeometryNativeResult.from_composition(
+        NativeGeometryComposition(
+            parts=(
+                NativeGeometryCompositionPart(
+                    GeometryNativeResult.from_owned(
+                        from_shapely_geometries(
+                            [box(0, 0, 1, 1), box(2, 0, 3, 1)],
+                            residency=Residency.DEVICE,
+                        ),
+                        crs=None,
+                    ),
+                    cp.asarray([0, 1], dtype=cp.int64),
+                ),
+            ),
+            row_count=2,
+            crs=None,
+        ),
+        crs=None,
+    )
+
+    taken = geometry.take(cp.empty(0, dtype=cp.int64), unique=True)
+
+    assert taken.composition is not None
+    assert taken.composition.row_count == 0
+    assert taken.composition.parts == ()
+    exported = taken.to_geoseries(index=pd.RangeIndex(0), name="geometry")
+    assert exported.empty
+
+
+def test_native_geometry_composition_concat_stays_native_until_export() -> None:
+    from vibespatial.api._native_results import _concat_geometry_result_sequence
+
+    first = GeometryNativeResult.from_composition(
+        NativeGeometryComposition(
+            parts=(
+                NativeGeometryCompositionPart(
+                    GeometryNativeResult.from_owned(
+                        from_shapely_geometries([Point(0, 0)]),
+                        crs=None,
+                    ),
+                    np.asarray([0]),
+                ),
+            ),
+            row_count=1,
+            crs=None,
+        ),
+        crs=None,
+    )
+    second_owned = from_shapely_geometries([Point(1, 1), Point(2, 2)])
+    second = GeometryNativeResult.from_owned(second_owned, crs=None)
+
+    combined = _concat_geometry_result_sequence(
+        [first, second],
+        geometry_name="geometry",
+        crs=None,
+    )
+
+    assert combined.composition is not None
+    assert combined.owned is None
+    assert combined.row_count == 3
+    assert combined.composition.parts[-1].geometry.owned is second_owned
+    exported = combined.to_geoseries(index=pd.RangeIndex(3), name="geometry")
+    assert exported.to_wkt().tolist() == [
+        "POINT (0 0)",
+        "POINT (1 1)",
+        "POINT (2 2)",
+    ]
+
+
+def test_ordered_geometry_collection_concat_preserves_row_local_assembly() -> None:
+    from vibespatial.api._native_results import _concat_geometry_result_sequence
+
+    ordered = _ordered_geometry_collection_from_owned_parts_at_capacity(
+        (
+            (from_shapely_geometries([MultiLineString()]), np.asarray([0])),
+            (
+                from_shapely_geometries(
+                    [MultiLineString([[(1, 0), (0, 0)]])],
+                ),
+                np.asarray([0]),
+            ),
+        ),
+        row_count=1,
+        crs=None,
+    )
+    point = GeometryNativeResult.from_owned(
+        from_shapely_geometries([Point(2, 2)]),
+        crs=None,
+    )
+
+    combined = _concat_geometry_result_sequence(
+        [ordered, point],
+        geometry_name="geometry",
+        crs=None,
+    )
+    exported = combined.to_geoseries(index=pd.RangeIndex(2), name="geometry")
+
+    assert exported.iloc[0].geom_type == "GeometryCollection"
+    assert len(exported.iloc[0].geoms) == 2
+    assert exported.iloc[0].geoms[0].is_empty
+    assert exported.iloc[0].geoms[1].geom_type == "MultiLineString"
+    assert exported.iloc[1].equals(Point(2, 2))
+
+
+def test_native_geometry_composition_tabular_take_and_export() -> None:
+    geometry = GeometryNativeResult.from_composition(
+        NativeGeometryComposition(
+            parts=(
+                NativeGeometryCompositionPart(
+                    GeometryNativeResult.from_owned(
+                        from_shapely_geometries(
+                            [box(0, 0, 1, 1), box(2, 0, 3, 1)],
+                        ),
+                        crs=None,
+                    ),
+                    np.asarray([0, 1]),
+                ),
+                NativeGeometryCompositionPart(
+                    GeometryNativeResult.from_owned(
+                        from_shapely_geometries(
+                            [LineString([(0, 0), (1, 0)])],
+                        ),
+                        crs=None,
+                    ),
+                    np.asarray([0]),
+                ),
+            ),
+            row_count=2,
+            crs=None,
+        ),
+        crs=None,
+    )
+    payload = NativeTabularResult(
+        attributes=NativeAttributeTable(
+            dataframe=pd.DataFrame({"value": [10, 20]}, index=[5, 6]),
+        ),
+        geometry=geometry,
+        geometry_name="geometry",
+        column_order=("value", "geometry"),
+    )
+
+    taken = payload.take(np.asarray([1, 0]), preserve_index=True)
+    exported = taken.to_geodataframe()
+
+    assert exported.index.tolist() == [6, 5]
+    assert exported["value"].tolist() == [20, 10]
+    assert exported.geom_type.tolist() == ["Polygon", "GeometryCollection"]
+    assert get_native_state(exported).residency is Residency.HOST
 
 
 def test_native_frame_state_from_native_tabular_result() -> None:
@@ -6419,9 +8653,7 @@ def test_native_geodataframe_repr_records_export_boundary_contract() -> None:
     clear_materialization_events()
     text = repr(frame)
     events = get_materialization_events(clear=True)
-    repr_events = [
-        event for event in events if event.operation == "geodataframe_repr"
-    ]
+    repr_events = [event for event in events if event.operation == "geodataframe_repr"]
 
     assert "POINT" in text
     assert len(repr_events) == 1
@@ -6437,9 +8669,7 @@ def test_native_geodataframe_html_repr_records_export_boundary_contract() -> Non
     clear_materialization_events()
     html = frame._repr_html_()
     events = get_materialization_events(clear=True)
-    html_events = [
-        event for event in events if event.operation == "geodataframe_html_repr"
-    ]
+    html_events = [event for event in events if event.operation == "geodataframe_html_repr"]
 
     assert "geometry" in html
     assert len(html_events) == 1
@@ -6537,9 +8767,7 @@ def test_native_geometry_geodataframe_arrow_export_records_boundary_without_fram
     clear_materialization_events()
     exported = frame.to_arrow()
     events = get_materialization_events(clear=True)
-    export_events = [
-        event for event in events if event.operation == "geodataframe_to_arrow"
-    ]
+    export_events = [event for event in events if event.operation == "geodataframe_to_arrow"]
 
     assert exported is not None
     assert len(export_events) == 1
@@ -6555,9 +8783,7 @@ def test_native_geometry_metric_properties_record_public_series_export_boundary(
     clear_materialization_events()
     area = frame.area
     events = get_materialization_events(clear=True)
-    area_events = [
-        event for event in events if event.operation == "geodataframe_area"
-    ]
+    area_events = [event for event in events if event.operation == "geodataframe_area"]
 
     assert area.tolist() == [6.0]
     assert len(area_events) == 1
@@ -6567,9 +8793,7 @@ def test_native_geometry_metric_properties_record_public_series_export_boundary(
     clear_materialization_events()
     length = series.length
     events = get_materialization_events(clear=True)
-    length_events = [
-        event for event in events if event.operation == "geoseries_length"
-    ]
+    length_events = [event for event in events if event.operation == "geoseries_length"]
 
     assert length.tolist() == [10.0]
     assert len(length_events) == 1
@@ -6585,9 +8809,7 @@ def test_native_geometry_bounds_properties_record_public_export_boundaries() -> 
     clear_materialization_events()
     bounds = frame.bounds
     events = get_materialization_events(clear=True)
-    bounds_events = [
-        event for event in events if event.operation == "geodataframe_bounds"
-    ]
+    bounds_events = [event for event in events if event.operation == "geodataframe_bounds"]
 
     assert bounds.iloc[0].tolist() == [1.0, 2.0, 3.0, 5.0]
     assert len(bounds_events) == 1
@@ -6597,9 +8819,7 @@ def test_native_geometry_bounds_properties_record_public_export_boundaries() -> 
     clear_materialization_events()
     total_bounds = series.total_bounds
     events = get_materialization_events(clear=True)
-    total_bounds_events = [
-        event for event in events if event.operation == "geoseries_total_bounds"
-    ]
+    total_bounds_events = [event for event in events if event.operation == "geoseries_total_bounds"]
 
     assert total_bounds.tolist() == [1.0, 2.0, 3.0, 5.0]
     assert len(total_bounds_events) == 1
@@ -6650,9 +8870,7 @@ def test_native_geometry_binary_predicate_records_public_series_export_boundary(
     clear_materialization_events()
     result = series.intersects(series)
     events = get_materialization_events(clear=True)
-    predicate_events = [
-        event for event in events if event.operation == "geoseries_intersects"
-    ]
+    predicate_events = [event for event in events if event.operation == "geoseries_intersects"]
     if has_gpu_runtime():
         d2h_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
         assert "geometry analysis mixed row-bounds host export" not in d2h_reasons
@@ -6740,9 +8958,7 @@ def test_native_tabular_arrow_export_records_boundary_contract() -> None:
 
     result.to_arrow()
     events = get_materialization_events(clear=True)
-    arrow_events = [
-        event for event in events if event.operation == "native_tabular_to_arrow"
-    ]
+    arrow_events = [event for event in events if event.operation == "native_tabular_to_arrow"]
 
     assert len(arrow_events) == 1
     assert "native_export_target=arrow" in arrow_events[0].detail
@@ -6756,9 +8972,7 @@ def test_owned_geometry_shapely_export_records_boundary_contract() -> None:
 
     got = owned.to_shapely()
     events = get_materialization_events(clear=True)
-    shapely_events = [
-        event for event in events if event.operation == "owned_geometry_to_shapely"
-    ]
+    shapely_events = [event for event in events if event.operation == "owned_geometry_to_shapely"]
 
     assert len(got) == 2
     assert len(shapely_events) == 1
@@ -6983,6 +9197,7 @@ def test_geodataframe_deep_copy_preserves_valid_private_native_state() -> None:
     copied = gdf.copy(deep=True)
 
     assert copied is not gdf
+    assert copied.dtypes.equals(gdf.dtypes)
     assert get_native_state(copied) is state
 
     copied["new_value"] = [3, 4]
@@ -7070,7 +9285,9 @@ def test_geodataframe_projection_preserves_projected_private_native_state() -> N
     assert "value" not in table.column_names
 
 
-def test_geodataframe_device_attribute_projection_preserves_private_native_state_without_runtime_d2h() -> None:
+def test_geodataframe_device_attribute_projection_preserves_private_native_state_without_runtime_d2h() -> (
+    None
+):
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device attribute projection")
     cp = pytest.importorskip("cupy")
@@ -7119,9 +9336,7 @@ def test_geodataframe_boolean_filter_preserves_range_index_private_native_state(
     assert filtered.index.tolist() == [1]
     assert filtered_state is not None
     assert filtered_state.row_count == 1
-    assert filtered_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [2]
+    assert filtered_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [2]
     assert get_materialization_events(clear=True) == []
 
 
@@ -7135,6 +9350,44 @@ def test_geodataframe_all_true_boolean_filter_reuses_private_native_state() -> N
     assert filtered.index.equals(gdf.index)
     assert filtered_state is state
     assert get_materialization_events(clear=True) == []
+
+
+def test_geodataframe_boolean_filter_without_sidecar_uses_native_before_pandas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gdf = GeoDataFrame(
+        {
+            "value": [1, 2, 3],
+            "geometry": GeoSeries.from_wkt(
+                ["POINT (0 0)", "POINT (1 1)", "POINT (2 2)"],
+                name="geometry",
+            ),
+        }
+    )
+    _attach_owned_native_tabular_state(gdf, attribute_storage="arrow")
+    mask = pd.Series([True, False, True], index=gdf.index)
+    clear_materialization_events()
+
+    original_getitem = pd.DataFrame.__getitem__
+
+    def _fail_pandas_boolean_filter(self, key):
+        if isinstance(key, pd.Series) and pd.api.types.is_bool_dtype(key.dtype):
+            raise AssertionError("native boolean filter should run before pandas")
+        return original_getitem(self, key)
+
+    monkeypatch.setattr(pd.DataFrame, "__getitem__", _fail_pandas_boolean_filter)
+
+    filtered = gdf[mask]
+    filtered_state = get_native_state(filtered)
+
+    assert filtered.index.tolist() == [0, 2]
+    assert filtered["value"].tolist() == [1, 3]
+    assert filtered_state is not None
+    assert filtered_state.row_count == 2
+    assert filtered_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        1,
+        3,
+    ]
 
 
 def test_geodataframe_boolean_filter_unique_index_preserves_private_native_state() -> None:
@@ -7155,9 +9408,7 @@ def test_geodataframe_boolean_filter_unique_index_preserves_private_native_state
 
     assert filtered.index.tolist() == ["a"]
     assert filtered_state is not None
-    assert filtered_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1]
+    assert filtered_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [1]
 
 
 def test_native_frame_state_take_validates_rowset_source() -> None:
@@ -7204,6 +9455,80 @@ def test_native_attribute_take_respects_preserve_index_for_host_storage() -> Non
     assert arrow_rebased.index.equals(pd.RangeIndex(2))
     assert pandas_rebased.to_pandas()["value"].tolist() == [30, 10]
     assert arrow_rebased.to_pandas()["value"].tolist() == [30, 10]
+
+
+def test_native_attribute_take_keeps_device_storage_for_host_positions() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device attribute host-position take")
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    source_index = pd.Index(["a", "b", "c"], name="source")
+    arrow = pa.table({"value": pa.array([10, 20, 30], type=pa.int64())})
+    attributes = NativeAttributeTable(
+        device_table=plc.Table.from_arrow(arrow),
+        index_override=source_index,
+        column_override=tuple(arrow.column_names),
+        schema_override=arrow.schema,
+    )
+    row_positions = np.asarray([2, 0], dtype=np.int64)
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        taken = attributes.take(row_positions, preserve_index=True)
+        arrays = taken.numeric_column_arrays(("value",))
+
+    assert taken.index.tolist() == ["c", "a"]
+    assert taken.device_table is not None
+    assert arrays is not None
+    assert cp.asnumpy(arrays["value"]).tolist() == [30, 10]
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_native_attribute_host_take_composes_device_row_view() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for nested device attribute take")
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    arrow = pa.table(
+        {"value": pa.array([10, 20, 30, 40, 50, 60], type=pa.int64())}
+    )
+    attributes = NativeAttributeTable(
+        device_table=plc.Table.from_arrow(arrow),
+        index_override=pd.RangeIndex(6),
+        column_override=tuple(arrow.column_names),
+        schema_override=arrow.schema,
+    )
+    row_view = attributes.take(
+        cp.asarray([5, 1, 4, 2], dtype=cp.int64),
+        preserve_index=False,
+    )
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        taken = row_view.take(
+            np.asarray([2, 0], dtype=np.int64),
+            preserve_index=True,
+        )
+        arrays = taken.numeric_column_arrays(("value",))
+
+    assert taken.device_table is not None
+    assert arrays is not None
+    assert cp.asnumpy(arrays["value"]).tolist() == [50, 60]
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
 
 
 def test_geodataframe_private_native_rowset_selector_preserves_taken_state() -> None:
@@ -7276,8 +9601,7 @@ def test_geodataframe_explode_lineal_preserves_private_native_state() -> None:
     assert exploded_state.attributes.device_table is not None
     assert isinstance(exploded_state.provenance, NativeGeometryProvenance)
     assert cp.asnumpy(exploded_state.provenance.source_rows).tolist() == [0, 1, 1]
-    assert 1 <= len(producer_events) <= 6
-    assert sum(event.bytes_transferred for event in producer_events) <= 64
+    assert producer_events == []
 
     reset_d2h_transfer_count()
     clear_materialization_events()
@@ -7354,8 +9678,7 @@ def test_geodataframe_explode_point_preserves_private_native_state() -> None:
     assert exploded_state.attributes.device_table is not None
     assert isinstance(exploded_state.provenance, NativeGeometryProvenance)
     assert cp.asnumpy(exploded_state.provenance.source_rows).tolist() == [0, 1, 1]
-    assert 1 <= len(producer_events) <= 6
-    assert sum(event.bytes_transferred for event in producer_events) <= 64
+    assert producer_events == []
 
     reset_d2h_transfer_count()
     clear_materialization_events()
@@ -7439,8 +9762,7 @@ def test_geodataframe_explode_mixed_family_preserves_private_native_state() -> N
         FAMILY_TAGS[GeometryFamily.LINESTRING],
         FAMILY_TAGS[GeometryFamily.POLYGON],
     ]
-    assert 1 <= len(producer_events) <= 12
-    assert sum(event.bytes_transferred for event in producer_events) <= 128
+    assert producer_events == []
 
     reset_d2h_transfer_count()
     clear_materialization_events()
@@ -7549,8 +9871,13 @@ def test_geodataframe_private_area_expression_feeds_native_row_filter() -> None:
     gdf = GeoDataFrame(
         {
             "value": [1, 2, 3],
-            "geometry": GeoSeries(geometries, name="geometry"),
-        }
+            "geometry": GeoSeries(
+                geometries,
+                index=pd.Index(["a", "b", "c"], name="parcel"),
+                name="geometry",
+            ),
+        },
+        index=pd.Index(["a", "b", "c"], name="parcel"),
     )
     owned = from_shapely_geometries(geometries).move_to(
         Residency.DEVICE,
@@ -7562,6 +9889,7 @@ def test_geodataframe_private_area_expression_feeds_native_row_filter() -> None:
         NativeTabularResult(
             attributes=NativeAttributeTable(
                 device_table=plc.Table.from_arrow(attribute_arrow),
+                index_override=gdf.index,
                 column_override=tuple(attribute_arrow.column_names),
                 schema_override=attribute_arrow.schema,
             ),
@@ -7586,6 +9914,436 @@ def test_geodataframe_private_area_expression_feeds_native_row_filter() -> None:
     assert taken_state.attributes.device_table is not None
     assert get_materialization_events(clear=True) == []
     reset_d2h_transfer_count()
+
+
+def test_public_geom_type_isin_mask_feeds_native_boolean_filter(monkeypatch) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native geom_type mask rowset")
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+    from vibespatial.api.geo_base import _native_boolean_rowset_from_public_mask
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    geometries = [
+        box(0, 0, 1, 1),
+        Point(2, 2),
+        box(0, 0, 3, 3),
+    ]
+    index = pd.Index(["a", "b", "c"], name="parcel")
+    gdf = GeoDataFrame(
+        {
+            "value": [1, 2, 3],
+            "geometry": GeoSeries(geometries, index=index, name="geometry"),
+        },
+        index=index,
+    )
+    owned = from_shapely_geometries(geometries).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test public geom_type native rowset",
+    )
+    attribute_arrow = pa.table({"value": pa.array([1, 2, 3], type=pa.int64())})
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(
+                device_table=plc.Table.from_arrow(attribute_arrow),
+                index_override=gdf.index,
+                column_override=tuple(attribute_arrow.column_names),
+                schema_override=attribute_arrow.schema,
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("value", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+
+    geometry = gdf.geometry
+    assert get_native_state(geometry) is not None
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+    with assert_zero_d2h_transfers():
+        mask = geometry.geom_type.isin({"Polygon", "MultiPolygon"})
+    assert get_materialization_events(clear=True) == []
+    rowset = _native_boolean_rowset_from_public_mask(mask, state)
+    assert rowset is not None
+    assert rowset.is_device
+    assert cp.asnumpy(rowset.positions).tolist() == [0, 2]
+    assert rowset.geometry_family_domain == (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON)
+    assert rowset.trusted_all_valid_rows is True
+
+    clear_materialization_events()
+    counts = geometry.geom_type.value_counts()
+    assert counts.to_dict() == {"Polygon": 2, "Point": 1}
+    materialization_operations = {
+        event.operation for event in get_materialization_events(clear=True)
+    }
+    assert "geoseries_geom_type" in materialization_operations
+
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+    all_mask = geometry.geom_type.isin({"Point", "Polygon", "MultiPolygon"})
+    assert all_mask.all()
+    reduction_events = get_materialization_events(clear=True)
+    assert reduction_events == []
+
+    clear_materialization_events()
+    all_filtered = gdf[all_mask]
+    assert all_filtered.index.tolist() == ["a", "b", "c"]
+    assert get_native_state(all_filtered) is not None
+    assert get_materialization_events(clear=True) == []
+
+    clear_materialization_events()
+
+    original_getitem = pd.DataFrame.__getitem__
+
+    def _fail_pandas_boolean_filter(self, key):
+        if isinstance(key, pd.Series) and (
+            pd.api.types.is_bool_dtype(key.dtype)
+            or getattr(key.dtype, "name", None) == "vibespatial_bool"
+        ):
+            raise AssertionError("native boolean filter should run before pandas")
+        return original_getitem(self, key)
+
+    monkeypatch.setattr(pd.DataFrame, "__getitem__", _fail_pandas_boolean_filter)
+    filtered = gdf[mask]
+    filtered_state = get_native_state(filtered)
+    materialization_operations = {
+        event.operation for event in get_materialization_events(clear=True)
+    }
+
+    assert filtered.index.tolist() == ["a", "c"]
+    assert filtered["value"].tolist() == [1, 3]
+    assert filtered_state is not None
+    assert filtered_state.row_count == 2
+    assert filtered_state.attributes.device_table is not None
+    assert filtered_state.geometry.owned.device_state.trusted_all_valid is True
+    assert filtered_state.geometry.owned.device_state.trusted_polygonal_only is True
+    assert "row_positions_to_host" not in materialization_operations
+    assert "geoseries_geom_type_isin" not in materialization_operations
+    assert filtered.geometry.geom_type.tolist() == ["Polygon", "Polygon"]
+
+
+def test_public_geom_type_isin_filter_preserves_loader_attributes_until_access(
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native geom_type mask rowset")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    geometries = [
+        box(0, 0, 1, 1),
+        Point(2, 2),
+        box(0, 0, 3, 3),
+    ]
+    source = GeoDataFrame(
+        {
+            "value": [10, 20, 30],
+            "geometry": GeoSeries(geometries, name="geometry"),
+        },
+    )
+    owned = from_shapely_geometries(geometries).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test public geom_type loader-backed rowset",
+    )
+    calls = 0
+
+    def _load() -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        return pd.DataFrame({"value": [10, 20, 30]}, index=pd.RangeIndex(3))
+
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable.from_loader(
+                _load,
+                index_override=source.index,
+                columns=("value",),
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("value", "geometry"),
+        )
+    )
+    attach_native_state(source, state)
+
+    original_getitem = pd.DataFrame.__getitem__
+
+    def _fail_pandas_boolean_filter(self, key):
+        if isinstance(key, pd.Series) and (
+            pd.api.types.is_bool_dtype(key.dtype)
+            or getattr(key.dtype, "name", None) == "vibespatial_bool"
+        ):
+            raise AssertionError("native boolean filter should run before pandas")
+        return original_getitem(self, key)
+
+    monkeypatch.setattr(pd.DataFrame, "__getitem__", _fail_pandas_boolean_filter)
+
+    mask = source.geometry.geom_type.isin({"Polygon", "MultiPolygon"})
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+    with assert_zero_d2h_transfers():
+        filtered = source[mask].copy()
+
+    filtered_state = get_native_state(filtered)
+    assert filtered_state is not None
+    assert filtered_state.row_count == 2
+    assert filtered_state.attributes.loader is not None
+    assert calls == 0
+    assert cp.asnumpy(filtered_state.index_plan.device_labels).tolist() == [0, 2]
+    assert get_materialization_events(clear=True) == []
+    assert get_d2h_transfer_events(clear=True) == []
+
+    assert filtered["value"].tolist() == [10, 30]
+    assert calls == 1
+
+
+def test_public_geom_type_isin_filter_uses_rowset_for_host_label_take_index(
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native geom_type mask rowset")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.api._native_public_arrays import native_public_index_from_plan
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    geometries = [
+        box(0, 0, 1, 1),
+        Point(2, 2),
+        box(0, 0, 3, 3),
+    ]
+    base_index = pd.Index(["a", "b", "c"], name="parcel")
+    index_plan = NativeIndexPlan.from_index(base_index).take(
+        cp.asarray([0, 2, 1], dtype=cp.int64),
+        preserve_index=True,
+        unique=True,
+    )
+    public_index = native_public_index_from_plan(index_plan)
+    source = GeoDataFrame(
+        {
+            "value": [10, 30, 20],
+            "geometry": GeoSeries(geometries, index=public_index, name="geometry"),
+        },
+        index=public_index,
+    )
+    owned = from_shapely_geometries(geometries).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test public geom_type host-label-take rowset",
+    )
+    calls = 0
+
+    def _load() -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        return pd.DataFrame({"value": [10, 30, 20]}, index=public_index)
+
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable.from_loader(
+                _load,
+                index_override=public_index,
+                columns=("value",),
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("value", "geometry"),
+            index_plan=index_plan,
+        )
+    )
+    attach_native_state(source, state)
+
+    original_getitem = pd.DataFrame.__getitem__
+
+    def _fail_pandas_boolean_filter(self, key):
+        if isinstance(key, pd.Series) and (
+            pd.api.types.is_bool_dtype(key.dtype)
+            or getattr(key.dtype, "name", None) == "vibespatial_bool"
+        ):
+            raise AssertionError("native boolean filter should run before pandas")
+        return original_getitem(self, key)
+
+    monkeypatch.setattr(pd.DataFrame, "__getitem__", _fail_pandas_boolean_filter)
+
+    mask = source.geometry.geom_type.isin({"Polygon", "MultiPolygon"})
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+    with assert_zero_d2h_transfers():
+        filtered = source[mask].copy()
+
+    filtered_state = get_native_state(filtered)
+    assert filtered_state is not None
+    assert filtered_state.row_count == 2
+    assert filtered_state.attributes.loader is not None
+    assert calls == 0
+    assert cp.asnumpy(filtered_state.index_plan.take_positions).tolist() == [0, 1]
+    assert get_materialization_events(clear=True) == []
+    assert get_d2h_transfer_events(clear=True) == []
+
+    assert filtered.index.tolist() == ["a", "b"]
+    assert filtered["value"].tolist() == [10, 20]
+    assert calls == 1
+
+
+def test_public_geom_type_identity_filter_reuses_public_columns_and_device_state() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native geom_type identity rowset")
+    pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    geometries = [box(0, 0, 1, 1), box(1, 1, 2, 2), box(2, 2, 3, 3)]
+    owned = from_shapely_geometries(geometries).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test public geom_type identity rowset",
+    )
+    index = pd.Index(["a", "b", "c"], name="parcel")
+    source = GeoDataFrame(
+        {
+            "value": [10, 20, 30],
+            "region": pd.array(["north", "south", "east"], dtype="string"),
+            "geometry": GeoSeries(
+                DeviceGeometryArray._from_owned(owned),
+                index=index,
+                name="geometry",
+            ),
+        },
+        index=index,
+    )
+    attribute_arrow = pa.table(
+        {
+            "value": pa.array([10, 20, 30], type=pa.int64()),
+            "region": pa.array(["north", "south", "east"], type=pa.string()),
+        }
+    )
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(
+                device_table=plc.Table.from_arrow(attribute_arrow),
+                index_override=source.index,
+                column_override=tuple(attribute_arrow.column_names),
+                schema_override=attribute_arrow.schema,
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("value", "region", "geometry"),
+        )
+    )
+    attach_native_state(source, state)
+    mask = source.geometry.geom_type.isin({"Polygon", "MultiPolygon"})
+
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+    with assert_zero_d2h_transfers():
+        filtered = source[mask].copy()
+    events = get_materialization_events(clear=True)
+    filtered_state = get_native_state(filtered)
+
+    assert filtered_state is not None
+    assert filtered_state.row_count == 3
+    assert filtered_state.attributes.device_table is not None
+    assert filtered["value"].tolist() == [10, 20, 30]
+    assert filtered["region"].tolist() == ["north", "south", "east"]
+    assert events == []
+    assert get_d2h_transfer_events(clear=True) == []
+
+
+def test_public_dwithin_scalar_mask_feeds_native_boolean_filter(monkeypatch) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native dwithin mask rowset")
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+    from vibespatial.api.geo_base import _native_boolean_rowset_from_public_mask
+
+    geometries = [Point(0, 0), Point(1, 1), Point(5, 5)]
+    index = pd.Index(["a", "b", "c"], name="building")
+    owned = from_shapely_geometries(geometries).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test public dwithin native rowset",
+    )
+    gdf = GeoDataFrame(
+        {
+            "value": [1, 2, 3],
+            "geometry": GeoSeries(
+                DeviceGeometryArray._from_owned(owned),
+                index=index,
+                name="geometry",
+            ),
+        },
+        index=index,
+    )
+    attribute_arrow = pa.table({"value": pa.array([1, 2, 3], type=pa.int64())})
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(
+                device_table=plc.Table.from_arrow(attribute_arrow),
+                index_override=gdf.index,
+                column_override=tuple(attribute_arrow.column_names),
+                schema_override=attribute_arrow.schema,
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("value", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+
+    clear_dispatch_events()
+    mask = gdf.geometry.dwithin(Point(0, 0), distance=1.5)
+    rowset = _native_boolean_rowset_from_public_mask(mask, state)
+    dispatch_events = get_dispatch_events(clear=True)
+
+    assert mask.tolist() == [True, True, False]
+    assert rowset is not None
+    assert rowset.is_device
+    assert cp.asnumpy(rowset.positions).tolist() == [0, 1]
+    assert any(
+        event.surface == "DeviceGeometryArray._dwithin_scalar"
+        and event.implementation == "dwithin_scalar_gpu"
+        for event in dispatch_events
+    )
+
+    clear_materialization_events()
+    original_getitem = pd.DataFrame.__getitem__
+
+    def _fail_pandas_boolean_filter(self, key):
+        if isinstance(key, pd.Series) and pd.api.types.is_bool_dtype(key.dtype):
+            raise AssertionError("native dwithin filter should run before pandas")
+        return original_getitem(self, key)
+
+    monkeypatch.setattr(pd.DataFrame, "__getitem__", _fail_pandas_boolean_filter)
+    filtered = gdf[mask]
+    filtered_state = get_native_state(filtered)
+    materialization_operations = {
+        event.operation for event in get_materialization_events(clear=True)
+    }
+
+    assert filtered.index.tolist() == ["a", "b"]
+    assert filtered["value"].tolist() == [1, 2]
+    assert filtered_state is not None
+    assert filtered_state.row_count == 2
+    assert filtered_state.attributes.device_table is not None
+    assert "row_positions_to_host" not in materialization_operations
 
 
 def test_geodataframe_assign_native_expression_column_feeds_known_consumers() -> None:
@@ -7634,19 +10392,23 @@ def test_geodataframe_assign_native_expression_column_feeds_known_consumers() ->
     d2h_events = get_d2h_transfer_events(clear=True)
     assigned_state = get_native_state(assigned)
 
-    assert assigned["area"].tolist() == [1.0, 9.0, 25.0]
-    assert any(
-        event.boundary is MaterializationBoundary.USER_EXPORT
-        and event.operation == "native_expression_to_public_column"
-        for event in events
-    )
-    assert any(
-        event.reason.endswith("::native_expression_to_public_column")
-        for event in d2h_events
-    )
+    assert events == []
+    assert d2h_events == []
     assert assigned_state is not None
     assert assigned_state.column_order == ("value", "geometry", "area")
     assert assigned_state.attributes.device_table is not None
+
+    assert assigned["area"].tolist() == [1.0, 9.0, 25.0]
+    export_events = get_materialization_events(clear=True)
+    export_d2h_events = get_d2h_transfer_events(clear=True)
+    assert any(
+        event.boundary is MaterializationBoundary.USER_EXPORT
+        and event.operation == "native_expression_to_public_column"
+        for event in export_events
+    )
+    assert any(
+        event.reason.endswith("::native_expression_to_public_column") for event in export_d2h_events
+    )
 
     reset_d2h_transfer_count()
     clear_materialization_events()
@@ -7663,6 +10425,438 @@ def test_geodataframe_assign_native_expression_column_feeds_known_consumers() ->
     assert filtered_state.attributes.device_table is not None
     assert get_materialization_events(clear=True) == []
     reset_d2h_transfer_count()
+
+
+def test_geodataframe_assign_native_expression_series_without_frame_state() -> None:
+    from vibespatial.api._native_expression import NativeExpression
+    from vibespatial.api._native_public_arrays import NativeNumericExpressionArray
+
+    gdf = GeoDataFrame(
+        {"geometry": GeoSeries([Point(0, 0), Point(1, 1)], name="geometry")},
+        index=pd.Index(["a", "b"]),
+    )
+    values = pd.Series(
+        NativeNumericExpressionArray(
+            NativeExpression(
+                operation="test.detached_assignment",
+                values=np.asarray([2, 1], dtype=np.int32),
+                source_token="detached-source",
+                source_row_count=2,
+                dtype="int32",
+                precision="source",
+            )
+        ),
+        index=pd.Index(["b", "a"]),
+    )
+
+    gdf["code"] = values
+
+    assert gdf["code"].tolist() == [1, 2]
+    assert gdf["code"].dtype == np.dtype("int32")
+
+
+def test_public_area_assignment_promotes_arrow_attributes_to_device() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for public area native sidecar assignment")
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    from vibespatial.api.geo_base import _native_expression_from_public_series
+
+    geometries = [box(0, 0, 1, 1), box(0, 0, 3, 3), box(0, 0, 5, 5)]
+    gdf = GeoDataFrame(
+        {
+            "value": [1, 2, 3],
+            "geometry": GeoSeries(geometries, name="geometry"),
+        }
+    )
+    owned = from_shapely_geometries(geometries).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test public area assignment sidecar",
+    )
+    attribute_arrow = pa.table({"value": pa.array([1, 2, 3], type=pa.int64())})
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(arrow_table=attribute_arrow),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("value", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+
+    area = gdf.geometry.area
+    area_expression = _native_expression_from_public_series(area)
+    assert area.tolist() == [1.0, 9.0, 25.0]
+    assert area_expression is not None
+    assert area_expression.is_device
+
+    gdf["area"] = area
+    assigned_state = get_native_state(gdf)
+    assert assigned_state is not None
+    assert assigned_state.column_order == ("value", "geometry", "area")
+    assert assigned_state.attributes.device_table is not None
+
+    area_column = gdf._native_attribute_expression("area")
+    assert area_column is not None
+    assert area_column.is_device
+    assert cp.asnumpy(area_column.values).tolist() == [1.0, 9.0, 25.0]
+
+
+def test_public_area_setitem_series_sidecar_does_not_rematerialize_expression() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for public area native sidecar assignment")
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    from vibespatial.api.geo_base import _native_expression_from_public_series
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+
+    geometries = [box(0, 0, 1, 1), box(0, 0, 3, 3), box(0, 0, 5, 5)]
+    gdf = GeoDataFrame(
+        {
+            "value": [1, 2, 3],
+            "geometry": GeoSeries(geometries, name="geometry"),
+        }
+    )
+    owned = from_shapely_geometries(geometries).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test public area sidecar setitem no rematerialize",
+    )
+    attribute_arrow = pa.table({"value": pa.array([1, 2, 3], type=pa.int64())})
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(arrow_table=attribute_arrow),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("value", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+
+    area = gdf.geometry.area
+    assert _native_expression_from_public_series(area) is not None
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+    gdf["area"] = area
+    d2h_reasons = {event.reason for event in get_d2h_transfer_events(clear=True)}
+    materialization_operations = {
+        event.operation for event in get_materialization_events(clear=True)
+    }
+
+    assigned_state = get_native_state(gdf)
+    area_column = gdf._native_attribute_expression("area")
+    assert assigned_state is not None
+    assert assigned_state.column_order == ("value", "geometry", "area")
+    assert assigned_state.attributes.device_table is not None
+    assert area_column is not None
+    assert area_column.is_device
+    assert cp.asnumpy(area_column.values).tolist() == [1.0, 9.0, 25.0]
+    assert "native_expression_to_public_column" not in materialization_operations
+    assert not any(
+        reason.endswith("::native_expression_to_public_column") for reason in d2h_reasons
+    )
+
+
+def test_public_area_series_stays_lazy_until_public_values() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for public area native sidecar")
+    pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    from vibespatial.api.geo_base import _native_expression_from_public_series
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    geometries = [box(0, 0, 1, 1), box(0, 0, 3, 3), box(0, 0, 5, 5)]
+    gdf = GeoDataFrame(
+        {
+            "value": [1, 2, 3],
+            "geometry": GeoSeries(geometries, name="geometry"),
+        }
+    )
+    owned = from_shapely_geometries(geometries).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test public area lazy sidecar",
+    )
+    attribute_arrow = pa.table({"value": pa.array([1, 2, 3], type=pa.int64())})
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(arrow_table=attribute_arrow),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("value", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+    area = gdf.geometry.area
+    assert _native_expression_from_public_series(area) is not None
+    assert get_materialization_events(clear=True) == []
+    assert get_d2h_transfer_events(clear=True) == []
+
+    assert area.tolist() == [1.0, 9.0, 25.0]
+    materialization_operations = [
+        event.operation for event in get_materialization_events(clear=True)
+    ]
+    d2h_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    assert materialization_operations == ["geoseries_area"]
+    assert d2h_reasons == [
+        "vibespatial.api.GeoSeries.area::geoseries_area",
+    ]
+
+
+def test_public_area_series_arithmetic_filter_preserves_device_rowflow() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for public area native sidecar arithmetic")
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+    from vibespatial.api.geo_base import (
+        _native_boolean_rowset_from_public_mask,
+        _native_expression_from_public_series,
+    )
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    geometries = [box(0, 0, 1, 1), box(0, 0, 3, 3), box(0, 0, 5, 5)]
+    gdf = GeoDataFrame(
+        {
+            "parcel_area": [1.0, 3.0, 5.0],
+            "geometry": GeoSeries(geometries, name="geometry"),
+        }
+    )
+    owned = from_shapely_geometries(geometries).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test public area arithmetic sidecar",
+    )
+    attribute_arrow = pa.table({"parcel_area": pa.array([1.0, 3.0, 5.0], type=pa.float64())})
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(
+                device_table=plc.Table.from_arrow(attribute_arrow),
+                column_override=tuple(attribute_arrow.column_names),
+                schema_override=attribute_arrow.schema,
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("parcel_area", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+    with assert_zero_d2h_transfers():
+        area = gdf.geometry.area
+        ratio = area / gdf["parcel_area"]
+        ratio_expression = _native_expression_from_public_series(ratio)
+        assert ratio_expression is not None
+        assert ratio_expression.is_device
+        gdf["area_ratio"] = ratio
+        assigned_state = get_native_state(gdf)
+        assert assigned_state is not None
+        mask = gdf["area_ratio"] >= 3.0
+        rowset = _native_boolean_rowset_from_public_mask(mask, assigned_state)
+        filtered = gdf[mask]
+
+    filtered_state = get_native_state(filtered)
+    ratio_column = gdf._native_attribute_expression("area_ratio")
+
+    assert cp.asnumpy(ratio_expression.values).tolist() == [1.0, 3.0, 5.0]
+    assert ratio_column is not None
+    assert ratio_column.is_device
+    assert rowset is not None
+    assert rowset.is_device
+    assert cp.asnumpy(rowset.positions).tolist() == [1, 2]
+    assert filtered_state is not None
+    assert filtered_state.row_count == 2
+    assert filtered_state.attributes.device_table is not None
+    assert get_materialization_events(clear=True) == []
+
+    assert filtered["area_ratio"].tolist() == [3.0, 5.0]
+    export_operations = [event.operation for event in get_materialization_events(clear=True)]
+    assert export_operations == ["native_attribute_column_to_public_series"]
+    reset_d2h_transfer_count()
+
+
+def test_geodataframe_copy_preserves_lazy_native_columns_without_d2h() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native lazy copy")
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    import pylibcudf as plc
+
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    geometries = [box(0, 0, 1, 1), box(0, 0, 3, 3), box(0, 0, 5, 5)]
+    gdf = GeoDataFrame(
+        {
+            "parcel_area": [1.0, 3.0, 5.0],
+            "geometry": GeoSeries(geometries, name="geometry"),
+        }
+    )
+    owned = from_shapely_geometries(geometries).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test native lazy copy",
+    )
+    attribute_arrow = pa.table({"parcel_area": pa.array([1.0, 3.0, 5.0], type=pa.float64())})
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(
+                device_table=plc.Table.from_arrow(attribute_arrow),
+                column_override=tuple(attribute_arrow.column_names),
+                schema_override=attribute_arrow.schema,
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("parcel_area", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+    area = gdf.geometry.area
+    gdf["area_ratio"] = area / gdf["parcel_area"]
+    filtered = gdf[gdf["area_ratio"] >= 3.0]
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        copied = filtered.copy()
+        copied_state = get_native_state(copied)
+        area_ratio = copied_state.attributes.numeric_column_arrays(("area_ratio",))
+
+    assert copied_state is not None
+    assert copied_state.index_plan.kind == "device-labels"
+    assert copied_state.geometry.owned is not None
+    assert copied_state.geometry.owned.residency is Residency.DEVICE
+    assert area_ratio is not None
+    assert cp.asnumpy(area_ratio["area_ratio"]).tolist() == [3.0, 5.0]
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_geodataframe_column_projection_preserves_lazy_native_columns_without_d2h() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native lazy projection")
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    import pylibcudf as plc
+
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    geometries = [box(0, 0, 1, 1), box(0, 0, 3, 3), box(0, 0, 5, 5)]
+    gdf = GeoDataFrame(
+        {
+            "parcel_id": [10, 20, 30],
+            "geometry": GeoSeries(geometries, name="geometry"),
+        }
+    )
+    owned = from_shapely_geometries(geometries).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test native lazy projection",
+    )
+    attribute_arrow = pa.table({"parcel_id": pa.array([10, 20, 30], type=pa.int64())})
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(
+                device_table=plc.Table.from_arrow(attribute_arrow),
+                column_override=tuple(attribute_arrow.column_names),
+                schema_override=attribute_arrow.schema,
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("parcel_id", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+    gdf["parcel_area"] = gdf.geometry.area
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        projected = gdf[["parcel_id", "parcel_area", "geometry"]]
+        projected_state = get_native_state(projected)
+        parcel_values = projected_state.attributes.numeric_column_arrays(("parcel_id",))
+        area_values = projected_state.attributes.numeric_column_arrays(("parcel_area",))
+
+    assert projected_state is not None
+    assert projected_state.column_order == ("parcel_id", "parcel_area", "geometry")
+    assert projected_state.geometry.owned is not None
+    assert projected_state.geometry.owned.residency is Residency.DEVICE
+    assert parcel_values is not None
+    assert area_values is not None
+    assert cp.asnumpy(parcel_values["parcel_id"]).tolist() == [10, 20, 30]
+    assert cp.asnumpy(area_values["parcel_area"]).tolist() == [1.0, 9.0, 25.0]
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_native_backed_public_area_reuses_single_expression(monkeypatch) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for public area native expression export")
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    from vibespatial.api.geo_base import _native_expression_from_public_series
+    from vibespatial.constructive import measurement as measurement_module
+
+    geometries = [box(0, 0, 1, 1), box(0, 0, 3, 3), box(0, 0, 5, 5)]
+    gdf = GeoDataFrame(
+        {
+            "value": [1, 2, 3],
+            "geometry": GeoSeries(geometries, name="geometry"),
+        }
+    )
+    owned = from_shapely_geometries(geometries).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test public area expression reuse",
+    )
+    attribute_arrow = pa.table({"value": pa.array([1, 2, 3], type=pa.int64())})
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(arrow_table=attribute_arrow),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("value", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+
+    calls = {"device_area": 0}
+    real_device_area = measurement_module._area_gpu_device_fp64
+
+    def _count_device_area(*args, **kwargs):
+        calls["device_area"] += 1
+        return real_device_area(*args, **kwargs)
+
+    def _fail_public_area_owned(*args, **kwargs):  # pragma: no cover - failure path
+        raise AssertionError("native-backed public area should reuse NativeExpression")
+
+    monkeypatch.setattr(measurement_module, "_area_gpu_device_fp64", _count_device_area)
+    monkeypatch.setattr(measurement_module, "area_owned", _fail_public_area_owned)
+
+    area = gdf.geometry.area
+    area_expression = _native_expression_from_public_series(area)
+
+    assert area.tolist() == [1.0, 9.0, 25.0]
+    assert area_expression is not None
+    assert area_expression.is_device
+    assert cp.asnumpy(area_expression.values).tolist() == [1.0, 9.0, 25.0]
+    assert calls["device_area"] == 1
 
 
 def test_geodataframe_setitem_native_expression_column_preserves_state() -> None:
@@ -7711,6 +10905,89 @@ def test_geodataframe_setitem_native_expression_column_preserves_state() -> None
     assert cp.asnumpy(perimeter_column.values).tolist() == [4.0, 8.0]
 
 
+def test_geodataframe_native_series_arithmetic_filter_preserves_device_rowflow() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native expression public Series arithmetic")
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+    from vibespatial.api.geo_base import (
+        _native_boolean_rowset_from_public_mask,
+        _native_expression_from_public_series,
+    )
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    geometries = [box(0, 0, 1, 1), box(0, 0, 2, 2), box(0, 0, 3, 3)]
+    gdf = GeoDataFrame(
+        {
+            "wet_area": [0.2, 2.0, 6.0],
+            "parcel_area": [1.0, 4.0, 6.0],
+            "geometry": GeoSeries(geometries, name="geometry"),
+        }
+    )
+    owned = from_shapely_geometries(geometries).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test native expression public arithmetic",
+    )
+    attribute_arrow = pa.table(
+        {
+            "wet_area": pa.array([0.2, 2.0, 6.0], type=pa.float64()),
+            "parcel_area": pa.array([1.0, 4.0, 6.0], type=pa.float64()),
+        }
+    )
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(
+                device_table=plc.Table.from_arrow(attribute_arrow),
+                column_override=tuple(attribute_arrow.column_names),
+                schema_override=attribute_arrow.schema,
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("wet_area", "parcel_area", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        wet_area = gdf["wet_area"]
+        parcel_area = gdf["parcel_area"]
+        ratio = wet_area / parcel_area
+        ratio_expression = _native_expression_from_public_series(ratio)
+        assert ratio_expression is not None
+        assert ratio_expression.is_device
+        gdf["flood_ratio"] = ratio
+        assigned_state = get_native_state(gdf)
+        assert assigned_state is not None
+        mask = gdf["flood_ratio"] >= 0.5
+        rowset = _native_boolean_rowset_from_public_mask(mask, assigned_state)
+        filtered = gdf[mask]
+
+    filtered_state = get_native_state(filtered)
+    ratio_column = gdf._native_attribute_expression("flood_ratio")
+
+    assert cp.asnumpy(ratio_expression.values).tolist() == [0.2, 0.5, 1.0]
+    assert ratio_column is not None
+    assert ratio_column.is_device
+    assert rowset is not None
+    assert rowset.is_device
+    assert cp.asnumpy(rowset.positions).tolist() == [1, 2]
+    assert filtered_state is not None
+    assert filtered_state.row_count == 2
+    assert filtered_state.attributes.device_table is not None
+    assert get_materialization_events(clear=True) == []
+
+    assert filtered["flood_ratio"].tolist() == [0.5, 1.0]
+    export_operations = [event.operation for event in get_materialization_events(clear=True)]
+    assert export_operations == ["native_attribute_column_to_public_series"]
+    reset_d2h_transfer_count()
+
+
 def test_geodataframe_iloc_slice_preserves_private_native_state() -> None:
     gdf, _state = _native_backed_geodataframe()
     clear_materialization_events()
@@ -7736,9 +11013,10 @@ def test_geodataframe_iloc_take_preserves_projected_private_native_state() -> No
     assert selected_state is not None
     assert selected_state.row_count == 2
     assert selected_state.column_order == ("name", "geometry")
-    assert selected_state.to_native_tabular_result().attributes.to_pandas()[
-        "name"
-    ].tolist() == ["b", "a"]
+    assert selected_state.to_native_tabular_result().attributes.to_pandas()["name"].tolist() == [
+        "b",
+        "a",
+    ]
 
 
 def test_geodataframe_take_preserves_private_native_state() -> None:
@@ -7751,9 +11029,10 @@ def test_geodataframe_take_preserves_private_native_state() -> None:
     assert selected.index.tolist() == [1, 0]
     assert selected_state is not None
     assert selected_state.row_count == 2
-    assert selected_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [2, 1]
+    assert selected_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        2,
+        1,
+    ]
 
 
 def test_geodataframe_take_axis_columns_preserves_projected_private_native_state() -> None:
@@ -7799,9 +11078,10 @@ def test_geodataframe_boolean_series_unique_index_preserves_private_native_state
     assert selected.index.tolist() == ["a", "c"]
     assert selected["value"].tolist() == [1, 3]
     assert selected_state is not None
-    assert selected_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1, 3]
+    assert selected_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        1,
+        3,
+    ]
 
 
 def test_geodataframe_boolean_series_unique_host_index_is_strict_native_safe(
@@ -7828,11 +11108,11 @@ def test_geodataframe_boolean_series_unique_host_index_is_strict_native_safe(
     assert get_materialization_events(clear=True) == []
 
 
-def test_geodataframe_boolean_filter_preserves_device_label_native_state() -> None:
+def test_geodataframe_boolean_filter_preserves_host_then_device_index_plans() -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device-label native filter")
     pytest.importorskip("cupy")
-    pytest.importorskip("pylibcudf")
+    plc = pytest.importorskip("pylibcudf")
 
     owned = from_shapely_geometries(
         [Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3)],
@@ -7845,7 +11125,9 @@ def test_geodataframe_boolean_filter_preserves_device_label_native_state() -> No
     state = NativeFrameState.from_native_tabular_result(
         NativeTabularResult(
             attributes=NativeAttributeTable(
-                arrow_table=pa.table({"value": pa.array([0, 1, 2, 3], type=pa.int64())}),
+                device_table=plc.Table.from_arrow(
+                    pa.table({"value": pa.array([0, 1, 2, 3], type=pa.int64())})
+                ),
                 index_override=gdf.index,
                 column_override=("value",),
             ),
@@ -7859,20 +11141,30 @@ def test_geodataframe_boolean_filter_preserves_device_label_native_state() -> No
     label_backed_rows = gdf[pd.Series([True, True, True, False], index=gdf.index)]
     label_backed_rows_state = get_native_state(label_backed_rows)
     assert label_backed_rows_state is not None
-    assert label_backed_rows_state.index_plan.kind == "device-labels"
+    assert label_backed_rows_state.index_plan.kind == "range"
 
     clear_materialization_events()
-    selected = label_backed_rows[label_backed_rows["value"].isin([1])]
+    selected = label_backed_rows[
+        label_backed_rows.geometry.dwithin(Point(1, 1), distance=0.1)
+    ]
     selected_state = get_native_state(selected)
 
-    assert selected.index.tolist() == [1]
-    assert selected["value"].tolist() == [1]
     assert selected_state is not None
     assert selected_state.index_plan.kind == "device-labels"
     assert [
-        event for event in get_materialization_events(clear=True)
+        event
+        for event in get_materialization_events(clear=True)
         if event.operation == "index_plan_to_host"
     ] == []
+
+    assert selected.index.tolist() == [1]
+    index_events = [
+        event
+        for event in get_materialization_events(clear=True)
+        if event.operation == "index_plan_to_host"
+    ]
+    assert len(index_events) == 1
+    assert selected["value"].tolist() == [1]
 
 
 def test_geodataframe_boolean_series_duplicate_index_preserves_private_native_state() -> None:
@@ -7895,9 +11187,7 @@ def test_geodataframe_boolean_series_duplicate_index_preserves_private_native_st
     selected_state = get_native_state(selected)
     assert selected_state is not None
     assert selected_state.index_plan.has_duplicates is False
-    assert selected_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1]
+    assert selected_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [1]
 
 
 def test_geodataframe_boolean_series_multiindex_preserves_private_native_state() -> None:
@@ -7927,9 +11217,10 @@ def test_geodataframe_boolean_series_multiindex_preserves_private_native_state()
         ("a", 1),
         ("a", 3),
     ]
-    assert selected_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1, 3]
+    assert selected_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        1,
+        3,
+    ]
 
 
 def test_geodataframe_position_selectors_delegating_to_take_preserve_private_native_state() -> None:
@@ -7964,9 +11255,10 @@ def test_geodataframe_drop_row_preserves_unique_index_private_native_state() -> 
     assert selected["value"].tolist() == [1, 3]
     assert selected_state is not None
     assert selected_state.row_count == 2
-    assert selected_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1, 3]
+    assert selected_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        1,
+        3,
+    ]
 
 
 def test_geodataframe_drop_column_preserves_projected_private_native_state() -> None:
@@ -8008,9 +11300,10 @@ def test_geodataframe_drop_duplicate_index_preserves_private_native_state() -> N
     selected_state = get_native_state(selected)
     assert selected_state is not None
     assert selected_state.index_plan.has_duplicates is True
-    assert selected_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1, 2]
+    assert selected_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        1,
+        2,
+    ]
 
 
 def test_geodataframe_drop_multiindex_preserves_private_native_state() -> None:
@@ -8040,9 +11333,10 @@ def test_geodataframe_drop_multiindex_preserves_private_native_state() -> None:
         ("a", 1),
         ("a", 3),
     ]
-    assert selected_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1, 3]
+    assert selected_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        1,
+        3,
+    ]
 
 
 def test_geodataframe_drop_inplace_clears_private_native_state() -> None:
@@ -8080,9 +11374,10 @@ def test_geodataframe_drop_duplicates_ignore_index_preserves_private_native_stat
     assert selected["name"].tolist() == ["b", "c"]
     assert selected_state is not None
     assert selected_state.index_plan.to_public_index().tolist() == [0, 1]
-    assert selected_state.to_native_tabular_result().attributes.to_pandas()[
-        "name"
-    ].tolist() == ["b", "c"]
+    assert selected_state.to_native_tabular_result().attributes.to_pandas()["name"].tolist() == [
+        "b",
+        "c",
+    ]
 
 
 def test_geodataframe_drop_duplicates_ignore_index_device_state_without_runtime_d2h() -> None:
@@ -8119,6 +11414,148 @@ def test_geodataframe_drop_duplicates_ignore_index_device_state_without_runtime_
     assert selected.index.tolist() == [0, 1]
     assert selected_state is not None
     assert selected_state.index_plan.to_public_index().tolist() == [0, 1]
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_geodataframe_drop_duplicates_lazy_native_columns_preserves_device_rowflow() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native lazy drop_duplicates")
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    import pylibcudf as plc
+
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    owned = from_shapely_geometries(
+        [Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3)],
+        residency=Residency.DEVICE,
+    )
+    arrow = pa.table(
+        {
+            "parcel_id": pa.array([1, 1, 2, 2], type=pa.int64()),
+            "flood_ratio": pa.array([0.7, 0.3, 0.9, 0.1], type=pa.float64()),
+        }
+    )
+    gdf = GeoDataFrame(
+        {
+            "parcel_id": [1, 1, 2, 2],
+            "flood_ratio": [0.7, 0.3, 0.9, 0.1],
+            "geometry": GeoSeries(DeviceGeometryArray._from_owned(owned), name="geometry"),
+        }
+    )
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(
+                device_table=plc.Table.from_arrow(arrow),
+                index_override=pd.RangeIndex(4),
+                column_override=tuple(arrow.column_names),
+                schema_override=arrow.schema,
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("parcel_id", "flood_ratio", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        deduped = gdf.drop_duplicates("parcel_id")
+        deduped_state = get_native_state(deduped)
+        parcel_values = deduped_state.attributes.numeric_column_arrays(("parcel_id",))
+        ratio_values = deduped_state.attributes.numeric_column_arrays(("flood_ratio",))
+        last_deduped = gdf.drop_duplicates("parcel_id", keep="last")
+        last_state = get_native_state(last_deduped)
+        last_parcel_values = last_state.attributes.numeric_column_arrays(("parcel_id",))
+        last_ratio_values = last_state.attributes.numeric_column_arrays(("flood_ratio",))
+        no_duplicates = gdf.drop_duplicates("parcel_id", keep=False)
+        no_duplicates_state = get_native_state(no_duplicates)
+
+    assert deduped_state is not None
+    assert deduped_state.index_plan.kind == "device-labels"
+    assert deduped_state.geometry.owned is not None
+    assert deduped_state.geometry.owned.residency is Residency.DEVICE
+    assert parcel_values is not None
+    assert ratio_values is not None
+    assert cp.asnumpy(parcel_values["parcel_id"]).tolist() == [1, 2]
+    assert cp.asnumpy(ratio_values["flood_ratio"]).tolist() == [0.7, 0.9]
+    assert last_state is not None
+    assert last_parcel_values is not None
+    assert last_ratio_values is not None
+    assert cp.asnumpy(last_parcel_values["parcel_id"]).tolist() == [1, 2]
+    assert cp.asnumpy(last_ratio_values["flood_ratio"]).tolist() == [0.3, 0.1]
+    assert no_duplicates_state is not None
+    assert no_duplicates_state.row_count == 0
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_geodataframe_identity_native_drop_duplicates_rebuilds_without_lazy_column_export() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native lazy identity drop_duplicates")
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    import pylibcudf as plc
+
+    from vibespatial.api._native_public_arrays import NativeNumericExpressionArray
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    owned = from_shapely_geometries(
+        [Point(0, 0), Point(1, 1), Point(2, 2)],
+        residency=Residency.DEVICE,
+    )
+    arrow = pa.table(
+        {
+            "parcel_id": pa.array([1, 2, 3], type=pa.int64()),
+            "flood_ratio": pa.array([0.7, 0.3, 0.9], type=pa.float64()),
+        }
+    )
+    gdf = GeoDataFrame(
+        {
+            "parcel_id": [1, 2, 3],
+            "flood_ratio": [0.7, 0.3, 0.9],
+            "geometry": GeoSeries(DeviceGeometryArray._from_owned(owned), name="geometry"),
+        }
+    )
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(
+                device_table=plc.Table.from_arrow(arrow),
+                index_override=pd.RangeIndex(3),
+                column_override=tuple(arrow.column_names),
+                schema_override=arrow.schema,
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("parcel_id", "flood_ratio", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+    projected = gdf[["parcel_id", "flood_ratio", "geometry"]]
+    assert isinstance(projected["parcel_id"].array, NativeNumericExpressionArray)
+
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+    with assert_zero_d2h_transfers():
+        deduped = projected.drop_duplicates("parcel_id")
+        deduped_state = get_native_state(deduped)
+        parcel_values = deduped_state.attributes.numeric_column_arrays(("parcel_id",))
+        ratio_values = deduped_state.attributes.numeric_column_arrays(("flood_ratio",))
+
+    assert deduped_state is not None
+    assert deduped_state.row_count == 3
+    assert parcel_values is not None
+    assert ratio_values is not None
+    assert cp.asnumpy(parcel_values["parcel_id"]).tolist() == [1, 2, 3]
+    assert cp.asnumpy(ratio_values["flood_ratio"]).tolist() == [0.7, 0.3, 0.9]
     assert get_materialization_events(clear=True) == []
     reset_d2h_transfer_count()
 
@@ -8279,9 +11716,7 @@ def test_geoseries_copy_preserves_private_native_state() -> None:
 
 
 def test_geoseries_take_preserves_private_native_state() -> None:
-    series = _native_backed_geoseries_from_arrow(
-        index=pd.Index(["a", "b", "c"], name="site")
-    )
+    series = _native_backed_geoseries_from_arrow(index=pd.Index(["a", "b", "c"], name="site"))
 
     selected = series.take([2, 0])
     selected_state = get_native_state(selected)
@@ -8294,9 +11729,7 @@ def test_geoseries_take_preserves_private_native_state() -> None:
 
 
 def test_geoseries_head_tail_preserve_private_native_state() -> None:
-    series = _native_backed_geoseries_from_arrow(
-        index=pd.Index(["a", "b", "c"], name="site")
-    )
+    series = _native_backed_geoseries_from_arrow(index=pd.Index(["a", "b", "c"], name="site"))
 
     head = series.head(2)
     tail = series.tail(2)
@@ -8308,9 +11741,7 @@ def test_geoseries_head_tail_preserve_private_native_state() -> None:
 
 
 def test_geoseries_drop_reindex_sample_preserve_private_native_state() -> None:
-    series = _native_backed_geoseries_from_arrow(
-        index=pd.Index(["a", "b", "c"], name="site")
-    )
+    series = _native_backed_geoseries_from_arrow(index=pd.Index(["a", "b", "c"], name="site"))
 
     dropped = series.drop(index=["b"])
     reindexed = series.reindex(["c", "a", "c"])
@@ -8327,9 +11758,7 @@ def test_geoseries_drop_reindex_sample_preserve_private_native_state() -> None:
 
 
 def test_geoseries_getitem_slice_preserves_private_native_state() -> None:
-    series = _native_backed_geoseries_from_arrow(
-        index=pd.Index(["a", "b", "c"], name="site")
-    )
+    series = _native_backed_geoseries_from_arrow(index=pd.Index(["a", "b", "c"], name="site"))
 
     selected = series[1:]
     selected_state = get_native_state(selected)
@@ -8341,9 +11770,7 @@ def test_geoseries_getitem_slice_preserves_private_native_state() -> None:
 
 
 def test_geoseries_getitem_boolean_series_preserves_private_native_state() -> None:
-    series = _native_backed_geoseries_from_arrow(
-        index=pd.Index(["a", "b", "c"], name="site")
-    )
+    series = _native_backed_geoseries_from_arrow(index=pd.Index(["a", "b", "c"], name="site"))
 
     selected = series[pd.Series([True, False, True], index=series.index)]
     selected_state = get_native_state(selected)
@@ -8355,9 +11782,7 @@ def test_geoseries_getitem_boolean_series_preserves_private_native_state() -> No
 
 
 def test_geoseries_getitem_boolean_series_label_aligned_preserves_private_native_state() -> None:
-    series = _native_backed_geoseries_from_arrow(
-        index=pd.Index(["a", "b", "c"], name="site")
-    )
+    series = _native_backed_geoseries_from_arrow(index=pd.Index(["a", "b", "c"], name="site"))
 
     selected = series[pd.Series([True, False, True], index=pd.Index(["c", "b", "a"]))]
     selected_state = get_native_state(selected)
@@ -8368,9 +11793,7 @@ def test_geoseries_getitem_boolean_series_label_aligned_preserves_private_native
 
 
 def test_geoseries_loc_iloc_preserve_private_native_state() -> None:
-    series = _native_backed_geoseries_from_arrow(
-        index=pd.Index(["a", "b", "c"], name="site")
-    )
+    series = _native_backed_geoseries_from_arrow(index=pd.Index(["a", "b", "c"], name="site"))
 
     iloc_selected = series.iloc[[2, 0]]
     loc_selected = series.loc[["c", "a", "c"]]
@@ -8393,9 +11816,7 @@ def test_geoseries_loc_iloc_preserve_private_native_state() -> None:
 
 
 def test_geoseries_indexer_writes_clear_private_native_state() -> None:
-    series = _native_backed_geoseries_from_arrow(
-        index=pd.Index(["a", "b", "c"], name="site")
-    )
+    series = _native_backed_geoseries_from_arrow(index=pd.Index(["a", "b", "c"], name="site"))
 
     series.iloc[0] = Point(10, 10)
 
@@ -8403,9 +11824,7 @@ def test_geoseries_indexer_writes_clear_private_native_state() -> None:
 
 
 def test_geoseries_sort_index_unique_preserves_private_native_state() -> None:
-    series = _native_backed_geoseries_from_arrow(
-        index=pd.Index(["b", "a", "c"], name="site")
-    )
+    series = _native_backed_geoseries_from_arrow(index=pd.Index(["b", "a", "c"], name="site"))
 
     selected = series.sort_index()
     selected_state = get_native_state(selected)
@@ -8421,9 +11840,7 @@ def test_geoseries_sort_index_unique_preserves_private_native_state() -> None:
 
 
 def test_geoseries_sort_index_duplicate_preserves_private_native_state() -> None:
-    series = _native_backed_geoseries_from_arrow(
-        index=pd.Index(["b", "a", "a"], name="site")
-    )
+    series = _native_backed_geoseries_from_arrow(index=pd.Index(["b", "a", "a"], name="site"))
 
     selected = series.sort_index(kind="mergesort")
     selected_state = get_native_state(selected)
@@ -8439,9 +11856,7 @@ def test_geoseries_sort_index_duplicate_preserves_private_native_state() -> None
 
 
 def test_geoseries_sort_index_ignore_index_preserves_private_native_state() -> None:
-    series = _native_backed_geoseries_from_arrow(
-        index=pd.Index(["b", "a", "c"], name="site")
-    )
+    series = _native_backed_geoseries_from_arrow(index=pd.Index(["b", "a", "c"], name="site"))
 
     selected = series.sort_index(ignore_index=True)
     selected_state = get_native_state(selected)
@@ -8457,9 +11872,7 @@ def test_geoseries_sort_index_ignore_index_preserves_private_native_state() -> N
 
 
 def test_geoseries_metadata_relabels_preserve_private_native_state() -> None:
-    series = _native_backed_geoseries_from_arrow(
-        index=pd.Index(["a", "b", "c"], name="site")
-    )
+    series = _native_backed_geoseries_from_arrow(index=pd.Index(["a", "b", "c"], name="site"))
 
     renamed = series.rename("geom")
     mapped = renamed.rename(index={"a": "x", "b": "y", "c": "z"})
@@ -8545,9 +11958,7 @@ def test_native_attribute_table_rename_columns_preserves_multiindex_labels() -> 
         [("metrics", "value"), ("labels", "name")],
         names=["kind", "field"],
     )
-    table = NativeAttributeTable(
-        dataframe=pd.DataFrame([[1, "a"]], columns=columns)
-    )
+    table = NativeAttributeTable(dataframe=pd.DataFrame([[1, "a"]], columns=columns))
 
     renamed = table.rename_columns({("metrics", "value"): ("metrics", "score")})
 
@@ -8574,7 +11985,7 @@ def test_native_attribute_table_assign_columns_preserves_arrow_payload() -> None
     assert assigned.to_pandas()["score"].tolist() == [10, 20]
 
 
-def test_native_attribute_table_assign_columns_declines_device_payload() -> None:
+def test_native_attribute_table_assign_columns_partitions_device_payload() -> None:
     table = NativeAttributeTable(
         device_table=_FakeDeviceTable(),
         index_override=pd.RangeIndex(2),
@@ -8588,11 +11999,15 @@ def test_native_attribute_table_assign_columns_declines_device_payload() -> None
     )
 
     assigned = table.assign_columns(
-        {"score": pd.Series([10, 20])},
+        {"score": pd.Series([object(), object()], dtype=object)},
         columns=("value", "name", "score"),
     )
 
-    assert assigned is None
+    assert assigned is not None
+    assert assigned.parts is not None
+    assert tuple(assigned.columns) == ("value", "name", "score")
+    assert assigned.parts[0].device_table is not None
+    assert assigned.parts[1].dataframe is not None
 
 
 def test_native_attribute_table_assign_expression_columns_preserves_device_payload() -> None:
@@ -8634,6 +12049,118 @@ def test_native_attribute_table_assign_expression_columns_preserves_device_paylo
     assert tuple(assigned.columns) == ("value", "area")
     assert arrays is not None
     assert cp.asnumpy(arrays["value"]).tolist() == [1, 2]
+    assert cp.asnumpy(arrays["area"]).tolist() == [1.5, 2.5]
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_native_attribute_loader_with_expression_materializes_values() -> None:
+    table = NativeAttributeTable.from_loader(
+        lambda: pd.DataFrame({"value": [1, 2]}),
+        index_override=pd.RangeIndex(2),
+        columns=("value",),
+    )
+    expression = NativeExpression(
+        operation="geometry.area",
+        values=np.asarray([1.5, 2.5], dtype=np.float64),
+        source_row_count=2,
+        dtype="float64",
+        precision="fp64",
+    )
+
+    appended = table.with_column("area", expression)
+    frame = appended.to_pandas(copy=False)
+
+    assert tuple(appended.columns) == ("value", "area")
+    assert frame["area"].tolist() == [1.5, 2.5]
+    assert appended.to_arrow(index=False).column("area").to_pylist() == [1.5, 2.5]
+
+
+def test_native_attribute_mixed_host_device_assignment_preserves_expression_payload() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for mixed native attribute assignment")
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    table = NativeAttributeTable(
+        dataframe=pd.DataFrame(
+            {
+                "label": ["a", "b"],
+                "value": [1, 2],
+            }
+        )
+    )
+    expression = NativeExpression(
+        operation="geometry.area",
+        values=cp.asarray([1.5, 2.5], dtype=cp.float64),
+        source_row_count=2,
+        dtype="float64",
+        precision="fp64",
+    )
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        assigned = table.assign_columns(
+            {"area": expression},
+            columns=("label", "value", "area"),
+        )
+        arrays = assigned.numeric_column_arrays(["area"])
+
+    assert assigned is not None
+    assert assigned.parts is not None
+    assert tuple(assigned.columns) == ("label", "value", "area")
+    assert arrays is not None
+    assert cp.asnumpy(arrays["area"]).tolist() == [1.5, 2.5]
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_native_attribute_mixed_host_assignment_preserves_device_part() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for mixed native attribute assignment")
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    table = NativeAttributeTable(dataframe=pd.DataFrame({"label": ["a", "b"]}))
+    expression = NativeExpression(
+        operation="geometry.area",
+        values=cp.asarray([1.5, 2.5], dtype=cp.float64),
+        source_row_count=2,
+        dtype="float64",
+        precision="fp64",
+    )
+    mixed = table.assign_columns(
+        {"area": expression},
+        columns=("label", "area"),
+    )
+    assert mixed is not None
+    assert mixed.parts is not None
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        assigned = mixed.assign_columns(
+            {"parcel_group": pd.Series(["0", "1"])},
+            columns=("label", "area", "parcel_group"),
+        )
+        arrays = assigned.numeric_column_arrays(["area"])
+
+    assert assigned is not None
+    assert assigned.parts is not None
+    assert tuple(assigned.columns) == ("label", "area", "parcel_group")
+    host_part = next(part for part in assigned.parts if "parcel_group" in tuple(part.columns))
+    assert host_part.dataframe is not None
+    assert host_part.dataframe["parcel_group"].tolist() == ["0", "1"]
+    assert arrays is not None
     assert cp.asnumpy(arrays["area"]).tolist() == [1.5, 2.5]
     assert get_materialization_events(clear=True) == []
     reset_d2h_transfer_count()
@@ -8727,15 +12254,16 @@ def test_native_attribute_table_with_column_unsupported_device_payload_exports_o
     )
     clear_materialization_events()
 
-    appended = table.with_column("label", ["a", "b"])
+    labels = [object(), object()]
+    appended = table.with_column("label", labels)
 
-    assert appended.dataframe is not None
-    assert appended.to_pandas()["label"].tolist() == ["a", "b"]
+    assert appended.parts is not None
+    exported_labels = appended.to_pandas()["label"].tolist()
+    assert exported_labels[0] is labels[0]
+    assert exported_labels[1] is labels[1]
     events = get_materialization_events(clear=True)
     assert any(
-        event.boundary is MaterializationBoundary.USER_EXPORT
-        and event.operation == "device_attributes_to_arrow"
-        and event.d2h_transfer
+        event.boundary is MaterializationBoundary.USER_EXPORT and event.d2h_transfer
         for event in events
     )
 
@@ -8750,9 +12278,10 @@ def test_geodataframe_rename_attribute_preserves_private_native_state() -> None:
     assert renamed_state is not None
     assert renamed_state.column_order == ("score", "name", "geometry")
     assert renamed_state.geometry_name == "geometry"
-    assert renamed_state.to_native_tabular_result().attributes.to_pandas()[
-        "score"
-    ].tolist() == [1, 2]
+    assert renamed_state.to_native_tabular_result().attributes.to_pandas()["score"].tolist() == [
+        1,
+        2,
+    ]
 
 
 def test_geodataframe_rename_index_preserves_private_native_state() -> None:
@@ -8844,9 +12373,10 @@ def test_geodataframe_set_axis_columns_preserves_private_native_state() -> None:
     assert relabeled.columns.tolist() == ["score", "name", "geometry"]
     assert relabeled_state is not None
     assert relabeled_state.column_order == ("score", "name", "geometry")
-    assert relabeled_state.to_native_tabular_result().attributes.to_pandas()[
-        "score"
-    ].tolist() == [1, 2]
+    assert relabeled_state.to_native_tabular_result().attributes.to_pandas()["score"].tolist() == [
+        1,
+        2,
+    ]
 
 
 def test_geodataframe_set_axis_index_preserves_private_native_state() -> None:
@@ -8881,9 +12411,7 @@ def test_geodataframe_reset_index_drop_preserves_private_native_state() -> None:
     assert reset.index.equals(pd.RangeIndex(2))
     assert reset_state is not None
     assert reset_state.index_plan.kind == "range"
-    assert reset_state.to_native_tabular_result().attributes.index.equals(
-        pd.RangeIndex(2)
-    )
+    assert reset_state.to_native_tabular_result().attributes.index.equals(pd.RangeIndex(2))
 
 
 def test_geodataframe_reset_index_without_drop_preserves_private_native_state() -> None:
@@ -8906,9 +12434,10 @@ def test_geodataframe_reset_index_without_drop_preserves_private_native_state() 
     assert reset_state is not None
     assert reset_state.index_plan.kind == "range"
     assert reset_state.column_order == ("site", "value", "geometry")
-    assert reset_state.to_native_tabular_result().attributes.to_pandas()[
-        "site"
-    ].tolist() == ["b", "a"]
+    assert reset_state.to_native_tabular_result().attributes.to_pandas()["site"].tolist() == [
+        "b",
+        "a",
+    ]
 
 
 def test_geodataframe_reset_multiindex_preserves_private_native_state() -> None:
@@ -9000,7 +12529,9 @@ def test_geodataframe_reset_multiindex_level_drop_preserves_private_native_state
     assert attrs["value"].tolist() == [2, 1]
 
 
-def test_geodataframe_device_attribute_reset_index_preserves_private_state_without_runtime_d2h() -> None:
+def test_geodataframe_device_attribute_reset_index_preserves_private_state_without_runtime_d2h() -> (
+    None
+):
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device reset-index attribute")
     cp = pytest.importorskip("cupy")
@@ -9029,9 +12560,7 @@ def test_geodataframe_device_attribute_reset_index_preserves_private_state_witho
         reset = gdf.reset_index()
         reset_state = get_native_state(reset)
         assert reset_state is not None
-        arrays = reset_state.attributes.numeric_column_arrays(
-            ("site", "value", "flag")
-        )
+        arrays = reset_state.attributes.numeric_column_arrays(("site", "value", "flag"))
 
     assert reset_state.attributes.device_table is not None
     assert reset_state.column_order == ("site", "value", "flag", "geometry")
@@ -9104,9 +12633,10 @@ def test_geodataframe_set_index_duplicate_labels_preserves_private_native_state(
     assert indexed_state is not None
     assert indexed_state.index_plan.has_duplicates is True
     assert indexed_state.column_order == ("value", "geometry")
-    assert indexed_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1, 2]
+    assert indexed_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        1,
+        2,
+    ]
 
 
 def test_geodataframe_set_index_multiindex_preserves_private_native_state() -> None:
@@ -9173,9 +12703,10 @@ def test_geodataframe_reindex_rows_preserves_unique_index_private_native_state()
     assert reindexed.index.tolist() == ["c", "a"]
     assert reindexed["value"].tolist() == [3, 1]
     assert reindexed_state is not None
-    assert reindexed_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [3, 1]
+    assert reindexed_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        3,
+        1,
+    ]
 
 
 def test_geodataframe_reindex_columns_preserves_projected_private_native_state() -> None:
@@ -9210,9 +12741,10 @@ def test_geodataframe_reindex_rows_and_columns_preserves_private_native_state() 
     assert reindexed.columns.tolist() == ["geometry", "value"]
     assert reindexed_state is not None
     assert reindexed_state.column_order == ("geometry", "value")
-    assert reindexed_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [3, 1]
+    assert reindexed_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        3,
+        1,
+    ]
 
 
 def test_geodataframe_reindex_missing_row_drops_private_native_state() -> None:
@@ -9253,9 +12785,10 @@ def test_geodataframe_reindex_duplicate_target_preserves_private_native_state() 
     assert reindexed["value"].tolist() == [2, 2]
     assert reindexed_state is not None
     assert reindexed_state.index_plan.has_duplicates is True
-    assert reindexed_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [2, 2]
+    assert reindexed_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        2,
+        2,
+    ]
 
 
 def test_geodataframe_reindex_like_preserves_exact_private_native_state() -> None:
@@ -9320,9 +12853,10 @@ def test_geodataframe_filter_rows_preserves_unique_index_private_native_state() 
 
     assert filtered.index.tolist() == ["b", "c"]
     assert filtered_state is not None
-    assert filtered_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [2, 3]
+    assert filtered_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        2,
+        3,
+    ]
 
 
 def test_geodataframe_filter_without_geometry_drops_private_native_state() -> None:
@@ -9364,9 +12898,10 @@ def test_geodataframe_assign_new_attribute_preserves_private_native_state() -> N
     assert assigned.columns.tolist() == ["value", "name", "geometry", "score"]
     assert assigned_state is not None
     assert assigned_state.column_order == ("value", "name", "geometry", "score")
-    assert assigned_state.to_native_tabular_result().attributes.to_pandas()[
-        "score"
-    ].tolist() == [10, 20]
+    assert assigned_state.to_native_tabular_result().attributes.to_pandas()["score"].tolist() == [
+        10,
+        20,
+    ]
 
 
 def test_geodataframe_assign_replace_attribute_preserves_private_native_state() -> None:
@@ -9378,9 +12913,10 @@ def test_geodataframe_assign_replace_attribute_preserves_private_native_state() 
     assert assigned["value"].tolist() == [10, 20]
     assert assigned_state is not None
     assert assigned_state.column_order == ("value", "name", "geometry")
-    assert assigned_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [10, 20]
+    assert assigned_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        10,
+        20,
+    ]
 
 
 def test_geodataframe_assign_callable_attribute_preserves_private_native_state() -> None:
@@ -9391,9 +12927,10 @@ def test_geodataframe_assign_callable_attribute_preserves_private_native_state()
 
     assert assigned["score"].tolist() == [11, 12]
     assert assigned_state is not None
-    assert assigned_state.to_native_tabular_result().attributes.to_pandas()[
-        "score"
-    ].tolist() == [11, 12]
+    assert assigned_state.to_native_tabular_result().attributes.to_pandas()["score"].tolist() == [
+        11,
+        12,
+    ]
 
 
 def test_geodataframe_assign_geometry_drops_private_native_state() -> None:
@@ -9424,7 +12961,7 @@ def test_geodataframe_assign_native_geometry_preserves_private_native_state() ->
     assert assigned_state.column_order == ("value", "name", "geometry")
 
 
-def test_geodataframe_assign_device_attribute_state_declines_private_native_state() -> None:
+def test_geodataframe_assign_partitions_device_attribute_state() -> None:
     gdf, _state = _native_backed_geodataframe()
     device_attributes = NativeAttributeTable(
         device_table=_FakeDeviceTable(),
@@ -9445,9 +12982,13 @@ def test_geodataframe_assign_device_attribute_state_declines_private_native_stat
     )
     attach_native_state(gdf, NativeFrameState.from_native_tabular_result(result))
 
-    assigned = gdf.assign(score=[10, 20])
+    assigned_values = [object(), object()]
+    assigned = gdf.assign(score=assigned_values)
 
-    assert get_native_state(assigned) is None
+    assigned_state = get_native_state(assigned)
+    assert assigned_state is not None
+    assert assigned_state.attributes.parts is not None
+    assert assigned["score"].tolist() == assigned_values
 
 
 @pytest.mark.parametrize("operation", ["assign", "setitem", "insert"])
@@ -9522,9 +13063,10 @@ def test_geodataframe_sort_values_preserves_unique_index_private_native_state() 
     assert sorted_gdf.index.tolist() == ["a", "b"]
     assert sorted_gdf["value"].tolist() == [1, 2]
     assert sorted_state is not None
-    assert sorted_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1, 2]
+    assert sorted_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        1,
+        2,
+    ]
 
 
 def test_geodataframe_sort_values_ignore_index_preserves_private_native_state() -> None:
@@ -9537,9 +13079,10 @@ def test_geodataframe_sort_values_ignore_index_preserves_private_native_state() 
     assert sorted_gdf["value"].tolist() == [2, 1]
     assert sorted_state is not None
     assert sorted_state.index_plan.kind == "range"
-    assert sorted_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [2, 1]
+    assert sorted_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        2,
+        1,
+    ]
 
 
 def test_geodataframe_sort_index_ignore_index_preserves_private_native_state() -> None:
@@ -9562,9 +13105,10 @@ def test_geodataframe_sort_index_ignore_index_preserves_private_native_state() -
     assert sorted_gdf["value"].tolist() == [1, 2]
     assert sorted_state is not None
     assert sorted_state.index_plan.kind == "range"
-    assert sorted_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1, 2]
+    assert sorted_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        1,
+        2,
+    ]
 
 
 def test_geodataframe_sort_index_duplicate_index_preserves_private_native_state() -> None:
@@ -9587,9 +13131,11 @@ def test_geodataframe_sort_index_duplicate_index_preserves_private_native_state(
     assert sorted_gdf.columns.equals(gdf.columns)
     assert sorted_gdf["value"].tolist() == [2, 1, 3]
     assert sorted_state is not None
-    assert sorted_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [2, 1, 3]
+    assert sorted_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        2,
+        1,
+        3,
+    ]
 
 
 def test_geodataframe_sort_values_ignore_index_preserves_device_state_without_runtime_d2h() -> None:
@@ -9640,8 +13186,6 @@ def test_geodataframe_sort_values_ignore_index_preserves_device_state_without_ru
         sorted_state = get_native_state(sorted_gdf)
         arrays = sorted_state.attributes.numeric_column_arrays(("score",))
 
-    assert sorted_gdf.index.equals(pd.RangeIndex(3))
-    assert sorted_gdf["score"].tolist() == [0.0, 1.0, 2.0]
     assert sorted_state is not None
     assert sorted_state.index_plan.kind == "range"
     assert sorted_state.geometry.owned is not None
@@ -9649,6 +13193,249 @@ def test_geodataframe_sort_values_ignore_index_preserves_device_state_without_ru
     assert arrays is not None
     assert cp.asnumpy(arrays["score"]).tolist() == [0.0, 1.0, 2.0]
     assert get_materialization_events(clear=True) == []
+
+    assert sorted_gdf.index.equals(pd.RangeIndex(3))
+    assert sorted_gdf["score"].tolist() == [0.0, 1.0, 2.0]
+    export_operations = [event.operation for event in get_materialization_events(clear=True)]
+    assert export_operations == ["native_attribute_column_to_public_series"]
+    reset_d2h_transfer_count()
+
+
+def test_geodataframe_sort_values_lazy_native_columns_preserves_device_rowflow() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native lazy sort preservation")
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    import pylibcudf as plc
+
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    owned = from_shapely_geometries(
+        [Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3)],
+        residency=Residency.DEVICE,
+    )
+    arrow = pa.table(
+        {
+            "parcel_id": pa.array([2, 1, 1, 2], type=pa.int64()),
+            "flood_ratio": pa.array([0.1, 0.3, 0.7, 0.9], type=pa.float64()),
+        }
+    )
+    gdf = GeoDataFrame(
+        {
+            "parcel_id": [2, 1, 1, 2],
+            "flood_ratio": [0.1, 0.3, 0.7, 0.9],
+            "geometry": GeoSeries(DeviceGeometryArray._from_owned(owned), name="geometry"),
+        }
+    )
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(
+                device_table=plc.Table.from_arrow(arrow),
+                index_override=pd.RangeIndex(4),
+                column_override=tuple(arrow.column_names),
+                schema_override=arrow.schema,
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("parcel_id", "flood_ratio", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        sorted_gdf = gdf.sort_values(
+            ["parcel_id", "flood_ratio"],
+            ascending=[True, False],
+        )
+        sorted_state = get_native_state(sorted_gdf)
+        parcel_values = sorted_state.attributes.numeric_column_arrays(("parcel_id",))
+        ratio_values = sorted_state.attributes.numeric_column_arrays(("flood_ratio",))
+
+    assert sorted_state is not None
+    assert sorted_state.index_plan.kind == "device-labels"
+    assert sorted_state.geometry.owned is not None
+    assert sorted_state.geometry.owned.residency is Residency.DEVICE
+    assert parcel_values is not None
+    assert ratio_values is not None
+    assert cp.asnumpy(parcel_values["parcel_id"]).tolist() == [1, 1, 2, 2]
+    assert cp.asnumpy(ratio_values["flood_ratio"]).tolist() == [0.7, 0.3, 0.9, 0.1]
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_geodataframe_sort_dedupe_composes_native_attribute_row_view() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native row-indirected attributes")
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    import pylibcudf as plc
+
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    geoms = [
+        Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+        MultiPolygon(
+            [
+                Polygon([(10, 0), (11, 0), (11, 1), (10, 0)]),
+                Polygon([(12, 0), (13, 0), (13, 1), (12, 0)]),
+            ]
+        ),
+        Polygon(
+            [(20, 0), (24, 0), (24, 4), (20, 0)],
+            [[(21, 1), (22, 1), (22, 2), (21, 1)]],
+        ),
+        MultiPolygon(
+            [
+                Polygon(
+                    [(30, 0), (34, 0), (34, 4), (30, 0)],
+                    [[(31, 1), (32, 1), (32, 2), (31, 1)]],
+                )
+            ]
+        ),
+    ]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    arrow = pa.table(
+        {
+            "parcel_id": pa.array([2, 1, 1, 2], type=pa.int64()),
+            "flood_ratio": pa.array([0.1, 0.3, 0.7, 0.9], type=pa.float64()),
+            "zone_id": pa.array([5, 6, 7, 8], type=pa.int64()),
+        }
+    )
+    gdf = GeoDataFrame(
+        {
+            "parcel_id": [2, 1, 1, 2],
+            "flood_ratio": [0.1, 0.3, 0.7, 0.9],
+            "zone_id": [5, 6, 7, 8],
+            "geometry": GeoSeries(
+                DeviceGeometryArray._from_owned(owned),
+                name="geometry",
+            ),
+        }
+    )
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(
+                device_table=plc.Table.from_arrow(arrow),
+                index_override=pd.RangeIndex(4),
+                column_override=tuple(arrow.column_names),
+                schema_override=arrow.schema,
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("parcel_id", "flood_ratio", "zone_id", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        sorted_gdf = gdf.sort_values(
+            ["parcel_id", "flood_ratio"],
+            ascending=[True, False],
+        )
+        sorted_state = get_native_state(sorted_gdf)
+        deduped = sorted_gdf.drop_duplicates("parcel_id")
+        deduped_state = get_native_state(deduped)
+        parcel_values = deduped_state.attributes.numeric_column_arrays(("parcel_id",))
+        ratio_values = deduped_state.attributes.numeric_column_arrays(("flood_ratio",))
+
+    assert sorted_state is not None
+    assert sorted_state.attributes.row_positions is not None
+    assert sorted_state.geometry.owned is not None
+    assert sorted_state.geometry.owned.is_indexed_view
+    assert deduped_state is not None
+    assert deduped_state.attributes.row_positions is not None
+    assert cp.asnumpy(deduped_state.attributes.row_positions).tolist() == [2, 3]
+    assert deduped_state.geometry.owned is not None
+    assert deduped_state.geometry.owned.is_indexed_view
+    assert parcel_values is not None
+    assert ratio_values is not None
+    assert cp.asnumpy(parcel_values["parcel_id"]).tolist() == [1, 2]
+    assert cp.asnumpy(ratio_values["flood_ratio"]).tolist() == [0.7, 0.9]
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_geodataframe_small_native_sort_uses_cupy_rowset_without_pylibcudf_sort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native lazy sort preservation")
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    import pylibcudf as plc
+    import pylibcudf.sorting as sorting
+
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    def _fail_sort(*_args, **_kwargs):  # pragma: no cover - failure path
+        raise AssertionError("small native sort should use the CuPy rowset path")
+
+    monkeypatch.setattr(sorting, "stable_sorted_order", _fail_sort)
+    monkeypatch.setattr(sorting, "sorted_order", _fail_sort)
+
+    owned = from_shapely_geometries(
+        [Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3)],
+        residency=Residency.DEVICE,
+    )
+    arrow = pa.table(
+        {
+            "parcel_id": pa.array([2, 1, 1, 2], type=pa.int64()),
+            "flood_ratio": pa.array([0.1, 0.3, 0.7, 0.9], type=pa.float64()),
+        }
+    )
+    gdf = GeoDataFrame(
+        {
+            "parcel_id": [2, 1, 1, 2],
+            "flood_ratio": [0.1, 0.3, 0.7, 0.9],
+            "geometry": GeoSeries(DeviceGeometryArray._from_owned(owned), name="geometry"),
+        }
+    )
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(
+                device_table=plc.Table.from_arrow(arrow),
+                index_override=pd.RangeIndex(4),
+                column_override=tuple(arrow.column_names),
+                schema_override=arrow.schema,
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("parcel_id", "flood_ratio", "geometry"),
+        )
+    )
+    attach_native_state(gdf, state)
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        sorted_gdf = gdf.sort_values(
+            ["parcel_id", "flood_ratio"],
+            ascending=[True, False],
+        )
+        sorted_state = get_native_state(sorted_gdf)
+        parcel_values = sorted_state.attributes.numeric_column_arrays(("parcel_id",))
+        ratio_values = sorted_state.attributes.numeric_column_arrays(("flood_ratio",))
+
+    assert sorted_state is not None
+    assert parcel_values is not None
+    assert ratio_values is not None
+    assert cp.asnumpy(parcel_values["parcel_id"]).tolist() == [1, 1, 2, 2]
+    assert cp.asnumpy(ratio_values["flood_ratio"]).tolist() == [0.7, 0.3, 0.9, 0.1]
+    assert get_materialization_events(clear=True) == []
+    assert sorted_gdf["parcel_id"].tolist() == [1, 1, 2, 2]
     reset_d2h_transfer_count()
 
 
@@ -9672,9 +13459,10 @@ def test_geodataframe_sort_values_duplicate_index_preserves_private_native_state
     assert sorted_gdf.index.tolist() == ["same", "same"]
     assert sorted_gdf.columns.equals(gdf.columns)
     assert sorted_state is not None
-    assert sorted_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1, 2]
+    assert sorted_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        1,
+        2,
+    ]
 
 
 def test_geodataframe_sort_index_axis_columns_preserves_projected_private_native_state() -> None:
@@ -9706,9 +13494,7 @@ def test_geodataframe_loc_read_preserves_unique_index_private_native_state() -> 
     assert selected["value"].tolist() == [1]
     assert selected_state is not None
     assert selected_state.row_count == 1
-    assert selected_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1]
+    assert selected_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [1]
 
 
 def test_geodataframe_loc_column_projection_preserves_private_native_state() -> None:
@@ -9721,9 +13507,10 @@ def test_geodataframe_loc_column_projection_preserves_private_native_state() -> 
     assert selected.columns.tolist() == ["geometry", "value"]
     assert selected_state is not None
     assert selected_state.column_order == ("geometry", "value")
-    assert selected_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [2, 1]
+    assert selected_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        2,
+        1,
+    ]
 
 
 def test_geodataframe_loc_duplicate_source_index_preserves_private_native_state() -> None:
@@ -9746,9 +13533,10 @@ def test_geodataframe_loc_duplicate_source_index_preserves_private_native_state(
     assert selected_state is not None
     assert selected_state.row_count == 2
     assert selected_state.index_plan.has_duplicates is True
-    assert selected_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1, 2]
+    assert selected_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        1,
+        2,
+    ]
 
 
 def test_geodataframe_loc_duplicate_label_repeat_preserves_private_native_state() -> None:
@@ -9772,9 +13560,13 @@ def test_geodataframe_loc_duplicate_label_repeat_preserves_private_native_state(
     assert selected_state is not None
     assert selected_state.column_order == ("geometry", "value")
     assert selected_state.index_plan.has_duplicates is True
-    assert selected_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1, 2, 3, 1, 2]
+    assert selected_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        1,
+        2,
+        3,
+        1,
+        2,
+    ]
 
 
 def test_geodataframe_loc_multiindex_preserves_private_native_state() -> None:
@@ -9804,9 +13596,10 @@ def test_geodataframe_loc_multiindex_preserves_private_native_state() -> None:
         ("a", 1),
         ("a", 3),
     ]
-    assert selected_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [1, 3]
+    assert selected_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        1,
+        3,
+    ]
 
 
 def test_geodataframe_query_expression_drops_result_private_native_state() -> None:
@@ -10469,9 +14262,10 @@ def test_geodataframe_setitem_replace_attribute_preserves_private_native_state()
     assert gdf["value"].tolist() == [10, 20]
     assert setitem_state is not None
     assert setitem_state.column_order == ("value", "name", "geometry")
-    assert setitem_state.to_native_tabular_result().attributes.to_pandas()[
-        "value"
-    ].tolist() == [10, 20]
+    assert setitem_state.to_native_tabular_result().attributes.to_pandas()["value"].tolist() == [
+        10,
+        20,
+    ]
 
 
 def test_geodataframe_setitem_geometry_clears_private_native_state() -> None:
@@ -10509,9 +14303,10 @@ def test_geodataframe_setitem_multiple_attribute_columns_preserves_private_nativ
     assert gdf["name"].tolist() == ["x", "y"]
     assert setitem_state is not None
     assert setitem_state.column_order == ("value", "name", "geometry")
-    assert setitem_state.to_native_tabular_result().attributes.to_pandas()[
-        "name"
-    ].tolist() == ["x", "y"]
+    assert setitem_state.to_native_tabular_result().attributes.to_pandas()["name"].tolist() == [
+        "x",
+        "y",
+    ]
 
 
 def test_geodataframe_setitem_multiple_columns_with_geometry_clears_private_native_state() -> None:
@@ -10526,7 +14321,9 @@ def test_geodataframe_setitem_multiple_columns_with_geometry_clears_private_nati
     assert get_native_state(gdf) is None
 
 
-def test_geodataframe_setitem_multiple_device_attribute_columns_preserves_without_runtime_d2h() -> None:
+def test_geodataframe_setitem_multiple_device_attribute_columns_preserves_without_runtime_d2h() -> (
+    None
+):
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device attribute assignment")
     cp = pytest.importorskip("cupy")
@@ -10566,7 +14363,7 @@ def test_geodataframe_setitem_multiple_device_attribute_columns_preserves_withou
     reset_d2h_transfer_count()
 
 
-def test_geodataframe_setitem_device_attribute_state_declines_private_native_state() -> None:
+def test_geodataframe_setitem_partitions_device_attribute_state() -> None:
     gdf, _state = _native_backed_geodataframe()
     device_attributes = NativeAttributeTable(
         device_table=_FakeDeviceTable(),
@@ -10587,9 +14384,13 @@ def test_geodataframe_setitem_device_attribute_state_declines_private_native_sta
     )
     attach_native_state(gdf, NativeFrameState.from_native_tabular_result(result))
 
-    gdf["score"] = [10, 20]
+    assigned_values = [object(), object()]
+    gdf["score"] = assigned_values
 
-    assert get_native_state(gdf) is None
+    assigned_state = get_native_state(gdf)
+    assert assigned_state is not None
+    assert assigned_state.attributes.parts is not None
+    assert gdf["score"].tolist() == assigned_values
 
 
 def test_geodataframe_insert_attribute_preserves_private_native_state() -> None:
@@ -10602,9 +14403,10 @@ def test_geodataframe_insert_attribute_preserves_private_native_state() -> None:
     assert gdf.columns.tolist() == ["value", "score", "name", "geometry"]
     assert insert_state is not None
     assert insert_state.column_order == ("value", "score", "name", "geometry")
-    assert insert_state.to_native_tabular_result().attributes.to_pandas()[
-        "score"
-    ].tolist() == [10, 20]
+    assert insert_state.to_native_tabular_result().attributes.to_pandas()["score"].tolist() == [
+        10,
+        20,
+    ]
 
 
 def test_geodataframe_insert_duplicate_column_declines_private_native_state() -> None:
@@ -10616,7 +14418,7 @@ def test_geodataframe_insert_duplicate_column_declines_private_native_state() ->
     assert get_native_state(gdf) is None
 
 
-def test_geodataframe_insert_device_attribute_state_declines_private_native_state() -> None:
+def test_geodataframe_insert_partitions_device_attribute_state() -> None:
     gdf, _state = _native_backed_geodataframe()
     device_attributes = NativeAttributeTable(
         device_table=_FakeDeviceTable(),
@@ -10637,9 +14439,13 @@ def test_geodataframe_insert_device_attribute_state_declines_private_native_stat
     )
     attach_native_state(gdf, NativeFrameState.from_native_tabular_result(result))
 
-    gdf.insert(1, "score", [10, 20])
+    assigned_values = [object(), object()]
+    gdf.insert(1, "score", assigned_values)
 
-    assert get_native_state(gdf) is None
+    assigned_state = get_native_state(gdf)
+    assert assigned_state is not None
+    assert assigned_state.attributes.parts is not None
+    assert gdf["score"].tolist() == assigned_values
 
 
 def test_geodataframe_pop_attribute_preserves_projected_private_native_state() -> None:
@@ -10955,6 +14761,91 @@ def test_geodataframe_to_parquet_uses_private_native_state(
     gdf.to_parquet(path)
 
     assert path.exists()
+
+
+def test_geodataframe_to_parquet_keeps_device_attributes_and_host_index_plan(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for indexed device attribute export")
+    pytest.importorskip("pylibcudf")
+    gdf = GeoDataFrame(
+        {
+            "value": [1, 2],
+            "name": ["a", "b"],
+            "geometry": GeoSeries.from_wkt(
+                ["POINT (0 0)", "POINT (1 1)"],
+                name="geometry",
+            ),
+        },
+        index=pd.Index([10, 20], name="parcel_id"),
+    )
+    state = _attach_owned_native_tabular_state(gdf, attribute_storage="device")
+    assert state.attributes.device_table is not None
+
+    captured = {}
+
+    def _capture_native_payload(payload, path, **_kwargs):
+        captured["payload"] = payload
+        Path(path).write_bytes(b"")
+
+    monkeypatch.setattr(
+        "vibespatial.io.geoparquet._write_geoparquet_native_tabular_result",
+        _capture_native_payload,
+    )
+
+    path = tmp_path / "native-indexed.parquet"
+    clear_materialization_events()
+    gdf.to_parquet(path)
+    events = get_materialization_events(clear=True)
+
+    payload = captured["payload"]
+    assert path.exists()
+    assert payload.attributes.dataframe is None
+    assert payload.attributes.device_table is not None
+    assert payload.attributes.index.equals(gdf.index)
+    assert payload.index_plan.kind == "host-labels"
+    assert get_native_state(gdf) is state
+    assert get_native_state(gdf).attributes.device_table is not None
+    assert all(event.operation != "device_attributes_to_arrow" for event in events)
+
+
+def test_device_wkb_writer_encodes_indexed_view_without_runtime_d2h() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for indexed-view WKB writer probe")
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.io.wkb import _encode_owned_wkb_column_device
+
+    owned = from_shapely_geometries(
+        [
+            Point(0, 0),
+            Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
+            MultiPolygon(
+                [
+                    Polygon([(10, 0), (11, 0), (11, 1), (10, 1)]),
+                ]
+            ),
+            LineString([(0, 0), (1, 1)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    indexed = owned.device_take(cp.asarray([2, 1, 2, 3], dtype=cp.int64))
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+
+    with assert_zero_d2h_transfers():
+        column = _encode_owned_wkb_column_device(indexed)
+
+    assert column.size() == 4
+    assert get_d2h_transfer_events(clear=True) == []
+    reset_d2h_transfer_count()
 
 
 def test_native_backed_geodataframe_writers_record_public_boundaries(tmp_path) -> None:

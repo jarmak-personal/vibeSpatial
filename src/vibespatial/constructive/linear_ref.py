@@ -46,19 +46,34 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import (
+    estimate_pairwise_work_from_owned,
+    estimate_physical_work_from_owned,
+)
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
 
-request_nvrtc_warmup([
-    ("interpolate-linestring", _INTERPOLATE_LINESTRING_KERNEL_SOURCE, _INTERPOLATE_LINESTRING_KERNEL_NAMES),
-    ("interpolate-multilinestring", _INTERPOLATE_MULTILINESTRING_KERNEL_SOURCE, _INTERPOLATE_MULTILINESTRING_KERNEL_NAMES),
-    ("project-linestring", _PROJECT_LINESTRING_KERNEL_SOURCE, _PROJECT_LINESTRING_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        (
+            "interpolate-linestring",
+            _INTERPOLATE_LINESTRING_KERNEL_SOURCE,
+            _INTERPOLATE_LINESTRING_KERNEL_NAMES,
+        ),
+        (
+            "interpolate-multilinestring",
+            _INTERPOLATE_MULTILINESTRING_KERNEL_SOURCE,
+            _INTERPOLATE_MULTILINESTRING_KERNEL_NAMES,
+        ),
+        ("project-linestring", _PROJECT_LINESTRING_KERNEL_SOURCE, _PROJECT_LINESTRING_KERNEL_NAMES),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # CPU fallback: interpolate along LineString coordinate buffer
 # ---------------------------------------------------------------------------
+
 
 def _interpolate_linestring_cpu(
     buf: FamilyGeometryBuffer,
@@ -126,6 +141,7 @@ def _interpolate_linestring_cpu(
 # ---------------------------------------------------------------------------
 # CPU fallback: interpolate along MultiLineString coordinate buffer
 # ---------------------------------------------------------------------------
+
 
 def _interpolate_multilinestring_cpu(
     buf: FamilyGeometryBuffer,
@@ -212,6 +228,7 @@ def _interpolate_multilinestring_cpu(
 # ---------------------------------------------------------------------------
 # CPU fallback: project point onto LineString
 # ---------------------------------------------------------------------------
+
 
 def _project_linestring_cpu(
     line_buf: FamilyGeometryBuffer,
@@ -502,6 +519,7 @@ def _project_gpu(
 # Public API: interpolate_owned
 # ---------------------------------------------------------------------------
 
+
 def interpolate_owned(
     owned: OwnedGeometryArray,
     distance: float | np.ndarray,
@@ -551,6 +569,7 @@ def interpolate_owned(
     row_count = owned.row_count
     if row_count == 0:
         from vibespatial.constructive.point import _empty_point_output
+
         return _empty_point_output()
 
     # Prepare distance array
@@ -566,6 +585,12 @@ def interpolate_owned(
         kernel_name="interpolate_linear_ref",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            output_byte_count=row_count * 16,
+            primary_unit_name="interpolate-line-segment",
+        ),
         requested_mode=dispatch_mode,
         current_residency=owned.residency,
     )
@@ -616,6 +641,7 @@ def interpolate_owned(
 
     # Build Point OwnedGeometryArray from CPU results
     from vibespatial.constructive.point import point_owned_from_xy
+
     return point_owned_from_xy(out_x, out_y)
 
 
@@ -655,6 +681,7 @@ def interpolate_native_tabular_result(
 # ---------------------------------------------------------------------------
 # Public API: project_owned
 # ---------------------------------------------------------------------------
+
 
 def project_owned(
     owned: OwnedGeometryArray,
@@ -711,6 +738,12 @@ def project_owned(
         kernel_name="project_linear_ref",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
+        work_estimate=estimate_pairwise_work_from_owned(
+            owned,
+            point_owned,
+            output_row_count=row_count,
+            primary_unit_name="project-line-segment",
+        ),
         requested_mode=dispatch_mode,
         current_residency=owned.residency,
     )

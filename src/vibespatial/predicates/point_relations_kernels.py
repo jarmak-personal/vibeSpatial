@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
 from vibespatial.cuda.device_functions.point_in_ring import POINT_IN_RING_KIND_DEVICE
 from vibespatial.cuda.device_functions.point_on_segment import (
     POINT_ON_SEGMENT_KIND_DEVICE,
@@ -17,7 +18,11 @@ from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
 # by the shared cuda.device_functions modules.
 
 _SHARED_DEVICE_HELPERS = (
-    POINT_ON_SEGMENT_KIND_DEVICE + POINT_IN_RING_KIND_DEVICE + SPATIAL_TOLERANCE_PREAMBLE + r"""
+    ORIENT2D_DEVICE
+    + POINT_ON_SEGMENT_KIND_DEVICE
+    + POINT_IN_RING_KIND_DEVICE
+    + SPATIAL_TOLERANCE_PREAMBLE
+    + r"""
 #define POINT_RELATION_TOLERANCE VS_SPATIAL_EPSILON
 
 extern "C" __device__ inline double vibespatial_abs(double value) {
@@ -83,7 +88,8 @@ extern "C" __device__ inline unsigned char multipolygon_point_location(
   }
   return 0;
 }
-""")
+"""
+)
 
 # ---------------------------------------------------------------------------
 # Single-point kernel __global__ functions (appended after shared helpers)

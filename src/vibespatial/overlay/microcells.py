@@ -15,7 +15,6 @@ from vibespatial.overlay.contraction_types import (
     RowMicrocellBand,
 )
 from vibespatial.predicates.binary import (
-    _broadcast_right_owned,
     evaluate_geopandas_binary_predicate,
 )
 from vibespatial.runtime import ExecutionMode
@@ -24,14 +23,13 @@ from vibespatial.spatial.segment_primitives import (
     SegmentIntersectionKind,
     SegmentTable,
     _extract_segments_gpu,
-    _segment_row_spans,
     classify_segment_intersections,
     extract_segments,
     get_cuda_runtime,
     summarize_exact_local_events,
 )
 
-from ._host_boundary import overlay_bool_scalar, overlay_device_to_host, overlay_int_scalar
+from ._host_boundary import overlay_int_scalar
 
 try:
     import cupy as cp
@@ -282,14 +280,18 @@ def _microcell_summary_from_segments(
 
         left_mask = left_segments.row_indices == row_idx
         right_mask = right_segments.row_indices == row_idx
-        minx = np.concatenate([
-            np.minimum(left_segments.x0[left_mask], left_segments.x1[left_mask]),
-            np.minimum(right_segments.x0[right_mask], right_segments.x1[right_mask]),
-        ])
-        maxx = np.concatenate([
-            np.maximum(left_segments.x0[left_mask], left_segments.x1[left_mask]),
-            np.maximum(right_segments.x0[right_mask], right_segments.x1[right_mask]),
-        ])
+        minx = np.concatenate(
+            [
+                np.minimum(left_segments.x0[left_mask], left_segments.x1[left_mask]),
+                np.minimum(right_segments.x0[right_mask], right_segments.x1[right_mask]),
+            ]
+        )
+        maxx = np.concatenate(
+            [
+                np.maximum(left_segments.x0[left_mask], left_segments.x1[left_mask]),
+                np.maximum(right_segments.x0[right_mask], right_segments.x1[right_mask]),
+            ]
+        )
 
         start = np.searchsorted(event_x, minx, side="right") - 1
         end = np.searchsorted(event_x, maxx, side="left") - 1
@@ -349,9 +351,7 @@ def _row_microcell_bands(
     if x0.size == 0:
         return []
 
-    event_x = np.unique(
-        np.concatenate((x0, x1, point_x.astype(np.float64, copy=False)))
-    )
+    event_x = np.unique(np.concatenate((x0, x1, point_x.astype(np.float64, copy=False))))
     if event_x.size < 2:
         return []
 
@@ -360,12 +360,7 @@ def _row_microcell_bands(
     maxx = np.maximum(x0, x1)
     start = np.searchsorted(event_x, minx, side="right") - 1
     end = np.searchsorted(event_x, maxx, side="left") - 1
-    valid = (
-        (start >= 0)
-        & (end >= start)
-        & (start < interval_count)
-        & (maxx > minx)
-    )
+    valid = (start >= 0) & (end >= start) & (start < interval_count) & (maxx > minx)
     if not np.any(valid):
         return []
 
@@ -382,7 +377,9 @@ def _row_microcell_bands(
         ends[end_idx + 1].append(seg_id)
 
     active: set[int] = set()
-    bands: list[tuple[int, int, int, float, float, float, float, float, float, float, float, bool, bool]] = []
+    bands: list[
+        tuple[int, int, int, float, float, float, float, float, float, float, float, bool, bool]
+    ] = []
     for interval_index in range(interval_count):
         for seg_id in starts[interval_index]:
             active.add(seg_id)
@@ -399,14 +396,20 @@ def _row_microcell_bands(
 
         x_mid = 0.5 * (x_left + x_right)
         active_ids = np.asarray(sorted(active), dtype=np.int32)
-        y_mid = _segment_y_at_x(x0[active_ids], y0[active_ids], x1[active_ids], y1[active_ids], x_mid)
+        y_mid = _segment_y_at_x(
+            x0[active_ids], y0[active_ids], x1[active_ids], y1[active_ids], x_mid
+        )
         if y_mid.size < 2:
             continue
         order = np.argsort(y_mid, kind="stable")
         sorted_ids = active_ids[order]
         sorted_mid_y = y_mid[order]
-        y_left = _segment_y_at_x(x0[sorted_ids], y0[sorted_ids], x1[sorted_ids], y1[sorted_ids], x_left)
-        y_right = _segment_y_at_x(x0[sorted_ids], y0[sorted_ids], x1[sorted_ids], y1[sorted_ids], x_right)
+        y_left = _segment_y_at_x(
+            x0[sorted_ids], y0[sorted_ids], x1[sorted_ids], y1[sorted_ids], x_left
+        )
+        y_right = _segment_y_at_x(
+            x0[sorted_ids], y0[sorted_ids], x1[sorted_ids], y1[sorted_ids], x_right
+        )
         is_left = sorted_ids < left_segment_count
         left_parity = np.cumsum(is_left, dtype=np.int32) & 1
         right_parity = np.cumsum(~is_left, dtype=np.int32) & 1
@@ -489,8 +492,10 @@ def build_overlay_microcell_bands(
         _require_same_row=True,
     )
     point_mask = (
-        np.asarray(exact.kinds, dtype=np.int8) == int(SegmentIntersectionKind.PROPER)
-    ) & np.isfinite(exact.point_x) & np.isfinite(exact.point_y)
+        (np.asarray(exact.kinds, dtype=np.int8) == int(SegmentIntersectionKind.PROPER))
+        & np.isfinite(exact.point_x)
+        & np.isfinite(exact.point_y)
+    )
     point_rows = exact.left_rows[point_mask].astype(np.int32, copy=False)
     point_x = exact.point_x[point_mask].astype(np.float64, copy=False)
 
@@ -555,39 +560,33 @@ def label_overlay_microcells(
 
     points = bands.representative_points
     row_ids = cp.asarray(bands.row_indices.astype(np.int64, copy=False))
-    left_inside = cp.empty(bands.count, dtype=cp.bool_)
-    right_inside = cp.empty(bands.count, dtype=cp.bool_)
-    unique_rows = cp.unique(row_ids).astype(cp.int64, copy=False)
-    unique_rows_h = overlay_device_to_host(
-        unique_rows,
-        reason="overlay microcells unique-row metadata loop",
-        dtype=np.int64,
+    left_rows = left._device_indexed_take(
+        row_ids,
+        assume_unique_indices=False,
     )
-    for row_id in unique_rows_h:
-        d_local = cp.flatnonzero(row_ids == int(row_id)).astype(cp.int64, copy=False)
-        point_subset = points.take(d_local)
-        d_row = cp.asarray([int(row_id)], dtype=cp.int64)
-        left_row = left.take(d_row)
-        right_row = right.take(d_row)
-        left_broadcast = _broadcast_right_owned(left_row, int(d_local.size))
-        right_broadcast = _broadcast_right_owned(right_row, int(d_local.size))
-        left_inside[d_local] = point_in_polygon(
-            point_subset,
-            left_broadcast,
-            dispatch_mode=dispatch_mode,
-            _return_device=True,
-        ).astype(cp.bool_, copy=False)
-        right_inside[d_local] = point_in_polygon(
-            point_subset,
-            right_broadcast,
-            dispatch_mode=dispatch_mode,
-            _return_device=True,
-        ).astype(cp.bool_, copy=False)
+    right_rows = right._device_indexed_take(
+        row_ids,
+        assume_unique_indices=False,
+    )
+    left_inside = point_in_polygon(
+        points,
+        left_rows,
+        dispatch_mode=dispatch_mode,
+        _return_device=True,
+    )
+    right_inside = point_in_polygon(
+        points,
+        right_rows,
+        dispatch_mode=dispatch_mode,
+        _return_device=True,
+    )
+    if left_inside is None or right_inside is None:
+        raise RuntimeError("GPU microcell labeling did not return device predicates")
 
     return OverlayMicrocellLabels(
         bands=bands,
-        left_inside=left_inside.astype(bool, copy=False),
-        right_inside=right_inside.astype(bool, copy=False),
+        left_inside=cp.asarray(left_inside, dtype=cp.bool_),
+        right_inside=cp.asarray(right_inside, dtype=cp.bool_),
     )
 
 
@@ -645,144 +644,505 @@ def _build_selected_row_microcell_arrays_device(
         return None
 
     interval_count = int(event_x.size - 1)
+    segment_count = int(x0.size)
+    memberships_per_page = 2 * 1024 * 1024
+    intervals_per_page = max(1, memberships_per_page // segment_count)
     minx = cp.minimum(x0, x1)
     maxx = cp.maximum(x0, x1)
-    start = cp.searchsorted(event_x, minx, side="right") - 1
-    end = cp.searchsorted(event_x, maxx, side="left") - 1
-    valid = (start >= 0) & (end >= start) & (start < interval_count) & (maxx > minx)
-    if not overlay_bool_scalar(
-        cp.any(valid),
-        reason="overlay microcells selected-row valid-band admission fence",
-    ):
-        return None
 
-    start_valid = start[valid].astype(cp.int64, copy=False)
-    end_valid = cp.minimum(end[valid], interval_count - 1).astype(cp.int64, copy=False)
-    seg_ids_valid = cp.arange(int(x0.size), dtype=cp.int32)[valid]
-    span = (end_valid - start_valid + 1).astype(cp.int32, copy=False)
-    total_memberships = overlay_int_scalar(
-        cp.sum(span, dtype=cp.int64),
-        reason="overlay microcells selected-row membership-count allocation fence",
+    from vibespatial.overlay.graph import (
+        _fp64_radix_keys,
+        _stable_radix_order_pass,
     )
-    if total_memberships == 0:
+
+    chunks: list[dict[str, Any]] = []
+    for interval_start in range(0, interval_count, intervals_per_page):
+        interval_end = min(interval_start + intervals_per_page, interval_count)
+        page_interval_count = interval_end - interval_start
+        membership_count = page_interval_count * segment_count
+        membership_ids = cp.arange(membership_count, dtype=cp.int32)
+        local_intervals = membership_ids // np.int32(segment_count)
+        segment_ids = membership_ids - local_intervals * np.int32(segment_count)
+        interval_ids = local_intervals + np.int32(interval_start)
+        x_mid = 0.5 * (event_x[interval_ids] + event_x[interval_ids + 1])
+        active = (minx[segment_ids] < x_mid) & (maxx[segment_ids] > x_mid)
+        y_mid = _segment_y_at_x_device(
+            x0[segment_ids],
+            y0[segment_ids],
+            x1[segment_ids],
+            y1[segment_ids],
+            x_mid,
+        )
+        y_mid = cp.where(active, y_mid, cp.inf)
+
+        order = cp.arange(membership_count, dtype=cp.int32)
+        y_keys = _fp64_radix_keys(y_mid)
+        order = _stable_radix_order_pass(order, y_keys)
+        del y_keys
+        order = _stable_radix_order_pass(order, interval_ids)
+
+        sorted_segment_ids = segment_ids[order].reshape(
+            page_interval_count,
+            segment_count,
+        )
+        sorted_active = active[order].reshape(
+            page_interval_count,
+            segment_count,
+        )
+        sorted_y = y_mid[order].reshape(page_interval_count, segment_count)
+        sorted_is_left = (
+            (sorted_segment_ids < np.int32(left_segment_count)) & sorted_active
+        ).astype(cp.int32, copy=False)
+        sorted_is_right = (
+            (sorted_segment_ids >= np.int32(left_segment_count)) & sorted_active
+        ).astype(cp.int32, copy=False)
+        left_prefix = cp.cumsum(sorted_is_left, axis=1, dtype=cp.int32)
+        right_prefix = cp.cumsum(sorted_is_right, axis=1, dtype=cp.int32)
+
+        pair_valid = (
+            sorted_active[:, :-1] & sorted_active[:, 1:] & (sorted_y[:, 1:] > sorted_y[:, :-1])
+        )
+        left_inside = (left_prefix[:, :-1] & np.int32(1)) != 0
+        right_inside = (right_prefix[:, :-1] & np.int32(1)) != 0
+        match selection_operation:
+            case None:
+                selected = cp.ones_like(pair_valid)
+            case "intersection":
+                selected = left_inside & right_inside
+            case "union":
+                selected = left_inside | right_inside
+            case "difference":
+                selected = left_inside & ~right_inside
+            case "symmetric_difference":
+                selected = left_inside ^ right_inside
+            case "identity":
+                selected = left_inside
+            case _:
+                raise ValueError(f"unsupported selection operation: {selection_operation}")
+        kept_pairs = cp.flatnonzero((pair_valid & selected).reshape(-1)).astype(
+            cp.int32,
+            copy=False,
+        )
+        if int(kept_pairs.size) == 0:
+            continue
+
+        pair_width = segment_count - 1
+        kept_local_intervals = kept_pairs // np.int32(pair_width)
+        kept_lower_positions = kept_pairs - kept_local_intervals * np.int32(pair_width)
+        band_intervals = kept_local_intervals + np.int32(interval_start)
+        lower_seg = sorted_segment_ids[
+            kept_local_intervals,
+            kept_lower_positions,
+        ].astype(cp.int32, copy=False)
+        upper_seg = sorted_segment_ids[
+            kept_local_intervals,
+            kept_lower_positions + 1,
+        ].astype(cp.int32, copy=False)
+        x_left = event_x[band_intervals]
+        x_right = event_x[band_intervals + 1]
+        y_lower_left = _segment_y_at_x_device(
+            x0[lower_seg], y0[lower_seg], x1[lower_seg], y1[lower_seg], x_left
+        )
+        y_lower_right = _segment_y_at_x_device(
+            x0[lower_seg], y0[lower_seg], x1[lower_seg], y1[lower_seg], x_right
+        )
+        y_upper_left = _segment_y_at_x_device(
+            x0[upper_seg], y0[upper_seg], x1[upper_seg], y1[upper_seg], x_left
+        )
+        y_upper_right = _segment_y_at_x_device(
+            x0[upper_seg], y0[upper_seg], x1[upper_seg], y1[upper_seg], x_right
+        )
+        kept_left_inside = left_inside.reshape(-1)[kept_pairs]
+        kept_right_inside = right_inside.reshape(-1)[kept_pairs]
+        chunks.append(
+            {
+                "interval_indices": band_intervals.astype(cp.int32, copy=False),
+                "lower_segment_ids": lower_seg,
+                "upper_segment_ids": upper_seg,
+                "x_left": x_left,
+                "x_right": x_right,
+                "y_lower_left": y_lower_left,
+                "y_lower_right": y_lower_right,
+                "y_upper_left": y_upper_left,
+                "y_upper_right": y_upper_right,
+                "representative_x": 0.5 * (x_left + x_right),
+                "representative_y": 0.5
+                * (
+                    sorted_y[:, :-1].reshape(-1)[kept_pairs]
+                    + sorted_y[:, 1:].reshape(-1)[kept_pairs]
+                ),
+                "left_inside": kept_left_inside,
+                "right_inside": kept_right_inside,
+            }
+        )
+
+    if not chunks:
         return None
 
-    span_offsets = cp.cumsum(span.astype(cp.int64), dtype=cp.int64) - span.astype(cp.int64)
-    membership_ids = cp.arange(total_memberships, dtype=cp.int64)
-    span_ends = span_offsets + span.astype(cp.int64)
-    membership_sources = cp.searchsorted(span_ends, membership_ids, side="right")
-    repeated_starts = start_valid[membership_sources]
-    repeated_seg_ids = seg_ids_valid[membership_sources]
-    repeated_offsets = span_offsets[membership_sources]
-    local_rank = membership_ids - repeated_offsets
-    interval_ids = repeated_starts + local_rank
-
-    x_mid = 0.5 * (event_x[:-1] + event_x[1:])
-    y_mid = _segment_y_at_x_device(
-        x0[repeated_seg_ids],
-        y0[repeated_seg_ids],
-        x1[repeated_seg_ids],
-        y1[repeated_seg_ids],
-        x_mid[interval_ids],
-    )
-    order = cp.lexsort(cp.stack((y_mid, interval_ids)))
-    interval_sorted = interval_ids[order]
-    seg_sorted = repeated_seg_ids[order]
-    y_mid_sorted = y_mid[order]
-    if int(seg_sorted.size) < 2:
-        return None
-
-    same_next = interval_sorted[:-1] == interval_sorted[1:]
-    if not overlay_bool_scalar(
-        cp.any(same_next),
-        reason="overlay microcells selected-row adjacent-band admission fence",
-    ):
-        return None
-
-    interval_change = cp.empty(int(seg_sorted.size), dtype=cp.bool_)
-    interval_change[0] = True
-    if int(seg_sorted.size) > 1:
-        interval_change[1:] = interval_sorted[1:] != interval_sorted[:-1]
-    interval_starts = cp.flatnonzero(interval_change).astype(cp.int64, copy=False)
-    interval_ends = cp.concatenate(
-        (interval_starts[1:], cp.asarray([int(seg_sorted.size)], dtype=cp.int64))
-    )
-    interval_counts = interval_ends - interval_starts
-
-    is_left_sorted = (seg_sorted < left_segment_count).astype(cp.int32, copy=False)
-    is_right_sorted = (1 - is_left_sorted).astype(cp.int32, copy=False)
-    left_cumsum = cp.cumsum(is_left_sorted, dtype=cp.int32)
-    right_cumsum = cp.cumsum(is_right_sorted, dtype=cp.int32)
-    left_prefix = cp.zeros(int(interval_starts.size), dtype=cp.int32)
-    right_prefix = cp.zeros(int(interval_starts.size), dtype=cp.int32)
-    if int(interval_starts.size) > 1:
-        left_prefix[1:] = left_cumsum[interval_starts[1:] - 1]
-        right_prefix[1:] = right_cumsum[interval_starts[1:] - 1]
-    interval_membership_ids = cp.arange(int(seg_sorted.size), dtype=cp.int64)
-    interval_ends = cp.cumsum(interval_counts, dtype=cp.int64)
-    interval_sources = cp.searchsorted(interval_ends, interval_membership_ids, side="right")
-    left_counts_per_pos = left_cumsum - left_prefix[interval_sources]
-    right_counts_per_pos = right_cumsum - right_prefix[interval_sources]
-
-    lower_pos = cp.flatnonzero(same_next).astype(cp.int64, copy=False)
-    left_inside = (left_counts_per_pos[lower_pos] & 1).astype(cp.bool_, copy=False)
-    right_inside = (right_counts_per_pos[lower_pos] & 1).astype(cp.bool_, copy=False)
-    band_mid_span = (
-        y_mid_sorted[1:][same_next] - y_mid_sorted[:-1][same_next]
-    ) > 1e-12
-
-    match selection_operation:
-        case None:
-            band_keep = cp.ones(int(lower_pos.size), dtype=cp.bool_)
-        case "intersection":
-            band_keep = left_inside & right_inside
-        case "union":
-            band_keep = left_inside | right_inside
-        case "difference":
-            band_keep = left_inside & ~right_inside
-        case "symmetric_difference":
-            band_keep = left_inside ^ right_inside
-        case "identity":
-            band_keep = left_inside
-        case _:
-            raise ValueError(f"unsupported selection operation: {selection_operation}")
-    band_keep = band_keep & band_mid_span
-    if not overlay_bool_scalar(
-        cp.any(band_keep),
-        reason="overlay microcells selected-row kept-band admission fence",
-    ):
-        return None
-
-    band_intervals = interval_sorted[:-1][same_next][band_keep].astype(cp.int32, copy=False)
-    lower_seg = seg_sorted[:-1][same_next][band_keep].astype(cp.int32, copy=False)
-    upper_seg = seg_sorted[1:][same_next][band_keep].astype(cp.int32, copy=False)
-    x_left = event_x[band_intervals]
-    x_right = event_x[band_intervals.astype(cp.int64) + 1]
-
-    y_lower_left = _segment_y_at_x_device(x0[lower_seg], y0[lower_seg], x1[lower_seg], y1[lower_seg], x_left)
-    y_lower_right = _segment_y_at_x_device(x0[lower_seg], y0[lower_seg], x1[lower_seg], y1[lower_seg], x_right)
-    y_upper_left = _segment_y_at_x_device(x0[upper_seg], y0[upper_seg], x1[upper_seg], y1[upper_seg], x_left)
-    y_upper_right = _segment_y_at_x_device(x0[upper_seg], y0[upper_seg], x1[upper_seg], y1[upper_seg], x_right)
-    representative_y = 0.5 * (
-        y_mid_sorted[:-1][same_next][band_keep] + y_mid_sorted[1:][same_next][band_keep]
-    )
+    def _cat(name: str):
+        arrays = [chunk[name] for chunk in chunks]
+        return arrays[0] if len(arrays) == 1 else cp.concatenate(arrays)
 
     return {
         "row_index": row_index,
-        "interval_indices": band_intervals,
-        "lower_segment_ids": lower_seg,
-        "upper_segment_ids": upper_seg,
-        "x_left": x_left,
-        "x_right": x_right,
-        "y_lower_left": y_lower_left,
-        "y_lower_right": y_lower_right,
-        "y_upper_left": y_upper_left,
-        "y_upper_right": y_upper_right,
-        "representative_x": 0.5 * (x_left + x_right),
-        "representative_y": representative_y,
-        "left_inside": left_inside[band_keep],
-        "right_inside": right_inside[band_keep],
+        **{
+            name: _cat(name)
+            for name in (
+                "interval_indices",
+                "lower_segment_ids",
+                "upper_segment_ids",
+                "x_left",
+                "x_right",
+                "y_lower_left",
+                "y_lower_right",
+                "y_upper_left",
+                "y_upper_right",
+                "representative_x",
+                "representative_y",
+                "left_inside",
+                "right_inside",
+            )
+        },
     }
+
+
+def _microcell_chunks_to_labels_device(
+    chunks: list[dict[str, Any]],
+) -> OverlayMicrocellLabels:
+    if cp is None or not chunks:
+        return _empty_overlay_microcell_labels_device()
+
+    def _cat(name: str):
+        arrays = [chunk[name] for chunk in chunks]
+        return arrays[0] if len(arrays) == 1 else cp.concatenate(arrays)
+
+    row_arrays = [
+        cp.full(
+            int(chunk["interval_indices"].size),
+            int(chunk["row_index"]),
+            dtype=cp.int32,
+        )
+        for chunk in chunks
+    ]
+    row_indices = row_arrays[0] if len(row_arrays) == 1 else cp.concatenate(row_arrays)
+    bands = OverlayMicrocellBands(
+        row_indices=row_indices,
+        interval_indices=_cat("interval_indices"),
+        lower_segment_ids=_cat("lower_segment_ids"),
+        upper_segment_ids=_cat("upper_segment_ids"),
+        x_left=_cat("x_left"),
+        x_right=_cat("x_right"),
+        y_lower_left=_cat("y_lower_left"),
+        y_lower_right=_cat("y_lower_right"),
+        y_upper_left=_cat("y_upper_left"),
+        y_upper_right=_cat("y_upper_right"),
+        representative_x=_cat("representative_x"),
+        representative_y=_cat("representative_y"),
+    )
+    return OverlayMicrocellLabels(
+        bands=bands,
+        left_inside=_cat("left_inside").astype(cp.bool_, copy=False),
+        right_inside=_cat("right_inside").astype(cp.bool_, copy=False),
+    )
+
+
+def _build_selected_segmented_microcell_labels_device(
+    *,
+    row_count: int,
+    left_device,
+    right_device,
+    point_rows,
+    point_x,
+    selection_operation: str | None,
+) -> OverlayMicrocellLabels:
+    """Build aligned-row microcells as one device-indirected relation."""
+    from vibespatial.overlay.graph import (
+        _fp64_radix_keys,
+        _stable_radix_order_pass,
+    )
+
+    left_count = int(left_device.count)
+    right_count = int(right_device.count)
+    segment_count = left_count + right_count
+    if segment_count == 0:
+        return _empty_overlay_microcell_labels_device()
+
+    segment_rows = cp.concatenate(
+        (
+            cp.asarray(left_device.row_indices, dtype=cp.int32),
+            cp.asarray(right_device.row_indices, dtype=cp.int32),
+        )
+    )
+    segment_is_left = cp.concatenate(
+        (
+            cp.ones(left_count, dtype=cp.bool_),
+            cp.zeros(right_count, dtype=cp.bool_),
+        )
+    )
+    segment_x0 = cp.concatenate((cp.asarray(left_device.x0), cp.asarray(right_device.x0))).astype(
+        cp.float64, copy=False
+    )
+    segment_y0 = cp.concatenate((cp.asarray(left_device.y0), cp.asarray(right_device.y0))).astype(
+        cp.float64, copy=False
+    )
+    segment_x1 = cp.concatenate((cp.asarray(left_device.x1), cp.asarray(right_device.x1))).astype(
+        cp.float64, copy=False
+    )
+    segment_y1 = cp.concatenate((cp.asarray(left_device.y1), cp.asarray(right_device.y1))).astype(
+        cp.float64, copy=False
+    )
+
+    segment_order = cp.arange(segment_count, dtype=cp.int32)
+    segment_order = _stable_radix_order_pass(segment_order, segment_rows)
+    segment_rows = segment_rows[segment_order]
+    segment_is_left = segment_is_left[segment_order]
+    segment_x0 = segment_x0[segment_order]
+    segment_y0 = segment_y0[segment_order]
+    segment_x1 = segment_x1[segment_order]
+    segment_y1 = segment_y1[segment_order]
+
+    segments_per_row = cp.bincount(
+        segment_rows,
+        minlength=row_count,
+    ).astype(cp.int32, copy=False)
+    segment_row_offsets = cp.concatenate(
+        (
+            cp.zeros(1, dtype=cp.int64),
+            cp.cumsum(segments_per_row, dtype=cp.int64),
+        )
+    )
+
+    event_rows = cp.concatenate(
+        (
+            segment_rows,
+            segment_rows,
+            cp.asarray(point_rows, dtype=cp.int32),
+        )
+    )
+    event_x = cp.concatenate(
+        (
+            segment_x0,
+            segment_x1,
+            cp.asarray(point_x, dtype=cp.float64),
+        )
+    )
+    event_count = int(event_x.size)
+    event_order = cp.arange(event_count, dtype=cp.int32)
+    event_order = _stable_radix_order_pass(event_order, _fp64_radix_keys(event_x))
+    event_order = _stable_radix_order_pass(event_order, event_rows)
+    sorted_event_rows = event_rows[event_order]
+    sorted_event_x = event_x[event_order]
+    unique_event = cp.empty(event_count, dtype=cp.bool_)
+    unique_event[0] = True
+    if event_count > 1:
+        unique_event[1:] = (sorted_event_rows[1:] != sorted_event_rows[:-1]) | (
+            sorted_event_x[1:] != sorted_event_x[:-1]
+        )
+    unique_event_ids = cp.flatnonzero(unique_event).astype(cp.int32, copy=False)
+    unique_event_rows = sorted_event_rows[unique_event_ids]
+    unique_event_x = sorted_event_x[unique_event_ids]
+    if int(unique_event_x.size) < 2:
+        return _empty_overlay_microcell_labels_device()
+
+    interval_valid = (unique_event_rows[1:] == unique_event_rows[:-1]) & (
+        unique_event_x[1:] > unique_event_x[:-1]
+    )
+    interval_event_ids = cp.flatnonzero(interval_valid).astype(cp.int32, copy=False)
+    if int(interval_event_ids.size) == 0:
+        return _empty_overlay_microcell_labels_device()
+    interval_rows = unique_event_rows[interval_event_ids]
+    interval_x_left = unique_event_x[interval_event_ids]
+    interval_x_right = unique_event_x[interval_event_ids + 1]
+    interval_count = int(interval_rows.size)
+    interval_start = cp.empty(interval_count, dtype=cp.bool_)
+    interval_start[0] = True
+    if interval_count > 1:
+        interval_start[1:] = interval_rows[1:] != interval_rows[:-1]
+    interval_starts = cp.flatnonzero(interval_start).astype(cp.int32, copy=False)
+    interval_groups = cp.cumsum(
+        interval_start.astype(cp.int32),
+        dtype=cp.int32,
+    ) - np.int32(1)
+    interval_indices = cp.arange(interval_count, dtype=cp.int32) - interval_starts[interval_groups]
+
+    interval_segment_counts = segments_per_row[interval_rows]
+    max_row_segments = int(
+        (
+            left_device.max_segments_per_row
+            if left_device.max_segments_per_row is not None
+            else left_count
+        )
+        + (
+            right_device.max_segments_per_row
+            if right_device.max_segments_per_row is not None
+            else right_count
+        )
+    )
+    membership_capacity = interval_count * max_row_segments
+    if membership_capacity == 0:
+        return _empty_overlay_microcell_labels_device()
+    membership_starts = (
+        cp.cumsum(
+            interval_segment_counts,
+            dtype=cp.int64,
+        )
+        - interval_segment_counts
+    )
+    membership_slots = cp.arange(membership_capacity, dtype=cp.int64)
+    logical_membership_count = membership_starts[-1] + interval_segment_counts[-1]
+    safe_membership_slots = cp.minimum(
+        membership_slots,
+        cp.maximum(logical_membership_count - np.int64(1), np.int64(0)),
+    )
+    membership_interval_ids = cp.searchsorted(
+        membership_starts + interval_segment_counts,
+        safe_membership_slots,
+        side="right",
+    ).astype(cp.int32, copy=False)
+    membership_interval_ids = cp.minimum(
+        membership_interval_ids,
+        np.int32(interval_count - 1),
+    )
+    membership_local_ids = (
+        safe_membership_slots - membership_starts[membership_interval_ids]
+    )
+    membership_segment_ids = (
+        segment_row_offsets[interval_rows[membership_interval_ids]] + membership_local_ids
+    ).astype(cp.int32, copy=False)
+    membership_x_mid = 0.5 * (
+        interval_x_left[membership_interval_ids] + interval_x_right[membership_interval_ids]
+    )
+    membership_active = (
+        (membership_slots < logical_membership_count)
+        & (cp.minimum(segment_x0, segment_x1)[membership_segment_ids] < membership_x_mid)
+    ) & (cp.maximum(segment_x0, segment_x1)[membership_segment_ids] > membership_x_mid)
+    active_memberships = cp.flatnonzero(membership_active).astype(cp.int32, copy=False)
+    if int(active_memberships.size) < 2:
+        return _empty_overlay_microcell_labels_device()
+    membership_interval_ids = membership_interval_ids[active_memberships]
+    membership_segment_ids = membership_segment_ids[active_memberships]
+    membership_x_mid = membership_x_mid[active_memberships]
+    membership_y_mid = _segment_y_at_x_device(
+        segment_x0[membership_segment_ids],
+        segment_y0[membership_segment_ids],
+        segment_x1[membership_segment_ids],
+        segment_y1[membership_segment_ids],
+        membership_x_mid,
+    )
+
+    membership_order = cp.arange(int(membership_y_mid.size), dtype=cp.int32)
+    membership_order = _stable_radix_order_pass(
+        membership_order,
+        _fp64_radix_keys(membership_y_mid),
+    )
+    membership_order = _stable_radix_order_pass(
+        membership_order,
+        membership_interval_ids,
+    )
+    sorted_interval_ids = membership_interval_ids[membership_order]
+    sorted_segment_ids = membership_segment_ids[membership_order]
+    sorted_y = membership_y_mid[membership_order]
+    sorted_is_left = segment_is_left[sorted_segment_ids].astype(cp.int32, copy=False)
+    sorted_is_right = np.int32(1) - sorted_is_left
+
+    sorted_interval_start = cp.empty(int(sorted_interval_ids.size), dtype=cp.bool_)
+    sorted_interval_start[0] = True
+    if int(sorted_interval_ids.size) > 1:
+        sorted_interval_start[1:] = sorted_interval_ids[1:] != sorted_interval_ids[:-1]
+    sorted_interval_starts = cp.flatnonzero(sorted_interval_start).astype(
+        cp.int32,
+        copy=False,
+    )
+    sorted_interval_groups = cp.cumsum(
+        sorted_interval_start.astype(cp.int32),
+        dtype=cp.int32,
+    ) - np.int32(1)
+    left_cumulative = cp.cumsum(sorted_is_left, dtype=cp.int32)
+    right_cumulative = cp.cumsum(sorted_is_right, dtype=cp.int32)
+    left_base = left_cumulative[sorted_interval_starts] - sorted_is_left[sorted_interval_starts]
+    right_base = right_cumulative[sorted_interval_starts] - sorted_is_right[sorted_interval_starts]
+    left_prefix = left_cumulative - left_base[sorted_interval_groups]
+    right_prefix = right_cumulative - right_base[sorted_interval_groups]
+
+    adjacent_same_interval = sorted_interval_ids[1:] == sorted_interval_ids[:-1]
+    pair_valid = adjacent_same_interval & (sorted_y[1:] > sorted_y[:-1])
+    left_inside = (left_prefix[:-1] & np.int32(1)) != 0
+    right_inside = (right_prefix[:-1] & np.int32(1)) != 0
+    match selection_operation:
+        case None:
+            selected = cp.ones_like(pair_valid)
+        case "intersection":
+            selected = left_inside & right_inside
+        case "union":
+            selected = left_inside | right_inside
+        case "difference":
+            selected = left_inside & ~right_inside
+        case "symmetric_difference":
+            selected = left_inside ^ right_inside
+        case "identity":
+            selected = left_inside
+        case _:
+            raise ValueError(f"unsupported selection operation: {selection_operation}")
+    kept_lower_positions = cp.flatnonzero(pair_valid & selected).astype(
+        cp.int32,
+        copy=False,
+    )
+    if int(kept_lower_positions.size) == 0:
+        return _empty_overlay_microcell_labels_device()
+
+    kept_interval_ids = sorted_interval_ids[kept_lower_positions]
+    lower_segment_ids = sorted_segment_ids[kept_lower_positions]
+    upper_segment_ids = sorted_segment_ids[kept_lower_positions + 1]
+    x_left = interval_x_left[kept_interval_ids]
+    x_right = interval_x_right[kept_interval_ids]
+    y_lower_left = _segment_y_at_x_device(
+        segment_x0[lower_segment_ids],
+        segment_y0[lower_segment_ids],
+        segment_x1[lower_segment_ids],
+        segment_y1[lower_segment_ids],
+        x_left,
+    )
+    y_lower_right = _segment_y_at_x_device(
+        segment_x0[lower_segment_ids],
+        segment_y0[lower_segment_ids],
+        segment_x1[lower_segment_ids],
+        segment_y1[lower_segment_ids],
+        x_right,
+    )
+    y_upper_left = _segment_y_at_x_device(
+        segment_x0[upper_segment_ids],
+        segment_y0[upper_segment_ids],
+        segment_x1[upper_segment_ids],
+        segment_y1[upper_segment_ids],
+        x_left,
+    )
+    y_upper_right = _segment_y_at_x_device(
+        segment_x0[upper_segment_ids],
+        segment_y0[upper_segment_ids],
+        segment_x1[upper_segment_ids],
+        segment_y1[upper_segment_ids],
+        x_right,
+    )
+    bands = OverlayMicrocellBands(
+        row_indices=interval_rows[kept_interval_ids].astype(cp.int32, copy=False),
+        interval_indices=interval_indices[kept_interval_ids].astype(cp.int32, copy=False),
+        lower_segment_ids=lower_segment_ids,
+        upper_segment_ids=upper_segment_ids,
+        x_left=x_left,
+        x_right=x_right,
+        y_lower_left=y_lower_left,
+        y_lower_right=y_lower_right,
+        y_upper_left=y_upper_left,
+        y_upper_right=y_upper_right,
+        representative_x=0.5 * (x_left + x_right),
+        representative_y=0.5
+        * (sorted_y[kept_lower_positions] + sorted_y[kept_lower_positions + 1]),
+    )
+    return OverlayMicrocellLabels(
+        bands=bands,
+        left_inside=left_inside[kept_lower_positions],
+        right_inside=right_inside[kept_lower_positions],
+    )
 
 
 def _build_and_label_selected_overlay_microcells_device(
@@ -798,11 +1158,41 @@ def _build_and_label_selected_overlay_microcells_device(
     left_device = _extract_segments_gpu(left)
     right_device = _extract_segments_gpu(right)
     try:
+        if left.row_count == right.row_count == 1:
+            intersections = classify_segment_intersections(
+                left,
+                right,
+                dispatch_mode=dispatch_mode,
+                _require_same_row=True,
+                _cached_left_device_segments=left_device,
+                _cached_right_device_segments=right_device,
+                _same_row_span_summary=(left_device.count, right_device.count, 0),
+            )
+            ds = intersections.device_state
+            if ds is None:
+                raise RuntimeError("GPU segment intersection result did not expose device_state")
+            point_mask = cp.isfinite(cp.asarray(ds.point_x)) & cp.isfinite(cp.asarray(ds.point_y))
+            chunk = _build_selected_row_microcell_arrays_device(
+                0,
+                x0=cp.concatenate((cp.asarray(left_device.x0), cp.asarray(right_device.x0))),
+                y0=cp.concatenate((cp.asarray(left_device.y0), cp.asarray(right_device.y0))),
+                x1=cp.concatenate((cp.asarray(left_device.x1), cp.asarray(right_device.x1))),
+                y1=cp.concatenate((cp.asarray(left_device.y1), cp.asarray(right_device.y1))),
+                left_segment_count=left_device.count,
+                point_x=cp.asarray(ds.point_x)[point_mask].astype(
+                    cp.float64,
+                    copy=False,
+                ),
+                selection_operation=selection_operation,
+            )
+            return _microcell_chunks_to_labels_device([] if chunk is None else [chunk])
+
         intersections = classify_segment_intersections(
             left,
             right,
             dispatch_mode=dispatch_mode,
             _require_same_row=True,
+            _cached_left_device_segments=left_device,
             _cached_right_device_segments=right_device,
         )
         ds = intersections.device_state
@@ -813,115 +1203,13 @@ def _build_and_label_selected_overlay_microcells_device(
         point_rows = cp.asarray(ds.left_rows)[point_mask].astype(cp.int32, copy=False)
         point_x = cp.asarray(ds.point_x)[point_mask].astype(cp.float64, copy=False)
 
-        left_row_ids, left_row_starts, left_row_ends = _segment_row_spans(left_device.row_indices)
-        right_row_ids, right_row_starts, right_row_ends = _segment_row_spans(right_device.row_indices)
-        left_row_ids_h = overlay_device_to_host(
-            left_row_ids,
-            reason="overlay microcells left row-span id metadata",
-            dtype=np.int64,
-        )
-        left_row_starts_h = overlay_device_to_host(
-            left_row_starts,
-            reason="overlay microcells left row-span start metadata",
-            dtype=np.int64,
-        )
-        left_row_ends_h = overlay_device_to_host(
-            left_row_ends,
-            reason="overlay microcells left row-span end metadata",
-            dtype=np.int64,
-        )
-        right_row_ids_h = overlay_device_to_host(
-            right_row_ids,
-            reason="overlay microcells right row-span id metadata",
-            dtype=np.int64,
-        )
-        right_row_starts_h = overlay_device_to_host(
-            right_row_starts,
-            reason="overlay microcells right row-span start metadata",
-            dtype=np.int64,
-        )
-        right_row_ends_h = overlay_device_to_host(
-            right_row_ends,
-            reason="overlay microcells right row-span end metadata",
-            dtype=np.int64,
-        )
-        right_span_by_row = {
-            int(row): (int(start), int(end))
-            for row, start, end in zip(right_row_ids_h, right_row_starts_h, right_row_ends_h, strict=False)
-        }
-
-        chunks: list[dict[str, Any]] = []
-        for row, left_start, left_end in zip(left_row_ids_h, left_row_starts_h, left_row_ends_h, strict=False):
-            right_span = right_span_by_row.get(int(row))
-            if right_span is None:
-                continue
-            right_start, right_end = right_span
-            row_point_x = point_x[point_rows == int(row)]
-            chunk = _build_selected_row_microcell_arrays_device(
-                int(row),
-                x0=cp.concatenate(
-                    (cp.asarray(left_device.x0)[left_start:left_end], cp.asarray(right_device.x0)[right_start:right_end])
-                ),
-                y0=cp.concatenate(
-                    (cp.asarray(left_device.y0)[left_start:left_end], cp.asarray(right_device.y0)[right_start:right_end])
-                ),
-                x1=cp.concatenate(
-                    (cp.asarray(left_device.x1)[left_start:left_end], cp.asarray(right_device.x1)[right_start:right_end])
-                ),
-                y1=cp.concatenate(
-                    (cp.asarray(left_device.y1)[left_start:left_end], cp.asarray(right_device.y1)[right_start:right_end])
-                ),
-                left_segment_count=int(left_end - left_start),
-                point_x=row_point_x,
-                selection_operation=selection_operation,
-            )
-            if chunk is not None:
-                chunks.append(chunk)
-
-        if not chunks:
-            return _empty_overlay_microcell_labels_device()
-
-        def _cat(name: str):
-            return cp.concatenate([chunk[name] for chunk in chunks])
-
-        interval_indices = _cat("interval_indices")
-        lower_segment_ids = _cat("lower_segment_ids")
-        upper_segment_ids = _cat("upper_segment_ids")
-        x_left = _cat("x_left")
-        x_right = _cat("x_right")
-        y_lower_left = _cat("y_lower_left")
-        y_lower_right = _cat("y_lower_right")
-        y_upper_left = _cat("y_upper_left")
-        y_upper_right = _cat("y_upper_right")
-        representative_x = _cat("representative_x")
-        representative_y = _cat("representative_y")
-        left_inside = _cat("left_inside").astype(cp.bool_, copy=False)
-        right_inside = _cat("right_inside").astype(cp.bool_, copy=False)
-        row_indices = cp.concatenate(
-            [
-                cp.full(int(chunk["interval_indices"].size), int(chunk["row_index"]), dtype=cp.int32)
-                for chunk in chunks
-            ]
-        )
-
-        bands = OverlayMicrocellBands(
-            row_indices=row_indices,
-            interval_indices=interval_indices,
-            lower_segment_ids=lower_segment_ids,
-            upper_segment_ids=upper_segment_ids,
-            x_left=x_left,
-            x_right=x_right,
-            y_lower_left=y_lower_left,
-            y_lower_right=y_lower_right,
-            y_upper_left=y_upper_left,
-            y_upper_right=y_upper_right,
-            representative_x=representative_x,
-            representative_y=representative_y,
-        )
-        return OverlayMicrocellLabels(
-            bands=bands,
-            left_inside=left_inside,
-            right_inside=right_inside,
+        return _build_selected_segmented_microcell_labels_device(
+            row_count=left.row_count,
+            left_device=left_device,
+            right_device=right_device,
+            point_rows=point_rows,
+            point_x=point_x,
+            selection_operation=selection_operation,
         )
     finally:
         left_device.free()
@@ -980,12 +1268,16 @@ def build_and_label_overlay_microcells(
         _require_same_row=True,
     )
     point_mask = (
-        np.asarray(exact.kinds, dtype=np.int8) == int(SegmentIntersectionKind.PROPER)
-    ) & np.isfinite(exact.point_x) & np.isfinite(exact.point_y)
+        (np.asarray(exact.kinds, dtype=np.int8) == int(SegmentIntersectionKind.PROPER))
+        & np.isfinite(exact.point_x)
+        & np.isfinite(exact.point_y)
+    )
     point_rows = exact.left_rows[point_mask].astype(np.int32, copy=False)
     point_x = exact.point_x[point_mask].astype(np.float64, copy=False)
 
-    row_bands: list[tuple[int, int, int, int, float, float, float, float, float, float, float, bool, bool]] = []
+    row_bands: list[
+        tuple[int, int, int, int, float, float, float, float, float, float, float, bool, bool]
+    ] = []
     for row_index in range(left.row_count):
         row_point_x = point_x[point_rows == row_index]
         row_bands.extend(
@@ -1056,8 +1348,12 @@ def build_overlay_contraction_summary(
     dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
 ) -> OverlayContractionSummary:
     aligned = build_aligned_overlay_workload(left, right)
-    left_segments = _extract_segments_for_microcells(aligned.left_aligned, dispatch_mode=dispatch_mode)
-    right_segments = _extract_segments_for_microcells(aligned.right_aligned, dispatch_mode=dispatch_mode)
+    left_segments = _extract_segments_for_microcells(
+        aligned.left_aligned, dispatch_mode=dispatch_mode
+    )
+    right_segments = _extract_segments_for_microcells(
+        aligned.right_aligned, dispatch_mode=dispatch_mode
+    )
     exact_events = summarize_exact_local_events(
         aligned.left_aligned,
         aligned.right_aligned,

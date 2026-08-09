@@ -298,12 +298,14 @@ def _materialize_full_polygon_family(buffer: FamilyGeometryBuffer) -> np.ndarray
     if nonempty_positions.size == 0:
         return result
     ring_counts = np.diff(buffer.geometry_offsets)[nonempty_positions]
-    coord_count = int(buffer.ring_offsets[-1])
+    active_ring_count = int(buffer.geometry_offsets[-1])
+    active_ring_offsets = buffer.ring_offsets[: active_ring_count + 1]
+    coord_count = int(active_ring_offsets[-1])
     rings = shapely.linearrings(
         _xy_view(buffer, coord_count),
         indices=np.repeat(
-            np.arange(buffer.ring_offsets.size - 1, dtype=np.int32),
-            np.diff(buffer.ring_offsets),
+            np.arange(active_ring_count, dtype=np.int32),
+            np.diff(active_ring_offsets),
         ),
     )
     result[nonempty_positions] = np.asarray(
@@ -363,12 +365,14 @@ def _materialize_full_multilinestring_family(buffer: FamilyGeometryBuffer) -> np
     nonempty_positions = np.flatnonzero(~empty_mask)
     if nonempty_positions.size == 0:
         return result
-    coord_count = int(buffer.part_offsets[-1])
+    active_part_count = int(buffer.geometry_offsets[-1])
+    active_part_offsets = buffer.part_offsets[: active_part_count + 1]
+    coord_count = int(active_part_offsets[-1])
     lines = shapely.linestrings(
         _xy_view(buffer, coord_count),
         indices=np.repeat(
-            np.arange(buffer.part_offsets.size - 1, dtype=np.int32),
-            np.diff(buffer.part_offsets),
+            np.arange(active_part_count, dtype=np.int32),
+            np.diff(active_part_offsets),
         ),
     )
     line_counts = np.diff(buffer.geometry_offsets)[nonempty_positions]
@@ -437,19 +441,23 @@ def _materialize_full_multipolygon_family(buffer: FamilyGeometryBuffer) -> np.nd
     nonempty_positions = np.flatnonzero(~empty_mask)
     if nonempty_positions.size == 0:
         return result
-    coord_count = int(buffer.ring_offsets[-1])
+    active_polygon_count = int(buffer.geometry_offsets[-1])
+    active_part_offsets = buffer.part_offsets[: active_polygon_count + 1]
+    active_ring_count = int(active_part_offsets[-1])
+    active_ring_offsets = buffer.ring_offsets[: active_ring_count + 1]
+    coord_count = int(active_ring_offsets[-1])
     rings = shapely.linearrings(
         _xy_view(buffer, coord_count),
         indices=np.repeat(
-            np.arange(buffer.ring_offsets.size - 1, dtype=np.int32),
-            np.diff(buffer.ring_offsets),
+            np.arange(active_ring_count, dtype=np.int32),
+            np.diff(active_ring_offsets),
         ),
     )
     polygons = shapely.polygons(
         rings,
         indices=np.repeat(
-            np.arange(buffer.part_offsets.size - 1, dtype=np.int32),
-            np.diff(buffer.part_offsets),
+            np.arange(active_polygon_count, dtype=np.int32),
+            np.diff(active_part_offsets),
         ),
     )
     polygon_counts = np.diff(buffer.geometry_offsets)[nonempty_positions]
@@ -464,9 +472,8 @@ def _materialize_full_multipolygon_family(buffer: FamilyGeometryBuffer) -> np.nd
 
 
 def _is_full_family_selection(buffer: FamilyGeometryBuffer, family_rows: np.ndarray) -> bool:
-    return (
-        family_rows.size == buffer.row_count
-        and bool(np.array_equal(family_rows, np.arange(buffer.row_count, dtype=np.int32)))
+    return family_rows.size == buffer.row_count and bool(
+        np.array_equal(family_rows, np.arange(buffer.row_count, dtype=np.int32))
     )
 
 
@@ -502,6 +509,114 @@ def _materialize_family_rows(buffer: FamilyGeometryBuffer, family_rows: np.ndarr
     raise NotImplementedError(f"unsupported geometry family: {buffer.family.value}")
 
 
+def _metadata_rows_for_shapely_export(
+    owned: OwnedGeometryArray,
+    rows: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    base = getattr(owned, "_base", None)
+    index_map = getattr(owned, "_index_map", None)
+    if base is not None and index_map is not None:
+        if hasattr(index_map, "__cuda_array_interface__") and base.device_state is not None:
+            try:
+                import cupy as cp
+            except ModuleNotFoundError:  # pragma: no cover - guarded by device state
+                cp = None
+            if cp is not None:
+                from vibespatial.cuda._runtime import get_cuda_runtime
+
+                current = owned
+                d_rows = cp.asarray(rows, dtype=cp.int64)
+                d_validity = cp.ones(int(d_rows.size), dtype=cp.bool_)
+                while current.is_indexed_view:
+                    current_state = current._ensure_device_state(preserve_indexed_view=True)
+                    d_validity &= cp.asarray(current_state.validity, dtype=cp.bool_)[d_rows]
+                    current_map = getattr(current, "_index_map", None)
+                    current_base = getattr(current, "_base", None)
+                    if current_map is None or current_base is None:
+                        raise RuntimeError(
+                            "indexed Shapely export encountered an incomplete row carrier"
+                        )
+                    d_rows = cp.asarray(current_map, dtype=cp.int64)[d_rows]
+                    current = current_base
+
+                base_state = current._ensure_device_state(preserve_indexed_view=True)
+                d_validity &= cp.asarray(base_state.validity, dtype=cp.bool_)[d_rows]
+                runtime = get_cuda_runtime()
+                validity = runtime.copy_device_to_host(
+                    d_validity,
+                    reason="owned geometry shapely export validity metadata boundary",
+                )
+                tags = runtime.copy_device_to_host(
+                    cp.asarray(base_state.tags)[d_rows],
+                    reason="owned geometry shapely export family-tag metadata boundary",
+                )
+                family_row_offsets = runtime.copy_device_to_host(
+                    cp.asarray(base_state.family_row_offsets)[d_rows],
+                    reason="owned geometry shapely export family-row metadata boundary",
+                )
+                return (
+                    np.asarray(validity, dtype=bool),
+                    np.asarray(tags, dtype=np.int8),
+                    np.asarray(family_row_offsets, dtype=np.int32),
+                )
+
+        base_rows = np.asarray(index_map, dtype=np.int64)[rows]
+        return (
+            np.asarray(base.validity[base_rows], dtype=bool),
+            np.asarray(base.tags[base_rows], dtype=np.int8),
+            np.asarray(base.family_row_offsets[base_rows], dtype=np.int32),
+        )
+
+    if (
+        getattr(owned, "_validity", None) is not None
+        and getattr(owned, "_tags", None) is not None
+        and getattr(owned, "_family_row_offsets", None) is not None
+    ):
+        return (
+            np.asarray(owned.validity[rows], dtype=bool),
+            np.asarray(owned.tags[rows], dtype=np.int8),
+            np.asarray(owned.family_row_offsets[rows], dtype=np.int32),
+        )
+    if owned.device_state is None:
+        return (
+            np.asarray(owned.validity[rows], dtype=bool),
+            np.asarray(owned.tags[rows], dtype=np.int8),
+            np.asarray(owned.family_row_offsets[rows], dtype=np.int32),
+        )
+
+    try:
+        import cupy as cp
+    except ModuleNotFoundError:  # pragma: no cover - guarded by device state
+        return (
+            np.asarray(owned.validity[rows], dtype=bool),
+            np.asarray(owned.tags[rows], dtype=np.int8),
+            np.asarray(owned.family_row_offsets[rows], dtype=np.int32),
+        )
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    state = owned._ensure_device_state(preserve_indexed_view=True)
+    d_rows = cp.asarray(rows, dtype=cp.int64)
+    runtime = get_cuda_runtime()
+    validity = runtime.copy_device_to_host(
+        cp.asarray(state.validity)[d_rows],
+        reason="owned geometry shapely export validity metadata boundary",
+    )
+    tags = runtime.copy_device_to_host(
+        cp.asarray(state.tags)[d_rows],
+        reason="owned geometry shapely export family-tag metadata boundary",
+    )
+    family_row_offsets = runtime.copy_device_to_host(
+        cp.asarray(state.family_row_offsets)[d_rows],
+        reason="owned geometry shapely export family-row metadata boundary",
+    )
+    return (
+        np.asarray(validity, dtype=bool),
+        np.asarray(tags, dtype=np.int8),
+        np.asarray(family_row_offsets, dtype=np.int32),
+    )
+
+
 def owned_to_shapely(
     owned: OwnedGeometryArray,
     *,
@@ -510,7 +625,7 @@ def owned_to_shapely(
 ) -> np.ndarray:
     from vibespatial.geometry import owned as owned_module
 
-    owned._ensure_host_state()
+    owned._ensure_host_state(preserve_indexed_view=True)
     if rows is None:
         rows = np.arange(owned.row_count, dtype=np.intp)
         detail = "materialized shapely geometries via explicit host bridge"
@@ -524,13 +639,14 @@ def owned_to_shapely(
     if rows.size == 0:
         return result
 
-    validity = np.asarray(owned.validity[rows], dtype=bool)
+    validity, tags, family_row_offsets = _metadata_rows_for_shapely_export(
+        owned,
+        rows,
+    )
     result[~validity] = None
     if not validity.any():
         return result
 
-    tags = np.asarray(owned.tags[rows], dtype=np.int8)
-    family_row_offsets = np.asarray(owned.family_row_offsets[rows], dtype=np.int32)
     for family, buffer in owned.families.items():
         family_tag = owned_module.FAMILY_TAGS[family]
         family_mask = validity & (tags == family_tag)

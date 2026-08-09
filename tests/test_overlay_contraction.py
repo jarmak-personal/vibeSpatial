@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 from pathlib import Path
 
 import pytest
@@ -15,8 +16,8 @@ from vibespatial.overlay.contraction import (
     summarize_overlay_contraction_canary,
 )
 
-contract_module = importlib.import_module("vibespatial.overlay.contract")
 reconstruct_module = importlib.import_module("vibespatial.overlay.contraction_reconstruct")
+boundary_graph_module = importlib.import_module("vibespatial.overlay.boundary_graph")
 DATA_ROOT = Path(__file__).resolve().parents[1] / "tests" / "upstream" / "geopandas" / "tests" / "data"
 LEFT_NYBB = DATA_ROOT / "nybb_16a.zip"
 RIGHT_NYBB = DATA_ROOT / "overlay" / "nybb_qgis" / "polydf2.shp"
@@ -26,6 +27,19 @@ def _load_nybb_owned():
     left = read_file(f"zip://{LEFT_NYBB}")
     right = read_file(str(RIGHT_NYBB))
     return left.geometry.values.to_owned(), right.geometry.values.to_owned()
+
+
+def test_overlay_contraction_reconstruction_is_native_boundary_shaped() -> None:
+    reconstruct_source = inspect.getsource(
+        reconstruct_module.reconstruct_overlay_from_microcells
+    )
+    boundary_source = inspect.getsource(boundary_graph_module)
+
+    assert "microcell_boundary_segments_gpu" in reconstruct_source
+    assert "build_polygon_output_from_boundary_segments_gpu" in reconstruct_source
+    assert "segmented_union_all" not in reconstruct_source
+    assert "overlay_device_to_host" not in boundary_source
+    assert "cp.lexsort(cp.stack" not in boundary_source
 
 
 def test_overlay_contraction_nybb_pair_alignment_shape_is_stable() -> None:
@@ -91,22 +105,9 @@ def test_overlay_contraction_owned_matches_simple_rectangles(operation, expected
 
 
 @pytest.mark.gpu
-def test_overlay_contraction_gpu_path_bypasses_host_helper(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_overlay_contraction_gpu_path_stays_native() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
-
-    monkeypatch.setattr(
-        contract_module,
-        "_contract_overlay_microcells_host",
-        lambda *args, **kwargs: pytest.fail("GPU contraction should not need the host helper on simple rectangles"),
-    )
-    monkeypatch.setattr(
-        reconstruct_module,
-        "_walk_boundary_rings",
-        lambda *args, **kwargs: pytest.fail("GPU contraction should not export microcell edges to host"),
-    )
 
     left = from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)])
     right = from_shapely_geometries([box(1.0, 0.0, 3.0, 2.0)])
@@ -125,19 +126,12 @@ def test_overlay_contraction_gpu_path_bypasses_host_helper(
         ("difference", box(0.0, 0.0, 1.0, 2.0)),
     ],
 )
-def test_overlay_contraction_reconstruction_uses_device_grouped_microcell_union(
+def test_overlay_contraction_reconstruction_uses_native_boundary_graph(
     operation,
     expected,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
-
-    monkeypatch.setattr(
-        reconstruct_module,
-        "_walk_boundary_rings",
-        lambda *args, **kwargs: pytest.fail("selected microcells should reduce on device"),
-    )
 
     left = from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)])
     right = from_shapely_geometries([box(1.0, 0.0, 3.0, 2.0)])

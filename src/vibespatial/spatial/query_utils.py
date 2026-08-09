@@ -20,6 +20,10 @@ from vibespatial.geometry.owned import (
 from vibespatial.predicates.binary import evaluate_binary_predicate
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import (
+    PhysicalWorkEstimate,
+    estimate_spatial_index_work_from_owned,
+)
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import Residency
@@ -162,7 +166,11 @@ def _to_owned_points_fast(values: np.ndarray) -> OwnedGeometryArray | None:
         families={GeometryFamily.POINT: point_buffer},
         residency=Residency.HOST,
     )
-    array._record(DiagnosticKind.CREATED, "created owned geometry array from shapely points (vectorized fast-path)", visible=True)
+    array._record(
+        DiagnosticKind.CREATED,
+        "created owned geometry array from shapely points (vectorized fast-path)",
+        visible=True,
+    )
     return array
 
 
@@ -207,7 +215,9 @@ def _reorder_scalar_tree_matches(indices: np.ndarray, order: np.ndarray) -> np.n
     return indices[np.argsort(rank[indices], kind="stable")]
 
 
-def _indices_to_dense(indices: np.ndarray, tree_size: int, query_size: int, scalar: bool) -> np.ndarray:
+def _indices_to_dense(
+    indices: np.ndarray, tree_size: int, query_size: int, scalar: bool
+) -> np.ndarray:
     if scalar:
         dense = np.zeros(tree_size, dtype=bool)
         dense[indices] = True
@@ -235,7 +245,9 @@ def _indices_to_sparse(indices: np.ndarray, tree_size: int, query_size: int, sca
 
 def _expand_bounds(bounds: np.ndarray, distances: np.ndarray) -> np.ndarray:
     expanded = bounds.copy()
-    if hasattr(expanded, "__cuda_array_interface__") and not hasattr(distances, "__cuda_array_interface__"):
+    if hasattr(expanded, "__cuda_array_interface__") and not hasattr(
+        distances, "__cuda_array_interface__"
+    ):
         import cupy as cp
 
         distances = cp.asarray(distances)
@@ -256,6 +268,10 @@ def _gpu_bounds_dispatch_mode(geometry_array: OwnedGeometryArray) -> ExecutionMo
         mixed_geometry=len(geometry_families) > 1,
         current_residency=geometry_array.residency,
         gpu_available=has_gpu_runtime(),
+        work_estimate=estimate_spatial_index_work_from_owned(
+            geometry_array,
+            primary_unit_name="bounds-coordinate",
+        ),
     )
     return selection.selected
 
@@ -268,13 +284,25 @@ def _planned_query_runtime_selection(
     requested_mode: ExecutionMode | str,
     reason: str,
     gpu_available: bool | None = None,
+    work_estimate: PhysicalWorkEstimate | None = None,
 ) -> RuntimeSelection:
+    if work_estimate is None and kernel_name in {
+        "spatial_query_refine",
+        "predicate_refine",
+        "dwithin_refine",
+    }:
+        work_estimate = PhysicalWorkEstimate.for_relation_pairs(
+            row_count=row_count,
+            relation_pair_count=row_count,
+            primary_unit_name="refine-relation-pair",
+        )
     selection = plan_dispatch_selection(
         kernel_name=kernel_name,
         kernel_class=kernel_class,
         row_count=row_count,
         requested_mode=requested_mode,
         gpu_available=gpu_available,
+        work_estimate=work_estimate,
     )
     return replace(selection.runtime_selection, reason=reason)
 
@@ -355,7 +383,10 @@ def _filter_device_de9im_relation_pairs(
         d_keep[d_gpu_idx] = d_point_keep
 
     from vibespatial.predicates.binary import _evaluate_de9im_device
-    from vibespatial.predicates.polygon import compute_polygon_de9im_gpu
+    from vibespatial.predicates.polygon import (
+        compute_polygon_de9im_gpu,
+        compute_polygonal_intersects_gpu,
+    )
 
     de9im_families = (
         GeometryFamily.LINESTRING,
@@ -363,20 +394,63 @@ def _filter_device_de9im_relation_pairs(
         GeometryFamily.POLYGON,
         GeometryFamily.MULTIPOLYGON,
     )
-    for query_family in de9im_families:
+    polygonal_families = frozenset({GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON})
+
+    def _present_families(owned):
+        present = []
+        for family in de9im_families:
+            if family not in owned.families:
+                continue
+            family_has_rows = getattr(owned, "family_has_rows", None)
+            if family_has_rows is not None and not family_has_rows(family):
+                continue
+            present.append(family)
+        return tuple(present)
+
+    query_families = _present_families(query_owned)
+    tree_families = _present_families(tree_owned)
+    if not query_families or not tree_families:
+        return None
+
+    single_de9im_family_pair = (
+        not gpu_pairs_present and len(query_families) == 1 and len(tree_families) == 1
+    )
+    for query_family in query_families:
         query_tag = FAMILY_TAGS[query_family]
-        for tree_family in de9im_families:
+        for tree_family in tree_families:
             tree_tag = FAMILY_TAGS[tree_family]
-            d_pair_mask = (
-                d_de9im_pair_mask
-                & (d_left_tags == query_tag)
-                & (d_right_tags == tree_tag)
-            )
-            d_pair_idx = cp.flatnonzero(d_pair_mask).astype(
-                cp.int32,
-                copy=False,
-            )
+            if single_de9im_family_pair:
+                d_pair_idx = cp.arange(
+                    device_candidates.total_pairs,
+                    dtype=cp.int32,
+                )
+            else:
+                d_pair_mask = (
+                    d_de9im_pair_mask & (d_left_tags == query_tag) & (d_right_tags == tree_tag)
+                )
+                d_pair_idx = cp.flatnonzero(d_pair_mask).astype(
+                    cp.int32,
+                    copy=False,
+                )
             if d_pair_idx.size == 0:
+                continue
+            if (
+                predicate == "intersects"
+                and query_family in polygonal_families
+                and tree_family in polygonal_families
+            ):
+                d_intersects = compute_polygonal_intersects_gpu(
+                    query_owned,
+                    tree_owned,
+                    query_family=query_family,
+                    tree_family=tree_family,
+                    d_left=device_candidates.d_left[d_pair_idx],
+                    d_right=device_candidates.d_right[d_pair_idx],
+                    return_device=True,
+                )
+                if d_intersects is None:
+                    return None
+                d_keep[d_pair_idx] = d_intersects
                 continue
             d_masks = compute_polygon_de9im_gpu(
                 query_owned,
@@ -478,9 +552,7 @@ def _owned_gpu_predicate_family_admission(
         if query_owned.family_has_rows(family)
     )
     tree_tags = tuple(
-        FAMILY_TAGS[family]
-        for family in tree_owned.families
-        if tree_owned.family_has_rows(family)
+        FAMILY_TAGS[family] for family in tree_owned.families if tree_owned.family_has_rows(family)
     )
     if not query_tags or not tree_tags:
         return None
@@ -492,20 +564,15 @@ def _owned_gpu_predicate_family_admission(
         for right_tag in tree_tags:
             left_is_point = left_tag in {point_tag, mp_tag}
             right_is_point = right_tag in {point_tag, mp_tag}
-            gpu_pair = (
-                (left_is_point and right_tag in non_de9im_tags)
-                or (right_is_point and left_tag in non_de9im_tags)
+            gpu_pair = (left_is_point and right_tag in non_de9im_tags) or (
+                right_is_point and left_tag in non_de9im_tags
             )
             de9im_pair = left_tag in de9im_tags and right_tag in de9im_tags
             all_gpu = all_gpu and gpu_pair
             any_gpu = any_gpu or gpu_pair
-            all_non_gpu_have_de9im = (
-                all_non_gpu_have_de9im and (de9im_pair or gpu_pair)
-            )
+            all_non_gpu_have_de9im = all_non_gpu_have_de9im and (de9im_pair or gpu_pair)
 
-    if all_gpu:
-        return all_gpu, any_gpu, all_non_gpu_have_de9im
-    return None
+    return all_gpu, any_gpu, all_non_gpu_have_de9im
 
 
 def _filter_predicate_pairs_owned(
@@ -622,6 +689,7 @@ def _filter_predicate_pairs_owned(
     # (ADR-0005: no eager D→H for tag lookup).
     if _has_device and has_gpu_runtime():
         import cupy as _cp
+
         # Reuse device-resident tags from device_state when available
         # to avoid redundant H→D transfers (hitlist #17).
         _q_ds = query_owned.device_state
@@ -633,23 +701,29 @@ def _filter_predicate_pairs_owned(
 
         point_tag = FAMILY_TAGS[GeometryFamily.POINT]
         mp_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
-        line_tags_arr = _cp.array([FAMILY_TAGS[f] for f in (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING)], dtype=_cp.int8)
-        region_tags_arr = _cp.array([FAMILY_TAGS[f] for f in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON)], dtype=_cp.int8)
-        all_non_de9im = _cp.concatenate([_cp.array([point_tag, mp_tag], dtype=_cp.int8), line_tags_arr, region_tags_arr])
+        line_tags_arr = _cp.array(
+            [FAMILY_TAGS[f] for f in (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING)],
+            dtype=_cp.int8,
+        )
+        region_tags_arr = _cp.array(
+            [FAMILY_TAGS[f] for f in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON)],
+            dtype=_cp.int8,
+        )
+        all_non_de9im = _cp.concatenate(
+            [_cp.array([point_tag, mp_tag], dtype=_cp.int8), line_tags_arr, region_tags_arr]
+        )
 
         d_left_is_point = (d_left_tags == point_tag) | (d_left_tags == mp_tag)
         d_right_is_point = (d_right_tags == point_tag) | (d_right_tags == mp_tag)
-        d_gpu_pair_mask = (
-            (d_left_is_point & _cp.isin(d_right_tags, all_non_de9im))
-            | (d_right_is_point & _cp.isin(d_left_tags, all_non_de9im))
+        d_gpu_pair_mask = (d_left_is_point & _cp.isin(d_right_tags, all_non_de9im)) | (
+            d_right_is_point & _cp.isin(d_left_tags, all_non_de9im)
         )
 
         # Device-resident non-point tag set for DE-9IM path (avoids H2D
         # upload of host non_point_tags later).
         d_non_point_tags = _cp.concatenate([line_tags_arr, region_tags_arr])
-        d_de9im_pair_mask = (
-            _cp.isin(d_left_tags, d_non_point_tags)
-            & _cp.isin(d_right_tags, d_non_point_tags)
+        d_de9im_pair_mask = _cp.isin(d_left_tags, d_non_point_tags) & _cp.isin(
+            d_right_tags, d_non_point_tags
         )
 
         owned_family_admission = _owned_gpu_predicate_family_admission(
@@ -676,9 +750,8 @@ def _filter_predicate_pairs_owned(
                 reason="spatial query predicate family-admission scalar fence",
             )
 
-        host_fallback_needed = (
-            not all_gpu
-            and not (all_non_gpu_have_de9im and predicate in _POLYGON_DE9IM_PREDICATES)
+        host_fallback_needed = not all_gpu and not (
+            all_non_gpu_have_de9im and predicate in _POLYGON_DE9IM_PREDICATES
         )
         fallback_event_recorded = False
         if host_fallback_needed:
@@ -727,8 +800,14 @@ def _filter_predicate_pairs_owned(
 
         # Convert device tag arrays to host-compatible numpy references for
         # downstream code that indexes with them.
-        line_tags = np.array([FAMILY_TAGS[f] for f in (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING)], dtype=np.int8)
-        region_tags = np.array([FAMILY_TAGS[f] for f in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON)], dtype=np.int8)
+        line_tags = np.array(
+            [FAMILY_TAGS[f] for f in (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING)],
+            dtype=np.int8,
+        )
+        region_tags = np.array(
+            [FAMILY_TAGS[f] for f in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON)],
+            dtype=np.int8,
+        )
     else:
         # No device candidates — materialise host indices eagerly.
         if left_indices is None or right_indices is None:
@@ -744,15 +823,22 @@ def _filter_predicate_pairs_owned(
 
         point_tag = FAMILY_TAGS[GeometryFamily.POINT]
         mp_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
-        line_tags = np.array([FAMILY_TAGS[f] for f in (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING)], dtype=np.int8)
-        region_tags = np.array([FAMILY_TAGS[f] for f in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON)], dtype=np.int8)
-        all_non_de9im = np.concatenate([np.array([point_tag, mp_tag], dtype=np.int8), line_tags, region_tags])
+        line_tags = np.array(
+            [FAMILY_TAGS[f] for f in (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING)],
+            dtype=np.int8,
+        )
+        region_tags = np.array(
+            [FAMILY_TAGS[f] for f in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON)],
+            dtype=np.int8,
+        )
+        all_non_de9im = np.concatenate(
+            [np.array([point_tag, mp_tag], dtype=np.int8), line_tags, region_tags]
+        )
 
         left_is_point = (left_tags == point_tag) | (left_tags == mp_tag)
         right_is_point = (right_tags == point_tag) | (right_tags == mp_tag)
-        gpu_pair_mask = (
-            (left_is_point & np.isin(right_tags, all_non_de9im))
-            | (right_is_point & np.isin(left_tags, all_non_de9im))
+        gpu_pair_mask = (left_is_point & np.isin(right_tags, all_non_de9im)) | (
+            right_is_point & np.isin(left_tags, all_non_de9im)
         )
 
         all_gpu = bool(np.all(gpu_pair_mask))
@@ -795,8 +881,13 @@ def _filter_predicate_pairs_owned(
             )
         _ensure_host_indices()  # only indices needed — no D→H for tags (hitlist #18)
         from vibespatial.predicates.point_relations import classify_point_predicates_indexed
+
         keep = classify_point_predicates_indexed(
-            predicate, query_owned, tree_owned, left_indices, right_indices,
+            predicate,
+            query_owned,
+            tree_owned,
+            left_indices,
+            right_indices,
         )
         return (
             left_indices[keep],
@@ -843,8 +934,7 @@ def _filter_predicate_pairs_owned(
                     requested_mode=ExecutionMode.GPU,
                     gpu_available=True,
                     reason=(
-                        f"GPU DE-9IM {predicate} refinement with "
-                        "device-resident relation pairs"
+                        f"GPU DE-9IM {predicate} refinement with device-resident relation pairs"
                     ),
                 ),
             )
@@ -854,9 +944,7 @@ def _filter_predicate_pairs_owned(
     if _has_device and has_gpu_runtime():
         _ensure_host_tags()
         non_point_tags = np.concatenate([line_tags, region_tags])
-        de9im_pair_mask = (
-            np.isin(left_tags, non_point_tags) & np.isin(right_tags, non_point_tags)
-        )
+        de9im_pair_mask = np.isin(left_tags, non_point_tags) & np.isin(right_tags, non_point_tags)
         non_gpu_mask = ~gpu_pair_mask
         all_non_gpu_have_de9im = bool(np.all(de9im_pair_mask | gpu_pair_mask))
 
@@ -866,11 +954,16 @@ def _filter_predicate_pairs_owned(
             # Handle point-pairs via indexed access (no take copy).
             if any_gpu:
                 from vibespatial.predicates.point_relations import classify_point_predicates_indexed
+
                 gpu_idx = np.flatnonzero(gpu_pair_mask)
                 gpu_left = left_indices[gpu_idx]
                 gpu_right = right_indices[gpu_idx]
                 keep[gpu_idx] = classify_point_predicates_indexed(
-                    predicate, query_owned, tree_owned, gpu_left, gpu_right,
+                    predicate,
+                    query_owned,
+                    tree_owned,
+                    gpu_left,
+                    gpu_right,
                 )
 
             # Handle line/polygon pairs via DE-9IM kernel.
@@ -892,16 +985,15 @@ def _filter_predicate_pairs_owned(
                 # directly on GPU instead of uploading host numpy masks.
                 if _use_device_idx:
                     d_non_gpu_mask = ~d_gpu_pair_mask
-                    d_de9im_pair_mask = (
-                        _cp.isin(d_left_tags, d_non_point_tags)
-                        & _cp.isin(d_right_tags, d_non_point_tags)
+                    d_de9im_pair_mask = _cp.isin(d_left_tags, d_non_point_tags) & _cp.isin(
+                        d_right_tags, d_non_point_tags
                     )
                     d_de9im_base_mask = d_non_gpu_mask & d_de9im_pair_mask
                     d_de9im_idx = _cp.flatnonzero(d_de9im_base_mask).astype(_cp.int32)
 
                 # Group by (left_family, right_family) to dispatch correct kernel.
                 de9im_masks = np.zeros(de9im_idx.size, dtype=np.uint16)
-                for (lt, rt) in unique_tag_pairs(de9im_left_tags, de9im_right_tags):
+                for lt, rt in unique_tag_pairs(de9im_left_tags, de9im_right_tags):
                     sub_mask = (de9im_left_tags == lt) & (de9im_right_tags == rt)
                     sub_idx = np.flatnonzero(sub_mask)
                     if sub_idx.size == 0:
@@ -917,7 +1009,9 @@ def _filter_predicate_pairs_owned(
                     d_sub_left = None
                     d_sub_right = None
                     if _use_device_idx:
-                        d_sub_mask = (d_left_tags[d_de9im_idx] == lt) & (d_right_tags[d_de9im_idx] == rt)
+                        d_sub_mask = (d_left_tags[d_de9im_idx] == lt) & (
+                            d_right_tags[d_de9im_idx] == rt
+                        )
                         d_full_idx = d_de9im_idx[_cp.flatnonzero(d_sub_mask)]
                         d_sub_left = _dc.d_left[d_full_idx]
                         d_sub_right = _dc.d_right[d_full_idx]
@@ -926,11 +1020,16 @@ def _filter_predicate_pairs_owned(
                         compute_polygon_de9im_gpu,
                         evaluate_predicate_from_de9im,
                     )
+
                     sub_result = compute_polygon_de9im_gpu(
-                        query_owned, tree_owned,
-                        de9im_left[sub_idx], de9im_right[sub_idx],
-                        query_family=lf, tree_family=rf,
-                        d_left=d_sub_left, d_right=d_sub_right,
+                        query_owned,
+                        tree_owned,
+                        de9im_left[sub_idx],
+                        de9im_right[sub_idx],
+                        query_family=lf,
+                        tree_family=rf,
+                        d_left=d_sub_left,
+                        d_right=d_sub_right,
                     )
                     if sub_result is not None:
                         de9im_masks[sub_idx] = sub_result
@@ -996,10 +1095,15 @@ def _filter_predicate_pairs_owned(
 
     # GPU portion via indexed access (no take copy).
     from vibespatial.predicates.point_relations import classify_point_predicates_indexed
+
     gpu_left = left_indices[gpu_idx]
     gpu_right = right_indices[gpu_idx]
     keep[gpu_idx] = classify_point_predicates_indexed(
-        predicate, query_owned, tree_owned, gpu_left, gpu_right,
+        predicate,
+        query_owned,
+        tree_owned,
+        gpu_left,
+        gpu_right,
     )
 
     # CPU portion via direct Shapely indexing.

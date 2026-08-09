@@ -15,9 +15,10 @@ from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 # ---------------------------------------------------------------------------
 
 _MAX_HULL_VERTS = 2048
-_CONVEX_HULL_KERNEL_SOURCE = PRECISION_PREAMBLE + (
-    "\n#define MAX_HULL_VERTS " + str(_MAX_HULL_VERTS) + "\n"
-) + r"""
+_CONVEX_HULL_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + ("\n#define MAX_HULL_VERTS " + str(_MAX_HULL_VERTS) + "\n")
+    + r"""
 /* ---------- shared device helper: monotone chain ----------
  *
  * Runs Andrew's monotone chain on x-sorted coordinates sx[0..n-1], sy[0..n-1].
@@ -247,5 +248,6 @@ extern "C" __global__ void convex_hull_write(
     monotone_chain(x + cs, y + cs, n, ox + out_start, oy + out_start);
 }}
 """
+)
 _CONVEX_HULL_KERNEL_NAMES = ("convex_hull_count", "convex_hull_write")
 _CONVEX_HULL_FP64 = _CONVEX_HULL_KERNEL_SOURCE.format(compute_type="double")

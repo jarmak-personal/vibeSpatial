@@ -27,6 +27,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_pairwise_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
@@ -37,25 +38,30 @@ from vibespatial.runtime.residency import Residency, TransferTrigger, combined_r
 # Point-distance family support (mirrors point_distance._FAMILY_KERNEL_MAP)
 # ---------------------------------------------------------------------------
 
-_POINT_DISTANCE_FAMILIES: frozenset[GeometryFamily] = frozenset({
-    GeometryFamily.LINESTRING,
-    GeometryFamily.MULTILINESTRING,
-    GeometryFamily.POLYGON,
-    GeometryFamily.MULTIPOLYGON,
-})
+_POINT_DISTANCE_FAMILIES: frozenset[GeometryFamily] = frozenset(
+    {
+        GeometryFamily.LINESTRING,
+        GeometryFamily.MULTILINESTRING,
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+    }
+)
 
 # Segment-distance family support
-_SEGMENT_FAMILIES: frozenset[GeometryFamily] = frozenset({
-    GeometryFamily.LINESTRING,
-    GeometryFamily.MULTILINESTRING,
-    GeometryFamily.POLYGON,
-    GeometryFamily.MULTIPOLYGON,
-})
+_SEGMENT_FAMILIES: frozenset[GeometryFamily] = frozenset(
+    {
+        GeometryFamily.LINESTRING,
+        GeometryFamily.MULTILINESTRING,
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+    }
+)
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def distance_owned(
     left: OwnedGeometryArray,
@@ -94,6 +100,12 @@ def distance_owned(
         row_count=n,
         requested_mode=dispatch_mode,
         current_residency=combined_residency(left, right),
+        work_estimate=estimate_pairwise_work_from_owned(
+            left,
+            right,
+            workload=workload,
+            primary_unit_name="distance-coordinate",
+        ),
     )
 
     if selection.selected is ExecutionMode.GPU:
@@ -139,9 +151,7 @@ def distance_expression_owned(
     from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
 
     requested_mode = (
-        dispatch_mode
-        if isinstance(dispatch_mode, ExecutionMode)
-        else ExecutionMode(dispatch_mode)
+        dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
     )
     if isinstance(precision, str):
         precision = PrecisionMode(precision)
@@ -157,6 +167,12 @@ def distance_expression_owned(
         row_count=n,
         requested_mode=requested_mode,
         current_residency=combined_residency(left, right),
+        work_estimate=estimate_pairwise_work_from_owned(
+            left,
+            right,
+            workload=workload,
+            primary_unit_name="distance-coordinate",
+        ),
     )
     if selection.selected is not ExecutionMode.GPU:
         return None
@@ -192,7 +208,10 @@ def dwithin_owned(
     *threshold* may be a scalar or per-row array.
     """
     distances = distance_owned(
-        left, right, dispatch_mode=dispatch_mode, precision=precision,
+        left,
+        right,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
     )
     # NaN rows (null geometry) -> False for dwithin
     return np.where(np.isnan(distances), False, distances <= threshold)
@@ -221,6 +240,17 @@ def evaluate_geopandas_dwithin(
     if n == 0:
         return np.empty(0, dtype=bool)
 
+    work_estimate = None
+    if isinstance(left, OwnedGeometryArray) and isinstance(right, OwnedGeometryArray):
+        from vibespatial.runtime.crossover import detect_workload_shape
+
+        work_estimate = estimate_pairwise_work_from_owned(
+            left,
+            right,
+            workload=detect_workload_shape(left.row_count, right.row_count),
+            primary_unit_name="dwithin-coordinate",
+        )
+
     selection = plan_dispatch_selection(
         kernel_name="geometry_distance",
         kernel_class=KernelClass.METRIC,
@@ -228,6 +258,7 @@ def evaluate_geopandas_dwithin(
         requested_mode=ExecutionMode.AUTO,
         requested_precision=PrecisionMode.AUTO,
         current_residency=combined_residency(left, right),
+        work_estimate=work_estimate,
     )
     if selection.selected is not ExecutionMode.GPU:
         return None
@@ -250,7 +281,9 @@ def evaluate_geopandas_dwithin(
             return None
 
         result = dwithin_owned(
-            left_owned, right_owned, distance,
+            left_owned,
+            right_owned,
+            distance,
             precision=precision_plan.compute_precision,
         )
         record_dispatch_event(
@@ -276,12 +309,20 @@ def evaluate_geopandas_dwithin(
 # GPU path
 # ---------------------------------------------------------------------------
 
+
 @register_kernel_variant(
     "geometry_distance",
     "gpu-cuda-python",
     kernel_class=KernelClass.METRIC,
     execution_modes=(ExecutionMode.GPU,),
-    geometry_families=("point", "linestring", "polygon", "multipoint", "multilinestring", "multipolygon"),
+    geometry_families=(
+        "point",
+        "linestring",
+        "polygon",
+        "multipoint",
+        "multilinestring",
+        "multipolygon",
+    ),
     supports_mixed=True,
     tags=("cuda-python", "metric", "distance"),
 )
@@ -372,7 +413,12 @@ def _distance_gpu(
             d_sub_dist = runtime.allocate((sub_count,), np.float64)
             try:
                 _launch_point_point_distance_kernel(
-                    left, right, d_idx, d_idx, d_sub_dist, sub_count,
+                    left,
+                    right,
+                    d_idx,
+                    d_idx,
+                    d_sub_dist,
+                    sub_count,
                 )
                 sub_distances = np.empty(sub_count, dtype=np.float64)
                 runtime.copy_device_to_host(
@@ -390,8 +436,14 @@ def _distance_gpu(
             d_sub_dist = runtime.allocate((sub_count,), np.float64)
             try:
                 ok = compute_point_distance_gpu(
-                    left, right, d_idx, d_idx, d_sub_dist, sub_count,
-                    tree_family=rf, compute_precision=precision,
+                    left,
+                    right,
+                    d_idx,
+                    d_idx,
+                    d_sub_dist,
+                    sub_count,
+                    tree_family=rf,
+                    compute_precision=precision,
                 )
                 if ok:
                     sub_distances = np.empty(sub_count, dtype=np.float64)
@@ -409,8 +461,14 @@ def _distance_gpu(
             d_sub_dist = runtime.allocate((sub_count,), np.float64)
             try:
                 ok = compute_point_distance_gpu(
-                    right, left, d_idx, d_idx, d_sub_dist, sub_count,
-                    tree_family=lf, compute_precision=precision,
+                    right,
+                    left,
+                    d_idx,
+                    d_idx,
+                    d_sub_dist,
+                    sub_count,
+                    tree_family=lf,
+                    compute_precision=precision,
                 )
                 if ok:
                     sub_distances = np.empty(sub_count, dtype=np.float64)
@@ -431,7 +489,10 @@ def _distance_gpu(
                 pass  # ok stays False -> falls to Shapely below
             elif lf == MP:
                 mp_result = _compute_multipoint_distances_gpu(
-                    left, right, sub_idx, sub_idx,
+                    left,
+                    right,
+                    sub_idx,
+                    sub_idx,
                     target_family=rf,
                 )
                 if mp_result is not None:
@@ -439,7 +500,10 @@ def _distance_gpu(
                     ok = True
             else:
                 mp_result = _compute_multipoint_distances_gpu(
-                    right, left, sub_idx, sub_idx,
+                    right,
+                    left,
+                    sub_idx,
+                    sub_idx,
                     target_family=lf,
                 )
                 if mp_result is not None:
@@ -451,8 +515,14 @@ def _distance_gpu(
             d_sub_dist = runtime.allocate((sub_count,), np.float64)
             try:
                 ok = compute_segment_distance_gpu(
-                    left, right, d_idx, d_idx, d_sub_dist, sub_count,
-                    query_family=lf, tree_family=rf,
+                    left,
+                    right,
+                    d_idx,
+                    d_idx,
+                    d_sub_dist,
+                    sub_count,
+                    query_family=lf,
+                    tree_family=rf,
                 )
                 if ok:
                     sub_distances = np.empty(sub_count, dtype=np.float64)
@@ -473,7 +543,8 @@ def _distance_gpu(
             left_shapely = np.asarray(left.to_shapely(), dtype=object)
             right_shapely = np.asarray(right.to_shapely(), dtype=object)
             sub_dists = shapely.distance(
-                left_shapely[sub_idx], right_shapely[sub_idx],
+                left_shapely[sub_idx],
+                right_shapely[sub_idx],
             )
             result[sub_idx] = np.asarray(sub_dists, dtype=np.float64)
 
@@ -600,12 +671,20 @@ def _distance_gpu_device(
 # CPU fallback
 # ---------------------------------------------------------------------------
 
+
 @register_kernel_variant(
     "geometry_distance",
     "cpu",
     kernel_class=KernelClass.METRIC,
     execution_modes=(ExecutionMode.CPU,),
-    geometry_families=("point", "linestring", "polygon", "multipoint", "multilinestring", "multipolygon"),
+    geometry_families=(
+        "point",
+        "linestring",
+        "polygon",
+        "multipoint",
+        "multilinestring",
+        "multipolygon",
+    ),
     supports_mixed=True,
     tags=("shapely", "metric", "distance"),
 )

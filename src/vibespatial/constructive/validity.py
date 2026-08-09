@@ -67,22 +67,29 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.config import SPATIAL_EPSILON
+from vibespatial.runtime.crossover import estimate_segment_pair_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.residency import combined_residency
 
-request_nvrtc_warmup([
-    ("is-valid-rings-fp64", _IS_VALID_RINGS_FP64, _IS_VALID_RINGS_KERNEL_NAMES),
-    ("is-simple-segments-fp64", _IS_SIMPLE_SEGMENTS_FP64, _IS_SIMPLE_SEGMENTS_KERNEL_NAMES),
-    (
-        "is-simple-segments-exact-fp64",
-        _IS_SIMPLE_SEGMENTS_EXACT_FP64,
-        _IS_SIMPLE_SEGMENTS_KERNEL_NAMES,
-    ),
-    ("holes-in-shell-fp64", _HOLES_IN_SHELL_FP64, _HOLES_IN_SHELL_KERNEL_NAMES),
-    ("ring-pair-interaction-fp64", _RING_PAIR_INTERACTION_FP64, _RING_PAIR_INTERACTION_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("is-valid-rings-fp64", _IS_VALID_RINGS_FP64, _IS_VALID_RINGS_KERNEL_NAMES),
+        ("is-simple-segments-fp64", _IS_SIMPLE_SEGMENTS_FP64, _IS_SIMPLE_SEGMENTS_KERNEL_NAMES),
+        (
+            "is-simple-segments-exact-fp64",
+            _IS_SIMPLE_SEGMENTS_EXACT_FP64,
+            _IS_SIMPLE_SEGMENTS_KERNEL_NAMES,
+        ),
+        ("holes-in-shell-fp64", _HOLES_IN_SHELL_FP64, _HOLES_IN_SHELL_KERNEL_NAMES),
+        (
+            "ring-pair-interaction-fp64",
+            _RING_PAIR_INTERACTION_FP64,
+            _RING_PAIR_INTERACTION_KERNEL_NAMES,
+        ),
+    ]
+)
 
 
 def _runtime_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
@@ -93,6 +100,7 @@ def _runtime_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
 # Helpers: shoelace signed area and segment intersection (CPU)
 # ---------------------------------------------------------------------------
 
+
 def _shoelace_area_2x(x: np.ndarray, y: np.ndarray, start: int, end: int) -> float:
     """Compute 2x signed area of a ring slice. Positive = CCW."""
     xs = x[start:end]
@@ -101,8 +109,14 @@ def _shoelace_area_2x(x: np.ndarray, y: np.ndarray, start: int, end: int) -> flo
 
 
 def _segments_cross(
-    ax0: float, ay0: float, ax1: float, ay1: float,
-    bx0: float, by0: float, bx1: float, by1: float,
+    ax0: float,
+    ay0: float,
+    ax1: float,
+    ay1: float,
+    bx0: float,
+    by0: float,
+    bx1: float,
+    by1: float,
 ) -> bool:
     """Return True if segments (a0-a1) and (b0-b1) properly cross.
 
@@ -131,8 +145,12 @@ def _segments_cross(
 
 
 def _point_on_segment_cpu(
-    px: float, py: float,
-    ax: float, ay: float, bx: float, by: float,
+    px: float,
+    py: float,
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
 ) -> bool:
     """Return True if point (px,py) lies on segment (ax,ay)-(bx,by)."""
     dx = bx - ax
@@ -146,15 +164,20 @@ def _point_on_segment_cpu(
     miny = min(ay, by)
     maxy = max(ay, by)
     return (
-        px >= minx - SPATIAL_EPSILON and px <= maxx + SPATIAL_EPSILON
-        and py >= miny - SPATIAL_EPSILON and py <= maxy + SPATIAL_EPSILON
+        px >= minx - SPATIAL_EPSILON
+        and px <= maxx + SPATIAL_EPSILON
+        and py >= miny - SPATIAL_EPSILON
+        and py <= maxy + SPATIAL_EPSILON
     )
 
 
 def _point_in_ring_even_odd(
-    px: float, py: float,
-    x: np.ndarray, y: np.ndarray,
-    coord_start: int, coord_end: int,
+    px: float,
+    py: float,
+    x: np.ndarray,
+    y: np.ndarray,
+    coord_start: int,
+    coord_end: int,
 ) -> bool:
     """Even-odd ray-cast: is (px,py) inside the ring [coord_start:coord_end]?
 
@@ -185,6 +208,7 @@ def _point_in_ring_even_odd(
 # Per-family validity helpers (CPU)
 # ---------------------------------------------------------------------------
 
+
 def _is_valid_points(buf: FamilyGeometryBuffer) -> np.ndarray:
     """Points are always structurally valid."""
     return np.ones(buf.row_count, dtype=bool)
@@ -196,7 +220,7 @@ def _is_valid_linestrings(buf: FamilyGeometryBuffer) -> np.ndarray:
     if buf.x.size == 0 or buf.empty_mask.size == 0:
         return result
     offsets = buf.geometry_offsets
-    counts = offsets[1:buf.row_count + 1] - offsets[:buf.row_count]
+    counts = offsets[1 : buf.row_count + 1] - offsets[: buf.row_count]
     # Empty linestrings (0 coords) are valid; 1-coord linestrings are invalid
     invalid = (counts >= 1) & (counts < 2)
     result[invalid] = False
@@ -204,7 +228,10 @@ def _is_valid_linestrings(buf: FamilyGeometryBuffer) -> np.ndarray:
 
 
 def _is_valid_polygon_ring(
-    x: np.ndarray, y: np.ndarray, coord_start: int, coord_end: int,
+    x: np.ndarray,
+    y: np.ndarray,
+    coord_start: int,
+    coord_end: int,
     is_exterior: bool,
 ) -> bool:
     """Check OGC validity of a single polygon ring.
@@ -256,9 +283,11 @@ def _point_on_seg_collinear_cpu(px, py, ax, ay, bx, by):
 
 
 def _check_ring_pair_interaction_cpu(
-    x: np.ndarray, y: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
     ring_offsets: np.ndarray,
-    ring_start_idx: int, ring_end_idx: int,
+    ring_start_idx: int,
+    ring_end_idx: int,
 ) -> bool:
     """Check inter-ring interactions for a single polygon's rings (CPU).
 
@@ -306,8 +335,12 @@ def _check_ring_pair_interaction_cpu(
                     dy = float(y[cj_start + sj + 1])
 
                     # MBR early reject
-                    if (max(ax, bx) < min(cx, dx) or max(cx, dx) < min(ax, bx) or
-                            max(ay, by) < min(cy, dy) or max(cy, dy) < min(ay, by)):
+                    if (
+                        max(ax, bx) < min(cx, dx)
+                        or max(cx, dx) < min(ax, bx)
+                        or max(ay, by) < min(cy, dy)
+                        or max(cy, dy) < min(ay, by)
+                    ):
                         continue
 
                     o1 = _orient2d_exact(ax, ay, bx, by, cx, cy)
@@ -394,6 +427,137 @@ def _check_ring_pair_interaction_cpu(
     return True
 
 
+def _point_in_polygon_part_strict_cpu(
+    px: float,
+    py: float,
+    x: np.ndarray,
+    y: np.ndarray,
+    ring_offsets: np.ndarray,
+    part_offsets: np.ndarray,
+    part: int,
+) -> bool:
+    """Return whether a point lies strictly in one polygon part's area."""
+    ring_start = int(part_offsets[part])
+    ring_end = int(part_offsets[part + 1])
+    if ring_start >= ring_end:
+        return False
+
+    def _ring_relation(ring: int) -> tuple[bool, bool]:
+        coord_start = int(ring_offsets[ring])
+        coord_end = int(ring_offsets[ring + 1])
+        for coord in range(coord_start + 1, coord_end):
+            if _point_on_segment_cpu(
+                px,
+                py,
+                float(x[coord - 1]),
+                float(y[coord - 1]),
+                float(x[coord]),
+                float(y[coord]),
+            ):
+                return False, True
+        return (
+            _point_in_ring_even_odd(px, py, x, y, coord_start, coord_end),
+            False,
+        )
+
+    in_shell, on_shell = _ring_relation(ring_start)
+    if not in_shell or on_shell:
+        return False
+    for ring in range(ring_start + 1, ring_end):
+        in_hole, on_hole = _ring_relation(ring)
+        if in_hole or on_hole:
+            return False
+    return True
+
+
+def _check_multipolygon_part_interaction_cpu(
+    x: np.ndarray,
+    y: np.ndarray,
+    ring_offsets: np.ndarray,
+    part_offsets: np.ndarray,
+    part_start: int,
+    part_end: int,
+) -> bool:
+    """Check that distinct MultiPolygon parts meet only at isolated points."""
+    for left_part in range(part_start, part_end):
+        for right_part in range(left_part + 1, part_end):
+            for left_ring in range(
+                int(part_offsets[left_part]),
+                int(part_offsets[left_part + 1]),
+            ):
+                left_coord_start = int(ring_offsets[left_ring])
+                left_coord_end = int(ring_offsets[left_ring + 1])
+                for right_ring in range(
+                    int(part_offsets[right_part]),
+                    int(part_offsets[right_part + 1]),
+                ):
+                    right_coord_start = int(ring_offsets[right_ring])
+                    right_coord_end = int(ring_offsets[right_ring + 1])
+                    for left_coord in range(left_coord_start, left_coord_end - 1):
+                        ax = float(x[left_coord])
+                        ay = float(y[left_coord])
+                        bx = float(x[left_coord + 1])
+                        by = float(y[left_coord + 1])
+                        if ax == bx and ay == by:
+                            continue
+                        for right_coord in range(right_coord_start, right_coord_end - 1):
+                            cx = float(x[right_coord])
+                            cy = float(y[right_coord])
+                            dx = float(x[right_coord + 1])
+                            dy = float(y[right_coord + 1])
+                            if cx == dx and cy == dy:
+                                continue
+                            if (
+                                max(ax, bx) < min(cx, dx)
+                                or max(cx, dx) < min(ax, bx)
+                                or max(ay, by) < min(cy, dy)
+                                or max(cy, dy) < min(ay, by)
+                            ):
+                                continue
+                            o1 = _orient2d_exact(ax, ay, bx, by, cx, cy)
+                            o2 = _orient2d_exact(ax, ay, bx, by, dx, dy)
+                            o3 = _orient2d_exact(cx, cy, dx, dy, ax, ay)
+                            o4 = _orient2d_exact(cx, cy, dx, dy, bx, by)
+                            if (
+                                o1 != 0
+                                and o2 != 0
+                                and o1 != o2
+                                and o3 != 0
+                                and o4 != 0
+                                and o3 != o4
+                            ):
+                                return False
+                            if o1 == 0 and o2 == 0 and o3 == 0 and o4 == 0:
+                                overlap_x = min(max(ax, bx), max(cx, dx)) - max(
+                                    min(ax, bx), min(cx, dx)
+                                )
+                                overlap_y = min(max(ay, by), max(cy, dy)) - max(
+                                    min(ay, by), min(cy, dy)
+                                )
+                                if overlap_x > 0.0 or overlap_y > 0.0:
+                                    return False
+
+            for source_part, target_part in (
+                (left_part, right_part),
+                (right_part, left_part),
+            ):
+                exterior_ring = int(part_offsets[source_part])
+                coord_start = int(ring_offsets[exterior_ring])
+                coord_end = int(ring_offsets[exterior_ring + 1]) - 1
+                for coord in range(coord_start, coord_end):
+                    if _point_in_polygon_part_strict_cpu(
+                        float(x[coord]),
+                        float(y[coord]),
+                        x,
+                        y,
+                        ring_offsets,
+                        part_offsets,
+                        target_part,
+                    ):
+                        return False
+    return True
+
+
 def _is_valid_polygons(buf: FamilyGeometryBuffer) -> np.ndarray:
     """Polygon validity: ring closure, min coords, simplicity, hole containment, ring interaction."""
     result = np.ones(buf.row_count, dtype=bool)
@@ -421,7 +585,7 @@ def _is_valid_polygons(buf: FamilyGeometryBuffer) -> np.ndarray:
         for ring_idx, r in enumerate(range(ring_start_idx, ring_end_idx)):
             coord_start = int(ring_offsets[r])
             coord_end = int(ring_offsets[r + 1])
-            is_exterior = (ring_idx == 0)
+            is_exterior = ring_idx == 0
 
             if not _is_valid_polygon_ring(x, y, coord_start, coord_end, is_exterior):
                 result[g] = False
@@ -450,7 +614,11 @@ def _is_valid_polygons(buf: FamilyGeometryBuffer) -> np.ndarray:
 
         # Step 3: Ring-pair interaction (crossing, overlap, multi-touch)
         if not _check_ring_pair_interaction_cpu(
-            x, y, ring_offsets, ring_start_idx, ring_end_idx,
+            x,
+            y,
+            ring_offsets,
+            ring_start_idx,
+            ring_end_idx,
         ):
             result[g] = False
 
@@ -515,7 +683,7 @@ def _is_valid_multipolygons(buf: FamilyGeometryBuffer) -> np.ndarray:
             for ring_idx, r in enumerate(range(ring_start_idx, ring_end_idx)):
                 coord_start = int(ring_offsets[r])
                 coord_end = int(ring_offsets[r + 1])
-                is_exterior = (ring_idx == 0)
+                is_exterior = ring_idx == 0
 
                 if not _is_valid_polygon_ring(x, y, coord_start, coord_end, is_exterior):
                     result[g] = False
@@ -534,7 +702,12 @@ def _is_valid_multipolygons(buf: FamilyGeometryBuffer) -> np.ndarray:
                 hx = float(x[hole_coord_start])
                 hy = float(y[hole_coord_start])
                 if not _point_in_ring_even_odd(
-                    hx, hy, x, y, ext_coord_start, ext_coord_end,
+                    hx,
+                    hy,
+                    x,
+                    y,
+                    ext_coord_start,
+                    ext_coord_end,
                 ):
                     result[g] = False
                     holes_ok = False
@@ -545,10 +718,24 @@ def _is_valid_multipolygons(buf: FamilyGeometryBuffer) -> np.ndarray:
 
             # Step 3: Ring-pair interaction (crossing, overlap, multi-touch)
             if not _check_ring_pair_interaction_cpu(
-                x, y, ring_offsets, ring_start_idx, ring_end_idx,
+                x,
+                y,
+                ring_offsets,
+                ring_start_idx,
+                ring_end_idx,
             ):
                 result[g] = False
                 break
+
+        if result[g] and not _check_multipolygon_part_interaction_cpu(
+            x,
+            y,
+            ring_offsets,
+            part_offsets,
+            poly_start,
+            poly_end,
+        ):
+            result[g] = False
 
     return result
 
@@ -567,6 +754,7 @@ _VALIDITY_DISPATCH = {
 # Per-family simplicity helpers (CPU)
 # ---------------------------------------------------------------------------
 
+
 def _is_simple_points(buf: FamilyGeometryBuffer) -> np.ndarray:
     """Points are always simple."""
     return np.ones(buf.row_count, dtype=bool)
@@ -578,13 +766,21 @@ def _is_simple_multipoints(buf: FamilyGeometryBuffer) -> np.ndarray:
 
 
 def _endpoints_coincide(
-    ax0: float, ay0: float, ax1: float, ay1: float,
-    bx0: float, by0: float, bx1: float, by1: float,
+    ax0: float,
+    ay0: float,
+    ax1: float,
+    ay1: float,
+    bx0: float,
+    by0: float,
+    bx1: float,
+    by1: float,
 ) -> bool:
     """Return True if any endpoint of segment A equals any endpoint of segment B."""
     return (
-        (ax0 == bx0 and ay0 == by0) or (ax0 == bx1 and ay0 == by1)
-        or (ax1 == bx0 and ay1 == by0) or (ax1 == bx1 and ay1 == by1)
+        (ax0 == bx0 and ay0 == by0)
+        or (ax0 == bx1 and ay0 == by1)
+        or (ax1 == bx0 and ay1 == by0)
+        or (ax1 == bx1 and ay1 == by1)
     )
 
 
@@ -603,8 +799,12 @@ def _point_strictly_on_segment_cpu(
 
 
 def _linestring_self_intersects(
-    x: np.ndarray, y: np.ndarray, start: int, end: int,
-    *, is_ring: bool = False,
+    x: np.ndarray,
+    y: np.ndarray,
+    start: int,
+    end: int,
+    *,
+    is_ring: bool = False,
 ) -> bool:
     """Brute-force O(n^2) self-intersection test for a linestring.
 
@@ -629,6 +829,8 @@ def _linestring_self_intersects(
         ay0 = float(y[start + i])
         ax1 = float(x[start + i + 1])
         ay1 = float(y[start + i + 1])
+        if ax0 == ax1 and ay0 == ay1:
+            continue
 
         # Only check non-adjacent segments (skip i+1 which shares an endpoint)
         for j in range(i + 2, n_segs):
@@ -639,6 +841,16 @@ def _linestring_self_intersects(
             by0 = float(y[start + j])
             bx1 = float(x[start + j + 1])
             by1 = float(y[start + j + 1])
+            if bx0 == bx1 and by0 == by1:
+                continue
+            if is_ring and i == 0 and bx1 == ax0 and by1 == ay0:
+                closure_tail = True
+                for k in range(j + 1, n_coords):
+                    if float(x[start + k]) != ax0 or float(y[start + k]) != ay0:
+                        closure_tail = False
+                        break
+                if closure_tail:
+                    continue
 
             # Check proper interior crossing
             if _segments_cross(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1):
@@ -797,6 +1009,7 @@ _SIMPLICITY_DISPATCH = {
 # GPU helpers: build is_exterior mask and reduce per-ring to per-geometry
 # ---------------------------------------------------------------------------
 
+
 def _build_is_exterior_for_validity(d_buf, family):
     """Build a device int32 array marking exterior rings (1) vs interior (0).
 
@@ -817,9 +1030,14 @@ def _build_is_exterior_for_validity(d_buf, family):
         raise ValueError(f"is_exterior only meaningful for polygon families, got {family}")
 
     d_is_exterior = cp.zeros(ring_count, dtype=cp.int32)
-    d_exterior_indices = d_offsets[:-1]
+    d_exterior_indices = cp.asarray(d_offsets[:-1], dtype=cp.int64)
     d_valid = d_exterior_indices < ring_count
-    d_is_exterior[d_exterior_indices[d_valid]] = 1
+    d_safe_exterior_indices = cp.minimum(d_exterior_indices, ring_count - 1)
+    cp.maximum.at(
+        d_is_exterior,
+        d_safe_exterior_indices,
+        d_valid.astype(cp.int32, copy=False),
+    )
     return d_is_exterior
 
 
@@ -865,7 +1083,7 @@ def _reduce_ring_valid_to_geom(
             d_start_sums[d_hp_indices] = d_cumsum[d_starts_ne[d_hp_indices] - 1]
 
         d_invalid_counts = d_end_sums - d_start_sums
-        d_result[d_ne_indices] = (d_invalid_counts == 0)
+        d_result[d_ne_indices] = d_invalid_counts == 0
 
     return _runtime_device_to_host(d_result, reason=reason)
 
@@ -887,7 +1105,7 @@ def _reduce_span_simple_to_geom(d_span_simple, d_geometry_offsets, geom_count):
 
 
 def _build_hole_and_exterior_indices(d_buf, family):
-    """Build hole_ring_indices and exterior_ring_indices for holes_in_shell kernel.
+    """Build ring-capacity hole metadata for the holes-in-shell kernel.
 
     For Polygon:      geometry_offsets[g] is the exterior ring; rings
                       geometry_offsets[g]+1 .. geometry_offsets[g+1]-1 are holes.
@@ -896,21 +1114,37 @@ def _build_hole_and_exterior_indices(d_buf, family):
                       rings part_offsets[p]+1 .. part_offsets[p+1]-1 are holes.
                       Each hole's exterior ring is part_offsets[p].
 
-    Returns (d_hole_ring_indices, d_exterior_ring_indices, hole_count).
-    All arrays are CuPy int32 on device.
+    Inactive nested-capacity lanes remain device-resident and are represented by
+    ``d_hole_active`` instead of being compacted through ``flatnonzero``.  All
+    returned arrays therefore have physical ring capacity.
     """
     ring_count = int(d_buf.ring_offsets.shape[0]) - 1
     if ring_count == 0:
-        return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32), 0
+        return (
+            cp.empty(0, dtype=cp.int32),
+            cp.empty(0, dtype=cp.int32),
+            cp.empty(0, dtype=cp.bool_),
+        )
 
     # Build is_exterior mask
     d_is_exterior = _build_is_exterior_for_validity(d_buf, family)
 
-    # Hole ring indices: all rings where is_exterior == 0
-    d_hole_ring_indices = cp.flatnonzero(d_is_exterior == 0).astype(cp.int32)
-    hole_count = int(d_hole_ring_indices.shape[0])
-    if hole_count == 0:
-        return d_hole_ring_indices, cp.empty(0, dtype=cp.int32), 0
+    d_ring_indices = cp.arange(ring_count, dtype=cp.int32)
+    if family is GeometryFamily.POLYGON:
+        d_active_ring_count = cp.asarray(d_buf.geometry_offsets[-1:], dtype=cp.int64)
+    else:
+        d_active_part_count = cp.asarray(d_buf.geometry_offsets[-1:], dtype=cp.int64)
+        d_active_ring_count = cp.asarray(d_buf.part_offsets, dtype=cp.int32)[
+            d_active_part_count
+        ].astype(cp.int64, copy=False)
+    d_hole_active = (d_ring_indices.astype(cp.int64, copy=False) < d_active_ring_count[0]) & (
+        d_is_exterior == 0
+    )
+    d_hole_ring_indices = cp.where(
+        d_hole_active,
+        d_ring_indices,
+        cp.int32(0),
+    )
 
     # For each hole, find its polygon's exterior ring index.
     # The exterior ring of a hole is the largest value in d_offsets[:-1] that
@@ -924,14 +1158,26 @@ def _build_hole_and_exterior_indices(d_buf, family):
     # For each hole ring index h, the exterior ring is d_offsets[k] where
     # k = searchsorted(d_offsets, h, side='right') - 1
     d_ext_starts = d_offsets[:-1]
-    d_pos = cp.searchsorted(d_ext_starts, d_hole_ring_indices, side="right") - 1
-    d_exterior_ring_indices = d_ext_starts[d_pos].astype(cp.int32)
+    d_pos = cp.maximum(
+        cp.searchsorted(d_ext_starts, d_hole_ring_indices, side="right") - 1,
+        0,
+    )
+    d_exterior_ring_indices = cp.where(
+        d_hole_active,
+        d_ext_starts[d_pos],
+        cp.int32(0),
+    ).astype(cp.int32, copy=False)
 
-    return d_hole_ring_indices, d_exterior_ring_indices, hole_count
+    return d_hole_ring_indices, d_exterior_ring_indices, d_hole_active
 
 
-def _launch_holes_in_shell_kernel(runtime, d_buf, d_hole_ring_indices,
-                                  d_exterior_ring_indices, hole_count):
+def _launch_holes_in_shell_kernel(
+    runtime,
+    d_buf,
+    d_hole_ring_indices,
+    d_exterior_ring_indices,
+    d_hole_active,
+):
     """Launch the holes_in_shell kernel and return device result array (int32).
 
     Returns a device array of shape (hole_count,) where 1 = hole inside shell,
@@ -944,23 +1190,45 @@ def _launch_holes_in_shell_kernel(runtime, d_buf, d_hole_ring_indices,
     )
     kernel = kernels["holes_in_shell"]
 
-    d_hole_valid = runtime.allocate((hole_count,), np.int32, zero=True)
+    hole_capacity = int(d_hole_ring_indices.size)
+    d_hole_valid = runtime.allocate((hole_capacity,), np.int32, zero=True)
     ptr = runtime.pointer
     params = (
-        (ptr(d_buf.x), ptr(d_buf.y), ptr(d_buf.ring_offsets),
-         ptr(d_hole_ring_indices), ptr(d_exterior_ring_indices),
-         ptr(d_hole_valid), hole_count),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+        (
+            ptr(d_buf.x),
+            ptr(d_buf.y),
+            ptr(d_buf.ring_offsets),
+            ptr(d_hole_ring_indices),
+            ptr(d_exterior_ring_indices),
+            ptr(d_hole_active),
+            ptr(d_hole_valid),
+            hole_capacity,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+        ),
     )
-    grid, block = runtime.launch_config(kernel, hole_count)
+    grid, block = runtime.launch_config(kernel, hole_capacity)
     runtime.launch(kernel, grid=grid, block=block, params=params)
     return d_hole_valid
 
 
-def _reduce_hole_valid_to_geom(d_hole_valid, d_hole_ring_indices,
-                               d_buf, family, family_rows, geom_count):
+def _reduce_hole_valid_to_geom(
+    d_hole_valid,
+    d_hole_ring_indices,
+    d_hole_active,
+    d_buf,
+    family,
+    family_rows,
+    geom_count,
+):
     """Reduce per-hole validity to per-geometry using cumsum.
 
     A geometry is valid (for hole containment) iff ALL its holes are inside
@@ -971,8 +1239,8 @@ def _reduce_hole_valid_to_geom(d_hole_valid, d_hole_ring_indices,
 
     Returns a CuPy array of bool (length geom_count) on device.
     """
-    hole_count = int(d_hole_valid.shape[0])
-    if hole_count == 0:
+    hole_capacity = int(d_hole_valid.shape[0])
+    if hole_capacity == 0:
         return cp.ones(geom_count, dtype=cp.bool_)
 
     # Build per-geometry ring ranges (same as the ring reduction uses)
@@ -1003,37 +1271,31 @@ def _reduce_hole_valid_to_geom(d_hole_valid, d_hole_ring_indices,
     d_hole_invalid_full = cp.zeros(ring_count, dtype=cp.int32)
 
     # Mark rings where hole is not inside shell
-    d_invalid_holes = d_hole_valid == 0
-    d_invalid_hole_indices = d_hole_ring_indices[d_invalid_holes]
-    if d_invalid_hole_indices.size > 0:
-        d_hole_invalid_full[d_invalid_hole_indices] = 1
+    d_invalid_holes = cp.asarray(d_hole_active, dtype=cp.bool_) & (d_hole_valid == 0)
+    cp.maximum.at(
+        d_hole_invalid_full,
+        cp.asarray(d_hole_ring_indices, dtype=cp.int64),
+        d_invalid_holes.astype(cp.int32, copy=False),
+    )
 
     # Now reduce using the standard cumsum trick
     d_cumsum = cp.cumsum(d_hole_invalid_full)
-    d_empty = d_starts == d_ends
-    d_result = cp.ones(geom_count, dtype=cp.bool_)
-
-    d_ne_indices = cp.flatnonzero(~d_empty)
-    if d_ne_indices.size > 0:
-        d_end_indices = d_ends[d_ne_indices] - 1
-        d_end_sums = d_cumsum[d_end_indices]
-
-        d_starts_ne = d_starts[d_ne_indices]
-        d_start_sums = cp.zeros(d_ne_indices.size, dtype=cp.int32)
-        d_has_prev = d_starts_ne > 0
-        d_hp_indices = cp.flatnonzero(d_has_prev)
-        if d_hp_indices.size > 0:
-            d_start_sums[d_hp_indices] = d_cumsum[d_starts_ne[d_hp_indices] - 1]
-
-        d_invalid_counts = d_end_sums - d_start_sums
-        d_result[d_ne_indices] = d_result[d_ne_indices] & (d_invalid_counts == 0)
-
-    return d_result
+    d_nonempty = d_starts < d_ends
+    d_end_indices = cp.maximum(d_ends - 1, 0)
+    d_end_sums = cp.where(d_nonempty, d_cumsum[d_end_indices], cp.int32(0))
+    d_previous_indices = cp.maximum(d_starts - 1, 0)
+    d_start_sums = cp.where(
+        d_starts > 0,
+        d_cumsum[d_previous_indices],
+        cp.int32(0),
+    )
+    return (~d_nonempty) | ((d_end_sums - d_start_sums) == 0)
 
 
 # ---------------------------------------------------------------------------
 # GPU dispatch: is_valid per-family
 # ---------------------------------------------------------------------------
+
 
 def _is_valid_gpu_points(d_buf, result, global_rows):
     """Points are always valid on GPU -- write True directly."""
@@ -1099,7 +1361,7 @@ def _is_valid_gpu_multilinestrings_device(d_buf, family_rows):
     if total_parts == 0:
         return cp.ones(geom_count, dtype=cp.bool_)
 
-    d_invalid = (1 - d_part_valid_int)
+    d_invalid = 1 - d_part_valid_int
     d_cumsum = cp.cumsum(d_invalid)
 
     d_empty = d_starts == d_ends
@@ -1118,13 +1380,14 @@ def _is_valid_gpu_multilinestrings_device(d_buf, family_rows):
             d_start_sums[d_hp_indices] = d_cumsum[d_starts_ne[d_hp_indices] - 1]
 
         d_invalid_counts = d_end_sums - d_start_sums
-        d_result[d_ne_indices] = (d_invalid_counts == 0)
+        d_result[d_ne_indices] = d_invalid_counts == 0
 
     return d_result
 
 
-def _launch_ring_pair_interaction_kernel(runtime, d_buf, d_poly_ring_starts,
-                                         d_poly_ring_ends, poly_count):
+def _launch_ring_pair_interaction_kernel(
+    runtime, d_buf, d_poly_ring_starts, d_poly_ring_ends, poly_count
+):
     """Launch the ring_pair_interaction kernel and return device result (int32).
 
     Returns a device array of shape (poly_count,) where 1 = valid (no
@@ -1140,12 +1403,24 @@ def _launch_ring_pair_interaction_kernel(runtime, d_buf, d_poly_ring_starts,
     d_poly_valid = runtime.allocate((poly_count,), np.int32, zero=True)
     ptr = runtime.pointer
     params = (
-        (ptr(d_buf.x), ptr(d_buf.y), ptr(d_buf.ring_offsets),
-         ptr(d_poly_ring_starts), ptr(d_poly_ring_ends),
-         ptr(d_poly_valid), poly_count),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+        (
+            ptr(d_buf.x),
+            ptr(d_buf.y),
+            ptr(d_buf.ring_offsets),
+            ptr(d_poly_ring_starts),
+            ptr(d_poly_ring_ends),
+            ptr(d_poly_valid),
+            poly_count,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+        ),
     )
     # 1 block per polygon part — use occupancy API for optimal block size.
     # CudaDriverRuntime.launch expects 3D launch tuples.
@@ -1190,6 +1465,8 @@ def _is_valid_gpu_polygons_device(
     family_rows,
     *,
     exact_collinearity: bool = False,
+    row_ring_simple=None,
+    row_ring_interaction_valid=None,
 ):
     """Return device Polygon validity for family rows."""
     runtime = get_cuda_runtime()
@@ -1199,7 +1476,9 @@ def _is_valid_gpu_polygons_device(
 
     # Step 1: structural ring validity (closure, min coords)
     kernels = compile_kernel_group(
-        "is-valid-rings-fp64", _IS_VALID_RINGS_FP64, _IS_VALID_RINGS_KERNEL_NAMES,
+        "is-valid-rings-fp64",
+        _IS_VALID_RINGS_FP64,
+        _IS_VALID_RINGS_KERNEL_NAMES,
     )
     kernel = kernels["is_valid_rings"]
 
@@ -1211,28 +1490,50 @@ def _is_valid_gpu_polygons_device(
     try:
         ptr = runtime.pointer
         params = (
-            (ptr(d_buf.x), ptr(d_buf.y), ptr(d_buf.ring_offsets),
-             ptr(d_is_exterior), ptr(d_ring_valid), ring_count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(d_buf.x),
+                ptr(d_buf.y),
+                ptr(d_buf.ring_offsets),
+                ptr(d_is_exterior),
+                ptr(d_ring_valid),
+                ring_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, ring_count)
         runtime.launch(kernel, grid=grid, block=block, params=params)
 
-        # Step 2: ring simplicity (no self-intersection) via is_simple_segments
-        d_ring_simple = _launch_is_simple_kernel(
-            runtime,
-            d_buf.x,
-            d_buf.y,
-            d_buf.ring_offsets,
-            ring_count,
-            is_ring=1,
-            exact_collinearity=exact_collinearity,
-        )
+        # Step 2: ring simplicity (no self-intersection). Native expression
+        # callers supply the exact sweep-reduced row result so long rings are
+        # candidate-shaped rather than quadratic. Keep the direct helper's
+        # bounded block path for callers that only own a family buffer.
+        if row_ring_simple is None:
+            d_ring_simple = _launch_is_simple_kernel(
+                runtime,
+                d_buf.x,
+                d_buf.y,
+                d_buf.ring_offsets,
+                ring_count,
+                is_ring=1,
+                exact_collinearity=exact_collinearity,
+                active_span_count=cp.asarray(
+                    d_buf.geometry_offsets[-1:],
+                    dtype=cp.int64,
+                ),
+            )
+            d_ring_simple_cp = cp.asarray(d_ring_simple)
+        else:
+            d_ring_simple_cp = cp.ones(ring_count, dtype=cp.int32)
 
-        # Combine: ring is valid only if structurally valid AND simple
+        # Combine structural ring validity with any family-buffer simplicity.
         d_ring_valid_cp = cp.asarray(d_ring_valid)
-        d_ring_simple_cp = cp.asarray(d_ring_simple)
         d_ring_ok = (d_ring_valid_cp & d_ring_simple_cp).astype(cp.int32)
 
         # Reduce per-ring results to per-geometry (all rings must be valid)
@@ -1244,36 +1545,45 @@ def _is_valid_gpu_polygons_device(
         d_invalid = 1 - d_ring_ok
         d_cumsum = cp.cumsum(d_invalid)
 
-        d_empty = d_starts == d_ends
-        d_result = cp.ones(geom_count, dtype=cp.bool_)
-
-        d_ne_indices = cp.flatnonzero(~d_empty)
-        if d_ne_indices.size > 0:
-            d_end_indices = d_ends[d_ne_indices] - 1
-            d_end_sums = d_cumsum[d_end_indices]
-
-            d_starts_ne = d_starts[d_ne_indices]
-            d_start_sums = cp.zeros(d_ne_indices.size, dtype=cp.int32)
-            d_has_prev = d_starts_ne > 0
-            d_hp_indices = cp.flatnonzero(d_has_prev)
-            if d_hp_indices.size > 0:
-                d_start_sums[d_hp_indices] = d_cumsum[d_starts_ne[d_hp_indices] - 1]
-
-            d_invalid_counts = d_end_sums - d_start_sums
-            d_result[d_ne_indices] = (d_invalid_counts == 0)
+        d_nonempty = d_starts < d_ends
+        d_end_indices = cp.maximum(d_ends - 1, 0)
+        d_end_sums = cp.where(
+            d_nonempty,
+            d_cumsum[d_end_indices],
+            cp.int32(0),
+        )
+        d_previous_indices = cp.maximum(d_starts - 1, 0)
+        d_start_sums = cp.where(
+            d_starts > 0,
+            d_cumsum[d_previous_indices],
+            cp.int32(0),
+        )
+        d_result = (~d_nonempty) | ((d_end_sums - d_start_sums) == 0)
+        if row_ring_simple is not None:
+            d_result &= cp.asarray(row_ring_simple, dtype=cp.bool_)
 
         # Stay on device: d_result is the running per-geometry validity mask
 
         # Step 3: hole-in-shell containment
-        d_hole_indices, d_ext_indices, hole_count = \
-            _build_hole_and_exterior_indices(d_buf, GeometryFamily.POLYGON)
-        if hole_count > 0:
+        d_hole_indices, d_ext_indices, d_hole_active = _build_hole_and_exterior_indices(
+            d_buf, GeometryFamily.POLYGON
+        )
+        if int(d_hole_indices.size) > 0:
             d_hole_valid = _launch_holes_in_shell_kernel(
-                runtime, d_buf, d_hole_indices, d_ext_indices, hole_count,
+                runtime,
+                d_buf,
+                d_hole_indices,
+                d_ext_indices,
+                d_hole_active,
             )
             d_hole_geom = _reduce_hole_valid_to_geom(
-                cp.asarray(d_hole_valid), d_hole_indices,
-                d_buf, GeometryFamily.POLYGON, family_rows, geom_count,
+                cp.asarray(d_hole_valid),
+                d_hole_indices,
+                d_hole_active,
+                d_buf,
+                GeometryFamily.POLYGON,
+                family_rows,
+                geom_count,
             )
             # AND on device: geometry valid only if rings ok AND holes ok
             d_result &= d_hole_geom
@@ -1286,9 +1596,15 @@ def _is_valid_gpu_polygons_device(
         d_poly_ring_ends = d_buf.geometry_offsets[1:]
         total_polys = int(d_poly_ring_starts.shape[0])
         d_rpi_valid = None
-        if total_polys > 0:
+        if row_ring_interaction_valid is not None:
+            d_result &= cp.asarray(row_ring_interaction_valid, dtype=cp.bool_)
+        elif total_polys > 0:
             d_rpi_valid = _launch_ring_pair_interaction_kernel(
-                runtime, d_buf, d_poly_ring_starts, d_poly_ring_ends, total_polys,
+                runtime,
+                d_buf,
+                d_poly_ring_starts,
+                d_poly_ring_ends,
+                total_polys,
             )
             # AND on device
             d_rpi_cp = cp.asarray(d_rpi_valid)
@@ -1339,6 +1655,9 @@ def _is_valid_gpu_multipolygons_device(
     family_rows,
     *,
     exact_collinearity: bool = False,
+    row_ring_simple=None,
+    row_ring_interaction_valid=None,
+    row_part_interaction_valid=None,
 ):
     """Return device MultiPolygon validity for family rows."""
     runtime = get_cuda_runtime()
@@ -1348,7 +1667,9 @@ def _is_valid_gpu_multipolygons_device(
 
     # Step 1: structural ring validity (closure, min coords)
     kernels = compile_kernel_group(
-        "is-valid-rings-fp64", _IS_VALID_RINGS_FP64, _IS_VALID_RINGS_KERNEL_NAMES,
+        "is-valid-rings-fp64",
+        _IS_VALID_RINGS_FP64,
+        _IS_VALID_RINGS_KERNEL_NAMES,
     )
     kernel = kernels["is_valid_rings"]
 
@@ -1360,28 +1681,46 @@ def _is_valid_gpu_multipolygons_device(
     try:
         ptr = runtime.pointer
         params = (
-            (ptr(d_buf.x), ptr(d_buf.y), ptr(d_buf.ring_offsets),
-             ptr(d_is_exterior), ptr(d_ring_valid), ring_count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(d_buf.x),
+                ptr(d_buf.y),
+                ptr(d_buf.ring_offsets),
+                ptr(d_is_exterior),
+                ptr(d_ring_valid),
+                ring_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, ring_count)
         runtime.launch(kernel, grid=grid, block=block, params=params)
 
-        # Step 2: ring simplicity (no self-intersection) via is_simple_segments
-        d_ring_simple = _launch_is_simple_kernel(
-            runtime,
-            d_buf.x,
-            d_buf.y,
-            d_buf.ring_offsets,
-            ring_count,
-            is_ring=1,
-            exact_collinearity=exact_collinearity,
-        )
+        # Step 2: ring simplicity. See the Polygon path above.
+        if row_ring_simple is None:
+            d_ring_simple = _launch_is_simple_kernel(
+                runtime,
+                d_buf.x,
+                d_buf.y,
+                d_buf.ring_offsets,
+                ring_count,
+                is_ring=1,
+                exact_collinearity=exact_collinearity,
+                active_span_count=cp.asarray(d_buf.part_offsets, dtype=cp.int64)[
+                    cp.asarray(d_buf.geometry_offsets[-1:], dtype=cp.int64)
+                ],
+            )
+            d_ring_simple_cp = cp.asarray(d_ring_simple)
+        else:
+            d_ring_simple_cp = cp.ones(ring_count, dtype=cp.int32)
 
-        # Combine: ring is valid only if structurally valid AND simple
+        # Combine structural ring validity with any family-buffer simplicity.
         d_ring_valid_cp = cp.asarray(d_ring_valid)
-        d_ring_simple_cp = cp.asarray(d_ring_simple)
         d_ring_ok = (d_ring_valid_cp & d_ring_simple_cp).astype(cp.int32)
 
         # For MultiPolygon: geometry_offsets -> parts, part_offsets -> rings.
@@ -1400,36 +1739,45 @@ def _is_valid_gpu_multipolygons_device(
         d_invalid = 1 - d_ring_ok
         d_cumsum = cp.cumsum(d_invalid)
 
-        d_empty = d_starts == d_ends
-        d_result = cp.ones(geom_count, dtype=cp.bool_)
-
-        d_ne_indices = cp.flatnonzero(~d_empty)
-        if d_ne_indices.size > 0:
-            d_end_indices = d_ends[d_ne_indices] - 1
-            d_end_sums = d_cumsum[d_end_indices]
-
-            d_starts_ne = d_starts[d_ne_indices]
-            d_start_sums = cp.zeros(d_ne_indices.size, dtype=cp.int32)
-            d_has_prev = d_starts_ne > 0
-            d_hp_indices = cp.flatnonzero(d_has_prev)
-            if d_hp_indices.size > 0:
-                d_start_sums[d_hp_indices] = d_cumsum[d_starts_ne[d_hp_indices] - 1]
-
-            d_invalid_counts = d_end_sums - d_start_sums
-            d_result[d_ne_indices] = (d_invalid_counts == 0)
+        d_nonempty = d_starts < d_ends
+        d_end_indices = cp.maximum(d_ends - 1, 0)
+        d_end_sums = cp.where(
+            d_nonempty,
+            d_cumsum[d_end_indices],
+            cp.int32(0),
+        )
+        d_previous_indices = cp.maximum(d_starts - 1, 0)
+        d_start_sums = cp.where(
+            d_starts > 0,
+            d_cumsum[d_previous_indices],
+            cp.int32(0),
+        )
+        d_result = (~d_nonempty) | ((d_end_sums - d_start_sums) == 0)
+        if row_ring_simple is not None:
+            d_result &= cp.asarray(row_ring_simple, dtype=cp.bool_)
 
         # Stay on device: d_result is the running per-geometry validity mask
 
         # Step 3: hole-in-shell containment
-        d_hole_indices, d_ext_indices, hole_count = \
-            _build_hole_and_exterior_indices(d_buf, GeometryFamily.MULTIPOLYGON)
-        if hole_count > 0:
+        d_hole_indices, d_ext_indices, d_hole_active = _build_hole_and_exterior_indices(
+            d_buf, GeometryFamily.MULTIPOLYGON
+        )
+        if int(d_hole_indices.size) > 0:
             d_hole_valid = _launch_holes_in_shell_kernel(
-                runtime, d_buf, d_hole_indices, d_ext_indices, hole_count,
+                runtime,
+                d_buf,
+                d_hole_indices,
+                d_ext_indices,
+                d_hole_active,
             )
             d_hole_geom = _reduce_hole_valid_to_geom(
-                cp.asarray(d_hole_valid), d_hole_indices,
-                d_buf, GeometryFamily.MULTIPOLYGON, family_rows, geom_count,
+                cp.asarray(d_hole_valid),
+                d_hole_indices,
+                d_hole_active,
+                d_buf,
+                GeometryFamily.MULTIPOLYGON,
+                family_rows,
+                geom_count,
             )
             # AND on device
             d_result &= d_hole_geom
@@ -1439,9 +1787,15 @@ def _is_valid_gpu_multipolygons_device(
         d_poly_ring_starts = d_buf.part_offsets[:-1]
         d_poly_ring_ends = d_buf.part_offsets[1:]
         total_polys = int(d_poly_ring_starts.shape[0])
-        if total_polys > 0:
+        if row_ring_interaction_valid is not None:
+            d_result &= cp.asarray(row_ring_interaction_valid, dtype=cp.bool_)
+        elif total_polys > 0:
             d_rpi_valid = _launch_ring_pair_interaction_kernel(
-                runtime, d_buf, d_poly_ring_starts, d_poly_ring_ends, total_polys,
+                runtime,
+                d_buf,
+                d_poly_ring_starts,
+                d_poly_ring_ends,
+                total_polys,
             )
             # Reduce per-part RPI to per-geometry: a geometry is invalid if ANY
             # of its parts is invalid. Use cumsum trick on (1 - rpi_valid).
@@ -1453,23 +1807,29 @@ def _is_valid_gpu_multipolygons_device(
             d_gstart = d_buf.geometry_offsets[d_family_rows_mp]
             d_gend = d_buf.geometry_offsets[d_family_rows_mp + 1]
 
-            d_ge = d_gstart == d_gend
-            d_rpi_result = cp.ones(geom_count, dtype=cp.bool_)
-            d_ne = cp.flatnonzero(~d_ge)
-            if d_ne.size > 0:
-                d_e_idx = d_gend[d_ne] - 1
-                d_e_sums = d_rpi_cumsum[d_e_idx]
-                d_s_ne = d_gstart[d_ne]
-                d_s_sums = cp.zeros(d_ne.size, dtype=cp.int32)
-                d_hp = d_s_ne > 0
-                d_hp_idx = cp.flatnonzero(d_hp)
-                if d_hp_idx.size > 0:
-                    d_s_sums[d_hp_idx] = d_rpi_cumsum[d_s_ne[d_hp_idx] - 1]
-                d_ic = d_e_sums - d_s_sums
-                d_rpi_result[d_ne] = (d_ic == 0)
+            d_nonempty_parts = d_gstart < d_gend
+            d_rpi_end_indices = cp.maximum(d_gend - 1, 0)
+            d_rpi_end_sums = cp.where(
+                d_nonempty_parts,
+                d_rpi_cumsum[d_rpi_end_indices],
+                cp.int32(0),
+            )
+            d_rpi_previous_indices = cp.maximum(d_gstart - 1, 0)
+            d_rpi_start_sums = cp.where(
+                d_gstart > 0,
+                d_rpi_cumsum[d_rpi_previous_indices],
+                cp.int32(0),
+            )
+            d_rpi_result = (~d_nonempty_parts) | ((d_rpi_end_sums - d_rpi_start_sums) == 0)
 
             # AND on device
             d_result &= d_rpi_result
+
+        # Step 5: interactions between distinct polygon parts. Per-part ring
+        # validity above cannot detect overlapping components, shared edges,
+        # or one component lying inside another component's area.
+        if row_part_interaction_valid is not None:
+            d_result &= cp.asarray(row_part_interaction_valid, dtype=cp.bool_)
 
         return d_result
     finally:
@@ -1486,6 +1846,7 @@ def _is_valid_gpu_multipolygons_device(
 # ---------------------------------------------------------------------------
 # GPU dispatch: is_simple per-family
 # ---------------------------------------------------------------------------
+
 
 def _is_simple_gpu_points(d_buf, result, global_rows):
     """Points are always simple on GPU."""
@@ -1506,17 +1867,12 @@ def _launch_is_simple_kernel(
     is_ring,
     *,
     exact_collinearity: bool = False,
+    active_span_count=None,
 ):
     """Launch the is_simple_segments kernel and return the device result array."""
     kernels = compile_kernel_group(
-        (
-            "is-simple-segments-exact-fp64"
-            if exact_collinearity
-            else "is-simple-segments-fp64"
-        ),
-        _IS_SIMPLE_SEGMENTS_EXACT_FP64
-        if exact_collinearity
-        else _IS_SIMPLE_SEGMENTS_FP64,
+        ("is-simple-segments-exact-fp64" if exact_collinearity else "is-simple-segments-fp64"),
+        _IS_SIMPLE_SEGMENTS_EXACT_FP64 if exact_collinearity else _IS_SIMPLE_SEGMENTS_FP64,
         _IS_SIMPLE_SEGMENTS_KERNEL_NAMES,
     )
     kernel = kernels["is_simple_segments"]
@@ -1524,14 +1880,29 @@ def _launch_is_simple_kernel(
     d_result = runtime.allocate((span_count,), np.int32, zero=True)
     ptr = runtime.pointer
     params = (
-        (ptr(d_buf_x), ptr(d_buf_y), ptr(d_span_offsets),
-         ptr(d_result), int(is_ring), span_count),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+        (
+            ptr(d_buf_x),
+            ptr(d_buf_y),
+            ptr(d_span_offsets),
+            ptr(d_result),
+            0 if active_span_count is None else ptr(active_span_count),
+            int(is_ring),
+            span_count,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_I32,
+        ),
     )
-    # 1 block per span. CudaDriverRuntime.launch expects 3D launch tuples.
+    # A bounded persistent grid consumes a device-resident active prefix. This
+    # avoids capacity-shaped block scheduling for dynamic polygon outputs.
     block_size = 256
-    grid = (span_count, 1, 1)
+    grid = (min(span_count, 4096), 1, 1)
     block = (block_size, 1, 1)
     runtime.launch(kernel, grid=grid, block=block, params=params)
     return d_result
@@ -1550,7 +1921,12 @@ def _is_simple_gpu_linestrings(d_buf, family_rows, result, global_rows):
         return
 
     d_span_result = _launch_is_simple_kernel(
-        runtime, d_buf.x, d_buf.y, d_buf.geometry_offsets, total_spans, is_ring=0,
+        runtime,
+        d_buf.x,
+        d_buf.y,
+        d_buf.geometry_offsets,
+        total_spans,
+        is_ring=0,
     )
     try:
         d_family_rows = cp.asarray(family_rows)
@@ -1577,7 +1953,12 @@ def _is_simple_gpu_polygons(d_buf, family_rows, result, global_rows):
 
     # Launch over ALL rings with is_ring=1 (closed ring adjacency)
     d_span_result = _launch_is_simple_kernel(
-        runtime, d_buf.x, d_buf.y, d_buf.ring_offsets, ring_count, is_ring=1,
+        runtime,
+        d_buf.x,
+        d_buf.y,
+        d_buf.ring_offsets,
+        ring_count,
+        is_ring=1,
     )
     try:
         # Reduce per-ring to per-geometry
@@ -1606,7 +1987,7 @@ def _is_simple_gpu_polygons(d_buf, family_rows, result, global_rows):
                 d_start_sums[d_hp_indices] = d_cumsum[d_starts_ne[d_hp_indices] - 1]
 
             d_invalid_counts = d_end_sums - d_start_sums
-            d_result[d_ne_indices] = (d_invalid_counts == 0)
+            d_result[d_ne_indices] = d_invalid_counts == 0
 
         result[global_rows] = _runtime_device_to_host(
             d_result,
@@ -1628,7 +2009,12 @@ def _is_simple_gpu_multilinestrings(d_buf, family_rows, result, global_rows):
         return
 
     d_span_result = _launch_is_simple_kernel(
-        runtime, d_buf.x, d_buf.y, d_buf.part_offsets, total_parts, is_ring=0,
+        runtime,
+        d_buf.x,
+        d_buf.y,
+        d_buf.part_offsets,
+        total_parts,
+        is_ring=0,
     )
     try:
         geom_count = int(family_rows.shape[0])
@@ -1656,7 +2042,7 @@ def _is_simple_gpu_multilinestrings(d_buf, family_rows, result, global_rows):
                 d_start_sums[d_hp_indices] = d_cumsum[d_starts_ne[d_hp_indices] - 1]
 
             d_invalid_counts = d_end_sums - d_start_sums
-            d_result[d_ne_indices] = (d_invalid_counts == 0)
+            d_result[d_ne_indices] = d_invalid_counts == 0
 
         result[global_rows] = _runtime_device_to_host(
             d_result,
@@ -1679,7 +2065,12 @@ def _is_simple_gpu_multipolygons(d_buf, family_rows, result, global_rows):
         return
 
     d_span_result = _launch_is_simple_kernel(
-        runtime, d_buf.x, d_buf.y, d_buf.ring_offsets, ring_count, is_ring=1,
+        runtime,
+        d_buf.x,
+        d_buf.y,
+        d_buf.ring_offsets,
+        ring_count,
+        is_ring=1,
     )
     try:
         geom_count = int(family_rows.shape[0])
@@ -1711,7 +2102,7 @@ def _is_simple_gpu_multipolygons(d_buf, family_rows, result, global_rows):
                 d_start_sums[d_hp_indices] = d_cumsum[d_starts_ne[d_hp_indices] - 1]
 
             d_invalid_counts = d_end_sums - d_start_sums
-            d_result[d_ne_indices] = (d_invalid_counts == 0)
+            d_result[d_ne_indices] = d_invalid_counts == 0
 
         result[global_rows] = _runtime_device_to_host(
             d_result,
@@ -1725,14 +2116,19 @@ def _is_simple_gpu_multipolygons(d_buf, family_rows, result, global_rows):
 # Kernel registry (ADR-0033 observability)
 # ---------------------------------------------------------------------------
 
+
 @register_kernel_variant(
     "is_valid",
     "gpu-cuda-python",
     kernel_class=KernelClass.PREDICATE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     precision_modes=(PrecisionMode.FP64,),
@@ -1749,8 +2145,12 @@ def _is_valid_gpu_dispatch(owned):
     kernel_class=KernelClass.PREDICATE,
     execution_modes=(ExecutionMode.CPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     precision_modes=(PrecisionMode.FP64,),
@@ -1784,8 +2184,12 @@ def _is_valid_cpu(owned: OwnedGeometryArray) -> np.ndarray:
     kernel_class=KernelClass.PREDICATE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     precision_modes=(PrecisionMode.FP64,),
@@ -1802,8 +2206,12 @@ def _is_simple_gpu_dispatch(owned):
     kernel_class=KernelClass.PREDICATE,
     execution_modes=(ExecutionMode.CPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     precision_modes=(PrecisionMode.FP64,),
@@ -1831,10 +2239,444 @@ def _is_simple_cpu(owned: OwnedGeometryArray) -> np.ndarray:
     return result
 
 
+def _polygon_ring_topology_sweep_device(owned: OwnedGeometryArray):
+    """Return row-level ring simplicity and cross-ring/part validity.
+
+    Physical shape: extracted polygon segments -> same-row MBR overlap
+    candidates -> exact segment classifications -> row reduction. Consecutive
+    ring edges are removed by their nonzero-edge rank, preserving the GEOS
+    treatment of repeated consecutive vertices and ring closure. Cross-ring
+    proper intersections, overlaps, and distinct multi-touch points are reduced
+    from the same relation. Cross-part crossings and shared intervals are also
+    reduced here so MultiPolygon validity never repeats segment-pair work.
+    """
+    from vibespatial.spatial.segment_primitives import (
+        PagedSegmentIntersectionResult,
+        SegmentIntersectionKind,
+        _extract_segments_gpu,
+        classify_segment_intersections,
+    )
+
+    runtime = get_cuda_runtime()
+    segments = _extract_segments_gpu(owned, compute_type="double")
+    if segments.count < 2:
+        segments.free()
+        valid = cp.ones(owned.row_count, dtype=cp.bool_)
+        return valid, valid.copy(), valid.copy()
+
+    d_rows = cp.asarray(segments.row_indices, dtype=cp.int32)
+    d_parts = (
+        cp.zeros(segments.count, dtype=cp.int32)
+        if segments.part_indices is None
+        else cp.asarray(segments.part_indices, dtype=cp.int32)
+    )
+    d_rings = (
+        cp.zeros(segments.count, dtype=cp.int32)
+        if segments.ring_indices is None
+        else cp.asarray(segments.ring_indices, dtype=cp.int32)
+    )
+    d_nonzero = (cp.asarray(segments.x0) != cp.asarray(segments.x1)) | (
+        cp.asarray(segments.y0) != cp.asarray(segments.y1)
+    )
+    d_ring_start = cp.empty(segments.count, dtype=cp.bool_)
+    d_ring_start[0] = True
+    d_ring_start[1:] = (
+        (d_rows[1:] != d_rows[:-1]) | (d_parts[1:] != d_parts[:-1]) | (d_rings[1:] != d_rings[:-1])
+    )
+    d_ring_ids = cp.cumsum(d_ring_start.astype(cp.int32), dtype=cp.int32) - 1
+    d_nonzero_prefix = cp.cumsum(d_nonzero.astype(cp.int32), dtype=cp.int32)
+    d_ring_starts = cp.flatnonzero(d_ring_start).astype(cp.int32, copy=False)
+    d_ring_prefix_base = (
+        d_nonzero_prefix[d_ring_starts] - d_nonzero[d_ring_starts].astype(cp.int32, copy=False)
+    )[d_ring_ids]
+    d_nonzero_rank = d_nonzero_prefix - d_ring_prefix_base - 1
+    d_nonzero_counts = cp.zeros(segments.count, dtype=cp.int32)
+    cp.add.at(d_nonzero_counts, d_ring_ids, d_nonzero.astype(cp.int32))
+    d_ring_nonzero_count = d_nonzero_counts[d_ring_ids]
+    d_invalid_rows = cp.zeros(owned.row_count, dtype=cp.int32)
+    d_ring_interaction_invalid_rows = cp.zeros(owned.row_count, dtype=cp.int32)
+    d_part_interaction_invalid_rows = cp.zeros(owned.row_count, dtype=cp.int32)
+    touch_batches = []
+
+    def _release(page) -> None:
+        state = page.device_state
+        if state is None:
+            return
+        for values in (
+            state.left_rows,
+            state.left_segments,
+            state.left_lookup,
+            state.right_rows,
+            state.right_segments,
+            state.right_lookup,
+            state.kinds,
+            state.point_x,
+            state.point_y,
+            state.overlap_x0,
+            state.overlap_y0,
+            state.overlap_x1,
+            state.overlap_y1,
+            state.ambiguous_rows,
+        ):
+            runtime.free(values)
+
+    def _consume(page) -> None:
+        state = page.device_state
+        if state is None or page.count == 0:
+            return
+        try:
+            d_left_lookup = cp.asarray(state.left_lookup, dtype=cp.int32)
+            d_right_lookup = cp.asarray(state.right_lookup, dtype=cp.int32)
+            d_left_rank = d_nonzero_rank[d_left_lookup]
+            d_right_rank = d_nonzero_rank[d_right_lookup]
+            d_rank_min = cp.minimum(d_left_rank, d_right_rank)
+            d_rank_max = cp.maximum(d_left_rank, d_right_rank)
+            d_same_ring = (
+                (d_rows[d_left_lookup] == d_rows[d_right_lookup])
+                & (d_parts[d_left_lookup] == d_parts[d_right_lookup])
+                & (d_rings[d_left_lookup] == d_rings[d_right_lookup])
+            )
+            d_adjacent = (d_rank_max == d_rank_min + 1) | (
+                (d_rank_min == 0) & (d_rank_max == d_ring_nonzero_count[d_left_lookup] - 1)
+            )
+            d_invalid = (
+                d_same_ring
+                & d_nonzero[d_left_lookup]
+                & d_nonzero[d_right_lookup]
+                & ~d_adjacent
+                & (
+                    cp.asarray(state.kinds, dtype=cp.int8)
+                    != cp.int8(SegmentIntersectionKind.DISJOINT)
+                )
+            )
+            cp.maximum.at(
+                d_invalid_rows,
+                cp.asarray(state.left_rows, dtype=cp.int32),
+                d_invalid.astype(cp.int32, copy=False),
+            )
+
+            d_kinds = cp.asarray(state.kinds, dtype=cp.int8)
+            d_same_part = (
+                (d_rows[d_left_lookup] == d_rows[d_right_lookup])
+                & (d_parts[d_left_lookup] == d_parts[d_right_lookup])
+                & (d_rings[d_left_lookup] != d_rings[d_right_lookup])
+            )
+            d_hard_ring_violation = d_same_part & (
+                (d_kinds == cp.int8(SegmentIntersectionKind.PROPER))
+                | (d_kinds == cp.int8(SegmentIntersectionKind.OVERLAP))
+            )
+            cp.maximum.at(
+                d_ring_interaction_invalid_rows,
+                cp.asarray(state.left_rows, dtype=cp.int32),
+                d_hard_ring_violation.astype(cp.int32, copy=False),
+            )
+
+            d_distinct_part = (
+                (d_rows[d_left_lookup] == d_rows[d_right_lookup])
+                & (d_parts[d_left_lookup] != d_parts[d_right_lookup])
+            )
+            d_hard_part_violation = d_distinct_part & (
+                (d_kinds == cp.int8(SegmentIntersectionKind.PROPER))
+                | (d_kinds == cp.int8(SegmentIntersectionKind.OVERLAP))
+            )
+            cp.maximum.at(
+                d_part_interaction_invalid_rows,
+                cp.asarray(state.left_rows, dtype=cp.int32),
+                d_hard_part_violation.astype(cp.int32, copy=False),
+            )
+
+            d_touch = d_same_part & (d_kinds == cp.int8(SegmentIntersectionKind.TOUCH))
+            if int(d_touch.size) > 0:
+                d_left_ring = d_rings[d_left_lookup]
+                d_right_ring = d_rings[d_right_lookup]
+                touch_batches.append(
+                    (
+                        cp.asarray(state.left_rows, dtype=cp.int32),
+                        d_parts[d_left_lookup],
+                        cp.minimum(d_left_ring, d_right_ring),
+                        cp.maximum(d_left_ring, d_right_ring),
+                        cp.where(
+                            cp.asarray(state.point_x, dtype=cp.float64) == 0.0,
+                            cp.float64(0.0),
+                            cp.asarray(state.point_x, dtype=cp.float64),
+                        ),
+                        cp.where(
+                            cp.asarray(state.point_y, dtype=cp.float64) == 0.0,
+                            cp.float64(0.0),
+                            cp.asarray(state.point_y, dtype=cp.float64),
+                        ),
+                        d_touch,
+                    )
+                )
+        finally:
+            _release(page)
+
+    d_source_order = cp.arange(segments.count, dtype=cp.int32)
+    try:
+        intersections = classify_segment_intersections(
+            owned,
+            owned,
+            dispatch_mode=ExecutionMode.GPU,
+            precision=PrecisionMode.FP64,
+            _cached_left_device_segments=segments,
+            _cached_right_device_segments=segments,
+            _require_same_row=True,
+            _use_same_row_fast_path=False,
+            _collect_ambiguous_rows=False,
+            _strict_upper_source_rows=(d_source_order, d_source_order),
+            _compact_paged_non_disjoint=True,
+            _classified_page_consumer=_consume,
+        )
+        if not isinstance(intersections, PagedSegmentIntersectionResult):
+            _consume(intersections)
+
+        if touch_batches:
+            from vibespatial.overlay.graph import _fp64_radix_keys, _stable_radix_order_pass
+
+            d_touch_rows = cp.concatenate([batch[0] for batch in touch_batches])
+            d_touch_parts = cp.concatenate([batch[1] for batch in touch_batches])
+            d_touch_ring_lo = cp.concatenate([batch[2] for batch in touch_batches])
+            d_touch_ring_hi = cp.concatenate([batch[3] for batch in touch_batches])
+            d_touch_x = cp.concatenate([batch[4] for batch in touch_batches])
+            d_touch_y = cp.concatenate([batch[5] for batch in touch_batches])
+            d_touch_active = cp.concatenate([batch[6] for batch in touch_batches])
+            touch_order = cp.arange(d_touch_rows.size, dtype=cp.int32)
+            for key in (
+                _fp64_radix_keys(d_touch_y),
+                _fp64_radix_keys(d_touch_x),
+                d_touch_ring_hi,
+                d_touch_ring_lo,
+                d_touch_parts,
+                d_touch_rows,
+                (~d_touch_active).astype(cp.int8),
+            ):
+                touch_order = _stable_radix_order_pass(touch_order, key)
+
+            d_sorted_active = d_touch_active[touch_order]
+            d_sorted_rows = d_touch_rows[touch_order]
+            d_sorted_parts = d_touch_parts[touch_order]
+            d_sorted_ring_lo = d_touch_ring_lo[touch_order]
+            d_sorted_ring_hi = d_touch_ring_hi[touch_order]
+            d_sorted_x = d_touch_x[touch_order]
+            d_sorted_y = d_touch_y[touch_order]
+            d_unique_touch = d_sorted_active.copy()
+            if int(d_unique_touch.size) > 1:
+                d_unique_touch[1:] &= (
+                    ~d_sorted_active[:-1]
+                    | (d_sorted_rows[1:] != d_sorted_rows[:-1])
+                    | (d_sorted_parts[1:] != d_sorted_parts[:-1])
+                    | (d_sorted_ring_lo[1:] != d_sorted_ring_lo[:-1])
+                    | (d_sorted_ring_hi[1:] != d_sorted_ring_hi[:-1])
+                    | (d_sorted_x[1:] != d_sorted_x[:-1])
+                    | (d_sorted_y[1:] != d_sorted_y[:-1])
+                )
+            d_pair_start = d_sorted_active.copy()
+            if int(d_pair_start.size) > 1:
+                d_pair_start[1:] &= (
+                    ~d_sorted_active[:-1]
+                    | (d_sorted_rows[1:] != d_sorted_rows[:-1])
+                    | (d_sorted_parts[1:] != d_sorted_parts[:-1])
+                    | (d_sorted_ring_lo[1:] != d_sorted_ring_lo[:-1])
+                    | (d_sorted_ring_hi[1:] != d_sorted_ring_hi[:-1])
+                )
+            d_pair_ids = cp.cumsum(d_pair_start.astype(cp.int32), dtype=cp.int32) - 1
+            d_safe_pair_ids = cp.where(d_sorted_active, d_pair_ids, cp.int32(0))
+            d_unique_counts = cp.zeros(d_sorted_active.size, dtype=cp.int32)
+            cp.add.at(
+                d_unique_counts,
+                d_safe_pair_ids,
+                d_unique_touch.astype(cp.int32, copy=False),
+            )
+            d_multi_touch = d_sorted_active & (d_unique_counts[d_safe_pair_ids] >= 2)
+            cp.maximum.at(
+                d_ring_interaction_invalid_rows,
+                d_sorted_rows,
+                d_multi_touch.astype(cp.int32, copy=False),
+            )
+
+        return (
+            d_invalid_rows == 0,
+            d_ring_interaction_invalid_rows == 0,
+            d_part_interaction_invalid_rows == 0,
+        )
+    finally:
+        segments.free()
+
+
+def _multipolygon_part_containment_valid_device(owned: OwnedGeometryArray):
+    """Return row-level validity for nested MultiPolygon components.
+
+    Physical shape: polygon-part coordinate spans -> segmented part bounds ->
+    same-buffer MBR relation -> row-indirected representative-point/PIP refine
+    -> source-row reduction. Boundary crossing and shared-edge violations are
+    already reduced by ``_polygon_ring_topology_sweep_device``; this stage only
+    detects area containment among components whose boundaries do not cross.
+    """
+    from vibespatial.constructive.representative_point import representative_point_owned
+    from vibespatial.cuda.cccl_primitives import segmented_reduce_max, segmented_reduce_min
+    from vibespatial.geometry.owned import (
+        DeviceFamilyGeometryBuffer,
+        build_device_resident_owned,
+    )
+    from vibespatial.predicates.binary import binary_predicate_expression
+    from vibespatial.spatial.indexing import _generate_bounds_pairs_gpu
+
+    state = owned._ensure_device_state(preserve_indexed_view=True)
+    d_result = cp.ones(owned.row_count, dtype=cp.bool_)
+    d_tags = cp.asarray(state.tags, dtype=cp.int8)
+    d_family_rows = cp.asarray(state.family_row_offsets, dtype=cp.int64)
+    family = GeometryFamily.MULTIPOLYGON
+    d_buf = state.families.get(family)
+    if d_buf is None or d_buf.part_offsets is None or d_buf.ring_offsets is None:
+        return d_result
+
+    part_count = int(d_buf.part_offsets.size) - 1
+    family_row_count = int(d_buf.geometry_offsets.size) - 1
+    if part_count < 2 or family_row_count <= 0:
+        return d_result
+
+    d_part_offsets = cp.asarray(d_buf.part_offsets, dtype=cp.int64)
+    d_ring_offsets = cp.asarray(d_buf.ring_offsets, dtype=cp.int64)
+    d_part_coord_starts = d_ring_offsets[d_part_offsets[:-1]]
+    d_part_coord_ends = d_ring_offsets[d_part_offsets[1:]]
+    d_nonempty_parts = d_part_coord_starts < d_part_coord_ends
+
+    d_min_x = segmented_reduce_min(
+        cp.asarray(d_buf.x, dtype=cp.float64),
+        d_part_coord_starts,
+        d_part_coord_ends,
+        num_segments=part_count,
+    ).values
+    d_min_y = segmented_reduce_min(
+        cp.asarray(d_buf.y, dtype=cp.float64),
+        d_part_coord_starts,
+        d_part_coord_ends,
+        num_segments=part_count,
+    ).values
+    d_max_x = segmented_reduce_max(
+        cp.asarray(d_buf.x, dtype=cp.float64),
+        d_part_coord_starts,
+        d_part_coord_ends,
+        num_segments=part_count,
+    ).values
+    d_max_y = segmented_reduce_max(
+        cp.asarray(d_buf.y, dtype=cp.float64),
+        d_part_coord_starts,
+        d_part_coord_ends,
+        num_segments=part_count,
+    ).values
+    d_part_bounds = cp.stack((d_min_x, d_min_y, d_max_x, d_max_y), axis=1)
+    d_part_bounds[~d_nonempty_parts] = cp.nan
+
+    d_left_parts, d_right_parts, _pairs_examined, _selection = _generate_bounds_pairs_gpu(
+        d_part_bounds,
+        d_part_bounds,
+        same_input=True,
+        include_self=False,
+        capacity_output=False,
+    )
+    if int(d_left_parts.size) == 0:
+        return d_result
+
+    d_geometry_offsets = cp.asarray(d_buf.geometry_offsets, dtype=cp.int64)
+    d_part_owner = cp.searchsorted(
+        d_geometry_offsets[1:],
+        cp.arange(part_count, dtype=cp.int64),
+        side="right",
+    ).astype(
+        cp.int32,
+        copy=False,
+    )
+    d_global_family = cp.flatnonzero(
+        cp.asarray(state.validity, dtype=cp.bool_)
+        & (d_tags == np.int8(FAMILY_TAGS[family]))
+    ).astype(cp.int64, copy=False)
+    d_active_family_rows = cp.zeros(family_row_count, dtype=cp.bool_)
+    d_active_family_rows[d_family_rows[d_global_family]] = True
+    d_same_active_owner = (
+        (d_part_owner[d_left_parts] == d_part_owner[d_right_parts])
+        & d_active_family_rows[d_part_owner[d_left_parts]]
+    )
+    d_pair_positions = cp.flatnonzero(d_same_active_owner).astype(cp.int64, copy=False)
+    if int(d_pair_positions.size) == 0:
+        return d_result
+    d_left_parts = cp.asarray(d_left_parts, dtype=cp.int64)[d_pair_positions]
+    d_right_parts = cp.asarray(d_right_parts, dtype=cp.int64)[d_pair_positions]
+
+    d_part_validity = cp.ones(part_count, dtype=cp.bool_)
+    d_part_tags = cp.full(
+        part_count,
+        np.int8(FAMILY_TAGS[GeometryFamily.POLYGON]),
+        dtype=cp.int8,
+    )
+    part_polygons = build_device_resident_owned(
+        device_families={
+            GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.POLYGON,
+                x=d_buf.x,
+                y=d_buf.y,
+                geometry_offsets=cp.asarray(d_buf.part_offsets, dtype=cp.int32),
+                empty_mask=~d_nonempty_parts,
+                ring_offsets=d_buf.ring_offsets,
+                bounds=d_part_bounds,
+            )
+        },
+        row_count=part_count,
+        tags=d_part_tags,
+        validity=d_part_validity,
+        family_row_offsets=cp.arange(part_count, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+    part_state = part_polygons._ensure_device_state(preserve_indexed_view=True)
+    part_state.row_bounds = d_part_bounds
+    part_state.trusted_all_valid = True
+    part_state.trusted_all_non_empty = True
+    part_state.trusted_polygonal_only = True
+    part_state.trusted_homogeneous_family = GeometryFamily.POLYGON
+    part_state.trusted_family_domain = (GeometryFamily.POLYGON,)
+
+    part_points = representative_point_owned(
+        part_polygons,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    left_within_right = binary_predicate_expression(
+        "within",
+        part_points._device_indexed_take(d_left_parts),
+        part_polygons._device_indexed_take(d_right_parts),
+        dispatch_mode=ExecutionMode.GPU,
+        operation="validity.multipolygon_part_left_within_right",
+    )
+    right_within_left = binary_predicate_expression(
+        "within",
+        part_points._device_indexed_take(d_right_parts),
+        part_polygons._device_indexed_take(d_left_parts),
+        dispatch_mode=ExecutionMode.GPU,
+        operation="validity.multipolygon_part_right_within_left",
+    )
+    if left_within_right is None or right_within_left is None:
+        raise RuntimeError("native MultiPolygon part-containment predicate declined")
+
+    d_invalid_family_rows = cp.zeros(family_row_count, dtype=cp.int32)
+    d_nested = cp.asarray(left_within_right.values, dtype=cp.bool_) | cp.asarray(
+        right_within_left.values,
+        dtype=cp.bool_,
+    )
+    cp.maximum.at(
+        d_invalid_family_rows,
+        d_part_owner[d_left_parts],
+        d_nested.astype(cp.int32, copy=False),
+    )
+    d_result[d_global_family] = (
+        d_invalid_family_rows[d_family_rows[d_global_family]] == 0
+    )
+    return d_result
+
+
 def _validity_gpu_device_values(
     owned: OwnedGeometryArray,
     *,
     exact_collinearity: bool = False,
+    preserve_indexed_view: bool = True,
 ):
     """Compute public validity flags as a device-resident boolean vector.
 
@@ -1845,11 +2687,35 @@ def _validity_gpu_device_values(
     if cp is None:  # pragma: no cover - guarded by GPU tests
         raise RuntimeError("CuPy is required for device-resident validity")
 
-    device_state = owned._ensure_device_state()
+    device_state = owned._ensure_device_state(
+        preserve_indexed_view=preserve_indexed_view,
+    )
     d_source_validity = cp.asarray(device_state.validity, dtype=cp.bool_)
+    if device_state.trusted_all_ogc_valid is True:
+        return d_source_validity.copy()
     d_result = d_source_validity.copy()
     d_tags = cp.asarray(device_state.tags)
     d_family_row_offsets = cp.asarray(device_state.family_row_offsets)
+    has_polygon_family = any(
+        family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON)
+        for family in device_state.families
+    )
+    if has_polygon_family:
+        (
+            d_polygon_ring_simple,
+            d_polygon_ring_interaction_valid,
+            d_multipolygon_part_boundary_valid,
+        ) = (
+            _polygon_ring_topology_sweep_device(owned)
+        )
+        d_multipolygon_part_containment_valid = (
+            _multipolygon_part_containment_valid_device(owned)
+        )
+    else:
+        d_polygon_ring_simple = None
+        d_polygon_ring_interaction_valid = None
+        d_multipolygon_part_boundary_valid = None
+        d_multipolygon_part_containment_valid = None
 
     for family, d_buf in device_state.families.items():
         global_rows = cp.flatnonzero(
@@ -1876,17 +2742,52 @@ def _validity_gpu_device_values(
                 d_buf,
                 family_rows,
                 exact_collinearity=exact_collinearity,
+                row_ring_simple=d_polygon_ring_simple[global_rows],
+                row_ring_interaction_valid=d_polygon_ring_interaction_valid[global_rows],
             )
         elif family is GeometryFamily.MULTIPOLYGON:
             d_result[global_rows] = _is_valid_gpu_multipolygons_device(
                 d_buf,
                 family_rows,
                 exact_collinearity=exact_collinearity,
+                row_ring_simple=d_polygon_ring_simple[global_rows],
+                row_ring_interaction_valid=d_polygon_ring_interaction_valid[global_rows],
+                row_part_interaction_valid=(
+                    d_multipolygon_part_boundary_valid[global_rows]
+                    & d_multipolygon_part_containment_valid[global_rows]
+                ),
             )
         else:  # pragma: no cover - GeometryFamily is currently exhaustive.
             raise RuntimeError(f"unsupported geometry family for validity expression: {family}")
 
     return d_result
+
+
+def _public_validity_gpu_device_values(
+    owned: OwnedGeometryArray,
+    *,
+    exact_collinearity: bool = False,
+    preserve_indexed_view: bool = True,
+):
+    """Return Shapely-compatible public validity flags on device.
+
+    ``_validity_gpu_device_values`` is the native predicate expression used by
+    rowsets: null rows compare false.  The public GeoPandas/GEOS contract treats
+    null geometry rows as valid, so public consumers need this thin device-side
+    policy layer before the terminal host export.
+    """
+    values = _validity_gpu_device_values(
+        owned,
+        exact_collinearity=exact_collinearity,
+        preserve_indexed_view=preserve_indexed_view,
+    )
+    device_state = owned._ensure_device_state(
+        preserve_indexed_view=preserve_indexed_view,
+    )
+    return cp.asarray(values, dtype=cp.bool_) | ~cp.asarray(
+        device_state.validity,
+        dtype=cp.bool_,
+    )
 
 
 def validity_expression_owned(
@@ -1907,6 +2808,7 @@ def validity_expression_owned(
     values = _validity_gpu_device_values(
         owned,
         exact_collinearity=exact_collinearity,
+        preserve_indexed_view=True,
     )
     return NativeExpression(
         operation="geometry.is_valid",
@@ -1922,6 +2824,7 @@ def validity_expression_owned(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def is_valid_owned(
     owned: OwnedGeometryArray,
@@ -1989,6 +2892,12 @@ def is_valid_owned(
         kernel_name="is_valid",
         kernel_class=KernelClass.PREDICATE,
         row_count=row_count,
+        work_estimate=estimate_segment_pair_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            output_byte_count=row_count,
+            primary_unit_name="validity-segment-pair",
+        ),
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=combined_residency(owned),
@@ -2004,6 +2913,34 @@ def is_valid_owned(
         and cp is not None
         and owned.device_state is not None
     )
+
+    if use_gpu:
+        try:
+            d_result = _public_validity_gpu_device_values(
+                owned,
+                exact_collinearity=_exact_collinearity,
+                preserve_indexed_view=True,
+            )
+            result = _runtime_device_to_host(
+                d_result,
+                reason="constructive validity result terminal host export",
+            ).astype(bool, copy=False)
+            record_dispatch_event(
+                surface="geopandas.array.is_valid",
+                operation="is_valid",
+                requested=dispatch_mode,
+                selected=ExecutionMode.GPU,
+                implementation="is_valid_gpu_native_expression",
+                reason=selection.reason,
+                detail=(
+                    "precision=fp64 "
+                    f"(PREDICATE class, plan={precision_plan.compute_precision.value})"
+                ),
+            )
+            setattr(owned, cache_attr, result)
+            return result
+        except Exception:
+            pass
 
     result = np.ones(row_count, dtype=bool)
     tags = owned.tags
@@ -2118,6 +3055,12 @@ def is_simple_owned(
         kernel_name="is_simple",
         kernel_class=KernelClass.PREDICATE,
         row_count=row_count,
+        work_estimate=estimate_segment_pair_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            output_byte_count=row_count,
+            primary_unit_name="simplicity-segment-pair",
+        ),
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=combined_residency(owned),

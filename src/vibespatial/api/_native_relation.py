@@ -9,8 +9,9 @@ from vibespatial.api._native_grouped import (
     NativeGrouped,
     NativeGroupedAttributeReduction,
     NativeGroupedReduction,
+    NativeGroupedSelection,
 )
-from vibespatial.api._native_rowset import NativeRowSet
+from vibespatial.api._native_rowset import NativeDeviceSelection, NativeRowSet
 
 
 def _is_device_array(values: Any) -> bool:
@@ -245,12 +246,18 @@ class NativeRelation:
             )
         else:
             raise ValueError("NativeRelation semijoin order must be 'sorted' or 'first'")
+        identity = (
+            order == "sorted"
+            and self.left_row_count is not None
+            and _array_size(positions) == int(self.left_row_count)
+        )
         return NativeRowSet.from_positions(
             positions,
             source_token=self.left_token,
             source_row_count=self.left_row_count,
             ordered=True,
             unique=True,
+            identity=identity,
         )
 
     def right_semijoin_rowset(self, *, order: str = "sorted") -> NativeRowSet:
@@ -267,12 +274,18 @@ class NativeRelation:
             )
         else:
             raise ValueError("NativeRelation semijoin order must be 'sorted' or 'first'")
+        identity = (
+            order == "sorted"
+            and self.right_row_count is not None
+            and _array_size(positions) == int(self.right_row_count)
+        )
         return NativeRowSet.from_positions(
             positions,
             source_token=self.right_token,
             source_row_count=self.right_row_count,
             ordered=True,
             unique=True,
+            identity=identity,
         )
 
     def left_antijoin_rowset(
@@ -437,6 +450,24 @@ class NativeRelation:
         """Filter relation pairs by their private distance expression."""
         return self.filter_pairs(self.distance_rowset(op, scalar))
 
+    def filter_by_distance_selection(
+        self,
+        op: str,
+        scalar: float,
+    ) -> NativeRelationSelection | NativeRelation:
+        """Filter distances without compacting a device-backed pair relation."""
+        selection = self.distance_expression().compare_scalar_selection(op, scalar)
+        if isinstance(selection, NativeDeviceSelection):
+            return self.filter_pairs_selection(selection)
+        return self.filter_pairs(selection)
+
+    def filter_pairs_selection(
+        self,
+        selection: NativeDeviceSelection,
+    ) -> NativeRelationSelection:
+        """Keep a dynamic pair filter row-indirected and capacity-backed."""
+        return NativeRelationSelection(relation=self, selection=selection)
+
     def filter_by_equal_columns(self, left_columns, right_columns) -> NativeRelation:
         """Filter relation pairs where corresponding left/right columns match.
 
@@ -454,6 +485,46 @@ class NativeRelation:
             raise ValueError("left_columns and right_columns must have matching keys")
         if not left_columns:
             return self
+        keep = self._equal_columns_mask(left_columns, right_columns)
+        pair_rowset = NativeRowSet.from_positions(
+            _nonzero_positions(keep),
+            source_row_count=len(self),
+            ordered=self.sorted_by_left,
+            unique=False,
+        )
+        return self.filter_pairs(pair_rowset)
+
+    def filter_by_equal_columns_selection(
+        self,
+        left_columns,
+        right_columns,
+    ) -> NativeRelationSelection | NativeRelation:
+        """Filter equal pair attributes without device cardinality compaction."""
+        left_columns = dict(left_columns)
+        right_columns = dict(right_columns)
+        if set(left_columns) != set(right_columns):
+            raise ValueError("left_columns and right_columns must have matching keys")
+        if not left_columns:
+            return self
+        keep = self._equal_columns_mask(left_columns, right_columns)
+        if _is_device_array(keep):
+            return self.filter_pairs_selection(
+                NativeDeviceSelection.from_mask(
+                    keep,
+                    source_row_count=len(self),
+                )
+            )
+        pair_rowset = NativeRowSet.from_positions(
+            _nonzero_positions(keep),
+            source_row_count=len(self),
+            ordered=self.sorted_by_left,
+            unique=False,
+        )
+        return self.filter_pairs(pair_rowset)
+
+    def _equal_columns_mask(self, left_columns, right_columns):
+        left_columns = dict(left_columns)
+        right_columns = dict(right_columns)
         if self.left_row_count is not None:
             bad = [
                 name
@@ -476,7 +547,7 @@ class NativeRelation:
             for values in (*left_columns.values(), *right_columns.values())
         )
         if uses_device_columns:
-            return self._filter_by_equal_pylibcudf_columns(left_columns, right_columns)
+            return self._equal_pylibcudf_columns_mask(left_columns, right_columns)
 
         keep = None
         for name, left_values in left_columns.items():
@@ -487,19 +558,13 @@ class NativeRelation:
             )
             keep = column_keep if keep is None else keep & column_keep
 
-        pair_rowset = NativeRowSet.from_positions(
-            _nonzero_positions(keep),
-            source_row_count=len(self),
-            ordered=self.sorted_by_left,
-            unique=False,
-        )
-        return self.filter_pairs(pair_rowset)
+        return keep
 
-    def _filter_by_equal_pylibcudf_columns(
+    def _equal_pylibcudf_columns_mask(
         self,
         left_columns,
         right_columns,
-    ) -> NativeRelation:
+    ):
         if any(
             not _is_pylibcudf_column(values)
             for values in (*left_columns.values(), *right_columns.values())
@@ -556,14 +621,7 @@ class NativeRelation:
                 )
             )
 
-        keep = _device_bool_column_values(keep_column)
-        pair_rowset = NativeRowSet.from_positions(
-            _nonzero_positions(keep),
-            source_row_count=len(self),
-            ordered=self.sorted_by_left,
-            unique=False,
-        )
-        return self.filter_pairs(pair_rowset)
+        return _device_bool_column_values(keep_column)
 
     def left_reduce_distances(
         self,
@@ -704,4 +762,315 @@ class NativeRelation:
         )
 
 
-__all__ = ["NativeRelation"]
+@dataclass(frozen=True)
+class NativeRelationSelection:
+    """Capacity-backed relation view with device-resident cardinality.
+
+    Selected positions remain a compact prefix at source-pair capacity.
+    Aggregate consumers map inactive lanes to one sentinel group and therefore
+    avoid both a host count fence and a compact relation allocation.
+    """
+
+    relation: NativeRelation
+    selection: NativeDeviceSelection
+
+    def __post_init__(self) -> None:
+        pair_count = len(self.relation)
+        if (
+            self.selection.source_row_count is not None
+            and int(self.selection.source_row_count) != pair_count
+        ):
+            raise ValueError(
+                "NativeRelationSelection source row count must match relation pairs"
+            )
+        if self.selection.capacity > pair_count:
+            raise ValueError(
+                "NativeRelationSelection capacity cannot exceed relation pair count"
+            )
+        if (
+            self.selection.source_row_count is None
+            and self.selection.capacity != pair_count
+        ):
+            raise ValueError(
+                "NativeRelationSelection bounded capacity requires source_row_count"
+            )
+
+    @property
+    def capacity(self) -> int:
+        return self.selection.capacity
+
+    @property
+    def logical_count(self):
+        return self.selection.logical_count
+
+    @property
+    def is_device(self) -> bool:
+        return True
+
+    def __len__(self) -> int:
+        raise TypeError(
+            "NativeRelationSelection logical length is device-resident; use capacity "
+            "for native work or explicitly compact the selection"
+        )
+
+    def _grouped(self, side: str, *, row_count: int) -> NativeGroupedSelection:
+        source = (
+            self.relation.left_indices
+            if side == "left"
+            else self.relation.right_indices
+        )
+        token = self.relation.left_token if side == "left" else self.relation.right_token
+        return NativeGroupedSelection(
+            group_codes=source,
+            selection=self.selection,
+            group_count=int(row_count),
+            source_token=token,
+        )
+
+    def _match_counts(self, side: str, *, row_count: int):
+        source = (
+            self.relation.left_indices
+            if side == "left"
+            else self.relation.right_indices
+        )
+        return self._grouped(side, row_count=row_count).reduce_numeric(
+            source,
+            "count",
+        ).values
+
+    def left_match_count_expression(
+        self,
+        *,
+        source_row_count: int | None = None,
+        operation: str = "relation.selection.left_match_count",
+    ):
+        from vibespatial.api._native_expression import NativeExpression
+
+        row_count = _resolve_row_count(
+            source_row_count,
+            self.relation.left_row_count,
+            side="left",
+        )
+        counts = self._match_counts("left", row_count=row_count)
+        return NativeExpression(
+            operation=operation,
+            values=counts,
+            source_token=self.relation.left_token,
+            source_row_count=row_count,
+            dtype=_dtype_name(counts),
+        )
+
+    def right_match_count_expression(
+        self,
+        *,
+        source_row_count: int | None = None,
+        operation: str = "relation.selection.right_match_count",
+    ):
+        from vibespatial.api._native_expression import NativeExpression
+
+        row_count = _resolve_row_count(
+            source_row_count,
+            self.relation.right_row_count,
+            side="right",
+        )
+        counts = self._match_counts("right", row_count=row_count)
+        return NativeExpression(
+            operation=operation,
+            values=counts,
+            source_token=self.relation.right_token,
+            source_row_count=row_count,
+            dtype=_dtype_name(counts),
+        )
+
+    def _reduce_distances(
+        self,
+        side: str,
+        reducer: str,
+        *,
+        row_count: int,
+    ) -> NativeGroupedReduction:
+        if self.relation.distances is None:
+            raise ValueError("selected relation distance reduction requires distances")
+        return self._grouped(side, row_count=row_count).reduce_numeric(
+            self.relation.distances,
+            reducer,
+        )
+
+    def left_reduce_distances(
+        self,
+        reducer: str,
+        *,
+        left_row_count: int | None = None,
+    ) -> NativeGroupedReduction:
+        row_count = _resolve_row_count(
+            left_row_count,
+            self.relation.left_row_count,
+            side="left",
+        )
+        return self._reduce_distances("left", reducer, row_count=row_count)
+
+    def right_reduce_distances(
+        self,
+        reducer: str,
+        *,
+        right_row_count: int | None = None,
+    ) -> NativeGroupedReduction:
+        row_count = _resolve_row_count(
+            right_row_count,
+            self.relation.right_row_count,
+            side="right",
+        )
+        return self._reduce_distances("right", reducer, row_count=row_count)
+
+    def physicalize_geometries(
+        self,
+        left_geometry,
+        right_geometry,
+    ) -> NativeRelationGeometrySelection:
+        """Build null-padded pair geometry capacity without a count fence."""
+        if (
+            self.relation.left_row_count is not None
+            and int(left_geometry.row_count) != int(self.relation.left_row_count)
+        ):
+            raise ValueError("left geometry rows must match relation left_row_count")
+        if (
+            self.relation.right_row_count is not None
+            and int(right_geometry.row_count) != int(self.relation.right_row_count)
+        ):
+            raise ValueError("right geometry rows must match relation right_row_count")
+
+        active = self.selection.active_capacity_mask()
+        left_rows = self.selection.gather_capacity(
+            self.relation.left_indices,
+            fill_value=0,
+        )
+        right_rows = self.selection.gather_capacity(
+            self.relation.right_indices,
+            fill_value=0,
+        )
+        return NativeRelationGeometrySelection(
+            left_geometry=left_geometry.device_take_capacity(left_rows, active),
+            right_geometry=right_geometry.device_take_capacity(right_rows, active),
+            selection=self.selection,
+            broadcast_right_geometry=(
+                right_geometry
+                if self.relation.right_row_count == 1
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class NativeRelationGeometrySelection:
+    """Capacity-physicalized pair geometries plus device logical cardinality."""
+
+    left_geometry: Any
+    right_geometry: Any
+    selection: NativeDeviceSelection
+    broadcast_right_geometry: Any | None = None
+
+    def __post_init__(self) -> None:
+        if int(self.left_geometry.row_count) != self.selection.capacity:
+            raise ValueError("left capacity geometry rows must match selection")
+        if int(self.right_geometry.row_count) != self.selection.capacity:
+            raise ValueError("right capacity geometry rows must match selection")
+
+    @property
+    def capacity(self) -> int:
+        return self.selection.capacity
+
+    @property
+    def logical_count(self):
+        return self.selection.logical_count
+
+    def constructive_native(
+        self,
+        operation: str,
+        **kwargs,
+    ) -> NativeRelationConstructiveSelection:
+        """Run pair-capacity constructive work with null inactive lanes."""
+        import cupy as cp
+
+        from vibespatial.constructive.binary_constructive import (
+            binary_constructive_native,
+        )
+        from vibespatial.runtime import ExecutionMode
+
+        if "dispatch_mode" in kwargs:
+            raise TypeError(
+                "NativeRelationGeometrySelection constructive dispatch is explicitly GPU"
+            )
+        result = None
+        if operation == "intersection" and self.broadcast_right_geometry is not None:
+            from vibespatial.api._native_result_core import GeometryNativeResult
+            from vibespatial.constructive.binary_constructive import (
+                broadcast_right_polygon_intersection_capacity_gpu,
+            )
+
+            broadcast_result = broadcast_right_polygon_intersection_capacity_gpu(
+                self.left_geometry,
+                self.broadcast_right_geometry,
+                dispatch_mode=ExecutionMode.GPU,
+            )
+            if broadcast_result is not None:
+                result = GeometryNativeResult.from_owned(broadcast_result, crs=None)
+        if result is None:
+            result = binary_constructive_native(
+                operation,
+                self.left_geometry,
+                self.right_geometry,
+                dispatch_mode=ExecutionMode.GPU,
+                **kwargs,
+            )
+        if int(result.row_count) != self.capacity:
+            raise RuntimeError(
+                "capacity constructive result did not preserve physical row count"
+            )
+        owned = result.owned
+        if owned is not None:
+            if owned.is_indexed_view:
+                owned = owned.physicalize_device_rows(
+                    allow_capacity_allocation=True,
+                )
+                result = type(result).from_owned(owned, crs=result.crs)
+            active = self.selection.active_capacity_mask()
+            state = owned._ensure_device_state(preserve_indexed_view=True)
+            state.validity = cp.asarray(state.validity, dtype=cp.bool_) & active
+            state.trusted_all_valid = True if self.capacity == 0 else False
+            owned._cached_is_valid_mask = None
+            owned._aligned_left_pairs_owned = self.left_geometry
+            owned._aligned_right_pairs_owned = self.right_geometry
+        return NativeRelationConstructiveSelection(
+            geometry=result,
+            selection=self.selection,
+            operation=operation,
+        )
+
+
+@dataclass(frozen=True)
+class NativeRelationConstructiveSelection:
+    """Capacity constructive output with device-resident logical cardinality."""
+
+    geometry: Any
+    selection: NativeDeviceSelection
+    operation: str
+
+    def __post_init__(self) -> None:
+        if int(self.geometry.row_count) != self.selection.capacity:
+            raise ValueError("capacity constructive rows must match selection")
+
+    @property
+    def capacity(self) -> int:
+        return self.selection.capacity
+
+    @property
+    def logical_count(self):
+        return self.selection.logical_count
+
+
+__all__ = [
+    "NativeRelation",
+    "NativeRelationConstructiveSelection",
+    "NativeRelationGeometrySelection",
+    "NativeRelationSelection",
+]

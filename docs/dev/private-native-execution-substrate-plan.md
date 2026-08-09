@@ -290,7 +290,7 @@ Completed in the slice:
 - Device `NativeGrouped` unary polygon reducers feed grouped overlay union without host group-code assembly for admitted owned dissolve shapes.
 - Grouped constructive native results carry grouped-union provenance, including repaired-operation markers when boundary repair runs.
 - Constructive output canaries lower pairwise intersections and polygonal parts to `NativeTabularResult` and feed native consumers before public export.
-- Row-position, host-array, pairwise/relation index, grouped export, public expression assignment, clip/overlay cleanup mask, spatial index/query/nearest/distance/segment exports, selected-face fallback, lower-level topology CPU export boundaries, device index-label, and owned-geometry host bridges carry strictness/runtime D2H accounting.
+- Row-position, host-array, pairwise/relation index, grouped export, public expression assignment, clip/overlay cleanup mask, spatial index/query/nearest/distance/segment exports, explicit selected-face debug export, lower-level topology CPU export boundaries, device index-label, and owned-geometry host bridges carry strictness/runtime D2H accounting.
 - WP9 source cleanup: `src/vibespatial` has no raw `cp.asnumpy` outside the CUDA runtime, no unnamed runtime D2H copies, and zero active zero-copy lint violations for raw device `.get()`.
 - Homogeneous device `NativeAttributeTable.concat()` uses `pylibcudf.concatenate` for native concat consumers.
 - Homogeneous public `concat(...)` preserves exact same-schema appends with RangeIndex or appended public indexes, including duplicates and MultiIndex.
@@ -298,7 +298,7 @@ Completed in the slice:
 - Point/lineal/polygonal part expansion, mixed-family explode, and public GeometryCollection explode ingress carry source rows plus family-rowset tags into native consumers.
 - Overlay assembly allocations and grouped pair-position expansion use native cardinalities, compacted sizes, host-known pair counts, or host-known capacity; the grouped canary rejects overlay D2H.
 - WP8 policy cleanup: device attribute compute/movement/export policies are inspectable.
-- WP9 cleanup: public overlay uses the shared D2H bridge; selected-face assembly is device-primary, non-empty filtering uses device row views, and contraction microcell rectangles reduce through grouped device union instead of host boundary walking.
+- WP9 cleanup: public overlay uses the shared D2H bridge only at terminal/debug boundaries; admitted selected-face assembly is device-only, non-empty filtering uses device row views, and contraction microcell rectangles reduce through grouped device union instead of host boundary walking.
 - WP9 cleanup: rectangle/few-right/many-vs-one box admission certifies dense boxes on device; grouped exact difference keeps device bbox pairs, CSR offsets, right-geometry source rows, aligned single-pair rowwise differences, grouped-union fallback, and admitted single-batch scatter rowsets through native paths, and broadcast-right chunk restoration keeps many-vs-one positions device-resident until public scatter.
 - Clip and pairwise constructive native-tabular assembly reuse attached `NativeFrameState` Arrow/device attributes for admissible row projections until explicit export.
 - Native* substrate scope is complete: device-label `NativeIndexPlan` survives `NativeFrameState -> NativeTabularResult`, device relation-join tabular lowering avoids relation-pair host export, and broader overlay topology remains future family-specific kernel work with explicit boundaries.

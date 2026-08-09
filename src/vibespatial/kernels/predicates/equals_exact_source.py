@@ -5,6 +5,7 @@ and kernel name tuples for per-family coordinate comparison.
 
 Extracted from equals_exact.py -- dispatch logic remains there.
 """
+
 from __future__ import annotations
 
 from vibespatial.geometry.buffers import GeometryFamily

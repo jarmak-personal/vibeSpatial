@@ -5,7 +5,7 @@ Scope: Detailed GPU performance audit workflow, anti-pattern checklist, and repo
 Read If: You are auditing GPU performance, reviewing CuPy or CCCL usage, or checking whether a path is still CPU-shaped.
 STOP IF: You already have the specific hot path open and only need a local implementation detail.
 Source Of Truth: Repo-specific GPU performance audit checklist and prioritization guide.
-Body Budget: 447/460 lines
+Body Budget: 448/460 lines
 Document: docs/testing/gpu-performance-checklist.md
 
 Section Map (Body Lines)
@@ -384,7 +384,8 @@ Mark as `BLOCKING` if:
   unless the entire pipeline is already falling back.
 - [ ] Confirm stream pools are paired with stream-aware launches and primitive
   calls; otherwise treat them as cosmetic concurrency.
-- [ ] Confirm microcell labeling and contraction are not row-by-row host loops.
+- [x] Confirm selected single-row microcell labeling and boundary reconstruction
+  contain no row-by-row host loop or host union-find.
 - [ ] Confirm constructive helpers such as clip, shortest line, line buffer,
   and union-all do not synchronize between same-stream stages without a host
   dependency.
@@ -428,7 +429,7 @@ auditing.
 | Device WKB decode and OGA builders | `src/vibespatial/io/pylibcudf.py` | Foundational ingest path; hidden host mirrors poison downstream residency | Eager D2H metadata copies and Python loops over nested geometry structure |
 | Point in polygon | `src/vibespatial/kernels/predicates/point_in_polygon.py` | Core refine primitive used by predicates and constructive work | Unconditional syncs and host-side work estimation in binned mode |
 | CCCL wrapper layer | `src/vibespatial/cuda/cccl_primitives.py` | Shared by scan, sort, compaction, binary search, segmented reduce | Null-stream synchronization is embedded in wrappers |
-| Overlay microcells | `src/vibespatial/overlay/microcells.py`, `src/vibespatial/overlay/contract.py` | Structural overlay path; expensive if host-managed | Row-by-row host loops and host-side union-find |
+| Overlay microcells | `src/vibespatial/overlay/microcells.py`, `src/vibespatial/overlay/boundary_graph.py` | Structural overlay path; expensive if host-managed | Connected oversized rows use bounded interval pages and exact native boundary assembly; multirow selected ingress still merits profiling if it becomes a hot admitted shape |
 | Grouped overlay orchestration | `src/vibespatial/overlay/gpu.py` | High-value constructive path | Host-materialized grouping and Python-controlled per-group dispatch |
 | Legacy count-scatter totals | `src/vibespatial/io/fgb_gpu.py`, `src/vibespatial/io/shp_gpu.py` | Easy wins that remove avoidable syncs | Old sync plus `.get()` pattern still present |
 | Hardcoded launch geometry | `src/vibespatial/overlay/assemble.py` | Can cap occupancy or hide resource mismatches | Hardcoded 256-thread block despite launch-config support |

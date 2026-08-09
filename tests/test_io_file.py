@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import io
 import json
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -49,6 +51,16 @@ from vibespatial.io.file import (
 )
 from vibespatial.io.support import IOOperation, IOPathKind
 from vibespatial.runtime import has_gpu_runtime
+
+
+def test_geopandas_io_file_alias_uses_canonical_module() -> None:
+    canonical_file = importlib.import_module("vibespatial.api.io.file")
+    compat_file = importlib.import_module("geopandas.io.file")
+    compat_package = importlib.import_module("geopandas.io")
+
+    assert compat_file is canonical_file
+    assert sys.modules["geopandas.io.file"] is canonical_file
+    assert compat_package.file is canonical_file
 
 
 def _sample_frame() -> geopandas.GeoDataFrame:
@@ -435,7 +447,7 @@ def test_public_to_parquet_device_owned_point_geometry_records_gpu_export(tmp_pa
     ]
     assert events
     assert events[-1].selected is geopandas.ExecutionMode.GPU
-    assert events[-1].implementation == "native_geodataframe_arrow_device_encoded_export"
+    assert events[-1].implementation == "native_geodataframe_device_export"
 
 
 @pytest.mark.gpu
@@ -2031,7 +2043,10 @@ def test_public_pyogrio_to_file_uses_compat_writer(monkeypatch, tmp_path) -> Non
     assert result.geometry.iloc[1].equals(Point(1, 1))
 
 
-@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+@pytest.mark.skipif(
+    not has_gpu_runtime() or importlib.util.find_spec("pyogrio") is None,
+    reason="GPU runtime or pyogrio unavailable",
+)
 def test_public_device_pyogrio_to_file_uses_native_arrow_sink(monkeypatch, tmp_path) -> None:
     import pyogrio
 
@@ -2080,7 +2095,10 @@ def test_public_device_pyogrio_to_file_uses_native_arrow_sink(monkeypatch, tmp_p
     assert result.geometry.iloc[1].equals(Point(1, 1))
 
 
-@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+@pytest.mark.skipif(
+    not has_gpu_runtime() or importlib.util.find_spec("pyogrio") is None,
+    reason="GPU runtime or pyogrio unavailable",
+)
 def test_public_device_geopackage_to_file_uses_native_arrow_sink(monkeypatch, tmp_path) -> None:
     import pyogrio
 
@@ -2127,7 +2145,10 @@ def test_public_device_geopackage_to_file_uses_native_arrow_sink(monkeypatch, tm
     assert result.geometry.iloc[1].equals(Point(1, 1))
 
 
-@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+@pytest.mark.skipif(
+    not has_gpu_runtime() or importlib.util.find_spec("pyogrio") is None,
+    reason="GPU runtime or pyogrio unavailable",
+)
 def test_public_device_flatgeobuf_to_file_uses_native_arrow_sink(monkeypatch, tmp_path) -> None:
     import pyogrio
 
@@ -3366,6 +3387,44 @@ def test_geojson_gpu_native_boundary_keeps_properties_lazy_until_materialization
     assert load_calls == 1
     assert list(frame.columns) == ["value", "geometry"]
     assert frame["value"].tolist() == [10, 20]
+
+
+@pytest.mark.gpu
+def test_geojson_gpu_family_summary_uses_single_device_fence(tmp_path) -> None:
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.io.geojson_gpu import read_geojson_gpu
+
+    path = tmp_path / "family-summary.geojson"
+    _sample_polygon_frame().to_file(path, driver="GeoJSON")
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    read_geojson_gpu(path)
+
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    assert "geojson geometry family-summary scalar fence" in reasons
+    assert "geojson unsupported geometry-count scalar fence" not in reasons
+    assert "geojson geometry family-domain scalar fence" not in reasons
+
+
+@pytest.mark.gpu
+def test_geojson_gpu_property_loader_exports_device_spans_once(tmp_path) -> None:
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.io.geojson_gpu import read_geojson_gpu
+
+    path = tmp_path / "property-spans.geojson"
+    _sample_polygon_frame().to_file(path, driver="GeoJSON")
+    result = read_geojson_gpu(path)
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    props = result.properties_loader()()
+
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    assert [row["id"] for row in props] == [1, 2]
+    assert reasons.count("geojson property object-spans host export") == 1
+    assert "geojson property object-starts host export" not in reasons
+    assert "geojson property object-ends host export" not in reasons
 
 
 def test_plan_geojson_ingest_auto_selects_best_available() -> None:

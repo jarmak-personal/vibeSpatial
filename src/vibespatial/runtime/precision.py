@@ -67,7 +67,9 @@ class PrecisionPlan:
     reason: str
 
 
-DEFAULT_CONSUMER_PROFILE = DevicePrecisionProfile(name="consumer-gpu", fp64_to_fp32_ratio=1.0 / 32.0)
+DEFAULT_CONSUMER_PROFILE = DevicePrecisionProfile(
+    name="consumer-gpu", fp64_to_fp32_ratio=1.0 / 32.0
+)
 DEFAULT_DATACENTER_PROFILE = DevicePrecisionProfile(name="datacenter-gpu", fp64_to_fp32_ratio=0.5)
 
 
@@ -87,8 +89,12 @@ def _native_fp64_plan(kernel_class: KernelClass, reason: str) -> PrecisionPlan:
     )
 
 
-def _consumer_fp32_plan(kernel_class: KernelClass, coordinate_stats: CoordinateStats) -> PrecisionPlan:
-    compensation = CompensationMode.KAHAN if kernel_class is KernelClass.METRIC else CompensationMode.CENTERED
+def _consumer_fp32_plan(
+    kernel_class: KernelClass, coordinate_stats: CoordinateStats
+) -> PrecisionPlan:
+    compensation = (
+        CompensationMode.KAHAN if kernel_class is KernelClass.METRIC else CompensationMode.CENTERED
+    )
     refinement = (
         RefinementMode.NONE
         if kernel_class in {KernelClass.COARSE, KernelClass.METRIC}
@@ -106,7 +112,8 @@ def _consumer_fp32_plan(kernel_class: KernelClass, coordinate_stats: CoordinateS
         kernel_class=kernel_class,
         compensation=compensation,
         refinement=refinement,
-        center_coordinates=compute_precision is PrecisionMode.FP32 and coordinate_stats.needs_centering,
+        center_coordinates=compute_precision is PrecisionMode.FP32
+        and coordinate_stats.needs_centering,
         reason="consumer-style fp64 throughput is poor; prefer staged fp32 unless kernel class is constructive",
     )
 
@@ -133,7 +140,9 @@ def select_precision_plan(
             storage_precision=PrecisionMode.FP64,
             compute_precision=PrecisionMode.FP32,
             kernel_class=kernel_class,
-            compensation=CompensationMode.KAHAN if kernel_class is KernelClass.METRIC else CompensationMode.CENTERED,
+            compensation=CompensationMode.KAHAN
+            if kernel_class is KernelClass.METRIC
+            else CompensationMode.CENTERED,
             refinement=(
                 RefinementMode.NONE
                 if kernel_class in {KernelClass.COARSE, KernelClass.METRIC}

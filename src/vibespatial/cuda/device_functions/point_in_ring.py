@@ -9,7 +9,7 @@ Three variants at increasing classification granularity:
   For face labeling, validity, segment distance containment.
 - ``POINT_IN_RING_KIND_DEVICE`` -- 3-way ``unsigned char``
   (0=outside, 1=boundary, 2=inside) for DE-9IM.
-  Requires ``POINT_ON_SEGMENT_KIND_DEVICE`` prepended before this string.
+  Requires ``ORIENT2D_DEVICE`` prepended before this string.
 
 All functions use the standard even-odd (ray-casting) rule with
 ``(start, end)`` coordinate-index convention where ``start`` is the first
@@ -119,13 +119,13 @@ __device__ inline bool vs_ring_contains_point_with_boundary(
 
 # ---------------------------------------------------------------------------
 # 3-way kind variant: 0=outside, 1=boundary, 2=inside (for DE-9IM)
-# Requires POINT_ON_SEGMENT_KIND_DEVICE to be prepended before this string.
+# Requires ORIENT2D_DEVICE to be prepended before this string.
 # ---------------------------------------------------------------------------
 POINT_IN_RING_KIND_DEVICE: str = r"""
 /* ------------------------------------------------------------------ */
 /* Point-in-ring 3-way classification (for DE-9IM)                    */
 /* Shared via vibespatial.cuda.device_functions.point_in_ring          */
-/* Requires: vs_point_on_segment_kind (from POINT_ON_SEGMENT_KIND_DEVICE) */
+/* Requires: vs_orient2d (from ORIENT2D_DEVICE)                       */
 /* ------------------------------------------------------------------ */
 
 /* Classify how point (px,py) relates to the ring defined by
@@ -143,7 +143,7 @@ POINT_IN_RING_KIND_DEVICE: str = r"""
      x, y      -- coordinate arrays (SoA layout)
      start     -- first coordinate index of the ring
      end       -- one-past-the-last coordinate index
-     tolerance -- boundary tolerance for vs_point_on_segment_kind
+     tolerance -- retained for ABI compatibility; exact classification ignores it
 */
 __device__ inline unsigned char vs_ring_point_classify(
     double px, double py,
@@ -151,19 +151,21 @@ __device__ inline unsigned char vs_ring_point_classify(
     int start, int end,
     double tolerance
 ) {
+    (void)tolerance;
     bool inside = false;
     if ((end - start) < 2) {
         return 0;
     }
     for (int i = start, j = end - 1; i < end; j = i++) {
         double ax = x[j], ay = y[j], bx = x[i], by = y[i];
-        const unsigned char seg_kind = vs_point_on_segment_kind(
-            px, py, ax, ay, bx, by, tolerance);
-        if (seg_kind != 0) {
+        const int orientation = vs_orient2d(ax, ay, bx, by, px, py);
+        if (orientation == 0
+            && px >= fmin(ax, bx) && px <= fmax(ax, bx)
+            && py >= fmin(ay, by) && py <= fmax(ay, by)) {
             return 1;
         }
         if ((ay > py) != (by > py)) {
-            if (px < (bx - ax) * (py - ay) / (by - ay) + ax)
+            if ((orientation > 0) == (by > ay))
                 inside = !inside;
         }
     }

@@ -37,18 +37,22 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import Residency
 
-request_nvrtc_warmup([
-    ("orient-rings-fp64", _ORIENT_FP64, _ORIENT_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("orient-rings-fp64", _ORIENT_FP64, _ORIENT_KERNEL_NAMES),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # GPU implementation
 # ---------------------------------------------------------------------------
+
 
 def _build_is_exterior(device_buf, family):
     """Build a device int32 array marking exterior rings (1) vs interior (0).
@@ -97,7 +101,9 @@ def _orient_family_gpu(runtime, device_buf, family, exterior_cw):
         return device_buf.x, device_buf.y
 
     kernels = compile_kernel_group(
-        "orient-rings-fp64", _ORIENT_FP64, _ORIENT_KERNEL_NAMES,
+        "orient-rings-fp64",
+        _ORIENT_FP64,
+        _ORIENT_KERNEL_NAMES,
     )
     kernel = kernels["orient_rings"]
 
@@ -158,7 +164,10 @@ def _orient_gpu(
     for family, device_buf in d_state.families.items():
         if family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
             d_x_out, d_y_out = _orient_family_gpu(
-                runtime, device_buf, family, exterior_cw,
+                runtime,
+                device_buf,
+                family,
+                exterior_cw,
             )
         else:
             # Non-polygon families pass through unchanged
@@ -192,6 +201,7 @@ def _orient_gpu(
 # CPU implementation (correct exterior/interior handling)
 # ---------------------------------------------------------------------------
 
+
 def _shoelace_area_2x(x, y, start, end):
     """Compute 2x signed area of a ring. Positive = CCW."""
     xs = x[start:end]
@@ -213,7 +223,7 @@ def _orient_polygon_cpu(buf, exterior_cw):
             coord_end = int(buf.ring_offsets[r + 1])
 
             area2 = _shoelace_area_2x(buf.x, buf.y, coord_start, coord_end)
-            is_exterior = (ring_idx == 0)
+            is_exterior = ring_idx == 0
 
             if is_exterior:
                 # Exterior: should be CW if exterior_cw, CCW otherwise
@@ -234,6 +244,7 @@ def _orient_polygon_cpu(buf, exterior_cw):
 # ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
+
 
 def orient_owned(
     owned: OwnedGeometryArray,
@@ -258,6 +269,11 @@ def orient_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
         current_residency=owned.residency,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            primary_unit_name="orient-ring-coordinate",
+        ),
     )
 
     if selection.selected is ExecutionMode.GPU:

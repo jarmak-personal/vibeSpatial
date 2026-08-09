@@ -37,18 +37,22 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import Residency
 
-request_nvrtc_warmup([
-    ("reverse-fp64", _REVERSE_FP64, _REVERSE_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("reverse-fp64", _REVERSE_FP64, _REVERSE_KERNEL_NAMES),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # GPU implementation
 # ---------------------------------------------------------------------------
+
 
 def _reverse_family_gpu(runtime, device_buf, family):
     """Reverse coordinates within appropriate spans for one family."""
@@ -81,10 +85,22 @@ def _reverse_family_gpu(runtime, device_buf, family):
 
     ptr = runtime.pointer
     params = (
-        (ptr(device_buf.x), ptr(device_buf.y), ptr(d_offsets),
-         ptr(d_x_out), ptr(d_y_out), span_count),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+        (
+            ptr(device_buf.x),
+            ptr(device_buf.y),
+            ptr(d_offsets),
+            ptr(d_x_out),
+            ptr(d_y_out),
+            span_count,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+        ),
     )
     grid, block = runtime.launch_config(kernel, span_count)
     runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -96,7 +112,14 @@ def _reverse_family_gpu(runtime, device_buf, family):
     "gpu-cuda-python",
     kernel_class=KernelClass.COARSE,
     execution_modes=(ExecutionMode.GPU,),
-    geometry_families=("point", "multipoint", "linestring", "multilinestring", "polygon", "multipolygon"),
+    geometry_families=(
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
+    ),
     supports_mixed=True,
     tags=("cuda-python", "constructive", "reverse"),
 )
@@ -135,6 +158,7 @@ def _reverse_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 # Public dispatch API
 # ---------------------------------------------------------------------------
 
+
 def reverse_owned(
     owned: OwnedGeometryArray,
     *,
@@ -151,6 +175,11 @@ def reverse_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
         current_residency=owned.residency,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            primary_unit_name="reverse-coordinate",
+        ),
     )
 
     if selection.selected is ExecutionMode.GPU:

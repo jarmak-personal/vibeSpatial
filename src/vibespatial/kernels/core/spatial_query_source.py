@@ -7,11 +7,14 @@ Contains NVRTC kernel source strings and kernel name tuples for:
 
 Extracted from spatial_query_kernels.py -- dispatch logic remains there.
 """
+
 from __future__ import annotations
 
 from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
 
-_SPATIAL_QUERY_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + """
+_SPATIAL_QUERY_KERNEL_SOURCE = (
+    SPATIAL_TOLERANCE_PREAMBLE
+    + """
 #if !defined(INFINITY)
 #define INFINITY __longlong_as_double(0x7FF0000000000000LL)
 #endif
@@ -284,6 +287,83 @@ extern "C" __global__ void regular_grid_box_overlap_scatter(
     }
 }
 
+extern "C" __global__ void regular_grid_box_overlap_scatter_fixed(
+        const double* query_bounds,
+        double origin_x,
+        double origin_y,
+        double cell_width,
+        double cell_height,
+        int cols,
+        int rows,
+        int polygon_count,
+        int max_cells_per_query,
+        int* out_left,
+        int* out_right,
+        int query_count
+) {
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= query_count) {
+        return;
+    }
+    const int out_base = q * max_cells_per_query;
+    for (int slot = 0; slot < max_cells_per_query; ++slot) {
+        out_left[out_base + slot] = -1;
+        out_right[out_base + slot] = -1;
+    }
+
+    const int base = q * 4;
+    const double minx = query_bounds[base + 0];
+    const double miny = query_bounds[base + 1];
+    const double maxx = query_bounds[base + 2];
+    const double maxy = query_bounds[base + 3];
+    if (isnan(minx) || isnan(miny) || isnan(maxx) || isnan(maxy)) {
+        return;
+    }
+
+    const double xmax = origin_x + ((double) cols) * cell_width;
+    const double ymax = origin_y + ((double) rows) * cell_height;
+    const double tol = 1e-9 * fmax(fmax(fabs(cell_width), fabs(cell_height)), 1.0);
+    if (maxx < origin_x - tol || minx > xmax + tol || maxy < origin_y - tol || miny > ymax + tol) {
+        return;
+    }
+
+    double fx_min = (minx - origin_x) / cell_width;
+    double fx_max = (maxx - origin_x) / cell_width;
+    double fy_min = (miny - origin_y) / cell_height;
+    double fy_max = (maxy - origin_y) / cell_height;
+
+    int start_col = (int) floor(fx_min - (tol / cell_width));
+    int end_col = (int) floor(fx_max + (tol / cell_width));
+    int start_row = (int) floor(fy_min - (tol / cell_height));
+    int end_row = (int) floor(fy_max + (tol / cell_height));
+
+    if (start_col < 0) start_col = 0;
+    if (start_row < 0) start_row = 0;
+    if (end_col >= cols) end_col = cols - 1;
+    if (end_row >= rows) end_row = rows - 1;
+    if (start_col > end_col || start_row > end_row) {
+        return;
+    }
+
+    int write_pos = out_base;
+    int written = 0;
+    for (int row_id = start_row; row_id <= end_row; ++row_id) {
+        for (int col_id = start_col; col_id <= end_col; ++col_id) {
+            const int polygon_row = row_id * cols + col_id;
+            if (polygon_row < 0 || polygon_row >= polygon_count) {
+                continue;
+            }
+            if (written >= max_cells_per_query) {
+                return;
+            }
+            out_left[write_pos] = q;
+            out_right[write_pos] = polygon_row;
+            ++write_pos;
+            ++written;
+        }
+    }
+}
+
 extern "C" __global__ void point_box_query_mask(
     const int* point_row_offsets,
     const int* point_geometry_offsets,
@@ -394,6 +474,44 @@ extern "C" __global__ void bbox_overlap_multi_count(
     }
   }
   out_counts[q] = count;
+}
+
+extern "C" __global__ void bbox_overlap_multi_pair_mask(
+    const double* query_bounds,
+    const double* tree_bounds,
+    int query_count,
+    int tree_count,
+    unsigned char* out_mask,
+    long long pair_count
+) {
+  const long long flat = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (flat >= pair_count) {
+    return;
+  }
+  const int q = (int)(flat / (long long)tree_count);
+  const int t = (int)(flat - (long long)q * (long long)tree_count);
+  const int qbase = q * 4;
+  const double qminx = query_bounds[qbase + 0];
+  const double qminy = query_bounds[qbase + 1];
+  const double qmaxx = query_bounds[qbase + 2];
+  const double qmaxy = query_bounds[qbase + 3];
+  if (isnan(qminx) || isnan(qminy) || isnan(qmaxx) || isnan(qmaxy)) {
+    out_mask[flat] = 0;
+    return;
+  }
+  const int tbase = t * 4;
+  const double tminx = tree_bounds[tbase + 0];
+  const double tminy = tree_bounds[tbase + 1];
+  const double tmaxx = tree_bounds[tbase + 2];
+  const double tmaxy = tree_bounds[tbase + 3];
+  if (isnan(tminx) || isnan(tminy) || isnan(tmaxx) || isnan(tmaxy)) {
+    out_mask[flat] = 0;
+    return;
+  }
+  out_mask[flat] = (
+    qminx <= tmaxx && qmaxx >= tminx &&
+    qminy <= tmaxy && qmaxy >= tminy
+  ) ? 1 : 0;
 }
 
 extern "C" __global__ void bbox_overlap_multi_scatter(
@@ -972,15 +1090,18 @@ extern "C" __global__ void nearest_first_per_segment(
   }
 }
 """
+)
 
 _SPATIAL_QUERY_KERNEL_NAMES = (
     "point_regular_grid_candidates",
     "point_regular_grid_scatter_pairs",
     "regular_grid_box_overlap_count",
     "regular_grid_box_overlap_scatter",
+    "regular_grid_box_overlap_scatter_fixed",
     "point_box_query_mask",
     "bbox_overlap_tree_mask",
     "bbox_overlap_multi_count",
+    "bbox_overlap_multi_pair_mask",
     "bbox_overlap_multi_scatter",
     "point_point_distance_pairs",
     "point_point_distance_pairs_from_owned",
@@ -995,7 +1116,9 @@ _SPATIAL_QUERY_KERNEL_NAMES = (
     "nearest_first_per_segment",
 )
 
-_MORTON_RANGE_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + """
+_MORTON_RANGE_KERNEL_SOURCE = (
+    SPATIAL_TOLERANCE_PREAMBLE
+    + """
 extern "C" __device__ unsigned long long _mr_spread_bits_32(unsigned int value) {
   unsigned long long x = (unsigned long long) value;
   x = (x | (x << 16)) & 0x0000FFFF0000FFFFULL;
@@ -1129,6 +1252,7 @@ extern "C" __global__ void morton_range_scatter(
   }
 }
 """
+)
 
 _MORTON_RANGE_KERNEL_NAMES = (
     "morton_range_from_bounds",

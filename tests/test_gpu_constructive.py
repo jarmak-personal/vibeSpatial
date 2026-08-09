@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import LineString, MultiLineString, Point, Polygon
+from shapely.geometry import LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon
 
 from vibespatial import ExecutionMode, clip_by_rect_owned, from_shapely_geometries, has_gpu_runtime
 from vibespatial.constructive.boundary import boundary_owned
@@ -12,6 +14,37 @@ from vibespatial.constructive.normalize import normalize_owned
 from vibespatial.constructive.point import clip_points_rect_owned, point_buffer_owned_array
 from vibespatial.constructive.polygon import polygon_buffer_owned_array
 from vibespatial.geometry.buffers import GeometryFamily
+
+
+def test_polygon_boundary_uses_nested_source_capacity_without_allocation_fences() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "vibespatial" / "constructive" / "boundary.py"
+    ).read_text()
+
+    assert "_device_gather_offset_index_ranges(" in source
+    assert source.count("allocation_capacity=int(d_x.size)") == 2
+    assert "count_scatter_total(" not in source
+    assert "boundary coordinate allocation fence" not in source
+    assert "boundary multiline ring allocation fence" not in source
+
+
+def test_segmentize_uses_constructive_precision_and_dispatch_policy() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source = repo_root.joinpath("src/vibespatial/constructive/segmentize.py").read_text()
+    kernel_source = repo_root.joinpath(
+        "src/vibespatial/constructive/segmentize_kernels.py"
+    ).read_text()
+
+    assert source.count("kernel_class=KernelClass.CONSTRUCTIVE") == 2
+    assert "kernel_class=KernelClass.COARSE" not in source
+    assert "count_scatter_totals(" in source
+    assert 'reason="segmentize exact output allocation packet"' in source
+    assert 'primary_unit_name="segmentize-input-coordinate"' in source
+    assert "coord_capacity = int(device_buf.x.size)" in source
+    assert "exclusive_scan_i64" in source
+    assert "One lane per physical input coordinate" in kernel_source
+    assert "for (int i = start; i < end - 1; i++)" not in kernel_source
+    assert "const long long tid" in kernel_source
 
 
 def _assert_geometries_equal(actual: list[object | None], expected: list[object | None]) -> None:
@@ -70,7 +103,9 @@ def test_gpu_point_buffer_matches_shapely_for_quad_segs_1() -> None:
 
 
 @pytest.mark.gpu
-def test_gpu_clip_by_rect_accepts_device_backed_point_input_without_full_host_materialization() -> None:
+def test_gpu_clip_by_rect_accepts_device_backed_point_input_without_full_host_materialization() -> (
+    None
+):
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
 
@@ -117,13 +152,15 @@ def test_exterior_gpu_coordinates_stay_device_resident() -> None:
 
     from vibespatial.runtime.residency import Residency
 
-    polys = from_shapely_geometries([
-        Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)]),
-        Polygon(
-            shell=[(0, 0), (6, 0), (6, 6), (0, 6), (0, 0)],
-            holes=[[(2, 2), (4, 2), (4, 4), (2, 4), (2, 2)]],
-        ),
-    ])
+    polys = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)]),
+            Polygon(
+                shell=[(0, 0), (6, 0), (6, 6), (0, 6), (0, 0)],
+                holes=[[(2, 2), (4, 2), (4, 4), (2, 4), (2, 2)]],
+            ),
+        ]
+    )
 
     result = exterior_owned(polys, dispatch_mode=ExecutionMode.GPU)
 
@@ -140,13 +177,15 @@ def test_exterior_gpu_coordinates_stay_device_resident() -> None:
     # coordinates as the exterior ring.
     expected_coords = [
         list(Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)]).exterior.coords),
-        list(Polygon(
-            shell=[(0, 0), (6, 0), (6, 6), (0, 6), (0, 0)],
-            holes=[[(2, 2), (4, 2), (4, 4), (2, 4), (2, 2)]],
-        ).exterior.coords),
+        list(
+            Polygon(
+                shell=[(0, 0), (6, 0), (6, 6), (0, 6), (0, 0)],
+                holes=[[(2, 2), (4, 2), (4, 4), (2, 4), (2, 2)]],
+            ).exterior.coords
+        ),
     ]
     actual = result.to_shapely()
-    if hasattr(actual, 'tolist'):
+    if hasattr(actual, "tolist"):
         actual = actual.tolist()
     for a, ec in zip(list(actual), expected_coords, strict=True):
         assert a.geom_type == "LineString"
@@ -172,7 +211,7 @@ def test_exterior_gpu_moderate_scale_with_nulls() -> None:
     result = exterior_owned(polys, dispatch_mode=ExecutionMode.GPU)
 
     actual = result.to_shapely()
-    if hasattr(actual, 'tolist'):
+    if hasattr(actual, "tolist"):
         actual = actual.tolist()
     for i, (a, g) in enumerate(zip(list(actual), geoms, strict=True)):
         if g is None:
@@ -207,10 +246,12 @@ def test_boundary_gpu_metadata_stays_device_resident() -> None:
 
     geoms = [
         Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)]),
-        shapely.MultiPolygon([
-            Polygon([(10, 0), (14, 0), (14, 4), (10, 4), (10, 0)]),
-            Polygon([(20, 0), (24, 0), (24, 4), (20, 4), (20, 0)]),
-        ]),
+        shapely.MultiPolygon(
+            [
+                Polygon([(10, 0), (14, 0), (14, 4), (10, 4), (10, 0)]),
+                Polygon([(20, 0), (24, 0), (24, 4), (20, 4), (20, 0)]),
+            ]
+        ),
     ]
     owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
     result = boundary_owned(owned, dispatch_mode=ExecutionMode.GPU)
@@ -219,6 +260,50 @@ def test_boundary_gpu_metadata_stays_device_resident() -> None:
     assert result._validity is None
     assert result._tags is None
     assert result._family_row_offsets is None
+
+
+@pytest.mark.gpu
+def test_boundary_gpu_preserves_indexed_polygon_carrier(monkeypatch) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    from vibespatial.geometry.owned import OwnedGeometryArray
+    from vibespatial.runtime.execution_trace import assert_no_transfers
+    from vibespatial.runtime.residency import Residency
+
+    polygons = [
+        Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)]),
+        Polygon([(10, 0), (14, 0), (14, 4), (10, 4), (10, 0)]),
+    ]
+    owned = from_shapely_geometries(polygons, residency=Residency.DEVICE)
+    indexed = owned._device_indexed_take(
+        cp.asarray([1, 0, 1], dtype=cp.int64),
+    )._apply_row_activity(cp.asarray([True, False, True], dtype=cp.bool_))
+
+    def _fail_physicalize(*_args, **_kwargs):
+        raise AssertionError("indexed boundary must not physicalize logical rows")
+
+    monkeypatch.setattr(
+        OwnedGeometryArray,
+        "physicalize_device_rows",
+        _fail_physicalize,
+    )
+    with assert_no_transfers():
+        result = boundary_owned(indexed, dispatch_mode=ExecutionMode.GPU)
+
+    assert result.is_indexed_view
+    assert result.row_count == indexed.row_count
+    assert result._base is not None
+    source_polygon = owned.device_state.families[GeometryFamily.POLYGON]
+    boundary_line = result._base.device_state.families[GeometryFamily.LINESTRING]
+    assert boundary_line.x.data.ptr == source_polygon.x.data.ptr
+
+    monkeypatch.undo()
+    actual = result.to_shapely()
+    assert actual[0].equals(polygons[1].boundary)
+    assert actual[1] is None
+    assert actual[2].equals(polygons[1].boundary)
 
 
 @pytest.mark.gpu
@@ -235,6 +320,20 @@ def test_boundary_gpu_mixed_polygon_ring_counts_preserves_row_types() -> None:
         [[(11, 1), (13, 1), (13, 3), (11, 3), (11, 1)]],
     )
     owned = from_shapely_geometries([single_ring, with_hole], residency=Residency.DEVICE)
+    state = owned.device_state
+    assert state is not None
+
+    from vibespatial.geometry.owned import build_device_resident_owned
+
+    owned = build_device_resident_owned(
+        device_families=dict(state.families),
+        row_count=owned.row_count,
+        tags=state.tags,
+        validity=state.validity,
+        family_row_offsets=state.family_row_offsets,
+        execution_mode="gpu",
+    )
+    assert not owned.families[GeometryFamily.POLYGON].host_materialized
 
     with assert_no_transfers():
         result = boundary_owned(owned, dispatch_mode=ExecutionMode.GPU)
@@ -291,3 +390,59 @@ def test_normalize_owned_device_resident_polygon_input_uses_device_stats() -> No
     actual = shapely.normalize(normalized.to_shapely()[0])
 
     assert bool(shapely.equals_exact(actual, expected, tolerance=1e-12))
+
+
+@pytest.mark.gpu
+def test_normalize_owned_orders_polygon_hierarchy_like_geos() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.runtime.residency import Residency
+
+    left = Polygon(
+        [(0, 0), (8, 0), (8, 8), (0, 8), (0, 0)],
+        holes=[
+            [(1, 1), (2, 1), (2, 2), (1, 2), (1, 1)],
+            [(5, 5), (7, 5), (7, 7), (5, 7), (5, 5)],
+        ],
+    )
+    middle = shapely.box(10, 0, 12, 2)
+    right = shapely.box(20, 0, 22, 2)
+    source = MultiPolygon([left, right, middle])
+    owned = from_shapely_geometries([source], residency=Residency.DEVICE)
+
+    actual = normalize_owned(
+        owned,
+        dispatch_mode=ExecutionMode.GPU,
+    ).to_shapely()[0]
+
+    assert shapely.equals_exact(actual, shapely.normalize(source), tolerance=0.0)
+
+
+@pytest.mark.gpu
+def test_normalize_owned_orders_lineal_and_point_multi_hierarchies_like_geos() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.runtime.residency import Residency
+
+    multiline = MultiLineString(
+        [
+            [(2, 0), (2, 1)],
+            [(5, 4), (6, 4)],
+            [(3, 4), (2, 4), (2, 3)],
+        ]
+    )
+    multipoint = MultiPoint([(2, 0), (5, 4), (2, 3)])
+    owned = from_shapely_geometries(
+        [multiline, multipoint],
+        residency=Residency.DEVICE,
+    )
+
+    actual = normalize_owned(
+        owned,
+        dispatch_mode=ExecutionMode.GPU,
+    ).to_shapely()
+
+    assert shapely.equals_exact(actual[0], shapely.normalize(multiline), tolerance=0.0)
+    assert shapely.equals_exact(actual[1], shapely.normalize(multipoint), tolerance=0.0)

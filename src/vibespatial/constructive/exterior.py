@@ -29,6 +29,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
@@ -68,6 +69,7 @@ def _empty_exterior_output(row_count: int, *, residency: Residency) -> OwnedGeom
             execution_mode="gpu",
         )
     return from_shapely_geometries([None] * row_count)
+
 
 @register_kernel_variant(
     "exterior_ring",
@@ -175,6 +177,7 @@ def _exterior_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 # Public dispatch API
 # ---------------------------------------------------------------------------
 
+
 def exterior_owned(
     owned: OwnedGeometryArray,
     *,
@@ -212,16 +215,17 @@ def exterior_owned(
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=owned.residency,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            primary_unit_name="exterior-ring-coordinate",
+        ),
     )
 
     # Short-circuit: no polygons means all-null output.
     poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
     if not np.any(owned.tags == poly_tag):
-        residency = (
-            Residency.DEVICE
-            if selection.selected is ExecutionMode.GPU
-            else Residency.HOST
-        )
+        residency = Residency.DEVICE if selection.selected is ExecutionMode.GPU else Residency.HOST
         return _empty_exterior_output(row_count, residency=residency)
 
     if selection.selected is ExecutionMode.GPU:
@@ -241,10 +245,7 @@ def exterior_owned(
                 operation="exterior",
                 implementation="exterior_ring_gpu_cupy",
                 reason=selection.reason,
-                detail=(
-                    f"rows={row_count}, "
-                    f"precision={precision_plan.compute_precision.value}"
-                ),
+                detail=(f"rows={row_count}, precision={precision_plan.compute_precision.value}"),
                 requested=selection.requested,
                 selected=ExecutionMode.GPU,
             )

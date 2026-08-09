@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import importlib
 from pathlib import Path
 
 import numpy as np
@@ -57,11 +58,65 @@ def test_clip_rect_gpu_output_assembly_has_no_raw_cupy_scalar_syncs() -> None:
     assert offenders == []
 
 
+def test_clip_rect_polygon_path_has_one_native_topology_carrier() -> None:
+    path = Path(__file__).resolve().parents[1] / "src" / "vibespatial" / "constructive" / "clip_rect.py"
+    source = path.read_text()
+
+    assert "_binary_constructive_gpu(" in source
+    assert "_build_device_boxes_from_bounds(" in source
+    function_start = source.index("def _clip_all_polygons_gpu(")
+    function_end = source.index("\ndef ", function_start + 1)
+    function_source = source[function_start:function_end]
+    assert "row_count=row_count" in function_source
+    assert "cp.flatnonzero" not in function_source
+    assert ".device_take(" not in function_source
+    for deleted_host_path in (
+        "_extract_polygon_rings_single_family",
+        "_extract_polygon_rings_vectorized",
+        "_build_polygon_clip_owned_result",
+        "_clip_all_polygons_gpu_rect_fast_path",
+        "clip-rect polygon output-geometry mask host export",
+        "clip-rect polygon surviving-ring counts host export",
+        "clip-rect polygon output ring-offset host export",
+    ):
+        assert deleted_host_path not in source
+
+
+def test_clip_rect_ring_assembly_uses_geometric_capacity_without_count_fence() -> None:
+    path = Path(__file__).resolve().parents[1] / "src" / "vibespatial" / "constructive" / "clip_rect.py"
+    source = path.read_text()
+    function_start = source.index("def _clip_polygon_rings_gpu_device(")
+    function_end = source.index("\ndef ", function_start + 1)
+    function_source = source[function_start:function_end]
+
+    assert "source_bound = (2 * int(d_ring_x.size)) + (5 * ring_count)" in function_source
+    assert "kernel_bound = 257 * ring_count" in function_source
+    assert "d_full_offsets[ring_count] = d_out_offsets[-1] + d_vertex_counts[-1]" in function_source
+    assert "count_scatter_total" not in function_source
+    assert "clip-rect ring vertex allocation fence" not in function_source
+
+
+def test_clip_rect_point_path_keeps_source_row_capacity() -> None:
+    path = Path(__file__).resolve().parents[1] / "src" / "vibespatial" / "constructive" / "clip_rect.py"
+    source = path.read_text()
+    function_start = source.index("def _clip_point_rows_device_capacity_path(")
+    function_end = source.index("\ndef ", function_start + 1)
+    function_source = source[function_start:function_end]
+
+    assert "row_count=row_count" in function_source
+    assert "cp.arange(row_count" in function_source
+    assert "cp.flatnonzero" not in function_source
+    assert ".device_take(" not in function_source
+    assert "copy_device_to_host" not in function_source
+
+
 def _assert_geometries_match(actual, expected) -> None:
     assert len(actual) == len(expected)
     for left, right in zip(actual, expected, strict=True):
         if left is None or right is None:
             assert left is right
+            continue
+        if left.is_empty and right.is_empty:
             continue
         assert left.geom_type == right.geom_type
         assert bool(shapely.equals(left, right))
@@ -212,8 +267,44 @@ def test_geometry_array_clip_by_rect_promotes_supported_host_families_to_device(
     assert result.owned.residency is Residency.DEVICE
     assert result.owned.device_state is not None
     expected = shapely.clip_by_rect(np.asarray(values, dtype=object), xmin, ymin, xmax, ymax)
-    expected_list = [None if geom is not None and geom.is_empty else geom for geom in expected.tolist()]
-    _assert_geometries_match(list(result.owned.to_shapely()), expected_list)
+    _assert_geometries_match(list(result.owned.to_shapely()), expected.tolist())
+
+
+@pytest.mark.gpu
+def test_clip_by_rect_point_family_uses_source_row_capacity() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    values = [
+        Point(0.5, 0.5),
+        Point(0.0, 0.5),
+        Point(3.0, 3.0),
+        None,
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+
+    result = clip_by_rect_owned(
+        owned,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result.owned_result is not None
+    assert result.owned_result_is_row_capacity
+    assert result.owned_result.row_count == len(values)
+    assert result.owned_result.validity.tolist() == [True, False, False, False]
+    assert result.owned_result_rows.tolist() == [0, 1, 2, 3]
+    expected = shapely.clip_by_rect(
+        np.asarray(values, dtype=object),
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+    )
+    _assert_geometries_match(result.geometries, expected.tolist())
 
 
 @pytest.mark.gpu
@@ -238,6 +329,42 @@ def test_geometry_array_clip_by_rect_preserves_multiline_parts_on_device() -> No
     expected = shapely.clip_by_rect(np.asarray(values, dtype=object), 0.0, 0.0, 10.0, 10.0)
     expected_list = [None if geom is not None and geom.is_empty else geom for geom in expected.tolist()]
     _assert_geometries_match(list(result.owned.to_shapely()), expected_list)
+
+
+@pytest.mark.gpu
+def test_clip_by_rect_line_family_capacity_path_preserves_source_parts(
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    values = [
+        MultiLineString(
+            [
+                [(-1.0, 0.5), (0.5, 0.5)],
+                [(0.5, 0.5), (1.5, 0.5)],
+            ]
+        ),
+        LineString([(10.0, 10.0), (12.0, 12.0)]),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+
+    result = clip_by_rect_owned(
+        owned,
+        0.0,
+        0.0,
+        2.0,
+        1.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result.owned_result is not None
+    assert result.owned_result_is_row_capacity
+    assert result.owned_result.row_count == len(values)
+    assert result.owned_result.validity.tolist() == [True, False]
+    actual = result.owned_result.to_shapely()[0]
+    expected = shapely.clip_by_rect(values[0], 0.0, 0.0, 2.0, 1.0)
+    assert actual.geom_type == "MultiLineString"
+    assert shapely.equals_exact(actual, expected, tolerance=1e-12, normalize=True)
 
 
 def test_clip_by_rect_benchmark_reports_candidate_and_fallback_counts() -> None:
@@ -307,10 +434,67 @@ def test_clip_by_rect_polygon_auto_uses_pair_owned_rectangle_kernel(
     assert result.runtime_selection.selected is ExecutionMode.GPU
     assert result.owned_result is not None
     assert any(
-        event.surface == "vibespatial.kernels.constructive.polygon_rect_intersection"
+        event.surface == "vibespatial.constructive.binary"
+        and event.implementation == "rectangle_pair_bounds_intersection_gpu"
         and event.selected is ExecutionMode.GPU
         for event in dispatch_events
     )
+
+
+@pytest.mark.gpu
+def test_clip_by_rect_polygon_topology_carrier_emits_disconnected_multipolygon() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    u_shape = Polygon(
+        [
+            (0.0, 0.0),
+            (4.0, 0.0),
+            (4.0, 4.0),
+            (3.0, 4.0),
+            (3.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 4.0),
+            (0.0, 4.0),
+            (0.0, 0.0),
+        ]
+    )
+    values = [u_shape, box(10.0, 10.0, 12.0, 12.0)]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+
+    result = clip_by_rect_owned(
+        owned,
+        -1.0,
+        2.0,
+        5.0,
+        3.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result.owned_result is not None
+    assert result.owned_result_rows_device is not None
+    assert hasattr(result.owned_result_rows_device, "__cuda_array_interface__")
+    assert cp.asnumpy(result.owned_result_rows_device).tolist() == [0, 1]
+    actual = [
+        geometry
+        for geometry, valid in zip(
+            result.owned_result.to_shapely(),
+            result.owned_result.validity,
+            strict=True,
+        )
+        if valid
+    ]
+    expected = shapely.clip_by_rect(
+        np.asarray(values, dtype=object),
+        -1.0,
+        2.0,
+        5.0,
+        3.0,
+    )
+    expected_nonempty = [geometry for geometry in expected if not geometry.is_empty]
+    assert actual[0].geom_type == "MultiPolygon"
+    _assert_geometries_match(actual, expected_nonempty)
 
 
 @pytest.mark.gpu
@@ -374,7 +558,7 @@ def test_clip_by_rect_gpu_line_row_map_stays_lazy_until_requested() -> None:
 
     assert isinstance(row_map, np.ndarray)
     assert row_map.dtype == np.int32
-    assert np.array_equal(row_map, np.asarray([0], dtype=np.int32))
+    assert np.array_equal(row_map, np.asarray([0, 1], dtype=np.int32))
 
 
 @pytest.mark.gpu
@@ -475,19 +659,10 @@ def test_clip_by_rect_gpu_dense_linestring_path_builds_mixed_outputs_without_gen
     ]
     owned = _make_device_resident_with_host_stubs_cleared(values)
 
-    def _fail_generic(*_args, **_kwargs):
-        raise AssertionError("dense LineString rectangle clip should not use generic regroup/scatter")
+    def _fail_scatter(*_args, **_kwargs):
+        raise AssertionError("line capacity output must not use compact scatter")
 
-    total_calls: list[int] = []
-    original_totals = clip_rect_mod.count_scatter_totals
-
-    def _record_count_scatter_totals(runtime, count_offset_pairs, *, reason=None):
-        total_calls.append(len(count_offset_pairs))
-        return original_totals(runtime, count_offset_pairs, reason=reason)
-
-    monkeypatch.setattr(clip_rect_mod, "_build_line_clip_device_result", _fail_generic)
-    monkeypatch.setattr(clip_rect_mod, "concat_owned_scatter", _fail_generic)
-    monkeypatch.setattr(clip_rect_mod, "count_scatter_totals", _record_count_scatter_totals)
+    monkeypatch.setattr(clip_rect_mod, "concat_owned_scatter", _fail_scatter)
 
     result = clip_by_rect_owned(
         owned,
@@ -504,15 +679,26 @@ def test_clip_by_rect_gpu_dense_linestring_path_builds_mixed_outputs_without_gen
         GeometryFamily.MULTILINESTRING,
     }
     assert result.fallback_rows.size == 0
-    assert result.owned_result_rows.tolist() == [0, 1]
-    assert total_calls == [3]
+    assert result.owned_result_is_row_capacity
+    assert result.owned_result.row_count == len(values)
+    assert result.owned_result_rows.tolist() == [0, 1, 2]
+    assert result.owned_result.validity.tolist() == [True, True, False]
 
     expected = shapely.clip_by_rect(np.asarray(values, dtype=object), 0.0, 0.0, 2.0, 1.0)
     expected_compact = [
         geom for geom in expected.tolist()
         if geom is not None and not geom.is_empty
     ]
-    _assert_geometries_match(list(result.owned_result.to_shapely()), expected_compact)
+    actual = [
+        geom
+        for geom, valid in zip(
+            result.owned_result.to_shapely(),
+            result.owned_result.validity,
+            strict=True,
+        )
+        if valid
+    ]
+    _assert_geometries_match(actual, expected_compact)
 
 
 @pytest.mark.gpu
@@ -536,10 +722,12 @@ def test_clip_by_rect_gpu_mixed_polygon_line_owned_result_keeps_both_families() 
     )
 
     assert result.owned_result is not None
-    assert set(result.owned_result.families) == {
+    assert {
         GeometryFamily.LINESTRING,
         GeometryFamily.POLYGON,
-    }
+    }.issubset(result.owned_result.families)
+    assert result.owned_result_is_row_capacity
+    assert result.owned_result.row_count == len(values)
     assert np.array_equal(result.owned_result_rows, np.asarray([0, 1], dtype=np.int32))
 
     expected = shapely.clip_by_rect(np.asarray(values, dtype=object), 0.0, 0.0, 2.0, 2.0)
@@ -547,7 +735,53 @@ def test_clip_by_rect_gpu_mixed_polygon_line_owned_result_keeps_both_families() 
         geom for geom in expected.tolist()
         if geom is not None and not geom.is_empty
     ]
-    _assert_geometries_match(list(result.owned_result.to_shapely()), expected_compact)
+    actual = [
+        geometry
+        for geometry, valid in zip(
+            result.owned_result.to_shapely(),
+            result.owned_result.validity,
+            strict=True,
+        )
+        if valid
+    ]
+    _assert_geometries_match(actual, expected_compact)
+
+
+@pytest.mark.gpu
+def test_clip_by_rect_gpu_mixed_point_line_polygon_uses_one_capacity_carrier() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    values = [
+        Point(0.5, 0.5),
+        LineString([(-1.0, 0.5), (0.5, 0.5)]),
+        box(0.0, 0.0, 2.0, 2.0),
+        Point(4.0, 4.0),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+
+    result = clip_by_rect_owned(
+        owned,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result.owned_result is not None
+    assert result.owned_result_is_row_capacity
+    assert result.owned_result.row_count == len(values)
+    assert result.owned_result.validity.tolist() == [True, True, True, False]
+    assert result.owned_result_rows.tolist() == [0, 1, 2, 3]
+    expected = shapely.clip_by_rect(
+        np.asarray(values, dtype=object),
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+    )
+    _assert_geometries_match(result.geometries, expected.tolist())
 
 
 @pytest.mark.gpu
@@ -575,13 +809,9 @@ def test_clip_by_rect_gpu_mixed_polygon_line_geometries_preserve_source_rows() -
 
 
 @pytest.mark.gpu
-def test_clip_by_rect_gpu_dense_linestring_path_reuses_cached_segment_extraction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_clip_by_rect_gpu_dense_linestring_path_repeats_fused_source_traversal() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
-
-    import vibespatial.constructive.clip_rect as clip_rect_mod
 
     owned = from_shapely_geometries(
         [
@@ -601,11 +831,6 @@ def test_clip_by_rect_gpu_dense_linestring_path_reuses_cached_segment_extraction
     )
     assert first.owned_result is not None
 
-    def _fail_extract(*_args, **_kwargs):
-        raise AssertionError("repeat viewport clip should reuse cached line segments")
-
-    monkeypatch.setattr(clip_rect_mod, "_extract_segments_vectorized", _fail_extract)
-
     second = clip_by_rect_owned(
         owned,
         0.0,
@@ -616,6 +841,7 @@ def test_clip_by_rect_gpu_dense_linestring_path_reuses_cached_segment_extraction
     )
 
     assert second.owned_result is not None
+    assert second.owned_result_is_row_capacity
     expected = shapely.clip_by_rect(
         np.asarray(
             [
@@ -745,14 +971,6 @@ def test_device_rectangle_clip_boundary_rows_stay_on_device_without_host_bounds_
         ]
     )
     values = DeviceGeometryArray._from_owned(owned, crs="EPSG:4326")
-    bounds = np.asarray(
-        [
-            (0.2, 0.2, 0.8, 0.8),
-            (1.0, 0.2, 1.4, 0.8),
-            (1.0, 1.0, 1.4, 1.4),
-        ],
-        dtype=np.float64,
-    )
     mask = box(0.0, 0.0, 1.0, 1.0)
 
     def _fail_asnumpy(*_args, **_kwargs):
@@ -761,15 +979,20 @@ def test_device_rectangle_clip_boundary_rows_stay_on_device_without_host_bounds_
     original_asnumpy = cp.asnumpy
     monkeypatch.setattr(cp, "asnumpy", _fail_asnumpy)
 
-    result = clip_mod._exact_rectangle_clip_boundary_owned_rows(
-        values,
-        bounds,
+    partition = geopandas.GeoSeries(values, crs="EPSG:4326")
+    result = clip_mod._clip_polygon_partition_with_rectangle_mask(
+        partition,
         (0.0, 0.0, 1.0, 1.0),
     )
 
     assert result is not None
     monkeypatch.setattr(cp, "asnumpy", original_asnumpy)
-    actual = list(result.to_shapely())
+    actual = list(
+        result.to_geoseries(
+            index=partition.index,
+            name="geometry",
+        )
+    )
     expected = list(
         shapely.intersection(
             np.asarray(values, dtype=object),
@@ -972,3 +1195,46 @@ def test_public_clip_device_rectangle_boundary_rows_stay_native(monkeypatch) -> 
     )
     keep = ~shapely.is_missing(expected) & ~shapely.is_empty(expected)
     _assert_geometries_match(list(result.values.owned.to_shapely()), expected[keep].tolist())
+
+
+def test_clip_point_contact_sliver_repair_uses_rectangle_bounds_carrier(monkeypatch) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    clip_mod = importlib.import_module("vibespatial.api.tools.clip")
+    geometry_analysis = importlib.import_module("vibespatial.kernels.core.geometry_analysis")
+    candidate_owned = from_shapely_geometries(
+        [box(1.0, 1.0, 1.4, 1.4)],
+        residency=Residency.DEVICE,
+    )
+    mask_owned = from_shapely_geometries(
+        [box(0.0, 0.0, 1.0, 1.0)],
+        residency=Residency.DEVICE,
+    )
+    boundary_parts = clip_mod._clip_polygon_boundary_intersection_device_capacity_parts(
+        candidate_owned,
+        mask_owned,
+        cp.asarray([0], dtype=cp.int64),
+    )
+    assert boundary_parts is not None
+    assert len(boundary_parts) == 1
+    boundary_owned = boundary_parts[0]
+    d_boundary_rows = cp.asarray([0], dtype=cp.int64)
+
+    def _fail_generic_bounds(*_args, **_kwargs):
+        raise AssertionError("rectangle point-contact repair should reuse trusted rectangle bounds")
+
+    monkeypatch.setattr(geometry_analysis, "compute_geometry_bounds_device", _fail_generic_bounds)
+    repaired = clip_mod._clip_point_contact_sliver_polygons_device(
+        candidate_owned,
+        mask_owned,
+        boundary_owned,
+        d_boundary_rows,
+    )
+
+    assert repaired is not None
+    repaired_owned, d_repaired_mask = repaired
+    assert repaired_owned.row_count == boundary_owned.row_count
+    assert not bool(d_repaired_mask[0])

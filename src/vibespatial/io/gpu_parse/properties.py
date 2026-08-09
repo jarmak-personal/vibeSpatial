@@ -30,6 +30,7 @@ Precision (ADR-0002):
     - Numeric property values are parsed to fp64 via parse_ascii_floats
       (storage is always fp64 per ADR-0002).
 """
+
 from __future__ import annotations
 
 import ctypes
@@ -89,16 +90,19 @@ VTYPE_COMPLEX: int = 4  # nested object or array -- skip
 # ---------------------------------------------------------------------------
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("gpu-parse-classify-value", _CLASSIFY_VALUE_SOURCE, _CLASSIFY_VALUE_NAMES),
-    ("gpu-parse-extract-bool", _EXTRACT_BOOL_SOURCE, _EXTRACT_BOOL_NAMES),
-    ("gpu-parse-prop-num-bounds", _PROPERTY_NUM_BOUNDS_SOURCE, _PROPERTY_NUM_BOUNDS_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("gpu-parse-classify-value", _CLASSIFY_VALUE_SOURCE, _CLASSIFY_VALUE_NAMES),
+        ("gpu-parse-extract-bool", _EXTRACT_BOOL_SOURCE, _EXTRACT_BOOL_NAMES),
+        ("gpu-parse-prop-num-bounds", _PROPERTY_NUM_BOUNDS_SOURCE, _PROPERTY_NUM_BOUNDS_NAMES),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # Kernel compilation helpers
 # ---------------------------------------------------------------------------
+
 
 def _classify_value_kernels():
     return compile_kernel_group(
@@ -137,6 +141,7 @@ def _properties_int_scalar(device_value: object, *, reason: str) -> int:
 # Kernel launch helper
 # ---------------------------------------------------------------------------
 
+
 def _launch_kernel(runtime, kernel, n, params):
     """Launch a kernel with occupancy-based grid/block sizing."""
     grid, block = runtime.launch_config(kernel, int(n))
@@ -146,6 +151,7 @@ def _launch_kernel(runtime, kernel, n, params):
 # ---------------------------------------------------------------------------
 # Property-specific number boundary detection
 # ---------------------------------------------------------------------------
+
 
 def _property_number_boundaries(
     d_bytes: cp.ndarray,
@@ -182,10 +188,21 @@ def _property_number_boundaries(
     d_is_start = cp.zeros(n, dtype=cp.uint8)
     d_is_end = cp.zeros(n, dtype=cp.uint8)
 
-    _launch_kernel(runtime, kernels["find_property_number_boundaries"], n, (
-        (ptr(d_bytes), ptr(d_quote_parity), ptr(d_is_start), ptr(d_is_end), n_i64),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
-    ))
+    _launch_kernel(
+        runtime,
+        kernels["find_property_number_boundaries"],
+        n,
+        (
+            (ptr(d_bytes), ptr(d_quote_parity), ptr(d_is_start), ptr(d_is_end), n_i64),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I64,
+            ),
+        ),
+    )
 
     return d_is_start, d_is_end
 
@@ -193,6 +210,7 @@ def _property_number_boundaries(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _find_property_keys(
     d_bytes: cp.ndarray,
@@ -287,22 +305,27 @@ def _classify_values(
     kernels = _classify_value_kernels()
     d_types = cp.empty(n_keys, dtype=cp.int8)
 
-    _launch_kernel(runtime, kernels["classify_property_values"], n_keys, (
+    _launch_kernel(
+        runtime,
+        kernels["classify_property_values"],
+        n_keys,
         (
-            ptr(d_bytes),
-            ptr(d_colon_positions),
-            ptr(d_types),
-            np.int32(n_keys),
-            np.int64(n_bytes),
+            (
+                ptr(d_bytes),
+                ptr(d_colon_positions),
+                ptr(d_types),
+                np.int32(n_keys),
+                np.int64(n_bytes),
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I64,
+            ),
         ),
-        (
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_I32,
-            KERNEL_PARAM_I64,
-        ),
-    ))
+    )
 
     return d_types
 
@@ -369,22 +392,27 @@ def _extract_boolean_column(
     kernels = _extract_bool_kernels()
     d_bools = cp.empty(n_keys, dtype=cp.uint8)
 
-    _launch_kernel(runtime, kernels["extract_booleans"], n_keys, (
+    _launch_kernel(
+        runtime,
+        kernels["extract_booleans"],
+        n_keys,
         (
-            ptr(d_bytes),
-            ptr(d_colon_positions),
-            ptr(d_bools),
-            np.int32(n_keys),
-            np.int64(n_bytes),
+            (
+                ptr(d_bytes),
+                ptr(d_colon_positions),
+                ptr(d_bools),
+                np.int32(n_keys),
+                np.int64(n_bytes),
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I64,
+            ),
         ),
-        (
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_I32,
-            KERNEL_PARAM_I64,
-        ),
-    ))
+    )
 
     return d_bools
 
@@ -392,6 +420,7 @@ def _extract_boolean_column(
 # ---------------------------------------------------------------------------
 # Schema inference
 # ---------------------------------------------------------------------------
+
 
 def infer_property_schema(
     d_bytes: cp.ndarray,
@@ -495,6 +524,7 @@ def infer_property_schema(
 # Main extraction entry point
 # ---------------------------------------------------------------------------
 
+
 def extract_gpu_properties(
     d_bytes: cp.ndarray,
     d_feature_starts: cp.ndarray,
@@ -548,8 +578,11 @@ def extract_gpu_properties(
 
     # Step 1: Infer schema from sample (D->H transfer, acceptable)
     schema = infer_property_schema(
-        d_bytes, d_quote_parity, d_depth,
-        d_feature_starts, d_feature_ends,
+        d_bytes,
+        d_quote_parity,
+        d_depth,
+        d_feature_starts,
+        d_feature_ends,
         sample_size=sample_size,
         property_depth=property_depth,
     )
@@ -570,7 +603,10 @@ def extract_gpu_properties(
 
         # Find all positions of this key across ALL features (on GPU)
         d_key_positions = _find_property_keys(
-            d_bytes, d_quote_parity, d_depth, key_name,
+            d_bytes,
+            d_quote_parity,
+            d_depth,
+            key_name,
             property_depth=property_depth,
         )
 
@@ -586,7 +622,7 @@ def extract_gpu_properties(
 
         if vtype == VTYPE_NUMBER:
             # Build a mask for features that actually have numeric values
-            d_is_numeric = (d_vtypes == VTYPE_NUMBER)
+            d_is_numeric = d_vtypes == VTYPE_NUMBER
             n_numeric = _properties_int_scalar(
                 cp.count_nonzero(d_is_numeric),
                 reason="geojson properties numeric-value count scalar fence",
@@ -620,16 +656,21 @@ def extract_gpu_properties(
                     # correspond to the subset that has the key.
                     # Map key positions back to feature indices using
                     # searchsorted on feature_starts.
-                    d_feature_indices = cp.searchsorted(
-                        d_feature_starts, d_key_positions, side="right",
-                    ) - 1
+                    d_feature_indices = (
+                        cp.searchsorted(
+                            d_feature_starts,
+                            d_key_positions,
+                            side="right",
+                        )
+                        - 1
+                    )
                     d_numeric_global = d_feature_indices[d_is_numeric]
                     if d_values.shape[0] == d_numeric_global.shape[0]:
                         d_full[d_numeric_global] = d_values
                 result[key_name] = d_full
 
         elif vtype == VTYPE_BOOLEAN:
-            d_is_bool = (d_vtypes == VTYPE_BOOLEAN)
+            d_is_bool = d_vtypes == VTYPE_BOOLEAN
             n_bool = _properties_int_scalar(
                 cp.count_nonzero(d_is_bool),
                 reason="geojson properties boolean-value count scalar fence",
@@ -651,9 +692,14 @@ def extract_gpu_properties(
                     if d_values.shape[0] == d_bool_indices.shape[0]:
                         d_full[d_bool_indices] = d_values
                 else:
-                    d_feature_indices = cp.searchsorted(
-                        d_feature_starts, d_key_positions, side="right",
-                    ) - 1
+                    d_feature_indices = (
+                        cp.searchsorted(
+                            d_feature_starts,
+                            d_key_positions,
+                            side="right",
+                        )
+                        - 1
+                    )
                     d_bool_global = d_feature_indices[d_is_bool]
                     if d_values.shape[0] == d_bool_global.shape[0]:
                         d_full[d_bool_global] = d_values

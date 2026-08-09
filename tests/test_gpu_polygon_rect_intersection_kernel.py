@@ -8,8 +8,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import Point, Polygon, box
+from shapely.geometry import LineString, Point, Polygon, box
 
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.residency import Residency, TransferTrigger
 from vibespatial.testing import build_owned as _make_owned_polygons
@@ -156,6 +157,181 @@ def test_polygon_rect_intersection_can_handle_device_take_rows():
     assert polygon_rect_intersection_can_handle(left_subset, right_subset) is True
 
 
+@requires_gpu
+def test_polygon_rect_bounds_clip_ignores_inactive_wide_physical_polygon():
+    import cupy as cp
+
+    from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        polygon_rect_intersection_from_bounds,
+    )
+
+    source = _make_owned_polygons([Point(0.0, 0.0).buffer(5.0, quad_segs=96)])
+    source.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test inactive wide row-indirected rectangle source",
+    )
+    polygon = source.device_state.families[GeometryFamily.POLYGON]
+    assert int(polygon.ring_offsets[-1] - polygon.ring_offsets[0]) > 257
+
+    result = polygon_rect_intersection_from_bounds(
+        source,
+        cp.full((1, 4), cp.nan, dtype=cp.float64),
+    )
+
+    assert result.residency is Residency.DEVICE
+    actual = result.to_shapely()[0]
+    assert actual is None or actual.is_empty
+
+
+@requires_gpu
+def test_polygon_rect_bounds_clip_preserves_coincident_boundary_vertices():
+    import cupy as cp
+
+    from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        polygon_rect_intersection_from_bounds,
+    )
+
+    source = _make_owned_polygons(
+        [
+            box(0.0, 0.0, 1.0, 1.0),
+            box(10.0, 0.0, 12.0, 2.0),
+        ]
+    )
+    source.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test coincident row-indirected rectangle bounds",
+    )
+    result = polygon_rect_intersection_from_bounds(
+        source,
+        cp.asarray(
+            [
+                [0.0, 0.0, 1.0, 1.0],
+                [10.0, 0.0, 11.0, 1.0],
+            ],
+            dtype=cp.float64,
+        ),
+    )
+
+    expected = np.asarray(
+        [
+            box(0.0, 0.0, 1.0, 1.0),
+            box(10.0, 0.0, 11.0, 1.0),
+        ],
+        dtype=object,
+    )
+    actual = np.asarray(result.to_shapely(), dtype=object)
+    assert shapely.equals_exact(
+        shapely.normalize(actual),
+        shapely.normalize(expected),
+        tolerance=0.0,
+    ).all()
+
+
+@requires_gpu
+def test_polygon_box_bounds_accept_device_row_indirected_polygon_rows_from_mixed_base():
+    import cupy as cp
+
+    from vibespatial.geometry.owned import from_shapely_geometries
+    from vibespatial.spatial.query_box import _extract_owned_polygon_box_bounds
+
+    mixed = from_shapely_geometries(
+        [
+            box(0.0, 0.0, 2.0, 2.0),
+            LineString([(100.0, 0.0), (101.0, 1.0)]),
+            LineString([(110.0, 0.0), (111.0, 1.0), (112.0, 1.0)]),
+            box(5.0, 1.0, 8.0, 4.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+    row_indices = np.tile(np.asarray([0, 3], dtype=np.int64), 600)
+    rowset = mixed.device_take(cp.asarray(row_indices, dtype=cp.int64))
+
+    assert rowset.is_indexed_view
+    assert set(rowset.families) == {GeometryFamily.POLYGON, GeometryFamily.LINESTRING}
+
+    d_bounds = _extract_owned_polygon_box_bounds(rowset, return_device=True)
+
+    assert d_bounds is not None
+    np.testing.assert_allclose(
+        cp.asnumpy(d_bounds),
+        np.tile(
+            np.asarray(
+                [
+                    [0.0, 0.0, 2.0, 2.0],
+                    [5.0, 1.0, 8.0, 4.0],
+                ],
+                dtype=np.float64,
+            ),
+            (600, 1),
+        ),
+    )
+
+
+@requires_gpu
+def test_rectangle_intersection_uses_shape_metadata_without_scalar_fences():
+    import cupy as cp
+
+    from vibespatial.constructive.binary_constructive import binary_constructive_owned
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    left = _make_owned_polygons(
+        [
+            box(0.0, 0.0, 2.0, 2.0),
+            box(3.0, 0.0, 5.0, 2.0),
+            box(10.0, 0.0, 11.0, 1.0),
+        ]
+    )
+    right = _make_owned_polygons(
+        [
+            box(1.0, 1.0, 3.0, 3.0),
+            box(4.0, 1.0, 6.0, 3.0),
+            box(20.0, 0.0, 21.0, 1.0),
+        ]
+    )
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test rectangle shape metadata",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test rectangle shape metadata",
+    )
+    left_subset = left.device_take(cp.asarray([0, 1, 2], dtype=cp.int64))
+    right_subset = right.device_take(cp.asarray([0, 1, 2], dtype=cp.int64))
+
+    reset_d2h_transfer_count()
+    result = binary_constructive_owned(
+        "intersection",
+        left_subset,
+        right_subset,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    transfers = get_d2h_transfer_events(clear=True)
+    reasons = {event.reason for event in transfers}
+
+    assert result.residency is Residency.DEVICE
+    assert result.row_count == 3
+    assert result.device_state is not None
+    polygon_buffer = result.device_state.families[GeometryFamily.POLYGON]
+    assert polygon_buffer.dense_single_ring_width == 5
+    assert polygon_buffer.axis_aligned_rectangles is True
+    assert "polygon-rectangle dense single-ring scalar fence" not in reasons
+    assert "polygon-rectangle empty-mask scalar fence" not in reasons
+    assert "polygon-rectangle ring-offset scalar fence" not in reasons
+    assert "polygon-rectangle x-closure scalar fence" not in reasons
+    assert "polygon-rectangle y-closure scalar fence" not in reasons
+    assert "polygon-rectangle axis-aligned scalar fence" not in reasons
+    assert "polygon-rectangle intersection vertex allocation fence" not in reasons
+    reset_d2h_transfer_count()
+
+
 def _assert_geom_equal(gpu_geom, ref_geom, *, rtol=1e-6, msg=""):
     if ref_geom is None or (hasattr(ref_geom, "is_empty") and ref_geom.is_empty):
         if gpu_geom is not None and hasattr(gpu_geom, "is_empty"):
@@ -207,6 +383,56 @@ def test_polygon_rect_intersection_handles_buffered_left_polygons():
     assert len(result_geoms) == 2
     for i, (got, exp) in enumerate(zip(result_geoms, expected.tolist(), strict=True)):
         _assert_geom_equal(got, exp, msg=f"pair {i}")
+
+
+@requires_gpu
+def test_polygon_rect_intersection_uses_cached_bounds_matrix_as_contiguous_columns():
+    import cupy as cp
+
+    from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        polygon_rect_intersection,
+    )
+
+    center = (489.9590630158275, 359.7573581617746)
+    rectangle_ids = [3247, 3248, 3249, 3250, 3346, 3347, 3348, 3349, 3350, 3351]
+    right_geoms = [
+        box(
+            (idx % 100) * 10.0,
+            (idx // 100) * 10.0,
+            (idx % 100 + 1) * 10.0,
+            (idx // 100 + 1) * 10.0,
+        )
+        for idx in rectangle_ids
+    ]
+    left_source = _make_owned_polygons([Point(*center).buffer(35.0)])
+    right = _make_owned_polygons(right_geoms)
+    left_source.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test cached rectangle bounds matrix",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test cached rectangle bounds matrix",
+    )
+    left = left_source.device_take(cp.zeros(len(right_geoms), dtype=cp.int64))
+    right_buffer = right.device_state.families[GeometryFamily.POLYGON]
+    right_buffer.bounds = cp.asarray(
+        [[*geom.bounds] for geom in right_geoms],
+        dtype=cp.float64,
+    )
+    right_buffer.axis_aligned_rectangles = True
+
+    result = polygon_rect_intersection(left, right, dispatch_mode=ExecutionMode.GPU)
+    result_geoms = result.to_shapely()
+    expected = shapely.intersection(
+        np.asarray([Point(*center).buffer(35.0)] * len(right_geoms), dtype=object),
+        np.asarray(right_geoms, dtype=object),
+    )
+
+    for i, (got, exp) in enumerate(zip(result_geoms, expected.tolist(), strict=True)):
+        _assert_geom_equal(got, exp, msg=f"cached bounds pair {i}")
 
 
 @requires_gpu
@@ -283,6 +509,59 @@ def test_polygon_rect_intersection_marks_touch_only_rows_empty():
 
     assert len(result_geoms) == 1
     assert result_geoms[0] is None or result_geoms[0].is_empty
+
+
+@requires_gpu
+def test_rectangle_clipped_difference_uses_native_clip_before_difference():
+    from vibespatial.constructive.binary_constructive import (
+        _row_aligned_rectangle_clipped_difference_gpu,
+    )
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    left_geoms = [
+        box(0.0, 0.0, 10.0, 10.0),
+        box(12.0, 0.0, 22.0, 10.0),
+        box(0.0, 12.0, 10.0, 22.0),
+    ]
+    right_geoms = [
+        Point(8.0, 5.0).buffer(5.0, quad_segs=8),
+        Point(17.0, 5.0).buffer(20.0, quad_segs=8),
+        Point(30.0, 30.0).buffer(3.0, quad_segs=8),
+    ]
+    left = _make_owned_polygons(left_geoms)
+    right = _make_owned_polygons(right_geoms)
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test rectangle clipped difference left",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test rectangle clipped difference right",
+    )
+
+    clear_dispatch_events()
+    result = _row_aligned_rectangle_clipped_difference_gpu(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    events = get_dispatch_events(clear=True)
+
+    assert result is not None
+    assert result.residency is Residency.DEVICE
+    assert result.row_count == len(left_geoms)
+    assert any(
+        event.implementation == "row_aligned_rectangle_clipped_difference_gpu" for event in events
+    )
+    result_geoms = result.to_shapely()
+    expected = shapely.difference(
+        np.asarray(left_geoms, dtype=object),
+        np.asarray(right_geoms, dtype=object),
+    )
+    for i, (got, exp) in enumerate(zip(result_geoms, expected.tolist(), strict=True)):
+        _assert_geom_equal(got, exp, msg=f"rectangle clipped difference row {i}")
 
 
 @requires_gpu

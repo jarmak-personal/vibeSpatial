@@ -104,7 +104,9 @@ def build_geoparquet_metadata_summary(
     )
 
 
-def _row_groups_from_mask(summary: GeoParquetMetadataSummary, mask: np.ndarray, *, strategy: str) -> GeoParquetPruneResult:
+def _row_groups_from_mask(
+    summary: GeoParquetMetadataSummary, mask: np.ndarray, *, strategy: str
+) -> GeoParquetPruneResult:
     selected = tuple(np.flatnonzero(mask).tolist())
     decoded_rows = int(summary.row_group_rows[np.asarray(mask, dtype=bool)].sum(dtype=np.int64))
     total_rows = summary.total_rows
@@ -144,7 +146,9 @@ def select_row_groups_loop(summary: GeoParquetMetadataSummary, bbox: BBox) -> Ge
     return _row_groups_from_mask(summary, mask, strategy="loop")
 
 
-def select_row_groups_vectorized(summary: GeoParquetMetadataSummary, bbox: BBox) -> GeoParquetPruneResult:
+def select_row_groups_vectorized(
+    summary: GeoParquetMetadataSummary, bbox: BBox
+) -> GeoParquetPruneResult:
     xmin, ymin, xmax, ymax = bbox
     mask = ~(
         (summary.xmin > xmax)

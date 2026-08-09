@@ -14,12 +14,11 @@ ADR-0033 dispatch tiers:
   Tier 1 (custom NVRTC) for geometry-specific decode
   Tier 3a (CCCL)        for prefix-sum offset computation
 """
+
 from __future__ import annotations
 
 import logging
 from typing import Any
-
-import numpy as np
 
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
@@ -62,9 +61,11 @@ request_warmup(["exclusive_scan_i32", "exclusive_scan_i64"])
 # ---------------------------------------------------------------------------
 # Kernel compilation (matches io_wkb._wkb_encode_kernels pattern)
 # ---------------------------------------------------------------------------
-_request_nvrtc_warmup([
-    ("wkb-decode", _WKB_DECODE_KERNEL_SOURCE, _WKB_DECODE_KERNEL_NAMES),
-])
+_request_nvrtc_warmup(
+    [
+        ("wkb-decode", _WKB_DECODE_KERNEL_SOURCE, _WKB_DECODE_KERNEL_NAMES),
+    ]
+)
 
 
 def _wkb_decode_kernels() -> dict[str, Any]:
@@ -93,31 +94,39 @@ _TAG_TO_FAMILY = {
 _FAMILY_TO_TAG = {v: k for k, v in _TAG_TO_FAMILY.items()}
 
 
-def _wkb_decode_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
-    """Copy WKB decode metadata through a named runtime D2H boundary."""
-    return np.asarray(get_cuda_runtime().copy_device_to_host(device_array, reason=reason))
+def _coordinate_capacity(payload_device) -> int:
+    """Conservative coordinate capacity from input bytes.
+
+    Python must know allocation shapes before kernels run.  Instead of pulling
+    exact output sizes back from device, allocate by input-byte capacity and
+    compact with device masks after the sizing/decode kernels fill exact
+    offsets.
+    """
+    return int(getattr(payload_device, "size", 0)) // 16 + 1
 
 
-def _wkb_decode_size_summary(*values: object, reason: str) -> np.ndarray:
-    """Return host allocation sizes from device scalar expressions."""
+def _structural_capacity(payload_device) -> int:
+    return int(getattr(payload_device, "size", 0)) // 4 + 1
+
+
+def _compact_prefix_capacity(values, logical_size):
     import cupy as cp
 
-    summary = cp.empty(len(values), dtype=cp.int64)
-    for index, value in enumerate(values):
-        summary[index] = value
-    return _wkb_decode_device_to_host(summary, reason=reason).reshape(-1)
+    keep = cp.arange(int(values.size), dtype=cp.int32) < logical_size
+    return values[keep]
 
 
-def _wkb_decode_bool_scalar(value: object, *, reason: str) -> bool:
+def _compact_offsets_capacity(values, logical_last_index):
     import cupy as cp
 
-    host = _wkb_decode_device_to_host(cp.asarray(value, dtype=cp.bool_).reshape(1), reason=reason)
-    return bool(host.reshape(-1)[0])
+    keep = cp.arange(int(values.size), dtype=cp.int32) <= logical_last_index
+    return values[keep]
 
 
 # ---------------------------------------------------------------------------
 # Stage 1: Header scan
 # ---------------------------------------------------------------------------
+
 
 def _stage1_header_scan(
     payload_device,
@@ -145,12 +154,22 @@ def _stage1_header_scan(
         grid=grid,
         block=block,
         params=(
-            (ptr(payload_device), ptr(record_offsets_device),
-             ptr(family_tags), ptr(is_native), ptr(primary_counts),
-             record_count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_I32),
+            (
+                ptr(payload_device),
+                ptr(record_offsets_device),
+                ptr(family_tags),
+                ptr(is_native),
+                ptr(primary_counts),
+                record_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         ),
     )
 
@@ -160,6 +179,7 @@ def _stage1_header_scan(
 # ---------------------------------------------------------------------------
 # Stage 2: Family partition
 # ---------------------------------------------------------------------------
+
 
 def _stage2_partition(
     family_tags,
@@ -182,6 +202,7 @@ def _stage2_partition(
 # ---------------------------------------------------------------------------
 # Stage 3 + 4: Per-family decode
 # ---------------------------------------------------------------------------
+
 
 def _decode_point_family(
     payload_device,
@@ -208,11 +229,24 @@ def _decode_point_family(
             grid=grid,
             block=block,
             params=(
-                (ptr(payload_device), ptr(record_offsets_device),
-                 ptr(row_indexes), ptr(x_out), ptr(y_out), ptr(empty_out), n),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32),
+                (
+                    ptr(payload_device),
+                    ptr(record_offsets_device),
+                    ptr(row_indexes),
+                    ptr(x_out),
+                    ptr(y_out),
+                    ptr(empty_out),
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
 
@@ -254,26 +288,19 @@ def _decode_linestring_family(
     point_counts = primary_counts[row_indexes].astype(cp.int32, copy=False)
 
     # Build geometry offsets via CCCL exclusive_sum (ADR-0033)
-    coord_offsets = exclusive_sum(point_counts, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
+    coord_offsets = (
+        exclusive_sum(point_counts, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
+    )
     geometry_offsets = cp.empty(n + 1, dtype=cp.int32)
     geometry_offsets[0] = 0
     if n > 0:
         geometry_offsets[1:] = coord_offsets + point_counts
 
-    size_summary = (
-        _wkb_decode_size_summary(
-            geometry_offsets[-1],
-            reason="WKB linestring decode coord-count scalar fence",
-        )
-        if n > 0
-        else np.zeros(1, dtype=np.int64)
-    )
-    total_coords = int(size_summary[0])
+    coord_capacity = _coordinate_capacity(payload_device)
+    x_out = cp.empty(coord_capacity, dtype=cp.float64)
+    y_out = cp.empty(coord_capacity, dtype=cp.float64)
 
-    x_out = cp.empty(total_coords, dtype=cp.float64)
-    y_out = cp.empty(total_coords, dtype=cp.float64)
-
-    if n > 0 and total_coords > 0:
+    if n > 0:
         kernel = kernels["decode_linestring_wkb"]
         ptr = runtime.pointer
         grid, block = runtime.launch_config(kernel, n)
@@ -282,14 +309,29 @@ def _decode_linestring_family(
             grid=grid,
             block=block,
             params=(
-                (ptr(payload_device), ptr(record_offsets_device),
-                 ptr(row_indexes), ptr(coord_offsets),
-                 ptr(x_out), ptr(y_out), n),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32),
+                (
+                    ptr(payload_device),
+                    ptr(record_offsets_device),
+                    ptr(row_indexes),
+                    ptr(coord_offsets),
+                    ptr(x_out),
+                    ptr(y_out),
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
+        total_coords = geometry_offsets[-1]
+        x_out = _compact_prefix_capacity(x_out, total_coords)
+        y_out = _compact_prefix_capacity(y_out, total_coords)
 
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.LINESTRING,
@@ -327,47 +369,43 @@ def _decode_polygon_family(
             grid=grid,
             block=block,
             params=(
-                (ptr(payload_device), ptr(record_offsets_device),
-                 ptr(row_indexes), ptr(total_rings_per), ptr(total_coords_per), n),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+                (
+                    ptr(payload_device),
+                    ptr(record_offsets_device),
+                    ptr(row_indexes),
+                    ptr(total_rings_per),
+                    ptr(total_coords_per),
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
 
     # Geometry offsets = prefix sum of ring counts (rings per polygon, ADR-0033)
-    ring_count_offsets = exclusive_sum(total_rings_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
+    ring_count_offsets = (
+        exclusive_sum(total_rings_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
+    )
     geometry_offsets = cp.empty(n + 1, dtype=cp.int32)
     geometry_offsets[0] = 0
     if n > 0:
         geometry_offsets[1:] = ring_count_offsets + total_rings_per
-    coord_offsets = exclusive_sum(total_coords_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
-    size_summary = (
-        _wkb_decode_size_summary(
-            geometry_offsets[-1],
-            coord_offsets[-1] + total_coords_per[-1],
-            reason="WKB polygon decode size summary scalar fence",
-        )
-        if n > 0
-        else np.zeros(2, dtype=np.int64)
+    coord_offsets = (
+        exclusive_sum(total_coords_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
     )
-    total_rings = int(size_summary[0])
-    total_coords = int(size_summary[1])
-    dense_single_ring_width = None
-    if n > 0 and total_coords > 0 and total_coords % n == 0:
-        candidate_width = total_coords // n
-        dense = cp.all(total_rings_per == 1) & cp.all(total_coords_per == candidate_width)
-        if _wkb_decode_bool_scalar(
-            dense,
-            reason="WKB polygon dense single-ring scalar fence",
-        ):
-            dense_single_ring_width = int(candidate_width)
+    ring_capacity = _structural_capacity(payload_device)
+    coord_capacity = _coordinate_capacity(payload_device)
+    ring_offsets_out = cp.empty(ring_capacity, dtype=cp.int32)
+    x_out = cp.empty(coord_capacity, dtype=cp.float64)
+    y_out = cp.empty(coord_capacity, dtype=cp.float64)
 
-    # Allocate output
-    ring_offsets_out = cp.empty(total_rings + 1, dtype=cp.int32)
-    x_out = cp.empty(total_coords, dtype=cp.float64)
-    y_out = cp.empty(total_coords, dtype=cp.float64)
-
-    if n > 0 and total_coords > 0:
+    if n > 0:
         decode_kernel = kernels["decode_polygon_wkb"]
         ptr = runtime.pointer
         grid, block = runtime.launch_config(decode_kernel, n)
@@ -376,21 +414,36 @@ def _decode_polygon_family(
             grid=grid,
             block=block,
             params=(
-                (ptr(payload_device), ptr(record_offsets_device),
-                 ptr(row_indexes), ptr(ring_count_offsets), ptr(coord_offsets),
-                 ptr(ring_offsets_out), ptr(x_out), ptr(y_out), n),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32),
+                (
+                    ptr(payload_device),
+                    ptr(record_offsets_device),
+                    ptr(row_indexes),
+                    ptr(ring_count_offsets),
+                    ptr(coord_offsets),
+                    ptr(ring_offsets_out),
+                    ptr(x_out),
+                    ptr(y_out),
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
-
-    # Set the sentinel ring offset
-    if total_rings > 0:
+        total_rings = geometry_offsets[-1]
+        total_coords = coord_offsets[-1] + total_coords_per[-1]
         ring_offsets_out[total_rings] = total_coords
-    elif total_rings == 0 and n > 0:
-        ring_offsets_out[0] = 0
+        ring_offsets_out = _compact_offsets_capacity(ring_offsets_out, total_rings)
+        x_out = _compact_prefix_capacity(x_out, total_coords)
+        y_out = _compact_prefix_capacity(y_out, total_coords)
 
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.POLYGON,
@@ -400,7 +453,7 @@ def _decode_polygon_family(
         empty_mask=total_rings_per == 0,
         ring_offsets=ring_offsets_out,
         bounds=None,
-        dense_single_ring_width=dense_single_ring_width,
+        dense_single_ring_width=None,
     )
 
 
@@ -419,25 +472,18 @@ def _decode_multipoint_family(
     n = int(row_indexes.size)
     part_counts = primary_counts[row_indexes].astype(cp.int32, copy=False)
 
-    coord_offsets = exclusive_sum(part_counts, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
+    coord_offsets = (
+        exclusive_sum(part_counts, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
+    )
     geometry_offsets = cp.empty(n + 1, dtype=cp.int32)
     geometry_offsets[0] = 0
     if n > 0:
         geometry_offsets[1:] = coord_offsets + part_counts
-    size_summary = (
-        _wkb_decode_size_summary(
-            geometry_offsets[-1],
-            reason="WKB multipoint decode coord-count scalar fence",
-        )
-        if n > 0
-        else np.zeros(1, dtype=np.int64)
-    )
-    total_coords = int(size_summary[0])
+    coord_capacity = _coordinate_capacity(payload_device)
+    x_out = cp.empty(coord_capacity, dtype=cp.float64)
+    y_out = cp.empty(coord_capacity, dtype=cp.float64)
 
-    x_out = cp.empty(total_coords, dtype=cp.float64)
-    y_out = cp.empty(total_coords, dtype=cp.float64)
-
-    if n > 0 and total_coords > 0:
+    if n > 0:
         kernel = kernels["decode_multipoint_wkb"]
         ptr = runtime.pointer
         grid, block = runtime.launch_config(kernel, n)
@@ -446,14 +492,29 @@ def _decode_multipoint_family(
             grid=grid,
             block=block,
             params=(
-                (ptr(payload_device), ptr(record_offsets_device),
-                 ptr(row_indexes), ptr(coord_offsets),
-                 ptr(x_out), ptr(y_out), n),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32),
+                (
+                    ptr(payload_device),
+                    ptr(record_offsets_device),
+                    ptr(row_indexes),
+                    ptr(coord_offsets),
+                    ptr(x_out),
+                    ptr(y_out),
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
+        total_coords = geometry_offsets[-1]
+        x_out = _compact_prefix_capacity(x_out, total_coords)
+        y_out = _compact_prefix_capacity(y_out, total_coords)
 
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.MULTIPOINT,
@@ -491,37 +552,43 @@ def _decode_multilinestring_family(
             grid=grid,
             block=block,
             params=(
-                (ptr(payload_device), ptr(record_offsets_device),
-                 ptr(row_indexes), ptr(total_parts_per), ptr(total_coords_per), n),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+                (
+                    ptr(payload_device),
+                    ptr(record_offsets_device),
+                    ptr(row_indexes),
+                    ptr(total_parts_per),
+                    ptr(total_coords_per),
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
 
     # Geometry offsets = prefix sum of part counts (ADR-0033)
-    part_count_offsets = exclusive_sum(total_parts_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
+    part_count_offsets = (
+        exclusive_sum(total_parts_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
+    )
     geometry_offsets = cp.empty(n + 1, dtype=cp.int32)
     geometry_offsets[0] = 0
     if n > 0:
         geometry_offsets[1:] = part_count_offsets + total_parts_per
-    coord_offsets = exclusive_sum(total_coords_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
-    size_summary = (
-        _wkb_decode_size_summary(
-            geometry_offsets[-1],
-            coord_offsets[-1] + total_coords_per[-1],
-            reason="WKB multilinestring decode size summary scalar fence",
-        )
-        if n > 0
-        else np.zeros(2, dtype=np.int64)
+    coord_offsets = (
+        exclusive_sum(total_coords_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
     )
-    total_parts = int(size_summary[0])
-    total_coords = int(size_summary[1])
+    part_capacity = _structural_capacity(payload_device)
+    coord_capacity = _coordinate_capacity(payload_device)
+    part_offsets_out = cp.empty(part_capacity, dtype=cp.int32)
+    x_out = cp.empty(coord_capacity, dtype=cp.float64)
+    y_out = cp.empty(coord_capacity, dtype=cp.float64)
 
-    part_offsets_out = cp.empty(total_parts + 1, dtype=cp.int32)
-    x_out = cp.empty(total_coords, dtype=cp.float64)
-    y_out = cp.empty(total_coords, dtype=cp.float64)
-
-    if n > 0 and total_coords > 0:
+    if n > 0:
         decode_kernel = kernels["decode_multilinestring_wkb"]
         ptr = runtime.pointer
         grid, block = runtime.launch_config(decode_kernel, n)
@@ -530,21 +597,36 @@ def _decode_multilinestring_family(
             grid=grid,
             block=block,
             params=(
-                (ptr(payload_device), ptr(record_offsets_device),
-                 ptr(row_indexes), ptr(part_count_offsets), ptr(coord_offsets),
-                 ptr(part_offsets_out), ptr(x_out), ptr(y_out), n),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32),
+                (
+                    ptr(payload_device),
+                    ptr(record_offsets_device),
+                    ptr(row_indexes),
+                    ptr(part_count_offsets),
+                    ptr(coord_offsets),
+                    ptr(part_offsets_out),
+                    ptr(x_out),
+                    ptr(y_out),
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
-
-    # Set sentinel
-    if total_parts > 0:
+        total_parts = geometry_offsets[-1]
+        total_coords = coord_offsets[-1] + total_coords_per[-1]
         part_offsets_out[total_parts] = total_coords
-    elif total_parts == 0 and n > 0:
-        part_offsets_out[0] = 0
+        part_offsets_out = _compact_offsets_capacity(part_offsets_out, total_parts)
+        x_out = _compact_prefix_capacity(x_out, total_coords)
+        y_out = _compact_prefix_capacity(y_out, total_coords)
 
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.MULTILINESTRING,
@@ -584,44 +666,50 @@ def _decode_multipolygon_family(
             grid=grid,
             block=block,
             params=(
-                (ptr(payload_device), ptr(record_offsets_device),
-                 ptr(row_indexes), ptr(total_parts_per),
-                 ptr(total_rings_per), ptr(total_coords_per), n),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32),
+                (
+                    ptr(payload_device),
+                    ptr(record_offsets_device),
+                    ptr(row_indexes),
+                    ptr(total_parts_per),
+                    ptr(total_rings_per),
+                    ptr(total_coords_per),
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
 
     # Geometry offsets = prefix sum of part counts (polygon parts per multipolygon, ADR-0033)
-    poly_count_offsets = exclusive_sum(total_parts_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
+    poly_count_offsets = (
+        exclusive_sum(total_parts_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
+    )
     geometry_offsets = cp.empty(n + 1, dtype=cp.int32)
     geometry_offsets[0] = 0
     if n > 0:
         geometry_offsets[1:] = poly_count_offsets + total_parts_per
-    ring_count_offsets = exclusive_sum(total_rings_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
-    coord_offsets = exclusive_sum(total_coords_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
-
-    size_summary = (
-        _wkb_decode_size_summary(
-            geometry_offsets[-1],
-            ring_count_offsets[-1] + total_rings_per[-1],
-            coord_offsets[-1] + total_coords_per[-1],
-            reason="WKB multipolygon decode size summary scalar fence",
-        )
-        if n > 0
-        else np.zeros(3, dtype=np.int64)
+    ring_count_offsets = (
+        exclusive_sum(total_rings_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
     )
-    total_parts = int(size_summary[0])
-    total_rings = int(size_summary[1])
-    total_coords = int(size_summary[2])
+    coord_offsets = (
+        exclusive_sum(total_coords_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
+    )
 
-    part_offsets_out = cp.empty(total_parts + 1, dtype=cp.int32)
-    ring_offsets_out = cp.empty(total_rings + 1, dtype=cp.int32)
-    x_out = cp.empty(total_coords, dtype=cp.float64)
-    y_out = cp.empty(total_coords, dtype=cp.float64)
+    structural_capacity = _structural_capacity(payload_device)
+    coord_capacity = _coordinate_capacity(payload_device)
+    part_offsets_out = cp.empty(structural_capacity, dtype=cp.int32)
+    ring_offsets_out = cp.empty(structural_capacity, dtype=cp.int32)
+    x_out = cp.empty(coord_capacity, dtype=cp.float64)
+    y_out = cp.empty(coord_capacity, dtype=cp.float64)
 
-    if n > 0 and total_coords > 0:
+    if n > 0:
         decode_kernel = kernels["decode_multipolygon_wkb"]
         ptr = runtime.pointer
         grid, block = runtime.launch_config(decode_kernel, n)
@@ -630,29 +718,43 @@ def _decode_multipolygon_family(
             grid=grid,
             block=block,
             params=(
-                (ptr(payload_device), ptr(record_offsets_device),
-                 ptr(row_indexes), ptr(poly_count_offsets),
-                 ptr(ring_count_offsets), ptr(coord_offsets),
-                 ptr(part_offsets_out), ptr(ring_offsets_out),
-                 ptr(x_out), ptr(y_out), n),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32),
+                (
+                    ptr(payload_device),
+                    ptr(record_offsets_device),
+                    ptr(row_indexes),
+                    ptr(poly_count_offsets),
+                    ptr(ring_count_offsets),
+                    ptr(coord_offsets),
+                    ptr(part_offsets_out),
+                    ptr(ring_offsets_out),
+                    ptr(x_out),
+                    ptr(y_out),
+                    n,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
-
-    # Set sentinels
-    if total_parts > 0:
+        total_parts = geometry_offsets[-1]
+        total_rings = ring_count_offsets[-1] + total_rings_per[-1]
+        total_coords = coord_offsets[-1] + total_coords_per[-1]
         part_offsets_out[total_parts] = total_rings
-    elif total_parts == 0 and n > 0:
-        part_offsets_out[0] = 0
-
-    if total_rings > 0:
         ring_offsets_out[total_rings] = total_coords
-    elif total_rings == 0 and n > 0:
-        ring_offsets_out[0] = 0
+        part_offsets_out = _compact_offsets_capacity(part_offsets_out, total_parts)
+        ring_offsets_out = _compact_offsets_capacity(ring_offsets_out, total_rings)
+        x_out = _compact_prefix_capacity(x_out, total_coords)
+        y_out = _compact_prefix_capacity(y_out, total_coords)
 
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.MULTIPOLYGON,
@@ -670,11 +772,14 @@ def _decode_multipolygon_family(
 # Stage 5: Assembly
 # ---------------------------------------------------------------------------
 
+
 def _assemble_single_family(
     family: GeometryFamily,
     family_buffer: DeviceFamilyGeometryBuffer,
     validity_device,
     record_count: int,
+    *,
+    all_valid: bool = False,
 ) -> OwnedGeometryArray:
     """Assemble single-family result using io_pylibcudf helper."""
     return _build_device_single_family_owned(
@@ -688,6 +793,7 @@ def _assemble_single_family(
         ring_offsets_device=family_buffer.ring_offsets,
         dense_single_ring_width=family_buffer.dense_single_ring_width,
         detail="created device-resident owned geometry array from GPU WKB decode kernel pipeline",
+        all_valid=all_valid,
     )
 
 
@@ -730,6 +836,7 @@ def _assemble_mixed(
 # ---------------------------------------------------------------------------
 # Public API: decode_wkb_device_pipeline
 # ---------------------------------------------------------------------------
+
 
 @register_kernel_variant(
     "decode_wkb",
@@ -779,7 +886,9 @@ def decode_wkb_device_pipeline(
 
     # Stage 1: Header scan
     family_tags, is_native, primary_counts = _stage1_header_scan(
-        payload_device, record_offsets_device, record_count,
+        payload_device,
+        record_offsets_device,
+        record_count,
     )
 
     # Stage 2: Family partition
@@ -804,27 +913,41 @@ def decode_wkb_device_pipeline(
     for family, row_indexes in partitions.items():
         if family is GeometryFamily.POINT:
             family_buffers[family] = _decode_point_family(
-                payload_device, record_offsets_device, row_indexes,
+                payload_device,
+                record_offsets_device,
+                row_indexes,
             )
         elif family is GeometryFamily.LINESTRING:
             family_buffers[family] = _decode_linestring_family(
-                payload_device, record_offsets_device, row_indexes, primary_counts,
+                payload_device,
+                record_offsets_device,
+                row_indexes,
+                primary_counts,
             )
         elif family is GeometryFamily.POLYGON:
             family_buffers[family] = _decode_polygon_family(
-                payload_device, record_offsets_device, row_indexes,
+                payload_device,
+                record_offsets_device,
+                row_indexes,
             )
         elif family is GeometryFamily.MULTIPOINT:
             family_buffers[family] = _decode_multipoint_family(
-                payload_device, record_offsets_device, row_indexes, primary_counts,
+                payload_device,
+                record_offsets_device,
+                row_indexes,
+                primary_counts,
             )
         elif family is GeometryFamily.MULTILINESTRING:
             family_buffers[family] = _decode_multilinestring_family(
-                payload_device, record_offsets_device, row_indexes,
+                payload_device,
+                record_offsets_device,
+                row_indexes,
             )
         elif family is GeometryFamily.MULTIPOLYGON:
             family_buffers[family] = _decode_multipolygon_family(
-                payload_device, record_offsets_device, row_indexes,
+                payload_device,
+                record_offsets_device,
+                row_indexes,
             )
 
     # Stage 5: Assembly
@@ -840,8 +963,13 @@ def decode_wkb_device_pipeline(
                 family_buffers[single_family],
                 is_native.astype(cp.bool_, copy=False),
                 record_count,
+                all_valid=True,
             )
 
     return _assemble_mixed(
-        partitions, family_buffers, family_tags, is_native, record_count,
+        partitions,
+        family_buffers,
+        family_tags,
+        is_native,
+        record_count,
     )

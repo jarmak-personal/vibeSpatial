@@ -8,6 +8,7 @@ Phase 8 (vibeSpatial-p23.8): All four overlay data structures are
 device-primary with lazy host materialization.  GPU-only consumers
 never trigger D->H copies.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -27,7 +28,6 @@ def _runtime_host_array(runtime, value, dtype, *, reason: str):
 @dataclass(frozen=True)
 class SplitEventDeviceState:
     source_segment_ids: DeviceArray
-    packed_keys: DeviceArray
     t: DeviceArray
     x: DeviceArray
     y: DeviceArray
@@ -47,6 +47,7 @@ class SplitEventTable:
     ``left_segment_count``, ``right_segment_count``, and
     ``runtime_selection`` never trigger device-to-host copies.
     """
+
     left_segment_count: int
     right_segment_count: int
     runtime_selection: RuntimeSelection
@@ -198,6 +199,10 @@ class AtomicEdgeDeviceState:
     part_indices: DeviceArray | None = None
     ring_indices: DeviceArray | None = None
     source_side: DeviceArray | None = None
+    # Bitset over all source atoms collapsed into this geometric edge:
+    # bit 0 = left, bit 1 = right. Coincident boundaries therefore retain
+    # dual-source provenance after geometric deduplication.
+    source_membership: DeviceArray | None = None
 
 
 @dataclass
@@ -210,6 +215,7 @@ class AtomicEdgeTable:
     ``right_segment_count``, and ``runtime_selection`` never trigger the
     device-to-host copies.
     """
+
     left_segment_count: int
     right_segment_count: int
     runtime_selection: RuntimeSelection
@@ -383,13 +389,13 @@ class AtomicEdgeTable:
 
 @dataclass(frozen=True)
 class HalfEdgeGraphDeviceState:
-    node_x: DeviceArray
-    node_y: DeviceArray
-    src_node_ids: DeviceArray
-    dst_node_ids: DeviceArray
-    angle: DeviceArray
-    sorted_edge_ids: DeviceArray
-    edge_positions: DeviceArray
+    node_x: DeviceArray | None
+    node_y: DeviceArray | None
+    src_node_ids: DeviceArray | None
+    dst_node_ids: DeviceArray | None
+    angle: DeviceArray | None
+    sorted_edge_ids: DeviceArray | None
+    edge_positions: DeviceArray | None
     next_edge_ids: DeviceArray
     src_x: DeviceArray
     src_y: DeviceArray
@@ -397,6 +403,7 @@ class HalfEdgeGraphDeviceState:
     # round-trips when GPU consumers need per-edge source metadata.
     source_segment_ids: DeviceArray | None = None
     source_side: DeviceArray | None = None
+    source_membership: DeviceArray | None = None
     row_indices: DeviceArray | None = None
     part_indices: DeviceArray | None = None
     ring_indices: DeviceArray | None = None
@@ -413,11 +420,14 @@ class HalfEdgeGraph:
     ``node_count``, ``left_segment_count``, ``right_segment_count``, and
     ``runtime_selection`` never trigger device-to-host copies.
     """
+
     left_segment_count: int
     right_segment_count: int
     runtime_selection: RuntimeSelection
     device_state: HalfEdgeGraphDeviceState
     _edge_count: int = 0
+    _node_count: int = 0
+    isolate_rows: bool = False
     # Host arrays — lazily materialized from device_state on first access.
     _source_segment_ids: np.ndarray | None = None
     _source_side: np.ndarray | None = None
@@ -470,54 +480,91 @@ class HalfEdgeGraph:
             np.float64,
             reason="overlay half-edge target-y host export",
         )
-        self._node_x = _runtime_host_array(
-            runtime,
-            ds.node_x,
-            np.float64,
-            reason="overlay half-edge node-x host export",
-        )
-        self._node_y = _runtime_host_array(
-            runtime,
-            ds.node_y,
-            np.float64,
-            reason="overlay half-edge node-y host export",
-        )
-        self._src_node_ids = _runtime_host_array(
-            runtime,
-            ds.src_node_ids,
-            np.int32,
-            reason="overlay half-edge source-node host export",
-        )
-        self._dst_node_ids = _runtime_host_array(
-            runtime,
-            ds.dst_node_ids,
-            np.int32,
-            reason="overlay half-edge target-node host export",
-        )
-        self._angle = _runtime_host_array(
-            runtime,
-            ds.angle,
-            np.float64,
-            reason="overlay half-edge angle host export",
-        )
-        self._sorted_edge_ids = _runtime_host_array(
-            runtime,
-            ds.sorted_edge_ids,
-            np.int32,
-            reason="overlay half-edge sorted-edge host export",
-        )
-        self._edge_positions = _runtime_host_array(
-            runtime,
-            ds.edge_positions,
-            np.int32,
-            reason="overlay half-edge edge-position host export",
-        )
         self._next_edge_ids = _runtime_host_array(
             runtime,
             ds.next_edge_ids,
             np.int32,
             reason="overlay half-edge next-edge host export",
         )
+        if ds.node_x is not None:
+            self._node_x = _runtime_host_array(
+                runtime,
+                ds.node_x,
+                np.float64,
+                reason="overlay half-edge node-x host export",
+            )
+            self._node_y = _runtime_host_array(
+                runtime,
+                ds.node_y,
+                np.float64,
+                reason="overlay half-edge node-y host export",
+            )
+            self._src_node_ids = _runtime_host_array(
+                runtime,
+                ds.src_node_ids,
+                np.int32,
+                reason="overlay half-edge source-node host export",
+            )
+            self._dst_node_ids = _runtime_host_array(
+                runtime,
+                ds.dst_node_ids,
+                np.int32,
+                reason="overlay half-edge target-node host export",
+            )
+            self._angle = _runtime_host_array(
+                runtime,
+                ds.angle,
+                np.float64,
+                reason="overlay half-edge angle host export",
+            )
+            self._sorted_edge_ids = _runtime_host_array(
+                runtime,
+                ds.sorted_edge_ids,
+                np.int32,
+                reason="overlay half-edge sorted-edge host export",
+            )
+            self._edge_positions = _runtime_host_array(
+                runtime,
+                ds.edge_positions,
+                np.int32,
+                reason="overlay half-edge edge-position host export",
+            )
+            return
+
+        edge_count = int(self._src_x.size)
+        edge_ids = np.arange(edge_count, dtype=np.int32)
+        twin_edge_ids = edge_ids ^ np.int32(1)
+        self._dst_x = self._src_x[twin_edge_ids]
+        self._dst_y = self._src_y[twin_edge_ids]
+        if self.isolate_rows:
+            self._ensure_host_metadata()
+            point_order = np.lexsort((self._src_y, self._src_x, self._row_indices))
+        else:
+            point_order = np.lexsort((self._src_y, self._src_x))
+        sorted_x = self._src_x[point_order]
+        sorted_y = self._src_y[point_order]
+        point_start = np.empty(edge_count, dtype=bool)
+        if edge_count:
+            point_start[0] = True
+            point_start[1:] = (sorted_x[1:] != sorted_x[:-1]) | (sorted_y[1:] != sorted_y[:-1])
+            if self.isolate_rows:
+                sorted_rows = self._row_indices[point_order]
+                point_start[1:] |= sorted_rows[1:] != sorted_rows[:-1]
+        point_node_ids = np.cumsum(point_start, dtype=np.int32) - 1
+        self._src_node_ids = np.empty(edge_count, dtype=np.int32)
+        self._src_node_ids[point_order] = point_node_ids
+        self._dst_node_ids = self._src_node_ids[twin_edge_ids]
+        self._node_x = sorted_x[point_start]
+        self._node_y = sorted_y[point_start]
+        self._angle = np.arctan2(
+            self._dst_y - self._src_y,
+            self._dst_x - self._src_x,
+        )
+        self._sorted_edge_ids = np.lexsort((edge_ids, self._angle, self._src_node_ids)).astype(
+            np.int32, copy=False
+        )
+        self._edge_positions = np.empty(edge_count, dtype=np.int32)
+        self._edge_positions[self._sorted_edge_ids] = edge_ids
 
     def _ensure_host_metadata(self) -> None:
         """Lazily copy per-edge metadata arrays from device to host on first access."""
@@ -678,10 +725,16 @@ class HalfEdgeGraph:
 
     @property
     def node_count(self) -> int:
+        if self._node_count > 0:
+            return self._node_count
         if self._node_x is not None:
             return int(self._node_x.size)
         if self.device_state is not None and self.device_state.node_x is not None:
             return int(self.device_state.node_x.size)
+        if self.device_state is not None:
+            self._ensure_host_topology()
+            if self._node_x is not None:
+                return int(self._node_x.size)
         return 0
 
 
@@ -801,7 +854,11 @@ class OverlayFaceTable:
     def left_covered(self) -> np.ndarray:
         if self._left_covered is None:
             self._ensure_host()
-        if self._left_covered is None and self.device_state is not None and self.device_state.left_covered is not None:
+        if (
+            self._left_covered is None
+            and self.device_state is not None
+            and self.device_state.left_covered is not None
+        ):
             runtime = get_cuda_runtime()
             self._left_covered = _runtime_host_array(
                 runtime,
@@ -815,7 +872,11 @@ class OverlayFaceTable:
     def right_covered(self) -> np.ndarray:
         if self._right_covered is None:
             self._ensure_host()
-        if self._right_covered is None and self.device_state is not None and self.device_state.right_covered is not None:
+        if (
+            self._right_covered is None
+            and self.device_state is not None
+            and self.device_state.right_covered is not None
+        ):
             runtime = get_cuda_runtime()
             self._right_covered = _runtime_host_array(
                 runtime,
@@ -839,3 +900,72 @@ class OverlayExecutionPlan:
     half_edge_graph: HalfEdgeGraph
     faces: OverlayFaceTable
     row_isolated: bool = False
+
+
+@dataclass(frozen=True)
+class ComponentOverlayExecutionPlan:
+    """One oversized logical row decomposed into disjoint topology rows.
+
+    ``left`` and ``right`` contain aligned synthetic MultiPolygon rows. Their
+    combined polygon-part x intervals are strictly separated between rows, so
+    each row owns an independent face graph and the results can be packed back
+    into one geometry without another constructive union.
+    """
+
+    left: object
+    right: object
+    component_count: int
+    max_left_segments_per_component: int
+    max_right_segments_per_component: int
+    dispatch_mode: object
+    include_same_side_splits: bool = False
+    row_isolated: bool = True
+
+
+@dataclass(frozen=True)
+class MicrocellOverlayExecutionPlan:
+    """One connected oversized row reconstructed from paged microcell bands."""
+
+    left: object
+    right: object
+    max_left_segments: int
+    max_right_segments: int
+    dispatch_mode: object
+    row_isolated: bool = True
+
+
+@dataclass(frozen=True)
+class PagedOverlayExecutionPlan:
+    """Independent row-isolated topology plans bounded by live-event work.
+
+    Every page owns complete logical rows, source-segment runs, and face graphs.
+    Page boundaries are algebraic from ``rows_per_page``; no device row/event
+    metadata is exported and no row-shaped host offset table is retained.
+    """
+
+    left: object
+    right: object
+    row_count: int
+    rows_per_page: int
+    max_left_segments_per_row: int
+    max_right_segments_per_row: int
+    dispatch_mode: object
+    use_same_row_fast_path: bool | None = None
+    include_same_side_splits: bool = False
+    right_geometry_source_rows: DeviceArray | np.ndarray | None = None
+    right_segment_source_rows: DeviceArray | np.ndarray | None = None
+    right_segment_broadcast: object | None = None
+    allow_component_decomposition: bool = True
+    row_isolated: bool = True
+
+    @property
+    def page_count(self) -> int:
+        if self.row_count == 0:
+            return 0
+        return (self.row_count + self.rows_per_page - 1) // self.rows_per_page
+
+    def row_span(self, page_index: int) -> tuple[int, int]:
+        if page_index < 0 or page_index >= self.page_count:
+            raise IndexError(f"overlay topology page index out of range: {page_index}")
+        start = page_index * self.rows_per_page
+        return start, min(start + self.rows_per_page, self.row_count)

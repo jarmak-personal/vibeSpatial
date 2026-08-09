@@ -53,11 +53,7 @@ def _actual_query_runtime_label() -> str:
 
 
 def _actual_query_implementation() -> str:
-    return (
-        "owned_gpu_spatial_query"
-        if has_gpu_runtime()
-        else "owned_cpu_spatial_query"
-    )
+    return "owned_gpu_spatial_query" if has_gpu_runtime() else "owned_cpu_spatial_query"
 
 
 def _sync_gpu_profile_stage() -> None:
@@ -89,7 +85,9 @@ def _build_join_inputs(rows: int, *, overlap_ratio: float) -> tuple[np.ndarray, 
     tree = np.asarray(
         list(
             generate_polygons(
-                SyntheticSpec(geometry_type="polygon", distribution="regular-grid", count=rows, seed=4)
+                SyntheticSpec(
+                    geometry_type="polygon", distribution="regular-grid", count=rows, seed=4
+                )
             ).geometries
         ),
         dtype=object,
@@ -108,7 +106,9 @@ def _build_overlay_inputs(rows: int) -> tuple[np.ndarray, np.ndarray]:
     left = np.asarray(
         list(
             generate_polygons(
-                SyntheticSpec(geometry_type="polygon", distribution="regular-grid", count=rows, seed=10)
+                SyntheticSpec(
+                    geometry_type="polygon", distribution="regular-grid", count=rows, seed=10
+                )
             ).geometries
         ),
         dtype=object,
@@ -216,15 +216,21 @@ def profile_join_kernel(
                 stage.device = ExecutionMode.GPU.value
                 stage.metadata["candidate_mode"] = "gpu"
                 stage.rows_out = int(left_idx.size)
-                execution_reason = "repo-owned GPU bbox candidate generation selected the join coarse filter"
+                execution_reason = (
+                    "repo-owned GPU bbox candidate generation selected the join coarse filter"
+                )
             else:
-                pairs = generate_bounds_pairs(query_owned, flat_index.geometry_array, tile_size=tile_size)
+                pairs = generate_bounds_pairs(
+                    query_owned, flat_index.geometry_array, tile_size=tile_size
+                )
                 left_idx = pairs.left_indices
                 right_idx = pairs.right_indices
                 stage.metadata["candidate_mode"] = "cpu"
                 stage.metadata["pairs_examined"] = int(pairs.pairs_examined)
                 stage.rows_out = int(pairs.count)
-                execution_reason = "repo-owned CPU bbox candidate generation selected the join coarse filter"
+                execution_reason = (
+                    "repo-owned CPU bbox candidate generation selected the join coarse filter"
+                )
 
     with profiler.stage(
         "refine_predicate",
@@ -332,7 +338,9 @@ def profile_overlay_kernel(
     requested_runtime = select_runtime(dispatch_mode)
     actual_selected_runtime = (
         ExecutionMode.GPU
-        if requested_runtime.requested is not ExecutionMode.CPU and has_gpu_runtime() and cp is not None
+        if requested_runtime.requested is not ExecutionMode.CPU
+        and has_gpu_runtime()
+        and cp is not None
         else ExecutionMode.CPU
     )
     runtime_selection = RuntimeSelection(
@@ -344,7 +352,9 @@ def profile_overlay_kernel(
             else "overlay profiling rail uses the CPU fallback segment pipeline"
         ),
     )
-    normalized_operation = operation if isinstance(operation, OverlayOperation) else OverlayOperation(operation)
+    normalized_operation = (
+        operation if isinstance(operation, OverlayOperation) else OverlayOperation(operation)
+    )
     profiler = StageProfiler(
         operation="overlay",
         dataset=f"polygon-{rows}",
@@ -418,7 +428,9 @@ def profile_overlay_kernel(
             stage.metadata["left_segment_count"] = int(left_segments.count)
             stage.metadata["right_segment_count"] = int(right_segments.count)
         else:
-            candidates = _generate_segment_candidates_from_tables(left_segments, right_segments, tile_size=tile_size)
+            candidates = _generate_segment_candidates_from_tables(
+                left_segments, right_segments, tile_size=tile_size
+            )
             stage.metadata["pairs_examined"] = candidates.pairs_examined
         stage.rows_out = candidates.count
 
@@ -460,7 +472,11 @@ def profile_overlay_kernel(
                 robustness_plan=robustness_plan,
             )
         stage.rows_out = result.count
-        if actual_selected_runtime is ExecutionMode.GPU and result.device_state is not None and cp is not None:
+        if (
+            actual_selected_runtime is ExecutionMode.GPU
+            and result.device_state is not None
+            and cp is not None
+        ):
             d_kinds = cp.asarray(result.device_state.kinds)
             stage.metadata["ambiguous_pairs"] = int(result.device_state.ambiguous_rows.size)
             proper_pairs, touch_pairs, overlap_pairs = _profile_pair_kind_counts(d_kinds)
@@ -481,7 +497,11 @@ def profile_overlay_kernel(
         detail="stable-sort emitted intersection events for deterministic overlay reconstruction",
     ) as stage:
         if result.count:
-            if actual_selected_runtime is ExecutionMode.GPU and result.device_state is not None and cp is not None:
+            if (
+                actual_selected_runtime is ExecutionMode.GPU
+                and result.device_state is not None
+                and cp is not None
+            ):
                 _ = cp.lexsort(
                     cp.stack(
                         (
@@ -514,9 +534,7 @@ def profile_overlay_kernel(
             "operation": normalized_operation.value,
             "candidate_pairs": int(candidates.count),
             "pairs_examined": (
-                int(candidates.pairs_examined)
-                if hasattr(candidates, "pairs_examined")
-                else None
+                int(candidates.pairs_examined) if hasattr(candidates, "pairs_examined") else None
             ),
             "actual_selected_runtime": actual_selected_runtime.value,
             "execution_implementation": (
@@ -665,10 +683,16 @@ def profile_spatial_query_stack(
 
     if point_box_pairs is not None:
         left_idx, right_idx = point_box_pairs
-        indices = right_idx.astype(np.intp, copy=False) if scalar else np.vstack((
-            left_idx.astype(np.intp, copy=False),
-            right_idx.astype(np.intp, copy=False),
-        ))
+        indices = (
+            right_idx.astype(np.intp, copy=False)
+            if scalar
+            else np.vstack(
+                (
+                    left_idx.astype(np.intp, copy=False),
+                    right_idx.astype(np.intp, copy=False),
+                )
+            )
+        )
         with profiler.stage(
             "format_output",
             category="emit",
@@ -739,10 +763,16 @@ def profile_spatial_query_stack(
             left_idx, right_idx = regular_grid_box_pairs.to_host()
         else:
             left_idx, right_idx = regular_grid_box_pairs
-        indices = right_idx.astype(np.intp, copy=False) if scalar else np.vstack((
-            left_idx.astype(np.intp, copy=False),
-            right_idx.astype(np.intp, copy=False),
-        ))
+        indices = (
+            right_idx.astype(np.intp, copy=False)
+            if scalar
+            else np.vstack(
+                (
+                    left_idx.astype(np.intp, copy=False),
+                    right_idx.astype(np.intp, copy=False),
+                )
+            )
+        )
         with profiler.stage(
             "format_output",
             category="emit",
@@ -800,10 +830,16 @@ def profile_spatial_query_stack(
             left_idx, right_idx = fast_pairs.to_host()
         else:
             left_idx, right_idx = fast_pairs
-        indices = right_idx.astype(np.intp, copy=False) if scalar else np.vstack((
-            left_idx.astype(np.intp, copy=False),
-            right_idx.astype(np.intp, copy=False),
-        ))
+        indices = (
+            right_idx.astype(np.intp, copy=False)
+            if scalar
+            else np.vstack(
+                (
+                    left_idx.astype(np.intp, copy=False),
+                    right_idx.astype(np.intp, copy=False),
+                )
+            )
+        )
         with profiler.stage(
             "format_output",
             category="emit",
@@ -858,10 +894,16 @@ def profile_spatial_query_stack(
 
     if owned_point_box_pairs is not None:
         left_idx, right_idx = owned_point_box_pairs
-        indices = right_idx.astype(np.intp, copy=False) if scalar else np.vstack((
-            left_idx.astype(np.intp, copy=False),
-            right_idx.astype(np.intp, copy=False),
-        ))
+        indices = (
+            right_idx.astype(np.intp, copy=False)
+            if scalar
+            else np.vstack(
+                (
+                    left_idx.astype(np.intp, copy=False),
+                    right_idx.astype(np.intp, copy=False),
+                )
+            )
+        )
         with profiler.stage(
             "format_output",
             category="emit",
@@ -899,7 +941,9 @@ def profile_spatial_query_stack(
         rows_in=query_owned.row_count,
         detail="compute query bounds for generic candidate generation",
     ) as stage:
-        query_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode(query_owned))
+        query_bounds = compute_geometry_bounds(
+            query_owned, dispatch_mode=_gpu_bounds_dispatch_mode(query_owned)
+        )
         stage.rows_out = int(query_bounds.shape[0])
 
     tree_bounds = flat_index.bounds
@@ -919,7 +963,9 @@ def profile_spatial_query_stack(
                 per_row_distance = np.full(query_size, float(distance), dtype=np.float64)
             else:
                 per_row_distance = np.asarray(distance, dtype=np.float64)
-            left_idx, right_idx = _generate_distance_pairs(query_bounds, tree_bounds, per_row_distance)
+            left_idx, right_idx = _generate_distance_pairs(
+                query_bounds, tree_bounds, per_row_distance
+            )
             stage.rows_out = int(left_idx.size)
 
         with profiler.stage(
@@ -985,10 +1031,16 @@ def profile_spatial_query_stack(
             if actual_selected_runtime != ExecutionMode.GPU.value:
                 actual_selected_runtime = refine_selection.selected.value
 
-    indices = right_idx.astype(np.intp, copy=False) if scalar else np.vstack((
-        left_idx.astype(np.intp, copy=False),
-        right_idx.astype(np.intp, copy=False),
-    ))
+    indices = (
+        right_idx.astype(np.intp, copy=False)
+        if scalar
+        else np.vstack(
+            (
+                left_idx.astype(np.intp, copy=False),
+                right_idx.astype(np.intp, copy=False),
+            )
+        )
+    )
     with profiler.stage(
         "format_output",
         category="emit",

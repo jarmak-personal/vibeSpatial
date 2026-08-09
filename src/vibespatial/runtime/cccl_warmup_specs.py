@@ -26,6 +26,7 @@ class AlgorithmFamily(StrEnum):
 @dataclass(frozen=True, slots=True)
 class CCCLWarmupSpec:
     """Specification for a CCCL make_* pre-compilation target."""
+
     name: str
     family: AlgorithmFamily
     key_dtype: Any
@@ -61,10 +62,18 @@ def build_spec_registry() -> dict[str, CCCLWarmupSpec]:
         "select_i64": S("select_i64", F.SELECT, i64, None, "select_predicate"),
         "reduce_sum_f64": S("reduce_sum_f64", F.REDUCE_INTO, f64, None, "sum"),
         "reduce_sum_i32": S("reduce_sum_i32", F.REDUCE_INTO, i32, None, "sum"),
-        "segmented_reduce_sum_i32": S("segmented_reduce_sum_i32", F.SEGMENTED_REDUCE, i32, None, "sum"),
-        "segmented_reduce_sum_f64": S("segmented_reduce_sum_f64", F.SEGMENTED_REDUCE, f64, None, "sum"),
-        "segmented_reduce_min_f64": S("segmented_reduce_min_f64", F.SEGMENTED_REDUCE, f64, None, "min"),
-        "segmented_reduce_max_f64": S("segmented_reduce_max_f64", F.SEGMENTED_REDUCE, f64, None, "max"),
+        "segmented_reduce_sum_i32": S(
+            "segmented_reduce_sum_i32", F.SEGMENTED_REDUCE, i32, None, "sum"
+        ),
+        "segmented_reduce_sum_f64": S(
+            "segmented_reduce_sum_f64", F.SEGMENTED_REDUCE, f64, None, "sum"
+        ),
+        "segmented_reduce_min_f64": S(
+            "segmented_reduce_min_f64", F.SEGMENTED_REDUCE, f64, None, "min"
+        ),
+        "segmented_reduce_max_f64": S(
+            "segmented_reduce_max_f64", F.SEGMENTED_REDUCE, f64, None, "max"
+        ),
         "lower_bound_i32": S("lower_bound_i32", F.LOWER_BOUND, i32, None, "none"),
         "lower_bound_i64": S("lower_bound_i64", F.LOWER_BOUND, i64, None, "none"),
         "lower_bound_f64": S("lower_bound_f64", F.LOWER_BOUND, f64, None, "none"),
@@ -79,6 +88,10 @@ def build_spec_registry() -> dict[str, CCCLWarmupSpec]:
         "merge_sort_u64_i32": S("merge_sort_u64_i32", F.MERGE_SORT, u64, i32, "less_than"),
         "unique_by_key_i32_i32": S("unique_by_key_i32_i32", F.UNIQUE_BY_KEY, i32, i32, "equal_to"),
         "unique_by_key_u64_i32": S("unique_by_key_u64_i32", F.UNIQUE_BY_KEY, u64, i32, "equal_to"),
-        "segmented_sort_asc_f64": S("segmented_sort_asc_f64", F.SEGMENTED_SORT, f64, i32, "less_than"),
-        "segmented_sort_asc_i32": S("segmented_sort_asc_i32", F.SEGMENTED_SORT, i32, i32, "less_than"),
+        "segmented_sort_asc_f64": S(
+            "segmented_sort_asc_f64", F.SEGMENTED_SORT, f64, i32, "less_than"
+        ),
+        "segmented_sort_asc_i32": S(
+            "segmented_sort_asc_i32", F.SEGMENTED_SORT, i32, i32, "less_than"
+        ),
     }

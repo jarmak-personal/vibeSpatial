@@ -101,7 +101,7 @@ def cuda_device_count() -> int:
         return 0
     try:
         _check_driver(cu.cuInit(0))
-        count, = _check_driver(cu.cuDeviceGetCount())
+        (count,) = _check_driver(cu.cuDeviceGetCount())
     except Exception:
         return 0
     return int(count)
@@ -461,6 +461,7 @@ def _make_oom_callback(max_retries: int = 3):
                 return False  # give up, let OOM propagate
             retry_state["count"] += 1
         import gc
+
         gc.collect()
         # Also free pinned memory — pinned allocations can hold
         # significant host+device resources.
@@ -502,16 +503,12 @@ def _normalize_stream_handle(stream: Any | None) -> Any | None:
     if callable(protocol):
         version, handle = protocol()
         if int(version) != 0:
-            raise ValueError(
-                f"unsupported CUDA stream protocol version {version!r}; expected 0"
-            )
+            raise ValueError(f"unsupported CUDA stream protocol version {version!r}; expected 0")
         return cu.CUstream(int(handle))
     pointer = getattr(stream, "ptr", None)
     if pointer is not None:
         return cu.CUstream(int(pointer))
-    raise TypeError(
-        "stream must be None, a CudaStream, or expose __cuda_stream__()/ptr"
-    )
+    raise TypeError("stream must be None, a CudaStream, or expose __cuda_stream__()/ptr")
 
 
 @dataclass(frozen=True, slots=True)
@@ -534,22 +531,10 @@ class CudaDriverRuntime:
         self._memory_pool: Any | None = None
         self._memory_backend: str = "none"
         self._rmm_mr = None
-        self._rmm_configured: bool = False
-        self._configure_memory_pool()
-
-    def _configure_memory_pool(self) -> None:
-        """Configure GPU memory pool. RMM setup is deferred until CUDA context exists."""
-        if cp is None:
-            return
-        if rmm is not None:
-            # Defer RMM setup — needs CUDA context (established in _ensure_context)
-            self._rmm_configured = False
-            return
-        # No RMM: use CuPy pool immediately (no CUDA context needed)
-        self._configure_cupy_pool()
+        self._memory_pool_configured: bool = False
 
     def _configure_cupy_pool(self) -> None:
-        """Fallback: CuPy MemoryPool (current behavior)."""
+        """Install the CuPy fallback pool after a CUDA context is active."""
         pool = cp.cuda.MemoryPool()
         pool_limit = os.environ.get("VIBESPATIAL_GPU_POOL_LIMIT")
         if pool_limit:
@@ -610,6 +595,25 @@ class CudaDriverRuntime:
         self._memory_pool = None  # CuPy pool is not used
         self._rmm_mr = mr  # prevent GC of resource chain
 
+    def _configure_memory_pool_for_active_context(self) -> None:
+        """Install one allocator exactly once after context creation."""
+        if self._memory_pool_configured:
+            return
+        if cp is None:  # pragma: no cover - guarded by _ensure_context
+            raise RuntimeError("CuPy is required for GPU memory pool configuration")
+        if rmm is None:
+            self._configure_cupy_pool()
+        else:
+            try:
+                self._configure_rmm_pool()
+            except Exception:
+                logger.warning(
+                    "RMM pool setup failed; falling back to CuPy memory pool",
+                    exc_info=True,
+                )
+                self._configure_cupy_pool()
+        self._memory_pool_configured = True
+
     def memory_pool_stats(self) -> dict[str, int]:
         """Return current memory pool statistics.
 
@@ -638,6 +642,7 @@ class CudaDriverRuntime:
         stats: dict[str, int] = {}
         try:
             from rmm import statistics as rmm_stats
+
             s = rmm_stats.get_statistics()
             if s is not None:
                 stats["used_bytes"] = int(s.current_bytes)
@@ -668,6 +673,7 @@ class CudaDriverRuntime:
             # must run first so that unreferenced CuPy arrays actually
             # return their allocations to the pool.
             import gc
+
             gc.collect()
         # Clear pinned memory pool (separate from device pool)
         _free_cupy_pinned_memory_pool()
@@ -681,36 +687,39 @@ class CudaDriverRuntime:
             raise RuntimeError("GPU execution was requested, but no CUDA device is available")
         with self._lock:
             if self._context is not None:
+                self._configure_memory_pool_for_active_context()
                 return self._context
             _check_driver(cu.cuInit(0))
-            device, = _check_driver(cu.cuDeviceGet(0))
-            context, = _check_driver(cu.cuDevicePrimaryCtxRetain(device))
-            major, = _check_driver(
+            (device,) = _check_driver(cu.cuDeviceGet(0))
+            (context,) = _check_driver(cu.cuDevicePrimaryCtxRetain(device))
+            (major,) = _check_driver(
                 cu.cuDeviceGetAttribute(
                     cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
                     device,
                 )
             )
-            minor, = _check_driver(
+            (minor,) = _check_driver(
                 cu.cuDeviceGetAttribute(
                     cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
                     device,
                 )
             )
             try:
-                fp64_ratio_raw, = _check_driver(
+                (fp64_ratio_raw,) = _check_driver(
                     cu.cuDeviceGetAttribute(
                         cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO,
                         device,
                     )
                 )
-                fp64_ratio = 1.0 / float(int(fp64_ratio_raw)) if int(fp64_ratio_raw) > 0 else 1.0 / 32.0
+                fp64_ratio = (
+                    1.0 / float(int(fp64_ratio_raw)) if int(fp64_ratio_raw) > 0 else 1.0 / 32.0
+                )
             except Exception:
                 fp64_ratio = 1.0 / 32.0  # conservative consumer default
             # Query driver CUDA version for NVRTC compatibility diagnostics
             driver_version = 0
             try:
-                dv, = _check_driver(cu.cuDriverGetVersion())
+                (dv,) = _check_driver(cu.cuDriverGetVersion())
                 driver_version = int(dv)
             except Exception:
                 pass
@@ -742,17 +751,7 @@ class CudaDriverRuntime:
                         self._driver_cuda_version[1],
                     )
 
-            # Deferred RMM setup — requires active CUDA context
-            if rmm is not None and not self._rmm_configured:
-                try:
-                    self._configure_rmm_pool()
-                except Exception:
-                    logger.warning(
-                        "RMM pool setup failed; falling back to CuPy memory pool",
-                        exc_info=True,
-                    )
-                    self._configure_cupy_pool()
-                self._rmm_configured = True
+            self._configure_memory_pool_for_active_context()
 
             return self._context
 
@@ -784,7 +783,9 @@ class CudaDriverRuntime:
         finally:
             _check_driver(cu.cuCtxPopCurrent())
 
-    def allocate(self, shape: tuple[int, ...], dtype: np.dtype[Any], *, zero: bool = False) -> DeviceArray:
+    def allocate(
+        self, shape: tuple[int, ...], dtype: np.dtype[Any], *, zero: bool = False
+    ) -> DeviceArray:
         _require_gpu_arrays()
         normalized_shape = tuple(int(dim) for dim in shape)
         normalized_dtype = np.dtype(dtype)
@@ -866,7 +867,7 @@ class CudaDriverRuntime:
         to enable overlap of kernel execution and data transfers.
         """
         with self.activate():
-            stream, = _check_driver(cu.cuStreamCreate(0))
+            (stream,) = _check_driver(cu.cuStreamCreate(0))
         return CudaStream(handle=stream)
 
     def destroy_stream(self, stream: CudaStream) -> None:
@@ -923,9 +924,14 @@ class CudaDriverRuntime:
             if host_array is None:
                 host_array = np.empty(device_array.shape, dtype=device_array.dtype)
             nbytes = host_array.nbytes
-            _check_driver(cu.cuMemcpyDtoHAsync(
-                host_array.ctypes.data, int(device_array.data.ptr), nbytes, stream_handle,
-            ))
+            _check_driver(
+                cu.cuMemcpyDtoHAsync(
+                    host_array.ctypes.data,
+                    int(device_array.data.ptr),
+                    nbytes,
+                    stream_handle,
+                )
+            )
         _notify_runtime_d2h_transfer(
             device_array,
             host_array=host_array,
@@ -952,12 +958,14 @@ class CudaDriverRuntime:
             )
         stream_handle = _normalize_stream_handle(stream)
         with self.activate():
-            _check_driver(cu.cuMemcpyDtoDAsync(
-                int(destination_array.data.ptr),
-                int(source_array.data.ptr),
-                source_nbytes,
-                stream_handle,
-            ))
+            _check_driver(
+                cu.cuMemcpyDtoDAsync(
+                    int(destination_array.data.ptr),
+                    int(source_array.data.ptr),
+                    source_nbytes,
+                    stream_handle,
+                )
+            )
 
     def copy_host_to_device_async(
         self,
@@ -978,9 +986,14 @@ class CudaDriverRuntime:
         stream_handle = _normalize_stream_handle(stream)
         with self.activate():
             nbytes = host.nbytes
-            _check_driver(cu.cuMemcpyHtoDAsync(
-                int(device_array.data.ptr), host.ctypes.data, nbytes, stream_handle,
-            ))
+            _check_driver(
+                cu.cuMemcpyHtoDAsync(
+                    int(device_array.data.ptr),
+                    host.ctypes.data,
+                    nbytes,
+                    stream_handle,
+                )
+            )
 
     def allocate_pinned(self, shape: tuple[int, ...], dtype: np.dtype[Any]) -> np.ndarray:
         """Allocate page-locked (pinned) host memory for async transfers.
@@ -1039,9 +1052,7 @@ class CudaDriverRuntime:
         try:
             with self.activate():
                 _min_grid, block_size = _check_driver(
-                    cu.cuOccupancyMaxPotentialBlockSize(
-                        kernel.function, 0, shared_mem_bytes, 0
-                    )
+                    cu.cuOccupancyMaxPotentialBlockSize(kernel.function, 0, shared_mem_bytes, 0)
                 )
             result = int(block_size)
         except (AttributeError, RuntimeError):
@@ -1072,7 +1083,9 @@ class CudaDriverRuntime:
         if cache_key in self._module_cache:
             return self._module_cache[cache_key]
         if nvrtc is None:
-            raise RuntimeError("NVRTC is not installed; cuda-python kernel compilation is unavailable")
+            raise RuntimeError(
+                "NVRTC is not installed; cuda-python kernel compilation is unavailable"
+            )
 
         # Double-checked locking: acquire lock only on cache miss.
         with self._module_cache_lock:
@@ -1095,17 +1108,19 @@ class CudaDriverRuntime:
                 if cubin is None:
                     # NVRTC compilation (expensive path: 20-400ms)
                     program_name = f"{cache_key}.cu".encode()
-                    program, = _check_nvrtc(
+                    (program,) = _check_nvrtc(
                         nvrtc.nvrtcCreateProgram(source.encode(), program_name, 0, [], [])
                     )
                     encoded_options = [option.encode() for option in compile_options]
-                    result = nvrtc.nvrtcCompileProgram(program, len(encoded_options), encoded_options)
+                    result = nvrtc.nvrtcCompileProgram(
+                        program, len(encoded_options), encoded_options
+                    )
                     if result[0] != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-                        log_size, = _check_nvrtc(nvrtc.nvrtcGetProgramLogSize(program))
+                        (log_size,) = _check_nvrtc(nvrtc.nvrtcGetProgramLogSize(program))
                         log = bytearray(log_size)
                         _check_nvrtc(nvrtc.nvrtcGetProgramLog(program, log))
                         raise RuntimeError(bytes(log).decode(errors="replace"))
-                    cubin_size, = _check_nvrtc(nvrtc.nvrtcGetCUBINSize(program))
+                    (cubin_size,) = _check_nvrtc(nvrtc.nvrtcGetCUBINSize(program))
                     cubin = bytearray(cubin_size)
                     _check_nvrtc(nvrtc.nvrtcGetCUBIN(program, cubin))
                     cubin = bytes(cubin)
@@ -1116,14 +1131,16 @@ class CudaDriverRuntime:
 
                 # Load CUBIN into driver module
                 try:
-                    module, = _check_driver(cu.cuModuleLoadData(cubin))
+                    (module,) = _check_driver(cu.cuModuleLoadData(cubin))
                 except RuntimeError:
                     if disk_cache_hit:
                         # Corrupt cache file — delete and recompile
                         _delete_cached_cubin(disk_key)
                         return self._compile_kernels_no_disk_cache(
-                            cache_key=cache_key, source=source,
-                            kernel_names=kernel_names, options=options,
+                            cache_key=cache_key,
+                            source=source,
+                            kernel_names=kernel_names,
+                            options=options,
                         )
                     raise
 
@@ -1150,21 +1167,21 @@ class CudaDriverRuntime:
         arch = f"--gpu-architecture=sm_{cc[0]}{cc[1]}"
         compile_options = tuple(options) + (arch,)
         program_name = f"{cache_key}.cu".encode()
-        program, = _check_nvrtc(
+        (program,) = _check_nvrtc(
             nvrtc.nvrtcCreateProgram(source.encode(), program_name, 0, [], [])
         )
         encoded_options = [option.encode() for option in compile_options]
         result = nvrtc.nvrtcCompileProgram(program, len(encoded_options), encoded_options)
         if result[0] != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-            log_size, = _check_nvrtc(nvrtc.nvrtcGetProgramLogSize(program))
+            (log_size,) = _check_nvrtc(nvrtc.nvrtcGetProgramLogSize(program))
             log = bytearray(log_size)
             _check_nvrtc(nvrtc.nvrtcGetProgramLog(program, log))
             raise RuntimeError(bytes(log).decode(errors="replace"))
-        cubin_size, = _check_nvrtc(nvrtc.nvrtcGetCUBINSize(program))
+        (cubin_size,) = _check_nvrtc(nvrtc.nvrtcGetCUBINSize(program))
         cubin = bytearray(cubin_size)
         _check_nvrtc(nvrtc.nvrtcGetCUBIN(program, cubin))
         cubin = bytes(cubin)
-        module, = _check_driver(cu.cuModuleLoadData(cubin))
+        (module,) = _check_driver(cu.cuModuleLoadData(cubin))
         kernels = {
             name: CompiledKernel(
                 name=name,
@@ -1174,6 +1191,7 @@ class CudaDriverRuntime:
         }
         self._module_cache[cache_key] = kernels
         return kernels
+
 
 _CUDA_RUNTIME = CudaDriverRuntime()
 
@@ -1224,14 +1242,14 @@ def count_scatter_totals(
         return []
 
     dtypes = [
-        np.dtype(device_counts.dtype)
-        for device_counts, _device_offsets in count_offset_pairs
+        np.dtype(device_counts.dtype) for device_counts, _device_offsets in count_offset_pairs
     ]
     offset_dtypes = [
-        np.dtype(device_offsets.dtype)
-        for _device_counts, device_offsets in count_offset_pairs
+        np.dtype(device_offsets.dtype) for _device_counts, device_offsets in count_offset_pairs
     ]
-    if any(offset_dtype != dtype for dtype, offset_dtype in zip(dtypes, offset_dtypes, strict=True)):
+    if any(
+        offset_dtype != dtype for dtype, offset_dtype in zip(dtypes, offset_dtypes, strict=True)
+    ):
         raise TypeError("count_scatter_totals requires counts and offsets with matching dtypes")
     if any(dtype != dtypes[0] for dtype in dtypes):
         return [
@@ -1251,12 +1269,13 @@ def count_scatter_totals(
         h_buf = runtime.allocate_pinned((2 * n_pairs,), dtype)
         for pair_index, (device_counts, device_offsets) in enumerate(count_offset_pairs):
             base = 2 * pair_index
-            runtime.copy_device_to_device_async(device_counts[-1:], d_buf[base:base + 1], xfer)
-            runtime.copy_device_to_device_async(device_offsets[-1:], d_buf[base + 1:base + 2], xfer)
+            runtime.copy_device_to_device_async(device_counts[-1:], d_buf[base : base + 1], xfer)
+            runtime.copy_device_to_device_async(
+                device_offsets[-1:], d_buf[base + 1 : base + 2], xfer
+            )
         runtime.copy_device_to_host_async(d_buf, xfer, h_buf, reason=reason)
     return [
-        int(h_buf[2 * pair_index]) + int(h_buf[2 * pair_index + 1])
-        for pair_index in range(n_pairs)
+        int(h_buf[2 * pair_index]) + int(h_buf[2 * pair_index + 1]) for pair_index in range(n_pairs)
     ]
 
 

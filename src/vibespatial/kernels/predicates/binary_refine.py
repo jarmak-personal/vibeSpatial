@@ -21,7 +21,14 @@ def _variant(
         name,
         "cpu",
         kernel_class=KernelClass.PREDICATE,
-        geometry_families=("point", "linestring", "polygon", "multipoint", "multilinestring", "multipolygon"),
+        geometry_families=(
+            "point",
+            "linestring",
+            "polygon",
+            "multipoint",
+            "multilinestring",
+            "multipolygon",
+        ),
         execution_modes=(ExecutionMode.CPU,),
         supports_mixed=True,
         tags=("exact-refine", "binary-predicate"),
@@ -35,7 +42,14 @@ def _gpu_variant(
         name,
         "gpu-cuda-python",
         kernel_class=KernelClass.PREDICATE,
-        geometry_families=("point", "linestring", "polygon", "multipoint", "multilinestring", "multipolygon"),
+        geometry_families=(
+            "point",
+            "linestring",
+            "polygon",
+            "multipoint",
+            "multilinestring",
+            "multipolygon",
+        ),
         execution_modes=(ExecutionMode.GPU,),
         preferred_residency=Residency.DEVICE,
         supports_mixed=True,
@@ -54,7 +68,9 @@ def intersects_exact(
 ) -> BinaryPredicateResult:
     from vibespatial.predicates.binary import evaluate_binary_predicate  # lazy
 
-    return evaluate_binary_predicate("intersects", left, right, dispatch_mode=dispatch_mode, precision=precision)
+    return evaluate_binary_predicate(
+        "intersects", left, right, dispatch_mode=dispatch_mode, precision=precision
+    )
 
 
 @_variant("within")
@@ -68,7 +84,9 @@ def within_exact(
 ) -> BinaryPredicateResult:
     from vibespatial.predicates.binary import evaluate_binary_predicate  # lazy
 
-    return evaluate_binary_predicate("within", left, right, dispatch_mode=dispatch_mode, precision=precision)
+    return evaluate_binary_predicate(
+        "within", left, right, dispatch_mode=dispatch_mode, precision=precision
+    )
 
 
 @_variant("contains")
@@ -82,7 +100,9 @@ def contains_exact(
 ) -> BinaryPredicateResult:
     from vibespatial.predicates.binary import evaluate_binary_predicate  # lazy
 
-    return evaluate_binary_predicate("contains", left, right, dispatch_mode=dispatch_mode, precision=precision)
+    return evaluate_binary_predicate(
+        "contains", left, right, dispatch_mode=dispatch_mode, precision=precision
+    )
 
 
 @_variant("covers")
@@ -96,7 +116,9 @@ def covers_exact(
 ) -> BinaryPredicateResult:
     from vibespatial.predicates.binary import evaluate_binary_predicate  # lazy
 
-    return evaluate_binary_predicate("covers", left, right, dispatch_mode=dispatch_mode, precision=precision)
+    return evaluate_binary_predicate(
+        "covers", left, right, dispatch_mode=dispatch_mode, precision=precision
+    )
 
 
 @_variant("covered_by")
@@ -110,7 +132,9 @@ def covered_by_exact(
 ) -> BinaryPredicateResult:
     from vibespatial.predicates.binary import evaluate_binary_predicate  # lazy
 
-    return evaluate_binary_predicate("covered_by", left, right, dispatch_mode=dispatch_mode, precision=precision)
+    return evaluate_binary_predicate(
+        "covered_by", left, right, dispatch_mode=dispatch_mode, precision=precision
+    )
 
 
 @_variant("touches")
@@ -124,7 +148,9 @@ def touches_exact(
 ) -> BinaryPredicateResult:
     from vibespatial.predicates.binary import evaluate_binary_predicate  # lazy
 
-    return evaluate_binary_predicate("touches", left, right, dispatch_mode=dispatch_mode, precision=precision)
+    return evaluate_binary_predicate(
+        "touches", left, right, dispatch_mode=dispatch_mode, precision=precision
+    )
 
 
 @_variant("crosses")
@@ -138,7 +164,9 @@ def crosses_exact(
 ) -> BinaryPredicateResult:
     from vibespatial.predicates.binary import evaluate_binary_predicate  # lazy
 
-    return evaluate_binary_predicate("crosses", left, right, dispatch_mode=dispatch_mode, precision=precision)
+    return evaluate_binary_predicate(
+        "crosses", left, right, dispatch_mode=dispatch_mode, precision=precision
+    )
 
 
 @_variant("contains_properly")
@@ -172,7 +200,9 @@ def overlaps_exact(
 ) -> BinaryPredicateResult:
     from vibespatial.predicates.binary import evaluate_binary_predicate  # lazy
 
-    return evaluate_binary_predicate("overlaps", left, right, dispatch_mode=dispatch_mode, precision=precision)
+    return evaluate_binary_predicate(
+        "overlaps", left, right, dispatch_mode=dispatch_mode, precision=precision
+    )
 
 
 @_variant("disjoint")
@@ -186,7 +216,9 @@ def disjoint_exact(
 ) -> BinaryPredicateResult:
     from vibespatial.predicates.binary import evaluate_binary_predicate  # lazy
 
-    return evaluate_binary_predicate("disjoint", left, right, dispatch_mode=dispatch_mode, precision=precision)
+    return evaluate_binary_predicate(
+        "disjoint", left, right, dispatch_mode=dispatch_mode, precision=precision
+    )
 
 
 @_variant("equals")
@@ -200,4 +232,6 @@ def equals_exact(
 ) -> BinaryPredicateResult:
     from vibespatial.predicates.binary import evaluate_binary_predicate  # lazy
 
-    return evaluate_binary_predicate("equals", left, right, dispatch_mode=dispatch_mode, precision=precision)
+    return evaluate_binary_predicate(
+        "equals", left, right, dispatch_mode=dispatch_mode, precision=precision
+    )

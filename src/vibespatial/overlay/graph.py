@@ -10,16 +10,19 @@ Public API
 - ``_empty_half_edge_graph`` — creates an empty graph structure
 - ``_quantize_coordinate`` — coordinate quantization helper
 """
+
 from __future__ import annotations
 
 import numpy as np
 
 from vibespatial.cuda._runtime import (
+    KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
     get_cuda_runtime,
 )
 from vibespatial.cuda.cccl_primitives import (
+    PairSortStrategy,
     exclusive_sum,
     sort_pairs,
 )
@@ -37,6 +40,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
     cp = None
 
 _OVERLAY_COORDINATE_SCALE = 1_000_000_000.0
+_FP64_SIGN_BIT = np.uint64(0x8000000000000000)
 
 
 def _require_gpu_arrays() -> None:
@@ -46,6 +50,64 @@ def _require_gpu_arrays() -> None:
 
 def _quantize_coordinate(values):
     return cp.rint(values * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
+
+
+def _fp64_radix_keys(values):
+    """Map fp64 values to unsigned keys with the same ascending order."""
+    bits = cp.asarray(values, dtype=cp.float64).view(cp.uint64)
+    negative_fill = cp.uint64(0) - (bits >> cp.uint64(63))
+    return bits ^ (negative_fill | _FP64_SIGN_BIT)
+
+
+def _stable_radix_lexicographic_order(*least_to_most_keys):
+    """Stable least-to-most radix passes without an N-by-K key stack."""
+    if not least_to_most_keys:
+        return cp.empty(0, dtype=cp.int32)
+    item_count = int(least_to_most_keys[0].size)
+    order = cp.arange(item_count, dtype=cp.int32)
+    for key in least_to_most_keys:
+        pass_keys = cp.asarray(key)[order]
+        sorted_pass = sort_pairs(
+            pass_keys,
+            order,
+            strategy=PairSortStrategy.RADIX,
+            synchronize=False,
+        )
+        next_order = sorted_pass.values
+        del pass_keys, sorted_pass, order
+        order = next_order
+    return order
+
+
+def _stable_radix_order_pass(order, key):
+    """Apply one stable radix pass to an existing device permutation."""
+    normalized_key = cp.asarray(key)
+    key_dtype = np.dtype(normalized_key.dtype)
+    if key_dtype not in {
+        np.dtype(np.int32),
+        np.dtype(np.int64),
+        np.dtype(np.uint64),
+        np.dtype(np.float64),
+    }:
+        if key_dtype.kind == "u":
+            normalized_key = normalized_key.astype(cp.uint64, copy=False)
+        elif key_dtype.kind in {"b", "i"}:
+            target_dtype = cp.int32 if key_dtype.itemsize <= 4 else cp.int64
+            normalized_key = normalized_key.astype(target_dtype, copy=False)
+        elif key_dtype.kind == "f":
+            normalized_key = normalized_key.astype(cp.float64, copy=False)
+        else:
+            raise TypeError(f"unsupported device radix key dtype: {key_dtype}")
+    pass_keys = normalized_key[order]
+    sorted_pass = sort_pairs(
+        pass_keys,
+        order,
+        strategy=PairSortStrategy.RADIX,
+        synchronize=False,
+    )
+    next_order = sorted_pass.values
+    del pass_keys, sorted_pass
+    return next_order
 
 
 def _sync_hotpath(runtime) -> None:
@@ -105,6 +167,7 @@ def _empty_half_edge_graph(
             src_y=empty_device_f64,
             source_segment_ids=empty_device_i32,
             source_side=empty_device_i8,
+            source_membership=runtime.allocate((0,), np.uint8),
             row_indices=empty_device_i32,
             part_indices=empty_device_i32,
             ring_indices=empty_device_i32,
@@ -119,90 +182,118 @@ def build_gpu_half_edge_graph(
     isolate_rows: bool = False,
 ) -> HalfEdgeGraph:
     _require_gpu_arrays()
-    _ = get_cuda_runtime()
+    runtime = get_cuda_runtime()
     if atomic_edges.count == 0:
         return _empty_half_edge_graph(atomic_edges)
 
     device = atomic_edges.device_state
     edge_count = int(atomic_edges.count)
-    all_x = cp.concatenate((device.src_x, device.dst_x))
-    all_y = cp.concatenate((device.src_y, device.dst_y))
-    all_rows = None
+    source_x = cp.asarray(device.src_x)
+    source_y = cp.asarray(device.src_y)
+    source_rows = None
     if isolate_rows and device.row_indices is not None:
-        d_rows = cp.asarray(device.row_indices)
-        all_rows = cp.concatenate((d_rows, d_rows))
+        source_rows = cp.asarray(device.row_indices)
 
-    # Shared split events already emit the exact same fp64 coordinate payload
-    # for both sides of a proper intersection. Keep node grouping on those
-    # exact coordinates instead of collapsing nearby-but-distinct vertices via
-    # quantization, which can fuse separate nodes in dense polygon/circle
-    # overlays and corrupt the successor graph.
-    if all_rows is not None:
-        point_order = cp.lexsort(cp.stack((all_y, all_x, all_rows)))
-    else:
-        point_order = cp.lexsort(cp.stack((all_y, all_x)))
-    sorted_x = all_x[point_order]
-    sorted_y = all_y[point_order]
-    sorted_rows = all_rows[point_order] if all_rows is not None else None
-    point_start_mask = cp.empty((int(all_x.size),), dtype=cp.bool_)
-    point_start_mask[0] = True
-    if int(all_x.size) > 1:
-        point_start_mask[1:] = (sorted_x[1:] != sorted_x[:-1]) | (sorted_y[1:] != sorted_y[:-1])
-        if sorted_rows is not None:
-            point_start_mask[1:] |= sorted_rows[1:] != sorted_rows[:-1]
-    del sorted_x, sorted_y, sorted_rows, all_rows
-    point_node_ids_sorted = cp.cumsum(point_start_mask.astype(cp.int32), dtype=cp.int32) - 1
-    point_node_ids = cp.empty((int(all_x.size),), dtype=cp.int32)
-    point_node_ids[point_order] = point_node_ids_sorted
-    del point_node_ids_sorted  # Phase 25 memory
+    # Atomic edges are emitted as adjacent forward/reverse twins and the
+    # successor construction below already relies on edge_id ^ 1. Every target
+    # endpoint is therefore represented by its twin's source endpoint. Build
+    # the node relation from source endpoints once instead of concatenating and
+    # sorting a duplicated 2*edge_count point relation.
+    point_order = cp.arange(edge_count, dtype=cp.int32)
+    source_y_keys = _fp64_radix_keys(source_y)
+    point_order = _stable_radix_order_pass(point_order, source_y_keys)
+    del source_y_keys
+    source_x_keys = _fp64_radix_keys(source_x)
+    point_order = _stable_radix_order_pass(point_order, source_x_keys)
+    del source_x_keys
+    if source_rows is not None:
+        point_order = _stable_radix_order_pass(point_order, source_rows)
 
-    src_node_ids = point_node_ids[:edge_count]
-    dst_node_ids = point_node_ids[edge_count:]
-    node_x = all_x[point_order][point_start_mask]
-    node_y = all_y[point_order][point_start_mask]
-    del all_x, all_y, point_order, point_start_mask  # Phase 25 memory
+    # Mark the end of each exact endpoint group in sorted position space. An
+    # exclusive sum of those markers is the node id for the current position:
+    # [0, 1, 0] -> [0, 0, 1]. This avoids materializing sorted x/y/row columns.
+    from vibespatial.overlay.gpu import _overlay_face_walk_kernels
+
+    kernels = _overlay_face_walk_kernels()
+    ptr = runtime.pointer
+    point_group_ends = cp.empty((edge_count,), dtype=cp.int32)
+    endpoint_grid, endpoint_block = runtime.launch_config(
+        kernels["mark_endpoint_group_ends"],
+        edge_count,
+    )
+    runtime.launch(
+        kernels["mark_endpoint_group_ends"],
+        grid=endpoint_grid,
+        block=endpoint_block,
+        params=(
+            (
+                ptr(source_x),
+                ptr(source_y),
+                ptr(source_rows if source_rows is not None else point_order),
+                ptr(point_order),
+                ptr(point_group_ends),
+                np.int32(source_rows is not None),
+                edge_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+    point_node_ids_sorted = exclusive_sum(point_group_ends)
+    del point_group_ends, source_rows
+    src_node_ids = cp.empty((edge_count,), dtype=cp.int32)
+    src_node_ids[point_order] = point_node_ids_sorted
+    del point_node_ids_sorted, point_order, source_x, source_y
 
     angle = cp.arctan2(device.dst_y - device.src_y, device.dst_x - device.src_x)
-    edge_ids = cp.arange(edge_count, dtype=cp.int32)
     # Use the full fp64 angle for radial ordering at each node. Quantizing
     # the turn angle can collapse near-collinear but distinct rays onto the
     # same key, which breaks the half-edge successor relation on dense
     # polygon/circle intersections even when the split-event payload is exact.
-    sorted_edge_ids = cp.lexsort(cp.stack((edge_ids, angle, src_node_ids)))
-    sorted_src_nodes = src_node_ids[sorted_edge_ids]
+    angle_keys = _fp64_radix_keys(angle)
+    del angle
+    sorted_edge_ids = cp.arange(edge_count, dtype=cp.int32)
+    sorted_edge_ids = _stable_radix_order_pass(sorted_edge_ids, angle_keys)
+    del angle_keys
+    sorted_edge_ids = _stable_radix_order_pass(sorted_edge_ids, src_node_ids)
 
-    span_start_mask = cp.empty((edge_count,), dtype=cp.bool_)
-    span_start_mask[0] = True
-    if edge_count > 1:
-        span_start_mask[1:] = sorted_src_nodes[1:] != sorted_src_nodes[:-1]
-    del sorted_src_nodes  # Phase 25 memory
-    span_group_ids = cp.cumsum(span_start_mask.astype(cp.int32), dtype=cp.int32) - 1
-    span_starts = cp.flatnonzero(span_start_mask).astype(cp.int32, copy=False)
-    span_ends = cp.concatenate((span_starts[1:], cp.asarray([edge_count], dtype=cp.int32)))
-    del span_start_mask  # Phase 25 memory
-    edge_positions = cp.empty((edge_count,), dtype=cp.int32)
-    edge_positions[sorted_edge_ids] = cp.arange(edge_count, dtype=cp.int32)
-
-    twin_edge_ids = edge_ids ^ 1
-    del edge_ids  # Phase 25 memory
-    twin_positions = edge_positions[twin_edge_ids]
-    del twin_edge_ids  # Phase 25 memory
-    twin_group_ids = span_group_ids[twin_positions]
-    del span_group_ids  # Phase 25 memory
-    twin_group_starts = span_starts[twin_group_ids]
-    twin_group_ends = span_ends[twin_group_ids]
-    del twin_group_ids, span_starts, span_ends  # Phase 25 memory
-    previous_positions = twin_positions - 1
-    del twin_positions  # Phase 25 memory
-    previous_positions = cp.where(
-        previous_positions < twin_group_starts,
-        twin_group_ends - 1,
-        previous_positions,
+    # For each outgoing edge in radial order, write its clockwise predecessor
+    # as the successor of its incoming twin. Group starts locate the wraparound
+    # predecessor with an upper-bound search; all other positions are O(1).
+    # This replaces edge-position, group-id, span-start/end, and twin-position
+    # arrays with one exact edge-parallel pass.
+    next_edge_ids = cp.empty((edge_count,), dtype=cp.int32)
+    successor_grid, successor_block = runtime.launch_config(
+        kernels["build_radial_successors"],
+        edge_count,
     )
-    del twin_group_starts, twin_group_ends  # Phase 25 memory
-    next_edge_ids = sorted_edge_ids[previous_positions]
-    del previous_positions  # Phase 25 memory
-
+    runtime.launch(
+        kernels["build_radial_successors"],
+        grid=successor_grid,
+        block=successor_block,
+        params=(
+            (
+                ptr(src_node_ids),
+                ptr(sorted_edge_ids),
+                ptr(next_edge_ids),
+                edge_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+    del sorted_edge_ids
     # Carry per-edge metadata from AtomicEdgeTable device state directly
     # -- no D->H transfer.  GPU consumers read device_state.row_indices etc.
     ae_ds = atomic_edges.device_state
@@ -211,19 +302,24 @@ def build_gpu_half_edge_graph(
         right_segment_count=atomic_edges.right_segment_count,
         runtime_selection=atomic_edges.runtime_selection,
         _edge_count=edge_count,
+        # Exact node count is debug/host metadata and is reconstructed lazily
+        # only when the public diagnostic property is requested.
+        _node_count=0,
+        isolate_rows=isolate_rows,
         device_state=HalfEdgeGraphDeviceState(
-            node_x=node_x,
-            node_y=node_y,
+            node_x=None,
+            node_y=None,
             src_node_ids=src_node_ids,
-            dst_node_ids=dst_node_ids,
-            angle=angle,
-            sorted_edge_ids=sorted_edge_ids,
-            edge_positions=edge_positions,
+            dst_node_ids=None,
+            angle=None,
+            sorted_edge_ids=None,
+            edge_positions=None,
             next_edge_ids=next_edge_ids,
             src_x=device.src_x,
             src_y=device.src_y,
             source_segment_ids=ae_ds.source_segment_ids,
             source_side=ae_ds.source_side,
+            source_membership=ae_ds.source_membership,
             row_indices=ae_ds.row_indices,
             part_indices=ae_ds.part_indices,
             ring_indices=ae_ds.ring_indices,
@@ -232,9 +328,20 @@ def build_gpu_half_edge_graph(
     )
 
 
-def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
-    cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray,
-    cp.ndarray, cp.ndarray, cp.ndarray, int,
+def _gpu_face_walk(
+    half_edge_graph: HalfEdgeGraph,
+    *,
+    area_epsilon: float = 0.0,
+) -> tuple[
+    cp.ndarray,
+    cp.ndarray,
+    cp.ndarray,
+    cp.ndarray,
+    cp.ndarray,
+    cp.ndarray,
+    cp.ndarray,
+    cp.ndarray,
+    int,
 ]:
     """GPU face walk via pointer jumping + shoelace aggregation.
 
@@ -249,7 +356,6 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     edge_count = half_edge_graph.edge_count
     kernels = _overlay_face_walk_kernels()
     ptr = runtime.pointer
-
     # --- Step 1: Pointer jumping to find cycles (Tier 2 CuPy) ---
     with hotpath_stage("overlay.graph.face_id_pointer_jump", category="refine"):
         face_id = cp.arange(edge_count, dtype=cp.int32)
@@ -295,7 +401,17 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
         empty_i32 = cp.asarray([0], dtype=cp.int32)
         empty_f64 = cp.empty(0, dtype=cp.float64)
         empty_i8 = cp.empty(0, dtype=cp.int8)
-        return empty_i32, cp.empty(0, dtype=cp.int32), empty_i8, empty_f64, empty_f64, empty_f64, empty_f64, empty_f64, 0
+        return (
+            empty_i32,
+            cp.empty(0, dtype=cp.int32),
+            empty_i8,
+            empty_f64,
+            empty_f64,
+            empty_f64,
+            empty_f64,
+            empty_f64,
+            0,
+        )
 
     valid_starts = starts[valid_face_indices]
     valid_ends = ends[valid_face_indices]
@@ -353,33 +469,11 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
         )
         _sync_hotpath(runtime)
 
-    # Build compact face_offsets and face_edge_ids in cycle traversal order.
-    # Rank edges within each cycle by pointer-jumping on the predecessor map:
-    # this avoids the prior O(cycle_length) per-edge root walk.
-    with hotpath_stage("overlay.graph.cycle_rank_pointer_jump", category="sort"):
-        next_edge_ids_i32 = cp.asarray(device.next_edge_ids, dtype=cp.int32)
-        predecessor = cp.empty(edge_count, dtype=cp.int32)
-        predecessor[next_edge_ids_i32] = edge_ids
-        root_mask = face_id == edge_ids
-        predecessor[root_mask] = edge_ids[root_mask]
-        d_rank = cp.ones(edge_count, dtype=cp.int32)
-        d_rank[root_mask] = 0
-        max_rank_iterations = max(1, int(np.ceil(np.log2(max(1, edge_count)))))
-        for _ in range(max_rank_iterations):
-            grandparent = predecessor[predecessor]
-            active = predecessor != grandparent
-            d_rank = cp.where(active, d_rank + d_rank[predecessor], d_rank)
-            predecessor = cp.where(active, grandparent, predecessor)
-        del next_edge_ids_i32, predecessor, root_mask, grandparent, active
-        _sync_hotpath(runtime)
-
-    # Pack (face_id, rank) into a single sort key so sort_pairs gives us
-    # edges grouped by face and ordered within each cycle.
-    with hotpath_stage("overlay.graph.cycle_sort", category="sort"):
-        packed_key = face_id.astype(cp.int64) * int(edge_count) + d_rank.astype(cp.int64)
-        cycle_sort = sort_pairs(packed_key, edge_ids, synchronize=False)
-        _sync_hotpath(runtime)
-        cycle_sorted_edge_ids = cycle_sort.values
+    # Every downstream GPU consumer uses face spans as unordered membership and
+    # follows next_edge_ids whenever traversal order matters. Keep the first
+    # face-id sort as the canonical membership carrier; a second list-ranking
+    # array and global (face, rank) sort only duplicate the same topology.
+    del face_id, edge_ids
 
     # Build face_offsets from valid_lengths on device (CCCL exclusive_sum).
     # exclusive_sum produces face_count elements; append the total to form
@@ -391,9 +485,8 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
         face_offsets = cp.concatenate((_prefix, _total))
         _sync_hotpath(runtime)
 
-    # Extract cycle-ordered edges for valid faces only.  The cycle-sorted
-    # array has the same segment boundaries (valid_starts, valid_ends) as
-    # the face_id-sorted array since the packed key preserves face_id order.
+    # Extract grouped edges for valid faces only. Face-local order is not part
+    # of the device contract; traversal uses next_edge_ids.
     # Allocate by host-known edge capacity and let device CSR offsets delimit
     # the live prefix; this avoids a D2H scalar allocation fence.
     with hotpath_stage("overlay.graph.gather_face_edges", category="emit"):
@@ -403,7 +496,7 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
         slot_face = cp.searchsorted(
             face_offsets[1:],
             safe_slot_ids,
-            side='right',
+            side="right",
         ).astype(cp.int32)
         if face_count:
             slot_face = cp.minimum(slot_face, np.int32(face_count - 1))
@@ -411,12 +504,10 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
         slot_local = safe_slot_ids - face_offsets[slot_face]
         # source position in the cycle-sorted full array
         src_pos = valid_starts[slot_face] + slot_local
-        face_edge_ids = cycle_sorted_edge_ids[src_pos]
+        face_edge_ids = sorted_edge_ids[src_pos]
         # Phase 25 memory: face walk intermediates consumed.
         del slot_ids, live_slot, safe_slot_ids, slot_face, slot_local, src_pos
-        del cycle_sorted_edge_ids
         del sorted_edge_ids, valid_starts, valid_ends, valid_lengths
-        del packed_key, d_rank
         _sync_hotpath(runtime)
 
     # --- Step 4: Face sample points via kernel ---
@@ -424,18 +515,59 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     label_y = cp.empty(face_count, dtype=cp.float64)
     bounded_mask = cp.empty(face_count, dtype=cp.int8)
     sample_params = (
-        (ptr(device.src_x), ptr(device.src_y), ptr(device.next_edge_ids),
-         ptr(face_offsets), ptr(face_edge_ids), ptr(signed_area),
-         ptr(label_x), ptr(label_y), ptr(bounded_mask), face_count,
-         edge_count),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-         KERNEL_PARAM_I32),
+        (
+            ptr(device.src_x),
+            ptr(device.src_y),
+            ptr(device.next_edge_ids),
+            ptr(face_offsets),
+            ptr(face_edge_ids),
+            ptr(signed_area),
+            ptr(centroid_x),
+            ptr(centroid_y),
+            ptr(label_x),
+            ptr(label_y),
+            ptr(bounded_mask),
+            area_epsilon,
+            face_count,
+            edge_count,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_I32,
+        ),
     )
-    sample_grid, sample_block = runtime.launch_config(kernels["compute_face_sample_points"], face_count)
+    sample_grid, sample_block = runtime.launch_config(
+        kernels["compute_face_sample_points"], face_count
+    )
     with hotpath_stage("overlay.graph.sample_points", category="refine"):
-        runtime.launch(kernels["compute_face_sample_points"], grid=sample_grid, block=sample_block, params=sample_params)
+        runtime.launch(
+            kernels["compute_face_sample_points"],
+            grid=sample_grid,
+            block=sample_block,
+            params=sample_params,
+        )
         _sync_hotpath(runtime)
 
-    return face_offsets, face_edge_ids, bounded_mask, signed_area, centroid_x, centroid_y, label_x, label_y, face_count
+    return (
+        face_offsets,
+        face_edge_ids,
+        bounded_mask,
+        signed_area,
+        centroid_x,
+        centroid_y,
+        label_x,
+        label_y,
+        face_count,
+    )

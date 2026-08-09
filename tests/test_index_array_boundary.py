@@ -20,6 +20,7 @@ from vibespatial.api import GeoDataFrame, GeoSeries
 from vibespatial.api._native_results import (
     NativeAttributeTable,
     NativeTabularResult,
+    NativeTabularSelection,
     RelationIndexResult,
     RelationJoinExportResult,
     RelationJoinResult,
@@ -1119,7 +1120,8 @@ class TestSpatialNearestReturnsIndexArrays:
             sort=False,
         )
 
-        assert isinstance(native_result, NativeTabularResult)
+        assert isinstance(native_result, NativeTabularSelection)
+        assert isinstance(native_result.capacity_result, NativeTabularResult)
         assert export_calls == 0
 
         materialized = clip_module._clip_native_tabular_to_spatial(
@@ -1200,13 +1202,14 @@ class TestSpatialNearestReturnsIndexArrays:
 
         tabular = to_native_tabular_result(native_result)
 
-        assert isinstance(tabular, NativeTabularResult)
+        assert isinstance(tabular, NativeTabularSelection)
+        assert isinstance(tabular.capacity_result, NativeTabularResult)
         assert_geodataframe_equal(
             tabular.to_geodataframe(),
             geopandas.clip(frame, mask),
         )
 
-    def test_clip_native_tabular_records_fallback_before_shapely_cleanup(
+    def test_clip_native_tabular_declines_before_shapely_cleanup(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -1240,21 +1243,23 @@ class TestSpatialNearestReturnsIndexArrays:
         monkeypatch.setattr(
             native_results_module,
             "_clip_owned_geometry_native_result",
-            lambda *args, **kwargs: (None, None, None),
+            lambda *args, **kwargs: (None, None, None, None, None),
         )
 
         real_to_shapely = OwnedGeometryArray.to_shapely
 
         def _guard_to_shapely(self, *args, **kwargs):
             raise AssertionError(
-                "fallback should be recorded before clip tabular host cleanup"
+                "clip tabular native decline should happen before host cleanup"
             )
 
         monkeypatch.setattr(OwnedGeometryArray, "to_shapely", _guard_to_shapely)
 
+        geopandas.clear_fallback_events()
         with pytest.raises(StrictNativeFallbackError):
             with strict_native_environment():
                 to_native_tabular_result(native_result)
+        assert geopandas.get_fallback_events(clear=True) == []
 
         monkeypatch.setattr(OwnedGeometryArray, "to_shapely", real_to_shapely)
 
@@ -1286,9 +1291,9 @@ class TestSpatialNearestReturnsIndexArrays:
 
         tabular = to_native_tabular_result(native_result)
 
-        assert isinstance(tabular, NativeTabularResult)
-        assert isinstance(tabular.attributes, NativeAttributeTable)
-        assert tabular.attributes.arrow_table is not None
+        assert isinstance(tabular, NativeTabularSelection)
+        assert isinstance(tabular.capacity_result.attributes, NativeAttributeTable)
+        assert tabular.capacity_result.attributes.device_table is not None
         assert_geodataframe_equal(tabular.to_geodataframe(), expected)
 
     def test_polygon_clip_native_tabular_skips_spatial_materialization(
@@ -1337,9 +1342,9 @@ class TestSpatialNearestReturnsIndexArrays:
 
         tabular = to_native_tabular_result(native_result)
 
-        assert isinstance(tabular, NativeTabularResult)
-        assert isinstance(tabular.attributes, NativeAttributeTable)
-        assert tabular.attributes.arrow_table is not None
+        assert isinstance(tabular, NativeTabularSelection)
+        assert isinstance(tabular.capacity_result.attributes, NativeAttributeTable)
+        assert tabular.capacity_result.attributes.device_table is not None
         assert to_shapely_calls == 0
         monkeypatch.undo()
         assert_geodataframe_equal(tabular.to_geodataframe(), expected)

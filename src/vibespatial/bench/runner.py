@@ -1,4 +1,5 @@
 """Benchmark orchestration: warmup, repeat/median, pipeline wrapping."""
+
 from __future__ import annotations
 
 import os
@@ -54,6 +55,7 @@ def _resolve_pipeline_profile_mode(
 # ---------------------------------------------------------------------------
 # Operation runner
 # ---------------------------------------------------------------------------
+
 
 def run_operation(
     name: str,
@@ -111,9 +113,7 @@ def run_operation(
     result = _aggregate_operation_samples(samples)
     metadata = dict(result.metadata)
     metadata["repeat"] = len(samples)
-    metadata["sample_seconds"] = [
-        sample.timing.median_seconds for sample in samples
-    ]
+    metadata["sample_seconds"] = [sample.timing.median_seconds for sample in samples]
     if all(sample.baseline_timing is not None for sample in samples):
         metadata["baseline_sample_seconds"] = [
             sample.baseline_timing.median_seconds  # type: ignore[union-attr]
@@ -131,9 +131,7 @@ def _aggregate_operation_samples(samples: list[BenchmarkResult]) -> BenchmarkRes
     if len(samples) == 1:
         return result
 
-    timing = timing_from_samples(
-        [sample.timing.median_seconds for sample in samples]
-    )
+    timing = timing_from_samples([sample.timing.median_seconds for sample in samples])
     baseline_timing = result.baseline_timing
     if all(sample.baseline_timing is not None for sample in samples):
         baseline_timing = timing_from_samples(
@@ -168,6 +166,7 @@ def _select_median(samples: list[BenchmarkResult]) -> BenchmarkResult:
 # Pipeline runner
 # ---------------------------------------------------------------------------
 
+
 def run_pipeline(
     name: str,
     *,
@@ -184,6 +183,7 @@ def run_pipeline(
         PIPELINE_DEFINITIONS,
         benchmark_pipeline_suite,
     )
+
     effective_profile_mode = _resolve_pipeline_profile_mode(
         profile_mode,
         gpu_sparkline=gpu_sparkline,
@@ -221,9 +221,7 @@ def _convert_pipeline_result(pr: Any) -> BenchmarkResult:
 
     runtime_d2h_count = getattr(pr, "runtime_d2h_transfer_count", None)
     transfers = TransferSummary(
-        d2h_count=(
-            pr.transfer_count if runtime_d2h_count is None else runtime_d2h_count
-        ),
+        d2h_count=(pr.transfer_count if runtime_d2h_count is None else runtime_d2h_count),
         h2d_count=0,
         total_bytes=int(getattr(pr, "runtime_d2h_transfer_bytes", 0) or 0),
         total_seconds=float(getattr(pr, "runtime_d2h_transfer_seconds", 0.0) or 0.0),
@@ -319,6 +317,7 @@ def _extract_gpu_util(
 # Suite runner
 # ---------------------------------------------------------------------------
 
+
 def _fmt_scale(scale: int) -> str:
     if scale >= 1_000_000:
         return f"{scale // 1_000_000}M"
@@ -343,9 +342,12 @@ def _progress(result: BenchmarkResult, *, idx: int, total: int) -> None:
     """
     from vibespatial.cuda.cccl_precompile import get_real_stderr
 
-    status = {"pass": "\033[32mPASS\033[0m", "fail": "\033[31mFAIL\033[0m",
-              "error": "\033[31mERR\033[0m", "skip": "\033[90mSKIP\033[0m"}.get(
-        result.status, result.status)
+    status = {
+        "pass": "\033[32mPASS\033[0m",
+        "fail": "\033[31mFAIL\033[0m",
+        "error": "\033[31mERR\033[0m",
+        "skip": "\033[90mSKIP\033[0m",
+    }.get(result.status, result.status)
     speedup = f" {result.speedup:.1f}x" if result.speedup is not None else ""
     time_str = _fmt_time(result.timing.median_seconds) if result.timing.sample_count > 0 else "-"
     print(

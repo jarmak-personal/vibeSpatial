@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import pytest
 from shapely.geometry import LineString, Point, Polygon
 
 from vibespatial import benchmark_bounds_pairs, from_shapely_geometries, generate_bounds_pairs
-from vibespatial.runtime import has_gpu_runtime
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 
 
 def test_generate_bounds_pairs_finds_intersections_across_geometry_families() -> None:
@@ -49,6 +50,77 @@ def test_generate_bounds_pairs_same_input_uses_upper_triangle() -> None:
     pairs = generate_bounds_pairs(owned, include_self=False)
 
     assert set(zip(pairs.left_indices.tolist(), pairs.right_indices.tolist(), strict=True)) == {(0, 1)}
+
+
+def test_generate_bounds_pairs_honors_explicit_cpu_relation_dispatch() -> None:
+    left = from_shapely_geometries([Point(0, 0)])
+    right = from_shapely_geometries([Point(0, 0)])
+
+    pairs = generate_bounds_pairs(
+        left,
+        right,
+        requested_mode=ExecutionMode.CPU,
+    )
+
+    assert pairs.device_left_indices is None
+    assert pairs.device_right_indices is None
+    assert pairs.left_indices.tolist() == [0]
+    assert pairs.right_indices.tolist() == [0]
+
+
+@pytest.mark.gpu
+def test_generate_bounds_pairs_honors_explicit_gpu_relation_dispatch() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    left = from_shapely_geometries([Point(0, 0)])
+    right = from_shapely_geometries([Point(0, 0)])
+
+    pairs = generate_bounds_pairs(
+        left,
+        right,
+        requested_mode=ExecutionMode.GPU,
+    )
+
+    assert pairs.device_left_indices is not None
+    assert pairs.device_right_indices is not None
+    assert pairs._host_left_indices is None
+    assert pairs._host_right_indices is None
+
+
+@pytest.mark.gpu
+def test_generate_bounds_pairs_keeps_bounded_pair_cardinality_on_device() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+
+    left = from_shapely_geometries([Point(0, 0), Point(10, 10)])
+    right = from_shapely_geometries([Point(0, 0), Point(5, 5), Point(10, 10)])
+    reset_d2h_transfer_count()
+
+    pairs = generate_bounds_pairs(
+        left,
+        right,
+        requested_mode=ExecutionMode.GPU,
+        capacity_output=True,
+    )
+    events = get_d2h_transfer_events(clear=True)
+
+    assert pairs.device_selection is not None
+    assert pairs.device_selection.capacity == 6
+    assert cp.asnumpy(pairs.device_selection.logical_count).tolist() == [2]
+    active = pairs.device_selection.active_capacity_mask()
+    assert set(
+        zip(
+            cp.asnumpy(pairs.device_left_indices[active]).tolist(),
+            cp.asnumpy(pairs.device_right_indices[active]).tolist(),
+            strict=True,
+        )
+    ) == {(0, 0), (1, 2)}
+    assert not any(
+        event.reason == "spatial index sweep candidate-pair allocation fence"
+        for event in events
+    )
 
 
 def test_benchmark_bounds_pairs_reports_dataset_stats() -> None:

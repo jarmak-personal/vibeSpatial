@@ -9,11 +9,8 @@ from pathlib import Path
 import cupy as cp
 
 from vibespatial.api import read_file
-from vibespatial.overlay.contract import contract_overlay_microcells
-from vibespatial.overlay.contraction_reconstruct import (
-    _coalesce_selected_microcells,
-    reconstruct_overlay_from_microcells,
-)
+from vibespatial.overlay.boundary_graph import microcell_boundary_segments_gpu
+from vibespatial.overlay.contraction_reconstruct import reconstruct_overlay_from_microcells
 from vibespatial.overlay.microcells import (
     build_aligned_overlay_workload,
     build_and_label_overlay_microcells,
@@ -51,7 +48,6 @@ def main() -> int:
         default="intersection",
         choices=("intersection", "union", "difference", "symmetric_difference", "identity"),
     )
-    parser.add_argument("--with-contract", action="store_true")
     parser.add_argument("--skip-reconstruct", action="store_true")
     parser.add_argument("--selected-build", action="store_true")
     args = parser.parse_args()
@@ -100,17 +96,24 @@ def main() -> int:
         cp.cuda.Stream.null.synchronize()
         t3 = time.perf_counter()
     selected_bands = _selected_count(labels, args.operation)
-    coalesced = _coalesce_selected_microcells(
-        labels,
-        cp.flatnonzero(
-            {
-                "intersection": labels.left_inside & labels.right_inside,
-                "union": labels.left_inside | labels.right_inside,
-                "difference": labels.left_inside & ~labels.right_inside,
-                "symmetric_difference": labels.left_inside ^ labels.right_inside,
-                "identity": labels.left_inside,
-            }[args.operation].astype(cp.bool_, copy=False)
-        ).astype(cp.int64, copy=False),
+    selected_ids = cp.flatnonzero(
+        {
+            "intersection": labels.left_inside & labels.right_inside,
+            "union": labels.left_inside | labels.right_inside,
+            "difference": labels.left_inside & ~labels.right_inside,
+            "symmetric_difference": labels.left_inside ^ labels.right_inside,
+            "identity": labels.left_inside,
+        }[args.operation].astype(cp.bool_, copy=False)
+    ).astype(cp.int64, copy=False)
+    bands = labels.bands
+    boundary = microcell_boundary_segments_gpu(
+        cp.asarray(bands.row_indices)[selected_ids],
+        cp.asarray(bands.x_left)[selected_ids],
+        cp.asarray(bands.x_right)[selected_ids],
+        cp.asarray(bands.y_lower_left)[selected_ids],
+        cp.asarray(bands.y_lower_right)[selected_ids],
+        cp.asarray(bands.y_upper_left)[selected_ids],
+        cp.asarray(bands.y_upper_right)[selected_ids],
     )
     print(
         json.dumps(
@@ -119,24 +122,13 @@ def main() -> int:
                 "elapsed_s": t3 - t2,
                 "labels": labels.count,
                 "selected_bands": selected_bands,
-                "coalesced_selected": int(cp.asarray(coalesced["row_indices"]).size),
+                "boundary_segments": int(boundary[0].size),
             }
         ),
         file=sys.stderr,
         flush=True,
     )
-    components = None
     t4 = t3
-    if args.with_contract:
-        components = contract_overlay_microcells(labels)
-        t4 = time.perf_counter()
-        print(
-            json.dumps(
-                {"stage": "contract", "elapsed_s": t4 - t3, "components": components.component_count}
-            ),
-            file=sys.stderr,
-            flush=True,
-        )
     if args.skip_reconstruct:
         result_row_count = 0
         t5 = t4
@@ -144,7 +136,6 @@ def main() -> int:
         result = reconstruct_overlay_from_microcells(
             labels,
             args.operation,
-            components=components,
             row_count=aligned.row_count,
         )
         cp.cuda.Stream.null.synchronize()
@@ -162,14 +153,12 @@ def main() -> int:
             "align_s": t1 - t0,
             "bands_s": t2 - t1,
             "label_s": t3 - t2,
-            "contract_s": t4 - t3,
             "reconstruct_s": t5 - t4,
             "total_s": t5 - t0,
         },
         "counts": {
             "aligned_rows": aligned.row_count,
             "bands": bands.count,
-            "components": None if components is None else components.component_count,
             "selected_bands": selected_bands,
             "result_rows": result_row_count,
         },

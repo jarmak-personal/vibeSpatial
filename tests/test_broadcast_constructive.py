@@ -6,8 +6,10 @@ with tiled-pairwise comparison.
 
 Covers nsf.3: elimination of [other]*len(self) materialization.
 """
+
 from __future__ import annotations
 
+import ast
 import importlib
 import os
 import tempfile
@@ -16,14 +18,24 @@ from pathlib import Path
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import MultiPoint, MultiPolygon, Point, Polygon, box
+from shapely.geometry import (
+    LineString,
+    MultiLineString,
+    MultiPoint,
+    MultiPolygon,
+    Point,
+    Polygon,
+    box,
+)
 
 from benchmarks.shootout._data import setup_fixtures
 from vibespatial.api import read_file
 from vibespatial.constructive import binary_constructive as binary_constructive_module
 from vibespatial.constructive.binary_constructive import binary_constructive_owned
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     from_shapely_geometries,
+    materialize_broadcast,
     tile_single_row,
 )
 from vibespatial.kernels.constructive.segmented_union import segmented_union_all
@@ -38,9 +50,242 @@ _CONSTRUCTIVE_OPS = ("intersection", "union", "difference", "symmetric_differenc
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
 
 
+def test_row_isolated_polygon_overlay_has_no_per_row_fallback_executor() -> None:
+    source = Path(binary_constructive_module.__file__).read_text()
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_dispatch_polygon_overlay_row_isolated_batch_gpu"
+    )
+    function_source = ast.unparse(function)
+
+    assert "for row_index in range" not in function_source
+    assert "_resolve_indexed_polygon_fast_path_candidate" not in function_source
+    assert "_row_isolated=True" in function_source
+    assert "_expand_right_segments_for_pair_rows_legacy" not in source
+    assert "_expand_right_segments_for_pair_rows" not in source
+    assert "expanded right-segment allocation fence" not in source
+    assert "_dispatch_exact_rowwise_polygon_union_rows_gpu" not in source
+    assert "row_aligned_union_area_proof_cpu_subset_rescue" not in source
+    assert "allow_segmented_union_fallback" not in source
+    assert "multipart-union group-offset host export" not in source
+    assert "constructive.intersection.multipart_union.fallback" not in source
+    assert "_dispatch_polygonal_multipart_difference_gpu" not in source
+    assert 'reason="polygonal difference polygon-part depth scalar fence"' not in source
+    assert "polygonal_multipart_grouped_difference_gpu" not in source
+    assert "_pack_line_parts_by_source_rows_gpu" not in source
+    assert "_lineal_polygon_rows_difference_gpu" not in source
+    assert "lineal-polygonal difference polygon-part depth scalar fence" not in source
+    assert "for part_index in range(max_parts)" not in source
+    assert "def _explode_polygonal_rows_to_polygons_gpu(" not in source
+    assert "def _explode_multipolygon_rows_to_polygons_gpu(" not in source
+    assert "_row_isolated_overlay_operation_area_gpu" not in source
+    assert "def _host_single_ring_polygon_mask(" not in source
+    assert "def _host_rectangle_polygon_mask(" not in source
+    assert "def _host_single_ring_and_rectangle_polygon_masks(" not in source
+    assert "def _sh_kernel_can_handle(" not in source
+    assert "def _aligned_sh_eligible_polygon_rows(" not in source
+    assert "def _dispatch_polygon_contraction_gpu(" not in source
+    assert "_MIXED_POLYGON_INTERSECTION_ROWWISE_MAX" not in source
+    assert "_POLYGON_CONTRACTION_MIN_ROWS" not in source
+
+    binary_dispatch = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_binary_constructive_gpu"
+    )
+    binary_dispatch_source = ast.unparse(binary_dispatch)
+    assert not any(isinstance(node, ast.Try) for node in ast.walk(binary_dispatch))
+    assert "_dispatch_partitioned_polygon_intersection_gpu" in binary_dispatch_source
+    assert "_dispatch_polygon_difference_overlay_batched_gpu" in binary_dispatch_source
+
+    difference_capacity_start = source.index(
+        "def _dispatch_polygon_difference_overlay_batched_gpu("
+    )
+    difference_capacity_end = source.index("\ndef ", difference_capacity_start + 1)
+    difference_capacity_source = source[difference_capacity_start:difference_capacity_end]
+    assert difference_capacity_source.count("NativeDeviceSelection.from_mask") == 2
+    assert "build_empty_polygon_rows_device" in difference_capacity_source
+    assert "device_scatter_owned_capacity_selection" in difference_capacity_source
+    assert "cp.flatnonzero" not in difference_capacity_source
+    assert "except Exception" not in difference_capacity_source
+    assert "partition_counts=device-resident" in difference_capacity_source
+
+    mixed_dispatch = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_dispatch_mixed_binary_constructive_gpu"
+    )
+    mixed_dispatch_source = ast.unparse(mixed_dispatch)
+    assert "NativeDeviceSelection.from_mask" in mixed_dispatch_source
+    assert "device_take_owned_family_capacity_selection" in mixed_dispatch_source
+    assert "device_select_owned_capacity_partitions" in mixed_dispatch_source
+    assert "cp.flatnonzero" not in mixed_dispatch_source
+    assert ".take(" not in mixed_dispatch_source
+    assert "int(d_sub_rows.size)" not in mixed_dispatch_source
+    assert "_concat_device_family_buffers" not in mixed_dispatch_source
+
+    line_capacity_start = source.index("def _explode_lineal_rows_to_line_capacity_gpu(")
+    line_capacity_end = source.index("\ndef ", line_capacity_start + 1)
+    line_capacity_source = source[line_capacity_start:line_capacity_end]
+    line_compose_start = source.index("def _line_part_selection_from_capacities(")
+    line_compose_end = source.index("\ndef ", line_compose_start + 1)
+    line_compose_source = source[line_compose_start:line_compose_end]
+    assert "_indexed_lineal_part_capacities" in line_capacity_source
+    assert "preserve_indexed_view=True" in line_capacity_source
+    assert "NativeDeviceSelection.from_mask" in line_compose_source
+    assert "safe_capacity_positions" in line_compose_source
+    assert "gather_capacity" in line_compose_source
+    assert "coord_capacity=" in line_compose_source
+    assert "cp.flatnonzero" not in line_capacity_source
+    assert "count_scatter_total" not in line_capacity_source
+
+    point_capacity_start = source.index("def _explode_point_rows_to_point_capacity_gpu(")
+    point_capacity_end = source.index("\ndef ", point_capacity_start + 1)
+    point_capacity_source = source[point_capacity_start:point_capacity_end]
+    point_compose_start = source.index("def _point_part_selection_from_capacities(")
+    point_compose_end = source.index("\ndef ", point_compose_start + 1)
+    point_compose_source = source[point_compose_start:point_compose_end]
+    assert "_indexed_point_part_capacities" in point_capacity_source
+    assert "preserve_indexed_view=True" in point_capacity_source
+    assert "NativeDeviceSelection.from_mask" in point_compose_source
+    assert "partition_capacity_positions" in point_compose_source
+    assert "gather_capacity" in point_compose_source
+    assert "cp.flatnonzero" not in point_capacity_source
+    assert "count_scatter_total" not in point_capacity_source
+
+    boundary_capacity_start = source.index("def _polygon_part_capacity_boundary_segments_gpu(")
+    boundary_capacity_end = source.index(
+        "\ndef ",
+        boundary_capacity_start + 1,
+    )
+    boundary_capacity_source = source[boundary_capacity_start:boundary_capacity_end]
+    assert "preserve_indexed_view=True" in boundary_capacity_source
+    assert "polygon_parts.ring_capacity" in boundary_capacity_source
+    assert "polygon_parts.coord_capacity" in boundary_capacity_source
+    assert "d_part_family_rows" in boundary_capacity_source
+    assert "d_physical_ring_rows" in boundary_capacity_source
+    assert "physicalize_device_rows" not in boundary_capacity_source
+
+    for function_name in (
+        "_dispatch_row_aligned_polygon_known_coverage_union_gpu",
+        "_dispatch_grouped_polygon_known_coverage_union_gpu",
+        "_dispatch_single_row_polygon_known_coverage_union_gpu",
+    ):
+        function_start = source.index(f"def {function_name}(")
+        function_end = source.index("\ndef ", function_start + 1)
+        function_source = source[function_start:function_end]
+        assert "cp.flatnonzero" not in function_source
+        assert "physicalize_device_rows" not in function_source
+
+    noded_coverage_start = source.index(
+        "def _dispatch_grouped_polygon_noded_coverage_union_gpu("
+    )
+    noded_coverage_end = source.index("\ndef ", noded_coverage_start + 1)
+    noded_coverage_source = source[noded_coverage_start:noded_coverage_end]
+    assert "build_gpu_split_events" in noded_coverage_source
+    assert "_assemble_noded_polygon_coverage_split_events_gpu" in noded_coverage_source
+    assert "right_geometry_source_rows=d_source_rows" in noded_coverage_source
+    assert "cp.flatnonzero" not in noded_coverage_source
+    assert "physicalize_device_rows" not in noded_coverage_source
+
+    noded_assembly_start = source.index(
+        "def _assemble_noded_polygon_coverage_split_events_gpu("
+    )
+    noded_assembly_end = source.index("\ndef ", noded_assembly_start + 1)
+    noded_assembly_source = source[noded_assembly_start:noded_assembly_end]
+    assert "noded_boundary_segments_from_split_events_gpu" in noded_assembly_source
+    assert "undirected_boundary_segment_orders_gpu" in noded_assembly_source
+    assert "build_polygon_output_from_boundary_segments_gpu" in noded_assembly_source
+    assert "cp.flatnonzero" not in noded_assembly_source
+
+    line_difference_source = (
+        Path(binary_constructive_module.__file__)
+        .with_name("line_polygon_difference.py")
+        .read_text()
+    )
+    assert "build_gpu_split_events" in line_difference_source
+    assert "NativeDeviceSelection.from_mask" in line_difference_source
+    assert "binary_predicate_expression" in line_difference_source
+    assert "sort_pairs" in line_difference_source
+    assert "cp.flatnonzero" not in line_difference_source
+    assert "count_scatter_total" not in line_difference_source
+    assert "_device_scalar_int" not in line_difference_source
+
+    multipart_start = source.index("def _dispatch_oriented_multipolygon_polygon_intersection_gpu(")
+    multipart_end = source.index("\ndef ", multipart_start + 1)
+    multipart_source = source[multipart_start:multipart_end]
+    assert "_explode_polygonal_rows_to_polygon_capacity_gpu" in multipart_source
+    assert "d_valid_rows_mask=d_valid_parts" in multipart_source
+    assert "_explode_multipolygon_rows_to_polygons_gpu" not in multipart_source
+    assert "cp.flatnonzero" not in multipart_source
+
+    orientation_start = source.index("def _oriented_multipolygon_polygon_source_rows_gpu(")
+    orientation_end = source.index("\ndef ", orientation_start + 1)
+    orientation_source = source[orientation_start:orientation_end]
+    assert "_device_single_family_covering_all_rows" in orientation_source
+    assert "cp.arange" in orientation_source
+    assert "cp.flatnonzero" not in orientation_source
+
+    capacity_pack_start = source.index("def _pack_disjoint_multipart_intersection_capacity_gpu(")
+    capacity_pack_end = source.index("\ndef ", capacity_pack_start + 1)
+    capacity_pack_source = source[capacity_pack_start:capacity_pack_end]
+    assert "NativeGroupedSelection" in capacity_pack_source
+    assert "d_output_validity" in capacity_pack_source
+    assert "d_valid_empty_rows=d_output_validity" in capacity_pack_source
+    assert "_explode_polygonal_rows_to_polygons_gpu" not in capacity_pack_source
+    assert "physicalize_device_rows" not in capacity_pack_source
+    assert "ring_capacity=polygon_parts.ring_capacity" in capacity_pack_source
+    assert "coord_capacity=polygon_parts.coord_capacity" in capacity_pack_source
+
+    grouped_pack_start = source.index("def _pack_native_grouped_disjoint_polygon_parts_gpu(")
+    grouped_pack_end = source.index("\ndef ", grouped_pack_start + 1)
+    grouped_pack_source = source[grouped_pack_start:grouped_pack_end]
+    assert "NativeGroupedSelection" in grouped_pack_source
+    assert "_assemble_sorted_polygon_part_capacity_gpu" in grouped_pack_source
+    assert "cp.argsort" not in grouped_pack_source
+    assert "cp.flatnonzero" not in grouped_pack_source
+    assert "physicalize_device_rows" not in grouped_pack_source
+    assert "preserve_indexed_view=True" in grouped_pack_source
+
+    disjoint_proof_start = source.index(
+        "def _sorted_polygon_parts_have_strictly_disjoint_group_bounds("
+    )
+    disjoint_proof_end = source.index("\ndef ", disjoint_proof_start + 1)
+    disjoint_proof_source = source[disjoint_proof_start:disjoint_proof_end]
+    assert "NativeDeviceSelection.from_mask" in disjoint_proof_source
+    assert "d_pair_count=d_refine_count" in disjoint_proof_source
+    assert "pair_capacity=refine_capacity" in disjoint_proof_source
+    assert "candidate_pair_count" not in disjoint_proof_source
+
+    coverage_start = source.index("def _dispatch_grouped_polygon_known_coverage_union_gpu(")
+    coverage_end = source.index("\ndef ", coverage_start + 1)
+    coverage_source = source[coverage_start:coverage_end]
+    assert "_dispatch_grouped_polygon_noded_coverage_union_gpu" in coverage_source
+    assert "cp.flatnonzero(valid_group_mask)" not in coverage_source
+
+    union_batch = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_dispatch_polygon_partition_union_gpu"
+    )
+    union_batch_source = ast.unparse(union_batch)
+    assert "for row_index in range" not in union_batch_source
+    assert "_include_same_side_splits=True" in union_batch_source
+    assert "NativeDeviceSelection.from_mask" in union_batch_source
+    assert "device_scatter_owned_capacity_selection" in union_batch_source
+    assert "cp.flatnonzero" not in union_batch_source
+    assert not any(isinstance(node, ast.Try) for node in ast.walk(union_batch))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _shapely_oracle(
     op: str,
@@ -53,7 +298,10 @@ def _shapely_oracle(
     result = getattr(shapely, op)(left_arr, right_arr)
     out: list[object | None] = []
     for left_val, right_val, val in zip(
-        left_geoms, [right_geom] * len(left_geoms), result.tolist(), strict=True,
+        left_geoms,
+        [right_geom] * len(left_geoms),
+        result.tolist(),
+        strict=True,
     ):
         if left_val is None or right_val is None:
             out.append(None)
@@ -97,6 +345,7 @@ def _assert_constructive_matches_oracle(
 # 1. Oracle: broadcast result == tiled-pairwise Shapely result
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("op", _CONSTRUCTIVE_OPS)
 def test_broadcast_polygon_polygon_matches_oracle(op: str) -> None:
     """Polygon x scalar Polygon broadcast matches tiled Shapely."""
@@ -139,6 +388,7 @@ def test_broadcast_point_polygon_matches_oracle(op: str) -> None:
 # 2. All 4 ops: intersection, union, difference, symmetric_difference
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("op", _CONSTRUCTIVE_OPS)
 def test_all_four_ops_polygon(op: str) -> None:
     """All 4 constructive ops work with broadcast polygon."""
@@ -150,6 +400,7 @@ def test_all_four_ops_polygon(op: str) -> None:
 # ---------------------------------------------------------------------------
 # 3. Null broadcast: single null geometry -> all-null output
 # ---------------------------------------------------------------------------
+
 
 def test_null_broadcast_right() -> None:
     """Broadcast of a null right geometry produces all-null output."""
@@ -167,6 +418,7 @@ def test_null_broadcast_right() -> None:
 # ---------------------------------------------------------------------------
 # 4. Empty broadcast: single empty geometry -> all-empty output
 # ---------------------------------------------------------------------------
+
 
 def test_empty_broadcast_right() -> None:
     """Broadcast of an empty right geometry produces appropriate output."""
@@ -187,22 +439,54 @@ def test_empty_broadcast_right() -> None:
         )
 
 
+@requires_gpu
+@pytest.mark.parametrize("operation", _CONSTRUCTIVE_OPS)
+def test_gpu_binary_constructive_preserves_valid_empty_identity_rows(
+    operation: str,
+) -> None:
+    left_geometries = [box(0, 0, 1, 1), Polygon(), None, Polygon()]
+    right_geometries = [Polygon(), box(2, 2, 3, 3), box(0, 0, 1, 1), Polygon()]
+    left = from_shapely_geometries(left_geometries)
+    right = from_shapely_geometries(right_geometries)
+
+    with strict_native_environment():
+        result = binary_constructive_owned(
+            operation,
+            left,
+            right,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+
+    actual = result.to_shapely()
+    expected = getattr(shapely, operation)(
+        np.asarray(left_geometries, dtype=object),
+        np.asarray(right_geometries, dtype=object),
+    )
+    for got, oracle in zip(actual, expected, strict=True):
+        if oracle is None:
+            assert got is None
+        else:
+            assert got is not None
+            assert got.geom_type == oracle.geom_type
+            assert shapely.equals(got, oracle)
+
+
 # ---------------------------------------------------------------------------
 # 5. Verify 1-row right (not N copies) via row_count check
 # ---------------------------------------------------------------------------
+
 
 def test_right_is_single_row() -> None:
     """After _coerce_other_to_owned change, right should be 1-row."""
     right_geom = box(0, 0, 2, 2)
     right_owned = from_shapely_geometries([right_geom])
-    assert right_owned.row_count == 1, (
-        f"Expected 1-row right, got {right_owned.row_count}"
-    )
+    assert right_owned.row_count == 1, f"Expected 1-row right, got {right_owned.row_count}"
 
 
 # ---------------------------------------------------------------------------
 # 6. Tiling equivalence regression
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("op", _CONSTRUCTIVE_OPS)
 def test_tiling_equivalence(op: str) -> None:
@@ -238,8 +522,10 @@ def test_tiling_equivalence(op: str) -> None:
 
 
 @requires_gpu
-def test_expand_right_segments_for_pair_rows_vectorized_matches_legacy() -> None:
+def test_indexed_right_segment_physicalization_matches_segment_oracle() -> None:
     import cupy as cp
+
+    from vibespatial.spatial.segment_primitives import _extract_segments_gpu
 
     right = from_shapely_geometries(
         [
@@ -260,45 +546,54 @@ def test_expand_right_segments_for_pair_rows_vectorized_matches_legacy() -> None
     )
     source_rows = np.asarray([2, 0, 2, 1, 0, 2, 1, 1], dtype=np.int32)
 
-    actual = binary_constructive_module._expand_right_segments_for_pair_rows(
-        right,
-        source_rows,
+    actual = _extract_segments_gpu(right.device_take(cp.asarray(source_rows)))
+
+    base = _extract_segments_gpu(right)
+    base_rows = cp.asnumpy(base.row_indices)
+    expected_slots = np.concatenate(
+        [np.flatnonzero(base_rows == source_row) for source_row in source_rows]
     )
-    expected = binary_constructive_module._expand_right_segments_for_pair_rows_legacy(
-        right,
-        source_rows,
+    expected_rows = np.concatenate(
+        [
+            np.full(
+                np.count_nonzero(base_rows == source_row),
+                pair_row,
+                dtype=np.int32,
+            )
+            for pair_row, source_row in enumerate(source_rows)
+        ]
     )
 
-    assert actual is not None
-    assert expected is not None
-    assert int(actual.count) == int(expected.count)
-    np.testing.assert_array_equal(cp.asnumpy(actual.row_indices), cp.asnumpy(expected.row_indices))
+    assert int(actual.count) == int(expected_slots.size)
+    np.testing.assert_array_equal(cp.asnumpy(actual.row_indices), expected_rows)
     np.testing.assert_array_equal(
         cp.asnumpy(actual.segment_indices),
-        cp.asnumpy(expected.segment_indices),
+        cp.asnumpy(base.segment_indices)[expected_slots],
     )
-    np.testing.assert_allclose(cp.asnumpy(actual.x0), cp.asnumpy(expected.x0))
-    np.testing.assert_allclose(cp.asnumpy(actual.y0), cp.asnumpy(expected.y0))
-    np.testing.assert_allclose(cp.asnumpy(actual.x1), cp.asnumpy(expected.x1))
-    np.testing.assert_allclose(cp.asnumpy(actual.y1), cp.asnumpy(expected.y1))
-    if actual.part_indices is None or expected.part_indices is None:
-        assert actual.part_indices is None and expected.part_indices is None
+    np.testing.assert_allclose(cp.asnumpy(actual.x0), cp.asnumpy(base.x0)[expected_slots])
+    np.testing.assert_allclose(cp.asnumpy(actual.y0), cp.asnumpy(base.y0)[expected_slots])
+    np.testing.assert_allclose(cp.asnumpy(actual.x1), cp.asnumpy(base.x1)[expected_slots])
+    np.testing.assert_allclose(cp.asnumpy(actual.y1), cp.asnumpy(base.y1)[expected_slots])
+    if actual.part_indices is None or base.part_indices is None:
+        assert actual.part_indices is None and base.part_indices is None
     else:
         np.testing.assert_array_equal(
             cp.asnumpy(actual.part_indices),
-            cp.asnumpy(expected.part_indices),
+            cp.asnumpy(base.part_indices)[expected_slots],
         )
-    if actual.ring_indices is None or expected.ring_indices is None:
-        assert actual.ring_indices is None and expected.ring_indices is None
+    if actual.ring_indices is None or base.ring_indices is None:
+        assert actual.ring_indices is None and base.ring_indices is None
     else:
         np.testing.assert_array_equal(
             cp.asnumpy(actual.ring_indices),
-            cp.asnumpy(expected.ring_indices),
+            cp.asnumpy(base.ring_indices)[expected_slots],
         )
 
 
 @requires_gpu
-def test_strict_broadcast_polygon_intersection_preserves_row_cardinality_for_complex_polygons() -> None:
+def test_strict_broadcast_polygon_intersection_preserves_row_cardinality_for_complex_polygons() -> (
+    None
+):
     """Strict scalar-right polygon intersection keeps one output slot per input row.
 
     Buffered polygons exceed the SH kernel's vertex workspace, so this exercises
@@ -339,116 +634,28 @@ def test_strict_broadcast_polygon_intersection_preserves_row_cardinality_for_com
             )
 
 
-@requires_gpu
-@pytest.mark.parametrize("op", _CONSTRUCTIVE_OPS)
-def test_multirow_polygon_constructive_prefers_contraction_path(
-    monkeypatch: pytest.MonkeyPatch,
-    op: str,
-) -> None:
-    row_count = 32
-    left = [
-        Point(float(i) * 10.0, float(i) * 10.0).buffer(4.0)
-        for i in range(row_count)
-    ]
-    right = [
-        Point(float(i) * 10.0 + 1.0, float(i) * 10.0 + 1.0).buffer(2.5)
-        for i in range(row_count)
-    ]
-    sentinel = from_shapely_geometries(
-        [
-            box(float(i) * 10.0, float(i) * 10.0, float(i) * 10.0 + 1.0, float(i) * 10.0 + 1.0)
-            for i in range(row_count)
-        ]
-    )
-
-    left_owned = from_shapely_geometries(left)
-    right_owned = from_shapely_geometries(right)
-
-    contraction_module = importlib.import_module("vibespatial.overlay.contraction")
-    calls: list[tuple[str, int]] = []
-
-    def _fake_contraction(left_arg, right_arg, *, operation: str, dispatch_mode=ExecutionMode.GPU):
-        calls.append((operation, left_arg.row_count))
-        return sentinel
-
-    def _unexpected(*args, **kwargs):
-        pytest.fail("legacy overlay helper should not run when contraction path succeeds")
-
-    monkeypatch.setattr(contraction_module, "overlay_contraction_owned", _fake_contraction)
-    monkeypatch.setattr(binary_constructive_module, "_sh_kernel_can_handle", lambda *args, **kwargs: False)
-    monkeypatch.setattr(binary_constructive_module, "_dispatch_polygon_intersection_overlay_rowwise_gpu", _unexpected)
-    monkeypatch.setattr(binary_constructive_module, "_dispatch_polygon_difference_overlay_rowwise_gpu", _unexpected)
-    monkeypatch.setattr(binary_constructive_module, "_dispatch_polygon_overlay_rowwise_gpu", _unexpected)
-    monkeypatch.setattr(binary_constructive_module, "_dispatch_overlay_gpu", _unexpected)
-
-    result = binary_constructive_owned(
-        op,
-        left_owned,
-        right_owned,
-        dispatch_mode=ExecutionMode.GPU,
-    )
-
-    assert calls == [(op, row_count)]
-    for got, exp in zip(result.to_shapely(), sentinel.to_shapely(), strict=True):
-        assert shapely.equals(got, exp)
-
-
-@requires_gpu
-def test_small_multirow_polygon_intersection_skips_contraction_path(
+def test_polygon_intersection_prefers_canonical_capacity_partition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    left_owned = from_shapely_geometries(
-        [Point(0, 0).buffer(4.0), Point(10, 10).buffer(4.0)]
-    )
-    right_owned = from_shapely_geometries(
-        [Point(1, 1).buffer(2.5), Point(9.5, 9.5).buffer(2.0)]
-    )
-    sentinel = from_shapely_geometries([box(0, 0, 1, 1), box(2, 2, 3, 3)])
-
-    contraction_module = importlib.import_module("vibespatial.overlay.contraction")
-
-    monkeypatch.setattr(
-        contraction_module,
-        "overlay_contraction_owned",
-        lambda *args, **kwargs: pytest.fail(
-            "small aligned polygon intersection should skip contraction"
-        ),
-    )
-    monkeypatch.setattr(binary_constructive_module, "_sh_kernel_can_handle", lambda *args, **kwargs: False)
-    monkeypatch.setattr(
-        binary_constructive_module,
-        "_dispatch_polygon_intersection_overlay_rowwise_gpu",
-        lambda *args, **kwargs: sentinel,
-    )
-
-    result = binary_constructive_owned(
-        "intersection",
-        left_owned,
-        right_owned,
-        dispatch_mode=ExecutionMode.GPU,
-    )
-
-    assert result is sentinel
-
-
-def test_polygon_intersection_tries_rowwise_overlay_after_overlay_exception(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Polygon intersection recovers with rowwise overlay when bulk overlay raises."""
+    """Aligned polygon intersection enters the canonical capacity router first."""
     left = from_shapely_geometries([Point(0, 0).buffer(2.0), Point(5, 5).buffer(2.0)])
     right = from_shapely_geometries([Point(1, 0).buffer(1.5), Point(5, 5).buffer(1.0)])
     sentinel = from_shapely_geometries([box(1, 1, 2, 2), box(4, 4, 5, 5)])
 
-    monkeypatch.setattr(binary_constructive_module, "_sh_kernel_can_handle", lambda *_: False)
-
-    def _raise_overlay(*args, **kwargs):
-        raise RuntimeError("overlay boom")
-
-    monkeypatch.setattr(binary_constructive_module, "_dispatch_overlay_gpu", _raise_overlay)
     monkeypatch.setattr(
         binary_constructive_module,
-        "_dispatch_polygon_intersection_overlay_rowwise_gpu",
+        "_dispatch_partitioned_polygon_intersection_gpu",
         lambda *args, **kwargs: sentinel,
+    )
+    monkeypatch.setattr(
+        binary_constructive_module,
+        "_dispatch_overlay_gpu",
+        lambda *args, **kwargs: pytest.fail("bulk overlay should not precede capacity routing"),
+    )
+    monkeypatch.setattr(
+        binary_constructive_module,
+        "_dispatch_polygon_intersection_overlay_exact_batch_gpu",
+        lambda *args, **kwargs: pytest.fail("rowwise overlay should not precede capacity routing"),
     )
 
     result = binary_constructive_module._binary_constructive_gpu(
@@ -460,12 +667,11 @@ def test_polygon_intersection_tries_rowwise_overlay_after_overlay_exception(
     assert result is sentinel
 
 
-def test_polygon_difference_tries_legacy_rowwise_after_batched_exception(
+def test_polygon_difference_propagates_batched_topology_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     left = from_shapely_geometries([box(0, 0, 2, 2), box(4, 4, 6, 6)])
     right = from_shapely_geometries([box(1, 1, 3, 3), box(4, 4, 5, 5)])
-    sentinel = from_shapely_geometries([box(0, 0, 1, 2), box(5, 5, 6, 6)])
 
     def _raise_batched(*args, **kwargs):
         raise RuntimeError("batched boom")
@@ -475,140 +681,35 @@ def test_polygon_difference_tries_legacy_rowwise_after_batched_exception(
         "_dispatch_polygon_difference_overlay_batched_gpu",
         _raise_batched,
     )
-    monkeypatch.setattr(
-        binary_constructive_module,
-        "_dispatch_polygon_difference_overlay_rowwise_gpu_legacy",
-        lambda *args, **kwargs: sentinel,
-    )
 
-    result = binary_constructive_module._dispatch_polygon_difference_overlay_rowwise_gpu(
-        left,
-        right,
-    )
-
-    assert result is sentinel
+    with pytest.raises(RuntimeError, match="batched boom"):
+        binary_constructive_module._binary_constructive_gpu(
+            "difference",
+            left,
+            right,
+        )
+    source = Path(binary_constructive_module.__file__).read_text()
+    assert "_dispatch_polygon_difference_overlay_rowwise_gpu_legacy" not in source
 
 
-@requires_gpu
-def test_polygon_intersection_prefers_rectangle_kernel_for_high_vertex_left_polygons(
+def test_polygon_symmetric_difference_propagates_overlay_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rect_module = importlib.import_module(
-        "vibespatial.kernels.constructive.polygon_rect_intersection"
-    )
+    left = from_shapely_geometries([box(0, 0, 2, 2)])
+    right = from_shapely_geometries([box(1, 1, 3, 3)])
 
-    left = from_shapely_geometries(
-        [Point(0, 0).buffer(5.0), Point(20, 0).buffer(5.0)]
-    )
-    right = from_shapely_geometries(
-        [box(-2.0, -2.0, 2.0, 2.0), box(18.0, -2.0, 22.0, 2.0)]
-    )
-    sentinel = from_shapely_geometries(
-        [box(-1.0, -1.0, 1.0, 1.0), box(19.0, -1.0, 21.0, 1.0)],
-        residency=Residency.DEVICE,
-    )
-    calls: list[int] = []
-
-    def _fake_rect_kernel(left_arg, right_arg, *, dispatch_mode=ExecutionMode.GPU):
-        calls.append(left_arg.row_count)
-        return sentinel
-
-    monkeypatch.setattr(
-        rect_module,
-        "polygon_rect_intersection",
-        _fake_rect_kernel,
-    )
     monkeypatch.setattr(
         binary_constructive_module,
-        "_dispatch_polygon_intersection_overlay_rowwise_gpu",
-        lambda *args, **kwargs: pytest.fail(
-            "high-vertex polygon vs rectangle intersection should avoid rowwise overlay"
-        ),
+        "_dispatch_overlay_gpu",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("overlay boom")),
     )
 
-    result = binary_constructive_owned(
-        "intersection",
-        left,
-        right,
-        dispatch_mode=ExecutionMode.GPU,
-    )
-
-    assert calls == [2]
-    for got, exp in zip(result.to_shapely(), sentinel.to_shapely(), strict=True):
-        assert shapely.equals(got, exp)
-
-
-def test_host_rectangle_polygon_mask_rejects_diagonal_bowtie_ring() -> None:
-    owned = from_shapely_geometries(
-        [
-            Polygon([(0.0, 0.0), (2.0, 2.0), (0.0, 2.0), (2.0, 0.0), (0.0, 0.0)]),
-            box(10.0, 10.0, 12.0, 12.0),
-        ]
-    )
-
-    mask = binary_constructive_module._host_rectangle_polygon_mask(owned)
-
-    assert mask is not None
-    assert mask.tolist() == [False, True]
-
-
-@requires_gpu
-def test_polygon_intersection_prefers_rectangle_kernel_when_left_is_rectangle_batch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    rect_module = importlib.import_module(
-        "vibespatial.kernels.constructive.polygon_rect_intersection"
-    )
-
-    left = from_shapely_geometries(
-        [box(-2.0, -2.0, 2.0, 2.0), box(18.0, -2.0, 22.0, 2.0)]
-    )
-    right = from_shapely_geometries(
-        [Point(0, 0).buffer(5.0), Point(20, 0).buffer(5.0)]
-    )
-    sentinel = from_shapely_geometries(
-        [box(-1.0, -1.0, 1.0, 1.0), box(19.0, -1.0, 21.0, 1.0)],
-        residency=Residency.DEVICE,
-    )
-    calls: list[tuple[int, int]] = []
-
-    def _fake_can_handle(left_arg, right_arg):
-        calls.append((left_arg.row_count, right_arg.row_count))
-        return left_arg is right and right_arg is left
-
-    def _fake_rect_kernel(left_arg, right_arg, *, dispatch_mode=ExecutionMode.GPU):
-        assert left_arg is right
-        assert right_arg is left
-        return sentinel
-
-    monkeypatch.setattr(
-        rect_module,
-        "polygon_rect_intersection_can_handle",
-        _fake_can_handle,
-    )
-    monkeypatch.setattr(
-        rect_module,
-        "polygon_rect_intersection",
-        _fake_rect_kernel,
-    )
-    monkeypatch.setattr(
-        binary_constructive_module,
-        "_dispatch_polygon_intersection_overlay_rowwise_gpu",
-        lambda *args, **kwargs: pytest.fail(
-            "rectangle-left polygon intersection should use swapped rectangle kernel before rowwise overlay"
-        ),
-    )
-
-    result = binary_constructive_owned(
-        "intersection",
-        left,
-        right,
-        dispatch_mode=ExecutionMode.GPU,
-    )
-
-    assert calls == [(2, 2), (2, 2)]
-    for got, exp in zip(result.to_shapely(), sentinel.to_shapely(), strict=True):
-        assert shapely.equals(got, exp)
+    with pytest.raises(RuntimeError, match="overlay boom"):
+        binary_constructive_module._binary_constructive_gpu(
+            "symmetric_difference",
+            left,
+            right,
+        )
 
 
 @requires_gpu
@@ -642,12 +743,8 @@ def test_single_pair_polygon_intersection_uses_exact_overlay_path_for_complex_po
 
 @requires_gpu
 def test_single_pair_polygon_difference_preserves_touch_only_left_polygon() -> None:
-    left = from_shapely_geometries(
-        [box(-1, 1, 1, 3)]
-    )
-    right = from_shapely_geometries(
-        [box(1, 1, 3, 3)]
-    )
+    left = from_shapely_geometries([box(-1, 1, 1, 3)])
+    right = from_shapely_geometries([box(1, 1, 3, 3)])
 
     result = binary_constructive_owned(
         "difference",
@@ -660,6 +757,47 @@ def test_single_pair_polygon_difference_preserves_touch_only_left_polygon() -> N
     expected = box(-1, 1, 1, 3)
     assert got is not None
     assert got.equals_exact(expected, tolerance=1e-9)
+
+
+@requires_gpu
+def test_polygon_difference_capacity_partition_preserves_null_and_empty_semantics() -> None:
+    left_geometries = [
+        box(0, 0, 2, 2),
+        box(0, 0, 2, 2),
+        None,
+        Polygon(),
+        box(0, 0, 3, 3),
+    ]
+    right_geometries = [
+        box(-1, -1, 3, 3),
+        box(3, 3, 4, 4),
+        box(0, 0, 1, 1),
+        box(0, 0, 1, 1),
+        box(1, 1, 2, 2),
+    ]
+    left = from_shapely_geometries(left_geometries)
+    right = from_shapely_geometries(right_geometries)
+
+    with strict_native_environment():
+        result = binary_constructive_module._dispatch_polygon_difference_overlay_batched_gpu(
+            left,
+            right,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+
+    assert result is not None
+    got = list(result.to_shapely())
+    expected = [
+        None if lhs is None or rhs is None else lhs.difference(rhs)
+        for lhs, rhs in zip(left_geometries, right_geometries, strict=True)
+    ]
+    for actual, oracle in zip(got, expected, strict=True):
+        if oracle is None:
+            assert actual is None
+        else:
+            assert actual is not None
+            assert actual.geom_type == oracle.geom_type
+            assert shapely.normalize(actual).equals(shapely.normalize(oracle))
 
 
 @requires_gpu
@@ -859,9 +997,7 @@ def test_single_pair_polygon_difference_preserves_left_for_lower_dim_right(
     right_geom,
     label: str,
 ) -> None:
-    left = from_shapely_geometries(
-        [box(0, 0, 4, 4)]
-    )
+    left = from_shapely_geometries([box(0, 0, 4, 4)])
     right = from_shapely_geometries([right_geom])
 
     result = binary_constructive_owned(
@@ -907,7 +1043,9 @@ def test_polygon_union_batches_aligned_overlay_candidate_generation(
     )
 
     got = result.to_shapely()
-    expected = shapely.union(np.asarray(left, dtype=object), np.asarray(right, dtype=object)).tolist()
+    expected = shapely.union(
+        np.asarray(left, dtype=object), np.asarray(right, dtype=object)
+    ).tolist()
     assert len(got) == len(expected) == 4
     for got_geom, expected_geom in zip(got, expected, strict=True):
         assert got_geom is not None
@@ -928,10 +1066,10 @@ def test_polygon_difference_batches_aligned_overlay_candidate_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     left = [
-        box(0, 0, 4, 4),      # partial overlap
-        box(10, 0, 14, 4),    # touch-only
-        box(20, 0, 24, 4),    # full overlap
-        box(30, 0, 34, 4),    # disjoint
+        box(0, 0, 4, 4),  # partial overlap
+        box(10, 0, 14, 4),  # touch-only
+        box(20, 0, 24, 4),  # full overlap
+        box(30, 0, 34, 4),  # disjoint
     ]
     right = [
         box(2, 0, 6, 4),
@@ -951,7 +1089,9 @@ def test_polygon_difference_batches_aligned_overlay_candidate_generation(
     )
 
     got = result.to_shapely()
-    expected = shapely.difference(np.asarray(left, dtype=object), np.asarray(right, dtype=object)).tolist()
+    expected = shapely.difference(
+        np.asarray(left, dtype=object), np.asarray(right, dtype=object)
+    ).tolist()
     assert len(got) == len(expected) == 4
     for got_geom, expected_geom in zip(got, expected, strict=True):
         if expected_geom is None:
@@ -1005,7 +1145,6 @@ def test_polygon_intersection_single_pair_uses_same_row_candidate_fast_path(
         left,
         right,
         dispatch_mode=ExecutionMode.GPU,
-        _prefer_exact_polygon_intersection=True,
     )
 
     got = result.to_shapely()[0]
@@ -1022,7 +1161,130 @@ def test_polygon_intersection_single_pair_uses_same_row_candidate_fast_path(
 
 
 @requires_gpu
-def test_multipolygon_polygon_intersection_regroups_with_grouped_union_plan(
+def test_multipart_direct_pack_refines_bbox_overlap_with_device_predicate() -> None:
+    """Overlapping envelopes alone must not force the grouped union carrier."""
+    constructive_module = importlib.import_module("vibespatial.constructive.binary_constructive")
+    cp = pytest.importorskip("cupy")
+
+    parts = from_shapely_geometries(
+        [
+            Polygon([(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (0.0, 0.0)]),
+            Polygon([(1.1, 3.0), (3.0, 1.1), (3.0, 3.0), (1.1, 3.0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    result = constructive_module._pack_disjoint_multipart_intersection_parts_gpu(
+        parts,
+        cp.zeros(parts.row_count, dtype=cp.int32),
+        output_row_count=1,
+    )
+
+    assert result is not None
+    assert result.row_count == 1
+    assert shapely.normalize(result.to_shapely()[0]).equals(
+        shapely.normalize(shapely.union_all(parts.to_shapely()))
+    )
+
+
+@requires_gpu
+def test_multipart_capacity_pack_preserves_valid_empty_and_null_rows() -> None:
+    constructive_module = importlib.import_module("vibespatial.constructive.binary_constructive")
+    cp = pytest.importorskip("cupy")
+
+    empty = shapely.intersection(box(0, 0, 1, 1), box(2, 2, 3, 3))
+    parts = from_shapely_geometries(
+        [empty, None, box(4, 4, 5, 5)],
+        residency=Residency.DEVICE,
+    )
+    result = constructive_module._pack_disjoint_multipart_intersection_parts_gpu(
+        parts,
+        cp.arange(3, dtype=cp.int32),
+        output_row_count=3,
+        assume_disjoint=True,
+    )
+
+    assert result is not None
+    got = result.to_shapely()
+    assert got[0] is not None and got[0].is_empty
+    assert got[1] is None
+    assert got[2].equals(box(4, 4, 5, 5))
+
+
+@requires_gpu
+def test_boundary_segment_capacity_ignores_inactive_duplicate_tail() -> None:
+    cp = pytest.importorskip("cupy")
+    from vibespatial.overlay.boundary_graph import (
+        undirected_boundary_segment_orders_gpu,
+    )
+
+    start_x = cp.asarray([0.0, 1.0, 1.0, 0.0, 0.0])
+    start_y = cp.asarray([0.0, 0.0, 1.0, 1.0, 0.0])
+    end_x = cp.asarray([1.0, 1.0, 0.0, 0.0, 1.0])
+    end_y = cp.asarray([0.0, 1.0, 1.0, 0.0, 0.0])
+    active = cp.asarray([True, True, True, True, False])
+
+    order = undirected_boundary_segment_orders_gpu(
+        start_x,
+        start_y,
+        end_x,
+        end_y,
+        cp.zeros(5, dtype=cp.int32),
+        active,
+    )
+
+    assert sorted(cp.asnumpy(order).tolist()) == [0, 1, 2, 3]
+
+
+@requires_gpu
+def test_native_grouped_multipart_union_uses_structural_same_row_span_proof() -> None:
+    constructive_module = importlib.import_module("vibespatial.constructive.binary_constructive")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    parts = from_shapely_geometries(
+        [
+            box(0.0, 0.0, 2.0, 2.0),
+            box(1.0, 0.0, 3.0, 2.0),
+            box(10.0, 0.0, 12.0, 2.0),
+            box(11.0, 0.0, 13.0, 2.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+    sorted_order = cp.arange(parts.row_count, dtype=cp.int64)
+    group_offsets = cp.asarray([0, 2, 4], dtype=cp.int64)
+    group_ids = cp.asarray([0, 1], dtype=cp.int64)
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    result = constructive_module._regroup_native_grouped_parts_with_grouped_union_gpu(
+        parts,
+        sorted_order,
+        group_offsets,
+        group_ids,
+        output_row_count=2,
+        allow_direct_disjoint_pack=False,
+        use_same_row_fast_path=True,
+    )
+    events = get_d2h_transfer_events(clear=True)
+
+    assert result is not None
+    assert result.row_count == 2
+    got = result.to_shapely()
+    assert shapely.normalize(got[0]).equals(
+        shapely.normalize(shapely.union_all(parts.to_shapely()[:2]))
+    )
+    assert shapely.normalize(got[1]).equals(
+        shapely.normalize(shapely.union_all(parts.to_shapely()[2:]))
+    )
+    assert "segment same-row span summary scalar fence" not in {event.reason for event in events}
+
+
+@requires_gpu
+def test_multipolygon_polygon_intersection_refines_bbox_overlap_before_union_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     left = from_shapely_geometries(
@@ -1109,14 +1371,323 @@ def test_multipolygon_polygon_intersection_regroups_with_grouped_union_plan(
             f"row {row}: regrouped multipart intersection mismatch"
         )
 
-    assert union_materialize_calls == 1
+    assert union_materialize_calls == 0
     assert segmented_union_calls == 0
 
+
+@requires_gpu
+def test_materialize_device_broadcast_stays_device_without_host_resolution() -> None:
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+
+    source = from_shapely_geometries(
+        [box(0.0, 0.0, 3.0, 2.0)],
+        residency=Residency.DEVICE,
+    )
+    tiled = tile_single_row(source, 5)
+
+    assert tiled.is_indexed_view
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    materialized = materialize_broadcast(tiled)
+    runtime_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert materialized.residency is Residency.DEVICE
+    assert not materialized.is_indexed_view
+    assert materialized.row_count == 5
+    assert materialized.families[GeometryFamily.POLYGON].row_count == 5
+    assert "materialized broadcast-right geometry on device" not in runtime_reasons
+    assert "owned geometry polygon coordinate-x materialization boundary" not in runtime_reasons
+    assert "owned geometry host metadata validity boundary" not in runtime_reasons
+
+
+@requires_gpu
+def test_device_broadcast_polygon_intersection_uses_row_indirected_right() -> None:
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    left_geoms = [
+        box(0.0, 0.0, 4.0, 4.0),
+        box(5.0, 0.0, 8.0, 3.0),
+        Polygon([(10.0, 0.0), (14.0, 0.0), (13.0, 4.0), (10.0, 3.0)]),
+    ]
+    right_geom = box(1.0, 1.0, 12.0, 2.5)
+    left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+    right = from_shapely_geometries([right_geom], residency=Residency.DEVICE)
+    tiled = tile_single_row(right, len(left_geoms))
+
+    assert tiled.is_indexed_view
+    assert hasattr(tiled._index_map, "__cuda_array_interface__")
+    assert bool(cp.all(tiled._index_map == 0))
+
+    source = Path(binary_constructive_module.__file__).read_text()
+    assert "materialize_broadcast" not in source
+
+    clear_dispatch_events()
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    result = binary_constructive_owned(
+        "intersection",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    runtime_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert result.residency is Residency.DEVICE
+    assert "owned geometry device-take nested slice-size allocation fence" not in runtime_reasons
+    assert "owned geometry device-take slice-size allocation fence" not in runtime_reasons
+    got = result.to_shapely()
+    expected = shapely.intersection(
+        np.asarray(left_geoms, dtype=object),
+        right_geom,
+    ).tolist()
+    for actual, oracle in zip(got, expected, strict=True):
+        assert actual is not None
+        assert shapely.normalize(actual).equals(shapely.normalize(oracle))
+
+    events = get_dispatch_events(clear=True)
+    assert any(
+        event.implementation == "polygon_intersection_partitioned_capacity_gpu" for event in events
+    )
+
+
+@requires_gpu
+def test_exact_broadcast_polygon_topology_keeps_one_physical_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.constructive.binary_constructive import (
+        _dispatch_polygon_intersection_overlay_broadcast_right_gpu,
+    )
+    from vibespatial.geometry.owned import OwnedGeometryArray
+    from vibespatial.overlay import gpu as overlay_gpu
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    left_geoms = [
+        box(0.0, 0.0, 3.0, 3.0),
+        box(4.2, 2.2, 5.2, 3.8),
+        box(8.0, 0.0, 9.0, 1.0),
+    ]
+    mask = Polygon(
+        [(1.0, 1.0), (6.0, 1.0), (6.0, 4.0), (4.0, 4.0), (4.0, 2.0), (1.0, 2.0)]
+    )
+    left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+    right = from_shapely_geometries([mask], residency=Residency.DEVICE)
+
+    def _reject_physical_broadcast(self, rows, *args, **kwargs):
+        raise AssertionError("broadcast-right topology physically repeated geometry rows")
+
+    monkeypatch.setattr(
+        OwnedGeometryArray,
+        "_physical_device_take",
+        _reject_physical_broadcast,
+    )
+    monkeypatch.setattr(
+        overlay_gpu,
+        "_compute_live_split_event_budget",
+        lambda: 120,
+    )
+    clear_dispatch_events()
+    result = _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result is not None
+    expected = shapely.intersection(np.asarray(left_geoms, dtype=object), mask)
+    for actual, oracle in zip(result.to_shapely(), expected, strict=True):
+        if oracle.is_empty:
+            assert actual is None or actual.is_empty
+        else:
+            assert actual is not None
+            assert shapely.normalize(actual).equals(shapely.normalize(oracle))
+
+    events = get_dispatch_events(clear=True)
+    event = next(
+        event
+        for event in events
+        if event.implementation == "broadcast_right_virtual_segment_topology_gpu"
+    )
+    assert "physical_right_segments=6" in event.detail
+    assert "logical_right_segments=18" in event.detail
+    assert any(
+        event.implementation == "broadcast_right_complete_row_topology_pages_gpu"
+        for event in events
+    )
+
+
+@requires_gpu
+def test_polygonal_multipart_difference_uses_one_batch_topology_plan() -> None:
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    left_geoms = [box(0, 0, 10, 10), box(20, 0, 30, 10)]
+    right_geoms = [
+        MultiPolygon([box(-1, 2, 3, 4), box(7, 6, 11, 8)]),
+        MultiPolygon([box(19, 1, 23, 3), box(27, 7, 31, 9)]),
+    ]
+    left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+    right = from_shapely_geometries(right_geoms, residency=Residency.DEVICE)
+
+    clear_dispatch_events()
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    result = binary_constructive_owned(
+        "difference",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    assert "polygonal difference polygon-part depth scalar fence" not in reasons
+    expected = [lhs.difference(rhs) for lhs, rhs in zip(left_geoms, right_geoms, strict=True)]
+    for actual, oracle in zip(result.to_shapely(), expected, strict=True):
+        assert shapely.normalize(actual).equals(shapely.normalize(oracle))
+
+    implementations = [event.implementation for event in get_dispatch_events(clear=True)]
+    assert "polygonal_multipart_grouped_difference_gpu" not in implementations
+    assert any(
+        implementation.startswith("row_aligned_difference_") for implementation in implementations
+    )
+
+
+@requires_gpu
+def test_lineal_polygonal_difference_subtracts_all_multipart_polygon_parts_on_device() -> None:
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    polygon_with_hole = Polygon(
+        [(1, -1), (5, -1), (5, 1), (1, 1), (1, -1)],
+        [[(2, -0.5), (4, -0.5), (4, 0.5), (2, 0.5), (2, -0.5)]],
+    )
+    left_geoms = [
+        LineString([(0, 0), (6, 0)]),
+        MultiLineString([[(0, 0), (4, 0)], [(0, 4), (6, 4)]]),
+        LineString([(-1, 0), (2, 0)]),
+        LineString(),
+        LineString([(0, 0), (3, 0)]),
+    ]
+    right_geoms = [
+        polygon_with_hole,
+        MultiPolygon([box(1, -1, 2, 1), box(3, 3, 5, 5)]),
+        box(0, 0, 1, 1),
+        box(0, 0, 1, 1),
+        None,
+    ]
+    left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+    right = from_shapely_geometries(right_geoms, residency=Residency.DEVICE)
+
+    clear_dispatch_events()
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    result = binary_constructive_owned(
+        "difference",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result.residency is Residency.DEVICE
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    assert "lineal-polygonal difference polygon-part depth scalar fence" not in reasons
+    got = result.to_shapely()
+    expected = [lhs.difference(rhs) for lhs, rhs in zip(left_geoms, right_geoms, strict=True)]
+    for actual, oracle in zip(got, expected, strict=True):
+        if oracle is None:
+            assert actual is None
+        else:
+            assert shapely.normalize(actual).equals(shapely.normalize(oracle))
+
+    events = get_dispatch_events(clear=True)
+    assert any(
+        event.implementation == "lineal_polygonal_collective_split_topology_gpu" for event in events
+    )
+
+
+@requires_gpu
+def test_rectangle_containment_difference_emits_hole_without_segment_extraction() -> None:
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    left_geoms = [box(0, 0, 10, 10), box(20, 0, 30, 10)]
+    right_geoms = [box(2, 2, 4, 4), box(23, 3, 27, 7)]
+    left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+    right = from_shapely_geometries(right_geoms, residency=Residency.DEVICE)
+
+    clear_dispatch_events()
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    result = binary_constructive_owned(
+        "difference",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    runtime_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert result.residency is Residency.DEVICE
+    got = result.to_shapely()
+    expected = [lhs.difference(rhs) for lhs, rhs in zip(left_geoms, right_geoms, strict=True)]
+    for actual, oracle in zip(got, expected, strict=True):
+        assert actual.equals(oracle)
+    assert "segment extraction total-segments allocation fence" not in runtime_reasons
+    events = get_dispatch_events(clear=True)
+    assert any(
+        event.implementation == "row_aligned_polygon_hole_difference_gpu"
+        for event in events
+    )
+
+
+@requires_gpu
+def test_nonrect_containment_difference_emits_native_hole_capacity() -> None:
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    left_geoms = [
+        Polygon(
+            [(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)],
+            holes=[[(7, 7), (8, 7), (8, 8), (7, 8), (7, 7)]],
+        ),
+        Polygon([(20, 0), (31, 0), (30, 10), (20, 9), (20, 0)]),
+    ]
+    right_geoms = [
+        Polygon([(1, 1), (5, 1), (4, 5), (1, 4), (1, 1)]),
+        Polygon([(22, 2), (27, 1), (28, 6), (23, 7), (22, 2)]),
+    ]
+    left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+    right = from_shapely_geometries(right_geoms, residency=Residency.DEVICE)
+
+    clear_dispatch_events()
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    result = binary_constructive_owned(
+        "difference",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    runtime_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    expected = [lhs.difference(rhs) for lhs, rhs in zip(left_geoms, right_geoms, strict=True)]
+    for actual, oracle in zip(result.to_shapely(), expected, strict=True):
+        assert shapely.equals(shapely.normalize(actual), shapely.normalize(oracle))
+    assert "segment extraction total-segments allocation fence" not in runtime_reasons
+    assert any(
+        event.implementation == "row_aligned_polygon_hole_difference_gpu"
+        for event in get_dispatch_events(clear=True)
+    )
 
 
 # ---------------------------------------------------------------------------
 # 7. tile_single_row unit tests
 # ---------------------------------------------------------------------------
+
 
 def test_tile_single_row_metadata() -> None:
     """tile_single_row produces correct metadata arrays."""

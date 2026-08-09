@@ -4,12 +4,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from vibespatial import has_gpu_runtime
 from vibespatial.geometry.buffers import GeometryFamily
 
 try:
     import cupy as cp
 
-    HAS_GPU = True
+    HAS_GPU = has_gpu_runtime()
 except (ImportError, ModuleNotFoundError):
     HAS_GPU = False
 
@@ -450,10 +451,8 @@ class TestReadKmlGpu:
         owned = kml_result.geometry
 
         x, y = _get_device_coords(owned, GeometryFamily.POINT)
-        # parse_ascii_floats has limited precision for very long decimals,
-        # but should be within 1e-8 for typical coordinate values.
-        np.testing.assert_allclose(x[0], lon, rtol=1e-8)
-        np.testing.assert_allclose(y[0], lat, rtol=1e-8)
+        assert float(x[0]).hex() == float(lon).hex()
+        assert float(y[0]).hex() == float(lat).hex()
 
     @needs_gpu
     def test_2d_coordinates_no_altitude(self):

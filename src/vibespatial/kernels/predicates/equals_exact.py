@@ -51,14 +51,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-
 def _compile_equals_exact_kernels(compute_type: str = "double"):
     """Compile the equals_exact kernel source for the given compute precision."""
     source = _format_kernel_source(compute_type)
     runtime = get_cuda_runtime()
-    cache_key = make_kernel_cache_key(
-        f"equals-exact-{compute_type}", source
-    )
+    cache_key = make_kernel_cache_key(f"equals-exact-{compute_type}", source)
     return runtime.compile_kernels(
         cache_key=cache_key,
         source=source,
@@ -72,15 +69,18 @@ def _compile_equals_exact_kernels(compute_type: str = "double"):
 _WARMUP_SOURCE_FP64 = _format_kernel_source("double")
 _WARMUP_SOURCE_FP32 = _format_kernel_source("float")
 
-request_nvrtc_warmup([
-    ("equals-exact-double", _WARMUP_SOURCE_FP64, _KERNEL_NAMES),
-    ("equals-exact-float", _WARMUP_SOURCE_FP32, _KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("equals-exact-double", _WARMUP_SOURCE_FP64, _KERNEL_NAMES),
+        ("equals-exact-float", _WARMUP_SOURCE_FP32, _KERNEL_NAMES),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # Kernel variant registration
 # ---------------------------------------------------------------------------
+
 
 @register_kernel_variant(
     "geom_equals_exact",
@@ -88,8 +88,12 @@ request_nvrtc_warmup([
     kernel_class=KernelClass.PREDICATE,
     execution_modes=("gpu",),
     geometry_families=(
-        "point", "linestring", "polygon",
-        "multipoint", "multilinestring", "multipolygon",
+        "point",
+        "linestring",
+        "polygon",
+        "multipoint",
+        "multilinestring",
+        "multipolygon",
     ),
     supports_mixed=True,
     preferred_residency=Residency.DEVICE,
@@ -150,24 +154,33 @@ def launch_equals_exact_family(
     grid, block = runtime.launch_config(kernel, n)
 
     # Build parameter list depending on family offset structure
-    if family in (GeometryFamily.POINT, GeometryFamily.MULTIPOINT,
-                  GeometryFamily.LINESTRING):
+    if family in (GeometryFamily.POINT, GeometryFamily.MULTIPOINT, GeometryFamily.LINESTRING):
         # Simple: geometry_offsets -> coordinates
         params = (
             (
-                ptr(left_buf.x), ptr(left_buf.y), ptr(left_buf.geometry_offsets),
-                ptr(right_buf.x), ptr(right_buf.y), ptr(right_buf.geometry_offsets),
+                ptr(left_buf.x),
+                ptr(left_buf.y),
+                ptr(left_buf.geometry_offsets),
+                ptr(right_buf.x),
+                ptr(right_buf.y),
+                ptr(right_buf.geometry_offsets),
                 ptr(row_indices_device),
-                ptr(left_state.family_row_offsets), ptr(right_state.family_row_offsets),
+                ptr(left_state.family_row_offsets),
+                ptr(right_state.family_row_offsets),
                 tolerance,
                 ptr(d_out),
                 n,
             ),
             (
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_F64,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_I32,
@@ -178,23 +191,33 @@ def launch_equals_exact_family(
         # geometry_offsets -> part_offsets -> coordinates
         params = (
             (
-                ptr(left_buf.x), ptr(left_buf.y),
-                ptr(left_buf.geometry_offsets), ptr(left_buf.part_offsets),
-                ptr(right_buf.x), ptr(right_buf.y),
-                ptr(right_buf.geometry_offsets), ptr(right_buf.part_offsets),
+                ptr(left_buf.x),
+                ptr(left_buf.y),
+                ptr(left_buf.geometry_offsets),
+                ptr(left_buf.part_offsets),
+                ptr(right_buf.x),
+                ptr(right_buf.y),
+                ptr(right_buf.geometry_offsets),
+                ptr(right_buf.part_offsets),
                 ptr(row_indices_device),
-                ptr(left_state.family_row_offsets), ptr(right_state.family_row_offsets),
+                ptr(left_state.family_row_offsets),
+                ptr(right_state.family_row_offsets),
                 tolerance,
                 ptr(d_out),
                 n,
             ),
             (
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_F64,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_I32,
@@ -205,23 +228,33 @@ def launch_equals_exact_family(
         # geometry_offsets -> ring_offsets -> coordinates
         params = (
             (
-                ptr(left_buf.x), ptr(left_buf.y),
-                ptr(left_buf.geometry_offsets), ptr(left_buf.ring_offsets),
-                ptr(right_buf.x), ptr(right_buf.y),
-                ptr(right_buf.geometry_offsets), ptr(right_buf.ring_offsets),
+                ptr(left_buf.x),
+                ptr(left_buf.y),
+                ptr(left_buf.geometry_offsets),
+                ptr(left_buf.ring_offsets),
+                ptr(right_buf.x),
+                ptr(right_buf.y),
+                ptr(right_buf.geometry_offsets),
+                ptr(right_buf.ring_offsets),
                 ptr(row_indices_device),
-                ptr(left_state.family_row_offsets), ptr(right_state.family_row_offsets),
+                ptr(left_state.family_row_offsets),
+                ptr(right_state.family_row_offsets),
                 tolerance,
                 ptr(d_out),
                 n,
             ),
             (
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_F64,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_I32,
@@ -232,27 +265,37 @@ def launch_equals_exact_family(
         # geometry_offsets -> part_offsets -> ring_offsets -> coordinates
         params = (
             (
-                ptr(left_buf.x), ptr(left_buf.y),
-                ptr(left_buf.geometry_offsets), ptr(left_buf.part_offsets),
+                ptr(left_buf.x),
+                ptr(left_buf.y),
+                ptr(left_buf.geometry_offsets),
+                ptr(left_buf.part_offsets),
                 ptr(left_buf.ring_offsets),
-                ptr(right_buf.x), ptr(right_buf.y),
-                ptr(right_buf.geometry_offsets), ptr(right_buf.part_offsets),
+                ptr(right_buf.x),
+                ptr(right_buf.y),
+                ptr(right_buf.geometry_offsets),
+                ptr(right_buf.part_offsets),
                 ptr(right_buf.ring_offsets),
                 ptr(row_indices_device),
-                ptr(left_state.family_row_offsets), ptr(right_state.family_row_offsets),
+                ptr(left_state.family_row_offsets),
+                ptr(right_state.family_row_offsets),
                 tolerance,
                 ptr(d_out),
                 n,
             ),
             (
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_F64,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_I32,

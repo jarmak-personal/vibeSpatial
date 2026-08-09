@@ -41,6 +41,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
@@ -58,15 +59,18 @@ from vibespatial.constructive.affine_transform_kernels import (
 # Background precompilation
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 
-request_nvrtc_warmup([
-    ("affine-transform-fp64", _AFFINE_FP64, _AFFINE_KERNEL_NAMES),
-    ("affine-transform-fp32", _AFFINE_FP32, _AFFINE_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("affine-transform-fp64", _AFFINE_FP64, _AFFINE_KERNEL_NAMES),
+        ("affine-transform-fp32", _AFFINE_FP32, _AFFINE_KERNEL_NAMES),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # Matrix builders for each affine operation
 # ---------------------------------------------------------------------------
+
 
 def _affine_matrix(matrix) -> tuple[float, float, float, float, float, float]:
     """Convert a shapely-compatible affine matrix to (a, b, xoff, d, e, yoff)."""
@@ -80,7 +84,9 @@ def _affine_matrix(matrix) -> tuple[float, float, float, float, float, float]:
 
 
 def _translate_matrix(
-    xoff: float = 0.0, yoff: float = 0.0, zoff: float = 0.0,
+    xoff: float = 0.0,
+    yoff: float = 0.0,
+    zoff: float = 0.0,
 ) -> tuple[float, float, float, float, float, float]:
     return (1.0, 0.0, float(xoff), 0.0, 1.0, float(yoff))
 
@@ -135,11 +141,16 @@ def _compose_around_origin(
 # GPU kernel launcher
 # ---------------------------------------------------------------------------
 
+
 def _launch_affine_family(
     runtime,
     device_buf: DeviceFamilyGeometryBuffer,
-    a: float, b: float, xoff: float,
-    d: float, e: float, yoff: float,
+    a: float,
+    b: float,
+    xoff: float,
+    d: float,
+    e: float,
+    yoff: float,
     compute_type: str = "double",
 ) -> tuple:
     """Apply affine transform to one family's coordinates on device.
@@ -160,17 +171,36 @@ def _launch_affine_family(
 
     ptr = runtime.pointer
     params = (
-        (ptr(device_buf.x), ptr(device_buf.y),
-         ptr(d_x_out), ptr(d_y_out),
-         a, b, xoff, d, e, yoff,
-         0.0, 0.0,  # center_x, center_y (unused for affine)
-         coord_count),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-         KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-         KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-         KERNEL_PARAM_I32),
+        (
+            ptr(device_buf.x),
+            ptr(device_buf.y),
+            ptr(d_x_out),
+            ptr(d_y_out),
+            a,
+            b,
+            xoff,
+            d,
+            e,
+            yoff,
+            0.0,
+            0.0,  # center_x, center_y (unused for affine)
+            coord_count,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_I32,
+        ),
     )
     grid, block = runtime.launch_config(kernel, coord_count)
     runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -181,19 +211,31 @@ def _launch_affine_family(
 # GPU implementation
 # ---------------------------------------------------------------------------
 
+
 @register_kernel_variant(
     "affine_transform",
     "gpu-cuda-python",
     kernel_class=KernelClass.COARSE,
     execution_modes=(ExecutionMode.GPU,),
-    geometry_families=("point", "multipoint", "linestring", "multilinestring", "polygon", "multipolygon"),
+    geometry_families=(
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
+    ),
     supports_mixed=True,
     tags=("cuda-python", "constructive", "affine", "transform"),
 )
 def _affine_transform_gpu(
     owned: OwnedGeometryArray,
-    a: float, b: float, xoff: float,
-    d: float, e: float, yoff: float,
+    a: float,
+    b: float,
+    xoff: float,
+    d: float,
+    e: float,
+    yoff: float,
 ) -> OwnedGeometryArray:
     """GPU affine transform — returns device-resident OwnedGeometryArray.
 
@@ -207,7 +249,14 @@ def _affine_transform_gpu(
     new_device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
     for family, device_buf in d_state.families.items():
         d_x_out, d_y_out = _launch_affine_family(
-            runtime, device_buf, a, b, xoff, d, e, yoff,
+            runtime,
+            device_buf,
+            a,
+            b,
+            xoff,
+            d,
+            e,
+            yoff,
         )
         # Share all offset/metadata buffers from input — only coords change
         new_device_families[family] = DeviceFamilyGeometryBuffer(
@@ -236,19 +285,31 @@ def _affine_transform_gpu(
 # CPU fallback
 # ---------------------------------------------------------------------------
 
+
 @register_kernel_variant(
     "affine_transform",
     "cpu",
     kernel_class=KernelClass.COARSE,
     execution_modes=(ExecutionMode.CPU,),
-    geometry_families=("point", "multipoint", "linestring", "multilinestring", "polygon", "multipolygon"),
+    geometry_families=(
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
+    ),
     supports_mixed=True,
     tags=("numpy", "constructive", "affine"),
 )
 def _affine_transform_cpu(
     owned: OwnedGeometryArray,
-    a: float, b: float, xoff: float,
-    d: float, e: float, yoff: float,
+    a: float,
+    b: float,
+    xoff: float,
+    d: float,
+    e: float,
+    yoff: float,
 ) -> OwnedGeometryArray:
     """CPU affine transform — vectorized NumPy on coordinate buffers."""
 
@@ -285,6 +346,7 @@ def _affine_transform_cpu(
 # Public dispatch API
 # ---------------------------------------------------------------------------
 
+
 def affine_transform_owned(
     owned: OwnedGeometryArray,
     matrix,
@@ -311,6 +373,11 @@ def affine_transform_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
         current_residency=owned.residency,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            primary_unit_name="affine-coordinate",
+        ),
     )
 
     if selection.selected is ExecutionMode.GPU:

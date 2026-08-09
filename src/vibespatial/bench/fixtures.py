@@ -21,6 +21,7 @@ _DEFAULT_FIXTURE_DIR = Path(__file__).resolve().parents[3] / ".benchmark_fixture
 # Input format enum
 # ---------------------------------------------------------------------------
 
+
 class InputFormat(StrEnum):
     PARQUET = "parquet"
     GEOJSON = "geojson"
@@ -69,7 +70,9 @@ DEFAULT_BENCHMARK_FIXTURES: tuple[BenchmarkFixtureSpec, ...] = (
     BenchmarkFixtureSpec("points-grid-rows1000000", "point", "grid", 1_000_000),
     BenchmarkFixtureSpec("lines-random-walk-rows1000", "line", "random-walk", 1_000, vertices=8),
     BenchmarkFixtureSpec("lines-random-walk-rows10000", "line", "random-walk", 10_000, vertices=8),
-    BenchmarkFixtureSpec("lines-random-walk-rows100000", "line", "random-walk", 100_000, vertices=8),
+    BenchmarkFixtureSpec(
+        "lines-random-walk-rows100000", "line", "random-walk", 100_000, vertices=8
+    ),
     BenchmarkFixtureSpec("polygons-regular-grid-rows1000", "polygon", "regular-grid", 1_000),
     BenchmarkFixtureSpec("polygons-regular-grid-rows10000", "polygon", "regular-grid", 10_000),
     BenchmarkFixtureSpec("polygons-regular-grid-rows100000", "polygon", "regular-grid", 100_000),
@@ -113,7 +116,9 @@ def get_fixture_spec(name: str) -> BenchmarkFixtureSpec:
     raise KeyError(f"Unknown benchmark fixture: {name}")
 
 
-def fixture_path(spec_or_name: BenchmarkFixtureSpec | str, *, fixture_dir: str | Path | None = None) -> Path:
+def fixture_path(
+    spec_or_name: BenchmarkFixtureSpec | str, *, fixture_dir: str | Path | None = None
+) -> Path:
     spec = get_fixture_spec(spec_or_name) if isinstance(spec_or_name, str) else spec_or_name
     root = Path(fixture_dir) if fixture_dir is not None else default_fixture_dir()
     return root / f"{spec.name}.parquet"
@@ -156,6 +161,7 @@ def ensure_fixture(
 # ---------------------------------------------------------------------------
 # Multi-format fixture support
 # ---------------------------------------------------------------------------
+
 
 def fixture_path_for_format(
     spec_or_name: BenchmarkFixtureSpec | str,
@@ -242,7 +248,10 @@ def ensure_fixture_all_formats(
         formats = ALL_INPUT_FORMATS
     return {
         InputFormat(fmt): ensure_fixture_format(
-            spec_or_name, fmt, fixture_dir=fixture_dir, force=force,
+            spec_or_name,
+            fmt,
+            fixture_dir=fixture_dir,
+            force=force,
         )
         for fmt in formats
     }
@@ -251,6 +260,7 @@ def ensure_fixture_all_formats(
 # ---------------------------------------------------------------------------
 # Dynamic fixture resolution
 # ---------------------------------------------------------------------------
+
 
 def resolve_fixture_spec(
     geometry_type: str,
@@ -296,6 +306,7 @@ def resolve_fixture_spec(
 # Shifted fixture variants (for binary operations)
 # ---------------------------------------------------------------------------
 
+
 def resolve_shifted_fixture_spec(
     base: BenchmarkFixtureSpec,
     *,
@@ -339,7 +350,9 @@ def ensure_shifted_fixture(
     fmt = InputFormat(fmt) if not isinstance(fmt, InputFormat) else fmt
 
     # Check if canonical parquet already exists
-    parquet_path = fixture_path_for_format(shifted_spec, InputFormat.PARQUET, fixture_dir=fixture_dir)
+    parquet_path = fixture_path_for_format(
+        shifted_spec, InputFormat.PARQUET, fixture_dir=fixture_dir
+    )
     if not parquet_path.exists() or force:
         # Load base fixture, shift, write
         base_parquet = ensure_fixture(base, fixture_dir=fixture_dir, force=False)
@@ -362,7 +375,10 @@ def ensure_shifted_fixture(
 # Specialized fixture variants
 # ---------------------------------------------------------------------------
 
-def resolve_invalids_fixture_spec(scale: int, *, invalid_ratio: float = 0.05) -> BenchmarkFixtureSpec:
+
+def resolve_invalids_fixture_spec(
+    scale: int, *, invalid_ratio: float = 0.05
+) -> BenchmarkFixtureSpec:
     """Spec for a polygon fixture with some invalid geometries baked in."""
     return BenchmarkFixtureSpec(
         name=f"polygons-with-invalids-rows{scale}",
@@ -399,7 +415,9 @@ def ensure_invalids_fixture(
                 geometries.append(Polygon([(x, 0), (x, 1), (x + 1, 1), (x + 1, 0)]))
 
         frame = geopandas.GeoDataFrame(
-            {"geometry": geometries}, geometry="geometry", crs="EPSG:4326",
+            {"geometry": geometries},
+            geometry="geometry",
+            crs="EPSG:4326",
         )
         parquet_path.parent.mkdir(parents=True, exist_ok=True)
         write_geoparquet(frame, parquet_path, geometry_encoding="geoarrow")

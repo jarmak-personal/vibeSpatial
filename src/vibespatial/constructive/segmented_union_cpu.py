@@ -30,14 +30,10 @@ def segmented_union_pair_cpu(
     left_geoms = owned_to_shapely(left)
     right_geoms = owned_to_shapely(right)
     left_geom = (
-        left_geoms[0]
-        if left_geoms.size > 0 and left_geoms[0] is not None
-        else _EMPTY_POLYGON
+        left_geoms[0] if left_geoms.size > 0 and left_geoms[0] is not None else _EMPTY_POLYGON
     )
     right_geom = (
-        right_geoms[0]
-        if right_geoms.size > 0 and right_geoms[0] is not None
-        else _EMPTY_POLYGON
+        right_geoms[0] if right_geoms.size > 0 and right_geoms[0] is not None else _EMPTY_POLYGON
     )
 
     merged = shapely.union(left_geom, right_geom)

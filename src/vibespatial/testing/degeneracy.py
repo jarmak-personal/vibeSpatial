@@ -75,7 +75,9 @@ class SegmentVerification:
         return asdict(self)
 
 
-def _build_geodataframe(geometries: tuple[object | None, ...], *, prefix: str) -> geopandas.GeoDataFrame:
+def _build_geodataframe(
+    geometries: tuple[object | None, ...], *, prefix: str
+) -> geopandas.GeoDataFrame:
     return geopandas.GeoDataFrame(
         {f"{prefix}_id": list(range(len(geometries)))},
         geometry=list(geometries),
@@ -191,7 +193,11 @@ def overlay_cases() -> tuple[DegeneracyCase, ...]:
 
 
 def clip_cases() -> tuple[DegeneracyCase, ...]:
-    return tuple(case for case in DEGENERACY_CORPUS if case.clip_expectation is not None and case.clip_mask is not None)
+    return tuple(
+        case
+        for case in DEGENERACY_CORPUS
+        if case.clip_expectation is not None and case.clip_mask is not None
+    )
 
 
 def segment_cases() -> tuple[DegeneracyCase, ...]:
@@ -211,14 +217,18 @@ def verify_overlay_case(case: DegeneracyCase) -> OverlayVerification:
     raw_error: str | None = None
     if case.overlay_expectation.raw_error_substring is not None:
         try:
-            geopandas.overlay(left, right, how="intersection", make_valid=False, keep_geom_type=False)
+            geopandas.overlay(
+                left, right, how="intersection", make_valid=False, keep_geom_type=False
+            )
         except Exception as exc:
             raw_failed = True
             raw_error = str(exc)
         else:
             raw_error = None
 
-    result = geopandas.overlay(left, right, how="intersection", make_valid=True, keep_geom_type=False)
+    result = geopandas.overlay(
+        left, right, how="intersection", make_valid=True, keep_geom_type=False
+    )
     return OverlayVerification(
         name=case.name,
         rows_with_make_valid=len(result),

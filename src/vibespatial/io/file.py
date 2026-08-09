@@ -11,7 +11,7 @@ from time import perf_counter
 from vibespatial.geometry.owned import (
     OwnedGeometryArray,
 )
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import get_fallback_events, record_fallback_event
 from vibespatial.runtime.materialization import NativeExportBoundary, record_native_export_boundary
@@ -99,9 +99,7 @@ def _native_payload_geometry_type(payload) -> str:
     owned = payload.geometry.owned
     if owned is not None:
         geometry_types = sorted(
-            family_names[family]
-            for family in owned.families
-            if family in family_names
+            family_names[family] for family in owned.families if family in family_names
         )
         return geometry_types[0] if len(geometry_types) == 1 else "Unknown"
 
@@ -507,7 +505,9 @@ def _read_osm_pbf_supported_layers_native(
             for layer_name in _OSM_PYOGRIO_DEFAULT_LAYERS
         ]
     else:
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="osm-pbf-layer") as executor:
+        with ThreadPoolExecutor(
+            max_workers=worker_count, thread_name_prefix="osm-pbf-layer"
+        ) as executor:
             futures = [
                 executor.submit(
                     _read_osm_pbf_pyogrio_layer_native,
@@ -556,7 +556,9 @@ def _read_osm_pbf_supported_layers_public(
             for layer_name in _OSM_PYOGRIO_DEFAULT_LAYERS
         ]
     else:
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="osm-pbf-layer") as executor:
+        with ThreadPoolExecutor(
+            max_workers=worker_count, thread_name_prefix="osm-pbf-layer"
+        ) as executor:
             futures = [
                 executor.submit(
                     _read_osm_pbf_pyogrio_layer_public,
@@ -702,9 +704,7 @@ def _write_vector_file_native_pyogrio(
     from vibespatial.api.io.file import _check_metadata_supported, _detect_driver, _expand_user
 
     if schema is not None:
-        raise ValueError(
-            "The 'schema' argument is not supported with the 'pyogrio' engine."
-        )
+        raise ValueError("The 'schema' argument is not supported with the 'pyogrio' engine.")
     if crs is not None:
         raise ValueError("Passing 'crs' is not supported with the 'pyogrio' engine.")
     append = kwargs.pop("append", None)
@@ -726,17 +726,19 @@ def _write_vector_file_native_pyogrio(
         geometry_encoding="WKB",
         force_device_geometry_encode=force_device_geometry_encode,
     )
-    record_native_export_boundary(NativeExportBoundary(
-        surface="vibespatial.io.file._write_vector_file_native_pyogrio",
-        operation="native_tabular_to_file",
-        target="file",
-        reason="native tabular result exported to pyogrio Arrow vector-file sink",
-        detail=(
-            f"driver={driver_name}, attribute_columns={len(normalized.attributes.columns)}, "
-            f"geometry_encoding=WKB, device_geometry_encode={int(force_device_geometry_encode)}"
-        ),
-        row_count=normalized.geometry.row_count,
-    ))
+    record_native_export_boundary(
+        NativeExportBoundary(
+            surface="vibespatial.io.file._write_vector_file_native_pyogrio",
+            operation="native_tabular_to_file",
+            target="file",
+            reason="native tabular result exported to pyogrio Arrow vector-file sink",
+            detail=(
+                f"driver={driver_name}, attribute_columns={len(normalized.attributes.columns)}, "
+                f"geometry_encoding=WKB, device_geometry_encode={int(force_device_geometry_encode)}"
+            ),
+            row_count=normalized.geometry.row_count,
+        )
+    )
 
     pyogrio.write_arrow(
         arrow_table,
@@ -928,10 +930,7 @@ def _pyogrio_metadata_dtype_map(metadata: dict[str, object]) -> dict[str, str]:
     dtypes = metadata.get("dtypes")
     if fields is None or dtypes is None:
         return {}
-    return {
-        str(field): str(dtype)
-        for field, dtype in zip(fields, dtypes)
-    }
+    return {str(field): str(dtype) for field, dtype in zip(fields, dtypes)}
 
 
 def _pyogrio_public_attribute_table_from_arrow(table, metadata: dict[str, object]):
@@ -1136,25 +1135,15 @@ def read_geojson_native(
 def _geojsonseq_inline_featurecollection_payload(path: Path) -> bytes:
     raw = path.read_bytes().strip()
     if b"\x1e" in raw:
-        records = [
-            record.strip()
-            for record in raw.split(b"\x1e")
-            if record.strip()
-        ]
+        records = [record.strip() for record in raw.split(b"\x1e") if record.strip()]
     elif raw:
         records = [
-            record.strip()
-            for record in raw.replace(b"\r\n", b"\n").split(b"\n")
-            if record.strip()
+            record.strip() for record in raw.replace(b"\r\n", b"\n").split(b"\n") if record.strip()
         ]
     else:
         records = []
     body = b",".join(records)
-    return (
-        _GEOJSONSEQ_FEATURECOLLECTION_PREFIX
-        + body
-        + _GEOJSONSEQ_FEATURECOLLECTION_SUFFIX
-    )
+    return _GEOJSONSEQ_FEATURECOLLECTION_PREFIX + body + _GEOJSONSEQ_FEATURECOLLECTION_SUFFIX
 
 
 def _geojsonseq_uses_record_separator(path: Path) -> bool:
@@ -1428,7 +1417,7 @@ def _resolve_named_file_source_path(source) -> Path | None:
             return None
         candidate = source
         if candidate.startswith("/vsizip/"):
-            candidate = candidate[len("/vsizip/"):]
+            candidate = candidate[len("/vsizip/") :]
         parsed = urlparse(candidate)
         if parsed.scheme:
             if (
@@ -1462,7 +1451,7 @@ def _is_remote_named_file_source(source) -> bool:
         if candidate.startswith("{") or candidate.startswith("["):
             return False
         if candidate.startswith("/vsizip/"):
-            candidate = candidate[len("/vsizip/"):]
+            candidate = candidate[len("/vsizip/") :]
         parsed = urlparse(candidate)
         if parsed.scheme == "zip":
             return bool(parsed.netloc) or _is_remote_named_file_source(parsed.path)
@@ -1635,7 +1624,9 @@ def plan_vector_file_io(
     operation: IOOperation | str,
     driver: str | None = None,
 ) -> VectorFilePlan:
-    normalized_operation = operation if isinstance(operation, IOOperation) else IOOperation(operation)
+    normalized_operation = (
+        operation if isinstance(operation, IOOperation) else IOOperation(operation)
+    )
     normalized_driver = _normalize_driver(filename, driver)
     if normalized_driver == "GeoJSON":
         io_format = IOFormat.GEOJSON
@@ -1715,7 +1706,9 @@ def plan_vector_file_io(
     else:
         io_format = IOFormat.GDAL_LEGACY
         implementation = "legacy_gdal_adapter"
-        reason = "Legacy GDAL-backed vector formats route through host file-engine adapters for parity."
+        reason = (
+            "Legacy GDAL-backed vector formats route through host file-engine adapters for parity."
+        )
     support_plan = plan_io_support(io_format, normalized_operation)
     return VectorFilePlan(
         format=io_format,
@@ -1955,9 +1948,7 @@ def _try_csv_pylibcudf_read_native(filename, *, target_crs: str | None = None):
     if layout.geometry_format not in {"wkt", "wkb"}:
         return None
 
-    options = plc.io.csv.CsvReaderOptions.builder(
-        plc.io.types.SourceInfo([str(file_path)])
-    ).build()
+    options = plc.io.csv.CsvReaderOptions.builder(plc.io.types.SourceInfo([str(file_path)])).build()
     options.set_header(0)
     csv_table = plc.io.csv.read_csv(options)
     column_names = csv_table.column_names()
@@ -1979,9 +1970,7 @@ def _try_csv_pylibcudf_read_native(filename, *, target_crs: str | None = None):
     else:
         owned = _decode_hex_string_column_to_owned(geom_column)
 
-    attribute_names = [
-        name for idx, name in enumerate(column_names) if idx != geom_idx
-    ]
+    attribute_names = [name for idx, name in enumerate(column_names) if idx != geom_idx]
     attributes = None
     if attribute_names:
         attributes = csv_table.tbl.to_arrow(metadata=column_names).select(attribute_names)
@@ -2076,11 +2065,11 @@ def _try_shapefile_shp_direct_gpu_read_native(
     *,
     target_crs: str | None = None,
 ):
+    if not has_gpu_runtime():
+        return None
+
     file_path = Path(filename)
-    is_zip = (
-        file_path.suffix.lower() == ".zip"
-        or str(file_path).lower().endswith(".shp.zip")
-    )
+    is_zip = file_path.suffix.lower() == ".zip" or str(file_path).lower().endswith(".shp.zip")
 
     crs = None
     attrs_df = None
@@ -2495,7 +2484,7 @@ def _try_gpu_read_file_native(
     plan,
     engine=None,
     bbox,
-    mask,
+    mask=None,
     columns,
     rows,
     target_crs: str | None = None,
@@ -2543,9 +2532,8 @@ def _try_gpu_read_file_native(
             geometry_only=osm_geometry_only,
         )
     )
-    use_pyogrio_osm_layer = (
-        plan.format is IOFormat.OSM_PBF
-        and _osm_uses_pyogrio_compat_layer(layer=osm_layer, tags=osm_tags)
+    use_pyogrio_osm_layer = plan.format is IOFormat.OSM_PBF and _osm_uses_pyogrio_compat_layer(
+        layer=osm_layer, tags=osm_tags
     )
 
     if osm_pyogrio_default:
@@ -2597,12 +2585,7 @@ def _try_gpu_read_file_native(
             )
         return payload
 
-    if (
-        use_pyogrio_osm_layer
-        and bbox is None
-        and columns is None
-        and rows is None
-    ):
+    if use_pyogrio_osm_layer and bbox is None and columns is None and rows is None:
         normalized_osm_layer = _normalize_osm_layer(osm_layer)
         payload = _read_osm_pbf_pyogrio_layer_native(
             filename,
@@ -2748,7 +2731,9 @@ def _try_gpu_read_file_native(
         if plan.format is IOFormat.GEOJSON and _prefer_pipeline_native_read(plan):
             geojson_source = _resolve_geojson_native_source(filename)
             geojson_plan = plan_geojson_ingest(
-                prefer="auto" if _geojson_pipeline_prefers_gpu_for_source(geojson_source) else "fast-json",
+                prefer="auto"
+                if _geojson_pipeline_prefers_gpu_for_source(geojson_source)
+                else "fast-json",
                 objective="pipeline",
             )
             try:
@@ -2944,7 +2929,7 @@ def _try_gpu_read_file(
     plan,
     engine=None,
     bbox,
-    mask,
+    mask=None,
     columns,
     rows,
     target_crs: str | None = None,
@@ -3126,7 +3111,7 @@ def read_vector_file_native(
                 f"Cannot read OSM PBF file '{filename}': GPU runtime is required for "
                 "full-data OSM PBF reads. Standard layered reads "
                 "(`points`, `lines`, `multipolygons`) can use the pyogrio "
-                "compatibility path; `layer=\"all\"` and native-only tag modes "
+                'compatibility path; `layer="all"` and native-only tag modes '
                 "require the GPU OSM reader."
             )
 
@@ -3392,9 +3377,7 @@ def read_vector_file(
         gpu_failure = _latest_read_file_gpu_failure(fallback_start)
         if gpu_failure is not None:
             detail = gpu_failure.detail or gpu_failure.reason
-            raise RuntimeError(
-                f"Cannot read WKT file '{filename}': GPU WKT read failed: {detail}"
-            )
+            raise RuntimeError(f"Cannot read WKT file '{filename}': GPU WKT read failed: {detail}")
         raise RuntimeError(
             f"Cannot read WKT file '{filename}': GPU runtime is required for raw "
             "WKT files (pyogrio/GDAL does not support this format). Ensure a CUDA "
@@ -3419,7 +3402,7 @@ def read_vector_file(
                 f"Cannot read OSM PBF file '{filename}': GPU runtime is required for "
                 "full-data OSM PBF reads. Standard layered reads "
                 "(`points`, `lines`, `multipolygons`) can use the pyogrio "
-                "compatibility path; `layer=\"all\"` and native-only tag modes "
+                'compatibility path; `layer="all"` and native-only tag modes '
                 "require the GPU OSM reader."
             )
 
@@ -3542,15 +3525,19 @@ def write_vector_file(
             kwargs=kwargs,
         )
 
-    use_native_pyogrio_write = payload is not None and chosen_engine == "pyogrio" and (
-        not is_public_spatial or native_write_blocker is None
+    use_native_pyogrio_write = (
+        payload is not None
+        and chosen_engine == "pyogrio"
+        and (not is_public_spatial or native_write_blocker is None)
     )
     force_device_geometry_encode = bool(is_public_spatial and native_write_blocker is None)
     if use_native_pyogrio_write:
         column_names = [*payload.attributes.columns, payload.geometry_name]
         driver_name = driver or plan.driver
         api_file._check_metadata_supported(kwargs.get("metadata"), chosen_engine, driver_name)
-        if driver_name == "ESRI Shapefile" and any(len(str(column)) > 10 for column in column_names):
+        if driver_name == "ESRI Shapefile" and any(
+            len(str(column)) > 10 for column in column_names
+        ):
             import warnings
 
             warnings.warn(

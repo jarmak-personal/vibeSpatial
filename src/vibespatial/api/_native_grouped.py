@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from vibespatial.api._native_rowset import NativeIndexPlan
+from vibespatial.api._native_rowset import NativeDeviceSelection, NativeIndexPlan
 from vibespatial.runtime.materialization import (
     NativeExportBoundary,
     record_native_export_boundary,
@@ -135,10 +135,7 @@ def _is_numeric_like(values: Any) -> bool:
         normalized = np.dtype(dtype)
     except TypeError:
         return False
-    return bool(
-        np.issubdtype(normalized, np.number)
-        or np.issubdtype(normalized, np.bool_)
-    )
+    return bool(np.issubdtype(normalized, np.number) or np.issubdtype(normalized, np.bool_))
 
 
 def _normalized_dtype(values: Any) -> np.dtype:
@@ -217,9 +214,7 @@ def _cupy_extrema_scatter(
         scratch_dtype = xp.float64 if dtype.itemsize == 8 else xp.float32
         final_dtype = dtype
     else:
-        raise TypeError(
-            "NativeGrouped min/max reducers admit only real numeric or bool values"
-        )
+        raise TypeError("NativeGrouped min/max reducers admit only real numeric or bool values")
 
     reduced = xp.empty(int(group_count), dtype=scratch_dtype)
     reduced[...] = _extrema_identity(scratch_dtype, reducer)
@@ -258,6 +253,16 @@ class NativeGroupedReduction:
 
     def to_pandas(self, *, name: str | None = None) -> pd.Series:
         if isinstance(self.values, pd.Series):
+            from vibespatial.api._native_public_arrays import NativeAttributeColumnArray
+
+            if isinstance(self.values.array, NativeAttributeColumnArray):
+                index = (
+                    self.output_index_plan.index
+                    if self.output_index_plan is not None
+                    and self.output_index_plan.index is not None
+                    else pd.RangeIndex(self.group_count)
+                )
+                return self.values.array.to_pandas_series(index=index, name=name)
             series = self.values.copy(deep=False)
             if self.output_index_plan is not None and self.output_index_plan.index is not None:
                 index = self.output_index_plan.index
@@ -268,22 +273,23 @@ class NativeGroupedReduction:
             series.name = name
             return series
         if self.is_device:
-            record_native_export_boundary(NativeExportBoundary(
-                surface="vibespatial.api.NativeGroupedReduction.to_pandas",
-                operation="grouped_reduction_to_pandas",
-                target="pandas-series",
-                reason="native grouped reduction exported to pandas Series",
-                row_count=self.group_count,
-                byte_count=int(self.values.nbytes),
-                detail=f"reducer={self.reducer}",
-                d2h_transfer=True,
-                strict_disallowed=False,
-            ))
+            record_native_export_boundary(
+                NativeExportBoundary(
+                    surface="vibespatial.api.NativeGroupedReduction.to_pandas",
+                    operation="grouped_reduction_to_pandas",
+                    target="pandas-series",
+                    reason="native grouped reduction exported to pandas Series",
+                    row_count=self.group_count,
+                    byte_count=int(self.values.nbytes),
+                    detail=f"reducer={self.reducer}",
+                    d2h_transfer=True,
+                    strict_disallowed=False,
+                )
+            )
             values = _device_to_host(
                 self.values,
                 reason=(
-                    "vibespatial.api.NativeGroupedReduction.to_pandas"
-                    "::grouped_reduction_to_pandas"
+                    "vibespatial.api.NativeGroupedReduction.to_pandas::grouped_reduction_to_pandas"
                 ),
             )
         else:
@@ -321,20 +327,32 @@ class NativeGroupedAttributeReduction:
             if reduction.is_device
         )
         if device_bytes:
-            record_native_export_boundary(NativeExportBoundary(
-                surface="vibespatial.api.NativeGroupedAttributeReduction.to_pandas",
-                operation="grouped_attribute_reduction_to_pandas",
-                target="pandas-dataframe",
-                reason="native grouped attribute reductions exported to pandas DataFrame",
-                row_count=self.group_count,
-                byte_count=device_bytes,
-                detail=f"columns={len(self.columns)}",
-                d2h_transfer=True,
-                strict_disallowed=False,
-            ))
+            record_native_export_boundary(
+                NativeExportBoundary(
+                    surface="vibespatial.api.NativeGroupedAttributeReduction.to_pandas",
+                    operation="grouped_attribute_reduction_to_pandas",
+                    target="pandas-dataframe",
+                    reason="native grouped attribute reductions exported to pandas DataFrame",
+                    row_count=self.group_count,
+                    byte_count=device_bytes,
+                    detail=f"columns={len(self.columns)}",
+                    d2h_transfer=True,
+                    strict_disallowed=False,
+                )
+            )
         for name, reduction in self.columns.items():
             values = reduction.values
             if isinstance(values, pd.Series):
+                from vibespatial.api._native_public_arrays import (
+                    NativeAttributeColumnArray,
+                )
+
+                if isinstance(values.array, NativeAttributeColumnArray):
+                    data[name] = values.array.to_pandas_series(
+                        index=self.index,
+                        name=name,
+                    )
+                    continue
                 series = values.copy(deep=False)
                 if not series.index.equals(self.index):
                     series.index = self.index
@@ -382,6 +400,183 @@ class NativeGroupedAttributeReduction:
 
 
 @dataclass(frozen=True)
+class NativeGroupedSelection:
+    """Capacity-backed grouped view with device-resident selected cardinality."""
+
+    group_codes: Any
+    selection: NativeDeviceSelection
+    group_count: int
+    source_token: str | None = None
+    output_index_plan: NativeIndexPlan | None = None
+
+    def __post_init__(self) -> None:
+        if not _is_device_array(self.group_codes):
+            raise TypeError("NativeGroupedSelection requires device group codes")
+        source_row_count = self.source_row_count
+        if _array_size(self.group_codes) != source_row_count:
+            raise ValueError("NativeGroupedSelection group codes must match selection source rows")
+        if (
+            self.source_token is not None
+            and self.selection.source_token is not None
+            and self.source_token != self.selection.source_token
+        ):
+            raise ValueError("NativeGroupedSelection source token must match selection")
+        if int(self.group_count) < 0:
+            raise ValueError("NativeGroupedSelection group_count must be nonnegative")
+
+    @property
+    def capacity(self) -> int:
+        return self.selection.capacity
+
+    @property
+    def source_row_count(self) -> int:
+        if self.selection.source_row_count is None:
+            return self.selection.capacity
+        return int(self.selection.source_row_count)
+
+    @property
+    def logical_count(self):
+        return self.selection.logical_count
+
+    @property
+    def is_device(self) -> bool:
+        return True
+
+    def _capacity_codes(self):
+        import cupy as cp
+
+        group_count = int(self.group_count)
+        gathered = cp.asarray(
+            self.selection.gather_capacity(
+                self.group_codes,
+                fill_value=group_count,
+            ),
+            dtype=cp.int64,
+        )
+        active = self.selection.active_capacity_mask()
+        valid = active & (gathered >= 0) & (gathered < group_count)
+        return cp.where(valid, gathered, cp.int64(group_count)), valid
+
+    def reduce_numeric(self, values: Any, reducer: str) -> NativeGroupedReduction:
+        """Reduce selected all-valid values without compacting selected rows."""
+        normalized = reducer.lower()
+        if normalized not in {"sum", "count", "mean", "min", "max", "any", "all"}:
+            raise ValueError(
+                "NativeGroupedSelection reducer must be sum, count, mean, min, max, any, or all"
+            )
+        if _array_size(values) != self.source_row_count:
+            raise ValueError(
+                "NativeGroupedSelection values length must match selection source rows"
+            )
+        if not _is_numeric_like(values):
+            raise TypeError("NativeGroupedSelection reducer admits only numeric or bool values")
+
+        import cupy as cp
+
+        group_count = int(self.group_count)
+        codes, valid = self._capacity_codes()
+        values_array = cp.asarray(
+            self.selection.gather_capacity(values, fill_value=0),
+        )
+        counts_with_sentinel = cp.bincount(
+            codes,
+            minlength=group_count + 1,
+        ).astype(cp.int64, copy=False)
+        counts = counts_with_sentinel[:group_count]
+        if normalized == "count":
+            reduced = counts
+        elif normalized in {"sum", "mean"}:
+            if normalized == "sum":
+                out_dtype = (
+                    cp.int64 if np.issubdtype(values_array.dtype, np.bool_) else values_array.dtype
+                )
+                sums_with_sentinel = cp.zeros(group_count + 1, dtype=out_dtype)
+                cp.add.at(
+                    sums_with_sentinel,
+                    codes,
+                    cp.where(
+                        valid,
+                        values_array.astype(out_dtype, copy=False),
+                        cp.zeros((), dtype=out_dtype),
+                    ),
+                )
+                reduced = sums_with_sentinel[:group_count]
+            else:
+                sums_with_sentinel = cp.zeros(group_count + 1, dtype=cp.float64)
+                cp.add.at(
+                    sums_with_sentinel,
+                    codes,
+                    cp.where(
+                        valid,
+                        values_array.astype(cp.float64, copy=False),
+                        cp.float64(0.0),
+                    ),
+                )
+                sums = sums_with_sentinel[:group_count]
+                reduced = cp.full(group_count, cp.nan, dtype=cp.float64)
+                has_values = counts > 0
+                reduced[has_values] = sums[has_values] / counts[has_values]
+        elif normalized in {"any", "all"}:
+            if not np.issubdtype(values_array.dtype, np.bool_):
+                raise TypeError("NativeGroupedSelection any/all reducers admit only bool values")
+            true_counts_with_sentinel = cp.zeros(group_count + 1, dtype=cp.uint64)
+            cp.add.at(
+                true_counts_with_sentinel,
+                codes,
+                cp.where(valid & values_array, cp.uint64(1), cp.uint64(0)),
+            )
+            true_counts = true_counts_with_sentinel[:group_count]
+            reduced = (
+                true_counts > 0
+                if normalized == "any"
+                else true_counts == counts.astype(cp.uint64, copy=False)
+            )
+        else:
+            out_dtype = _empty_group_extrema_dtype(values_array)
+            identity = _extrema_identity(out_dtype, normalized)
+            reduced_with_sentinel = cp.full(
+                group_count + 1,
+                identity,
+                dtype=out_dtype,
+            )
+            scatter_values = cp.where(
+                valid,
+                values_array.astype(out_dtype, copy=False),
+                cp.asarray(identity, dtype=out_dtype),
+            )
+            reducer_func = cp.minimum if normalized == "min" else cp.maximum
+            reducer_func.at(reduced_with_sentinel, codes, scatter_values)
+            reduced = reduced_with_sentinel[:group_count]
+            reduced = cp.where(counts > 0, reduced, cp.asarray(cp.nan, dtype=out_dtype))
+
+        return NativeGroupedReduction(
+            values=reduced,
+            reducer=normalized,
+            group_count=group_count,
+            output_index_plan=self.output_index_plan,
+        )
+
+    def reduce_expression(self, expression: Any, reducer: str) -> NativeGroupedReduction:
+        """Reduce a selected private expression over source-capacity rows."""
+        from vibespatial.api._native_expression import NativeExpression
+
+        if not isinstance(expression, NativeExpression):
+            raise TypeError("NativeGroupedSelection.reduce_expression expects NativeExpression")
+        if (
+            expression.source_row_count is not None
+            and int(expression.source_row_count) != self.source_row_count
+        ):
+            raise ValueError("NativeGroupedSelection expression source rows must match capacity")
+        if (
+            expression.source_token is not None
+            and self.source_token is not None
+            and expression.source_token != self.source_token
+        ):
+            raise ValueError("NativeGroupedSelection expression source token does not match")
+        return self.reduce_numeric(expression.values, reducer)
+
+
+@dataclass(frozen=True)
 class NativeGrouped:
     """Private grouped-execution carrier for segmented reductions."""
 
@@ -394,6 +589,11 @@ class NativeGrouped:
     row_count: int | None = None
     output_index_plan: NativeIndexPlan | None = None
     null_key_policy: str = "drop"
+    sorted_order_is_identity: bool = False
+    all_groups_observed: bool | None = None
+    group_size_min: int | None = None
+    group_size_max: int | None = None
+    strictly_disjoint_group_bounds: bool | None = None
 
     @classmethod
     def from_dense_codes(
@@ -404,6 +604,10 @@ class NativeGrouped:
         output_index: pd.Index | None = None,
         source_token: str | None = None,
         null_key_policy: str = "drop",
+        all_groups_observed: bool | None = None,
+        group_size_min: int | None = None,
+        group_size_max: int | None = None,
+        strictly_disjoint_group_bounds: bool | None = None,
     ) -> NativeGrouped:
         """Build grouped state from dense row-to-group codes.
 
@@ -423,6 +627,21 @@ class NativeGrouped:
             codes,
             group_count=resolved_group_count,
         )
+        if not _is_device_array(group_offsets):
+            host_offsets = np.asarray(group_offsets, dtype=np.int64)
+            host_group_ids = np.asarray(group_ids, dtype=np.int64)
+            counts = host_offsets[1:] - host_offsets[:-1]
+            inferred_all_observed = int(host_group_ids.size) == int(resolved_group_count) and bool(
+                np.all(counts > 0)
+            )
+            if all_groups_observed is None:
+                all_groups_observed = inferred_all_observed
+            if group_size_min is None:
+                group_size_min = (
+                    0 if not inferred_all_observed else int(counts.min()) if counts.size else 0
+                )
+            if group_size_max is None:
+                group_size_max = int(counts.max(initial=0))
         return cls(
             group_codes=codes,
             group_offsets=group_offsets,
@@ -441,6 +660,198 @@ class NativeGrouped:
                 )
             ),
             null_key_policy=null_key_policy,
+            all_groups_observed=all_groups_observed,
+            group_size_min=group_size_min,
+            group_size_max=group_size_max,
+            strictly_disjoint_group_bounds=strictly_disjoint_group_bounds,
+        )
+
+    @classmethod
+    def from_dense_sorted_offsets(
+        cls,
+        group_offsets: Any,
+        *,
+        row_count: int | None = None,
+        output_index: pd.Index | None = None,
+        source_token: str | None = None,
+        null_key_policy: str = "drop",
+        all_groups_observed: bool | None = None,
+        group_size_min: int | None = None,
+        group_size_max: int | None = None,
+        strictly_disjoint_group_bounds: bool | None = None,
+    ) -> NativeGrouped:
+        """Build identity-sorted grouped state while retaining empty groups.
+
+        Unlike ``from_sorted_offsets``, this constructor does not compact the
+        offset or group-id metadata when groups have zero rows. It is the
+        physical carrier for public-row-capacity grouped work where an empty
+        span is meaningful and output order is already dense.
+        """
+        if null_key_policy != "drop":
+            raise ValueError("NativeGrouped currently admits only drop null-key policy")
+        xp = _array_namespace(group_offsets)
+        offsets = xp.asarray(group_offsets, dtype=xp.int64)
+        if _array_size(offsets) == 0:
+            raise ValueError("NativeGrouped dense sorted offsets require length >= 1")
+        group_count = _array_size(offsets) - 1
+        if output_index is not None and len(output_index) != group_count:
+            raise ValueError("NativeGrouped output_index length must match group_count")
+
+        if xp is np:
+            if offsets.ndim != 1:
+                raise ValueError("NativeGrouped dense sorted offsets must be one-dimensional")
+            if int(offsets[0]) != 0:
+                raise ValueError("NativeGrouped dense sorted offsets must start at zero")
+            if np.any(offsets[1:] < offsets[:-1]):
+                raise ValueError("NativeGrouped dense sorted offsets must be nondecreasing")
+            resolved_row_count = int(offsets[-1])
+            if row_count is not None and int(row_count) != resolved_row_count:
+                raise ValueError("NativeGrouped row_count must match final dense sorted offset")
+        else:
+            if row_count is None:
+                raise ValueError("NativeGrouped device dense sorted offsets require row_count")
+            resolved_row_count = int(row_count)
+
+        if resolved_row_count:
+            positions = xp.arange(resolved_row_count, dtype=xp.int64)
+            group_codes = xp.searchsorted(
+                offsets[1:],
+                positions,
+                side="right",
+            ).astype(xp.int32, copy=False)
+        else:
+            group_codes = _empty_like_namespace_array(xp, xp.int32)
+        return cls(
+            group_codes=group_codes,
+            group_offsets=offsets.astype(xp.int32, copy=False),
+            source_token=source_token,
+            sorted_order=xp.arange(resolved_row_count, dtype=xp.int64),
+            group_ids=xp.arange(group_count, dtype=xp.int32),
+            group_count=group_count,
+            row_count=resolved_row_count,
+            output_index_plan=(
+                NativeIndexPlan.from_index(output_index)
+                if output_index is not None
+                else NativeIndexPlan(
+                    kind="range",
+                    length=group_count,
+                    index=pd.RangeIndex(group_count),
+                )
+            ),
+            null_key_policy=null_key_policy,
+            sorted_order_is_identity=True,
+            all_groups_observed=all_groups_observed,
+            group_size_min=group_size_min,
+            group_size_max=group_size_max,
+            strictly_disjoint_group_bounds=strictly_disjoint_group_bounds,
+        )
+
+    @classmethod
+    def from_sorted_offsets(
+        cls,
+        group_offsets: Any,
+        *,
+        row_count: int | None = None,
+        output_index: pd.Index | None = None,
+        source_token: str | None = None,
+        null_key_policy: str = "drop",
+        all_groups_observed: bool | None = None,
+        group_size_min: int | None = None,
+        group_size_max: int | None = None,
+        strictly_disjoint_group_bounds: bool | None = None,
+    ) -> NativeGrouped:
+        """Build grouped state for rows already sorted by dense group offsets.
+
+        The input offsets describe full dense groups.  The carrier stores the
+        compact observed-group offsets expected by native consumers while
+        preserving an identity sorted-order proof, so geometry reducers can
+        consume already grouped rows without a redundant sort or gather.
+        """
+        if null_key_policy != "drop":
+            raise ValueError("NativeGrouped currently admits only drop null-key policy")
+        xp = _array_namespace(group_offsets)
+        offsets = xp.asarray(group_offsets, dtype=xp.int64)
+        if _array_size(offsets) == 0:
+            raise ValueError("NativeGrouped sorted offsets must have length >= 1")
+        group_count = _array_size(offsets) - 1
+        if output_index is not None and len(output_index) != group_count:
+            raise ValueError("NativeGrouped output_index length must match group_count")
+
+        if xp is np:
+            if offsets.ndim != 1:
+                raise ValueError("NativeGrouped sorted offsets must be one-dimensional")
+            if int(offsets[0]) != 0:
+                raise ValueError("NativeGrouped sorted offsets must start at zero")
+            if np.any(offsets[1:] < offsets[:-1]):
+                raise ValueError("NativeGrouped sorted offsets must be nondecreasing")
+            resolved_row_count = int(offsets[-1])
+            if row_count is not None and int(row_count) != resolved_row_count:
+                raise ValueError("NativeGrouped row_count must match final sorted offset")
+        else:
+            if row_count is None:
+                raise ValueError("NativeGrouped device sorted offsets require row_count")
+            resolved_row_count = int(row_count)
+
+        counts = offsets[1:] - offsets[:-1]
+        if xp is np:
+            host_counts = np.asarray(counts, dtype=np.int64)
+            inferred_all_observed = bool(np.all(host_counts > 0))
+            inferred_min = int(host_counts.min()) if host_counts.size else 0
+            inferred_max = int(host_counts.max()) if host_counts.size else 0
+            if all_groups_observed is None:
+                all_groups_observed = inferred_all_observed
+            if group_size_min is None:
+                group_size_min = inferred_min
+            if group_size_max is None:
+                group_size_max = inferred_max
+        elif group_size_min is not None and int(group_size_min) > 0:
+            all_groups_observed = True if all_groups_observed is None else all_groups_observed
+        if all_groups_observed is True:
+            group_ids = xp.arange(group_count, dtype=xp.int32)
+            compact_offsets = offsets.astype(xp.int32, copy=False)
+        else:
+            observed_mask = counts > 0
+            group_ids = xp.nonzero(observed_mask)[0].astype(xp.int32, copy=False)
+            observed_counts = counts[observed_mask].astype(xp.int32, copy=False)
+            compact_offsets = xp.concatenate(
+                [
+                    xp.asarray([0], dtype=xp.int32),
+                    xp.cumsum(observed_counts, dtype=xp.int32),
+                ],
+            )
+        if resolved_row_count:
+            positions = xp.arange(resolved_row_count, dtype=xp.int64)
+            group_codes = xp.searchsorted(
+                offsets[1:],
+                positions,
+                side="right",
+            ).astype(xp.int32, copy=False)
+        else:
+            group_codes = _empty_like_namespace_array(xp, xp.int32)
+        sorted_order = xp.arange(resolved_row_count, dtype=xp.int64)
+        return cls(
+            group_codes=group_codes,
+            group_offsets=compact_offsets,
+            source_token=source_token,
+            sorted_order=sorted_order,
+            group_ids=group_ids,
+            group_count=group_count,
+            row_count=resolved_row_count,
+            output_index_plan=(
+                NativeIndexPlan.from_index(output_index)
+                if output_index is not None
+                else NativeIndexPlan(
+                    kind="range",
+                    length=group_count,
+                    index=pd.RangeIndex(group_count),
+                )
+            ),
+            null_key_policy=null_key_policy,
+            sorted_order_is_identity=True,
+            all_groups_observed=all_groups_observed,
+            group_size_min=group_size_min,
+            group_size_max=group_size_max,
+            strictly_disjoint_group_bounds=strictly_disjoint_group_bounds,
         )
 
     @property
@@ -578,9 +989,7 @@ class NativeGrouped:
             reduced = xp.empty(self.resolved_group_count, dtype=xp.float64)
             reduced[...] = xp.nan
             has_values = counts > 0
-            reduced[has_values] = (
-                sums[has_values] / counts[has_values].astype(xp.float64)
-            )
+            reduced[has_values] = sums[has_values] / counts[has_values].astype(xp.float64)
 
         return NativeGroupedReduction(
             values=reduced,
@@ -595,12 +1004,10 @@ class NativeGrouped:
 
         if not isinstance(expression, NativeExpression):
             raise TypeError("NativeGrouped.reduce_expression expects NativeExpression")
-        if expression.source_row_count is not None and int(expression.source_row_count) != _array_size(
-            self.group_codes
-        ):
-            raise ValueError(
-                "NativeGrouped expression source row count must match group codes"
-            )
+        if expression.source_row_count is not None and int(
+            expression.source_row_count
+        ) != _array_size(self.group_codes):
+            raise ValueError("NativeGrouped expression source row count must match group codes")
         if (
             expression.source_token is not None
             and self.source_token is not None
@@ -654,9 +1061,26 @@ class NativeGrouped:
             else:
                 value_positions = offsets[1:] - 1
             selected_rows = sorted_rows[value_positions]
-            result.iloc[group_ids.astype(np.intp, copy=False)] = series.iloc[
-                selected_rows
-            ].array
+            from vibespatial.api._native_public_arrays import (
+                NativeAttributeColumnArray,
+            )
+
+            if isinstance(series.array, NativeAttributeColumnArray):
+                output_positions = np.full(group_count, -1, dtype=np.int64)
+                output_positions[group_ids.astype(np.intp, copy=False)] = selected_rows
+                result = pd.Series(
+                    series.array.take(
+                        output_positions,
+                        allow_fill=True,
+                        fill_value=None,
+                    ),
+                    index=index,
+                    name=series.name,
+                )
+            else:
+                result.iloc[group_ids.astype(np.intp, copy=False)] = series.iloc[
+                    selected_rows
+                ].array
 
         return NativeGroupedReduction(
             values=result,
@@ -732,4 +1156,5 @@ __all__ = [
     "NativeGrouped",
     "NativeGroupedAttributeReduction",
     "NativeGroupedReduction",
+    "NativeGroupedSelection",
 ]

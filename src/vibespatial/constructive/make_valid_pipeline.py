@@ -19,15 +19,18 @@ from vibespatial.constructive.make_valid_pipeline_kernels import (
     _VALIDITY_KERNEL_SOURCE_FP64,
     _format_validity_kernel_source,
 )
-from vibespatial.cuda._runtime import get_cuda_runtime
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import (
+    PhysicalWorkEstimate,
+    estimate_segment_pair_work_from_owned,
+)
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode
+from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import Residency, combined_residency
 
 
@@ -73,12 +76,13 @@ class MakeValidPlan:
 @dataclass(frozen=True)
 class MakeValidResult:
     row_count: int
-    valid_rows: np.ndarray
-    repaired_rows: np.ndarray
-    null_rows: np.ndarray
+    valid_rows: object
+    repaired_rows: object
+    null_rows: object
     method: str
     keep_collapsed: bool
     owned: object | None = None
+    native_geometry: object | None = None
     selected: ExecutionMode = ExecutionMode.CPU
     _geometries: np.ndarray | None = None
 
@@ -92,6 +96,18 @@ class MakeValidResult:
         """
         if self._geometries is not None:
             return self._geometries
+        if self.native_geometry is not None:
+            import pandas as pd
+
+            result = np.asarray(
+                self.native_geometry.to_geoseries(
+                    index=pd.RangeIndex(int(self.row_count)),
+                    name="geometry",
+                ),
+                dtype=object,
+            )
+            object.__setattr__(self, "_geometries", result)
+            return result
         if self.owned is not None:
             result = np.asarray(self.owned.to_shapely(), dtype=object)
             object.__setattr__(self, "_geometries", result)
@@ -121,7 +137,9 @@ class MakeValidResult:
             raise ValueError("make_valid native result index length must match row count")
 
         geometry_metadata = None
-        if self.owned is not None:
+        if self.native_geometry is not None:
+            geometry = self.native_geometry.with_crs(crs)
+        elif self.owned is not None:
             geometry = GeometryNativeResult.from_owned(self.owned, crs=crs)
             from vibespatial.api._native_metadata import NativeGeometryMetadata
 
@@ -142,16 +160,21 @@ class MakeValidResult:
                 source_rows = cp.arange(int(self.row_count), dtype=cp.int64)
             except ModuleNotFoundError:
                 pass
-        repaired_mask = np.zeros(int(self.row_count), dtype=bool)
-        if self.repaired_rows.size:
-            repaired_mask[np.asarray(self.repaired_rows, dtype=np.int64)] = True
-        if self.owned is not None and self.owned.residency is Residency.DEVICE:
+        device_result = self.owned is not None and self.owned.residency is Residency.DEVICE
+        if device_result:
             try:
                 import cupy as cp
 
-                repaired_mask = cp.asarray(repaired_mask, dtype=cp.bool_)
+                repaired_mask = cp.zeros(int(self.row_count), dtype=cp.bool_)
+                repaired_mask[cp.asarray(self.repaired_rows, dtype=cp.int64)] = True
             except ModuleNotFoundError:
-                pass
+                repaired_mask = np.zeros(int(self.row_count), dtype=bool)
+                if self.repaired_rows.size:
+                    repaired_mask[np.asarray(self.repaired_rows, dtype=np.int64)] = True
+        else:
+            repaired_mask = np.zeros(int(self.row_count), dtype=bool)
+            if self.repaired_rows.size:
+                repaired_mask[np.asarray(self.repaired_rows, dtype=np.int64)] = True
 
         return NativeTabularResult(
             attributes=NativeAttributeTable(dataframe=pd.DataFrame(index=index)),
@@ -185,32 +208,32 @@ class MakeValidBenchmark:
 
 @dataclass(frozen=True)
 class _DeviceValidityRows:
-    valid_rows: np.ndarray
-    repaired_rows: np.ndarray
-    null_rows: np.ndarray
+    valid_rows: object
+    repaired_rows: object
+    null_rows: object
 
 
-def _device_scalar_to_host(value, *, reason: str):
-    import cupy as cp
+def _make_valid_linework_native_geometry(
+    source_owned,
+    repaired_owned,
+    repaired_rows,
+    *,
+    method: str,
+):
+    if method != "linework" or repaired_owned is None:
+        return None
+    if repaired_owned.residency is not Residency.DEVICE:
+        return None
 
-    runtime = get_cuda_runtime()
-    d_value = cp.ascontiguousarray(cp.asarray(value).reshape(1))
-    with runtime.stream_context() as stream:
-        host = runtime.copy_device_to_host_async(d_value, stream, reason=reason)
-    return np.asarray(host).reshape(-1)[0]
+    from vibespatial.constructive.boundary_remnants import (
+        polygon_make_valid_linework_composition_device,
+    )
 
-
-def _device_int_scalar(value, *, reason: str) -> int:
-    return int(_device_scalar_to_host(value, reason=reason))
-
-
-def _copy_device_i32_rows(device_rows, *, reason: str) -> np.ndarray:
-    return np.asarray(
-        get_cuda_runtime().copy_device_to_host(
-            device_rows.astype(device_rows.dtype, copy=False),
-            reason=reason,
-        ),
-        dtype=np.int32,
+    return polygon_make_valid_linework_composition_device(
+        source_owned,
+        repaired_owned,
+        repaired_rows,
+        crs=None,
     )
 
 
@@ -221,10 +244,8 @@ def _try_device_validity_expression_rows(
 ) -> _DeviceValidityRows | None:
     """Return compact row sets from the device validity expression.
 
-    Physical shape: row-aligned predicate expression -> compact invalid/null
-    row indices.  The only host transfers are named scalar count fences and
-    compact row-index fences; full host validity or family metadata is not
-    materialized.
+    Physical shape: row-aligned predicate expression -> compact device rowsets.
+    Full validity, compact row positions, and family metadata remain resident.
     """
     if owned.device_state is None or not has_gpu_runtime():
         return None
@@ -235,49 +256,39 @@ def _try_device_validity_expression_rows(
 
     from vibespatial.constructive.validity import validity_expression_owned
 
-    state = owned._ensure_device_state()
+    state = owned._ensure_device_state(preserve_indexed_view=True)
     expression = validity_expression_owned(owned)
 
     d_validity = cp.asarray(state.validity, dtype=cp.bool_)
     d_valid_flags = cp.asarray(expression.values, dtype=cp.bool_)
     d_repair_needed = (~d_valid_flags) & d_validity
-    repair_count = _device_int_scalar(
-        cp.count_nonzero(d_repair_needed),
-        reason="make-valid validity-expression repair-count scalar fence",
+    repaired_rows = cp.flatnonzero(d_repair_needed).astype(
+        cp.int32,
+        copy=False,
     )
 
-    d_null_mask = ~d_validity
-    null_count = _device_int_scalar(
-        cp.count_nonzero(d_null_mask),
-        reason="make-valid validity-expression null-count scalar fence",
+    trusted_no_null_rows = (
+        state.trusted_all_valid is True or getattr(state, "trusted_all_non_empty", None) is True
     )
-
-    repaired_rows = np.asarray([], dtype=np.int32)
-    if repair_count:
-        repaired_rows = _copy_device_i32_rows(
-            cp.flatnonzero(d_repair_needed).astype(cp.int32, copy=False),
-            reason="make-valid validity-expression repair-row compact fence",
+    if not trusted_no_null_rows:
+        cached_host_validity = getattr(owned, "_validity", None)
+        trusted_no_null_rows = (
+            cached_host_validity is not None
+            and int(cached_host_validity.size) == int(row_count)
+            and bool(np.all(cached_host_validity))
         )
 
-    null_rows = np.asarray([], dtype=np.int32)
-    if null_count:
-        null_rows = _copy_device_i32_rows(
-            cp.flatnonzero(d_null_mask).astype(cp.int32, copy=False),
-            reason="make-valid validity-expression null-row compact fence",
+    null_rows = cp.empty(0, dtype=cp.int32)
+    if not trusted_no_null_rows:
+        null_rows = cp.flatnonzero(~d_validity).astype(
+            cp.int32,
+            copy=False,
         )
 
-    invalid_or_null = repaired_rows
-    if null_rows.size:
-        invalid_or_null = (
-            null_rows
-            if repaired_rows.size == 0
-            else np.concatenate([repaired_rows, null_rows])
-        )
-    valid_rows = np.setdiff1d(
-        np.arange(row_count, dtype=np.int32),
-        invalid_or_null,
-        assume_unique=False,
-    ).astype(np.int32, copy=False)
+    valid_rows = cp.flatnonzero(d_valid_flags & d_validity).astype(
+        cp.int32,
+        copy=False,
+    )
 
     return _DeviceValidityRows(
         valid_rows=valid_rows,
@@ -298,6 +309,8 @@ def _make_valid_no_repair_result_from_device_rows(
     """Return a device-resident no-op result when validity proves no repairs."""
     if device_rows.repaired_rows.size:
         return None
+    if not device_rows.null_rows.size:
+        owned._cached_is_valid_mask = np.ones(row_count, dtype=bool)
 
     record_dispatch_event(
         surface="geopandas.array.make_valid",
@@ -349,7 +362,6 @@ def _make_valid_result_from_device_rows(
     method: str,
     keep_collapsed: bool,
     dispatch_mode: ExecutionMode | str,
-    ensure_geometries,
 ) -> MakeValidResult | None:
     """Repair compact invalid rows selected by device validity expression."""
     no_repair = _make_valid_no_repair_result_from_device_rows(
@@ -373,35 +385,6 @@ def _make_valid_result_from_device_rows(
         return None
 
     result_owned = gpu_result.repaired_owned
-    if gpu_result.still_invalid_rows.size > 0:
-        geometries = ensure_geometries()
-        cpu_fixed = make_valid_cpu_repair(
-            geometries,
-            gpu_result.still_invalid_rows,
-            method=method,
-            keep_collapsed=keep_collapsed,
-        )
-        record_fallback_event(
-            surface="geopandas.array.make_valid",
-            reason="GPU repair left compact invalid rows for shapely.make_valid",
-            detail=(
-                f"rows={row_count}, repaired={device_rows.repaired_rows.size}, "
-                f"cpu_rows={gpu_result.still_invalid_rows.size}, method={method}"
-            ),
-            requested=dispatch_mode,
-            selected=ExecutionMode.CPU,
-            pipeline="make_valid_owned",
-            d2h_transfer=True,
-        )
-        from vibespatial.geometry.owned import from_shapely_geometries, scatter_replacement_rows
-
-        still_geoms = [cpu_fixed[i] for i in gpu_result.still_invalid_rows]
-        still_owned = from_shapely_geometries(still_geoms)
-        result_owned = scatter_replacement_rows(
-            result_owned,
-            still_owned,
-            gpu_result.still_invalid_rows,
-        )
 
     record_dispatch_event(
         surface="geopandas.array.make_valid",
@@ -415,6 +398,12 @@ def _make_valid_result_from_device_rows(
         requested=dispatch_mode,
         selected=ExecutionMode.GPU,
     )
+    native_geometry = _make_valid_linework_native_geometry(
+        owned,
+        result_owned,
+        device_rows.repaired_rows,
+        method=method,
+    )
     return MakeValidResult(
         row_count=row_count,
         valid_rows=device_rows.valid_rows,
@@ -423,14 +412,17 @@ def _make_valid_result_from_device_rows(
         method=method,
         keep_collapsed=keep_collapsed,
         owned=result_owned,
+        native_geometry=native_geometry,
         selected=ExecutionMode.GPU,
     )
 
 
-request_nvrtc_warmup([
-    ("make-valid-detect-fp64", _VALIDITY_KERNEL_SOURCE_FP64, _VALIDITY_KERNEL_NAMES),
-    ("make-valid-detect-fp32", _VALIDITY_KERNEL_SOURCE_FP32, _VALIDITY_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("make-valid-detect-fp64", _VALIDITY_KERNEL_SOURCE_FP64, _VALIDITY_KERNEL_NAMES),
+        ("make-valid-detect-fp32", _VALIDITY_KERNEL_SOURCE_FP32, _VALIDITY_KERNEL_NAMES),
+    ]
+)
 
 
 def _compile_validity_kernels(compute_type: str = "double"):
@@ -450,320 +442,54 @@ def _owned_all_polygon_rectangles(owned) -> bool:
     """Return True when every valid row is an exact axis-aligned rectangle."""
     if owned is None or owned.row_count == 0:
         return False
-    cached_validity = owned._current_cached_validity_mask()
-    if cached_validity is not None:
-        if not bool(np.all(cached_validity)):
-            return False
-    elif getattr(owned, "_validity", None) is not None:
-        if not bool(np.all(owned._validity)):
-            return False
-    elif owned.device_state is not None:
-        try:
-            import cupy as cp
-        except ModuleNotFoundError:
-            return False
-        if _device_int_scalar(
-            cp.count_nonzero(~cp.asarray(owned.device_state.validity, dtype=cp.bool_)),
-            reason="make-valid rectangle invalid-count scalar fence",
-        ):
-            return False
-    elif not bool(np.all(owned.validity)):
+    if not has_gpu_runtime():
         return False
 
     from vibespatial.geometry.buffers import GeometryFamily
     from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        _device_logical_rectangle_bounds,
         _device_rectangle_bounds,
     )
 
     if set(owned.families) != {GeometryFamily.POLYGON}:
         return False
 
-    owned._ensure_device_state()
-    polygon_buf = owned.device_state.families.get(GeometryFamily.POLYGON)
-    if polygon_buf is None or (int(polygon_buf.geometry_offsets.size) - 1) != owned.row_count:
+    state = owned._ensure_device_state(preserve_indexed_view=True)
+    polygon_buf = state.families.get(GeometryFamily.POLYGON)
+    physical_rows = (
+        max(int(polygon_buf.geometry_offsets.size) - 1, 0) if polygon_buf is not None else 0
+    )
+    if polygon_buf is None or physical_rows <= 0:
         return False
-    return _device_rectangle_bounds(polygon_buf, owned.row_count) is not None
+    if getattr(owned, "is_indexed_view", False) or physical_rows != owned.row_count:
+        if not bool(getattr(polygon_buf, "axis_aligned_rectangles", False)):
+            return False
+        rect_bounds = _device_logical_rectangle_bounds(
+            polygon_buf,
+            state,
+            owned.row_count,
+        )
+    else:
+        rect_bounds = _device_rectangle_bounds(polygon_buf, owned.row_count)
+    if rect_bounds is None:
+        return False
+
+    cached_validity = owned._current_cached_validity_mask()
+    if cached_validity is not None:
+        return bool(np.all(cached_validity))
+    if getattr(owned, "_validity", None) is not None:
+        return bool(np.all(owned._validity))
+    if state is not None:
+        # Rectangle structure proves topology, but the no-op result also needs
+        # a non-null proof. Without one, let the device validity expression
+        # produce aligned valid/null rowsets instead of synchronizing a scalar.
+        return state.trusted_all_valid is True
+    return bool(np.all(owned.validity))
 
 
-def _gpu_polygon_validity_mask(owned) -> np.ndarray | None:
-    """Compute per-row validity for polygon families using GPU ring checks.
-
-    Uses ADR-0002 dual-precision dispatch: selects fp32 or fp64 compute
-    based on device profile (PREDICATE kernel class). On consumer GPUs
-    with 1:32 fp64:fp32 throughput, fp32 runs ~32x faster for the ring
-    closure comparison.
-
-    Returns a boolean array (True = valid) for all rows, or None if GPU
-    detection is not applicable (e.g., no polygon families, no GPU).
-    """
-    from vibespatial.cuda._runtime import (
-        KERNEL_PARAM_I32,
-        KERNEL_PARAM_PTR,
-        get_cuda_runtime,
-    )
-    from vibespatial.runtime import has_gpu_runtime
-
-    if not has_gpu_runtime():
-        return None
-
-    polygon_families = []
-    for family_name in ("polygon", "multipolygon"):
-        if family_name in owned.families:
-            polygon_families.append((family_name, owned.families[family_name]))
-    if not polygon_families:
-        return None
-
-    # ADR-0002: select compute precision based on device profile
-    selection = plan_dispatch_selection(
-        kernel_name="is_valid",
-        kernel_class=KernelClass.PREDICATE,
-        row_count=owned.row_count,
-        requested_mode=ExecutionMode.GPU,
-        requested_precision=PrecisionMode.AUTO,
-        current_residency=combined_residency(owned),
-    )
-    precision_plan = selection.precision_plan
-    compute_type = "float" if precision_plan.compute_precision is PrecisionMode.FP32 else "double"
-
-    runtime = get_cuda_runtime()
-    kernels = _compile_validity_kernels(compute_type)
-
-    # Build a per-row validity array; start with True for non-null, non-polygon rows
-    row_valid = np.ones(owned.row_count, dtype=bool)
-    row_valid[~owned.validity] = False
-
-    from vibespatial.geometry.owned import FAMILY_TAGS
-
-    for family_name, buffer in polygon_families:
-        if not hasattr(buffer, "ring_offsets") or buffer.ring_offsets is None:
-            continue
-        ring_offsets = np.asarray(buffer.ring_offsets, dtype=np.int32)
-        ring_count = len(ring_offsets) - 1
-        if ring_count <= 0:
-            continue
-
-        # Use device-resident data if available (ADR-0005), else upload
-        device_buf = None
-        if owned.device_state is not None:
-            device_families = owned.device_state.families
-            if family_name in device_families:
-                device_buf = device_families[family_name]
-
-        if device_buf is not None:
-            d_x = device_buf.x
-            d_y = device_buf.y
-            d_ring_offsets = device_buf.ring_offsets
-            owns_buffers = False
-        else:
-            d_x = runtime.from_host(np.ascontiguousarray(buffer.x, dtype=np.float64))
-            d_y = runtime.from_host(np.ascontiguousarray(buffer.y, dtype=np.float64))
-            d_ring_offsets = runtime.from_host(ring_offsets)
-            owns_buffers = True
-
-        d_ring_valid = runtime.allocate((ring_count,), np.uint8)
-        geom_offsets = np.asarray(buffer.geometry_offsets, dtype=np.int32)
-        polygon_count = len(geom_offsets) - 1
-        d_geom_offsets = None
-        d_poly_valid = None
-
-        try:
-            ptr = runtime.pointer
-            ring_grid, ring_block = runtime.launch_config(kernels["check_ring_validity"], ring_count)
-            runtime.launch(
-                kernels["check_ring_validity"],
-                grid=ring_grid,
-                block=ring_block,
-                params=(
-                    (ptr(d_x), ptr(d_y), ptr(d_ring_offsets),
-                     ptr(d_ring_valid), ring_count),
-                    (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                     KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-                ),
-            )
-
-            if polygon_count <= 0:
-                continue
-            d_geom_offsets = runtime.from_host(geom_offsets)
-            d_poly_valid = runtime.allocate((polygon_count,), np.uint8)
-            poly_grid, poly_block = runtime.launch_config(kernels["reduce_ring_to_polygon_validity"], polygon_count)
-            runtime.launch(
-                kernels["reduce_ring_to_polygon_validity"],
-                grid=poly_grid,
-                block=poly_block,
-                params=(
-                    (ptr(d_ring_valid), ptr(d_geom_offsets),
-                     ptr(d_poly_valid), polygon_count),
-                    (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                     KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-                ),
-            )
-            runtime.synchronize()
-
-            # Vectorized scatter: map family rows to global rows (no Python loop)
-            h_poly_valid = runtime.copy_device_to_host(
-                d_poly_valid,
-                reason="make-valid polygon validity mask host export",
-            )
-            invalid_family_rows = np.flatnonzero(h_poly_valid == 0)
-            if invalid_family_rows.size > 0:
-                family_tag = FAMILY_TAGS[family_name]
-                tag_match = owned.tags == family_tag
-                for fr in invalid_family_rows:
-                    global_mask = owned.validity & tag_match & (owned.family_row_offsets == int(fr))
-                    row_valid[global_mask] = False
-        finally:
-            runtime.free(d_ring_valid)
-            if owns_buffers:
-                runtime.free(d_x)
-                runtime.free(d_y)
-                runtime.free(d_ring_offsets)
-            if d_geom_offsets is not None:
-                runtime.free(d_geom_offsets)
-            if d_poly_valid is not None:
-                runtime.free(d_poly_valid)
-
-    return row_valid
-
-
-def _detect_self_intersections_gpu(owned, valid_mask: np.ndarray) -> np.ndarray | None:
-    """Refine validity mask by detecting self-intersections on GPU.
-
-    GPU ring-structure checks (ring closure, vertex count) handle the fast
-    structural cases. Self-intersection detection reuses the existing
-    _extract_ring_segments_gpu + _detect_intra_ring_intersections infrastructure
-    from make_valid_gpu.py, keeping all work device-resident (zero D->H transfer
-    for the detection pass). The result is a per-row boolean mask where True
-    means valid (no self-intersections found).
-
-    For each polygon family:
-    1. Extract ring segments (existing NVRTC or CuPy fallback)
-    2. Generate intra-ring non-adjacent segment pairs
-    3. Classify pairs for proper crossings (Shewchuk adaptive on GPU)
-    4. Reduce per-polygon: invalid if any ring has a proper crossing
-    5. Map family-row invalidity back to global row mask
-    """
-    structurally_valid_rows = np.flatnonzero(valid_mask)
-    if structurally_valid_rows.size == 0:
-        return valid_mask
-
-    try:
-        import cupy as cp
-    except ModuleNotFoundError:
-        return None
-
-    from vibespatial.geometry.owned import FAMILY_TAGS
-    from vibespatial.runtime import has_gpu_runtime
-
-    if not has_gpu_runtime():
-        return None
-
-    from .make_valid_gpu import (
-        _compile_repair_kernels,
-        _detect_intra_ring_intersections,
-        _extract_ring_segments_gpu,
-    )
-
-    try:
-        kernels = _compile_repair_kernels()
-    except Exception:
-        return None
-
-    for family_name in ("polygon", "multipolygon"):
-        if family_name not in owned.families:
-            continue
-        buffer = owned.families[family_name]
-        if not hasattr(buffer, "ring_offsets") or buffer.ring_offsets is None:
-            continue
-
-        ring_offsets = np.asarray(buffer.ring_offsets, dtype=np.int32)
-        ring_count = len(ring_offsets) - 1
-        if ring_count <= 0:
-            continue
-
-        geom_offsets = np.asarray(buffer.geometry_offsets, dtype=np.int32)
-        polygon_count = len(geom_offsets) - 1
-        if polygon_count <= 0:
-            continue
-
-        # Use device-resident data if available, else upload
-        device_buf = None
-        if owned.device_state is not None:
-            device_families = owned.device_state.families
-            if family_name in device_families:
-                device_buf = device_families[family_name]
-
-        if device_buf is not None:
-            d_x = cp.asarray(device_buf.x)
-            d_y = cp.asarray(device_buf.y)
-            d_ring_offsets = cp.asarray(device_buf.ring_offsets)
-        else:
-            d_x = cp.asarray(np.ascontiguousarray(buffer.x, dtype=np.float64))
-            d_y = cp.asarray(np.ascontiguousarray(buffer.y, dtype=np.float64))
-            d_ring_offsets = cp.asarray(ring_offsets)
-
-        # Step 1: Extract ring segments (device-resident)
-        d_seg_x0, d_seg_y0, d_seg_x1, d_seg_y1, d_seg_ring_ids = \
-            _extract_ring_segments_gpu(
-                d_x, d_y, d_ring_offsets, ring_count, kernels=kernels,
-            )
-        total_segments = int(d_seg_x0.size)
-        if total_segments < 2:
-            continue
-
-        # Step 2+3: Detect intra-ring intersections (device-resident)
-        d_seg_a, d_seg_b, d_kinds, d_px, d_py = \
-            _detect_intra_ring_intersections(
-                d_seg_x0, d_seg_y0, d_seg_x1, d_seg_y1, d_seg_ring_ids,
-                total_segments, ring_count, d_ring_offsets, kernels=kernels,
-            )
-
-        if d_seg_a.size == 0:
-            # No self-intersections in this family
-            continue
-
-        # Step 4: Reduce intersections to per-polygon invalidity.
-        # d_seg_a contains segment indices that had crossings.
-        # Map segment -> ring -> polygon, then mark polygons with any hit.
-
-        # Get the ring IDs of segments involved in crossings
-        d_crossing_ring_ids = d_seg_ring_ids[d_seg_a]
-        # Also include the other segment's ring (for cross-ring pairs)
-        d_crossing_ring_ids_b = d_seg_ring_ids[d_seg_b]
-        d_all_crossing_rings = cp.concatenate([d_crossing_ring_ids, d_crossing_ring_ids_b])
-        d_unique_crossing_rings = cp.unique(d_all_crossing_rings)
-
-        # Map rings to polygons: binary search in geom_offsets
-        d_geom_offsets = cp.asarray(geom_offsets)
-        # For each crossing ring, find which polygon it belongs to
-        d_crossing_polys = cp.searchsorted(
-            d_geom_offsets[1:], d_unique_crossing_rings, side="right",
-        ).astype(cp.int32)
-        d_unique_invalid_polys = cp.unique(d_crossing_polys)
-
-        # Step 5: Map family-row invalidity back to global row mask
-        # Vectorized: find all global rows whose (tag, family_row_offset)
-        # matches any of the invalid polygon family rows.
-        # Keep invalid poly set on device; upload family offsets for
-        # device-side cp.isin to avoid ZCOPY002 D2H inside loop.
-        d_invalid_polys = d_unique_invalid_polys[d_unique_invalid_polys < polygon_count]
-        if d_invalid_polys.size > 0:
-            family_tag = FAMILY_TAGS[family_name]
-            tag_match = owned.validity & (owned.tags == family_tag)
-            global_rows_for_family = np.flatnonzero(tag_match)
-            if global_rows_for_family.size > 0:
-                fam_offsets = owned.family_row_offsets[global_rows_for_family]
-                d_fam_offsets = cp.asarray(fam_offsets)
-                d_invalid_set = cp.isin(d_fam_offsets, d_invalid_polys)
-                invalid_set = get_cuda_runtime().copy_device_to_host(
-                    d_invalid_set,
-                    reason="make-valid invalid-family-row mask host export",
-                )
-                valid_mask[global_rows_for_family[invalid_set]] = False
-
-    return valid_mask
-
-
-def plan_make_valid_pipeline(*, method: str = "linework", keep_collapsed: bool = True) -> MakeValidPlan:
+def plan_make_valid_pipeline(
+    *, method: str = "linework", keep_collapsed: bool = True
+) -> MakeValidPlan:
     stages = (
         MakeValidStage(
             name="compute_validity_mask",
@@ -785,7 +511,9 @@ def plan_make_valid_pipeline(*, method: str = "linework", keep_collapsed: bool =
         ),
         MakeValidStage(
             name="repair_invalid_topology",
-            primitive=MakeValidPrimitive.POLYGONIZE_REPAIR if method == "linework" else MakeValidPrimitive.SEGMENTIZE_INVALID,
+            primitive=MakeValidPrimitive.POLYGONIZE_REPAIR
+            if method == "linework"
+            else MakeValidPrimitive.SEGMENTIZE_INVALID,
             purpose="Repair only the compacted invalid rows using the selected make-valid strategy.",
             inputs=("invalid_rows",),
             outputs=("repaired_rows",),
@@ -838,71 +566,10 @@ def plan_make_valid_pipeline(*, method: str = "linework", keep_collapsed: bool =
 
 
 def fusion_plan_for_make_valid(*, method: str = "linework", keep_collapsed: bool = True):
-    return plan_fusion(plan_make_valid_pipeline(method=method, keep_collapsed=keep_collapsed).fusion_steps)
+    return plan_fusion(
+        plan_make_valid_pipeline(method=method, keep_collapsed=keep_collapsed).fusion_steps
+    )
 
-
-def _non_polygon_validity_from_owned(owned, gpu_mask: np.ndarray) -> None:
-    """Apply validity checks for non-polygon families directly from owned buffers.
-
-    Points and MultiPoints are always valid (OGC spec).
-    LineStrings are valid if they have >= 2 coordinates (or are empty).
-    MultiLineStrings are valid if each part has >= 2 coordinates.
-
-    This avoids Shapely materialization for the non-polygon validity check.
-    """
-    from vibespatial.geometry.buffers import GeometryFamily
-    from vibespatial.geometry.owned import FAMILY_TAGS
-
-    # Points and MultiPoints: always valid -- gpu_mask already defaults to True
-    # for valid (non-null) rows from _gpu_polygon_validity_mask.
-
-    # LineStrings: check coord count >= 2
-    ls_tag = FAMILY_TAGS.get(GeometryFamily.LINESTRING)
-    if ls_tag is not None and GeometryFamily.LINESTRING in owned.families:
-        buf = owned.families[GeometryFamily.LINESTRING]
-        if buf.row_count > 0:
-            offsets = buf.geometry_offsets
-            counts = offsets[1:buf.row_count + 1] - offsets[:buf.row_count]
-            # 1-coord linestrings are invalid; 0-coord (empty) are valid
-            ls_invalid_family = np.flatnonzero((counts >= 1) & (counts < 2))
-            if ls_invalid_family.size > 0:
-                ls_rows = np.flatnonzero(
-                    owned.validity & (owned.tags == ls_tag)
-                )
-                # Vectorized scatter: map invalid family rows to global rows
-                valid_fam = ls_invalid_family[ls_invalid_family < ls_rows.size]
-                if valid_fam.size > 0:
-                    gpu_mask[ls_rows[valid_fam]] = False
-
-    # MultiLineStrings: check each part has >= 2 coordinates
-    mls_tag = FAMILY_TAGS.get(GeometryFamily.MULTILINESTRING)
-    if mls_tag is not None and GeometryFamily.MULTILINESTRING in owned.families:
-        buf = owned.families[GeometryFamily.MULTILINESTRING]
-        if buf.row_count > 0 and buf.part_offsets is not None:
-            geom_offsets = buf.geometry_offsets
-            part_offsets = buf.part_offsets
-            # Vectorized: compute coord counts per part, then check per-geometry
-            part_counts = part_offsets[1:] - part_offsets[:-1]
-            # A part is invalid if it has exactly 1 coordinate
-            invalid_parts = (part_counts >= 1) & (part_counts < 2)
-            if np.any(invalid_parts):
-                mls_rows = np.flatnonzero(
-                    owned.validity & (owned.tags == mls_tag)
-                )
-                # For each geometry, check if any of its parts is invalid
-                for g in range(buf.row_count):
-                    if buf.empty_mask[g]:
-                        continue
-                    part_start = int(geom_offsets[g])
-                    part_end = int(geom_offsets[g + 1])
-                    if np.any(invalid_parts[part_start:part_end]):
-                        if g < mls_rows.size:
-                            gpu_mask[mls_rows[g]] = False
-
-
-# ---------------------------------------------------------------------------
-# Kernel variant registration (ADR-0033 tier system)
-# ---------------------------------------------------------------------------
 
 @register_kernel_variant(
     "make_valid",
@@ -914,12 +581,14 @@ def _non_polygon_validity_from_owned(owned, gpu_mask: np.ndarray) -> None:
     tags=("nvrtc", "constructive", "make_valid", "compact-invalid"),
 )
 def _make_valid_gpu_repair(owned, repaired_rows, *, method, keep_collapsed):
-    """GPU repair via gpu_repair_invalid_polygons (ADR-0019 + ADR-0033)."""
+    """GPU repair through the shared native topology pipeline."""
     from .make_valid_gpu import gpu_repair_invalid_polygons
 
     return gpu_repair_invalid_polygons(
-        owned, repaired_rows,
-        method=method, keep_collapsed=keep_collapsed,
+        owned,
+        repaired_rows,
+        method=method,
+        keep_collapsed=keep_collapsed,
     )
 
 
@@ -952,10 +621,21 @@ def make_valid_owned(
     # (2,000 rows) instead of the generic CONSTRUCTIVE default (50,000).
     # When owned has device_state the data is already on GPU, so the
     # transfer-free repair path is profitable at very low row counts.
+    work_estimate = (
+        estimate_segment_pair_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            output_byte_count=row_count * 32,
+            primary_unit_name="make-valid-topology-segment-pair",
+        )
+        if owned is not None
+        else PhysicalWorkEstimate.from_rows(row_count)
+    )
     selection = plan_dispatch_selection(
         kernel_name="make_valid_repair",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
+        work_estimate=work_estimate,
         requested_mode=dispatch_mode,
         current_residency=combined_residency(owned),
     )
@@ -989,6 +669,8 @@ def make_valid_owned(
     # uploading the entire array just to repair 5% on GPU is slower than CPU
     # Shapely.  The GPU path only fires when data is already device-resident.
     gpu_detection_used = False
+    native_repair_declined = False
+    fallback_recorded = False
     if owned is not None:
         cached_validity = owned._current_cached_validity_mask()
         if cached_validity is not None:
@@ -1002,10 +684,7 @@ def make_valid_owned(
                     surface="geopandas.array.make_valid",
                     operation="make_valid",
                     implementation="cached_validity_no_repair",
-                    reason=(
-                        "Owned geometry validity cache proved no non-null rows "
-                        "require repair"
-                    ),
+                    reason=("Owned geometry validity cache proved no non-null rows require repair"),
                     detail=f"rows={row_count}, method={method}, repaired=0",
                     requested=dispatch_mode,
                     selected=selection.selected,
@@ -1020,6 +699,36 @@ def make_valid_owned(
                     owned=owned,
                     selected=selection.selected,
                 )
+
+        device_state = getattr(owned, "device_state", None)
+        if (
+            device_state is not None
+            and device_state.trusted_all_valid is True
+            and device_state.trusted_all_ogc_valid is True
+        ):
+            owned._cached_is_valid_mask = np.ones(row_count, dtype=bool)
+            record_dispatch_event(
+                surface="geopandas.array.make_valid",
+                operation="make_valid",
+                implementation="trusted_ogc_valid_no_repair",
+                reason=(
+                    "Owned geometry device metadata proved all rows non-null "
+                    "and OGC-valid; make_valid is a no-op"
+                ),
+                detail=f"rows={row_count}, method={method}, repaired=0",
+                requested=dispatch_mode,
+                selected=selection.selected,
+            )
+            return MakeValidResult(
+                row_count=row_count,
+                valid_rows=np.arange(row_count, dtype=np.int32),
+                repaired_rows=np.asarray([], dtype=np.int32),
+                null_rows=np.asarray([], dtype=np.int32),
+                method=method,
+                keep_collapsed=keep_collapsed,
+                owned=owned,
+                selected=selection.selected,
+            )
 
     if owned is not None and selection.selected is ExecutionMode.GPU:
         if _owned_all_polygon_rectangles(owned):
@@ -1043,7 +752,7 @@ def make_valid_owned(
                 selected=ExecutionMode.GPU,
             )
         device_rows = None
-        if getattr(owned, "_validity", None) is None and owned.device_state is not None:
+        if owned.device_state is not None:
             device_rows = _try_device_validity_expression_rows(
                 owned,
                 row_count=row_count,
@@ -1056,65 +765,49 @@ def make_valid_owned(
                     method=method,
                     keep_collapsed=keep_collapsed,
                     dispatch_mode=dispatch_mode,
-                    ensure_geometries=_ensure_geometries,
                 )
                 if device_result is not None:
                     return device_result
-        # Compute null_mask from owned validity (no Shapely needed)
-        null_mask = ~owned.validity
-        if owned.device_state is not None:
-            if device_rows is None:
-                device_rows = _try_device_validity_expression_rows(
-                    owned,
-                    row_count=row_count,
-                )
-            if device_rows is not None:
-                device_result = _make_valid_result_from_device_rows(
-                    device_rows,
-                    owned=owned,
-                    row_count=row_count,
-                    method=method,
-                    keep_collapsed=keep_collapsed,
-                    dispatch_mode=dispatch_mode,
-                    ensure_geometries=_ensure_geometries,
-                )
-                if device_result is not None:
-                    return device_result
-        from vibespatial.constructive.validity import is_valid_owned
+                native_repair_declined = True
 
-        # Once the public make_valid boundary has selected GPU, keep the
-        # internal validity pass on GPU as well instead of replanning below
-        # a smaller unary crossover.
-        if owned.device_state is None:
-            owned._ensure_device_state()
-        gpu_mask = is_valid_owned(owned, dispatch_mode=ExecutionMode.GPU)
-        gpu_mask[null_mask] = False
-        # Non-polygon families: validate from owned buffers (no Shapely needed)
-        _non_polygon_validity_from_owned(owned, gpu_mask)
-        # Refine with GPU self-intersection detection (no Shapely needed)
-        gpu_mask = _detect_self_intersections_gpu(owned, gpu_mask)
-        if gpu_mask is None:
-            gpu_detection_used = False
-            _ensure_geometries()
-            valid_mask = make_valid_cpu_is_valid(geometries)
+        if native_repair_declined:
+            # The native repair result is atomic. Recompute validity from the
+            # whole host operation instead of exporting and patching residual
+            # rows from a partially repaired carrier.
             record_fallback_event(
                 surface="geopandas.array.make_valid",
-                reason="GPU self-intersection detection unavailable; using shapely.is_valid",
-                detail=f"rows={row_count}, method={method}",
+                reason=(
+                    "Native make-valid did not produce a complete aligned result; "
+                    "falling back to whole-operation shapely.make_valid"
+                ),
+                detail=(
+                    f"rows={row_count}, "
+                    f"repair_candidates={device_rows.repaired_rows.size}, "
+                    f"method={method}"
+                ),
                 requested=dispatch_mode,
                 selected=ExecutionMode.CPU,
                 pipeline="make_valid_owned",
                 d2h_transfer=True,
             )
+            fallback_recorded = True
+            _ensure_geometries()
+            valid_mask = make_valid_cpu_is_valid(geometries)
         else:
+            # Compute null_mask from owned validity (no Shapely needed).
+            null_mask = ~owned.validity
+            from vibespatial.constructive.validity import is_valid_owned
+
+            # Once the public make_valid boundary has selected GPU, keep the
+            # internal validity pass on GPU as well instead of replanning below
+            # a smaller unary crossover.
+            if owned.device_state is None:
+                owned._ensure_device_state()
+            gpu_mask = is_valid_owned(owned, dispatch_mode=ExecutionMode.GPU)
+            gpu_mask[null_mask] = False
             gpu_detection_used = True
             gpu_invalid_rows = np.flatnonzero(~gpu_mask & ~null_mask)
             if gpu_invalid_rows.size == 0:
-                # All rows passed GPU checks -- no repair needed.
-                # Carry the original owned so callers can stay
-                # device-resident without re-uploading via from_shapely.
-                # Geometries are lazy: only materialized when .geometries
-                # is accessed (ADR-0005 zero-transfer chain).
                 record_dispatch_event(
                     surface="geopandas.array.make_valid",
                     operation="make_valid",
@@ -1153,10 +846,16 @@ def make_valid_owned(
     if repaired_rows.size:
         # Try GPU repair path first — stays device-resident, no D->H (ADR-0005)
         gpu_repair_done = False
-        if owned is not None and selection.selected is ExecutionMode.GPU:
+        if (
+            owned is not None
+            and selection.selected is ExecutionMode.GPU
+            and not native_repair_declined
+        ):
             gpu_result = _make_valid_gpu_repair(
-                owned, repaired_rows,
-                method=method, keep_collapsed=keep_collapsed,
+                owned,
+                repaired_rows,
+                method=method,
+                keep_collapsed=keep_collapsed,
             )
             if gpu_result is not None:
                 result_owned = gpu_result.repaired_owned
@@ -1164,31 +863,15 @@ def make_valid_owned(
                 if gpu_repair_done:
                     selected = ExecutionMode.GPU
 
-                # Handle non-polygon rows GPU couldn't fix
-                if gpu_repair_done and gpu_result.still_invalid_rows.size > 0:
-                    _ensure_geometries()
-                    cpu_fixed = make_valid_cpu_repair(
-                        geometries, gpu_result.still_invalid_rows,
-                        method=method, keep_collapsed=keep_collapsed,
-                    )
-                    # Build a small owned from CPU-fixed rows and merge
-                    from vibespatial.geometry.owned import from_shapely_geometries
-                    try:
-                        still_geoms = [cpu_fixed[i] for i in gpu_result.still_invalid_rows]
-                        still_owned = from_shapely_geometries(still_geoms)
-                        from vibespatial.geometry.owned import scatter_replacement_rows
-                        result_owned = scatter_replacement_rows(
-                            result_owned, still_owned, gpu_result.still_invalid_rows,
-                        )
-                    except Exception:
-                        pass  # best-effort; main repair already done
-
         if not gpu_repair_done:
             # GPU repair failed — fall back to CPU. Now we need Shapely.
-            if selection.selected is ExecutionMode.GPU:
+            if selection.selected is ExecutionMode.GPU and not fallback_recorded:
                 record_fallback_event(
                     surface="geopandas.array.make_valid",
-                    reason="GPU repair failed or unavailable, falling back to shapely.make_valid",
+                    reason=(
+                        "Native make-valid did not produce a complete aligned result; "
+                        "falling back to whole-operation shapely.make_valid"
+                    ),
                     detail=f"rows={row_count}, repaired={repaired_rows.size}, method={method}",
                     requested=dispatch_mode,
                     selected=ExecutionMode.CPU,
@@ -1197,8 +880,10 @@ def make_valid_owned(
                 )
             _ensure_geometries()
             result = make_valid_cpu_repair(
-                geometries, repaired_rows,
-                method=method, keep_collapsed=keep_collapsed,
+                geometries,
+                repaired_rows,
+                method=method,
+                keep_collapsed=keep_collapsed,
             )
             if not gpu_detection_used:
                 selected = ExecutionMode.CPU
@@ -1218,11 +903,19 @@ def make_valid_owned(
         operation="make_valid",
         implementation=impl,
         reason=f"make_valid dispatch: detection={'GPU' if gpu_detection_used else 'CPU'}, "
-               f"repair={selected.value}, {repaired_rows.size} rows repaired",
+        f"repair={selected.value}, {repaired_rows.size} rows repaired",
         detail=f"rows={row_count}, method={method}, repaired={repaired_rows.size}",
         requested=dispatch_mode,
         selected=selected,
     )
+    native_geometry = None
+    if selected is ExecutionMode.GPU and repaired_rows.size:
+        native_geometry = _make_valid_linework_native_geometry(
+            owned,
+            result_owned,
+            repaired_rows,
+            method=method,
+        )
     return MakeValidResult(
         row_count=row_count,
         valid_rows=np.flatnonzero(valid_mask).astype(np.int32),
@@ -1231,6 +924,7 @@ def make_valid_owned(
         method=method,
         keep_collapsed=keep_collapsed,
         owned=result_owned,
+        native_geometry=native_geometry,
         selected=selected,
         _geometries=result,
     )
@@ -1314,7 +1008,14 @@ def _warmup_gpu_make_valid_pipeline():
     make_valid_owned(owned=build_make_valid_warmup_owned())
 
 
-def benchmark_make_valid(values, *, method: str = "linework", keep_collapsed: bool = True, dataset: str = "make-valid", owned=None):
+def benchmark_make_valid(
+    values,
+    *,
+    method: str = "linework",
+    keep_collapsed: bool = True,
+    dataset: str = "make-valid",
+    owned=None,
+):
     geometries = np.asarray(values, dtype=object)
 
     # Warm up the full GPU make_valid pipeline before the timed measurement.
@@ -1331,7 +1032,9 @@ def benchmark_make_valid(values, *, method: str = "linework", keep_collapsed: bo
             make_valid_owned(geometries, method=method, keep_collapsed=keep_collapsed, owned=owned)
 
     start = perf_counter()
-    compact = make_valid_owned(geometries, method=method, keep_collapsed=keep_collapsed, owned=owned)
+    compact = make_valid_owned(
+        geometries, method=method, keep_collapsed=keep_collapsed, owned=owned
+    )
     compact_elapsed = perf_counter() - start
 
     start = perf_counter()

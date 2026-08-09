@@ -8,7 +8,9 @@ from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 # NVRTC kernel: reverse coordinates within spans defined by offsets
 # ---------------------------------------------------------------------------
 
-_REVERSE_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_REVERSE_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + r"""
 extern "C" __global__ void reverse_spans(
     const double* __restrict__ x_in,
     const double* __restrict__ y_in,
@@ -49,5 +51,6 @@ extern "C" __global__ void reverse_by_offsets(
     }}
 }}
 """
+)
 _REVERSE_KERNEL_NAMES = ("reverse_spans", "reverse_by_offsets")
 _REVERSE_FP64 = _REVERSE_KERNEL_SOURCE.format(compute_type="double")

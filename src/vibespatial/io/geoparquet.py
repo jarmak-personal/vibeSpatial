@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import re
@@ -11,6 +12,7 @@ from time import perf_counter
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
 from vibespatial.api._native_metadata import NativeGeometryMetadata
 from vibespatial.api._native_results import (
@@ -19,6 +21,7 @@ from vibespatial.api._native_results import (
     NativeGeometryColumn,
     NativeReadProvenance,
     NativeTabularResult,
+    NativeTabularSelection,
     _concat_native_tabular_results,
     native_attribute_table_from_arrow_table,
     to_native_tabular_result,
@@ -27,6 +30,7 @@ from vibespatial.api._native_state import attach_native_state_from_native_tabula
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import (
+    DeviceRegularGridRectMetadata,
     OwnedGeometryArray,
     concatenate_owned_arrays,
 )
@@ -62,10 +66,105 @@ from .wkb import (
 )
 
 _SMALL_TERMINAL_ARROW_EXPORT_MAX_ROWS = 2_048
-_SMALL_TERMINAL_ARROW_EXPORT_FAMILIES = frozenset({
-    GeometryFamily.POLYGON,
-    GeometryFamily.MULTIPOLYGON,
-})
+_SMALL_TERMINAL_ARROW_EXPORT_FAMILIES = frozenset(
+    {
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+    }
+)
+_VIBESPATIAL_METADATA_KEY = "vibespatial"
+_VIBESPATIAL_SHAPE_PROOF_KEY = "shape_proof"
+_REGULAR_GRID_RECT_PROOF_KIND = "regular_grid_rect"
+_REGULAR_GRID_RECT_PROOF_VERSION = 1
+
+
+def _regular_grid_rect_proof_from_column_metadata(
+    column_meta: dict[str, Any] | None,
+    *,
+    row_count: int,
+) -> DeviceRegularGridRectMetadata | None:
+    if not isinstance(column_meta, dict):
+        return None
+    native_meta = column_meta.get(_VIBESPATIAL_METADATA_KEY)
+    if not isinstance(native_meta, dict):
+        return None
+    proof = native_meta.get(_VIBESPATIAL_SHAPE_PROOF_KEY)
+    if not isinstance(proof, dict):
+        return None
+    if proof.get("kind") != _REGULAR_GRID_RECT_PROOF_KIND:
+        return None
+    if int(proof.get("version", -1)) != _REGULAR_GRID_RECT_PROOF_VERSION:
+        return None
+    if int(proof.get("size", -1)) != int(row_count):
+        return None
+    total_bounds = proof.get("total_bounds")
+    if not isinstance(total_bounds, (list, tuple)) or len(total_bounds) != 4:
+        return None
+    try:
+        origin_x = float(proof["origin_x"])
+        origin_y = float(proof["origin_y"])
+        cell_width = float(proof["cell_width"])
+        cell_height = float(proof["cell_height"])
+        cols = int(proof["cols"])
+        rows = int(proof["rows"])
+        size = int(proof["size"])
+        total_bounds_tuple = tuple(float(value) for value in total_bounds)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if cell_width <= 0.0 or cell_height <= 0.0 or cols <= 0 or rows <= 0:
+        return None
+    if size != int(row_count):
+        return None
+    if not np.isfinite(
+        np.asarray(
+            [
+                origin_x,
+                origin_y,
+                cell_width,
+                cell_height,
+                *total_bounds_tuple,
+            ],
+            dtype=np.float64,
+        )
+    ).all():
+        return None
+    return DeviceRegularGridRectMetadata(
+        origin_x=origin_x,
+        origin_y=origin_y,
+        cell_width=cell_width,
+        cell_height=cell_height,
+        cols=cols,
+        rows=rows,
+        size=size,
+        total_bounds=total_bounds_tuple,
+    )
+
+
+def _attach_regular_grid_rect_proof_from_column_metadata(
+    owned: OwnedGeometryArray,
+    column_meta: dict[str, Any] | None,
+) -> None:
+    """Rehydrate a trusted terminal GeoParquet regular-grid proof."""
+    if owned.residency is not Residency.DEVICE or owned.device_state is None:
+        return
+    if set(owned.device_state.families) != {GeometryFamily.POLYGON}:
+        return
+    polygon_buffer = owned.device_state.families.get(GeometryFamily.POLYGON)
+    if polygon_buffer is None:
+        return
+    if int(getattr(polygon_buffer.geometry_offsets, "size", 0)) != int(owned.row_count) + 1:
+        return
+    if int(getattr(polygon_buffer.ring_offsets, "size", 0)) != int(owned.row_count) + 1:
+        return
+    proof = _regular_grid_rect_proof_from_column_metadata(
+        column_meta,
+        row_count=owned.row_count,
+    )
+    if proof is None:
+        return
+    polygon_buffer.dense_single_ring_width = 5
+    polygon_buffer.axis_aligned_rectangles = True
+    polygon_buffer.regular_grid_rect = proof
 
 
 def _record_public_geoparquet_dispatch(
@@ -90,14 +189,14 @@ def _record_public_geoparquet_dispatch(
 
 
 def _payload_geometry_series(payload: NativeTabularResult):
-    attributes = payload.attributes_for_export(
-        surface="vibespatial.io.geoparquet._payload_geometry_series",
-        include_index=True,
-        strict_disallowed=False,
-    )
+    # GeoParquet geometry metadata depends on CRS, geometry type domain, and
+    # optional shape proofs; public index labels are serialized by the Arrow
+    # table export below.  Use a synthetic row index here so metadata assembly
+    # does not duplicate a device-position host export for host-label plans.
+    index = pd.RangeIndex(payload.geometry.row_count)
     return _authoritative_geometry_series(
         payload.geometry.to_geoseries(
-            index=attributes.index,
+            index=index,
             name=payload.geometry_name,
         )
     )
@@ -149,6 +248,26 @@ def _authoritative_native_tabular_result(
     payload: NativeTabularResult,
 ) -> NativeTabularResult:
     def authoritative_geometry_result(geometry: GeometryNativeResult) -> GeometryNativeResult:
+        if geometry.composition is not None:
+            from vibespatial.api._native_result_core import (
+                NativeGeometryComposition,
+                NativeGeometryCompositionPart,
+            )
+
+            return GeometryNativeResult.from_composition(
+                NativeGeometryComposition(
+                    parts=tuple(
+                        NativeGeometryCompositionPart(
+                            authoritative_geometry_result(part.geometry),
+                            part.output_rows,
+                        )
+                        for part in geometry.composition.parts
+                    ),
+                    row_count=geometry.composition.row_count,
+                    crs=geometry.crs,
+                ),
+                crs=geometry.crs,
+            )
         owned = geometry.owned
         if owned is None or owned.device_state is None:
             return geometry
@@ -165,7 +284,10 @@ def _authoritative_native_tabular_result(
         )
         for column in payload.secondary_geometry
     )
-    if authoritative_geometry is payload.geometry and authoritative_secondary == payload.secondary_geometry:
+    if (
+        authoritative_geometry is payload.geometry
+        and authoritative_secondary == payload.secondary_geometry
+    ):
         return payload
     return NativeTabularResult(
         attributes=payload.attributes,
@@ -199,7 +321,9 @@ def _record_terminal_geoparquet_compatibility_export(
 
 
 def _terminal_arrow_export_selected_mode(owned: OwnedGeometryArray | None) -> ExecutionMode:
-    if owned is not None and (owned.device_state is not None or owned.residency is Residency.DEVICE):
+    if owned is not None and (
+        owned.device_state is not None or owned.residency is Residency.DEVICE
+    ):
         return ExecutionMode.GPU
     return ExecutionMode.CPU
 
@@ -227,7 +351,10 @@ def _record_terminal_geoparquet_native_arrow_export(
 def _owned_prefers_small_terminal_arrow_export(owned: OwnedGeometryArray | None) -> bool:
     if owned is None:
         return False
-    families = frozenset(owned.families)
+    if owned.device_state is not None:
+        families = frozenset(owned.device_state.families)
+    else:
+        families = frozenset(owned.families)
     return bool(families) and families.issubset(_SMALL_TERMINAL_ARROW_EXPORT_FAMILIES)
 
 
@@ -266,9 +393,7 @@ def _try_promote_geoparquet_geometry_columns_to_device(
             else:
                 original_owned = getattr(array, "_owned", None)
                 original_residency = (
-                    original_owned.residency
-                    if original_owned is not None
-                    else None
+                    original_owned.residency if original_owned is not None else None
                 )
                 snapshots.append((array, original_owned, original_residency))
                 has_z = getattr(array, "has_z", None)
@@ -320,7 +445,11 @@ def _geometry_columns_are_device_owned(df, geometry_columns) -> bool:
         return False
     for column_name in geometry_columns:
         array = df[column_name].array
-        owned = array.owned if isinstance(array, DeviceGeometryArray) else getattr(array, "_owned", None)
+        owned = (
+            array.owned
+            if isinstance(array, DeviceGeometryArray)
+            else getattr(array, "_owned", None)
+        )
         if owned is None:
             return False
         if owned.device_state is None and owned.residency is not Residency.DEVICE:
@@ -349,6 +478,7 @@ def _write_native_tabular_result_with_arrow(
         geometry_encoding=geometry_encoding,
         schema_version=schema_version,
         write_covering_bbox=write_covering_bbox,
+        force_device_geometry_encode=True,
     )
     pq.write_table(table, path, compression=compression, **kwargs)
 
@@ -359,22 +489,26 @@ def _decode_pylibcudf_geoparquet_column_with_arrow_fallback(
     column_name: str,
     column_index: int,
     encoding: str | None,
+    column_meta: dict[str, Any] | None = None,
     schema=None,
 ) -> OwnedGeometryArray:
     import pyarrow as pa
 
     try:
-        return _decode_pylibcudf_geoparquet_column_to_owned(
-            table.columns()[column_index],
-            encoding,
-        )
+        decoder = _decode_pylibcudf_geoparquet_column_to_owned
+        if "column_meta" in inspect.signature(decoder).parameters:
+            return decoder(
+                table.columns()[column_index],
+                encoding,
+                column_meta=column_meta,
+            )
+        return decoder(table.columns()[column_index], encoding)
     except NotImplementedError as exc:
         record_fallback_event(
             surface="vibespatial.io.geoparquet",
             reason="explicit CPU fallback after GPU GeoParquet geometry decode could not complete",
             detail=(
-                f"column={column_name}, encoding={encoding!r}, "
-                f"detail={type(exc).__name__}: {exc}"
+                f"column={column_name}, encoding={encoding!r}, detail={type(exc).__name__}: {exc}"
             ),
             selected=ExecutionMode.CPU,
             pipeline="io/read_parquet",
@@ -519,6 +653,7 @@ def _write_geoparquet_native_tabular_result(
         write_covering_bbox=write_covering_bbox,
         column_order=payload.resolved_column_order,
         frame_attrs=payload.attrs,
+        index_plan=payload.index_plan,
         **kwargs,
     )
     if device_write.written:
@@ -577,6 +712,7 @@ def _write_geoparquet_native_tabular_result(
         geometry_encoding=geometry_encoding,
         interleaved=False,
         include_z=None,
+        force_device_geometry_encode=True,
     )
 
     geo_metadata = _create_geometry_metadata(
@@ -602,6 +738,7 @@ def _write_geoparquet_native_tabular_result(
     )
 
     pq.write_table(table, path, compression=compression, **kwargs)
+
 
 @dataclass(frozen=True)
 class GeoParquetScanPlan:
@@ -665,15 +802,17 @@ class GeoParquetEngineBenchmark:
     concat_elapsed_seconds: float = 0.0
 
 
-_PYLIBCUDF_GEOPARQUET_ENCODINGS = frozenset({
-    "point",
-    "linestring",
-    "polygon",
-    "multipoint",
-    "multilinestring",
-    "multipolygon",
-    "wkb",
-})
+_PYLIBCUDF_GEOPARQUET_ENCODINGS = frozenset(
+    {
+        "point",
+        "linestring",
+        "polygon",
+        "multipoint",
+        "multilinestring",
+        "multipolygon",
+        "wkb",
+    }
+)
 _DEFAULT_GPU_GEOPARQUET_CHUNK_ROWS = 250_000
 
 
@@ -685,8 +824,7 @@ def _unsupported_pylibcudf_geoparquet_encoding(
         return None
     requested = set(columns or ())
     geometry_columns = [
-        name for name in geo_metadata["columns"]
-        if not requested or name in requested
+        name for name in geo_metadata["columns"] if not requested or name in requested
     ]
     for column_name in geometry_columns:
         encoding = geo_metadata["columns"][column_name].get("encoding")
@@ -694,6 +832,7 @@ def _unsupported_pylibcudf_geoparquet_encoding(
         if normalized not in _PYLIBCUDF_GEOPARQUET_ENCODINGS:
             return column_name, normalized
     return None
+
 
 def _rebuild_arrow_array_with_schema_type(array, expected_type):
     import pyarrow as pa
@@ -724,9 +863,7 @@ def _rebuild_arrow_array_with_schema_type(array, expected_type):
         or pa.types.is_large_list(expected_type)
         or pa.types.is_fixed_size_list(expected_type)
     ):
-        children = [
-            _rebuild_arrow_array_with_schema_type(array.values, expected_type.value_type)
-        ]
+        children = [_rebuild_arrow_array_with_schema_type(array.values, expected_type.value_type)]
 
     return pa.Array.from_buffers(
         expected_type,
@@ -870,6 +1007,15 @@ def _hidden_index_fields_from_schema_metadata(
     ]
 
 
+def _physical_hidden_index_fields_from_schema(schema) -> list[str]:
+    available = set(schema.names)
+    return [
+        field
+        for field in _hidden_index_fields_from_schema_metadata(schema.metadata)
+        if field in available
+    ]
+
+
 def _merge_column_projection(*column_groups) -> list[str] | None:
     merged: list[str] = []
     seen: set[str] = set()
@@ -939,7 +1085,9 @@ def _compile_pylibcudf_parquet_filter(
     import pylibcudf as plc
 
     normalized = _normalize_parquet_filters(filters)
-    return plc.expressions.to_expression(str(normalized), tuple(str(name) for name in available_columns))
+    return plc.expressions.to_expression(
+        str(normalized), tuple(str(name) for name in available_columns)
+    )
 
 
 def _supports_pylibcudf_geoparquet_read(
@@ -965,7 +1113,10 @@ def _supports_pylibcudf_geoparquet_read(
     if geo_metadata is not None:
         primary = geo_metadata["primary_column"]
         if primary not in geo_metadata["columns"]:
-            return False, "GeoParquet metadata without a readable primary geometry routes through host pyarrow"
+            return (
+                False,
+                "GeoParquet metadata without a readable primary geometry routes through host pyarrow",
+            )
         if bbox is not None:
             try:
                 _validate_geoparquet_bbox_support(geo_metadata, bbox)
@@ -982,7 +1133,10 @@ def _supports_pylibcudf_geoparquet_read(
         try:
             _compile_pylibcudf_parquet_filter(filters, available_columns=available_columns)
         except Exception as exc:
-            return False, f"predicate filter could not be compiled for the pylibcudf scan backend: {exc}"
+            return (
+                False,
+                f"predicate filter could not be compiled for the pylibcudf scan backend: {exc}",
+            )
     if not _is_local_geoparquet_source(path, filesystem=filesystem):
         return False, "dataset and non-local GeoParquet paths still route through host pyarrow"
     return True, "local GeoParquet scan can use the pylibcudf reader"
@@ -1109,16 +1263,23 @@ def plan_geoparquet_scan(
             and (prune_result is not None or uses_covering_bbox or uses_point_encoding_pushdown)
         ),
         planner_strategy=prune_result.strategy if prune_result is not None else planner_strategy,
-        available_row_groups=metadata_summary.row_group_count if metadata_summary is not None else None,
+        available_row_groups=metadata_summary.row_group_count
+        if metadata_summary is not None
+        else None,
         selected_row_groups=prune_result.selected_row_groups if prune_result is not None else None,
-        decoded_row_fraction_estimate=prune_result.decoded_row_fraction if prune_result is not None else None,
-        pruned_row_group_fraction=prune_result.pruned_row_group_fraction if prune_result is not None else None,
+        decoded_row_fraction_estimate=prune_result.decoded_row_fraction
+        if prune_result is not None
+        else None,
+        pruned_row_group_fraction=prune_result.pruned_row_group_fraction
+        if prune_result is not None
+        else None,
         reason=(
             "GeoParquet reads should prefer a GPU scanner plus metadata-first pushdown; "
             "without pylibcudf the current path falls back to host pyarrow scanning, "
             "but row groups can still be pruned before full geometry decode."
         ),
     )
+
 
 def plan_geoparquet_engine(
     *,
@@ -1130,7 +1291,11 @@ def plan_geoparquet_engine(
 ) -> GeoParquetEnginePlan:
     primary_column = None if geo_metadata is None else geo_metadata["primary_column"]
     geometry_encoding = None
-    if geo_metadata is not None and primary_column is not None and primary_column in geo_metadata["columns"]:
+    if (
+        geo_metadata is not None
+        and primary_column is not None
+        and primary_column in geo_metadata["columns"]
+    ):
         geometry_encoding = geo_metadata["columns"][primary_column].get("encoding")
     return GeoParquetEnginePlan(
         selected_path=scan_plan.selected_path,
@@ -1144,6 +1309,7 @@ def plan_geoparquet_engine(
             "decode supported geometry encodings directly into owned buffers after scan."
         ),
     )
+
 
 def _plan_geoparquet_chunks(
     *,
@@ -1163,7 +1329,11 @@ def _plan_geoparquet_chunks(
             if metadata_summary is not None
             else 0
         )
-        return (GeoParquetChunkPlan(chunk_index=0, row_groups=row_groups, estimated_rows=estimated_rows),)
+        return (
+            GeoParquetChunkPlan(
+                chunk_index=0, row_groups=row_groups, estimated_rows=estimated_rows
+            ),
+        )
     chunks: list[GeoParquetChunkPlan] = []
     current: list[int] = []
     current_rows = 0
@@ -1265,7 +1435,11 @@ def _native_bbox_row_positions_and_metadata(payload: NativeTabularResult, bbox):
             )
         return cp.flatnonzero(d_keep).astype(cp.int64, copy=False), metadata
 
-    bounds = np.asarray(geometry.series.bounds, dtype=np.float64)
+    geometry_series = geometry.to_geoseries(
+        index=pd.RangeIndex(geometry.row_count),
+        name="geometry",
+    )
+    bounds = np.asarray(geometry_series.bounds, dtype=np.float64)
     keep = ~(
         (bounds[:, 0] > bbox[2])
         | (bounds[:, 1] > bbox[3])
@@ -1395,6 +1569,7 @@ def _geoparquet_table_to_native_tabular_result(
     elif hasattr(table, "schema"):
         schema_metadata = table.schema.metadata
     hidden_index_fields = _hidden_index_fields_from_schema_metadata(schema_metadata)
+    hidden_index_fields = [field for field in hidden_index_fields if field in result_column_names]
     if hidden_index_fields:
         hidden_index_field_set = set(hidden_index_fields)
         result_column_names = [
@@ -1411,7 +1586,9 @@ def _geoparquet_table_to_native_tabular_result(
         if geo_metadata is not None and _check_if_covering_in_geo_metadata(geo_metadata):
             bbox_column_name = _get_bbox_encoding_column_name(geo_metadata)
             result_column_names = [
-                column_name for column_name in result_column_names if column_name != bbox_column_name
+                column_name
+                for column_name in result_column_names
+                if column_name != bbox_column_name
             ]
 
     geometry_columns = [col for col in geo_metadata["columns"] if col in result_column_names]
@@ -1452,7 +1629,8 @@ def _geoparquet_table_to_native_tabular_result(
             if scanned_with_pylibcudf:
                 attrs_arrow = _read_non_geometry_geoparquet_columns_as_arrow(
                     path,
-                    columns=_merge_column_projection(non_geometry_columns, hidden_index_fields) or [],
+                    columns=_merge_column_projection(non_geometry_columns, hidden_index_fields)
+                    or [],
                     row_groups=row_groups,
                     filesystem=filesystem,
                     filters=filters,
@@ -1480,6 +1658,7 @@ def _geoparquet_table_to_native_tabular_result(
                     column_name=column_name,
                     column_index=scan_column_index,
                     encoding=column_meta.get("encoding"),
+                    column_meta=column_meta,
                     schema=schema,
                 )
             else:
@@ -1488,6 +1667,10 @@ def _geoparquet_table_to_native_tabular_result(
                     geo_metadata,
                     column_index=scan_column_index,
                 )
+            _attach_regular_grid_rect_proof_from_column_metadata(
+                owned,
+                column_meta,
+            )
             if row_count is None:
                 row_count = owned.row_count
             decoded_geometry[column_name] = GeometryNativeResult.from_owned(owned, crs=crs)
@@ -1563,8 +1746,7 @@ def _read_geoparquet_with_pylibcudf(
         else:
             requested_columns = set(columns)
             geometry_scan_columns = [
-                name for name in geo_metadata["columns"]
-                if name in requested_columns
+                name for name in geo_metadata["columns"] if name in requested_columns
             ]
         if not geometry_scan_columns:
             geometry_scan_columns = None
@@ -1597,6 +1779,7 @@ def _read_geoparquet_with_pylibcudf(
         df_attrs=df_attrs,
     )
 
+
 def _read_non_geometry_geoparquet_columns_as_arrow(
     path,
     *,
@@ -1620,13 +1803,28 @@ def _read_non_geometry_geoparquet_columns_as_arrow(
 
     scan_sources = [_coerce_pyarrow_parquet_source(source) for source in (sources or [path])]
     schema = pq.read_schema(scan_sources[0], filesystem=filesystem)
-    requested_columns = _merge_column_projection(
-        list(columns),
-        _hidden_index_fields_from_schema_metadata(schema.metadata),
-    ) or []
+    available_columns = tuple(schema.names)
+    available_column_set = set(available_columns)
+    requested_columns = (
+        _merge_column_projection(
+            list(columns),
+            _physical_hidden_index_fields_from_schema(schema),
+        )
+        or []
+    )
+    requested_columns = [column for column in requested_columns if column in available_column_set]
     filter_expression = _normalize_parquet_filters(filters)
-    filter_columns = _parquet_filter_column_names(filters)
+    filter_columns = _parquet_filter_column_names(
+        filters,
+        available_columns=available_columns,
+    )
     scan_columns = _merge_column_projection(requested_columns, filter_columns)
+
+    def _select_requested_columns(table):
+        selected = table.select(requested_columns)
+        if schema.metadata is not None:
+            selected = selected.replace_schema_metadata(schema.metadata)
+        return _normalize_arrow_pandas_range_metadata(selected)
 
     if row_groups is None:
         if len(scan_sources) == 1:
@@ -1635,17 +1833,19 @@ def _read_non_geometry_geoparquet_columns_as_arrow(
                 columns=scan_columns,
                 filesystem=filesystem,
                 filters=filter_expression,
-                use_pandas_metadata=True,
+                use_pandas_metadata=False,
             )
-            return table.select(requested_columns)
+            return _select_requested_columns(table)
         tables = [
-            pq.read_table(
-                source,
-                columns=scan_columns,
-                filesystem=filesystem,
-                filters=filter_expression,
-                use_pandas_metadata=True,
-            ).select(requested_columns)
+            _select_requested_columns(
+                pq.read_table(
+                    source,
+                    columns=scan_columns,
+                    filesystem=filesystem,
+                    filters=filter_expression,
+                    use_pandas_metadata=False,
+                )
+            )
             for source in scan_sources
         ]
     else:
@@ -1660,13 +1860,13 @@ def _read_non_geometry_geoparquet_columns_as_arrow(
                 source_row_groups,
                 columns=scan_columns,
                 use_threads=True,
-                use_pandas_metadata=True,
+                use_pandas_metadata=False,
             )
             if filter_expression is not None:
                 if not isinstance(filter_expression, pc.Expression):
                     filter_expression = pq.filters_to_expression(filter_expression)
                 table = table.filter(filter_expression)
-            tables.append(table.select(requested_columns))
+            tables.append(_select_requested_columns(table))
 
     if not tables:
         return pa.table({name: pa.array([], type=pa.null()) for name in requested_columns})
@@ -1690,9 +1890,13 @@ def _read_non_geometry_geoparquet_columns_with_pyarrow(
     if to_pandas_kwargs is None:
         to_pandas_kwargs = {}
     arrow_table = _read_non_geometry_geoparquet_columns_as_arrow(
-        path, columns=columns, row_groups=row_groups, filesystem=filesystem,
+        path,
+        columns=columns,
+        row_groups=row_groups,
+        filesystem=filesystem,
     )
     return arrow_table.to_pandas(**to_pandas_kwargs)
+
 
 @lru_cache(maxsize=32)
 def _cached_geoparquet_crs_from_user_input(crs_value: str) -> Any:
@@ -1730,6 +1934,7 @@ def _geoparquet_geometry_column_crs(column_metadata: dict[str, Any]) -> Any:
         return _cached_geoparquet_crs_from_user_input("OGC:CRS84")
     except Exception:
         return "OGC:CRS84"
+
 
 def _read_geoparquet_table_with_pylibcudf(
     path,
@@ -1769,6 +1974,7 @@ def _read_geoparquet_table_with_pylibcudf(
         )
     table_with_metadata = plc.io.parquet.read_parquet(options)
     return table_with_metadata.tbl
+
 
 def _parquet_column_path(*components: str) -> str:
     return ".".join(components)
@@ -1913,6 +2119,7 @@ def _build_geoparquet_metadata_summary_from_pyarrow(
         row_group_source_row_groups=row_group_source_row_groups,
     )
 
+
 def _read_geoparquet_with_pyarrow(
     path,
     *,
@@ -1957,7 +2164,9 @@ def _normalize_arrow_pandas_range_metadata(table):
                     range_start = int(range_spec.get("start", 0))
                     range_stop = int(range_spec.get("stop", table.num_rows))
                     range_step = int(range_spec.get("step", 1))
-                    expected_rows = max(0, (range_stop - range_start + (range_step - 1)) // range_step)
+                    expected_rows = max(
+                        0, (range_stop - range_start + (range_step - 1)) // range_step
+                    )
                     if expected_rows != int(table.num_rows):
                         range_spec["start"] = 0
                         range_spec["stop"] = int(table.num_rows)
@@ -2017,7 +2226,9 @@ def _read_geoparquet_table_with_pyarrow(
     else:
         filters = bbox_filter
     kwargs["use_pandas_metadata"] = True
-    is_directory_dataset = isinstance(normalized_path, (str, PathLike)) and Path(normalized_path).is_dir()
+    is_directory_dataset = (
+        isinstance(normalized_path, (str, PathLike)) and Path(normalized_path).is_dir()
+    )
     added_bbox_column = None
     row_group_columns = columns
     if row_group_columns is not None and filters is not None:
@@ -2074,6 +2285,7 @@ def _read_geoparquet_table_with_pyarrow(
         df_attrs = None
     return table, geo_metadata, df_attrs
 
+
 def _decode_arrow_geoparquet_table_to_owned(
     table,
     geo_metadata: dict[str, Any],
@@ -2081,7 +2293,9 @@ def _decode_arrow_geoparquet_table_to_owned(
     column_index: int | None = None,
 ) -> OwnedGeometryArray:
     primary = geo_metadata["primary_column"]
-    field_index = table.schema.get_field_index(primary) if column_index is None else int(column_index)
+    field_index = (
+        table.schema.get_field_index(primary) if column_index is None else int(column_index)
+    )
     if field_index == -1:
         field_index = 0
     field = table.schema.field(field_index)
@@ -2095,7 +2309,12 @@ def _decode_arrow_geoparquet_table_to_owned(
         else:
             raise KeyError(column_name)
     encoding = geo_metadata["columns"][column_name].get("encoding")
-    return _decode_geoarrow_array_to_owned(field, array, encoding=encoding)
+    owned = _decode_geoarrow_array_to_owned(field, array, encoding=encoding)
+    _attach_regular_grid_rect_proof_from_column_metadata(
+        owned,
+        geo_metadata["columns"][column_name],
+    )
+    return owned
 
 
 def _decode_geoparquet_table_to_owned(
@@ -2120,12 +2339,18 @@ def _decode_geoparquet_table_to_owned(
         else:
             primary = geo_metadata["primary_column"]
             decode_index = 0 if column_index is None else int(column_index)
-            return _decode_pylibcudf_geoparquet_column_with_arrow_fallback(
+            owned = _decode_pylibcudf_geoparquet_column_with_arrow_fallback(
                 table,
                 column_name=primary,
                 column_index=decode_index,
                 encoding=geo_metadata["columns"][primary].get("encoding"),
+                column_meta=geo_metadata["columns"][primary],
             )
+            _attach_regular_grid_rect_proof_from_column_metadata(
+                owned,
+                geo_metadata["columns"][primary],
+            )
+            return owned
 
     return _decode_arrow_geoparquet_table_to_owned(
         table,
@@ -2146,7 +2371,9 @@ def _geoparquet_native_provenance(
     chunk_rows: int | None,
 ) -> NativeReadProvenance:
     source = None if path is None else str(path)
-    groups = None if selected_row_groups is None else tuple(int(group) for group in selected_row_groups)
+    groups = (
+        None if selected_row_groups is None else tuple(int(group) for group in selected_row_groups)
+    )
     return NativeReadProvenance(
         surface=surface,
         format_name="geoparquet",
@@ -2204,9 +2431,7 @@ def _read_geoparquet_native_impl(
     read_kwargs = dict(kwargs)
     read_kwargs.pop("filesystem", None)
     selected_row_groups = (
-        scan_plan.selected_row_groups
-        if scan_plan.selected_row_groups is not None
-        else row_groups
+        scan_plan.selected_row_groups if scan_plan.selected_row_groups is not None else row_groups
     )
     read_plan = plan_geoparquet_read_backend(
         normalized_path,
@@ -2287,8 +2512,7 @@ def _read_geoparquet_native_impl(
     else:
         requested_columns = set(columns)
         geometry_scan_columns = [
-            name for name in geo_metadata["columns"]
-            if name in requested_columns
+            name for name in geo_metadata["columns"] if name in requested_columns
         ]
     if not geometry_scan_columns:
         geometry_scan_columns = None
@@ -2424,6 +2648,7 @@ def read_geoparquet_native(
         **kwargs,
     )
 
+
 def read_geoparquet_owned(
     path,
     *,
@@ -2460,12 +2685,12 @@ def read_geoparquet_owned(
     )
     row_groups = kwargs.pop("row_groups", None)
     selected_row_groups = (
-        scan_plan.selected_row_groups
-        if scan_plan.selected_row_groups is not None
-        else row_groups
+        scan_plan.selected_row_groups if scan_plan.selected_row_groups is not None else row_groups
     )
     primary_column = geo_metadata["primary_column"]
-    scan_columns = [primary_column] if columns is None else list(dict.fromkeys([*columns, primary_column]))
+    scan_columns = (
+        [primary_column] if columns is None else list(dict.fromkeys([*columns, primary_column]))
+    )
     decode_column_index = scan_columns.index(primary_column)
     read_plan = plan_geoparquet_read_backend(
         normalized_path,
@@ -2566,6 +2791,7 @@ def read_geoparquet_owned(
         chunks.append(owned)
     return concatenate_owned_arrays(chunks)
 
+
 def write_geoparquet(
     df,
     path,
@@ -2579,6 +2805,11 @@ def write_geoparquet(
 ) -> None:
     payload = to_native_tabular_result(df)
     if payload is not None:
+        if isinstance(payload, NativeTabularSelection):
+            payload = payload.to_native_tabular_result(
+                surface="vibespatial.io.geoparquet.write_geoparquet",
+                strict_disallowed=False,
+            )
         if write_covering_bbox and "bbox" in payload.attributes.columns:
             raise ValueError(
                 "An existing column 'bbox' already exists in the dataframe. "
@@ -2631,7 +2862,9 @@ def write_geoparquet(
                 terminal_owned = df[geometry_columns[0]].array.to_owned()
                 small_write_detail = _small_terminal_arrow_export_detail(
                     row_count=len(df),
-                    polygonal_terminal_candidate=_owned_prefers_small_terminal_arrow_export(terminal_owned),
+                    polygonal_terminal_candidate=_owned_prefers_small_terminal_arrow_export(
+                        terminal_owned
+                    ),
                 )
             if small_write_detail is not None:
                 _record_terminal_geoparquet_native_arrow_export(
@@ -2692,6 +2925,7 @@ def write_geoparquet(
         ),
         row_count=len(df),
     )
+
 
 def _write_geoparquet_native(
     df,
@@ -2790,10 +3024,7 @@ def _write_geoparquet_native(
     # Build a table from non-geometry columns
     geometry_columns_set = set(geometry_columns)
     df_attr = pd.DataFrame(
-        {
-            col: (None if col in geometry_columns_set else df[col])
-            for col in df.columns
-        },
+        {col: (None if col in geometry_columns_set else df[col]) for col in df.columns},
         index=df.index,
     )
     table = pa.Table.from_pandas(df_attr, preserve_index=index)
@@ -2819,9 +3050,7 @@ def _write_geoparquet_native(
                     )
                     table = table.set_column(col_idx, field, geom_arr)
                     encoding_name = (
-                        field.metadata[b"ARROW:extension:name"]
-                        .decode()
-                        .removeprefix("geoarrow.")
+                        field.metadata[b"ARROW:extension:name"].decode().removeprefix("geoarrow.")
                     )
                     geometry_encoding_dict[col_name] = encoding_name
                     continue
@@ -2841,9 +3070,7 @@ def _write_geoparquet_native(
             )
 
         # WKB encoding — use owned-buffer WKB encoder when available
-        field, wkb_arr = _encode_owned_wkb_array(
-            owned, field_name=col_name, crs=series.crs
-        )
+        field, wkb_arr = _encode_owned_wkb_array(owned, field_name=col_name, crs=series.crs)
         table = table.set_column(col_idx, field, wkb_arr)
         geometry_encoding_dict[col_name] = "WKB"
 
@@ -2870,6 +3097,7 @@ def _write_geoparquet_native(
     )
 
     pq.write_table(table, path, compression=compression, **kwargs)
+
 
 def read_geoparquet(
     path,
@@ -2934,6 +3162,7 @@ def read_geoparquet(
         to_pandas_kwargs=to_pandas_kwargs,
         **kwargs,
     )
+
 
 def benchmark_geoparquet_scan_engine(
     *,

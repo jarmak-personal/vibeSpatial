@@ -1,4 +1,5 @@
 """Overlay operation benchmarks: gpu-overlay, segment-filters, segment-intersections, segment-primitives."""
+
 from __future__ import annotations
 
 from typing import Any

@@ -44,6 +44,7 @@ from vibespatial.cuda.cccl_primitives import (
 from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode, combined_residency, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import PhysicalWorkEstimate
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.spatial.query_types import _record_device_join_materialization
 
@@ -53,22 +54,25 @@ from .query_utils import _expand_bounds
 logger = logging.getLogger(__name__)
 
 # Eagerly request CCCL spec warmup at module import (ADR-0034 Level 1).
-request_warmup([
-    "exclusive_scan_i32",
-    "exclusive_scan_i64",
-    "select_i32",
-    "select_i64",
-    "radix_sort_i32_i32",
-    "segmented_sort_asc_f64",
-    "segmented_reduce_min_f64",
-    "lower_bound_i32",
-    "upper_bound_i32",
-])
+request_warmup(
+    [
+        "exclusive_scan_i32",
+        "exclusive_scan_i64",
+        "select_i32",
+        "select_i64",
+        "radix_sort_i32_i32",
+        "segmented_sort_asc_f64",
+        "segmented_reduce_min_f64",
+        "lower_bound_i32",
+        "upper_bound_i32",
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # Result type
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True, slots=True)
 class DeviceKnnResult:
@@ -91,9 +95,10 @@ class DeviceKnnResult:
     k : int
         Requested k value.
     """
-    d_query_idx: Any   # CuPy int32 device array
+
+    d_query_idx: Any  # CuPy int32 device array
     d_target_idx: Any  # CuPy int32 device array
-    d_distances: Any   # CuPy float64 device array
+    d_distances: Any  # CuPy float64 device array
     total_pairs: int
     k: int
 
@@ -140,6 +145,7 @@ class DeviceKnnResult:
 # Distance computation dispatch (reuses nearest.py infrastructure)
 # ---------------------------------------------------------------------------
 
+
 def _select_distance_strategy(
     query_owned: OwnedGeometryArray,
     tree_owned: OwnedGeometryArray,
@@ -160,8 +166,11 @@ def _select_distance_strategy(
 
     if _points_only(query_owned) and _points_only(tree_owned):
         from vibespatial.geometry.buffers import GeometryFamily
-        if (GeometryFamily.POINT in query_owned.families
-                and GeometryFamily.POINT in tree_owned.families):
+
+        if (
+            GeometryFamily.POINT in query_owned.families
+            and GeometryFamily.POINT in tree_owned.families
+        ):
             return PointPointDistanceStrategy()
         return None
 
@@ -210,17 +219,29 @@ def _compute_pair_distances(
         PointFamilyDistanceStrategy,
         _points_only,
     )
-    if (_points_only(tree_owned) and not _points_only(query_owned)
-            and isinstance(strategy, PointFamilyDistanceStrategy)):
+
+    if (
+        _points_only(tree_owned)
+        and not _points_only(query_owned)
+        and isinstance(strategy, PointFamilyDistanceStrategy)
+    ):
         # Reverse: strategy computes point->family, so swap left/right
         ok = strategy.compute(
-            tree_owned, query_owned,
-            d_right, d_left, d_distances, pair_count,
+            tree_owned,
+            query_owned,
+            d_right,
+            d_left,
+            d_distances,
+            pair_count,
         )
     else:
         ok = strategy.compute(
-            query_owned, tree_owned,
-            d_left, d_right, d_distances, pair_count,
+            query_owned,
+            tree_owned,
+            d_left,
+            d_right,
+            d_distances,
+            pair_count,
         )
 
     if not ok:
@@ -232,6 +253,7 @@ def _compute_pair_distances(
 # ---------------------------------------------------------------------------
 # Per-query top-k selection
 # ---------------------------------------------------------------------------
+
 
 def _topk_per_query(
     d_query_idx: Any,
@@ -292,10 +314,16 @@ def _topk_per_query(
 
     # Step 3: Build segment boundaries from sorted query indices (Tier 3a CCCL).
     seg_starts = lower_bound_counting(
-        d_sorted_query, 0, n_queries, dtype=np.int32,
+        d_sorted_query,
+        0,
+        n_queries,
+        dtype=np.int32,
     ).astype(cp.int32, copy=False)
     seg_ends = upper_bound_counting(
-        d_sorted_query, 0, n_queries, dtype=np.int32,
+        d_sorted_query,
+        0,
+        n_queries,
+        dtype=np.int32,
     ).astype(cp.int32, copy=False)
 
     # Step 4: Segmented sort by distance within each query segment (Tier 3a CCCL).
@@ -337,6 +365,7 @@ def _topk_per_query(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def _bounds_are_device(*bounds_arrays: Any) -> bool:
     return any(hasattr(bounds, "__cuda_array_interface__") for bounds in bounds_arrays)
@@ -450,10 +479,15 @@ def spatial_index_knn_device(
     selection = plan_dispatch_selection(
         kernel_name="spatial_index_knn",
         kernel_class=KernelClass.METRIC,
-        row_count=n_queries * min(n_tree, 100),  # estimate work per query
+        row_count=n_queries,
         requested_precision=precision,
         gpu_available=True,
         current_residency=combined_residency(query_owned, tree_owned),
+        work_estimate=PhysicalWorkEstimate.for_candidate_pairs(
+            row_count=n_queries,
+            candidate_pair_count=n_queries * min(n_tree, 100),
+            primary_unit_name="knn-candidate-pair",
+        ),
     )
     if selection.selected is not ExecutionMode.GPU:
         return None
@@ -462,8 +496,7 @@ def spatial_index_knn_device(
     strategy = _select_distance_strategy(query_owned, tree_owned)
     if strategy is None:
         logger.debug(
-            "spatial_index_knn_device: no GPU distance strategy for "
-            "query=%s / tree=%s families",
+            "spatial_index_knn_device: no GPU distance strategy for query=%s / tree=%s families",
             list(query_owned.families.keys()),
             list(tree_owned.families.keys()),
         )
@@ -517,8 +550,11 @@ def spatial_index_knn_device(
             )
         # CPU fallback for candidate generation (small workloads).
         from .query_candidates import _generate_distance_pairs
+
         left_idx_h, right_idx_h = _generate_distance_pairs(
-            query_bounds, tree_bounds, per_row_dist,
+            query_bounds,
+            tree_bounds,
+            per_row_dist,
         )
         if left_idx_h.size == 0:
             return DeviceKnnResult(
@@ -548,15 +584,18 @@ def spatial_index_knn_device(
     d_sorted_right = sorted_result.values
 
     d_distances = _compute_pair_distances(
-        query_owned, tree_owned,
-        d_sorted_left, d_sorted_right, pair_count,
+        query_owned,
+        tree_owned,
+        d_sorted_left,
+        d_sorted_right,
+        pair_count,
     )
     if d_distances is None:
         return None
 
     # --- Handle exclusive flag: mark self-matches with infinity --------------
     if exclusive:
-        self_match = (d_sorted_left == d_sorted_right)
+        self_match = d_sorted_left == d_sorted_right
         d_distances = cp.where(self_match, cp.inf, d_distances)
 
     # --- Per-query top-k selection -------------------------------------------

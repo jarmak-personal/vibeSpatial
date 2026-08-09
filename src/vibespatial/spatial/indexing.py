@@ -25,7 +25,11 @@ from vibespatial.cuda._runtime import (  # noqa: E402
     get_cuda_runtime,
 )
 from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
-from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray  # noqa: E402
+from vibespatial.geometry.owned import (  # noqa: E402
+    FAMILY_TAGS,
+    DeviceRegularGridRectMetadata,
+    OwnedGeometryArray,
+)
 from vibespatial.kernels.core.geometry_analysis import (  # noqa: E402
     compute_geometry_bounds,
     compute_geometry_bounds_device,
@@ -34,6 +38,10 @@ from vibespatial.kernels.core.geometry_analysis import (  # noqa: E402
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime  # noqa: E402
 from vibespatial.runtime.adaptive import plan_dispatch_selection  # noqa: E402
 from vibespatial.runtime.config import COARSE_BOUNDS_TILE_SIZE, SEGMENT_TILE_SIZE  # noqa: E402
+from vibespatial.runtime.crossover import (  # noqa: E402
+    PhysicalWorkEstimate,
+    estimate_spatial_index_work_from_owned,
+)
 from vibespatial.runtime.fallbacks import record_fallback_event  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
 from vibespatial.runtime.residency import (  # noqa: E402
@@ -59,6 +67,7 @@ def _default_index_runtime_selection() -> RuntimeSelection:
         kernel_name="flat_index_build",
         kernel_class=KernelClass.COARSE,
         row_count=1,  # always exceeds threshold of 0
+        work_estimate=PhysicalWorkEstimate.from_rows(1),
         current_residency=Residency.HOST,
     )
 
@@ -84,13 +93,14 @@ class CandidatePairs:
 
     _host_left_indices: object  # np.ndarray or None (lazy from device)
     _host_right_indices: object  # np.ndarray or None (lazy from device)
-    left_bounds: np.ndarray
-    right_bounds: np.ndarray
+    left_bounds: object
+    right_bounds: object
     pairs_examined: int
     tile_size: int
     same_input: bool
     _device_left_indices: object = None  # CuPy device array or None
     _device_right_indices: object = None  # CuPy device array or None
+    _device_selection: object = None
 
     @property
     def left_indices(self) -> np.ndarray:
@@ -129,7 +139,16 @@ class CandidatePairs:
         return self._device_right_indices
 
     @property
+    def device_selection(self):
+        """Capacity selection when pair cardinality remains device-resident."""
+        return self._device_selection
+
+    @property
     def count(self) -> int:
+        if self._device_selection is not None:
+            raise TypeError(
+                "capacity-backed candidate pair count is device-resident"
+            )
         if self._host_left_indices is not None:
             return int(self._host_left_indices.size)
         if self._device_left_indices is not None:
@@ -147,12 +166,14 @@ def _generate_bounds_pairs_gpu(
     *,
     same_input: bool,
     include_self: bool,
-) -> tuple[object, object, int]:
+    capacity_output: bool,
+) -> tuple[object, object, int, object | None]:
     """GPU sort-and-sweep MBR overlap pair generation.
 
     Returns ``(d_left_indices, d_right_indices, pairs_examined)`` where the
     index arrays are CuPy device arrays (zero-copy -- no D->H transfer).
-    Returns numpy arrays for the empty-result edge case.
+    Empty results remain zero-length CuPy arrays so downstream native relation
+    consumers do not need a host-shaped special case.
     """
     runtime = get_cuda_runtime()
     kernels = _indexing_kernels()
@@ -177,7 +198,7 @@ def _generate_bounds_pairs_gpu(
 
     if left_count == 0 or right_count == 0:
         empty = cp.empty(0, dtype=cp.int32)
-        return empty, empty, 0
+        return empty, empty, 0, None
 
     # --- Extract valid bounds subsets on device ---
     d_left_valid_bounds = d_left_bounds_full[d_left_valid]  # [left_count, 4]
@@ -205,10 +226,12 @@ def _generate_bounds_pairs_gpu(
         total_count = left_count + right_count
         d_all_bounds = cp.concatenate([d_left_valid_bounds, d_right_valid_bounds], axis=0)
         d_all_orig = cp.concatenate([d_left_orig, d_right_orig])
-        d_all_side = cp.concatenate([
-            cp.zeros(left_count, dtype=cp.int32),
-            cp.ones(right_count, dtype=cp.int32),
-        ])
+        d_all_side = cp.concatenate(
+            [
+                cp.zeros(left_count, dtype=cp.int32),
+                cp.ones(right_count, dtype=cp.int32),
+            ]
+        )
         # Sort by minx (column 0) on device
         sort_order = cp.argsort(d_all_bounds[:, 0]).astype(cp.int32, copy=False)
         d_sorted_bounds = d_all_bounds[sort_order]
@@ -219,9 +242,12 @@ def _generate_bounds_pairs_gpu(
     # --- Pass 0: count pairs per sorted element ---
     d_counts = runtime.allocate((total_count,), np.int32, zero=True)
     _param_types = (
-        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
         KERNEL_PARAM_I32,
-        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
         KERNEL_PARAM_PTR,
         KERNEL_PARAM_I32,
         KERNEL_PARAM_I32,
@@ -229,7 +255,9 @@ def _generate_bounds_pairs_gpu(
     )
     count_params = (
         (
-            ptr(d_sorted_bounds_flat), ptr(d_sorted_orig), ptr(d_sorted_side),
+            ptr(d_sorted_bounds_flat),
+            ptr(d_sorted_orig),
+            ptr(d_sorted_side),
             total_count,
             0,  # out_left (unused in pass 0)
             0,  # out_right (unused in pass 0)
@@ -246,22 +274,63 @@ def _generate_bounds_pairs_gpu(
     # Prefix sum for scatter offsets (CCCL exclusive_sum, ADR-0033)
     cp_counts = cp.asarray(d_counts)
     d_offsets = exclusive_sum(cp_counts, synchronize=False)
-    total_pairs = count_scatter_total(
-        runtime,
-        cp_counts,
-        d_offsets,
-        reason="spatial index sweep candidate-pair allocation fence",
-    )
-
-    if total_pairs == 0:
-        empty = cp.empty(0, dtype=cp.int32)
-        return empty, empty, left_count * right_count
-
-    if total_pairs > 2_147_483_647:
-        raise OverflowError(
-            f"sweep_sorted_mbr_overlap: {total_pairs} candidate pairs exceed "
-            f"int32 offset capacity (2^31-1). Consider spatial partitioning."
+    pair_capacity = (
+        left_count * right_count
+        if not same_input
+        else (
+            left_count * (left_count + 1) // 2
+            if include_self
+            else left_count * (left_count - 1) // 2
         )
+    )
+    capacity_bytes = pair_capacity * np.dtype(np.int32).itemsize * 2
+    try:
+        pool_stats = runtime.memory_pool_stats()
+        free_bytes = int(
+            pool_stats.get("free_bytes", cp.cuda.Device().mem_info[0])
+        )
+    except Exception:
+        free_bytes = 0
+    input_row_capacity = left_count + (0 if same_input else right_count)
+    bounded_capacity_limit = max(input_row_capacity, 1) * 8
+    use_capacity_output = (
+        capacity_output
+        and pair_capacity <= np.iinfo(np.int32).max
+        and pair_capacity <= bounded_capacity_limit
+        and capacity_bytes <= free_bytes // 8
+    )
+    if use_capacity_output:
+        from vibespatial.api._native_rowset import NativeDeviceSelection
+
+        total_pairs_device = (
+            cp_counts[-1:].astype(cp.int64, copy=False)
+            + d_offsets[-1:].astype(cp.int64, copy=False)
+        )
+        total_pairs = pair_capacity
+        device_selection = NativeDeviceSelection(
+            positions=cp.arange(pair_capacity, dtype=cp.int64),
+            logical_count=total_pairs_device,
+            source_row_count=pair_capacity,
+            ordered=True,
+            unique=True,
+            full_selection_implies_identity=True,
+        )
+    else:
+        total_pairs = count_scatter_total(
+            runtime,
+            cp_counts,
+            d_offsets,
+            reason="spatial index sweep candidate-pair allocation fence",
+        )
+        device_selection = None
+        if total_pairs == 0:
+            empty = cp.empty(0, dtype=cp.int32)
+            return empty, empty, left_count * right_count, None
+        if total_pairs > 2_147_483_647:
+            raise OverflowError(
+                f"sweep_sorted_mbr_overlap: {total_pairs} candidate pairs exceed "
+                f"int32 offset capacity (2^31-1). Consider spatial partitioning."
+            )
 
     # Copy offsets into counts buffer for the scatter kernel to read
     cp.copyto(cp_counts, d_offsets)
@@ -273,9 +342,12 @@ def _generate_bounds_pairs_gpu(
     # --- Pass 1: scatter pairs ---
     scatter_params = (
         (
-            ptr(d_sorted_bounds_flat), ptr(d_sorted_orig), ptr(d_sorted_side),
+            ptr(d_sorted_bounds_flat),
+            ptr(d_sorted_orig),
+            ptr(d_sorted_side),
             total_count,
-            ptr(d_out_left), ptr(d_out_right),
+            ptr(d_out_left),
+            ptr(d_out_right),
             ptr(d_counts),
             1,  # pass_number = 1
             int(same_input),
@@ -288,7 +360,12 @@ def _generate_bounds_pairs_gpu(
     # No sync needed -- CuPy arrays stay on device.
 
     pairs_examined = left_count * right_count
-    return cp.asarray(d_out_left), cp.asarray(d_out_right), pairs_examined
+    return (
+        cp.asarray(d_out_left),
+        cp.asarray(d_out_right),
+        pairs_examined,
+        device_selection,
+    )
 
 
 def generate_bounds_pairs(
@@ -297,6 +374,8 @@ def generate_bounds_pairs(
     *,
     tile_size: int = COARSE_BOUNDS_TILE_SIZE,
     include_self: bool = False,
+    requested_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    capacity_output: bool = False,
 ) -> CandidatePairs:
     if tile_size <= 0:
         raise ValueError("tile_size must be positive")
@@ -304,27 +383,44 @@ def generate_bounds_pairs(
     same_input = right is None or right is left
     right_array = left if right is None else right
 
-    left_bounds = compute_geometry_bounds(left)
-    right_bounds = left_bounds if same_input else compute_geometry_bounds(right_array)
-
     total_geom_count = left.row_count + (0 if same_input else right_array.row_count)
+    candidate_pair_count = int(left.row_count) * int(right_array.row_count)
+    work_estimate = PhysicalWorkEstimate.for_candidate_pairs(
+        row_count=total_geom_count,
+        candidate_pair_count=candidate_pair_count,
+        primary_unit_name="bbox-candidate-pair",
+    )
     selection = plan_dispatch_selection(
         kernel_name="bbox_overlap_candidates",
         kernel_class=KernelClass.COARSE,
         row_count=total_geom_count,
-        requested_mode=ExecutionMode.AUTO,
+        requested_mode=requested_mode,
         gpu_available=has_gpu_runtime(),
         current_residency=left.residency if same_input else combined_residency(left, right_array),
+        work_estimate=work_estimate,
     )
     use_gpu = selection.selected is ExecutionMode.GPU and cp is not None
     if use_gpu:
-        d_left, d_right, pairs_examined = _generate_bounds_pairs_gpu(
+        left_bounds = compute_geometry_bounds_device(
+            left,
+            preserve_indexed_view=True,
+        )
+        right_bounds = (
+            left_bounds
+            if same_input
+            else compute_geometry_bounds_device(
+                right_array,
+                preserve_indexed_view=True,
+            )
+        )
+        d_left, d_right, pairs_examined, device_selection = _generate_bounds_pairs_gpu(
             left_bounds,
             right_bounds,
             same_input=same_input,
             include_self=include_self,
+            capacity_output=capacity_output,
         )
-        # Determine if GPU returned device arrays or host arrays (empty case)
+        # Preserve device-backed empty relations as well as non-empty results.
         is_device = cp is not None and isinstance(d_left, cp.ndarray)
         return CandidatePairs(
             _host_left_indices=None if is_device else d_left,
@@ -336,7 +432,11 @@ def generate_bounds_pairs(
             same_input=same_input,
             _device_left_indices=d_left if is_device else None,
             _device_right_indices=d_right if is_device else None,
+            _device_selection=device_selection,
         )
+
+    left_bounds = compute_geometry_bounds(left)
+    right_bounds = left_bounds if same_input else compute_geometry_bounds(right_array)
 
     # CPU path: nested-tile loop
     left_valid = np.flatnonzero(_valid_row_mask(left_bounds))
@@ -460,11 +560,14 @@ class FlatSpatialIndex:
         """Lazily materialise host order array from device (ADR-0005)."""
         if self._host_order is not None:
             return self._host_order
-        host_order = _runtime_device_to_host(
-            self.device_order,
-            np.int32,
-            reason="flat spatial index device order host export",
-        )
+        if self.device_order is not None:
+            host_order = _runtime_device_to_host(
+                self.device_order,
+                np.int32,
+                reason="flat spatial index device order host export",
+            )
+        else:
+            host_order = np.arange(self.size, dtype=np.int32)
         object.__setattr__(self, "_host_order", host_order)
         return host_order
 
@@ -473,11 +576,14 @@ class FlatSpatialIndex:
         """Lazily materialise host morton_keys array from device (ADR-0005)."""
         if self._host_morton_keys is not None:
             return self._host_morton_keys
-        host_keys = _runtime_device_to_host(
-            self.device_morton_keys,
-            np.uint64,
-            reason="flat spatial index device morton-key host export",
-        )
+        if self.device_morton_keys is not None:
+            host_keys = _runtime_device_to_host(
+                self.device_morton_keys,
+                np.uint64,
+                reason="flat spatial index device morton-key host export",
+            )
+        else:
+            host_keys = compute_morton_keys(self.geometry_array)
         object.__setattr__(self, "_host_morton_keys", host_keys)
         return host_keys
 
@@ -580,82 +686,6 @@ class RegularGridRectIndex:
     cols: int
     rows: int
     size: int
-
-
-def _coords_form_axis_aligned_box(
-    xs: np.ndarray,
-    ys: np.ndarray,
-) -> tuple[float, float, float, float] | None:
-    if xs.size != 5 or ys.size != 5:
-        return None
-    minx = float(xs.min())
-    miny = float(ys.min())
-    maxx = float(xs.max())
-    maxy = float(ys.max())
-    if minx >= maxx or miny >= maxy:
-        return None
-    tol = 1e-9 * max(abs(maxx - minx), abs(maxy - miny), 1.0)
-    if abs(xs[0] - xs[-1]) > tol or abs(ys[0] - ys[-1]) > tol:
-        return None
-    x_matches = (np.abs(xs - minx) <= tol) | (np.abs(xs - maxx) <= tol)
-    y_matches = (np.abs(ys - miny) <= tol) | (np.abs(ys - maxy) <= tol)
-    if not bool(np.all(x_matches) and np.all(y_matches)):
-        return None
-    edge_same_x = np.abs(xs[1:] - xs[:-1]) <= tol
-    edge_same_y = np.abs(ys[1:] - ys[:-1]) <= tol
-    if not bool(np.all(np.logical_xor(edge_same_x, edge_same_y))):
-        return None
-    return minx, miny, maxx, maxy
-
-
-def _detect_single_row_device_rect_index(
-    geometry_array: OwnedGeometryArray,
-) -> tuple[RegularGridRectIndex, np.ndarray] | None:
-    """Validate a one-row device polygon rectangle with minimal D2H."""
-    if (
-        cp is None
-        or geometry_array.row_count != 1
-        or GeometryFamily.POLYGON not in geometry_array.families
-        or len(geometry_array.families) != 1
-        or geometry_array.residency is not Residency.DEVICE
-    ):
-        return None
-    state = geometry_array._ensure_device_state()
-    device_buffer = state.families.get(GeometryFamily.POLYGON)
-    if device_buffer is None:
-        return None
-    if int(getattr(device_buffer.x, "size", 0)) != 5 or int(
-        getattr(device_buffer.y, "size", 0)
-    ) != 5:
-        return None
-
-    runtime = get_cuda_runtime()
-    xs = runtime.copy_device_to_host(
-        device_buffer.x,
-        reason="spatial index single-rectangle x-coordinate validation fence",
-    ).astype(np.float64, copy=False)
-    ys = runtime.copy_device_to_host(
-        device_buffer.y,
-        reason="spatial index single-rectangle y-coordinate validation fence",
-    ).astype(np.float64, copy=False)
-    bounds_tuple = _coords_form_axis_aligned_box(xs, ys)
-    if bounds_tuple is None:
-        return None
-
-    minx, miny, maxx, maxy = bounds_tuple
-    bounds = np.asarray([[minx, miny, maxx, maxy]], dtype=np.float64)
-    return (
-        RegularGridRectIndex(
-            origin_x=minx,
-            origin_y=miny,
-            cell_width=maxx - minx,
-            cell_height=maxy - miny,
-            cols=1,
-            rows=1,
-            size=1,
-        ),
-        bounds,
-    )
 
 
 def _detect_regular_grid_rect_index_device(
@@ -832,6 +862,20 @@ def _detect_regular_grid_rect_index_device(
         runtime.free(d_bounds)
         return None
     state.row_bounds = d_bounds
+    total_bounds = (float(h_minx), float(h_miny), float(h_maxx), float(h_maxy))
+    polygon_buffer.bounds = d_bounds
+    polygon_buffer.dense_single_ring_width = 5
+    polygon_buffer.axis_aligned_rectangles = True
+    polygon_buffer.regular_grid_rect = DeviceRegularGridRectMetadata(
+        origin_x=float(h_minx),
+        origin_y=float(h_miny),
+        cell_width=float(h_cell_width),
+        cell_height=float(h_cell_height),
+        cols=int(h_cols),
+        rows=int(h_rows),
+        size=row_count,
+        total_bounds=total_bounds,
+    )
     return (
         RegularGridRectIndex(
             origin_x=float(h_minx),
@@ -843,7 +887,92 @@ def _detect_regular_grid_rect_index_device(
             size=row_count,
         ),
         d_bounds,
-        (float(h_minx), float(h_miny), float(h_maxx), float(h_maxy)),
+        total_bounds,
+    )
+
+
+def _regular_grid_rect_index_from_device_proof(
+    geometry_array: OwnedGeometryArray,
+) -> tuple[RegularGridRectIndex, object, tuple[float, float, float, float]] | None:
+    """Build a regular-grid index from trusted device geometry metadata.
+
+    This path consumes a shape proof carried by native builders that already
+    know they emitted a dense row-major grid of axis-aligned rectangles.  It
+    avoids recertifying that known shape and, more importantly, avoids copying
+    the certification summary back to the host during native index builds.
+    """
+    if (
+        cp is None
+        or geometry_array.row_count <= 0
+        or GeometryFamily.POLYGON not in geometry_array.families
+        or len(geometry_array.families) != 1
+        or geometry_array.residency is not Residency.DEVICE
+    ):
+        return None
+    state = geometry_array._ensure_device_state()
+    polygon_buffer = state.families.get(GeometryFamily.POLYGON)
+    if polygon_buffer is None:
+        return None
+    proof = getattr(polygon_buffer, "regular_grid_rect", None)
+    if proof is None:
+        return None
+    row_count = int(geometry_array.row_count)
+    if int(proof.size) != row_count:
+        return None
+    if (
+        int(getattr(polygon_buffer, "dense_single_ring_width", 0) or 0) != 5
+        or not bool(getattr(polygon_buffer, "axis_aligned_rectangles", False))
+        or int(proof.cols) <= 0
+        or int(proof.rows) <= 0
+        or float(proof.cell_width) <= 0.0
+        or float(proof.cell_height) <= 0.0
+    ):
+        return None
+    d_bounds = polygon_buffer.bounds
+    if d_bounds is None:
+        d_bounds = getattr(state, "row_bounds", None)
+    if d_bounds is None:
+        d_bounds = compute_geometry_bounds_device(geometry_array)
+    state.row_bounds = d_bounds
+    return (
+        RegularGridRectIndex(
+            origin_x=float(proof.origin_x),
+            origin_y=float(proof.origin_y),
+            cell_width=float(proof.cell_width),
+            cell_height=float(proof.cell_height),
+            cols=int(proof.cols),
+            rows=int(proof.rows),
+            size=row_count,
+        ),
+        d_bounds,
+        tuple(float(value) for value in proof.total_bounds),
+    )
+
+
+def _seed_device_regular_grid_rect_proof(
+    geometry_array: OwnedGeometryArray,
+    regular_grid: RegularGridRectIndex,
+    total_bounds: tuple[float, float, float, float],
+) -> None:
+    """Attach a device regular-grid proof after trusted host validation."""
+    if (
+        geometry_array.residency is not Residency.DEVICE
+        or geometry_array.device_state is None
+        or GeometryFamily.POLYGON not in geometry_array.device_state.families
+    ):
+        return
+    polygon_buffer = geometry_array.device_state.families[GeometryFamily.POLYGON]
+    polygon_buffer.dense_single_ring_width = 5
+    polygon_buffer.axis_aligned_rectangles = True
+    polygon_buffer.regular_grid_rect = DeviceRegularGridRectMetadata(
+        origin_x=float(regular_grid.origin_x),
+        origin_y=float(regular_grid.origin_y),
+        cell_width=float(regular_grid.cell_width),
+        cell_height=float(regular_grid.cell_height),
+        cols=int(regular_grid.cols),
+        rows=int(regular_grid.rows),
+        size=int(regular_grid.size),
+        total_bounds=tuple(float(value) for value in total_bounds),
     )
 
 
@@ -894,13 +1023,14 @@ def _sample_regular_grid_polygon_vertices(
     )
 
 
-
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("indexing", _INDEXING_KERNEL_SOURCE, _INDEXING_KERNEL_NAMES),
-    ("segment-mbr", _SEGMENT_MBR_KERNEL_SOURCE, _SEGMENT_MBR_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("indexing", _INDEXING_KERNEL_SOURCE, _INDEXING_KERNEL_NAMES),
+        ("segment-mbr", _SEGMENT_MBR_KERNEL_SOURCE, _SEGMENT_MBR_KERNEL_NAMES),
+    ]
+)
 
 
 def _indexing_kernels():
@@ -908,7 +1038,9 @@ def _indexing_kernels():
 
 
 def _segment_mbr_kernels():
-    return compile_kernel_group("segment-mbr", _SEGMENT_MBR_KERNEL_SOURCE, _SEGMENT_MBR_KERNEL_NAMES)
+    return compile_kernel_group(
+        "segment-mbr", _SEGMENT_MBR_KERNEL_SOURCE, _SEGMENT_MBR_KERNEL_NAMES
+    )
 
 
 def _detect_regular_grid_rect_index(
@@ -925,13 +1057,10 @@ def _detect_regular_grid_rect_index(
     # coordinate payload stays on device until the sampled verification below.
     if geometry_array._validity is None:
         geometry_array._ensure_host_metadata()
-    if (
-        not polygon_buffer.host_materialized
-        and (
-            polygon_buffer.geometry_offsets.size == 0
-            or polygon_buffer.empty_mask.size == 0
-            or polygon_buffer.ring_offsets is None
-        )
+    if not polygon_buffer.host_materialized and (
+        polygon_buffer.geometry_offsets.size == 0
+        or polygon_buffer.empty_mask.size == 0
+        or polygon_buffer.ring_offsets is None
     ):
         geometry_array._ensure_host_family_structure(GeometryFamily.POLYGON)
         polygon_buffer = geometry_array.families[GeometryFamily.POLYGON]
@@ -941,9 +1070,13 @@ def _detect_regular_grid_rect_index(
         return None
 
     expected_ring_offsets = np.arange(0, (geometry_array.row_count + 1) * 5, 5, dtype=np.int32)
-    if polygon_buffer.ring_offsets is None or not np.array_equal(polygon_buffer.ring_offsets, expected_ring_offsets):
+    if polygon_buffer.ring_offsets is None or not np.array_equal(
+        polygon_buffer.ring_offsets, expected_ring_offsets
+    ):
         return None
-    if not np.array_equal(polygon_buffer.geometry_offsets, np.arange(geometry_array.row_count + 1, dtype=np.int32)):
+    if not np.array_equal(
+        polygon_buffer.geometry_offsets, np.arange(geometry_array.row_count + 1, dtype=np.int32)
+    ):
         return None
 
     if np.isnan(bounds).any():
@@ -972,7 +1105,12 @@ def _detect_regular_grid_rect_index(
 
     col_index = np.rint((bounds[:, 0] - minx) / cell_width).astype(np.int32, copy=False)
     row_index = np.rint((bounds[:, 1] - miny) / cell_height).astype(np.int32, copy=False)
-    if np.any(col_index < 0) or np.any(col_index >= cols) or np.any(row_index < 0) or np.any(row_index >= rows):
+    if (
+        np.any(col_index < 0)
+        or np.any(col_index >= cols)
+        or np.any(row_index < 0)
+        or np.any(row_index >= rows)
+    ):
         return None
 
     expected_index = row_index.astype(np.int64) * cols + col_index.astype(np.int64)
@@ -1215,6 +1353,7 @@ def build_flat_spatial_index(
     geometry_array: OwnedGeometryArray,
     *,
     runtime_selection: RuntimeSelection | None = None,
+    device_bounds_only: bool = False,
 ) -> FlatSpatialIndex:
     selection = runtime_selection or _default_index_runtime_selection()
     geometry_array.record_runtime_selection(selection)
@@ -1228,6 +1367,23 @@ def build_flat_spatial_index(
     )
 
     if (
+        device_bounds_only
+        and selection.selected is ExecutionMode.GPU
+        and geometry_array.residency is Residency.DEVICE
+        and has_gpu_runtime()
+    ):
+        device_bounds = compute_geometry_bounds_device(geometry_array)
+        return FlatSpatialIndex(
+            geometry_array=geometry_array,
+            _host_order=None,
+            _host_morton_keys=None,
+            _host_bounds=None,
+            total_bounds=(float("nan"),) * 4,
+            regular_grid=None,
+            device_bounds=device_bounds,
+        )
+
+    if (
         selection.selected is ExecutionMode.GPU
         and geometry_array.residency is Residency.DEVICE
         and geometry_array.row_count <= 1
@@ -1237,15 +1393,17 @@ def build_flat_spatial_index(
             bounds = np.empty((0, 4), dtype=np.float64)
             device_bounds = None
             regular_grid = None
+            total_bounds = (float("nan"),) * 4
         else:
-            single_rect = _detect_single_row_device_rect_index(geometry_array)
-            if single_rect is None:
+            device_regular_grid = _regular_grid_rect_index_from_device_proof(geometry_array)
+            if device_regular_grid is None:
                 bounds = None
                 device_bounds = compute_geometry_bounds_device(geometry_array)
                 regular_grid = None
+                total_bounds = (float("nan"),) * 4
             else:
-                regular_grid, bounds = single_rect
-                device_bounds = None
+                regular_grid, device_bounds, total_bounds = device_regular_grid
+                bounds = None
         order = np.arange(geometry_array.row_count, dtype=np.int32)
         morton_keys = order.astype(np.uint64, copy=False)
         if bounds is not None and bounds.shape[0] > 0:
@@ -1255,7 +1413,7 @@ def build_flat_spatial_index(
                 float(bounds[:, 2].max()),
                 float(bounds[:, 3].max()),
             )
-        else:
+        elif regular_grid is None:
             total_bounds = (float("nan"),) * 4
         return FlatSpatialIndex(
             geometry_array=geometry_array,
@@ -1267,7 +1425,9 @@ def build_flat_spatial_index(
             device_bounds=device_bounds,
         )
 
-    device_regular_grid = _detect_regular_grid_rect_index_device(geometry_array)
+    device_regular_grid = _regular_grid_rect_index_from_device_proof(geometry_array)
+    if device_regular_grid is None:
+        device_regular_grid = _detect_regular_grid_rect_index_device(geometry_array)
     if device_regular_grid is not None:
         regular_grid, device_bounds, total_bounds = device_regular_grid
         order = np.arange(geometry_array.row_count, dtype=np.int32)
@@ -1297,28 +1457,25 @@ def build_flat_spatial_index(
     d_morton_keys = None
     d_order = None
     if regular_grid is None:
-        use_gpu_sort = (
-            selection.selected is ExecutionMode.GPU
-            and has_gpu_runtime()
-        )
+        use_gpu_sort = selection.selected is ExecutionMode.GPU and has_gpu_runtime()
         if use_gpu_sort:
             # Keep device arrays to avoid D→H transfer mid-pipeline
             # (ADR-0005).  Host fields are lazily populated on first
             # access via query_bounds() / CPU fallback paths.
             if device_bounds is not None:
                 total_bounds = _device_total_bounds(device_bounds)
-                d_morton_keys_raw, d_order_raw = (
-                    _build_flat_spatial_index_gpu_from_device_bounds(
-                        geometry_array,
-                        device_bounds,
-                        total_bounds=total_bounds,
-                        keep_on_device=True,
-                    )
+                d_morton_keys_raw, d_order_raw = _build_flat_spatial_index_gpu_from_device_bounds(
+                    geometry_array,
+                    device_bounds,
+                    total_bounds=total_bounds,
+                    keep_on_device=True,
                 )
                 bounds = None
             else:
                 d_morton_keys_raw, d_order_raw = _build_flat_spatial_index_gpu(
-                    geometry_array, bounds, keep_on_device=True,
+                    geometry_array,
+                    bounds,
+                    keep_on_device=True,
                 )
             morton_keys = None
             order = None
@@ -1351,6 +1508,12 @@ def build_flat_spatial_index(
             float(np.nanmin(bounds[:, 1])),
             float(np.nanmax(bounds[:, 2])),
             float(np.nanmax(bounds[:, 3])),
+        )
+    if regular_grid is not None:
+        _seed_device_regular_grid_rect_proof(
+            geometry_array,
+            regular_grid,
+            total_bounds,
         )
     return FlatSpatialIndex(
         geometry_array=geometry_array,
@@ -1385,7 +1548,11 @@ class SegmentMBRTable:
     def count(self) -> int:
         if self.row_indices is None:
             return 0
-        return int(self.row_indices.shape[0]) if hasattr(self.row_indices, "shape") else int(self.row_indices.size)
+        return (
+            int(self.row_indices.shape[0])
+            if hasattr(self.row_indices, "shape")
+            else int(self.row_indices.size)
+        )
 
     def to_host(self) -> SegmentMBRTable:
         """Return a host-resident copy (NumPy arrays).
@@ -1512,52 +1679,82 @@ def _launch_segment_mbr_family(
 
     if family == GeometryFamily.LINESTRING:
         param_values_base = (
-            ptr(d_x), ptr(d_y), ptr(d_geom_offsets),
-            ptr(d_global_rows), geom_count,
+            ptr(d_x),
+            ptr(d_y),
+            ptr(d_geom_offsets),
+            ptr(d_global_rows),
+            geom_count,
             ptr(d_counts),
         )
         param_types_base = (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
             KERNEL_PARAM_PTR,
         )
     elif family == GeometryFamily.POLYGON:
         d_ring_offsets = cp.asarray(d_buf.ring_offsets)
         param_values_base = (
-            ptr(d_x), ptr(d_y), ptr(d_geom_offsets),
-            ptr(d_ring_offsets), ptr(d_global_rows), geom_count,
+            ptr(d_x),
+            ptr(d_y),
+            ptr(d_geom_offsets),
+            ptr(d_ring_offsets),
+            ptr(d_global_rows),
+            geom_count,
             ptr(d_counts),
         )
         param_types_base = (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
             KERNEL_PARAM_PTR,
         )
     elif family == GeometryFamily.MULTILINESTRING:
         d_part_offsets = cp.asarray(d_buf.part_offsets)
         param_values_base = (
-            ptr(d_x), ptr(d_y), ptr(d_geom_offsets),
-            ptr(d_part_offsets), ptr(d_global_rows), geom_count,
+            ptr(d_x),
+            ptr(d_y),
+            ptr(d_geom_offsets),
+            ptr(d_part_offsets),
+            ptr(d_global_rows),
+            geom_count,
             ptr(d_counts),
         )
         param_types_base = (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
             KERNEL_PARAM_PTR,
         )
     elif family == GeometryFamily.MULTIPOLYGON:
         d_part_offsets = cp.asarray(d_buf.part_offsets)
         d_ring_offsets = cp.asarray(d_buf.ring_offsets)
         param_values_base = (
-            ptr(d_x), ptr(d_y), ptr(d_geom_offsets),
-            ptr(d_part_offsets), ptr(d_ring_offsets),
-            ptr(d_global_rows), geom_count,
+            ptr(d_x),
+            ptr(d_y),
+            ptr(d_geom_offsets),
+            ptr(d_part_offsets),
+            ptr(d_ring_offsets),
+            ptr(d_global_rows),
+            geom_count,
             ptr(d_counts),
         )
         param_types_base = (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
             KERNEL_PARAM_PTR,
         )
     else:
@@ -1634,7 +1831,12 @@ def _extract_segment_mbrs_gpu(geometry_array: OwnedGeometryArray) -> SegmentMBRT
         d_global_rows = cp.flatnonzero(d_tags == family_tag).astype(cp.int32, copy=False)
 
         result = _launch_segment_mbr_family(
-            runtime, kernels, family, d_buf, d_global_rows, geom_count,
+            runtime,
+            kernels,
+            family,
+            d_buf,
+            d_global_rows,
+            geom_count,
         )
         if result is not None:
             d_row_out, d_seg_out, d_bounds_out = result
@@ -1676,6 +1878,10 @@ def extract_segment_mbrs(geometry_array: OwnedGeometryArray) -> SegmentMBRTable:
         requested_mode=ExecutionMode.AUTO,
         gpu_available=has_gpu_runtime() and cp is not None,
         current_residency=geometry_array.residency,
+        work_estimate=estimate_spatial_index_work_from_owned(
+            geometry_array,
+            primary_unit_name="segment-mbr",
+        ),
     )
     if selection.selected is ExecutionMode.GPU and cp is not None:
         try:
@@ -1808,7 +2014,7 @@ def _generate_segment_mbr_pairs_gpu(
     sweep_kernel = kernels["sweep_sorted_mbr_overlap"]
     ptr = runtime.pointer
 
-    d_left_bounds_full = cp.asarray(left_segments.bounds)    # (N, 4) device
+    d_left_bounds_full = cp.asarray(left_segments.bounds)  # (N, 4) device
     d_right_bounds_full = cp.asarray(right_segments.bounds)  # (M, 4) device
     d_left_rows_full = cp.asarray(left_segments.row_indices)
     d_left_segs_full = cp.asarray(left_segments.segment_indices)
@@ -1847,14 +2053,18 @@ def _generate_segment_mbr_pairs_gpu(
     # --- Build concatenated sorted array on device (no host round-trip) ---
     total_count = left_count + right_count
     d_all_bounds = cp.concatenate([d_left_bounds, d_right_bounds], axis=0)
-    d_all_orig = cp.concatenate([
-        cp.arange(left_count, dtype=cp.int32),
-        cp.arange(right_count, dtype=cp.int32),
-    ])
-    d_all_side = cp.concatenate([
-        cp.zeros(left_count, dtype=cp.int32),
-        cp.ones(right_count, dtype=cp.int32),
-    ])
+    d_all_orig = cp.concatenate(
+        [
+            cp.arange(left_count, dtype=cp.int32),
+            cp.arange(right_count, dtype=cp.int32),
+        ]
+    )
+    d_all_side = cp.concatenate(
+        [
+            cp.zeros(left_count, dtype=cp.int32),
+            cp.ones(right_count, dtype=cp.int32),
+        ]
+    )
 
     # Sort by minx (column 0) on device
     sort_order = cp.argsort(d_all_bounds[:, 0]).astype(cp.int32, copy=False)
@@ -1866,9 +2076,12 @@ def _generate_segment_mbr_pairs_gpu(
     # --- Pass 0: count pairs per sorted element ---
     d_counts = runtime.allocate((total_count,), np.int32, zero=True)
     _param_types = (
-        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
         KERNEL_PARAM_I32,
-        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
         KERNEL_PARAM_PTR,
         KERNEL_PARAM_I32,
         KERNEL_PARAM_I32,
@@ -1876,9 +2089,12 @@ def _generate_segment_mbr_pairs_gpu(
     )
     count_params = (
         (
-            ptr(d_sorted_bounds_flat), ptr(d_sorted_orig), ptr(d_sorted_side),
+            ptr(d_sorted_bounds_flat),
+            ptr(d_sorted_orig),
+            ptr(d_sorted_side),
             total_count,
-            0, 0,  # out_left, out_right (unused in pass 0)
+            0,
+            0,  # out_left, out_right (unused in pass 0)
             ptr(d_counts),
             0,  # pass_number = 0
             0,  # same_input = False
@@ -1929,9 +2145,12 @@ def _generate_segment_mbr_pairs_gpu(
     # --- Pass 1: scatter pairs ---
     scatter_params = (
         (
-            ptr(d_sorted_bounds_flat), ptr(d_sorted_orig), ptr(d_sorted_side),
+            ptr(d_sorted_bounds_flat),
+            ptr(d_sorted_orig),
+            ptr(d_sorted_side),
             total_count,
-            ptr(d_out_left), ptr(d_out_right),
+            ptr(d_out_left),
+            ptr(d_out_right),
             ptr(d_counts),
             1,  # pass_number = 1
             0,  # same_input = False
@@ -1967,8 +2186,12 @@ def _generate_segment_mbr_pairs_cpu(
 ) -> SegmentCandidatePairs:
     """CPU fallback: tiled numpy MBR overlap on host."""
     # Ensure host arrays
-    left_seg = left_segments.to_host() if left_segments.residency is Residency.DEVICE else left_segments
-    right_seg = right_segments.to_host() if right_segments.residency is Residency.DEVICE else right_segments
+    left_seg = (
+        left_segments.to_host() if left_segments.residency is Residency.DEVICE else left_segments
+    )
+    right_seg = (
+        right_segments.to_host() if right_segments.residency is Residency.DEVICE else right_segments
+    )
 
     left_rows_out: list[np.ndarray] = []
     left_segment_out: list[np.ndarray] = []
@@ -2031,11 +2254,13 @@ def generate_segment_mbr_pairs(
     """
     left_segments = extract_segment_mbrs(left)
     right_segments = extract_segment_mbrs(right)
+    segment_count = int(left_segments.count) + int(right_segments.count)
+    candidate_pair_count = int(left_segments.count) * int(right_segments.count)
 
     selection = plan_dispatch_selection(
         kernel_name="segment_mbr_pairs",
         kernel_class=KernelClass.COARSE,
-        row_count=left_segments.count + right_segments.count,
+        row_count=segment_count,
         requested_mode=ExecutionMode.AUTO,
         gpu_available=(
             has_gpu_runtime()
@@ -2044,6 +2269,13 @@ def generate_segment_mbr_pairs(
             and right_segments.residency is Residency.DEVICE
         ),
         current_residency=combined_residency(left, right),
+        work_estimate=PhysicalWorkEstimate(
+            row_count=segment_count,
+            segment_count=segment_count,
+            candidate_pair_count=candidate_pair_count,
+            primary_unit_count=max(segment_count, candidate_pair_count),
+            primary_unit_name="segment-candidate-pair",
+        ),
     )
     if selection.selected is ExecutionMode.GPU and cp is not None:
         try:
@@ -2055,7 +2287,9 @@ def generate_segment_mbr_pairs(
                 reason="GPU kernel failed, falling back to CPU",
             )
     return _generate_segment_mbr_pairs_cpu(
-        left_segments, right_segments, tile_size=tile_size,
+        left_segments,
+        right_segments,
+        tile_size=tile_size,
     )
 
 

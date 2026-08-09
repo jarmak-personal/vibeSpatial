@@ -4,6 +4,7 @@ Loads cached fixtures from disk using GPU-native readers (vibespatial path)
 or CPU readers (GeoPandas/pyogrio baseline path). Read time is tracked
 separately so benchmarks can report it in metadata.
 """
+
 from __future__ import annotations
 
 from pathlib import Path

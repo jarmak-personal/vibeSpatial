@@ -5,7 +5,7 @@ Scope: Rectangle clip fast-path strategy, owned constructive dataflow, and GeoPa
 Read If: You are changing clip_by_rect, rectangle clip performance, or early constructive fast paths.
 STOP IF: You already have the rectangle clip engine open and only need local implementation detail.
 Source Of Truth: Phase-5 rectangle clip fast-path policy before broader overlay assembly.
-Body Budget: 118/220 lines
+Body Budget: 130/220 lines
 Document: docs/architecture/clip-fast-paths.md
 
 Section Map (Body Lines)
@@ -15,17 +15,17 @@ Section Map (Body Lines)
 | 6-14 | Request Signals |
 | 15-21 | Open First |
 | 22-30 | Verify |
-| 31-36 | Risks |
-| 37-41 | Intent |
-| 42-53 | Options Considered |
-| 54-70 | Decision |
-| 71-98 | GeoPandas Adapter Policy |
-| 99-111 | CCCL Mapping |
-| 112-118 | Consequences |
+| 31-37 | Risks |
+| 38-42 | Intent |
+| 43-52 | Options Considered |
+| 53-73 | Decision |
+| 74-109 | GeoPandas Adapter Policy |
+| 110-123 | CCCL Mapping |
+| 124-130 | Consequences |
 DOC_HEADER:END -->
 
-`o17.5.2` lands the first owned constructive fast path through axis-aligned
-rectangle clipping.
+Rectangle clipping is an owned constructive surface with native rowset and
+topology carriers for device-resident inputs.
 
 ## Request Signals
 
@@ -54,30 +54,30 @@ rectangle clipping.
 
 ## Risks
 
-- General polygon intersection is too broad for the first constructive fast path.
+- Polygon clipping must preserve holes, disconnected parts, and multipart output;
+  ring-independent clipping is not a valid general topology model.
 - Forcing a slower owned host implementation onto GeoPandas would ship a performance regression.
 - Hole, multipolygon, and invalid-input behavior can drift if the fast path is not checked against the degeneracy corpus.
 
 ## Intent
 
-Choose the first constructive surface that is genuinely GPU-shaped and useful to
-GeoPandas, without overcommitting to a full overlay implementation.
+Keep rectangle clipping GPU-shaped while sharing exact polygon topology with the
+binary constructive planner instead of maintaining a second polygon assembler.
 
 ## Options Considered
 
-1. Full polygon or line intersection against arbitrary geometries.
-   Too broad for the first landing and too much assembly before we have a GPU
-   variant.
-2. Keep using Shapely only and postpone constructive kernels entirely.
-   Safe on CPU, but it leaves no owned execution seam for Phase 5.
-3. Rectangle clip first.
-   Bounds filtering, candidate compaction, and per-family clipping all map
-   cleanly onto reusable primitives and the GeoPandas `clip` / `clip_by_rect`
-   surfaces already expose it.
+1. Clip every polygon ring independently and rebuild geometry metadata after the
+   kernel. This cannot represent a concave polygon clipped into disconnected
+   parts and requires row-shaped host metadata.
+2. Add a second clip-specific exact topology implementation. This duplicates
+   boundary repair, multipart regrouping, and output assembly.
+3. Select polygon rows natively, build rectangle rows on device, and use the
+   shared rectangle/SH/exact binary constructive planner.
 
 ## Decision
 
-Use option 3.
+Use option 3. Dense proven rows can still use the bounded rectangle kernel, but
+the shared planner owns boundary-split repair and exact completion.
 
 The owned rectangle-clip engine now handles:
 
@@ -89,8 +89,11 @@ It uses:
 
 - owned buffer conversion
 - row bounds filtering
-- direct line clipping and ring clipping for candidate rows
-- row-level fallback for unsupported or invalid geometry cases
+- source-row-capacity point selection and direct line clipping for their
+  admitted family shapes
+- device rowset selection plus exact constructive topology for polygonal rows
+- identity device row maps plus validity-backed dynamic output selection
+- observable compatibility boundaries for unsupported or invalid input
 
 ## GeoPandas Adapter Policy
 
@@ -101,17 +104,25 @@ boundary when the resulting family mix is representable there.
 Current state:
 
 - the owned CPU path is correct and benchmarked
-- the owned GPU point-only path is now faster than Shapely on the benchmark
-  harness and can re-enter from device-backed point arrays without materializing
-  the full source batch
-- polygon families have a device-resident GPU clip path via Sutherland-Hodgman
-  kernel with vectorized ring extraction and direct OGA construction
-- line families have a device-resident GPU clip path via Liang-Barsky kernel
-  with CuPy/CCCL coordinate assembly (``_build_line_clip_device_result``)
-- both polygon and line GPU paths return ``Residency.DEVICE`` OwnedGeometryArrays
+- the owned GPU Point path filters coordinates in source-row capacity and can
+  re-enter from device-backed arrays without candidate compaction or host
+  materialization
+- polygon families use one device rowset plus device-built rectangle rows; the
+  binary constructive planner partitions rectangle, SH-eligible, and exact
+  topology work and returns Polygon/MultiPolygon output without host metadata
+- the former host polygon-ring extractor, per-ring clip assembler, surviving-ring
+  count export, output-offset export, and duplicate scalar rectangle path are
+  deleted
+- line families use fused fp64 Liang-Barsky count/scatter directly over owned
+  LineString/MultiLineString buffers; source rows and part boundaries remain
+  device-shaped and bounded output capacity avoids cardinality reads
+- point, polygon, and line GPU paths return source-row-capacity
+  ``Residency.DEVICE`` OwnedGeometryArrays, and mixed public rectangle clip
+  invokes the combined carrier once instead of partitioning families
 - default public `clip(..., keep_geom_type=False)` now builds a row-preserving
-  native result first and only exits to host for explicit semantic cleanup when
-  the output cannot stay in the native family model
+  native result first; valid/nonempty, positive-area, and keep-type cleanup
+  remain one capacity-backed device selection, and only unsupported public
+  collection typing exits the native family model
 - host normalization preserves owned backing for representable host-side results,
   so later `area` / `length` probes stay on the owned measurement path instead
   of silently dropping to Shapely
@@ -125,18 +136,19 @@ Current state:
 The intended GPU path stays staged:
 
 - bounds filter over row envelopes
-- candidate compaction with `DeviceSelect`
-- per-family clip kernels over compacted rows
-- output restoration by row scatter
+- source-row masks and capacity-preserving family partitions
+- per-family clip/topology kernels over source-row capacity
+- output selection through one device row-indirection map
 
-Rectangle clip is the right first constructive fast path because it preserves
-that staged structure instead of hiding everything inside a monolithic overlay
-kernel.
+Polygon rectangle clip shares the native constructive topology stages; point and
+line clip retain their narrower family kernels. Point, polygon, and line outputs
+compose as source-row capacity partitions. Host row-map reads occur only when a
+caller explicitly asks for the public Shapely result.
 
 ## Consequences
 
 - Phase 5 now has a real owned constructive engine to optimize further
-- the owned point-only GPU path can keep clipped coordinate payloads on device
+- the owned Point GPU path can keep selected coordinate payloads on device
   across constructive chains
 - GeoPandas keeps current host performance while the adapter seam stays visible
-- later overlay work can reuse the same candidate/filter/restore structure
+- overlay and clip use the same polygon topology and output carriers

@@ -10,6 +10,7 @@ numeric values embedded in structured text.  The pipeline is:
 All functions operate on device-resident arrays with zero host
 materialization.
 """
+
 from __future__ import annotations
 
 import ctypes
@@ -53,38 +54,48 @@ KERNEL_PARAM_I64 = ctypes.c_longlong
 # ---------------------------------------------------------------------------
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("gpu-parse-num-bounds", _NUM_BOUNDS_SOURCE, _NUM_BOUNDS_NAMES),
-    ("gpu-parse-float", _PARSE_FLOAT_SOURCE, _PARSE_FLOAT_NAMES),
-    ("gpu-parse-int", _PARSE_INT_SOURCE, _PARSE_INT_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("gpu-parse-num-bounds", _NUM_BOUNDS_SOURCE, _NUM_BOUNDS_NAMES),
+        ("gpu-parse-float", _PARSE_FLOAT_SOURCE, _PARSE_FLOAT_NAMES),
+        ("gpu-parse-int", _PARSE_INT_SOURCE, _PARSE_INT_NAMES),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # Kernel compilation helpers
 # ---------------------------------------------------------------------------
 
+
 def _num_bounds_kernels():
     return compile_kernel_group(
-        "gpu-parse-num-bounds", _NUM_BOUNDS_SOURCE, _NUM_BOUNDS_NAMES,
+        "gpu-parse-num-bounds",
+        _NUM_BOUNDS_SOURCE,
+        _NUM_BOUNDS_NAMES,
     )
 
 
 def _parse_float_kernels():
     return compile_kernel_group(
-        "gpu-parse-float", _PARSE_FLOAT_SOURCE, _PARSE_FLOAT_NAMES,
+        "gpu-parse-float",
+        _PARSE_FLOAT_SOURCE,
+        _PARSE_FLOAT_NAMES,
     )
 
 
 def _parse_int_kernels():
     return compile_kernel_group(
-        "gpu-parse-int", _PARSE_INT_SOURCE, _PARSE_INT_NAMES,
+        "gpu-parse-int",
+        _PARSE_INT_SOURCE,
+        _PARSE_INT_NAMES,
     )
 
 
 # ---------------------------------------------------------------------------
 # Kernel launch helper
 # ---------------------------------------------------------------------------
+
 
 def _launch_kernel(runtime, kernel, n, params):
     grid, block = runtime.launch_config(kernel, int(n))
@@ -94,6 +105,7 @@ def _launch_kernel(runtime, kernel, n, params):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def number_boundaries(
     d_bytes: cp.ndarray,
@@ -162,10 +174,21 @@ def number_boundaries(
     d_is_start = cp.zeros(n, dtype=cp.uint8)
     d_is_end = cp.zeros(n, dtype=cp.uint8)
 
-    _launch_kernel(runtime, kernels["find_number_boundaries"], n, (
-        (ptr(d_bytes), ptr(d_quote_parity), ptr(d_is_start), ptr(d_is_end), n_i64),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
-    ))
+    _launch_kernel(
+        runtime,
+        kernels["find_number_boundaries"],
+        n,
+        (
+            (ptr(d_bytes), ptr(d_quote_parity), ptr(d_is_start), ptr(d_is_end), n_i64),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I64,
+            ),
+        ),
+    )
 
     return d_is_start, d_is_end
 
@@ -231,10 +254,21 @@ def parse_ascii_floats(
 
     if n_nums > 0:
         kernels = _parse_float_kernels()
-        _launch_kernel(runtime, kernels["parse_ascii_floats"], n_nums, (
-            (ptr(d_bytes), ptr(d_starts), ptr(d_ends), ptr(d_output), np.int32(n_nums)),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-        ))
+        _launch_kernel(
+            runtime,
+            kernels["parse_ascii_floats"],
+            n_nums,
+            (
+                (ptr(d_bytes), ptr(d_starts), ptr(d_ends), ptr(d_output), np.int32(n_nums)),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
+            ),
+        )
 
     return d_output
 
@@ -302,10 +336,21 @@ def parse_ascii_ints(
 
     if n_nums > 0:
         kernels = _parse_int_kernels()
-        _launch_kernel(runtime, kernels["parse_ascii_ints"], n_nums, (
-            (ptr(d_bytes), ptr(d_starts), ptr(d_ends), ptr(d_output), np.int32(n_nums)),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-        ))
+        _launch_kernel(
+            runtime,
+            kernels["parse_ascii_ints"],
+            n_nums,
+            (
+                (ptr(d_bytes), ptr(d_starts), ptr(d_ends), ptr(d_output), np.int32(n_nums)),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
+            ),
+        )
 
     return d_output
 

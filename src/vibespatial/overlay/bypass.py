@@ -13,6 +13,7 @@ These functions identify polygons that can skip the full overlay computation:
 
 Extracted from ``gpu.py`` to reduce file size and clarify module boundaries.
 """
+
 from __future__ import annotations
 
 import logging
@@ -30,7 +31,7 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.residency import Residency
 
-from ._host_boundary import overlay_device_to_host, overlay_int_scalar
+from ._host_boundary import overlay_device_to_host
 
 try:
     import cupy as cp
@@ -38,6 +39,9 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
     cp = None
 
 logger = logging.getLogger(__name__)
+
+_CONTAINMENT_BYPASS_DENSE_MAX_ROWS = 4096
+_CONTAINMENT_BYPASS_DENSE_MIN_CANDIDATE_FRACTION = 0.75
 
 
 def _is_convex_ring_xy(x: np.ndarray, y: np.ndarray, start: int, end: int) -> bool:
@@ -65,6 +69,7 @@ def _is_convex_ring_xy(x: np.ndarray, y: np.ndarray, start: int, end: int) -> bo
         return False
     return bool(np.all(non_collinear > 0.0) or np.all(non_collinear < 0.0))
 
+
 # ---------------------------------------------------------------------------
 # Containment bypass: GPU-accelerated identification of polygons fully
 # inside the corridor, skipping overlay computation for those polygons.
@@ -75,6 +80,8 @@ def _containment_bypass_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
     how: str,
+    *,
+    prefer_indexed_bypass: bool = False,
 ) -> tuple[OwnedGeometryArray | None, cp.ndarray | None]:
     """Identify polygons in *left* that can bypass full overlay via containment/disjointness.
 
@@ -208,24 +215,19 @@ def _containment_bypass_gpu(
     d_bbox_disjoint: cp.ndarray | None = None  # type: ignore[name-defined]
     if how == "difference":
         d_bbox_disjoint = (
-            (d_lb[:, 2] < d_corr_bounds[0])   # L.xmax < R.xmin
+            (d_lb[:, 2] < d_corr_bounds[0])  # L.xmax < R.xmin
             | (d_lb[:, 0] > d_corr_bounds[2])  # L.xmin > R.xmax
             | (d_lb[:, 3] < d_corr_bounds[1])  # L.ymax < R.ymin
             | (d_lb[:, 1] > d_corr_bounds[3])  # L.ymin > R.ymax
         )
 
-    n_bbox_candidates = overlay_int_scalar(
-        cp.count_nonzero(d_bbox_inside),
-        reason="overlay containment-bypass bbox-contained count scalar fence",
-    )
-    n_bbox_disjoint = (
-        overlay_int_scalar(
-            cp.count_nonzero(d_bbox_disjoint),
-            reason="overlay containment-bypass bbox-disjoint count scalar fence",
-        )
-        if d_bbox_disjoint is not None
-        else 0
-    )
+    d_bbox_indices = cp.flatnonzero(d_bbox_inside).astype(cp.int64, copy=False)
+    n_bbox_candidates = int(d_bbox_indices.size)
+    d_disjoint_rows: cp.ndarray | None = None  # type: ignore[name-defined]
+    n_bbox_disjoint = 0
+    if d_bbox_disjoint is not None:
+        d_disjoint_rows = cp.flatnonzero(d_bbox_disjoint).astype(cp.int64)
+        n_bbox_disjoint = int(d_disjoint_rows.size)
 
     if n_bbox_candidates == 0 and n_bbox_disjoint == 0:
         d_remainder_mask = cp.ones(n_left, dtype=cp.bool_)
@@ -234,194 +236,350 @@ def _containment_bypass_gpu(
     # ------------------------------------------------------------------
     # Stage 2: GPU vertex-in-polygon (thread-per-polygon)
     # ------------------------------------------------------------------
-    # Only needed when there are bbox-inside candidates (potential containment).
-    d_cand_result: cp.ndarray | None = None  # type: ignore[name-defined]
-    d_bbox_indices: cp.ndarray | None = None  # type: ignore[name-defined]
+    pending_device_refs: list[object] = []
 
-    if n_bbox_candidates > 0:
-        d_bbox_indices = cp.flatnonzero(d_bbox_inside).astype(cp.int64)
+    def _launch_family_containment(
+        left_family: GeometryFamily,
+        d_family_rows,
+        d_family_boundary_overlap,
+        n_family: int,
+        kernels,
+        ptr,
+    ):
+        left_buf = left_state.families[left_family]
+        d_family_out = cp.empty(n_family, dtype=cp.int32)
 
-        # Gather tags and family_row_offsets for bbox-candidate rows.
-        d_tags = cp.asarray(left_state.tags)
-        d_fro = cp.asarray(left_state.family_row_offsets)
-        d_cand_tags = d_tags[d_bbox_indices]
-        d_cand_fro = d_fro[d_bbox_indices]
+        if left_family is GeometryFamily.POLYGON and corr_family is GeometryFamily.POLYGON:
+            use_block_sample = n_family >= 128
+            kernel = kernels[
+                "containment_poly_vs_poly_single_ring_block"
+                if use_block_sample
+                else "containment_poly_vs_poly"
+            ]
+            params = (
+                (
+                    ptr(d_family_rows),
+                    n_family,
+                    ptr(left_buf.x),
+                    ptr(left_buf.y),
+                    ptr(left_buf.geometry_offsets),
+                    ptr(left_buf.ring_offsets),
+                    ptr(corr_buffer.x),
+                    ptr(corr_buffer.y),
+                    ptr(corr_buffer.geometry_offsets),
+                    ptr(corr_buffer.ring_offsets),
+                    0,
+                    ptr(d_family_boundary_overlap),
+                    ptr(d_family_out),
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                ),
+            )
+        elif left_family is GeometryFamily.POLYGON and corr_family is GeometryFamily.MULTIPOLYGON:
+            kernel = kernels["containment_poly_vs_mpoly"]
+            params = (
+                (
+                    ptr(d_family_rows),
+                    n_family,
+                    ptr(left_buf.x),
+                    ptr(left_buf.y),
+                    ptr(left_buf.geometry_offsets),
+                    ptr(left_buf.ring_offsets),
+                    ptr(corr_buffer.x),
+                    ptr(corr_buffer.y),
+                    ptr(corr_buffer.geometry_offsets),
+                    ptr(corr_buffer.part_offsets),
+                    ptr(corr_buffer.ring_offsets),
+                    0,
+                    ptr(d_family_boundary_overlap),
+                    ptr(d_family_out),
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                ),
+            )
+        elif left_family is GeometryFamily.MULTIPOLYGON and corr_family is GeometryFamily.POLYGON:
+            kernel = kernels["containment_mpoly_vs_poly"]
+            params = (
+                (
+                    ptr(d_family_rows),
+                    n_family,
+                    ptr(left_buf.x),
+                    ptr(left_buf.y),
+                    ptr(left_buf.geometry_offsets),
+                    ptr(left_buf.part_offsets),
+                    ptr(left_buf.ring_offsets),
+                    ptr(corr_buffer.x),
+                    ptr(corr_buffer.y),
+                    ptr(corr_buffer.geometry_offsets),
+                    ptr(corr_buffer.ring_offsets),
+                    0,
+                    ptr(d_family_boundary_overlap),
+                    ptr(d_family_out),
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                ),
+            )
+        else:
+            kernel = kernels["containment_mpoly_vs_mpoly"]
+            params = (
+                (
+                    ptr(d_family_rows),
+                    n_family,
+                    ptr(left_buf.x),
+                    ptr(left_buf.y),
+                    ptr(left_buf.geometry_offsets),
+                    ptr(left_buf.part_offsets),
+                    ptr(left_buf.ring_offsets),
+                    ptr(corr_buffer.x),
+                    ptr(corr_buffer.y),
+                    ptr(corr_buffer.geometry_offsets),
+                    ptr(corr_buffer.part_offsets),
+                    ptr(corr_buffer.ring_offsets),
+                    0,
+                    ptr(d_family_boundary_overlap),
+                    ptr(d_family_out),
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                ),
+            )
 
-        # Per-candidate result: 1 = fully inside, 0 = not.
-        d_cand_result = cp.zeros(n_bbox_candidates, dtype=cp.int32)
+        if (
+            left_family is GeometryFamily.POLYGON
+            and corr_family is GeometryFamily.POLYGON
+            and n_family >= 128
+        ):
+            block_size = min(max(runtime.optimal_block_size(kernel), 32), 256)
+            grid, block = (n_family, 1, 1), (block_size, 1, 1)
+        else:
+            grid, block = runtime.launch_config(kernel, n_family)
+        runtime.launch(kernel, grid=grid, block=block, params=params)
+        pending_device_refs.extend((d_family_rows, d_family_boundary_overlap, d_family_out))
+        return d_family_out
 
-        kernels = _containment_bypass_kernels()
-        ptr = runtime.pointer
-        corr_row = 0  # corridor is always row 0 of its family buffer
+    def _boundary_overlap_rows(kernels, ptr):
+        d_boundary_overlap = cp.empty(n_left, dtype=cp.int32)
+        if corr_family is GeometryFamily.POLYGON:
+            kernel = kernels["containment_boundary_overlap_poly"]
+            params = (
+                (
+                    ptr(d_lb),
+                    n_left,
+                    ptr(corr_buffer.x),
+                    ptr(corr_buffer.y),
+                    ptr(corr_buffer.geometry_offsets),
+                    ptr(corr_buffer.ring_offsets),
+                    0,
+                    ptr(d_boundary_overlap),
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                ),
+            )
+        else:
+            kernel = kernels["containment_boundary_overlap_mpoly"]
+            params = (
+                (
+                    ptr(d_lb),
+                    n_left,
+                    ptr(corr_buffer.x),
+                    ptr(corr_buffer.y),
+                    ptr(corr_buffer.geometry_offsets),
+                    ptr(corr_buffer.part_offsets),
+                    ptr(corr_buffer.ring_offsets),
+                    0,
+                    ptr(d_boundary_overlap),
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                ),
+            )
+        grid, block = runtime.launch_config(kernel, n_left)
+        runtime.launch(kernel, grid=grid, block=block, params=params)
+        return d_boundary_overlap
 
-        # Process each left polygonal family against the corridor.
+    def _dense_family_inputs_from_host_metadata():
+        host_tags = getattr(left, "_tags", None)
+        host_family_row_offsets = getattr(left, "_family_row_offsets", None)
+        if host_tags is None or host_family_row_offsets is None:
+            return None
+        if int(host_tags.size) != n_left or int(host_family_row_offsets.size) != n_left:
+            return None
+        dense_by_size = n_left <= _CONTAINMENT_BYPASS_DENSE_MAX_ROWS
+        dense_by_fraction = (
+            n_bbox_candidates / max(n_left, 1)
+        ) >= _CONTAINMENT_BYPASS_DENSE_MIN_CANDIDATE_FRACTION
+        if not (dense_by_size or dense_by_fraction):
+            return None
+        family_inputs = []
         for left_family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
             if left_family not in left_state.families:
                 continue
-            tag_val = FAMILY_TAGS[left_family]
-            d_family_mask = d_cand_tags == tag_val
-            n_family = overlay_int_scalar(
-                cp.count_nonzero(d_family_mask),
-                reason=f"overlay containment-bypass {left_family.value} candidate count scalar fence",
+            host_positions = np.flatnonzero(host_tags == np.int8(FAMILY_TAGS[left_family])).astype(
+                np.int64, copy=False
             )
-            if n_family == 0:
+            if host_positions.size == 0:
                 continue
-
-            d_family_rows = d_cand_fro[d_family_mask].astype(cp.int32)
-            left_buf = left_state.families[left_family]
-
-            # Select the kernel variant based on left family x corridor family.
-            if left_family is GeometryFamily.POLYGON and corr_family is GeometryFamily.POLYGON:
-                kernel = kernels["containment_poly_vs_poly"]
-                params = (
-                    (
-                        ptr(d_family_rows),
-                        n_family,
-                        ptr(left_buf.x),
-                        ptr(left_buf.y),
-                        ptr(left_buf.geometry_offsets),
-                        ptr(left_buf.ring_offsets),
-                        ptr(corr_buffer.x),
-                        ptr(corr_buffer.y),
-                        ptr(corr_buffer.geometry_offsets),
-                        ptr(corr_buffer.ring_offsets),
-                        corr_row,
-                        ptr(d_cand_result),  # temporary -- write to family slice below
-                    ),
-                    (
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_I32, KERNEL_PARAM_PTR,
-                    ),
+            host_family_rows = np.asarray(
+                host_family_row_offsets[host_positions],
+                dtype=np.int32,
+            )
+            valid = host_family_rows >= 0
+            if not bool(np.all(valid)):
+                host_positions = host_positions[valid]
+                host_family_rows = host_family_rows[valid]
+            if host_positions.size == 0:
+                continue
+            family_inputs.append(
+                (
+                    left_family,
+                    cp.asarray(host_positions, dtype=cp.int64),
+                    cp.asarray(host_family_rows, dtype=cp.int32),
+                    int(host_positions.size),
                 )
-            elif left_family is GeometryFamily.POLYGON and corr_family is GeometryFamily.MULTIPOLYGON:
-                kernel = kernels["containment_poly_vs_mpoly"]
-                params = (
-                    (
-                        ptr(d_family_rows),
-                        n_family,
-                        ptr(left_buf.x),
-                        ptr(left_buf.y),
-                        ptr(left_buf.geometry_offsets),
-                        ptr(left_buf.ring_offsets),
-                        ptr(corr_buffer.x),
-                        ptr(corr_buffer.y),
-                        ptr(corr_buffer.geometry_offsets),
-                        ptr(corr_buffer.part_offsets),
-                        ptr(corr_buffer.ring_offsets),
-                        corr_row,
-                        ptr(d_cand_result),
-                    ),
-                    (
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                        KERNEL_PARAM_PTR,
-                    ),
-                )
-            elif left_family is GeometryFamily.MULTIPOLYGON and corr_family is GeometryFamily.POLYGON:
-                kernel = kernels["containment_mpoly_vs_poly"]
-                params = (
-                    (
-                        ptr(d_family_rows),
-                        n_family,
-                        ptr(left_buf.x),
-                        ptr(left_buf.y),
-                        ptr(left_buf.geometry_offsets),
-                        ptr(left_buf.part_offsets),
-                        ptr(left_buf.ring_offsets),
-                        ptr(corr_buffer.x),
-                        ptr(corr_buffer.y),
-                        ptr(corr_buffer.geometry_offsets),
-                        ptr(corr_buffer.ring_offsets),
-                        corr_row,
-                        ptr(d_cand_result),
-                    ),
-                    (
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                        KERNEL_PARAM_PTR,
-                    ),
-                )
-            else:
-                # multipolygon vs multipolygon
-                kernel = kernels["containment_mpoly_vs_mpoly"]
-                params = (
-                    (
-                        ptr(d_family_rows),
-                        n_family,
-                        ptr(left_buf.x),
-                        ptr(left_buf.y),
-                        ptr(left_buf.geometry_offsets),
-                        ptr(left_buf.part_offsets),
-                        ptr(left_buf.ring_offsets),
-                        ptr(corr_buffer.x),
-                        ptr(corr_buffer.y),
-                        ptr(corr_buffer.geometry_offsets),
-                        ptr(corr_buffer.part_offsets),
-                        ptr(corr_buffer.ring_offsets),
-                        corr_row,
-                        ptr(d_cand_result),
-                    ),
-                    (
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_I32, KERNEL_PARAM_PTR,
-                    ),
-                )
+            )
+        return tuple(family_inputs) if family_inputs else None
 
-            # The kernel writes to a flat output buffer indexed by thread id
-            # (0..n_family-1).  We need to write to the correct positions in
-            # d_cand_result.  Allocate a temporary per-family output, launch,
-            # then scatter back.
-            d_family_out = cp.empty(n_family, dtype=cp.int32)
-            # Fix params to point to family-local output.
-            params_vals = list(params[0])
-            params_vals[-1] = ptr(d_family_out)
-            params = (tuple(params_vals), params[1])
+    # Only needed when there are bbox-inside candidates (potential containment).
+    n_contained = 0
+    d_contained_rows: cp.ndarray | None = None  # type: ignore[name-defined]
 
-            grid, block = runtime.launch_config(kernel, n_family)
-            runtime.launch(kernel, grid=grid, block=block, params=params)
+    if n_bbox_candidates > 0:
+        kernels = _containment_bypass_kernels()
+        ptr = runtime.pointer
+        d_boundary_overlap = _boundary_overlap_rows(kernels, ptr)
+        dense_family_inputs = _dense_family_inputs_from_host_metadata()
 
-            # Scatter family results back to candidate-wide array.
-            d_family_cand_positions = cp.flatnonzero(d_family_mask)
-            runtime.synchronize()
-            d_cand_result[d_family_cand_positions] = d_family_out
+        if dense_family_inputs is not None:
+            d_row_result = cp.zeros(n_left, dtype=cp.int32)
+            for left_family, d_global_positions, d_family_rows, n_family in dense_family_inputs:
+                d_family_boundary_overlap = d_boundary_overlap[d_global_positions]
+                d_family_out = _launch_family_containment(
+                    left_family,
+                    d_family_rows,
+                    d_family_boundary_overlap,
+                    n_family,
+                    kernels,
+                    ptr,
+                )
+                d_row_result[d_global_positions] = d_family_out
+                pending_device_refs.append(d_global_positions)
+            d_contained_mask = d_bbox_inside & (d_row_result == 1)
+            d_contained_rows = cp.flatnonzero(d_contained_mask).astype(cp.int64)
+            n_contained = int(d_contained_rows.size)
+        else:
+            d_tags = cp.asarray(left_state.tags)
+            d_fro = cp.asarray(left_state.family_row_offsets)
+            d_cand_tags = d_tags[d_bbox_indices]
+            d_cand_fro = d_fro[d_bbox_indices]
+            d_cand_boundary_overlap = d_boundary_overlap[d_bbox_indices]
+            d_cand_result = cp.zeros(n_bbox_candidates, dtype=cp.int32)
+
+            for left_family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
+                if left_family not in left_state.families:
+                    continue
+                tag_val = FAMILY_TAGS[left_family]
+                d_family_mask = d_cand_tags == tag_val
+                d_family_cand_positions = cp.flatnonzero(d_family_mask)
+                n_family = d_family_cand_positions.size
+                if n_family == 0:
+                    continue
+
+                d_family_rows = d_cand_fro[d_family_cand_positions].astype(cp.int32)
+                d_family_boundary_overlap = d_cand_boundary_overlap[d_family_cand_positions]
+                d_family_out = _launch_family_containment(
+                    left_family,
+                    d_family_rows,
+                    d_family_boundary_overlap,
+                    n_family,
+                    kernels,
+                    ptr,
+                )
+                d_cand_result[d_family_cand_positions] = d_family_out
+                pending_device_refs.append(d_family_cand_positions)
+
+            d_cand_all_inside = d_cand_result == 1
+            d_contained_cand_indices = cp.flatnonzero(d_cand_all_inside)
+            n_contained = int(d_contained_cand_indices.size)
+            if n_contained > 0:
+                d_contained_rows = d_bbox_indices[d_contained_cand_indices].astype(
+                    cp.int64,
+                )
+        pending_device_refs.clear()
 
     # ------------------------------------------------------------------
     # Stage 3: Route results by operation semantics
     # ------------------------------------------------------------------
-    # Determine which rows are contained (all vertices inside corridor).
-    n_contained = 0
-    d_contained_rows: cp.ndarray | None = None  # type: ignore[name-defined]
-    if d_cand_result is not None and d_bbox_indices is not None:
-        d_cand_all_inside = d_cand_result == 1
-        n_contained = overlay_int_scalar(
-            cp.count_nonzero(d_cand_all_inside),
-            reason="overlay containment-bypass contained-row count scalar fence",
-        )
-        if n_contained > 0:
-            d_contained_cand_indices = cp.flatnonzero(d_cand_all_inside)
-            d_contained_rows = d_bbox_indices[d_contained_cand_indices].astype(cp.int64)
-
-    # Determine which rows are bbox-disjoint.
-    d_disjoint_rows: cp.ndarray | None = None  # type: ignore[name-defined]
-    if d_bbox_disjoint is not None and n_bbox_disjoint > 0:
-        d_disjoint_rows = cp.flatnonzero(d_bbox_disjoint).astype(cp.int64)
 
     # --- Apply operation-specific routing ---
     if how == "intersection":
@@ -430,10 +588,16 @@ def _containment_bypass_gpu(
             d_remainder_mask = cp.ones(n_left, dtype=cp.bool_)
             return None, d_remainder_mask
 
-        bypass_oga = left.take(d_contained_rows)
+        assert d_contained_rows is not None
+        if prefer_indexed_bypass and left.device_state is not None:
+            bypass_oga = OwnedGeometryArray._indexed_view(left, d_contained_rows)
+        else:
+            bypass_oga = left.take(d_contained_rows)
+        bypass_oga._containment_bypass_source_rows = d_contained_rows
         d_remainder_mask = cp.ones(n_left, dtype=cp.bool_)
         d_remainder_mask[d_contained_rows] = False
         n_bypassed = n_contained
+        n_remainder = n_left - n_contained
 
     elif how == "difference":
         # Contained -> excluded (L-R = empty); disjoint -> pass-through (L-R = L).
@@ -456,23 +620,15 @@ def _containment_bypass_gpu(
         # Build bypass OGA: only disjoint rows (contained produce empty).
         if d_disjoint_rows is not None and n_bbox_disjoint > 0:
             bypass_oga = left.take(d_disjoint_rows)
+            bypass_oga._containment_bypass_source_rows = d_disjoint_rows
         else:
             bypass_oga = None  # all bypassed rows were contained (empty result)
 
-        n_remainder = overlay_int_scalar(
-            cp.count_nonzero(d_remainder_mask),
-            reason="overlay containment-bypass difference-remainder count scalar fence",
-        )
+        n_remainder = n_left - n_bypassed
 
     else:
         # Should not reach here due to gate above.
         return None, None
-
-    if how == "intersection":
-        n_remainder = overlay_int_scalar(
-            cp.count_nonzero(d_remainder_mask),
-            reason="overlay containment-bypass intersection-remainder count scalar fence",
-        )
 
     record_dispatch_event(
         surface="geopandas.spatial_overlay",
@@ -583,7 +739,8 @@ def _is_clip_polygon_sh_eligible(
     if n_verts > _MAX_CLIP_VERTS:
         logger.debug(
             "SH batch clip: clip polygon has %d vertices (limit %d) -- skipping SH tier",
-            n_verts, _MAX_CLIP_VERTS,
+            n_verts,
+            _MAX_CLIP_VERTS,
         )
         return False, 0
 
@@ -844,14 +1001,26 @@ def _batch_point_in_ring_gpu(
 
     ptr = runtime.pointer
     params = (
-        (ptr(d_sample_x), ptr(d_sample_y),
-         ptr(d_ring_x), ptr(d_ring_y),
-         ptr(d_ring_offsets), ptr(d_pair_ring_idx),
-         ptr(d_results), pair_count),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+        (
+            ptr(d_sample_x),
+            ptr(d_sample_y),
+            ptr(d_ring_x),
+            ptr(d_ring_y),
+            ptr(d_ring_offsets),
+            ptr(d_pair_ring_idx),
+            ptr(d_results),
+            pair_count,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+        ),
     )
     runtime.launch(kernel, grid=grid, block=block, params=params)
 

@@ -42,6 +42,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import StrictNativeFallbackError, record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
@@ -52,9 +53,11 @@ logger = logging.getLogger(__name__)
 
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("vw-area-fp64", _VW_AREA_FP64, _VW_AREA_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("vw-area-fp64", _VW_AREA_FP64, _VW_AREA_KERNEL_NAMES),
+    ]
+)
 
 from vibespatial.cuda.cccl_precompile import request_warmup  # noqa: E402
 
@@ -64,6 +67,7 @@ request_warmup(["exclusive_scan_i32"])
 # ---------------------------------------------------------------------------
 # GPU implementation: single-pass area-threshold simplification
 # ---------------------------------------------------------------------------
+
 
 def _simplify_family_gpu(runtime, device_buf, family, tolerance):
     """GPU single-pass simplify for one family.
@@ -99,7 +103,9 @@ def _simplify_family_gpu(runtime, device_buf, family, tolerance):
 
     # 2. Launch VW effective area kernel (Tier 1 NVRTC, 1 thread per span)
     kernels = compile_kernel_group(
-        "vw-area-fp64", _VW_AREA_FP64, _VW_AREA_KERNEL_NAMES,
+        "vw-area-fp64",
+        _VW_AREA_FP64,
+        _VW_AREA_KERNEL_NAMES,
     )
     kernel = kernels["vw_effective_area"]
 
@@ -108,12 +114,22 @@ def _simplify_family_gpu(runtime, device_buf, family, tolerance):
     ptr = runtime.pointer
     params = (
         (
-            ptr(device_buf.x), ptr(device_buf.y), ptr(d_span_offsets),
-            ptr(d_areas), 0.0, 0.0, span_count,
+            ptr(device_buf.x),
+            ptr(device_buf.y),
+            ptr(d_span_offsets),
+            ptr(d_areas),
+            0.0,
+            0.0,
+            span_count,
         ),
         (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_I32,
         ),
     )
     grid, block = runtime.launch_config(kernel, span_count)
@@ -147,9 +163,7 @@ def _simplify_family_gpu(runtime, device_buf, family, tolerance):
     d_nonzero_mask = d_span_starts_cp > 0
     d_nz_indices = cp.flatnonzero(d_nonzero_mask)
     if d_nz_indices.size > 0:
-        d_start_sums[d_nz_indices] = d_cumsum[
-            d_span_starts_cp[d_nz_indices] - 1
-        ]
+        d_start_sums[d_nz_indices] = d_cumsum[d_span_starts_cp[d_nz_indices] - 1]
     d_per_span_counts = d_end_sums - d_start_sums
 
     # 6. For polygon rings: ensure >= 4 kept vertices per span
@@ -175,9 +189,7 @@ def _simplify_family_gpu(runtime, device_buf, family, tolerance):
             d_end_sums = d_cumsum[d_span_ends_cp - 1]
             d_start_sums = cp.zeros(span_count, dtype=cp.int32)
             if d_nz_indices.size > 0:
-                d_start_sums[d_nz_indices] = d_cumsum[
-                    d_span_starts_cp[d_nz_indices] - 1
-                ]
+                d_start_sums[d_nz_indices] = d_cumsum[d_span_starts_cp[d_nz_indices] - 1]
             d_per_span_counts = d_end_sums - d_start_sums
 
     # 7. Gather kept coordinates (Tier 2 CuPy fancy indexing)
@@ -215,7 +227,10 @@ def _simplify_family_gpu(runtime, device_buf, family, tolerance):
     kernel_class=KernelClass.COARSE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "linestring", "multilinestring", "polygon", "multipolygon",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("cuda-python", "constructive", "simplify"),
@@ -235,7 +250,10 @@ def _simplify_gpu(owned, tolerance):
             new_device_families[family] = device_buf
             continue
         new_device_families[family] = _simplify_family_gpu(
-            runtime, device_buf, family, tolerance,
+            runtime,
+            device_buf,
+            family,
+            tolerance,
         )
     tags, validity, family_row_offsets = forward_result_metadata(owned)
 
@@ -252,6 +270,7 @@ def _simplify_gpu(owned, tolerance):
 # ---------------------------------------------------------------------------
 # CPU Visvalingam-Whyatt implementation
 # ---------------------------------------------------------------------------
+
 
 def _vw_simplify_span(x, y, start, end, tolerance, preserve_topology=True):
     """Visvalingam-Whyatt simplification for one coordinate span.
@@ -351,6 +370,7 @@ def _simplify_family_cpu(buf, family, tolerance, preserve_topology=True):
 # Public dispatch API
 # ---------------------------------------------------------------------------
 
+
 def simplify_owned(
     owned: OwnedGeometryArray,
     tolerance: float,
@@ -392,6 +412,11 @@ def simplify_owned(
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=owned.residency,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            primary_unit_name="simplify-coordinate",
+        ),
     )
 
     if selection.selected is ExecutionMode.GPU:

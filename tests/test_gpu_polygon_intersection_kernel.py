@@ -6,6 +6,8 @@ for correctness, edge cases, and precision compliance (ADR-0002).
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import shapely
@@ -22,6 +24,26 @@ except (ImportError, ModuleNotFoundError):
     _has_gpu = False
 
 requires_gpu = pytest.mark.skipif(not _has_gpu, reason="GPU not available")
+
+
+def test_polygon_intersection_uses_shape_bounded_vertex_capacity() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "vibespatial"
+        / "kernels"
+        / "constructive"
+        / "polygon_intersection.py"
+    ).read_text()
+
+    assert "_polygon_intersection_vertex_capacity(" in source
+    assert "workspace_bound = row_count * (int(_MAX_CLIP_VERTS) + 1)" in source
+    assert "not owned.is_indexed_view" in source
+    assert "count_scatter_total(" not in source
+    assert "polygon-polygon intersection vertex allocation fence" not in source
+    assert "runtime.synchronize()" not in source
+
+
 def _shapely_intersection(left_geoms, right_geoms):
     """Shapely oracle: element-wise intersection."""
     left_arr = np.empty(len(left_geoms), dtype=object)
@@ -75,6 +97,7 @@ def _assert_geom_equal(gpu_geom, ref_geom, *, rtol=1e-6, msg=""):
 # Test: basic overlapping rectangles
 # ---------------------------------------------------------------------------
 
+
 @requires_gpu
 def test_basic_rectangle_overlap(make_owned):
     """Two overlapping axis-aligned rectangles."""
@@ -98,6 +121,7 @@ def test_basic_rectangle_overlap(make_owned):
 # Test: fully contained polygon
 # ---------------------------------------------------------------------------
 
+
 @requires_gpu
 def test_fully_contained(make_owned):
     """Left polygon fully inside right polygon."""
@@ -120,6 +144,7 @@ def test_fully_contained(make_owned):
 # ---------------------------------------------------------------------------
 # Test: no overlap (empty result)
 # ---------------------------------------------------------------------------
+
 
 @requires_gpu
 def test_no_overlap():
@@ -145,6 +170,7 @@ def test_no_overlap():
 # Test: touching edges
 # ---------------------------------------------------------------------------
 
+
 @requires_gpu
 def test_touching_edges():
     """Polygons that share an edge but have zero-area intersection."""
@@ -159,9 +185,14 @@ def test_touching_edges():
     result = polygon_intersection(left, right, dispatch_mode=ExecutionMode.GPU)
     result_geoms = result.to_shapely()
 
+    import cupy as cp
+
+    supported = result._polygon_intersection_sh_supported
+
     # Touching edge -> degenerate (line) intersection -> treated as empty polygon
     assert len(result_geoms) == 1
     geom = result_geoms[0]
+    assert cp.asnumpy(supported).tolist() == [False]
     if geom is not None and not geom.is_empty:
         # If it produces a polygon, its area should be negligible
         assert shapely.area(geom) < 1e-10
@@ -170,6 +201,7 @@ def test_touching_edges():
 # ---------------------------------------------------------------------------
 # Test: multiple pairs (batched)
 # ---------------------------------------------------------------------------
+
 
 @requires_gpu
 def test_multiple_pairs():
@@ -204,9 +236,270 @@ def test_multiple_pairs():
     _assert_geom_equal(result_geoms[2], ref_geoms[2], msg="pair 2")
 
 
+@requires_gpu
+def test_validated_simple_polygon_intersection_handles_concave_pair():
+    """Validated simple-polygon carrier handles concave single-ring pairs."""
+    import cupy as cp
+
+    from vibespatial.geometry.owned import from_shapely_geometries
+    from vibespatial.kernels.constructive.polygon_simple_intersection import (
+        polygon_simple_intersection,
+    )
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    left_geoms = [
+        box(0.0, 0.0, 3.0, 3.0),
+        box(10.0, 0.0, 13.0, 3.0),
+        box(10.0, 10.0, 11.0, 11.0),
+    ]
+    right_geoms = [
+        Polygon([(1, -1), (4, 1), (1, 4), (2, 1), (1, -1)]),
+        Polygon([(11, -1), (14, 1), (11, 4), (12, 1), (11, -1)]),
+        box(20.0, 20.0, 21.0, 21.0),
+    ]
+    left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+    right = from_shapely_geometries(right_geoms, residency=Residency.DEVICE)
+
+    clear_dispatch_events()
+    result_tuple = polygon_simple_intersection(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    events = get_dispatch_events(clear=True)
+
+    assert result_tuple is not None
+    result, supported = result_tuple
+    assert cp.asnumpy(supported).tolist() == [True, True, True]
+    assert any(
+        event.implementation == "validated_simple_polygon_intersection_gpu" for event in events
+    )
+
+    got = result.to_shapely()
+    expected = _shapely_intersection(left_geoms, right_geoms)
+    for got_geom, expected_geom in zip(got, expected, strict=True):
+        _assert_geom_equal(got_geom, expected_geom)
+
+
+@requires_gpu
+def test_validated_simple_polygon_intersection_is_translation_invariant() -> None:
+    """Projected-coordinate nodes must match the canonical exact topology."""
+    import cupy as cp
+
+    from vibespatial.geometry.owned import from_shapely_geometries
+    from vibespatial.kernels.constructive.polygon_simple_intersection import (
+        polygon_simple_intersection,
+    )
+
+    left_geom = Polygon(
+        [
+            (362082.6129809683, 3075418.12889014),
+            (362090.5054597832, 3076110.5708671827),
+            (361474.7678884961, 3076117.605466008),
+            (361466.8754096812, 3075425.1634890),
+        ]
+    )
+    right_geom = Polygon(
+        [
+            (362084.19134555734, 3075556.6172384047),
+            (362550.5237908291, 3078441.0256827176),
+            (361683.7484846617, 3078450.9131343374),
+        ]
+    )
+    left = from_shapely_geometries([left_geom], residency=Residency.DEVICE)
+    right = from_shapely_geometries([right_geom], residency=Residency.DEVICE)
+
+    result_tuple = polygon_simple_intersection(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result_tuple is not None
+    result, supported = result_tuple
+    assert cp.asnumpy(supported).tolist() == [True]
+    assert shapely.equals(result.to_shapely()[0], left_geom.intersection(right_geom))
+
+
+@requires_gpu
+def test_validated_simple_intersection_preserves_strictly_contained_fp64_sliver() -> None:
+    import cupy as cp
+
+    from vibespatial.geometry.owned import from_shapely_geometries
+    from vibespatial.kernels.constructive.polygon_simple_intersection import (
+        polygon_simple_intersection,
+    )
+    from vibespatial.runtime.residency import Residency
+
+    sliver = Polygon(
+        [
+            (673.2050807568874, 400.0),
+            (673.2050807568877, 399.9999999999999),
+            (673.2050807568876, 400.0),
+        ]
+    )
+    container = box(600.0, 300.0, 800.0, 500.0)
+    left = from_shapely_geometries([sliver], residency=Residency.DEVICE)
+    right = from_shapely_geometries([container], residency=Residency.DEVICE)
+
+    result_tuple = polygon_simple_intersection(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result_tuple is not None
+    result, supported = result_tuple
+    assert cp.asnumpy(supported).tolist() == [True]
+    assert shapely.equals_exact(result.to_shapely()[0], sliver, tolerance=0.0)
+
+
+@requires_gpu
+def test_projected_near_incidence_routes_bounded_carriers_to_exact_topology() -> None:
+    """Uncertain source incidences must preserve shared source-edge identity."""
+    import cupy as cp
+
+    from vibespatial.constructive.binary_constructive import (
+        _dispatch_partitioned_polygon_intersection_gpu,
+    )
+    from vibespatial.geometry.owned import from_shapely_geometries
+    from vibespatial.kernels.constructive.polygon_intersection import (
+        polygon_intersection_sh_eligible_mask,
+    )
+    from vibespatial.kernels.constructive.polygon_simple_intersection import (
+        polygon_simple_intersection,
+    )
+
+    parcel = Polygon(
+        [
+            (360125.33218083536, 3076582.0618681083),
+            (360124.6256267402, 3076520.961623712),
+            (360229.9370452518, 3076519.744716444),
+            (360323.09733569185, 3076643.4940596),
+            (360324.21483259567, 3076740.2675098213),
+            (360180.3158424565, 3076741.9304189333),
+        ]
+    )
+    primary_building = Polygon(
+        [
+            (360125.33218083536, 3076582.0618681083),
+            (360124.6256267402, 3076520.961623712),
+            (360229.9370452518, 3076519.744716444),
+            (360323.0973356905, 3076643.494059598),
+            (360324.21483259427, 3076740.2675098213),
+            (360180.3158424565, 3076741.9304189333),
+        ]
+    )
+    adjacent_building = Polygon(
+        [
+            (360323.0973356905, 3076643.494059598),
+            (360395.33196741896, 3076739.4468329023),
+            (360324.21483259427, 3076740.2675098213),
+        ]
+    )
+    buildings = [primary_building, adjacent_building]
+    left = from_shapely_geometries([parcel, parcel], residency=Residency.DEVICE)
+    right = from_shapely_geometries(buildings, residency=Residency.DEVICE)
+
+    sh_eligible = polygon_intersection_sh_eligible_mask(left, right)
+    simple_result = polygon_simple_intersection(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    result = _dispatch_partitioned_polygon_intersection_gpu(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert cp.asnumpy(sh_eligible).tolist() == [False, False]
+    assert simple_result is not None
+    assert cp.asnumpy(cp.asarray(simple_result[1])).tolist() == [False, False]
+    assert result is not None
+    actual = result.to_shapely()
+    expected = shapely.intersection(
+        np.asarray([parcel, parcel], dtype=object),
+        np.asarray(buildings, dtype=object),
+    )
+    assert all(
+        shapely.equals(got, want)
+        for got, want in zip(actual, expected, strict=True)
+    )
+    shared = shapely.intersection(
+        shapely.boundary(actual[0]),
+        shapely.boundary(actual[1]),
+    )
+    assert shapely.get_type_id(shared) == shapely.GeometryType.LINESTRING
+    assert shapely.length(shared) > 90.0
+
+
+@requires_gpu
+def test_row_indirected_polygon_rows_stay_virtual_in_gpu_kernel(monkeypatch):
+    """Direct SH kernel consumes device family-row offsets without resolving views."""
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
+    from vibespatial.kernels.constructive.polygon_intersection import polygon_intersection
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    source_left = [
+        Polygon([(0, 0), (4, 0), (4, 1), (2, 3), (0, 3), (0, 0)]),
+        Polygon([(10, 0), (13, 0), (14, 2), (12, 4), (10, 2), (10, 0)]),
+        Polygon([(20, 0), (24, 0), (25, 3), (22, 5), (20, 3), (20, 0)]),
+    ]
+    source_right = [
+        box(1, 1, 5, 4),
+        box(11, 1, 15, 5),
+        box(21, 1, 26, 4),
+    ]
+    left_rows = cp.asarray([0, 1, 0, 2, 1], dtype=cp.int64)
+    right_rows = cp.asarray([0, 1, 0, 2, 1], dtype=cp.int64)
+    left = OwnedGeometryArray._indexed_view(
+        from_shapely_geometries(source_left, residency=Residency.DEVICE),
+        left_rows,
+    )
+    right = OwnedGeometryArray._indexed_view(
+        from_shapely_geometries(source_right, residency=Residency.DEVICE),
+        right_rows,
+    )
+
+    def _fail_resolve(*_args, **_kwargs):
+        raise AssertionError("polygon_intersection should consume row-indirected views")
+
+    monkeypatch.setattr(left, "_resolve", _fail_resolve)
+    monkeypatch.setattr(left, "_device_resolve", _fail_resolve)
+    monkeypatch.setattr(right, "_resolve", _fail_resolve)
+    monkeypatch.setattr(right, "_device_resolve", _fail_resolve)
+
+    clear_dispatch_events()
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    result = polygon_intersection(left, right, dispatch_mode=ExecutionMode.GPU)
+    runtime_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    events = get_dispatch_events(clear=True)
+
+    assert left.is_indexed_view
+    assert right.is_indexed_view
+    assert result.row_count == int(left_rows.size)
+    assert not any("owned geometry host metadata" in reason for reason in runtime_reasons)
+    assert not any("intersection vertex allocation fence" in reason for reason in runtime_reasons)
+    assert any(event.implementation == "polygon_intersection_gpu" for event in events)
+
+    got = result.to_shapely()
+    expected = _shapely_intersection(
+        [source_left[index] for index in cp.asnumpy(left_rows)],
+        [source_right[index] for index in cp.asnumpy(right_rows)],
+    )
+    for row, (got_geom, expected_geom) in enumerate(zip(got, expected, strict=True)):
+        _assert_geom_equal(got_geom, expected_geom, msg=f"row-indirected pair {row}")
+
+
 # ---------------------------------------------------------------------------
 # Test: null input propagation
 # ---------------------------------------------------------------------------
+
 
 @requires_gpu
 def test_null_input_propagation():
@@ -224,9 +517,13 @@ def test_null_input_propagation():
 
     assert len(result_geoms) == 3
     # Pair 0: right is None -> null
-    assert result_geoms[0] is None or (hasattr(result_geoms[0], "is_empty") and result_geoms[0].is_empty)
+    assert result_geoms[0] is None or (
+        hasattr(result_geoms[0], "is_empty") and result_geoms[0].is_empty
+    )
     # Pair 1: left is None -> null
-    assert result_geoms[1] is None or (hasattr(result_geoms[1], "is_empty") and result_geoms[1].is_empty)
+    assert result_geoms[1] is None or (
+        hasattr(result_geoms[1], "is_empty") and result_geoms[1].is_empty
+    )
     # Pair 2: both valid -> should have area
     ref = shapely.intersection(
         shapely.from_wkt("POLYGON ((1 1, 3 1, 3 3, 1 3, 1 1))"),
@@ -238,6 +535,7 @@ def test_null_input_propagation():
 # ---------------------------------------------------------------------------
 # Test: non-axis-aligned polygons (triangles)
 # ---------------------------------------------------------------------------
+
 
 @requires_gpu
 def test_triangle_intersection():
@@ -260,7 +558,13 @@ def test_triangle_intersection():
 
 @requires_gpu
 def test_convex_diamond_overlap_normalizes_without_duplicate_vertices():
-    """Diamond overlaps should not retain duplicate corner vertices after clipping."""
+    """Uncertain diamond vertices decline SH and complete through exact topology."""
+    import cupy as cp
+
+    from vibespatial.constructive.binary_constructive import (
+        _dispatch_partitioned_polygon_intersection_gpu,
+    )
+
     left_geoms = [Point(0, 0).buffer(1, quad_segs=2)]
     right_geoms = [Point(1, 1).buffer(1, quad_segs=2)]
 
@@ -269,7 +573,16 @@ def test_convex_diamond_overlap_normalizes_without_duplicate_vertices():
 
     from vibespatial.kernels.constructive.polygon_intersection import polygon_intersection
 
-    result = polygon_intersection(left, right, dispatch_mode=ExecutionMode.GPU)
+    bounded = polygon_intersection(left, right, dispatch_mode=ExecutionMode.GPU)
+    assert cp.asnumpy(cp.asarray(bounded._polygon_intersection_sh_supported)).tolist() == [
+        False
+    ]
+    result = _dispatch_partitioned_polygon_intersection_gpu(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    assert result is not None
     result_geoms = result.to_shapely()
     ref_geoms = _shapely_intersection(left_geoms, right_geoms)
 
@@ -284,6 +597,7 @@ def test_convex_diamond_overlap_normalizes_without_duplicate_vertices():
 # ---------------------------------------------------------------------------
 # Test: identical polygons
 # ---------------------------------------------------------------------------
+
 
 @requires_gpu
 def test_identical_polygons():
@@ -308,6 +622,7 @@ def test_identical_polygons():
 # Test: large coordinate values (precision stress)
 # ---------------------------------------------------------------------------
 
+
 @requires_gpu
 def test_large_coordinates():
     """Polygons with large absolute coordinate values."""
@@ -326,7 +641,8 @@ def test_large_coordinates():
 
     assert len(result_geoms) == 1
     _assert_geom_equal(
-        result_geoms[0], ref_geoms[0],
+        result_geoms[0],
+        ref_geoms[0],
         rtol=1e-5,
         msg="large coordinates",
     )
@@ -335,6 +651,7 @@ def test_large_coordinates():
 # ---------------------------------------------------------------------------
 # Test: CPU fallback
 # ---------------------------------------------------------------------------
+
 
 def test_cpu_fallback():
     """CPU fallback produces correct results via Shapely."""
@@ -358,6 +675,7 @@ def test_cpu_fallback():
 # Test: row count mismatch raises ValueError
 # ---------------------------------------------------------------------------
 
+
 def test_row_count_mismatch():
     """Mismatched row counts should raise ValueError."""
     left = _make_owned_polygons([box(0, 0, 1, 1)])
@@ -373,6 +691,7 @@ def test_row_count_mismatch():
 # Test: empty input array
 # ---------------------------------------------------------------------------
 
+
 def test_empty_input():
     """Empty input arrays should return empty result."""
     left = _make_owned_polygons([])
@@ -387,6 +706,7 @@ def test_empty_input():
 # ---------------------------------------------------------------------------
 # Test: device-resident result (no D->H in hot path)
 # ---------------------------------------------------------------------------
+
 
 @requires_gpu
 def test_result_is_device_resident(strict_device_guard):
@@ -407,6 +727,7 @@ def test_result_is_device_resident(strict_device_guard):
 # ---------------------------------------------------------------------------
 # Test: partial overlap (L-shaped result)
 # ---------------------------------------------------------------------------
+
 
 @requires_gpu
 def test_partial_overlap_pentagon():
@@ -430,6 +751,7 @@ def test_partial_overlap_pentagon():
 # ---------------------------------------------------------------------------
 # Test: many pairs (stress test)
 # ---------------------------------------------------------------------------
+
 
 @requires_gpu
 def test_many_pairs():
@@ -487,6 +809,7 @@ def test_many_pairs():
 # Test: ADR-0002 precision plan is wired through
 # ---------------------------------------------------------------------------
 
+
 @requires_gpu
 def test_precision_plan_wired():
     """Verify that the precision plan is computed and stays fp64 for CONSTRUCTIVE."""
@@ -501,10 +824,7 @@ def test_precision_plan_wired():
 
     # Check dispatch event was recorded
     events = get_dispatch_events()
-    pi_events = [
-        e for e in events
-        if e.operation == "polygon_intersection"
-    ]
+    pi_events = [e for e in events if e.operation == "polygon_intersection"]
     assert len(pi_events) >= 1
     last_event = pi_events[-1]
     assert "precision=fp64" in last_event.detail
@@ -513,6 +833,7 @@ def test_precision_plan_wired():
 # ---------------------------------------------------------------------------
 # Test: CW-wound clip polygon (winding direction fix)
 # ---------------------------------------------------------------------------
+
 
 @requires_gpu
 def test_cw_clip_polygon_validity():
@@ -568,9 +889,7 @@ def test_cw_clip_polygon_validity():
         if ref_area < 1e-10:
             continue
         ratio = abs(gpu_area - ref_area) / max(abs(ref_area), 1e-15)
-        assert ratio < 1e-4, (
-            f"Pair {i}: GPU area={gpu_area}, ref area={ref_area}, ratio={ratio}"
-        )
+        assert ratio < 1e-4, f"Pair {i}: GPU area={gpu_area}, ref area={ref_area}, ratio={ratio}"
 
 
 @requires_gpu

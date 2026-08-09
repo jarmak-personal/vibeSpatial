@@ -16,6 +16,7 @@ ADR-0002: COARSE class -- segment length threshold is user-specified;
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -30,6 +31,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import Residency
@@ -48,133 +50,102 @@ from vibespatial.constructive.segmentize_kernels import (
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
+    KERNEL_PARAM_I64,
     KERNEL_PARAM_PTR,
     compile_kernel_group,
-    count_scatter_total,
+    count_scatter_totals,
     get_cuda_runtime,
 )
 
 # Background precompilation (ADR-0034)
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 
-request_nvrtc_warmup([
-    ("segmentize-count-fp64", _SEGMENTIZE_COUNT_FP64, _SEGMENTIZE_COUNT_KERNEL_NAMES),
-    ("segmentize-scatter-fp64", _SEGMENTIZE_SCATTER_FP64, _SEGMENTIZE_SCATTER_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("segmentize-count-fp64", _SEGMENTIZE_COUNT_FP64, _SEGMENTIZE_COUNT_KERNEL_NAMES),
+        ("segmentize-scatter-fp64", _SEGMENTIZE_SCATTER_FP64, _SEGMENTIZE_SCATTER_KERNEL_NAMES),
+    ]
+)
 
 from vibespatial.cuda.cccl_precompile import request_warmup  # noqa: E402
 
-request_warmup(["exclusive_scan_i32"])
+request_warmup(["exclusive_scan_i64"])
 
 
 # ---------------------------------------------------------------------------
-# GPU implementation: 2-pass count -> scan -> scatter
+# GPU implementation: coordinate-capacity count -> scan -> scatter
 # ---------------------------------------------------------------------------
 
-def _segmentize_family_gpu(runtime, device_buf, family, max_segment_length):
-    """GPU 2-pass segmentize for one family.
 
-    Returns a new :class:`DeviceFamilyGeometryBuffer` with densified
-    coordinates and updated span-level offsets.  Higher-level offsets
-    (geometry_offsets for Polygon, etc.) are preserved from the input.
-    """
+@dataclass
+class _SegmentizeFamilyPlan:
+    family: GeometryFamily
+    device_buffer: object
+    span_offsets: object | None
+    span_count: int
+    coord_capacity: int
+    counts: object | None
+    offsets: object | None
+    terminal: object | None
+    released: bool = False
+
+
+def _segmentize_span_offsets(device_buf, family):
+    if family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
+        return device_buf.ring_offsets
+    if family is GeometryFamily.MULTILINESTRING:
+        return device_buf.part_offsets
+    return device_buf.geometry_offsets
+
+
+def _plan_segmentize_family_gpu(
+    runtime,
+    device_buf,
+    family,
+    max_segment_length,
+) -> _SegmentizeFamilyPlan:
+    """Launch one count lane per physical coordinate for one family."""
     from vibespatial.cuda.cccl_primitives import exclusive_sum
 
-    # 1. Determine span offsets for this family
-    if family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
-        d_span_offsets = device_buf.ring_offsets
-    elif family is GeometryFamily.MULTILINESTRING:
-        d_span_offsets = device_buf.part_offsets
-    else:  # LineString
-        d_span_offsets = device_buf.geometry_offsets
-
+    d_span_offsets = _segmentize_span_offsets(device_buf, family)
     if d_span_offsets is None:
-        return device_buf
+        return _SegmentizeFamilyPlan(family, device_buf, None, 0, 0, None, None, None)
+    span_count = max(int(d_span_offsets.shape[0]) - 1, 0)
+    coord_capacity = int(device_buf.x.size)
+    if span_count == 0 or coord_capacity == 0:
+        return _SegmentizeFamilyPlan(
+            family,
+            device_buf,
+            d_span_offsets,
+            span_count,
+            coord_capacity,
+            None,
+            None,
+            None,
+        )
 
-    span_count = int(d_span_offsets.shape[0]) - 1
-    if span_count <= 0:
-        return device_buf
-
-    # 2. Pass 1: count kernel (1 thread per span)
-    d_counts = runtime.allocate((span_count,), np.int32, zero=True)
-
-    count_kernels = compile_kernel_group(
+    d_counts = runtime.allocate((coord_capacity,), np.int64, zero=True)
+    d_terminal = runtime.allocate((coord_capacity,), np.uint8, zero=True)
+    count_kernel = compile_kernel_group(
         "segmentize-count-fp64",
         _SEGMENTIZE_COUNT_FP64,
         _SEGMENTIZE_COUNT_KERNEL_NAMES,
-    )
-    count_kernel = count_kernels["segmentize_count"]
-
+    )["segmentize_count"]
     ptr = runtime.pointer
-    count_params = (
-        (
-            ptr(device_buf.x),
-            ptr(device_buf.y),
-            ptr(d_span_offsets),
-            ptr(d_counts),
-            float(max_segment_length),
-            span_count,
-        ),
-        (
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_F64,
-            KERNEL_PARAM_I32,
-        ),
-    )
-    count_grid, count_block = runtime.launch_config(count_kernel, span_count)
+    grid, block = runtime.launch_config(count_kernel, coord_capacity)
     runtime.launch(
-        count_kernel, grid=count_grid, block=count_block, params=count_params,
-    )
-
-    # 3. Scan: exclusive prefix sum (CCCL Tier 3a)
-    d_offsets = exclusive_sum(d_counts, synchronize=False)
-
-    # 4. Read total output size (single async pinned transfer)
-    total_out = count_scatter_total(
-        runtime,
-        d_counts,
-        d_offsets,
-        reason="segmentize output-coordinate allocation fence",
-    )
-
-    if total_out == 0:
-        # Degenerate: all spans empty.  Return a zero-coordinate buffer.
-        d_x_out = runtime.allocate((0,), np.float64)
-        d_y_out = runtime.allocate((0,), np.float64)
-        d_out_offsets_full = runtime.allocate((span_count + 1,), np.int32, zero=True)
-    else:
-        # 5. Build full offsets array (length span_count + 1) on device
-        d_out_offsets_full = runtime.allocate((span_count + 1,), np.int32)
-        cp.copyto(
-            cp.asarray(d_out_offsets_full[:span_count]),
-            cp.asarray(d_offsets),
-        )
-        d_out_offsets_full[span_count] = total_out
-
-        # Allocate output coordinate buffers
-        d_x_out = runtime.allocate((total_out,), np.float64)
-        d_y_out = runtime.allocate((total_out,), np.float64)
-
-        # 6. Pass 2: scatter kernel (1 thread per output coordinate)
-        scatter_kernels = compile_kernel_group(
-            "segmentize-scatter-fp64",
-            _SEGMENTIZE_SCATTER_FP64,
-            _SEGMENTIZE_SCATTER_KERNEL_NAMES,
-        )
-        scatter_kernel = scatter_kernels["segmentize_scatter"]
-
-        scatter_params = (
+        count_kernel,
+        grid=grid,
+        block=block,
+        params=(
             (
                 ptr(device_buf.x),
                 ptr(device_buf.y),
                 ptr(d_span_offsets),
-                ptr(d_out_offsets_full),
-                ptr(d_x_out),
-                ptr(d_y_out),
+                ptr(d_counts),
+                ptr(d_terminal),
                 float(max_segment_length),
+                coord_capacity,
                 span_count,
             ),
             (
@@ -183,24 +154,105 @@ def _segmentize_family_gpu(runtime, device_buf, family, max_segment_length):
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_F64,
                 KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
             ),
-        )
-        scatter_grid, scatter_block = runtime.launch_config(
-            scatter_kernel, total_out,
-        )
-        runtime.launch(
-            scatter_kernel,
-            grid=scatter_grid,
-            block=scatter_block,
-            params=scatter_params,
-        )
-
-    return build_updated_device_family_buffer(
+        ),
+    )
+    return _SegmentizeFamilyPlan(
         family,
         device_buf,
+        d_span_offsets,
+        span_count,
+        coord_capacity,
+        d_counts,
+        exclusive_sum(d_counts, synchronize=False),
+        d_terminal,
+    )
+
+
+def _release_segmentize_family_plan(runtime, plan: _SegmentizeFamilyPlan) -> None:
+    if plan.released:
+        return
+    for values in (plan.counts, plan.offsets, plan.terminal):
+        if values is not None:
+            runtime.free(values)
+    plan.released = True
+
+
+def _emit_segmentize_family_gpu(
+    runtime,
+    plan: _SegmentizeFamilyPlan,
+    total_out: int,
+):
+    """Allocate exact family output and scatter directly by output lane."""
+    if total_out > np.iinfo(np.int32).max:
+        raise OverflowError("segmentize output exceeds the int32 owned-coordinate contract")
+    if plan.counts is None or plan.offsets is None or plan.terminal is None:
+        if plan.span_offsets is None:
+            return plan.device_buffer
+        d_x_out = runtime.allocate((0,), np.float64)
+        d_y_out = runtime.allocate((0,), np.float64)
+        d_out_offsets_full = runtime.allocate(
+            (plan.span_count + 1,),
+            np.int32,
+            zero=True,
+        )
+    else:
+        d_coord_offsets = runtime.allocate((plan.coord_capacity + 1,), np.int64)
+        cp.copyto(
+            cp.asarray(d_coord_offsets[: plan.coord_capacity]),
+            cp.asarray(plan.offsets),
+        )
+        d_coord_offsets[plan.coord_capacity] = np.int64(total_out)
+        d_out_offsets_full = cp.asarray(d_coord_offsets)[
+            cp.asarray(plan.span_offsets, dtype=cp.int64)
+        ].astype(cp.int32, copy=False)
+        d_x_out = runtime.allocate((total_out,), np.float64)
+        d_y_out = runtime.allocate((total_out,), np.float64)
+
+        if total_out > 0:
+            scatter_kernel = compile_kernel_group(
+                "segmentize-scatter-fp64",
+                _SEGMENTIZE_SCATTER_FP64,
+                _SEGMENTIZE_SCATTER_KERNEL_NAMES,
+            )["segmentize_scatter"]
+            grid, block = runtime.launch_config(scatter_kernel, total_out)
+            runtime.launch(
+                scatter_kernel,
+                grid=grid,
+                block=block,
+                params=(
+                    (
+                        runtime.pointer(plan.device_buffer.x),
+                        runtime.pointer(plan.device_buffer.y),
+                        runtime.pointer(d_coord_offsets),
+                        runtime.pointer(plan.counts),
+                        runtime.pointer(plan.terminal),
+                        runtime.pointer(d_x_out),
+                        runtime.pointer(d_y_out),
+                        plan.coord_capacity,
+                        total_out,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_I64,
+                    ),
+                ),
+            )
+        runtime.free(d_coord_offsets)
+
+    return build_updated_device_family_buffer(
+        plan.family,
+        plan.device_buffer,
         d_x_out,
         d_y_out,
         d_out_offsets_full,
@@ -210,30 +262,58 @@ def _segmentize_family_gpu(runtime, device_buf, family, max_segment_length):
 @register_kernel_variant(
     "geometry_segmentize",
     "gpu-cuda-python",
-    kernel_class=KernelClass.COARSE,
+    kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "linestring", "multilinestring", "polygon", "multipolygon",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("cuda-python", "constructive", "segmentize"),
 )
 def _segmentize_gpu(owned, max_segment_length):
-    """GPU segmentize -- returns device-resident OwnedGeometryArray."""
+    """GPU segmentize with one exact-allocation packet for every family."""
     runtime = get_cuda_runtime()
     d_state = owned._ensure_device_state()
 
     new_device_families = {}
+    plans = []
     for family, device_buf in d_state.families.items():
         if family in (GeometryFamily.POINT, GeometryFamily.MULTIPOINT):
             new_device_families[family] = device_buf
             continue
-        new_device_families[family] = _segmentize_family_gpu(
-            runtime, device_buf, family, max_segment_length,
+        plans.append(
+            _plan_segmentize_family_gpu(
+                runtime,
+                device_buf,
+                family,
+                max_segment_length,
+            )
         )
 
-    tags, validity, family_row_offsets = forward_result_metadata(owned)
+    dynamic_plans = [plan for plan in plans if plan.counts is not None]
+    totals = count_scatter_totals(
+        runtime,
+        [(plan.counts, plan.offsets) for plan in dynamic_plans],
+        reason="segmentize exact output allocation packet",
+    )
+    totals_by_family = {
+        plan.family: total for plan, total in zip(dynamic_plans, totals, strict=True)
+    }
+    try:
+        for plan in plans:
+            new_device_families[plan.family] = _emit_segmentize_family_gpu(
+                runtime,
+                plan,
+                totals_by_family.get(plan.family, 0),
+            )
+    finally:
+        for plan in plans:
+            _release_segmentize_family_plan(runtime, plan)
 
+    tags, validity, family_row_offsets = forward_result_metadata(owned)
     return build_device_resident_owned(
         device_families=new_device_families,
         row_count=owned.row_count,
@@ -247,6 +327,7 @@ def _segmentize_gpu(owned, max_segment_length):
 # ---------------------------------------------------------------------------
 # CPU segmentize helpers
 # ---------------------------------------------------------------------------
+
 
 def _segmentize_span(x, y, start, end, max_segment_length):
     """Segmentize one coordinate span on CPU.
@@ -289,6 +370,7 @@ def _segmentize_span(x, y, start, end, max_segment_length):
 # ---------------------------------------------------------------------------
 # CPU fallback: segmentize per family
 # ---------------------------------------------------------------------------
+
 
 def _segmentize_family_cpu(buf, family, max_segment_length):
     """Segmentize one family's geometries on CPU.
@@ -344,6 +426,7 @@ def _segmentize_family_cpu(buf, family, max_segment_length):
 # Public dispatch API
 # ---------------------------------------------------------------------------
 
+
 def segmentize_owned(
     owned: OwnedGeometryArray,
     max_segment_length: float,
@@ -377,10 +460,15 @@ def segmentize_owned(
 
     selection = plan_dispatch_selection(
         kernel_name="geometry_segmentize",
-        kernel_class=KernelClass.COARSE,
+        kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
         current_residency=owned.residency,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            primary_unit_name="segmentize-input-coordinate",
+        ),
     )
 
     if selection.selected is ExecutionMode.GPU:

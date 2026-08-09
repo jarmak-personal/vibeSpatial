@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import shapely
@@ -15,6 +17,24 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.residency import Residency
+
+
+def test_polygon_buffer_uses_source_coordinate_capacity() -> None:
+    source = Path(__file__).resolve().parents[1].joinpath(
+        "src/vibespatial/constructive/polygon.py"
+    ).read_text()
+    start = source.index("def polygon_buffer_owned_array(")
+    end = source.index("\ndef ", start + 1)
+    dispatch_source = source[start:end]
+    gpu_start = source.index("def _build_polygon_buffers_gpu(")
+    gpu_end = source.index("\ndef ", gpu_start + 1)
+    gpu_source = source[gpu_start:gpu_end]
+
+    assert "int(poly_buf.x.size) * (4 * quad_segs + 1)" in source
+    assert 'primary_unit_name="polygon-buffer-output-coordinate"' in dispatch_source
+    assert "output_byte_count=output_coordinate_capacity * 16" in dispatch_source
+    assert "runtime.synchronize()" not in gpu_source
+    assert "polygon buffer vertex allocation fence" not in source
 
 
 def _buffer_matches_shapely(gpu_geom, shapely_geom, *, tol: float = 5e-4) -> bool:
@@ -186,6 +206,56 @@ def test_polygon_buffer_gpu_keeps_metadata_lazy(strict_device_guard) -> None:
     assert gpu._validity is None
     assert gpu._tags is None
     assert gpu._family_row_offsets is None
+
+
+@pytest.mark.gpu
+def test_polygon_buffer_gpu_accepts_device_only_polygon_rows() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    geoms = [
+        Polygon([(0, 0), (10, 0), (10, 8), (0, 8)]),
+        Polygon([(12, 0), (18, 0), (18, 6), (12, 6)]),
+    ]
+    source = from_shapely_geometries(geoms)
+    device_polys = polygon_buffer_owned_array(
+        source,
+        0.25,
+        quad_segs=4,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert device_polys.families[GeometryFamily.POLYGON].host_materialized is False
+    assert device_polys._validity is None
+    assert device_polys._tags is None
+    assert device_polys._family_row_offsets is None
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    buffered = polygon_buffer_owned_array(
+        device_polys,
+        0.5,
+        quad_segs=4,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    expected = shapely.buffer(
+        shapely.buffer(np.asarray(geoms, dtype=object), 0.25, quad_segs=4),
+        0.5,
+        quad_segs=4,
+    )
+    for result, expected_geom in zip(buffered.to_shapely(), expected):
+        assert _buffer_matches_shapely(result, expected_geom, tol=0.02)
+    assert not any("owned geometry host metadata" in reason for reason in reasons)
+    assert device_polys._validity is None
+    assert device_polys._tags is None
+    assert device_polys._family_row_offsets is None
 
 
 @pytest.mark.gpu

@@ -8,7 +8,9 @@ from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 # NVRTC kernel: compute effective area per vertex (Visvalingam-Whyatt)
 # ---------------------------------------------------------------------------
 
-_VW_AREA_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_VW_AREA_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + r"""
 extern "C" __global__ void vw_effective_area(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -46,5 +48,6 @@ extern "C" __global__ void vw_effective_area(
     }}
 }}
 """
+)
 _VW_AREA_KERNEL_NAMES = ("vw_effective_area",)
 _VW_AREA_FP64 = _VW_AREA_KERNEL_SOURCE.format(compute_type="double")

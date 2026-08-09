@@ -28,6 +28,40 @@ requires_gpu = pytest.mark.skipif(
 )
 
 
+def _materialize_shared_paths(result):
+    from vibespatial.api._native_result_core import GeometryNativeResult
+
+    if isinstance(result, GeometryNativeResult):
+        return result.to_geoseries(
+            index=np.arange(result.row_count),
+            name="geometry",
+        ).to_numpy()
+    return result
+
+
+def test_shared_paths_uses_shared_segment_capacity_topology() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source = (
+        repo_root / "src/vibespatial/constructive/shared_paths.py"
+    ).read_text()
+
+    assert "classify_segment_intersections(" in source
+    assert "atomic_line_union_from_part_capacity_device" in source
+    assert "_ordered_geometry_collection_from_owned_parts_at_capacity" in source
+    assert "selection.partition_capacity_positions()" in source
+    assert "selection.gather_capacity(" in source
+    assert "selection.as_capacity_prefix()" in source
+    assert "count_scatter_total" not in source
+    assert "copy_device_to_host" not in source
+    assert "unique_tag_pairs" not in source
+    assert "for pair_idx in range" not in source
+    assert "except Exception" not in source
+    assert not (
+        repo_root
+        / "src/vibespatial/kernels/constructive/shared_paths.py"
+    ).exists()
+
+
 def test_constructive_helper_d2h_exports_are_runtime_accounted() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     files = (
@@ -141,6 +175,7 @@ def test_shared_paths_ls_ls_forward():
 
     from vibespatial.constructive.shared_paths import shared_paths_owned
     result = shared_paths_owned(left, right, dispatch_mode="gpu")
+    result = _materialize_shared_paths(result)
 
     assert len(result) == 1
     _assert_shared_paths_match(result, left_geoms, right_geoms)
@@ -157,6 +192,7 @@ def test_shared_paths_ls_ls_backward():
 
     from vibespatial.constructive.shared_paths import shared_paths_owned
     result = shared_paths_owned(left, right, dispatch_mode="gpu")
+    result = _materialize_shared_paths(result)
 
     assert len(result) == 1
     _assert_shared_paths_match(result, left_geoms, right_geoms)
@@ -173,6 +209,7 @@ def test_shared_paths_ls_ls_no_shared():
 
     from vibespatial.constructive.shared_paths import shared_paths_owned
     result = shared_paths_owned(left, right, dispatch_mode="gpu")
+    result = _materialize_shared_paths(result)
 
     assert len(result) == 1
     gc = result[0]
@@ -191,6 +228,7 @@ def test_shared_paths_ls_ls_partial_overlap():
 
     from vibespatial.constructive.shared_paths import shared_paths_owned
     result = shared_paths_owned(left, right, dispatch_mode="gpu")
+    result = _materialize_shared_paths(result)
 
     assert len(result) == 1
     _assert_shared_paths_match(result, left_geoms, right_geoms)
@@ -207,6 +245,7 @@ def test_shared_paths_ls_ls_multiple_segments():
 
     from vibespatial.constructive.shared_paths import shared_paths_owned
     result = shared_paths_owned(left, right, dispatch_mode="gpu")
+    result = _materialize_shared_paths(result)
 
     assert len(result) == 1
     _assert_shared_paths_match(result, left_geoms, right_geoms)
@@ -231,6 +270,7 @@ def test_shared_paths_ls_ls_multiple_rows():
 
     from vibespatial.constructive.shared_paths import shared_paths_owned
     result = shared_paths_owned(left, right, dispatch_mode="gpu")
+    result = _materialize_shared_paths(result)
 
     assert len(result) == 3
     _assert_shared_paths_match(result, left_geoms, right_geoms)
@@ -255,6 +295,7 @@ def test_shared_paths_mls_ls():
 
     from vibespatial.constructive.shared_paths import shared_paths_owned
     result = shared_paths_owned(left, right, dispatch_mode="gpu")
+    result = _materialize_shared_paths(result)
 
     assert len(result) == 1
     _assert_shared_paths_match(result, left_geoms, right_geoms)
@@ -275,6 +316,7 @@ def test_shared_paths_ls_mls():
 
     from vibespatial.constructive.shared_paths import shared_paths_owned
     result = shared_paths_owned(left, right, dispatch_mode="gpu")
+    result = _materialize_shared_paths(result)
 
     assert len(result) == 1
     _assert_shared_paths_match(result, left_geoms, right_geoms)
@@ -299,6 +341,7 @@ def test_shared_paths_mls_mls():
 
     from vibespatial.constructive.shared_paths import shared_paths_owned
     result = shared_paths_owned(left, right, dispatch_mode="gpu")
+    result = _materialize_shared_paths(result)
 
     assert len(result) == 1
     _assert_shared_paths_match(result, left_geoms, right_geoms)
@@ -310,7 +353,7 @@ def test_shared_paths_mls_mls():
 
 @requires_gpu
 def test_shared_paths_null_geometry():
-    """GPU shared_paths: null geometry produces empty result."""
+    """GPU shared_paths: null geometry preserves missing-result semantics."""
     left_geoms = [LineString([(0, 0), (1, 1)]), None]
     right_geoms = [LineString([(0, 0), (1, 1)]), LineString([(0, 0), (1, 0)])]
 
@@ -319,15 +362,14 @@ def test_shared_paths_null_geometry():
 
     from vibespatial.constructive.shared_paths import shared_paths_owned
     result = shared_paths_owned(left, right, dispatch_mode="gpu")
+    result = _materialize_shared_paths(result)
 
     assert len(result) == 2
     # Row 0: should have forward shared segment
     gc0 = result[0]
     assert not gc0.geoms[0].is_empty  # forward
-    # Row 1: null left -> empty result
-    gc1 = result[1]
-    assert gc1.geoms[0].is_empty
-    assert gc1.geoms[1].is_empty
+    # Row 1: null left -> null result, matching Shapely/CPU behavior.
+    assert result[1] is None
 
 
 @requires_gpu
@@ -341,6 +383,7 @@ def test_shared_paths_identical_lines():
 
     from vibespatial.constructive.shared_paths import shared_paths_owned
     result = shared_paths_owned(left, right, dispatch_mode="gpu")
+    result = _materialize_shared_paths(result)
 
     assert len(result) == 1
     _assert_shared_paths_match(result, left_geoms, right_geoms)
@@ -361,6 +404,7 @@ def test_shared_paths_broadcast_right():
 
     from vibespatial.constructive.shared_paths import shared_paths_owned
     result = shared_paths_owned(left, right, dispatch_mode="gpu")
+    result = _materialize_shared_paths(result)
 
     assert len(result) == 3
     # Manually verify: row 0 forward, row 1 backward, row 2 empty
@@ -388,6 +432,7 @@ def test_shared_paths_mixed_forward_backward():
 
     from vibespatial.constructive.shared_paths import shared_paths_owned
     result = shared_paths_owned(left, right, dispatch_mode="gpu")
+    result = _materialize_shared_paths(result)
 
     assert len(result) == 1
     _assert_shared_paths_match(result, left_geoms, right_geoms)
@@ -404,6 +449,7 @@ def test_shared_paths_perpendicular_no_overlap():
 
     from vibespatial.constructive.shared_paths import shared_paths_owned
     result = shared_paths_owned(left, right, dispatch_mode="gpu")
+    result = _materialize_shared_paths(result)
 
     assert len(result) == 1
     gc = result[0]
@@ -426,6 +472,7 @@ def test_shared_paths_cpu_fallback():
     right = from_shapely_geometries(right_geoms)
 
     result = shared_paths_owned(left, right, dispatch_mode="cpu")
+    result = _materialize_shared_paths(result)
     assert len(result) == 1
     gc = result[0]
     assert not gc.geoms[0].is_empty  # forward

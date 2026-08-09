@@ -216,7 +216,9 @@ __device__ void seg_seg_closest_points(
 # non-adjacent pairs.
 # ---------------------------------------------------------------------------
 
-_LINESTRING_CLEARANCE_KERNEL_SOURCE = _SEGMENT_DISTANCE_HELPER + r"""
+_LINESTRING_CLEARANCE_KERNEL_SOURCE = (
+    _SEGMENT_DISTANCE_HELPER
+    + r"""
 extern "C" __global__ void linestring_minimum_clearance(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -276,6 +278,7 @@ extern "C" __global__ void linestring_minimum_clearance(
     out_clearance[row] = min_clear;
 }
 """
+)
 # ---------------------------------------------------------------------------
 # NVRTC kernel: Polygon minimum clearance (1 thread per geometry)
 # ---------------------------------------------------------------------------
@@ -285,7 +288,10 @@ extern "C" __global__ void linestring_minimum_clearance(
 # index within the same ring.  Cross-ring segment pairs are never adjacent.
 # ---------------------------------------------------------------------------
 
-_POLYGON_CLEARANCE_KERNEL_SOURCE = STRIP_CLOSURE_DEVICE + _SEGMENT_DISTANCE_HELPER + r"""
+_POLYGON_CLEARANCE_KERNEL_SOURCE = (
+    STRIP_CLOSURE_DEVICE
+    + _SEGMENT_DISTANCE_HELPER
+    + r"""
 extern "C" __global__ void polygon_minimum_clearance(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -357,11 +363,15 @@ extern "C" __global__ void polygon_minimum_clearance(
     out_clearance[row] = min_clear;
 }
 """
+)
 # ---------------------------------------------------------------------------
 # NVRTC kernel: MultiPolygon minimum clearance (1 thread per geometry)
 # ---------------------------------------------------------------------------
 
-_MULTIPOLYGON_CLEARANCE_KERNEL_SOURCE = STRIP_CLOSURE_DEVICE + _SEGMENT_DISTANCE_HELPER + r"""
+_MULTIPOLYGON_CLEARANCE_KERNEL_SOURCE = (
+    STRIP_CLOSURE_DEVICE
+    + _SEGMENT_DISTANCE_HELPER
+    + r"""
 extern "C" __global__ void multipolygon_minimum_clearance(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -435,11 +445,14 @@ extern "C" __global__ void multipolygon_minimum_clearance(
     out_clearance[row] = min_clear;
 }
 """
+)
 # ---------------------------------------------------------------------------
 # NVRTC kernel: MultiLineString minimum clearance (1 thread per geometry)
 # ---------------------------------------------------------------------------
 
-_MULTILINESTRING_CLEARANCE_KERNEL_SOURCE = _SEGMENT_DISTANCE_HELPER + r"""
+_MULTILINESTRING_CLEARANCE_KERNEL_SOURCE = (
+    _SEGMENT_DISTANCE_HELPER
+    + r"""
 extern "C" __global__ void multilinestring_minimum_clearance(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -497,6 +510,7 @@ extern "C" __global__ void multilinestring_minimum_clearance(
     out_clearance[row] = min_clear;
 }
 """
+)
 # ===========================================================================
 # CLEARANCE LINE kernels: same iteration but track closest point pair
 # ===========================================================================
@@ -505,7 +519,9 @@ extern "C" __global__ void multilinestring_minimum_clearance(
 # (< 2 non-adjacent segments), output NaN to signal empty LineString.
 # ===========================================================================
 
-_LINESTRING_CLEARANCE_LINE_KERNEL_SOURCE = _SEGMENT_CLOSEST_POINTS_HELPER + r"""
+_LINESTRING_CLEARANCE_LINE_KERNEL_SOURCE = (
+    _SEGMENT_CLOSEST_POINTS_HELPER
+    + r"""
 extern "C" __global__ void linestring_clearance_line(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -570,7 +586,10 @@ extern "C" __global__ void linestring_clearance_line(
     out_by[row] = best_by;
 }
 """
-_POLYGON_CLEARANCE_LINE_KERNEL_SOURCE = _SEGMENT_CLOSEST_POINTS_HELPER + r"""
+)
+_POLYGON_CLEARANCE_LINE_KERNEL_SOURCE = (
+    _SEGMENT_CLOSEST_POINTS_HELPER
+    + r"""
 extern "C" __global__ void polygon_clearance_line(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -651,7 +670,10 @@ extern "C" __global__ void polygon_clearance_line(
     out_by[row] = best_by;
 }
 """
-_MULTIPOLYGON_CLEARANCE_LINE_KERNEL_SOURCE = _SEGMENT_CLOSEST_POINTS_HELPER + r"""
+)
+_MULTIPOLYGON_CLEARANCE_LINE_KERNEL_SOURCE = (
+    _SEGMENT_CLOSEST_POINTS_HELPER
+    + r"""
 extern "C" __global__ void multipolygon_clearance_line(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -735,7 +757,10 @@ extern "C" __global__ void multipolygon_clearance_line(
     out_by[row] = best_by;
 }
 """
-_MULTILINESTRING_CLEARANCE_LINE_KERNEL_SOURCE = _SEGMENT_CLOSEST_POINTS_HELPER + r"""
+)
+_MULTILINESTRING_CLEARANCE_LINE_KERNEL_SOURCE = (
+    _SEGMENT_CLOSEST_POINTS_HELPER
+    + r"""
 extern "C" __global__ void multilinestring_clearance_line(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -801,6 +826,7 @@ extern "C" __global__ void multilinestring_clearance_line(
     out_by[row] = best_by;
 }
 """
+)
 # ADR-0002: METRIC class -- fp64 required for distance computation.
 # No fp32 variants needed; we wire precision for observability only.
 _LINESTRING_CLEARANCE_FP64 = _LINESTRING_CLEARANCE_KERNEL_SOURCE

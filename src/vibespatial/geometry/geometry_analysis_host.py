@@ -14,11 +14,17 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime.config import BOUNDS_SPAN_EPSILON
 
 
-def family_bounds_scalar(buffer: FamilyGeometryBuffer, row_index: int) -> tuple[float, float, float, float]:
+def family_bounds_scalar(
+    buffer: FamilyGeometryBuffer, row_index: int
+) -> tuple[float, float, float, float]:
     if bool(buffer.empty_mask[row_index]):
         return (math.nan, math.nan, math.nan, math.nan)
 
-    if buffer.family in {GeometryFamily.POINT, GeometryFamily.LINESTRING, GeometryFamily.MULTIPOINT}:
+    if buffer.family in {
+        GeometryFamily.POINT,
+        GeometryFamily.LINESTRING,
+        GeometryFamily.MULTIPOINT,
+    }:
         start = int(buffer.geometry_offsets[row_index])
         end = int(buffer.geometry_offsets[row_index + 1])
         xs = buffer.x[start:end]
@@ -80,7 +86,8 @@ def assemble_cached_bounds(geometry_array: OwnedGeometryArray) -> np.ndarray | N
         row_indexes = np.flatnonzero(geometry_array.tags == FAMILY_TAGS[family])
         if row_indexes.size == 0:
             continue
-        bounds[row_indexes] = buffer.bounds
+        family_rows = geometry_array.family_row_offsets[row_indexes]
+        bounds[row_indexes] = buffer.bounds[family_rows]
     return bounds
 
 
@@ -139,7 +146,9 @@ def family_bounds_vectorized(buffer: FamilyGeometryBuffer) -> np.ndarray:
         ends = buffer.part_offsets[buffer.geometry_offsets[1:]].astype(np.int64, copy=False)
         return slice_bounds_vectorized(buffer.x, buffer.y, starts, ends, buffer.empty_mask)
     if buffer.family is GeometryFamily.MULTIPOLYGON:
-        polygon_starts = buffer.part_offsets[buffer.geometry_offsets[:-1]].astype(np.int64, copy=False)
+        polygon_starts = buffer.part_offsets[buffer.geometry_offsets[:-1]].astype(
+            np.int64, copy=False
+        )
         polygon_ends = buffer.part_offsets[buffer.geometry_offsets[1:]].astype(np.int64, copy=False)
         starts = buffer.ring_offsets[polygon_starts].astype(np.int64, copy=False)
         ends = buffer.ring_offsets[polygon_ends].astype(np.int64, copy=False)
@@ -155,7 +164,9 @@ def compute_geometry_bounds_cpu_scalar(geometry_array: OwnedGeometryArray) -> np
         family = TAG_FAMILIES[int(geometry_array.tags[row_index])]
         family_buffer = geometry_array.families[family]
         family_row = int(geometry_array.family_row_offsets[row_index])
-        bounds[row_index] = np.asarray(family_bounds_scalar(family_buffer, family_row), dtype=np.float64)
+        bounds[row_index] = np.asarray(
+            family_bounds_scalar(family_buffer, family_row), dtype=np.float64
+        )
     return bounds
 
 
@@ -163,7 +174,10 @@ def compute_geometry_bounds_cpu_vectorized(geometry_array: OwnedGeometryArray) -
     cached = assemble_cached_bounds(geometry_array)
     if cached is not None:
         return cached
-    family_bounds = {family: family_bounds_vectorized(buffer) for family, buffer in geometry_array.families.items()}
+    family_bounds = {
+        family: family_bounds_vectorized(buffer)
+        for family, buffer in geometry_array.families.items()
+    }
     bounds = np.full((geometry_array.row_count, 4), np.nan, dtype=np.float64)
     for family, local_bounds in family_bounds.items():
         row_indexes = np.flatnonzero(geometry_array.tags == FAMILY_TAGS[family])
@@ -185,7 +199,9 @@ def compute_total_bounds_from_bounds(bounds: np.ndarray) -> tuple[float, float, 
     )
 
 
-def compute_offset_spans_cpu(geometry_array: OwnedGeometryArray, *, level: str = "geometry") -> dict[GeometryFamily, np.ndarray]:
+def compute_offset_spans_cpu(
+    geometry_array: OwnedGeometryArray, *, level: str = "geometry"
+) -> dict[GeometryFamily, np.ndarray]:
     result: dict[GeometryFamily, np.ndarray] = {}
     for family, buffer in geometry_array.families.items():
         if level == "geometry":
@@ -216,7 +232,9 @@ def _morton_code(x: int, y: int) -> int:
     return _spread_bits(x) | (_spread_bits(y) << 1)
 
 
-def compute_morton_keys_cpu(bounds: np.ndarray, total: tuple[float, float, float, float], row_count: int, *, bits: int = 16) -> np.ndarray:
+def compute_morton_keys_cpu(
+    bounds: np.ndarray, total: tuple[float, float, float, float], row_count: int, *, bits: int = 16
+) -> np.ndarray:
     minx, miny, maxx, maxy = total
     keys = np.full(row_count, np.iinfo(np.uint64).max, dtype=np.uint64)
     if any(math.isnan(value) for value in total):

@@ -7,6 +7,7 @@ unified ``BenchmarkResult`` objects.
 Requires the optional ``cuda-bench`` package:
     pip install cuda-bench[cu12]
 """
+
 from __future__ import annotations
 
 import json
@@ -27,6 +28,7 @@ from .schema import (
 # ---------------------------------------------------------------------------
 # Kernel bench spec and registry
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class KernelBenchSpec:
@@ -95,6 +97,7 @@ def _ensure_kernels_loaded() -> None:
 # Runner
 # ---------------------------------------------------------------------------
 
+
 def run_kernel_bench(
     kernel_name: str,
     *,
@@ -108,9 +111,7 @@ def run_kernel_bench(
 
     if kernel_name not in _KERNEL_BENCH_REGISTRY:
         available = ", ".join(_KERNEL_BENCH_REGISTRY) or "(none)"
-        raise KeyError(
-            f"Unknown kernel benchmark: {kernel_name!r}. Available: {available}"
-        )
+        raise KeyError(f"Unknown kernel benchmark: {kernel_name!r}. Available: {available}")
 
     spec = _KERNEL_BENCH_REGISTRY[kernel_name]
     effective_scale = scale or spec.default_scale
@@ -121,9 +122,12 @@ def run_kernel_bench(
     cmd = [
         sys.executable,
         spec.script_path,
-        "--scale", str(effective_scale),
-        "--precision", precision,
-        "--output-json", str(output_path),
+        "--scale",
+        str(effective_scale),
+        "--precision",
+        precision,
+        "--output-json",
+        str(output_path),
     ]
     if bandwidth:
         cmd.append("--bandwidth")
@@ -137,12 +141,16 @@ def run_kernel_bench(
         )
     except FileNotFoundError:
         return _unavailable_result(
-            kernel_name, effective_scale, precision,
+            kernel_name,
+            effective_scale,
+            precision,
             "cuda-bench not installed or kernel script not found",
         )
     except subprocess.TimeoutExpired:
         return _error_result(
-            kernel_name, effective_scale, precision,
+            kernel_name,
+            effective_scale,
+            precision,
             f"Kernel benchmark timed out after {timeout}s",
         )
     finally:
@@ -150,7 +158,9 @@ def run_kernel_bench(
 
     if proc.returncode != 0:
         return _error_result(
-            kernel_name, effective_scale, precision,
+            kernel_name,
+            effective_scale,
+            precision,
             proc.stderr.strip() or f"exit code {proc.returncode}",
         )
 
@@ -167,6 +177,7 @@ def run_kernel_bench(
 # ---------------------------------------------------------------------------
 # JSON parsing
 # ---------------------------------------------------------------------------
+
 
 def _parse_nvbench_json(
     kernel_name: str,
@@ -265,8 +276,12 @@ def _extract_summary_value(
 # Error/unavailable result factories
 # ---------------------------------------------------------------------------
 
+
 def _unavailable_result(
-    kernel_name: str, scale: int, precision: str, reason: str,
+    kernel_name: str,
+    scale: int,
+    precision: str,
+    reason: str,
 ) -> BenchmarkResult:
     return BenchmarkResult(
         operation=kernel_name,
@@ -281,7 +296,10 @@ def _unavailable_result(
 
 
 def _error_result(
-    kernel_name: str, scale: int, precision: str, reason: str,
+    kernel_name: str,
+    scale: int,
+    precision: str,
+    reason: str,
 ) -> BenchmarkResult:
     return BenchmarkResult(
         operation=kernel_name,

@@ -22,7 +22,8 @@ Supports:
 - Disconnected components: output MultiLineString with multiple parts
 - Rings (closed chains): detected via unvisited segments after open chains
 
-One batched D2H scalar fence sizes coordinate and part outputs.
+Source coordinate and part capacities size outputs; device offsets carry the
+logical lengths without a host allocation fence.
 """
 
 from __future__ import annotations
@@ -41,7 +42,6 @@ from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
     compile_kernel_group,
-    count_scatter_totals,
     get_cuda_runtime,
 )
 from vibespatial.cuda.cccl_precompile import request_warmup
@@ -61,6 +61,7 @@ from vibespatial.kernels.constructive.line_merge import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_part_pair_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import (
@@ -75,13 +76,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # CCCL: exclusive_sum used twice (coord offsets, part offsets)
-request_warmup([
-    "exclusive_scan_i32",
-])
+request_warmup(
+    [
+        "exclusive_scan_i32",
+    ]
+)
 
-request_nvrtc_warmup([
-    ("line-merge-fp64", _LINE_MERGE_KERNEL_SOURCE, LINE_MERGE_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("line-merge-fp64", _LINE_MERGE_KERNEL_SOURCE, LINE_MERGE_KERNEL_NAMES),
+    ]
+)
 
 
 def _compile_kernels():
@@ -96,6 +101,7 @@ def _compile_kernels():
 # ---------------------------------------------------------------------------
 # GPU implementation
 # ---------------------------------------------------------------------------
+
 
 @register_kernel_variant(
     "line_merge",
@@ -124,9 +130,10 @@ def _line_merge_gpu(
     runtime = get_cuda_runtime()
     d_state = owned._ensure_device_state()
     row_count = owned.row_count
-    validity = owned.validity
-    tags = owned.tags
     ptr = runtime.pointer
+
+    if row_count == 0:
+        return _build_empty_output(d_state.validity, row_count=0)
 
     kernels = _compile_kernels()
 
@@ -134,25 +141,15 @@ def _line_merge_gpu(
     ls_tag = FAMILY_TAGS[GeometryFamily.LINESTRING]
     mls_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
 
-    # Build the list of rows to process
-    eligible_mask = validity & ((tags == ls_tag) | (tags == mls_tag))
-    eligible_rows = np.flatnonzero(eligible_mask).astype(np.int32, copy=False)
-
-    if eligible_rows.size == 0:
-        return _build_empty_output(row_count, validity, tags)
-
-    n_eligible = eligible_rows.size
-
-    # Build per-row family codes and family-local row indices (vectorized)
-    fro = owned.family_row_offsets
-    eligible_tags = tags[eligible_rows]
-    family_codes = np.where(eligible_tags == ls_tag, 1, 0).astype(np.int32)
-    fam_local_rows = fro[eligible_rows].astype(np.int32)
-
-    # Upload row mapping arrays to device
-    d_global_rows = runtime.from_host(eligible_rows)
-    d_family_codes = runtime.from_host(family_codes)
-    d_fam_local_rows = runtime.from_host(fam_local_rows)
+    d_validity = cp.asarray(d_state.validity, dtype=cp.bool_)
+    d_tags = cp.asarray(d_state.tags, dtype=cp.int8)
+    d_eligible = d_validity & ((d_tags == ls_tag) | (d_tags == mls_tag))
+    d_family_codes = cp.where(d_tags == ls_tag, 1, 0).astype(cp.int32)
+    d_fam_local_rows = cp.where(
+        d_eligible,
+        cp.asarray(d_state.family_row_offsets, dtype=cp.int32),
+        cp.int32(0),
+    )
 
     # Get family buffers (use dummy empty arrays if family not present)
     has_mls = GeometryFamily.MULTILINESTRING in d_state.families
@@ -186,82 +183,113 @@ def _line_merge_gpu(
     directed_int = 1 if directed else 0
 
     # Allocate count output arrays
-    d_coord_counts = runtime.allocate((n_eligible,), np.int32, zero=True)
-    d_part_counts = runtime.allocate((n_eligible,), np.int32, zero=True)
+    d_coord_counts = runtime.allocate((row_count,), np.int32, zero=True)
+    d_part_counts = runtime.allocate((row_count,), np.int32, zero=True)
 
     # --- Pass 1: Count ---
     count_params = (
         (
-            ptr(mls_x), ptr(mls_y), ptr(mls_geom_off), ptr(mls_part_off),
+            ptr(mls_x),
+            ptr(mls_y),
+            ptr(mls_geom_off),
+            ptr(mls_part_off),
             mls_row_count,
-            ptr(ls_x), ptr(ls_y), ptr(ls_geom_off),
+            ptr(ls_x),
+            ptr(ls_y),
+            ptr(ls_geom_off),
             ls_row_count,
-            ptr(d_global_rows), ptr(d_family_codes), ptr(d_fam_local_rows),
+            ptr(d_family_codes),
+            ptr(d_fam_local_rows),
+            ptr(d_eligible),
             directed_int,
-            ptr(d_coord_counts), ptr(d_part_counts),
-            n_eligible,
+            ptr(d_coord_counts),
+            ptr(d_part_counts),
+            row_count,
         ),
         (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
         ),
     )
-    grid, block = runtime.launch_config(kernels["line_merge_count"], n_eligible)
+    grid, block = runtime.launch_config(kernels["line_merge_count"], row_count)
     runtime.launch(kernels["line_merge_count"], grid=grid, block=block, params=count_params)
 
     # --- Prefix sums for output offsets ---
     d_coord_offsets = exclusive_sum(d_coord_counts, synchronize=False)
     d_part_offsets = exclusive_sum(d_part_counts, synchronize=False)
 
-    total_coords, total_parts = count_scatter_totals(
-        runtime,
-        [
-            (d_coord_counts, d_coord_offsets),
-            (d_part_counts, d_part_offsets),
-        ],
-        reason="line-merge output totals allocation fence",
+    coordinate_capacity = (int(d_mls.x.size) if has_mls else 0) + (
+        int(d_ls.x.size) if has_ls else 0
+    )
+    part_capacity = (max(int(d_mls.part_offsets.size) - 1, 0) if has_mls else 0) + (
+        ls_row_count if has_ls else 0
     )
 
-    if total_coords == 0:
-        return _build_empty_output(row_count, validity, tags)
-
-    # --- Allocate output buffers ---
-    d_out_x = runtime.allocate((total_coords,), np.float64)
-    d_out_y = runtime.allocate((total_coords,), np.float64)
-    d_out_part_off = runtime.allocate((total_parts,), np.int32, zero=True)
+    # --- Allocate source-bounded output capacity ---
+    d_out_x = runtime.allocate((coordinate_capacity,), np.float64)
+    d_out_y = runtime.allocate((coordinate_capacity,), np.float64)
+    d_out_part_off = runtime.allocate((part_capacity,), np.int32, zero=True)
 
     # --- Pass 2: Scatter ---
     scatter_params = (
         (
-            ptr(mls_x), ptr(mls_y), ptr(mls_geom_off), ptr(mls_part_off),
+            ptr(mls_x),
+            ptr(mls_y),
+            ptr(mls_geom_off),
+            ptr(mls_part_off),
             mls_row_count,
-            ptr(ls_x), ptr(ls_y), ptr(ls_geom_off),
+            ptr(ls_x),
+            ptr(ls_y),
+            ptr(ls_geom_off),
             ls_row_count,
-            ptr(d_global_rows), ptr(d_family_codes), ptr(d_fam_local_rows),
+            ptr(d_family_codes),
+            ptr(d_fam_local_rows),
+            ptr(d_eligible),
             directed_int,
-            ptr(d_coord_offsets), ptr(d_part_offsets),
-            ptr(d_out_x), ptr(d_out_y), ptr(d_out_part_off),
-            n_eligible,
+            ptr(d_coord_offsets),
+            ptr(d_part_offsets),
+            ptr(d_out_x),
+            ptr(d_out_y),
+            ptr(d_out_part_off),
+            row_count,
         ),
         (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
         ),
     )
-    grid, block = runtime.launch_config(kernels["line_merge_scatter"], n_eligible)
+    grid, block = runtime.launch_config(kernels["line_merge_scatter"], row_count)
     runtime.launch(kernels["line_merge_scatter"], grid=grid, block=block, params=scatter_params)
 
     # --- Build output OGA ---
@@ -274,39 +302,33 @@ def _line_merge_gpu(
     # the part_offsets array.  We need to compute per-row geometry_offsets
     # from d_part_counts.
 
-    # Build geometry offsets for all rows (including non-eligible ones)
-    # Non-eligible rows get zero-length spans.
-    # Scatter part_counts into a full-row device array, then cumsum on device.
-    d_eligible_rows = cp.asarray(eligible_rows)
-    d_geom_counts = cp.zeros(row_count + 1, dtype=cp.int32)
-    d_geom_counts[d_eligible_rows + 1] = d_part_counts
-    d_out_geom_offsets = cp.cumsum(d_geom_counts, dtype=cp.int32)
+    d_out_geom_offsets = cp.empty(row_count + 1, dtype=cp.int32)
+    d_out_geom_offsets[0] = 0
+    cp.cumsum(d_part_counts, out=d_out_geom_offsets[1:])
 
-    # Append the sentinel to part_offsets: total_coords
-    # d_out_part_off has total_parts entries; we need total_parts + 1
-    # with the last entry being total_coords
-    d_sentinel = cp.array([total_coords], dtype=cp.int32)
-    d_full_part_off = cp.concatenate([d_out_part_off, d_sentinel])
+    d_total_coords = d_coord_offsets[-1:] + d_coord_counts[-1:]
+    d_total_parts = d_part_offsets[-1:] + d_part_counts[-1:]
+    d_full_part_off = cp.empty(part_capacity + 1, dtype=cp.int32)
+    if part_capacity:
+        d_part_lanes = cp.arange(part_capacity, dtype=cp.int32)
+        d_full_part_off[:part_capacity] = cp.where(
+            d_part_lanes < d_total_parts[0],
+            cp.asarray(d_out_part_off, dtype=cp.int32),
+            d_total_coords[0],
+        )
+    d_full_part_off[part_capacity] = d_total_coords[0]
 
-    # Empty mask: rows with zero parts (computed on device)
-    d_out_empty = cp.zeros(row_count, dtype=cp.uint8)
-    d_zero_mask = d_part_counts == 0
-    if int(d_zero_mask.any()) != 0:
-        d_out_empty[d_eligible_rows[d_zero_mask]] = 1
-    # Non-eligible valid rows that aren't LS/MLS are also empty in our output
-    non_eligible_valid = validity & ~eligible_mask
-    if non_eligible_valid.any():
-        d_non_eligible = cp.asarray(np.flatnonzero(non_eligible_valid).astype(np.int32))
-        d_out_empty[d_non_eligible] = 1
-
-    # Build output metadata
-    d_validity = cp.asarray(d_state.validity)
-    out_tags = cp.full(row_count, FAMILY_TAGS[GeometryFamily.MULTILINESTRING], dtype=cp.int8)
-    out_family_row_offsets = cp.arange(row_count, dtype=cp.int32)
-    d_null = ~d_validity
-    if int(d_null.any()) != 0:
-        out_tags[d_null] = -1
-        out_family_row_offsets[d_null] = -1
+    d_out_empty = (~d_eligible) | (cp.asarray(d_part_counts) == 0)
+    out_tags = cp.where(
+        d_validity,
+        np.int8(FAMILY_TAGS[GeometryFamily.MULTILINESTRING]),
+        np.int8(-1),
+    )
+    out_family_row_offsets = cp.where(
+        d_validity,
+        cp.arange(row_count, dtype=cp.int32),
+        cp.int32(-1),
+    )
 
     device_families = {
         GeometryFamily.MULTILINESTRING: DeviceFamilyGeometryBuffer(
@@ -329,27 +351,25 @@ def _line_merge_gpu(
     )
 
 
-def _build_empty_output(
-    row_count: int,
-    validity: np.ndarray,
-    tags: np.ndarray,
-) -> OwnedGeometryArray:
+def _build_empty_output(validity, *, row_count: int) -> OwnedGeometryArray:
     """Build an all-empty MultiLineString OGA."""
     runtime = get_cuda_runtime()
 
     d_validity = cp.asarray(validity, dtype=cp.bool_)
     out_tags = cp.full(row_count, FAMILY_TAGS[GeometryFamily.MULTILINESTRING], dtype=cp.int8)
     out_family_row_offsets = cp.arange(row_count, dtype=cp.int32)
-    d_null = ~d_validity
-    if int(d_null.any()) != 0:
-        out_tags[d_null] = -1
-        out_family_row_offsets[d_null] = -1
+    out_tags = cp.where(d_validity, out_tags, np.int8(-1))
+    out_family_row_offsets = cp.where(
+        d_validity,
+        out_family_row_offsets,
+        cp.int32(-1),
+    )
 
     d_x = runtime.allocate((0,), np.float64)
     d_y = runtime.allocate((0,), np.float64)
-    d_geom_off = runtime.from_host(np.zeros(row_count + 1, dtype=np.int32))
-    d_part_off = runtime.from_host(np.zeros(1, dtype=np.int32))
-    d_empty = runtime.from_host(np.ones(row_count, dtype=np.uint8))
+    d_geom_off = cp.zeros(row_count + 1, dtype=cp.int32)
+    d_part_off = cp.zeros(1, dtype=cp.int32)
+    d_empty = cp.ones(row_count, dtype=cp.bool_)
 
     device_families = {
         GeometryFamily.MULTILINESTRING: DeviceFamilyGeometryBuffer(
@@ -375,6 +395,7 @@ def _build_empty_output(
 # ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
+
 
 def line_merge_owned(
     owned: OwnedGeometryArray,
@@ -416,6 +437,11 @@ def line_merge_owned(
         kernel_name="line_merge",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
+        work_estimate=estimate_part_pair_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            primary_unit_name="line-merge-endpoint-pair",
+        ),
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=owned.residency,

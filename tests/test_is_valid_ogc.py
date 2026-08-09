@@ -9,9 +9,11 @@ Tests that is_valid_owned matches Shapely's is_valid for:
 
 Each test is parametrized across CPU and GPU dispatch modes.
 """
+
 from __future__ import annotations
 
 import ast
+import importlib
 from pathlib import Path
 
 import numpy as np
@@ -63,13 +65,69 @@ def _build_owned(*geoms) -> tuple:
 
 
 requires_gpu = pytest.mark.skipif(
-    not has_gpu_runtime(), reason="GPU runtime not available",
+    not has_gpu_runtime(),
+    reason="GPU runtime not available",
 )
+
+
+@requires_gpu
+def test_polygon_validity_uses_exact_candidate_topology_not_all_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validity_module = importlib.import_module("vibespatial.constructive.validity")
+
+    def _reject_all_pairs(*_args, **_kwargs):
+        raise AssertionError("polygon validity must consume the exact candidate relation")
+
+    monkeypatch.setattr(validity_module, "_launch_is_simple_kernel", _reject_all_pairs)
+    monkeypatch.setattr(
+        validity_module,
+        "_launch_ring_pair_interaction_kernel",
+        _reject_all_pairs,
+    )
+    theta = np.linspace(0.0, 2.0 * np.pi, 2049)
+    long_simple_ring = Polygon(np.column_stack((np.cos(theta), np.sin(theta))))
+    shared_edge_hole = Polygon(
+        shell=[(0, 0), (6, 0), (6, 6), (0, 6), (0, 0)],
+        holes=[[(0, 2), (2, 2), (2, 4), (0, 4), (0, 2)]],
+    )
+    owned = from_shapely_geometries(
+        [long_simple_ring, shared_edge_hole],
+        residency=Residency.DEVICE,
+    )
+
+    result = is_valid_owned(owned, dispatch_mode=ExecutionMode.GPU)
+
+    np.testing.assert_array_equal(result, np.asarray([True, False], dtype=bool))
+
+
+@requires_gpu
+def test_multipolygon_validity_uses_part_relation_on_device() -> None:
+    geometries = [
+        MultiPolygon([shapely.box(0, 0, 2, 2), shapely.box(1, 0, 3, 2)]),
+        MultiPolygon([shapely.box(0, 0, 4, 4), shapely.box(1, 1, 2, 2)]),
+        MultiPolygon([shapely.box(0, 0, 1, 1), shapely.box(1, 1, 2, 2)]),
+        MultiPolygon(
+            [
+                Polygon(
+                    shapely.box(0, 0, 6, 6).exterior.coords,
+                    [shapely.box(2, 2, 4, 4).exterior.coords],
+                ),
+                shapely.box(2.5, 2.5, 3.5, 3.5),
+            ]
+        ),
+    ]
+    owned = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+
+    result = is_valid_owned(owned, dispatch_mode=ExecutionMode.GPU)
+
+    np.testing.assert_array_equal(result, shapely.is_valid(geometries))
 
 
 # ---------------------------------------------------------------------------
 # Phase A: Ring self-intersection
 # ---------------------------------------------------------------------------
+
 
 class TestRingSelfIntersection:
     """is_valid must detect self-intersecting rings (bowties)."""
@@ -163,6 +221,7 @@ class TestRingSelfIntersection:
 # Mixed geometry types and edge cases
 # ---------------------------------------------------------------------------
 
+
 class TestMixedTypes:
     """is_valid works correctly across geometry types."""
 
@@ -222,9 +281,43 @@ def test_is_valid_owned_auto_stays_gpu_on_device_resident_buffers() -> None:
     assert event.implementation != "is_valid_cpu"
 
 
+@requires_gpu
+def test_is_valid_owned_device_public_export_avoids_host_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    bowtie = Polygon([(0, 0), (2, 2), (2, 0), (0, 2), (0, 0)])
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]),
+            bowtie,
+            None,
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    def _fail_host_metadata(_self):
+        raise AssertionError("device validity should not materialize host metadata")
+
+    monkeypatch.setattr(type(owned), "_ensure_host_metadata", _fail_host_metadata)
+
+    reset_d2h_transfer_count()
+    result = is_valid_owned(owned, dispatch_mode=ExecutionMode.AUTO)
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    np.testing.assert_array_equal(result, np.array([True, False, True], dtype=bool))
+    assert not any(reason.startswith("owned geometry host metadata") for reason in reasons)
+    assert "constructive validity result terminal host export" in reasons
+
+
 # ---------------------------------------------------------------------------
 # Phase B: Hole-in-shell containment
 # ---------------------------------------------------------------------------
+
 
 class TestHoleInShellContainment:
     """is_valid must detect holes outside their polygon's exterior ring."""
@@ -311,6 +404,7 @@ class TestHoleInShellContainment:
 # Degeneracy corpus
 # ---------------------------------------------------------------------------
 
+
 class TestDegeneracyCorpus:
     """is_valid matches Shapely for the degeneracy corpus geometries."""
 
@@ -351,6 +445,7 @@ class TestDegeneracyCorpus:
 # ---------------------------------------------------------------------------
 # Phase C: Ring-pair interaction (crossing, overlap, multi-touch)
 # ---------------------------------------------------------------------------
+
 
 class TestRingPairInteraction:
     """is_valid must detect inter-ring crossings, overlaps, and multi-touch."""
@@ -446,6 +541,46 @@ class TestRingPairInteraction:
         expected = np.array([shapely.is_valid(mp)])
         np.testing.assert_array_equal(result, expected)
         assert result[0] is np.bool_(False)
+
+    @pytest.mark.parametrize(
+        ("geometry", "expected_valid"),
+        [
+            (MultiPolygon([shapely.box(0, 0, 2, 2), shapely.box(1, 0, 3, 2)]), False),
+            (MultiPolygon([shapely.box(0, 0, 1, 1), shapely.box(1, 0, 2, 1)]), False),
+            (MultiPolygon([shapely.box(0, 0, 4, 4), shapely.box(1, 1, 2, 2)]), False),
+            (MultiPolygon([shapely.box(0, 0, 1, 1), shapely.box(1, 1, 2, 2)]), True),
+            (
+                MultiPolygon(
+                    [
+                        Polygon(
+                            shapely.box(0, 0, 6, 6).exterior.coords,
+                            [shapely.box(2, 2, 4, 4).exterior.coords],
+                        ),
+                        shapely.box(2.5, 2.5, 3.5, 3.5),
+                    ]
+                ),
+                True,
+            ),
+        ],
+        ids=(
+            "overlapping-area",
+            "shared-edge",
+            "nested-shell",
+            "single-point-touch",
+            "component-inside-hole",
+        ),
+    )
+    def test_multipolygon_cross_part_interaction(
+        self,
+        dispatch_mode,
+        geometry,
+        expected_valid,
+    ):
+        """Distinct MultiPolygon parts may meet only at isolated points."""
+        owned, _geometries = _build_owned(geometry)
+        result = is_valid_owned(owned, dispatch_mode=dispatch_mode)
+        np.testing.assert_array_equal(result, np.array([expected_valid]))
+        assert expected_valid is bool(shapely.is_valid(geometry))
 
     def test_valid_multi_hole_polygon(self, dispatch_mode):
         """Polygon with multiple properly-separated holes is valid."""

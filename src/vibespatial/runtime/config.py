@@ -17,7 +17,6 @@ __all__ = [
     "OVERLAY_GPU_REMAINDER_THRESHOLD",
     "OVERLAY_GROUPED_BOX_GPU_THRESHOLD",
     "OVERLAY_GROUPED_COVERAGE_EDGE_THRESHOLD",
-    "OVERLAY_PAIR_BATCH_THRESHOLD",
     "OVERLAY_UNION_ALL_GPU_THRESHOLD",
     "SEGMENT_TILE_SIZE",
     "SPATIAL_EPSILON",
@@ -73,7 +72,6 @@ OVERLAY_GPU_FAILURE_THRESHOLD = 3
 
 # Overlay difference skips batching below this total pair count because the
 # unbatched path is cheaper than extra gather/split overhead.
-OVERLAY_PAIR_BATCH_THRESHOLD = 200_000
 
 # Host-only installs still use this crossover for many-vs-one exact overlay
 # remainders. GPU-enabled runtimes now prefer the device remainder helpers

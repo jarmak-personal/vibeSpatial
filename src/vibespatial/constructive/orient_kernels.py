@@ -9,7 +9,10 @@ from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 # NVRTC kernel: orient rings by shoelace signed area
 # ---------------------------------------------------------------------------
 
-_ORIENT_KERNEL_SOURCE = SIGNED_AREA_DEVICE + PRECISION_PREAMBLE + r"""
+_ORIENT_KERNEL_SOURCE = (
+    SIGNED_AREA_DEVICE
+    + PRECISION_PREAMBLE
+    + r"""
 extern "C" __global__ void orient_rings(
     const double* __restrict__ x_in,
     const double* __restrict__ y_in,
@@ -72,5 +75,6 @@ extern "C" __global__ void orient_rings(
     }}
 }}
 """
+)
 _ORIENT_KERNEL_NAMES = ("orient_rings",)
 _ORIENT_FP64 = _ORIENT_KERNEL_SOURCE.format(compute_type="double")

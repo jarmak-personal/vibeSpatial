@@ -8,7 +8,7 @@ from vibespatial.constructive.multipoint_polygon_constructive import (
 from .clip_rect import clip_by_rect_kernel
 from .make_valid import make_valid_kernel
 from .nonpolygon_binary import (
-    linestring_linestring_intersection,
+    linestring_linestring_intersection_native,
     linestring_polygon_difference,
     linestring_polygon_intersection,
     point_linestring_difference,
@@ -26,7 +26,7 @@ from .stroke import offset_curve_kernel, point_buffer_kernel
 
 __all__ = [
     "clip_by_rect_kernel",
-    "linestring_linestring_intersection",
+    "linestring_linestring_intersection_native",
     "linestring_polygon_difference",
     "linestring_polygon_intersection",
     "make_valid_kernel",

@@ -1,4 +1,5 @@
 """Benchmark operation wrappers — importing this package triggers registration."""
+
 from vibespatial.bench.operations import (
     constructive_ops,
     io_ops,

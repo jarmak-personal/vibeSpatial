@@ -1,3 +1,4 @@
+from types import MethodType
 from warnings import warn
 
 import numpy as np
@@ -7,10 +8,20 @@ from pandas import DataFrame, Series
 from shapely.geometry import MultiPoint, box
 from shapely.geometry.base import BaseGeometry
 
+from vibespatial.api import geometry_array as _geometry_array
+from vibespatial.api._native_public_arrays import (
+    NativeBooleanMaskArray,
+    NativeGeometryTypeArray,
+    NativeNumericExpressionArray,
+    native_boolean_rowset_from_mask_array,
+    native_geometry_type_array_supported,
+)
 from vibespatial.api.geometry_array import GeometryDtype, points_from_xy
 from vibespatial.runtime.residency import Residency
 
 from . import _compat as compat
+
+GeometryArray = _geometry_array.GeometryArray
 
 
 def _is_geometry_like_dtype(dtype) -> bool:
@@ -35,6 +46,406 @@ def is_geometry_type(data):
         return True
     else:
         return False
+
+
+_NATIVE_BOOLEAN_ROWSET_ATTR = "_vibespatial_native_boolean_rowset"
+_NATIVE_EXPRESSION_ATTR = "_vibespatial_native_expression"
+
+
+def _attach_native_boolean_rowset(series, rowset) -> None:
+    if series is None or rowset is None:
+        return
+    try:
+        object.__setattr__(series, _NATIVE_BOOLEAN_ROWSET_ATTR, rowset)
+    except Exception:
+        pass
+
+
+def _native_boolean_rowset_from_public_mask(series, state):
+    rowset = getattr(series, _NATIVE_BOOLEAN_ROWSET_ATTR, None)
+    if rowset is None:
+        rowset = native_boolean_rowset_from_mask_array(series)
+    if rowset is None or state is None:
+        return None
+    if (
+        rowset.source_token is not None
+        and rowset.source_token != state.lineage_token
+    ):
+        return None
+    if (
+        rowset.source_row_count is not None
+        and int(rowset.source_row_count) != state.row_count
+    ):
+        return None
+    return rowset
+
+
+def _attach_native_expression(series, expression) -> None:
+    if series is None or expression is None:
+        return
+    try:
+        object.__setattr__(series, _NATIVE_EXPRESSION_ATTR, expression)
+    except Exception:
+        pass
+
+
+def _native_expression_from_public_series(series):
+    expression = getattr(series, _NATIVE_EXPRESSION_ATTR, None)
+    if expression is not None:
+        return expression
+    values = getattr(series, "array", None)
+    if isinstance(values, NativeNumericExpressionArray):
+        return values.expression
+    return None
+
+
+def _native_expression_operand_from_series_pair(left, right):
+    if not isinstance(right, Series):
+        return right
+    if not right.index.equals(left.index):
+        return None
+    return _native_expression_from_public_series(right)
+
+
+def _native_expression_series_arithmetic(left, right, op: str, *, reverse: bool = False):
+    expression = _native_expression_from_public_series(left)
+    if expression is None:
+        return None
+    operand = _native_expression_operand_from_series_pair(left, right)
+    if operand is None:
+        return None
+    return expression.binary_arithmetic(op, operand, reverse=reverse)
+
+
+def _native_expression_series_rowset(left, right, op: str, *, reverse: bool = False):
+    expression = _native_expression_from_public_series(left)
+    if expression is None:
+        return None
+    operand = _native_expression_operand_from_series_pair(left, right)
+    if operand is None:
+        return None
+    return expression.compare(op, operand, reverse=reverse)
+
+
+def _series_result_matches_native_expression(result, left) -> bool:
+    return (
+        isinstance(result, Series)
+        and isinstance(left, Series)
+        and len(result) == len(left)
+        and result.index.equals(left.index)
+    )
+
+
+def _series_uses_native_numeric_array(*values) -> bool:
+    return any(
+        isinstance(getattr(value, "array", None), NativeNumericExpressionArray)
+        for value in values
+        if isinstance(value, Series)
+    )
+
+
+def _series_from_native_expression(left, expression, *, operation: str):
+    result = Series(
+        NativeNumericExpressionArray(
+            expression,
+            export_surface="vibespatial.api.Series",
+            export_operation=operation,
+        ),
+        index=left.index,
+        name=getattr(left, "name", None),
+    )
+    _attach_native_expression(result, expression)
+    return result
+
+
+def _boolean_series_from_native_rowset(left, rowset, *, operation: str):
+    if rowset.is_device:
+        import cupy as cp
+
+        mask_values = cp.zeros(len(left), dtype=cp.bool_)
+        if len(rowset) > 0:
+            mask_values[cp.asarray(rowset.positions, dtype=cp.int64)] = True
+    else:
+        mask_values = np.zeros(len(left), dtype=bool)
+        if len(rowset) > 0:
+            mask_values[np.asarray(rowset.positions, dtype=np.int64)] = True
+    result = Series(
+        NativeBooleanMaskArray(
+            row_count=len(left),
+            rowset=rowset,
+            mask_values=mask_values,
+            export_surface="vibespatial.api.Series",
+            export_operation=operation,
+        ),
+        index=left.index,
+        name=getattr(left, "name", None),
+    )
+    _attach_native_boolean_rowset(result, rowset)
+    return result
+
+
+def _install_native_expression_series_ops() -> None:
+    """Attach private NativeExpression sidecars through admitted Series ops."""
+    if getattr(Series, "_vibespatial_native_expression_ops_installed", False):
+        return
+
+    def _wrap_arithmetic(method_name: str, op: str, *, reverse: bool = False) -> None:
+        original = getattr(Series, method_name)
+
+        def _with_native_expression(self, other, *args, **kwargs):
+            expression = _native_expression_series_arithmetic(
+                self,
+                other,
+                op,
+                reverse=reverse,
+            )
+            if expression is not None and _series_uses_native_numeric_array(self, other):
+                return _series_from_native_expression(
+                    self,
+                    expression,
+                    operation="native_series_arithmetic",
+                )
+            result = original(self, other, *args, **kwargs)
+            if expression is not None and _series_result_matches_native_expression(
+                result,
+                self,
+            ):
+                _attach_native_expression(result, expression)
+            return result
+
+        setattr(Series, method_name, _with_native_expression)
+
+    def _wrap_comparison(method_name: str, op: str, *, reverse: bool = False) -> None:
+        original = getattr(Series, method_name)
+
+        def _with_native_rowset(self, other, *args, **kwargs):
+            rowset = _native_expression_series_rowset(
+                self,
+                other,
+                op,
+                reverse=reverse,
+            )
+            if rowset is not None and _series_uses_native_numeric_array(self, other):
+                return _boolean_series_from_native_rowset(
+                    self,
+                    rowset,
+                    operation="native_series_compare",
+                )
+            result = original(self, other, *args, **kwargs)
+            if rowset is not None and _series_result_matches_native_expression(
+                result,
+                self,
+            ):
+                _attach_native_boolean_rowset(result, rowset)
+            return result
+
+        setattr(Series, method_name, _with_native_rowset)
+
+    for method_name, op, reverse in (
+        ("__add__", "+", False),
+        ("__radd__", "+", True),
+        ("__sub__", "-", False),
+        ("__rsub__", "-", True),
+        ("__mul__", "*", False),
+        ("__rmul__", "*", True),
+        ("__truediv__", "/", False),
+        ("__rtruediv__", "/", True),
+        ("__floordiv__", "//", False),
+        ("__rfloordiv__", "//", True),
+        ("__mod__", "%", False),
+        ("__rmod__", "%", True),
+    ):
+        _wrap_arithmetic(method_name, op, reverse=reverse)
+
+    for method_name, op in (
+        ("__gt__", ">"),
+        ("__ge__", ">="),
+        ("__lt__", "<"),
+        ("__le__", "<="),
+        ("__eq__", "=="),
+        ("__ne__", "!="),
+    ):
+        _wrap_comparison(method_name, op)
+
+    Series._vibespatial_native_expression_ops_installed = True
+
+
+_install_native_expression_series_ops()
+
+
+def _native_state_for_owner(owner):
+    try:
+        from vibespatial.api._native_state import get_native_state
+
+        state = get_native_state(owner)
+    except Exception:
+        state = None
+    return state
+
+
+def _native_geometry_expression_for_property(owner, op):
+    if op not in {"area", "length", "is_valid"}:
+        return None
+    state = _native_state_for_owner(owner)
+    if state is None:
+        return None
+    geometry = getattr(state, "geometry", None)
+    if getattr(geometry, "owned", None) is None:
+        return None
+    if op == "area":
+        return state.geometry_area_expression()
+    if op == "length":
+        return state.geometry_length_expression()
+    return state.geometry_validity_expression()
+
+
+def _host_values_from_native_expression(expression, *, surface: str, operation: str):
+    values = expression.values
+    if expression.is_device:
+        import cupy as cp
+
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        return get_cuda_runtime().copy_device_to_host(
+            cp.asarray(values),
+            reason=f"{surface}::{operation}_native_expression_to_public_series",
+        )
+    return np.asarray(values)
+
+
+def _geom_type_values_to_families(values):
+    try:
+        requested = set(values)
+    except TypeError:
+        return None
+    if not requested:
+        return ()
+
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    family_by_geom_type = {
+        "Point": GeometryFamily.POINT,
+        "LineString": GeometryFamily.LINESTRING,
+        "Polygon": GeometryFamily.POLYGON,
+        "MultiPoint": GeometryFamily.MULTIPOINT,
+        "MultiLineString": GeometryFamily.MULTILINESTRING,
+        "MultiPolygon": GeometryFamily.MULTIPOLYGON,
+    }
+    if any(value not in family_by_geom_type for value in requested):
+        return None
+    return tuple(
+        family
+        for geom_type, family in family_by_geom_type.items()
+        if geom_type in requested
+    )
+
+
+def _rowset_from_geom_type_isin(state, values, public_mask):
+    families = _geom_type_values_to_families(values)
+    if families is None:
+        return None
+
+    native_mask_rowset = native_boolean_rowset_from_mask_array(public_mask)
+    if native_mask_rowset is not None:
+        return native_mask_rowset
+
+    try:
+        mask_values = public_mask.to_numpy(dtype=bool, na_value=False)
+    except TypeError:
+        mask_values = np.asarray(public_mask, dtype=bool)
+    if mask_values.ndim != 1 or mask_values.shape[0] != state.row_count:
+        return None
+
+    if bool(mask_values.all()):
+        from vibespatial.api._native_rowset import NativeRowSet
+
+        return NativeRowSet.from_positions(
+            np.arange(state.row_count, dtype=np.int64),
+            source_token=state.lineage_token,
+            source_row_count=state.row_count,
+            ordered=True,
+            unique=True,
+            identity=True,
+            geometry_family_domain=families,
+            trusted_all_valid_rows=True,
+        )
+
+    rowset = None
+    for family in families:
+        family_rowset = state.geometry_family_rowset(family)
+        if family_rowset is None:
+            return None
+        rowset = family_rowset if rowset is None else rowset.union(family_rowset)
+
+    if rowset is None:
+        from vibespatial.api._native_rowset import NativeRowSet
+
+        rowset = NativeRowSet.from_positions(
+            np.empty(0, dtype=np.int64),
+            source_token=state.lineage_token,
+            source_row_count=state.row_count,
+            ordered=True,
+            unique=True,
+            geometry_family_domain=families,
+            trusted_all_valid_rows=True,
+        )
+
+    if len(rowset) != int(mask_values.sum()):
+        return None
+    return rowset
+
+
+def _attach_native_geom_type_public_ops(series, owner) -> None:
+    state = _native_state_for_owner(owner)
+    if state is None:
+        return
+
+    original_isin = Series.isin
+    original_value_counts = Series.value_counts
+
+    def _isin_with_native_rowset(self, values):
+        result = original_isin(self, values)
+        rowset = _rowset_from_geom_type_isin(state, values, result)
+        if rowset is not None:
+            _attach_native_boolean_rowset(result, rowset)
+        return result
+
+    def _value_counts_with_native_geom_type(
+        self,
+        normalize: bool = False,
+        sort: bool = True,
+        ascending: bool = False,
+        bins=None,
+        dropna: bool = True,
+    ):
+        if bins is None and isinstance(
+            getattr(self, "array", None),
+            NativeGeometryTypeArray,
+        ):
+            return self.array.value_counts(
+                normalize=normalize,
+                sort=sort,
+                ascending=ascending,
+                dropna=dropna,
+            )
+        return original_value_counts(
+            self,
+            normalize=normalize,
+            sort=sort,
+            ascending=ascending,
+            bins=bins,
+            dropna=dropna,
+        )
+
+    try:
+        object.__setattr__(series, "isin", MethodType(_isin_with_native_rowset, series))
+        object.__setattr__(
+            series,
+            "value_counts",
+            MethodType(_value_counts_with_native_geom_type, series),
+        )
+    except Exception:
+        pass
 
 
 def _active_geometry_values(obj):
@@ -91,11 +502,14 @@ def _record_native_public_export_boundary(
     operation: str,
     target: str,
     reason: str,
+    d2h_transfer: bool | None = None,
 ) -> None:
     payload = _native_display_export_payload(obj)
     if payload is None:
         return
-    row_count, byte_count, d2h_transfer, detail = payload
+    row_count, byte_count, inferred_d2h_transfer, detail = payload
+    if d2h_transfer is None:
+        d2h_transfer = inferred_d2h_transfer
     from vibespatial.runtime.materialization import (
         NativeExportBoundary,
         record_native_export_boundary,
@@ -123,7 +537,15 @@ def _record_native_display_export(obj, *, surface: str, operation: str, target: 
     )
 
 
-def _delegate_binary_method(op, this, other, align, *args, **kwargs):
+def _delegate_binary_method(
+    op,
+    this,
+    other,
+    align,
+    *args,
+    return_native_rowset: bool = False,
+    **kwargs,
+):
     # type: (str, GeoSeries, GeoSeries) -> GeoSeries/Series
     if align is None:
         align = True
@@ -166,7 +588,45 @@ def _delegate_binary_method(op, this, other, align, *args, **kwargs):
     else:
         raise TypeError(type(this), type(other))
 
-    data = getattr(a_this, op)(other, *args, **kwargs)
+    native_rowset = None
+    native_dwithin = None
+    if op == "dwithin" and isinstance(other, BaseGeometry):
+        try:
+            distance = kwargs["distance"] if "distance" in kwargs else args[0]
+        except IndexError:
+            distance = None
+        if np.isscalar(distance):
+            try:
+                scalar_distance = float(distance)
+            except (TypeError, ValueError):
+                scalar_distance = np.nan
+            if np.isfinite(scalar_distance):
+                try:
+                    from vibespatial.api._native_state import get_native_state
+
+                    state = get_native_state(this)
+                except Exception:
+                    state = None
+                if state is not None:
+                    native_method = getattr(
+                        a_this,
+                        "_dwithin_scalar_with_native_rowset",
+                        None,
+                    )
+                    if native_method is not None:
+                        native_dwithin = native_method(
+                            other,
+                            scalar_distance,
+                            source_token=state.lineage_token,
+                            source_row_count=state.row_count,
+                        )
+
+    if native_dwithin is not None:
+        data, native_rowset = native_dwithin
+    else:
+        data = getattr(a_this, op)(other, *args, **kwargs)
+    if return_native_rowset:
+        return data, this.index, native_rowset
     return data, this.index
 
 
@@ -182,7 +642,15 @@ def _binary_geo(op, this, other, align, *args, **kwargs):
 def _binary_op(op, this, other, align, *args, **kwargs):
     # type: (str, GeoSeries, GeoSeries, args/kwargs) -> Series[bool/float]
     """Binary operation on GeoSeries objects that returns a Series."""
-    data, index = _delegate_binary_method(op, this, other, align, *args, **kwargs)
+    data, index, native_rowset = _delegate_binary_method(
+        op,
+        this,
+        other,
+        align,
+        *args,
+        return_native_rowset=True,
+        **kwargs,
+    )
     surface_owner = this.__class__.__name__
     _record_native_public_export_boundary(
         this,
@@ -191,12 +659,60 @@ def _binary_op(op, this, other, align, *args, **kwargs):
         target="series",
         reason=f"native {surface_owner} binary operation exported to public Series",
     )
-    return Series(data, index=index)
+    result = Series(data, index=index)
+    if native_rowset is not None:
+        _attach_native_boolean_rowset(result, native_rowset)
+    return result
 
 
 def _delegate_property(op, this):
     # type: (str, GeoSeries) -> GeoSeries/Series
     a_this = this.geometry.values
+    if op == "geom_type":
+        state = _native_state_for_owner(this)
+        if state is not None and native_geometry_type_array_supported(state):
+            result = Series(
+                NativeGeometryTypeArray(
+                    state,
+                    export_surface=f"vibespatial.api.{this.__class__.__name__}.{op}",
+                    export_operation=f"{this.__class__.__name__.lower()}_{op}",
+                ),
+                index=this.index,
+            )
+            _attach_native_geom_type_public_ops(result, this)
+            return result
+
+    native_expression = _native_geometry_expression_for_property(this, op)
+    if native_expression is not None:
+        surface_owner = this.__class__.__name__
+        if op in {"area", "length"}:
+            result = Series(
+                NativeNumericExpressionArray(
+                    native_expression,
+                    export_surface=f"vibespatial.api.{surface_owner}.{op}",
+                    export_operation=f"{surface_owner.lower()}_{op}",
+                ),
+                index=this.index,
+            )
+        else:
+            _record_native_public_export_boundary(
+                this,
+                surface=f"vibespatial.api.{surface_owner}.{op}",
+                operation=f"{surface_owner.lower()}_{op}",
+                target="series",
+                reason=f"native {surface_owner} geometry property exported to public Series",
+            )
+            result = Series(
+                _host_values_from_native_expression(
+                    native_expression,
+                    surface=f"vibespatial.api.{surface_owner}.{op}",
+                    operation=f"{surface_owner.lower()}_{op}",
+                ),
+                index=this.index,
+            )
+        _attach_native_expression(result, native_expression)
+        return result
+
     data = getattr(a_this, op)
     if is_geometry_type(data):
         from vibespatial.api.geoseries import GeoSeries
@@ -211,7 +727,10 @@ def _delegate_property(op, this):
             target="series",
             reason=f"native {surface_owner} geometry property exported to public Series",
         )
-        return Series(data, index=this.index)
+        result = Series(data, index=this.index)
+        if op == "geom_type":
+            _attach_native_geom_type_public_ops(result, this)
+        return result
 
 
 def _delegate_geo_method(op, this, **kwargs):

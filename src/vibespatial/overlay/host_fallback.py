@@ -8,6 +8,7 @@ None of these functions touch CuPy or CUDA directly.  When GPU-accelerated
 batch PIP is needed (inside ``_build_polygon_output_from_faces``), the GPU
 function is imported lazily to avoid circular imports.
 """
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -20,6 +21,7 @@ from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
+    from_shapely_geometries,
 )
 from vibespatial.runtime import RuntimeSelection
 from vibespatial.runtime.config import OVERLAY_BATCH_PIP_GPU_THRESHOLD
@@ -41,14 +43,16 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
 def _signed_area_and_centroid(points: np.ndarray) -> tuple[float, float, float]:
     if points.shape[0] < 3:
         return 0.0, 0.0, 0.0
-    closed = np.vstack((points, points[:1]))
+    origin = points[0]
+    local = points - origin
+    closed = np.vstack((local, local[:1]))
     cross = (closed[:-1, 0] * closed[1:, 1]) - (closed[1:, 0] * closed[:-1, 1])
     twice_area = float(np.sum(cross))
     if twice_area == 0.0:
         return 0.0, float(points[:, 0].mean()), float(points[:, 1].mean())
     factor = 1.0 / (3.0 * twice_area)
-    cx = float(np.sum((closed[:-1, 0] + closed[1:, 0]) * cross) * factor)
-    cy = float(np.sum((closed[:-1, 1] + closed[1:, 1]) * cross) * factor)
+    cx = float(origin[0] + np.sum((closed[:-1, 0] + closed[1:, 0]) * cross) * factor)
+    cy = float(origin[1] + np.sum((closed[:-1, 1] + closed[1:, 1]) * cross) * factor)
     return twice_area * 0.5, cx, cy
 
 
@@ -72,13 +76,73 @@ def _face_sample_point(points: np.ndarray) -> tuple[float, float]:
 
 
 def _host_union_geometry(values):
-    geometries = [geometry for geometry in values.to_shapely() if geometry is not None and not geometry.is_empty]
+    geometries = [
+        geometry
+        for geometry in values.to_shapely()
+        if geometry is not None and not geometry.is_empty
+    ]
     if not geometries:
         return None
     return shapely.union_all(np.asarray(geometries, dtype=object), grid_size=0.0)
 
 
-def _label_face_coverage(left, right, centroid_x: np.ndarray, centroid_y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _grouped_spatial_difference_host(
+    left_values: np.ndarray,
+    right_values: np.ndarray,
+    pair_left: np.ndarray,
+    pair_right: np.ndarray,
+) -> np.ndarray:
+    neighbors: list[list[int]] = [[] for _ in range(left_values.size)]
+    for left_row, right_row in zip(pair_left.tolist(), pair_right.tolist(), strict=True):
+        neighbors[int(left_row)].append(int(right_row))
+    output = np.empty(left_values.size, dtype=object)
+    for row, geometry in enumerate(left_values.tolist()):
+        related = neighbors[row]
+        if geometry is None or not related:
+            output[row] = geometry
+            continue
+        coverage = shapely.union_all(right_values[np.asarray(related, dtype=np.int64)])
+        output[row] = shapely.difference(geometry, coverage)
+    return output
+
+
+def spatial_overlay_owned_host(left, right, candidate_pairs, *, how: str):
+    """Explicit Shapely oracle for geometry-only planar overlay."""
+    left_values = np.asarray(left.to_shapely(), dtype=object)
+    right_values = np.asarray(right.to_shapely(), dtype=object)
+    pair_left = np.asarray(candidate_pairs.left_indices, dtype=np.int64)
+    pair_right = np.asarray(candidate_pairs.right_indices, dtype=np.int64)
+    parts: list[np.ndarray] = []
+    if how in {"intersection", "identity", "union"}:
+        parts.append(shapely.intersection(left_values[pair_left], right_values[pair_right]))
+    if how in {"difference", "identity", "symmetric_difference", "union"}:
+        parts.append(
+            _grouped_spatial_difference_host(
+                left_values,
+                right_values,
+                pair_left,
+                pair_right,
+            )
+        )
+    if how in {"symmetric_difference", "union"}:
+        parts.append(
+            _grouped_spatial_difference_host(
+                right_values,
+                left_values,
+                pair_right,
+                pair_left,
+            )
+        )
+    combined = np.concatenate(parts) if parts else np.empty(0, dtype=object)
+    valid = combined != None  # noqa: E711
+    if bool(np.any(valid)):
+        valid[valid] &= ~shapely.is_empty(combined[valid])
+    return from_shapely_geometries(combined[valid].tolist())
+
+
+def _label_face_coverage(
+    left, right, centroid_x: np.ndarray, centroid_y: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     """Host fallback: label face coverage via Shapely coverage tests.
 
     Uses vectorized shapely.covers() on the unioned geometry of each side.
@@ -91,21 +155,32 @@ def _label_face_coverage(left, right, centroid_x: np.ndarray, centroid_y: np.nda
         return empty, empty
     points = shapely.points(centroid_x, centroid_y)
     left_covered = (
-        np.asarray(shapely.covers(left_union, points), dtype=bool) if left_union is not None else np.zeros(points.size, dtype=bool)
+        np.asarray(shapely.covers(left_union, points), dtype=bool)
+        if left_union is not None
+        else np.zeros(points.size, dtype=bool)
     )
     right_covered = (
-        np.asarray(shapely.covers(right_union, points), dtype=bool) if right_union is not None else np.zeros(points.size, dtype=bool)
+        np.asarray(shapely.covers(right_union, points), dtype=bool)
+        if right_union is not None
+        else np.zeros(points.size, dtype=bool)
     )
     return left_covered.astype(np.int8, copy=False), right_covered.astype(np.int8, copy=False)
 
 
-def _ring_points_for_face(half_edge_graph: HalfEdgeGraph, faces: OverlayFaceTable, face_index: int) -> np.ndarray:
+def _ring_points_for_face(
+    half_edge_graph: HalfEdgeGraph, faces: OverlayFaceTable, face_index: int
+) -> np.ndarray:
     start = int(faces.face_offsets[face_index])
     stop = int(faces.face_offsets[face_index + 1])
     edge_ids = faces.face_edge_ids[start:stop]
     if edge_ids.size == 0:
         return np.empty((0, 2), dtype=np.float64)
-    points = np.column_stack((half_edge_graph.src_x[edge_ids], half_edge_graph.src_y[edge_ids]))
+    ordered = np.empty(edge_ids.size, dtype=np.int32)
+    current = int(edge_ids[0])
+    for position in range(edge_ids.size):
+        ordered[position] = current
+        current = int(half_edge_graph.next_edge_ids[current])
+    points = np.column_stack((half_edge_graph.src_x[ordered], half_edge_graph.src_y[ordered]))
     if not np.allclose(points[0], points[-1]):
         points = np.vstack((points, points[:1]))
     return np.asarray(points, dtype=np.float64)
@@ -286,8 +361,12 @@ def _build_overlay_output_rows(
 
     families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
     if polygon_count:
-        poly_x = np.concatenate(polygon_x_chunks) if polygon_x_chunks else np.empty(0, dtype=np.float64)
-        poly_y = np.concatenate(polygon_y_chunks) if polygon_y_chunks else np.empty(0, dtype=np.float64)
+        poly_x = (
+            np.concatenate(polygon_x_chunks) if polygon_x_chunks else np.empty(0, dtype=np.float64)
+        )
+        poly_y = (
+            np.concatenate(polygon_y_chunks) if polygon_y_chunks else np.empty(0, dtype=np.float64)
+        )
         total_poly_coords = polygon_coord_cursor[0]
         families[GeometryFamily.POLYGON] = FamilyGeometryBuffer(
             family=GeometryFamily.POLYGON,
@@ -295,14 +374,24 @@ def _build_overlay_output_rows(
             row_count=polygon_count,
             x=poly_x,
             y=poly_y,
-            geometry_offsets=np.asarray([*polygon_geometry_offsets, len(polygon_ring_offsets)], dtype=np.int32),
+            geometry_offsets=np.asarray(
+                [*polygon_geometry_offsets, len(polygon_ring_offsets)], dtype=np.int32
+            ),
             empty_mask=np.zeros(polygon_count, dtype=bool),
             ring_offsets=np.asarray([*polygon_ring_offsets, total_poly_coords], dtype=np.int32),
             bounds=np.asarray(polygon_bounds, dtype=np.float64),
         )
     if multipolygon_count:
-        mpoly_x = np.concatenate(multipolygon_x_chunks) if multipolygon_x_chunks else np.empty(0, dtype=np.float64)
-        mpoly_y = np.concatenate(multipolygon_y_chunks) if multipolygon_y_chunks else np.empty(0, dtype=np.float64)
+        mpoly_x = (
+            np.concatenate(multipolygon_x_chunks)
+            if multipolygon_x_chunks
+            else np.empty(0, dtype=np.float64)
+        )
+        mpoly_y = (
+            np.concatenate(multipolygon_y_chunks)
+            if multipolygon_y_chunks
+            else np.empty(0, dtype=np.float64)
+        )
         total_mpoly_coords = multipolygon_coord_cursor[0]
         families[GeometryFamily.MULTIPOLYGON] = FamilyGeometryBuffer(
             family=GeometryFamily.MULTIPOLYGON,
@@ -315,8 +404,12 @@ def _build_overlay_output_rows(
                 dtype=np.int32,
             ),
             empty_mask=np.zeros(multipolygon_count, dtype=bool),
-            part_offsets=np.asarray([*multipolygon_part_offsets, len(multipolygon_ring_offsets)], dtype=np.int32),
-            ring_offsets=np.asarray([*multipolygon_ring_offsets, total_mpoly_coords], dtype=np.int32),
+            part_offsets=np.asarray(
+                [*multipolygon_part_offsets, len(multipolygon_ring_offsets)], dtype=np.int32
+            ),
+            ring_offsets=np.asarray(
+                [*multipolygon_ring_offsets, total_mpoly_coords], dtype=np.int32
+            ),
             bounds=np.asarray(multipolygon_bounds, dtype=np.float64),
         )
     return OwnedGeometryArray(
@@ -372,7 +465,9 @@ def _build_polygon_output_from_faces(
         current = int(half_edge_graph.next_edge_ids[edge_id])
         guard = 0
         while True:
-            twin_face = int(edge_face_ids[current ^ 1]) if (current ^ 1) < edge_face_ids.size else -1
+            twin_face = (
+                int(edge_face_ids[current ^ 1]) if (current ^ 1) < edge_face_ids.size else -1
+            )
             if twin_face < 0 or not selected_face_mask[twin_face]:
                 return current
             current = int(half_edge_graph.next_edge_ids[current ^ 1])
@@ -401,7 +496,9 @@ def _build_polygon_output_from_faces(
             continue
         row_ids = np.unique(half_edge_graph.row_indices[np.asarray(cycle_edges, dtype=np.int32)])
         if row_ids.size != 1:
-            raise RuntimeError("overlay boundary cycle spans multiple source rows; row-wise output assembly would be ambiguous")
+            raise RuntimeError(
+                "overlay boundary cycle spans multiple source rows; row-wise output assembly would be ambiguous"
+            )
         points = np.column_stack(
             (
                 half_edge_graph.src_x[np.asarray(cycle_edges, dtype=np.int32)],
@@ -426,9 +523,35 @@ def _build_polygon_output_from_faces(
         start = int(faces.face_offsets[face_index])
         stop = int(faces.face_offsets[face_index + 1])
         edge_ids = faces.face_edge_ids[start:stop]
+        if edge_ids.size == 0:
+            continue
+        twin_faces = np.full(edge_ids.size, -1, dtype=np.int32)
+        valid_twin = (edge_ids ^ 1) < edge_face_ids.size
+        twin_faces[valid_twin] = edge_face_ids[edge_ids[valid_twin] ^ 1]
+        border_selected = np.all((twin_faces >= 0) & selected_face_mask[twin_faces.clip(min=0)])
+        first_edge = int(edge_ids[0])
+        source_interior_ring = (
+            int(half_edge_graph.ring_indices[first_edge]) > 0
+            and np.all(
+                half_edge_graph.source_side[edge_ids] == half_edge_graph.source_side[first_edge]
+            )
+            and np.all(
+                half_edge_graph.row_indices[edge_ids] == half_edge_graph.row_indices[first_edge]
+            )
+            and np.all(
+                half_edge_graph.part_indices[edge_ids] == half_edge_graph.part_indices[first_edge]
+            )
+            and np.all(
+                half_edge_graph.ring_indices[edge_ids] == half_edge_graph.ring_indices[first_edge]
+            )
+        )
+        if not (border_selected or source_interior_ring):
+            continue
         row_ids = np.unique(half_edge_graph.row_indices[edge_ids])
         if row_ids.size != 1:
-            raise RuntimeError("overlay hole candidate spans multiple source rows; row-wise output assembly would be ambiguous")
+            raise RuntimeError(
+                "overlay hole candidate spans multiple source rows; row-wise output assembly would be ambiguous"
+            )
         cycle_rings[cycle_id] = ring
         cycle_samples[cycle_id] = _face_sample_point(ring[:-1])
         cycle_areas[cycle_id] = abs(float(faces.signed_area[face_index]))
@@ -436,7 +559,9 @@ def _build_polygon_output_from_faces(
         cycle_selected_boundary[cycle_id] = False
         cycle_id += 1
 
-    selected_boundary_indices = [cycle_index for cycle_index in cycle_rings if cycle_selected_boundary[cycle_index]]
+    selected_boundary_indices = [
+        cycle_index for cycle_index in cycle_rings if cycle_selected_boundary[cycle_index]
+    ]
 
     # --- Phase 1: compute containment depth for selected boundary cycles ---
     # Collect all (cycle_index, container_index) pairs needing PIP tests.
@@ -527,7 +652,9 @@ def _build_polygon_output_from_faces(
             # Exteriors sorted ascending by area -- first PIP hit is immediate parent.
             for exterior_index in exteriors_by_row.get(row, []):
                 if cycle_areas[exterior_index] > ca and _point_in_ring(
-                    sample_x, sample_y, cycle_rings[exterior_index],
+                    sample_x,
+                    sample_y,
+                    cycle_rings[exterior_index],
                 ):
                     candidate_holes[cycle_index] = exterior_index
                     break
@@ -553,9 +680,7 @@ def _build_polygon_output_from_faces(
     if len(local_depth_pairs) >= OVERLAY_BATCH_PIP_GPU_THRESHOLD and cp is not None:
         gpu_results = _batch_point_in_ring_gpu(local_depth_pairs, cycle_samples, cycle_rings)
         for cycle_index, container in candidate_holes.items():
-            local_depth = sum(
-                1 for pi in local_depth_map.get(cycle_index, []) if gpu_results[pi]
-            )
+            local_depth = sum(1 for pi in local_depth_map.get(cycle_index, []) if gpu_results[pi])
             if local_depth % 2 != 0:
                 continue
             hole_map[container].append(cycle_index)
@@ -575,7 +700,10 @@ def _build_polygon_output_from_faces(
 
     row_polygons: dict[int, list[list[np.ndarray]]] = {}
     for exterior_index in exterior_indices:
-        rings = [cycle_rings[exterior_index], *(cycle_rings[hole_index] for hole_index in sorted(hole_map[exterior_index]))]
+        rings = [
+            cycle_rings[exterior_index],
+            *(cycle_rings[hole_index] for hole_index in sorted(hole_map[exterior_index])),
+        ]
         row_polygons.setdefault(cycle_rows[exterior_index], []).append(rings)
 
     return _build_overlay_output_rows(row_polygons, faces.runtime_selection)

@@ -8,9 +8,11 @@ from ._runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
 from .crossover import (
     CrossoverPolicy,
     DispatchDecision,
+    PhysicalWorkEstimate,
     WorkloadShape,
     default_crossover_policy,
-    select_dispatch_for_rows,
+    effective_crossover_threshold,
+    select_dispatch_for_estimate,
 )
 from .kernel_registry import KernelVariantSpec, get_kernel_variants
 from .precision import (
@@ -71,6 +73,20 @@ class WorkloadProfile:
     chunk_index: int = 0
     avg_vertices_per_geometry: float = 0.0
     workload_shape: WorkloadShape | None = None
+    work_estimate: PhysicalWorkEstimate | None = None
+
+    def __post_init__(self) -> None:
+        if int(self.row_count) < 0:
+            raise ValueError("WorkloadProfile row_count must be non-negative")
+        if self.work_estimate is not None and int(self.work_estimate.row_count) != int(
+            self.row_count
+        ):
+            raise ValueError("WorkloadProfile work_estimate row_count mismatch")
+
+    def physical_work_estimate(self) -> PhysicalWorkEstimate:
+        if self.work_estimate is not None:
+            return self.work_estimate
+        return PhysicalWorkEstimate.from_rows(self.row_count)
 
 
 @dataclass(frozen=True)
@@ -140,7 +156,11 @@ def _select_runtime_with_availability(
     *,
     gpu_available: bool,
 ) -> RuntimeSelection:
-    mode = requested_mode if isinstance(requested_mode, ExecutionMode) else ExecutionMode(requested_mode)
+    mode = (
+        requested_mode
+        if isinstance(requested_mode, ExecutionMode)
+        else ExecutionMode(requested_mode)
+    )
 
     if mode is ExecutionMode.CPU:
         return RuntimeSelection(requested=mode, selected=ExecutionMode.CPU, reason="CPU requested")
@@ -257,16 +277,19 @@ def plan_adaptive_execution(
     device_snapshot: DeviceSnapshot | None = None,
     variants: tuple[KernelVariantSpec, ...] | None = None,
 ) -> AdaptivePlan:
-    normalized_class = kernel_class if isinstance(kernel_class, KernelClass) else KernelClass(kernel_class)
+    normalized_class = (
+        kernel_class if isinstance(kernel_class, KernelClass) else KernelClass(kernel_class)
+    )
     snapshot = device_snapshot or capture_device_snapshot()
     initial_runtime = _select_runtime_with_availability(
         requested_mode,
         gpu_available=snapshot.gpu_available,
     )
     crossover_policy = default_crossover_policy(kernel_name, normalized_class)
-    dispatch_decision = select_dispatch_for_rows(
+    work_estimate = workload.physical_work_estimate()
+    dispatch_decision = select_dispatch_for_estimate(
         requested_mode=requested_mode,
-        row_count=workload.row_count,
+        work_estimate=work_estimate,
         policy=crossover_policy,
         gpu_available=snapshot.gpu_available,
         workload_shape=workload.workload_shape,
@@ -278,13 +301,10 @@ def plan_adaptive_execution(
     )
     if sticky_device_auto:
         dispatch_decision = DispatchDecision.GPU
-    effective_threshold = crossover_policy.auto_min_rows
-    if workload.workload_shape in (WorkloadShape.BROADCAST_RIGHT, WorkloadShape.SCALAR_RIGHT):
-        effective_threshold = (
-            crossover_policy.broadcast_min_rows
-            if crossover_policy.broadcast_min_rows is not None
-            else crossover_policy.auto_min_rows // 10
-        )
+    effective_threshold = effective_crossover_threshold(
+        crossover_policy,
+        workload.workload_shape,
+    )
 
     if sticky_device_auto:
         runtime_selection = RuntimeSelection(
@@ -292,11 +312,17 @@ def plan_adaptive_execution(
             selected=ExecutionMode.GPU,
             reason="GPU runtime available; staying on device-resident buffers",
         )
-    elif initial_runtime.requested is ExecutionMode.AUTO and dispatch_decision is DispatchDecision.CPU:
+    elif (
+        initial_runtime.requested is ExecutionMode.AUTO
+        and dispatch_decision is DispatchDecision.CPU
+    ):
         runtime_selection = RuntimeSelection(
             requested=initial_runtime.requested,
             selected=ExecutionMode.CPU,
-            reason=f"{initial_runtime.reason}; below {effective_threshold}-row crossover",
+            reason=(
+                f"{initial_runtime.reason}; below {effective_threshold}-"
+                f"{work_estimate.dispatch_unit_name()} crossover"
+            ),
         )
     elif dispatch_decision is DispatchDecision.GPU:
         runtime_selection = RuntimeSelection(
@@ -330,6 +356,8 @@ def plan_adaptive_execution(
     ]
     if sticky_device_auto:
         diagnostics.append("residency: auto dispatch pinned to GPU for device-resident workload")
+    if not work_estimate.is_row_only:
+        diagnostics.append(f"physical work estimate: {work_estimate.telemetry_detail()}")
     if variant is None:
         diagnostics.append("variant: no compatible specialized variant registered")
     else:
@@ -360,10 +388,12 @@ def plan_adaptive_execution(
 # Phase 1: Session-scoped device snapshot caching (ADR-0007)
 # ---------------------------------------------------------------------------
 
+
 def _detect_device_profile() -> DevicePrecisionProfile:
     """Build a DevicePrecisionProfile from the actual hardware fp64:fp32 ratio."""
     try:
         from vibespatial.cuda._runtime import get_cuda_runtime
+
         runtime = get_cuda_runtime()
         ratio = runtime.fp64_to_fp32_ratio
         name = f"detected-{ratio:.4f}"
@@ -431,6 +461,7 @@ def invalidate_snapshot_cache() -> None:
 # Phase 2: Convenience dispatch functions (ADR-0007)
 # ---------------------------------------------------------------------------
 
+
 def plan_kernel_dispatch(
     *,
     kernel_name: str,
@@ -446,6 +477,7 @@ def plan_kernel_dispatch(
     chunk_index: int = 0,
     gpu_available: bool | None = None,
     workload_shape: WorkloadShape | None = None,
+    work_estimate: PhysicalWorkEstimate | None = None,
 ) -> AdaptivePlan:
     """Plan kernel dispatch with a cached device snapshot.
 
@@ -482,6 +514,7 @@ def plan_kernel_dispatch(
         is_streaming=is_streaming,
         chunk_index=chunk_index,
         workload_shape=workload_shape,
+        work_estimate=work_estimate,
     )
     return plan_adaptive_execution(
         kernel_name=kernel_name,
@@ -509,6 +542,7 @@ def plan_dispatch_selection(
     chunk_index: int = 0,
     gpu_available: bool | None = None,
     workload_shape: WorkloadShape | None = None,
+    work_estimate: PhysicalWorkEstimate | None = None,
 ) -> AdaptivePlan:
     """Plan dispatch while preserving compatibility with RuntimeSelection-style access."""
     plan = plan_kernel_dispatch(
@@ -525,6 +559,7 @@ def plan_dispatch_selection(
         chunk_index=chunk_index,
         gpu_available=gpu_available,
         workload_shape=workload_shape,
+        work_estimate=work_estimate,
     )
 
     if (

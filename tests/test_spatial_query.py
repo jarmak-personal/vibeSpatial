@@ -12,6 +12,7 @@ import vibespatial.spatial.nearest as spatial_nearest_module
 import vibespatial.spatial.query as spatial_query_module
 import vibespatial.spatial.query_utils as spatial_query_utils_module
 from vibespatial.api.geometry_array import GeometryArray
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
 from vibespatial.runtime.residency import Residency
@@ -26,6 +27,72 @@ from vibespatial.spatial.query_box import (
     _extract_box_query_bounds_shapely,
 )
 from vibespatial.spatial.spatial_index_device import spatial_index_device_query
+
+
+def _device_regular_box_owned_for_test(
+    row_count: int,
+    *,
+    origin_y: float = 0.0,
+    cols: int = 2,
+) -> OwnedGeometryArray:
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.geometry.owned import (
+        FAMILY_TAGS,
+        DeviceFamilyGeometryBuffer,
+        DeviceRegularGridRectMetadata,
+        build_device_resident_owned,
+    )
+
+    runtime = get_cuda_runtime()
+    row_ids = np.arange(row_count, dtype=np.int64)
+    minx = np.remainder(row_ids, cols).astype(np.float64, copy=False)
+    miny = (row_ids // cols).astype(np.float64, copy=False) + float(origin_y)
+    maxx = minx + 1.0
+    maxy = miny + 1.0
+    x = np.stack((minx, maxx, maxx, minx, minx), axis=1).reshape(-1)
+    y = np.stack((miny, miny, maxy, maxy, miny), axis=1).reshape(-1)
+    geometry_offsets = np.arange(row_count + 1, dtype=np.int32)
+    ring_offsets = geometry_offsets * 5
+    bounds = np.column_stack((minx, miny, maxx, maxy))
+    full_rows, tail_cols = divmod(row_count, cols)
+    grid_rows = full_rows + (1 if tail_cols else 0)
+    max_cols = cols if full_rows else tail_cols
+    total_bounds = (
+        0.0,
+        float(origin_y),
+        float(max_cols),
+        float(origin_y + grid_rows),
+    )
+    family = GeometryFamily.POLYGON
+    return build_device_resident_owned(
+        device_families={
+            family: DeviceFamilyGeometryBuffer(
+                family=family,
+                x=runtime.from_host(x),
+                y=runtime.from_host(y),
+                geometry_offsets=runtime.from_host(geometry_offsets),
+                empty_mask=runtime.from_host(np.zeros(row_count, dtype=np.bool_)),
+                ring_offsets=runtime.from_host(ring_offsets),
+                bounds=runtime.from_host(bounds),
+                dense_single_ring_width=5,
+                axis_aligned_rectangles=True,
+                regular_grid_rect=DeviceRegularGridRectMetadata(
+                    origin_x=0.0,
+                    origin_y=float(origin_y),
+                    cell_width=1.0,
+                    cell_height=1.0,
+                    cols=int(cols),
+                    rows=int(grid_rows),
+                    size=int(row_count),
+                    total_bounds=total_bounds,
+                ),
+            ),
+        },
+        row_count=row_count,
+        tags=np.full(row_count, FAMILY_TAGS[family], dtype=np.int8),
+        validity=np.ones(row_count, dtype=np.bool_),
+        family_row_offsets=np.arange(row_count, dtype=np.int32),
+    )
 
 
 def test_spatial_query_candidate_d2h_exports_are_runtime_accounted() -> None:
@@ -97,6 +164,7 @@ def test_polygon_box_query_scalar_fences_are_operation_named() -> None:
         ],
         residency=Residency.DEVICE,
     )
+    query_owned.device_state.families[GeometryFamily.POLYGON].axis_aligned_rectangles = False
 
     reset_d2h_transfer_count()
     get_d2h_transfer_events(clear=True)
@@ -391,8 +459,12 @@ def test_single_row_device_flat_index_keeps_bounds_device_until_host_boundary() 
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for device bounds query")
-def test_single_row_device_rect_flat_index_preserves_regular_grid_query() -> None:
-    from vibespatial.cuda._runtime import get_d2h_transfer_count, reset_d2h_transfer_count
+def test_single_row_device_rect_flat_index_reuses_native_shape_proof() -> None:
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_count,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
 
     tree_owned = from_shapely_geometries(
         [box(0.0, 0.0, 10.0, 10.0)],
@@ -404,6 +476,7 @@ def test_single_row_device_rect_flat_index_preserves_regular_grid_query() -> Non
     )
 
     reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
     flat_index = build_flat_spatial_index(
         tree_owned,
         runtime_selection=RuntimeSelection(
@@ -414,9 +487,13 @@ def test_single_row_device_rect_flat_index_preserves_regular_grid_query() -> Non
     )
 
     assert flat_index.regular_grid is not None
-    assert flat_index._host_bounds is not None
-    assert flat_index.device_bounds is None
-    assert get_d2h_transfer_count() == 2
+    assert flat_index.regular_grid.size == 1
+    assert flat_index.total_bounds == (0.0, 0.0, 10.0, 10.0)
+    assert flat_index._host_bounds is None
+    assert flat_index.device_bounds is not None
+    assert get_d2h_transfer_count() == 0
+    build_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    assert not any("single-rectangle" in reason for reason in build_reasons)
 
     result, execution = query_spatial_index(
         tree_owned,
@@ -431,7 +508,8 @@ def test_single_row_device_rect_flat_index_preserves_regular_grid_query() -> Non
 
     assert execution.selected is ExecutionMode.GPU
     assert result.size == 1
-    assert flat_index.regular_grid.size == 1
+    query_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    assert "device spatial-index candidate-pair allocation fence" not in query_reasons
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for device grid index")
@@ -483,6 +561,12 @@ def test_multi_row_device_regular_grid_index_avoids_host_metadata(
     assert flat_index._host_bounds is None
     assert flat_index.device_bounds is not None
     assert flat_index.total_bounds == (0.0, 0.0, 3.0, 2.0)
+    polygon_device = tree_owned.device_state.families[GeometryFamily.POLYGON]
+    assert polygon_device.dense_single_ring_width == 5
+    assert polygon_device.axis_aligned_rectangles is True
+    assert polygon_device.bounds is flat_index.device_bounds
+    assert polygon_device.regular_grid_rect is not None
+    assert polygon_device.regular_grid_rect.size == 5
     assert transfer_count <= 1
     assert transfer_bytes <= 64
 
@@ -494,6 +578,118 @@ def test_multi_row_device_regular_grid_index_avoids_host_metadata(
         [0.0, 1.0, 1.0, 2.0],
         [1.0, 1.0, 2.0, 2.0],
     ]
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for device grid index")
+def test_device_regular_grid_take_preserves_proof_without_recertification() -> None:
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    owned = _device_regular_box_owned_for_test(6)
+
+    reset_d2h_transfer_count()
+    taken = owned.take(np.arange(2, 6, dtype=np.int64))
+    proof = taken.device_state.families[GeometryFamily.POLYGON].regular_grid_rect
+    assert proof is not None
+    assert proof.origin_x == 0.0
+    assert proof.origin_y == 1.0
+    assert proof.cols == 2
+    assert proof.rows == 2
+    assert proof.size == 4
+    assert proof.total_bounds == (0.0, 1.0, 2.0, 3.0)
+
+    flat_index = build_flat_spatial_index(
+        taken,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.CPU,
+            selected=ExecutionMode.CPU,
+            reason="consume preserved device regular-grid proof",
+        ),
+    )
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    assert flat_index.regular_grid is not None
+    assert flat_index.total_bounds == (0.0, 1.0, 2.0, 3.0)
+    assert "spatial index regular-grid summary scalar fence" not in reasons
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for device grid index")
+def test_host_validated_device_regular_grid_seeds_device_proof() -> None:
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    owned = from_shapely_geometries(
+        [
+            box(float(col), float(row), float(col + 1), float(row + 1))
+            for row in range(2)
+            for col in range(2)
+        ],
+        residency=Residency.DEVICE,
+    )
+    first = build_flat_spatial_index(
+        owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.CPU,
+            selected=ExecutionMode.CPU,
+            reason="host validation seeds device proof",
+        ),
+    )
+    proof = owned.device_state.families[GeometryFamily.POLYGON].regular_grid_rect
+    assert first.regular_grid is not None
+    assert proof is not None
+    assert proof.total_bounds == (0.0, 0.0, 2.0, 2.0)
+
+    reset_d2h_transfer_count()
+    second = build_flat_spatial_index(
+        owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.CPU,
+            selected=ExecutionMode.CPU,
+            reason="consume host-seeded device proof",
+        ),
+    )
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    assert second.regular_grid is not None
+    assert second.device_bounds is not None
+    assert "spatial index regular-grid summary scalar fence" not in reasons
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for device grid index")
+def test_device_regular_grid_concat_preserves_row_aligned_proof() -> None:
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    top = _device_regular_box_owned_for_test(4)
+    bottom = _device_regular_box_owned_for_test(2, origin_y=2.0)
+
+    reset_d2h_transfer_count()
+    concatenated = OwnedGeometryArray.concat([top, bottom])
+    proof = concatenated.device_state.families[GeometryFamily.POLYGON].regular_grid_rect
+    assert proof is not None
+    assert proof.origin_x == 0.0
+    assert proof.origin_y == 0.0
+    assert proof.cols == 2
+    assert proof.rows == 3
+    assert proof.size == 6
+    assert proof.total_bounds == (0.0, 0.0, 2.0, 3.0)
+
+    flat_index = build_flat_spatial_index(
+        concatenated,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.CPU,
+            selected=ExecutionMode.CPU,
+            reason="consume concat regular-grid proof",
+        ),
+    )
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    assert flat_index.regular_grid is not None
+    assert flat_index.total_bounds == (0.0, 0.0, 2.0, 3.0)
+    assert "spatial index regular-grid summary scalar fence" not in reasons
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for device grid index")
@@ -547,6 +743,12 @@ def test_large_device_regular_grid_index_uses_parallel_certification(
     assert flat_index._host_bounds is None
     assert flat_index.device_bounds is not None
     assert flat_index.total_bounds == (0.0, 0.0, float(cols), float(rows))
+    polygon_device = tree_owned.device_state.families[GeometryFamily.POLYGON]
+    assert polygon_device.dense_single_ring_width == 5
+    assert polygon_device.axis_aligned_rectangles is True
+    assert polygon_device.bounds is flat_index.device_bounds
+    assert polygon_device.regular_grid_rect is not None
+    assert polygon_device.regular_grid_rect.size == cols * rows
     assert transfer_count <= 1
     assert transfer_bytes <= 64
 
@@ -1633,6 +1835,7 @@ class TestDeviceJoinResult:
         np.testing.assert_array_equal(left, [0, 1, 2])
         np.testing.assert_array_equal(right, [3, 4, 5])
 
+    @pytest.mark.gpu
     def test_device_join_result_materialization_is_observable(self) -> None:
         """_DeviceJoinResult should emit materialization events on lazy host copy."""
         pytest.importorskip("cupy")
@@ -1685,6 +1888,7 @@ class TestDeviceSpatialJoinResult:
         assert "d_left_idx" in field_names
         assert "d_right_idx" in field_names
 
+    @pytest.mark.gpu
     def test_to_host_returns_numpy_arrays(self) -> None:
         """to_host() should produce numpy int32 arrays matching device data."""
         pytest.importorskip("cupy")
@@ -1717,6 +1921,37 @@ class TestDeviceSpatialJoinResult:
             ("device_spatial_join_indices_to_host", "side=right, rows=4, bytes=16", False),
         }
 
+    @pytest.mark.gpu
+    def test_side_to_host_exports_only_requested_index_array(self) -> None:
+        """Side-specific exports should not materialize the other pair column."""
+        pytest.importorskip("cupy")
+        import cupy as cp
+
+        from vibespatial.runtime.materialization import (
+            clear_materialization_events,
+            get_materialization_events,
+        )
+        from vibespatial.spatial.query_types import DeviceSpatialJoinResult
+
+        d_left = cp.array([0, 1, 2, 3], dtype=cp.int32)
+        d_right = cp.array([4, 5, 6, 7], dtype=cp.int32)
+        result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
+        clear_materialization_events()
+
+        h_left = result.left_to_host(reason="test left-only export")
+        events = get_materialization_events(clear=True)
+
+        np.testing.assert_array_equal(h_left, [0, 1, 2, 3])
+        assert h_left.dtype == np.int32
+        assert [(event.operation, event.detail, event.reason) for event in events] == [
+            (
+                "device_spatial_join_indices_to_host",
+                "side=left, rows=4, bytes=16",
+                "test left-only export",
+            ),
+        ]
+
+    @pytest.mark.gpu
     def test_size_property(self) -> None:
         """size should report the number of index pairs."""
         pytest.importorskip("cupy")
@@ -1729,6 +1964,7 @@ class TestDeviceSpatialJoinResult:
         result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
         assert result.size == 2
 
+    @pytest.mark.gpu
     def test_empty_result(self) -> None:
         """Empty DeviceSpatialJoinResult should have size 0."""
         pytest.importorskip("cupy")
@@ -1745,6 +1981,7 @@ class TestDeviceSpatialJoinResult:
         assert h_right.size == 0
 
 
+@pytest.mark.gpu
 def test_device_knn_result_to_host_materialization_is_observable() -> None:
     pytest.importorskip("cupy")
     import cupy as cp
@@ -1883,8 +2120,8 @@ def test_return_device_point_region_refine_avoids_pair_d2h() -> None:
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
-def test_return_device_de9im_refine_avoids_pair_d2h() -> None:
-    """Device DE-9IM refinement should return filtered pairs without host export."""
+def test_return_device_polygonal_intersects_refine_avoids_pair_d2h(monkeypatch) -> None:
+    """Polygonal intersects relation refinement should stay device-resident."""
     from vibespatial.cuda._runtime import (
         get_d2h_transfer_events,
         get_d2h_transfer_stats,
@@ -1906,6 +2143,16 @@ def test_return_device_de9im_refine_avoids_pair_d2h() -> None:
         residency=Residency.DEVICE,
     )
 
+    import vibespatial.predicates.polygon as polygon_predicates
+
+    monkeypatch.setattr(
+        polygon_predicates,
+        "compute_polygon_de9im_gpu",
+        lambda *args, **kwargs: pytest.fail(
+            "polygonal intersects should not compute full DE-9IM masks"
+        ),
+    )
+
     tree_owned._ensure_device_state()
     query_owned._ensure_device_state()
     reset_d2h_transfer_count()
@@ -1923,12 +2170,12 @@ def test_return_device_de9im_refine_avoids_pair_d2h() -> None:
 
     assert execution.selected is ExecutionMode.GPU
     assert isinstance(result, DeviceSpatialJoinResult)
-    assert transfer_count <= 2
-    assert transfer_bytes <= 9
-    assert "spatial query predicate family-admission scalar fence" in event_reasons
+    assert transfer_count <= 1
+    assert transfer_bytes <= 8
     forbidden_exports = (
         "device candidate left pairs host export",
         "device candidate right pairs host export",
+        "spatial query predicate family-admission scalar fence",
         "spatial query left family-tag host export",
         "spatial query right family-tag host export",
         "spatial query GPU-pair mask host export",

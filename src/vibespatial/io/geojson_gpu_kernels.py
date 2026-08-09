@@ -92,6 +92,58 @@ __device__ __forceinline__ int match_literal(
     return 1;
 }
 
+__device__ __forceinline__ double decimal_pow10_abs(int exp10) {
+    double scale = 1.0;
+    double base = 10.0;
+    int e = exp10;
+    while (e > 0) {
+        if (e & 1) {
+            scale *= base;
+        }
+        base *= base;
+        e >>= 1;
+    }
+    return scale;
+}
+
+__device__ __forceinline__ double decimal_apply_scale(double value, int exp10) {
+    if (exp10 > 0) {
+        return value * decimal_pow10_abs(exp10);
+    }
+    if (exp10 < 0) {
+        return value / decimal_pow10_abs(-exp10);
+    }
+    return value;
+}
+
+__device__ __forceinline__ double decimal_mantissa_to_double(
+    unsigned long long mantissa,
+    int decimal_exp
+) {
+    const unsigned long long fp64_exact_integer_limit = 9007199254740992ULL;
+    if (mantissa <= fp64_exact_integer_limit) {
+        return decimal_apply_scale((double)mantissa, decimal_exp);
+    }
+
+    const unsigned long long chunk_base = 1000000000ULL;
+    unsigned long long high = mantissa / chunk_base;
+    unsigned long long low = mantissa - high * chunk_base;
+
+    if (high == 0ULL) {
+        return decimal_apply_scale((double)low, decimal_exp);
+    }
+    if (low == 0ULL) {
+        return decimal_apply_scale((double)high, decimal_exp + 9);
+    }
+
+    int high_exp = decimal_exp + 9;
+    double high_scale = high_exp >= 0
+        ? decimal_pow10_abs(high_exp)
+        : 1.0 / decimal_pow10_abs(-high_exp);
+    double low_term = decimal_apply_scale((double)low, decimal_exp);
+    return fma((double)high, high_scale, low_term);
+}
+
 __device__ __forceinline__ int parse_json_float_token(
     const unsigned char* __restrict__ input,
     long long n_bytes,
@@ -102,11 +154,14 @@ __device__ __forceinline__ int parse_json_float_token(
     long long pos = start;
     int negative = 0;
     int saw_digit = 0;
+    int after_decimal = 0;
     int in_exponent = 0;
     int exp_negative = 0;
     int exp_val = 0;
-    double result = 0.0;
-    double frac_mult = 0.0;
+    int significant_digits = 0;
+    int decimal_exp = 0;
+    int truncated_nonzero = 0;
+    unsigned long long mantissa = 0ULL;
 
     while (pos < n_bytes) {
         unsigned char c = input[pos];
@@ -123,10 +178,10 @@ __device__ __forceinline__ int parse_json_float_token(
                 break;
             }
         } else if (c == '.') {
-            if (frac_mult > 0.0 || in_exponent) {
+            if (after_decimal || in_exponent) {
                 break;
             }
-            frac_mult = 0.1;
+            after_decimal = 1;
         } else if (c == 'e' || c == 'E') {
             if (in_exponent || !saw_digit) {
                 break;
@@ -137,11 +192,25 @@ __device__ __forceinline__ int parse_json_float_token(
             saw_digit = 1;
             if (in_exponent) {
                 exp_val = exp_val * 10 + d;
-            } else if (frac_mult > 0.0) {
-                result += d * frac_mult;
-                frac_mult *= 0.1;
             } else {
-                result = result * 10.0 + d;
+                if (significant_digits == 0 && d == 0) {
+                    if (after_decimal) {
+                        decimal_exp -= 1;
+                    }
+                } else if (significant_digits < 19) {
+                    mantissa = mantissa * 10ULL + (unsigned long long)d;
+                    significant_digits += 1;
+                    if (after_decimal) {
+                        decimal_exp -= 1;
+                    }
+                } else if (!after_decimal) {
+                    decimal_exp += 1;
+                    if (d != 0) {
+                        truncated_nonzero = 1;
+                    }
+                } else if (d != 0) {
+                    truncated_nonzero = 1;
+                }
             }
         } else {
             break;
@@ -153,16 +222,14 @@ __device__ __forceinline__ int parse_json_float_token(
         return 0;
     }
 
-    if (negative) {
-        result = -result;
+    if (in_exponent) {
+        decimal_exp += exp_negative ? -exp_val : exp_val;
     }
 
-    if (in_exponent) {
-        double exp_mult = 1.0;
-        for (int e = 0; e < exp_val; ++e) {
-            exp_mult *= 10.0;
-        }
-        result = exp_negative ? (result / exp_mult) : (result * exp_mult);
+    double result = decimal_mantissa_to_double(mantissa, decimal_exp);
+    (void)truncated_nonzero;
+    if (negative) {
+        result = -result;
     }
 
     *out_value = result;
@@ -172,6 +239,8 @@ __device__ __forceinline__ int parse_json_float_token(
 
 extern "C" __global__ void find_geometry_key(
     const unsigned char* __restrict__ input,
+    const unsigned char* __restrict__ quote_parity,
+    const int* __restrict__ depth,
     unsigned char* __restrict__ hits,
     long long n
 ) {
@@ -196,6 +265,15 @@ extern "C" __global__ void find_geometry_key(
     // matches so property strings containing \"geometry\" do not qualify.
     if (match && idx > 0 && input[idx - 1] == '\\') {
         match = 0;
+    }
+    if (match) {
+        long long pos = idx + 10;
+        while (pos < n && is_ws(input[pos])) pos++;
+        if (pos >= n || input[pos] != ':') {
+            match = 0;
+        } else if (quote_parity[pos] != 0 || depth[pos] != 3) {
+            match = 0;
+        }
     }
     hits[idx] = match;
 }

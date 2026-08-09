@@ -60,7 +60,11 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
-from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
+from vibespatial.runtime.crossover import (
+    WorkloadShape,
+    detect_workload_shape,
+    estimate_pairwise_product_work_from_owned,
+)
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
@@ -71,9 +75,11 @@ logger = logging.getLogger(__name__)
 # Background precompilation (ADR-0034)
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("snap-fp64", _SNAP_FP64, _SNAP_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("snap-fp64", _SNAP_FP64, _SNAP_KERNEL_NAMES),
+    ]
+)
 
 from vibespatial.cuda.cccl_precompile import request_warmup  # noqa: E402
 
@@ -83,6 +89,7 @@ request_warmup(["exclusive_scan_i32"])
 # ---------------------------------------------------------------------------
 # Helpers: span offsets and coordinate ranges for a family
 # ---------------------------------------------------------------------------
+
 
 def _get_span_offsets(device_buf, family):
     """Return the device array of span offsets for this family.
@@ -192,16 +199,13 @@ def _pretransfer_family_data(d_left_state, d_right_state):
     # The actual D->H calls are in _transfer_coord_range_to_host /
     # _transfer_family_xy_to_host, not syntactically in a loop body.
     h_left_ranges = {
-        lf: _transfer_coord_range_to_host(buf, lf)
-        for lf, buf in d_left_state.families.items()
+        lf: _transfer_coord_range_to_host(buf, lf) for lf, buf in d_left_state.families.items()
     }
     h_right_ranges = {
-        rf: _transfer_coord_range_to_host(buf, rf)
-        for rf, buf in d_right_state.families.items()
+        rf: _transfer_coord_range_to_host(buf, rf) for rf, buf in d_right_state.families.items()
     }
     h_right_xy = {
-        rf: _transfer_family_xy_to_host(buf)
-        for rf, buf in d_right_state.families.items()
+        rf: _transfer_family_xy_to_host(buf) for rf, buf in d_right_state.families.items()
     }
     return h_left_ranges, h_right_ranges, h_right_xy
 
@@ -305,9 +309,17 @@ def _upload_virtual_b_to_device(host_arrays):
     (in _pretransfer_family_data) and H->D (here) in different
     function scopes, avoiding ZCOPY001 ping-pong detection.
     """
-    (h_geom_b_start, h_geom_b_end, h_a_cs, h_a_ce,
-     h_virt_b_x, h_virt_b_y, virt_offset,
-     h_virt_b_a_start, h_virt_b_a_end) = host_arrays
+    (
+        h_geom_b_start,
+        h_geom_b_end,
+        h_a_cs,
+        h_a_ce,
+        h_virt_b_x,
+        h_virt_b_y,
+        virt_offset,
+        h_virt_b_a_start,
+        h_virt_b_a_end,
+    ) = host_arrays
 
     return (
         cp.asarray(h_geom_b_start),
@@ -382,9 +394,15 @@ def _snap_and_dedup_family_gpu(
         return a_buf
 
     tolerance_sq = tolerance * tolerance
-    is_polygon_ring = 1 if a_family in (
-        GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON,
-    ) else 0
+    is_polygon_ring = (
+        1
+        if a_family
+        in (
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTIPOLYGON,
+        )
+        else 0
+    )
 
     snap_kernels = compile_kernel_group("snap-fp64", _SNAP_FP64, _SNAP_KERNEL_NAMES)
     ptr = runtime.pointer
@@ -400,17 +418,27 @@ def _snap_and_dedup_family_gpu(
         phase1_kernel = snap_kernels["snap_find_targets"]
         phase1_params = (
             (
-                ptr(a_buf.x), ptr(a_buf.y),
-                ptr(d_b_x), ptr(d_b_y), b_total_verts,
-                ptr(d_b_geom_a_start_arr), ptr(d_b_geom_a_end_arr),
-                ptr(d_snap_target_idx), ptr(d_snap_target_dist),
+                ptr(a_buf.x),
+                ptr(a_buf.y),
+                ptr(d_b_x),
+                ptr(d_b_y),
+                b_total_verts,
+                ptr(d_b_geom_a_start_arr),
+                ptr(d_b_geom_a_end_arr),
+                ptr(d_snap_target_idx),
+                ptr(d_snap_target_dist),
                 tolerance_sq,
             ),
             (
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_F64,
             ),
         )
@@ -427,17 +455,29 @@ def _snap_and_dedup_family_gpu(
     phase2_kernel = snap_kernels["snap_apply"]
     phase2_params = (
         (
-            ptr(a_buf.x), ptr(a_buf.y), ptr(d_a_span_offsets), a_span_count,
-            ptr(d_b_x), ptr(d_b_y),
+            ptr(a_buf.x),
+            ptr(a_buf.y),
+            ptr(d_a_span_offsets),
+            a_span_count,
+            ptr(d_b_x),
+            ptr(d_b_y),
             ptr(d_snap_target_idx),
-            ptr(d_out_x), ptr(d_out_y), ptr(d_keep),
+            ptr(d_out_x),
+            ptr(d_out_y),
+            ptr(d_keep),
             is_polygon_ring,
         ),
         (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
             KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
         ),
     )
@@ -532,14 +572,18 @@ def _snap_and_dedup_family_gpu(
 # GPU kernel dispatch (registered variant)
 # ---------------------------------------------------------------------------
 
+
 @register_kernel_variant(
     "snap",
     "gpu-cuda-python",
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("cuda-python", "constructive", "snap"),
@@ -586,7 +630,8 @@ def _snap_gpu(
 
     # Bulk D->H pre-transfer (bounded by geometry-type count, not data size)
     h_left_ranges, h_right_ranges, h_right_xy = _pretransfer_family_data(
-        d_left_state, d_right_state,
+        d_left_state,
+        d_right_state,
     )
 
     # Process each left family -- no D->H or H->D in this loop
@@ -623,25 +668,44 @@ def _snap_gpu(
 
         # Build virtual B arrays on host, then upload to device
         host_result = _build_virtual_b_host(
-            h_a_cs, h_a_ce, a_num_geoms,
-            a_local, b_global_tags, b_local,
-            h_right_ranges, h_right_xy,
+            h_a_cs,
+            h_a_ce,
+            a_num_geoms,
+            a_local,
+            b_global_tags,
+            b_local,
+            h_right_ranges,
+            h_right_xy,
         )
         if host_result is None:
             new_device_families[lf] = a_buf
             continue
 
-        (d_geom_b_start, d_geom_b_end, d_geom_a_start, d_geom_a_end,
-         d_virt_b_x, d_virt_b_y, virt_offset,
-         d_virt_b_a_start, d_virt_b_a_end) = _upload_virtual_b_to_device(host_result)
+        (
+            d_geom_b_start,
+            d_geom_b_end,
+            d_geom_a_start,
+            d_geom_a_end,
+            d_virt_b_x,
+            d_virt_b_y,
+            virt_offset,
+            d_virt_b_a_start,
+            d_virt_b_a_end,
+        ) = _upload_virtual_b_to_device(host_result)
 
         new_buf = _snap_and_dedup_family_gpu(
-            runtime, a_buf, lf,
-            d_geom_b_start, d_geom_b_end,
-            d_geom_a_start, d_geom_a_end,
-            d_virt_b_x, d_virt_b_y,
+            runtime,
+            a_buf,
+            lf,
+            d_geom_b_start,
+            d_geom_b_end,
+            d_geom_a_start,
+            d_geom_a_end,
+            d_virt_b_x,
+            d_virt_b_y,
             virt_offset,  # b_total_verts
-            d_virt_b_a_start, d_virt_b_a_end,
+            d_virt_b_a_start,
+            d_virt_b_a_end,
             tolerance,
         )
         new_device_families[lf] = new_buf
@@ -665,6 +729,7 @@ def _snap_gpu(
 # ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
+
 
 def snap_owned(
     left: OwnedGeometryArray,
@@ -718,6 +783,13 @@ def snap_owned(
         kernel_name="snap",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=n,
+        work_estimate=estimate_pairwise_product_work_from_owned(
+            left,
+            right,
+            pair_unit="coordinate",
+            output_row_count=n,
+            primary_unit_name="snap-coordinate-pair",
+        ),
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=combined_residency(left, right),

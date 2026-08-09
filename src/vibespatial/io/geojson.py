@@ -22,6 +22,7 @@ except ImportError:
     def _fast_json_loads(data):
         return json.loads(data)
 
+
 try:
     import simdjson as _simdjson
 
@@ -40,7 +41,7 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     from_geoarrow,
 )
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.dispatch import record_dispatch_event
 
 
@@ -329,22 +330,34 @@ def _append_geojson_geometry(
         return
 
 
-def _finalize_family_buffer(family: GeometryFamily, state: dict[str, object]) -> FamilyGeometryBuffer:
+def _finalize_family_buffer(
+    family: GeometryFamily, state: dict[str, object]
+) -> FamilyGeometryBuffer:
     x = np.asarray(state["x_payload"], dtype=np.float64)
     y = np.asarray(state["y_payload"], dtype=np.float64)
-    geometry_offsets = np.asarray([*state["geometry_offsets"], len(state["x_payload"])], dtype=np.int32)
+    geometry_offsets = np.asarray(
+        [*state["geometry_offsets"], len(state["x_payload"])], dtype=np.int32
+    )
     part_offsets = None
     ring_offsets = None
     if family is GeometryFamily.POLYGON:
         ring_offsets = np.asarray([*state["ring_offsets"], len(state["x_payload"])], dtype=np.int32)
-        geometry_offsets = np.asarray([*state["geometry_offsets"], len(state["ring_offsets"])], dtype=np.int32)
+        geometry_offsets = np.asarray(
+            [*state["geometry_offsets"], len(state["ring_offsets"])], dtype=np.int32
+        )
     elif family is GeometryFamily.MULTILINESTRING:
         part_offsets = np.asarray([*state["part_offsets"], len(state["x_payload"])], dtype=np.int32)
-        geometry_offsets = np.asarray([*state["geometry_offsets"], len(state["part_offsets"])], dtype=np.int32)
+        geometry_offsets = np.asarray(
+            [*state["geometry_offsets"], len(state["part_offsets"])], dtype=np.int32
+        )
     elif family is GeometryFamily.MULTIPOLYGON:
-        part_offsets = np.asarray([*state["part_offsets"], len(state["ring_offsets"])], dtype=np.int32)
+        part_offsets = np.asarray(
+            [*state["part_offsets"], len(state["ring_offsets"])], dtype=np.int32
+        )
         ring_offsets = np.asarray([*state["ring_offsets"], len(state["x_payload"])], dtype=np.int32)
-        geometry_offsets = np.asarray([*state["geometry_offsets"], len(state["part_offsets"])], dtype=np.int32)
+        geometry_offsets = np.asarray(
+            [*state["geometry_offsets"], len(state["part_offsets"])], dtype=np.int32
+        )
     return FamilyGeometryBuffer(
         family=family,
         schema=get_geometry_buffer_schema(family),
@@ -417,12 +430,19 @@ def _feature_collection_spans(text: str) -> list[tuple[int, int]]:
 
 
 def _has_pylibcudf_geojson_support() -> bool:
-    return find_spec("pylibcudf") is not None and find_spec("pyarrow") is not None
+    return (
+        has_gpu_runtime()
+        and find_spec("pylibcudf") is not None
+        and find_spec("pyarrow") is not None
+    )
 
 
 def _require_pylibcudf_geojson_support() -> None:
     if not _has_pylibcudf_geojson_support():
-        raise RuntimeError("pylibcudf + pyarrow are required for GeoJSON GPU ingest")
+        raise RuntimeError(
+            "an available CUDA runtime plus pylibcudf and pyarrow are required "
+            "for GeoJSON GPU ingest"
+        )
 
 
 def _geojson_records_column(records: list[str]):
@@ -505,15 +525,21 @@ def _decode_geojson_point_view(x_array, y_array, family: GeometryFamily) -> GeoA
         geometry_offsets[1:] = np.cumsum(non_empty.astype(np.int32), dtype=np.int32)
     return GeoArrowBufferView(
         family=family,
-        x=np.asarray(x_array.filter(pa.array(non_empty)).to_numpy(zero_copy_only=False), dtype=np.float64),
-        y=np.asarray(y_array.filter(pa.array(non_empty)).to_numpy(zero_copy_only=False), dtype=np.float64),
+        x=np.asarray(
+            x_array.filter(pa.array(non_empty)).to_numpy(zero_copy_only=False), dtype=np.float64
+        ),
+        y=np.asarray(
+            y_array.filter(pa.array(non_empty)).to_numpy(zero_copy_only=False), dtype=np.float64
+        ),
         geometry_offsets=geometry_offsets,
         empty_mask=~non_empty,
     )
 
 
 def _decode_geojson_point_geometry_view(coords_array, family: GeometryFamily) -> GeoArrowBufferView:
-    lengths = np.diff(np.asarray(coords_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32))
+    lengths = np.diff(
+        np.asarray(coords_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
+    )
     if lengths.size and not np.all((lengths == 0) | (lengths == 2)):
         raise NotImplementedError("GeoJSON GPU point ingest currently supports only 2D coordinates")
     scalars = np.asarray(coords_array.values.to_numpy(zero_copy_only=False), dtype=np.float64)
@@ -532,7 +558,9 @@ def _decode_geojson_point_geometry_view(coords_array, family: GeometryFamily) ->
     )
 
 
-def _decode_geojson_linestring_like_view(x_array, y_array, family: GeometryFamily) -> GeoArrowBufferView:
+def _decode_geojson_linestring_like_view(
+    x_array, y_array, family: GeometryFamily
+) -> GeoArrowBufferView:
     geometry_offsets = np.asarray(x_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
     return GeoArrowBufferView(
         family=family,
@@ -543,8 +571,12 @@ def _decode_geojson_linestring_like_view(x_array, y_array, family: GeometryFamil
     )
 
 
-def _decode_geojson_linestring_geometry_view(coords_array, family: GeometryFamily) -> GeoArrowBufferView:
-    geometry_offsets = np.asarray(coords_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
+def _decode_geojson_linestring_geometry_view(
+    coords_array, family: GeometryFamily
+) -> GeoArrowBufferView:
+    geometry_offsets = np.asarray(
+        coords_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32
+    )
     x, y = _coordinate_xy_from_point_lists(coords_array.values)
     return GeoArrowBufferView(
         family=family,
@@ -568,7 +600,9 @@ def _decode_geojson_polygon_view(x_array, y_array, family: GeometryFamily) -> Ge
     )
 
 
-def _decode_geojson_multilinestring_view(x_array, y_array, family: GeometryFamily) -> GeoArrowBufferView:
+def _decode_geojson_multilinestring_view(
+    x_array, y_array, family: GeometryFamily
+) -> GeoArrowBufferView:
     geometry_offsets = np.asarray(x_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
     part_offsets = np.asarray(x_array.values.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
     return GeoArrowBufferView(
@@ -581,8 +615,12 @@ def _decode_geojson_multilinestring_view(x_array, y_array, family: GeometryFamil
     )
 
 
-def _decode_geojson_multilinestring_geometry_view(coords_array, family: GeometryFamily) -> GeoArrowBufferView:
-    geometry_offsets = np.asarray(coords_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
+def _decode_geojson_multilinestring_geometry_view(
+    coords_array, family: GeometryFamily
+) -> GeoArrowBufferView:
+    geometry_offsets = np.asarray(
+        coords_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32
+    )
     part_array = coords_array.values
     part_offsets = np.asarray(part_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
     x, y = _coordinate_xy_from_point_lists(part_array.values)
@@ -596,8 +634,12 @@ def _decode_geojson_multilinestring_geometry_view(coords_array, family: Geometry
     )
 
 
-def _decode_geojson_polygon_geometry_view(coords_array, family: GeometryFamily) -> GeoArrowBufferView:
-    geometry_offsets = np.asarray(coords_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
+def _decode_geojson_polygon_geometry_view(
+    coords_array, family: GeometryFamily
+) -> GeoArrowBufferView:
+    geometry_offsets = np.asarray(
+        coords_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32
+    )
     ring_array = coords_array.values
     ring_offsets = np.asarray(ring_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
     x, y = _coordinate_xy_from_point_lists(ring_array.values)
@@ -611,10 +653,14 @@ def _decode_geojson_polygon_geometry_view(coords_array, family: GeometryFamily) 
     )
 
 
-def _decode_geojson_multipolygon_view(x_array, y_array, family: GeometryFamily) -> GeoArrowBufferView:
+def _decode_geojson_multipolygon_view(
+    x_array, y_array, family: GeometryFamily
+) -> GeoArrowBufferView:
     geometry_offsets = np.asarray(x_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
     part_offsets = np.asarray(x_array.values.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
-    ring_offsets = np.asarray(x_array.values.values.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
+    ring_offsets = np.asarray(
+        x_array.values.values.offsets.to_numpy(zero_copy_only=False), dtype=np.int32
+    )
     return GeoArrowBufferView(
         family=family,
         x=np.asarray(x_array.values.values.values.to_numpy(zero_copy_only=False), dtype=np.float64),
@@ -626,8 +672,12 @@ def _decode_geojson_multipolygon_view(x_array, y_array, family: GeometryFamily) 
     )
 
 
-def _decode_geojson_multipolygon_geometry_view(coords_array, family: GeometryFamily) -> GeoArrowBufferView:
-    geometry_offsets = np.asarray(coords_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
+def _decode_geojson_multipolygon_geometry_view(
+    coords_array, family: GeometryFamily
+) -> GeoArrowBufferView:
+    geometry_offsets = np.asarray(
+        coords_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32
+    )
     polygon_array = coords_array.values
     part_offsets = np.asarray(polygon_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
     ring_array = polygon_array.values
@@ -644,7 +694,9 @@ def _decode_geojson_multipolygon_geometry_view(coords_array, family: GeometryFam
     )
 
 
-def _decode_geojson_gpu_coordinates_view(family: GeometryFamily, coordinates_column) -> GeoArrowBufferView:
+def _decode_geojson_gpu_coordinates_view(
+    family: GeometryFamily, coordinates_column
+) -> GeoArrowBufferView:
     import pylibcudf as plc
 
     geometry_table = plc.io.json.read_json_from_string_column(
@@ -667,7 +719,9 @@ def _decode_geojson_gpu_coordinates_view(family: GeometryFamily, coordinates_col
     raise NotImplementedError(f"unsupported GeoJSON GPU family: {family.value}")
 
 
-def _decode_geojson_gpu_geometry_view(family: GeometryFamily, geometry_column) -> GeoArrowBufferView:
+def _decode_geojson_gpu_geometry_view(
+    family: GeometryFamily, geometry_column
+) -> GeoArrowBufferView:
     import pylibcudf as plc
 
     geometry_table = plc.io.json.read_json_from_string_column(
@@ -683,7 +737,9 @@ def _decode_geojson_gpu_geometry_view(family: GeometryFamily, geometry_column) -
     raise NotImplementedError(f"unsupported GeoJSON geometry-object family: {family.value}")
 
 
-def _decode_geojson_coordinate_array_view(family: GeometryFamily, coords_array) -> GeoArrowBufferView:
+def _decode_geojson_coordinate_array_view(
+    family: GeometryFamily, coords_array
+) -> GeoArrowBufferView:
     if family is GeometryFamily.POINT:
         return _decode_geojson_point_geometry_view(coords_array, family)
     if family in {GeometryFamily.LINESTRING, GeometryFamily.MULTIPOINT}:
@@ -713,7 +769,9 @@ def _read_geojson_owned_pylibcudf_arrays(text: str) -> GeoJSONOwnedBatch | None:
     ).tbl
     geometry_type_array = plc.concatenate.concatenate(type_table.columns()).to_arrow()
     geometry_types = geometry_type_array.to_pylist()
-    families = {_geometry_family_from_geojson_name(name) for name in geometry_types if name is not None}
+    families = {
+        _geometry_family_from_geojson_name(name) for name in geometry_types if name is not None
+    }
     families.discard(None)
     if len(families) != 1:
         return None
@@ -810,9 +868,7 @@ def _read_geojson_owned_pylibcudf_rowized(text: str) -> GeoJSONOwnedBatch | None
     _, geometry_struct = geometry_child
     geometry_types = geometry_struct.field(0).to_pylist()
     families = {
-        _geometry_family_from_geojson_name(name)
-        for name in geometry_types
-        if name is not None
+        _geometry_family_from_geojson_name(name) for name in geometry_types if name is not None
     }
     families.discard(None)
     if len(families) != 1:
@@ -1238,6 +1294,7 @@ def _read_geojson_owned_simdjson(data: str | bytes) -> GeoJSONOwnedBatch:
 # Chunked GeoJSON ingest: split features array by byte range, parse chunks
 # ---------------------------------------------------------------------------
 
+
 def _find_feature_chunk_boundaries(
     text_bytes: bytes,
     n_chunks: int,
@@ -1358,6 +1415,7 @@ def read_geojson_owned(
     plan = plan_geojson_ingest(prefer=prefer, objective=objective)
     if plan.selected_strategy == "gpu-byte-classify":
         from .geojson_gpu import read_geojson_gpu
+
         record_dispatch_event(
             surface="vibespatial.io.geojson",
             operation="read_owned",

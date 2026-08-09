@@ -128,6 +128,46 @@ def test_representative_point_stays_device_resident(strict_device_guard):
     assert result.residency == Residency.DEVICE
 
 
+@pytest.mark.gpu
+def test_representative_point_consumes_indexed_polygon_rows_without_d2h():
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for indexed representative-point carrier")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+    from vibespatial.runtime.residency import Residency
+
+    source = [_make_concave_l_shape(), _make_polygon_with_hole()]
+    owned = from_shapely_geometries(source, residency=Residency.DEVICE)
+    indices = cp.arange(1024, dtype=cp.int64) & 1
+    indexed = owned.device_take(indices)
+    assert indexed.is_indexed_view
+    indexed.device_state.trusted_polygonal_only = None
+    assert indexed.device_state.trusted_family_domain == (GeometryFamily.POLYGON,)
+
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+    with assert_zero_d2h_transfers():
+        result = representative_point_owned(
+            indexed,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+
+    assert result.residency is Residency.DEVICE
+    assert not result.is_indexed_view
+    assert get_materialization_events(clear=True) == []
+    result_geoms = result.to_shapely()
+    _assert_point_inside(result_geoms, [source[i & 1] for i in range(1024)])
+    reset_d2h_transfer_count()
+
+
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
 @pytest.mark.parametrize(
     ("family", "device_buffer", "source_geom"),
@@ -375,6 +415,43 @@ class TestRepresentativePointMultiPolygon:
         result = representative_point_owned(owned)
         geoms = result.to_shapely()
         _assert_point_inside(geoms, [mp])
+
+    def test_disconnected_triangles_return_strict_interior_point(self):
+        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime.residency import Residency
+
+        mp = MultiPolygon([
+            Polygon([(0, 0), (2, 0), (1, 1)]),
+            Polygon([(0, 3), (1, 2), (2, 3)]),
+        ])
+        owned = from_shapely_geometries([mp], residency=Residency.DEVICE)
+
+        result = representative_point_owned(
+            owned,
+            dispatch_mode=ExecutionMode.GPU,
+        ).to_shapely()[0]
+
+        assert mp.contains(result)
+
+    def test_component_boundary_centroid_uses_strict_interior_scanline(self):
+        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime.residency import Residency
+
+        mp = MultiPolygon(
+            [
+                Polygon([(1, 9), (5, 5), (1, 1), (1, 9)]),
+                Polygon([(9, 1), (5, 5), (9, 9), (9, 1)]),
+            ]
+        )
+        owned = from_shapely_geometries([mp], residency=Residency.DEVICE)
+
+        result = representative_point_owned(
+            owned,
+            dispatch_mode=ExecutionMode.GPU,
+        ).to_shapely()[0]
+
+        assert mp.contains(result)
+        assert not mp.boundary.covers(result)
 
 
 # ---------------------------------------------------------------------------

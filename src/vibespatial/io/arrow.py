@@ -9,6 +9,7 @@ The original monolithic io_arrow module has been refactored into:
 This file preserves backwards compatibility so that ``from vibespatial.io.arrow import X``
 continues to work.
 """
+
 from __future__ import annotations
 
 import numpy as np

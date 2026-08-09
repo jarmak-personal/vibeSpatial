@@ -26,11 +26,7 @@ def group_has_only_polygon_families(
         from vibespatial.cuda._runtime import get_cuda_runtime
 
         state = geometries._ensure_device_state()
-        polygon_families = {
-            TAG_FAMILIES[tag]
-            for tag in polygon_tags
-            if tag in TAG_FAMILIES
-        }
+        polygon_families = {TAG_FAMILIES[tag] for tag in polygon_tags if tag in TAG_FAMILIES}
         if set(state.families).issubset(polygon_families):
             return True
         d_validity = cp.asarray(state.validity).astype(cp.bool_, copy=False)

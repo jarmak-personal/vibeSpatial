@@ -173,19 +173,53 @@ def infer_geom_types(ga: GeometryArray) -> frozenset[str] | None:
     falls back to shapely.get_type_id.
     """
     from vibespatial.geometry.owned import TAG_FAMILIES
+    from vibespatial.runtime.residency import Residency
 
     if ga._owned is not None:
-        tags = ga._owned.tags
-        if hasattr(tags, "get"):
-            # CuPy array -- pull to host
-            tags = np.asarray(tags)
-        unique_tags = np.unique(tags)
-        return frozenset(
-            TAG_FAMILIES[int(t)].value for t in unique_tags if int(t) >= 0
-        )
+        owned = ga._owned
+        if (
+            owned.residency is Residency.DEVICE
+            and owned.device_state is not None
+            and getattr(owned, "_tags", None) is None
+        ):
+            state = owned._ensure_device_state(preserve_indexed_view=True)
+            if state.trusted_homogeneous_family is not None:
+                return frozenset({state.trusted_homogeneous_family.value})
+            if not getattr(owned, "is_indexed_view", False):
+                return frozenset(family.value for family in state.families)
+            try:
+                import cupy as cp
+            except ModuleNotFoundError:  # pragma: no cover - guarded by residency
+                cp = None
+            if cp is not None:
+                from vibespatial.cuda._runtime import get_cuda_runtime
+
+                domain = len(TAG_FAMILIES)
+                d_tags = cp.asarray(state.tags, dtype=cp.int16)
+                d_valid = cp.asarray(state.validity, dtype=cp.bool_)
+                d_present = cp.zeros(domain, dtype=cp.bool_)
+                d_domain_rows = d_valid & (d_tags >= 0) & (d_tags < np.int16(domain))
+                d_present[d_tags[d_domain_rows]] = True
+                unique_tags = np.flatnonzero(
+                    get_cuda_runtime().copy_device_to_host(
+                        d_present,
+                        reason="provenance geometry tag-domain summary scalar fence",
+                    )
+                )
+            else:
+                unique_tags = np.asarray([], dtype=np.int64)
+        else:
+            tags = owned.tags
+            if hasattr(tags, "get"):
+                # CuPy array -- pull to host
+                tags = np.asarray(tags)
+            unique_tags = np.unique(tags)
+        return frozenset(TAG_FAMILIES[int(t)].value for t in unique_tags if int(t) >= 0)
     if ga._shapely_data is not None and len(ga._shapely_data) > 0:
         type_ids = shapely.get_type_id(ga._shapely_data)
-        valid = type_ids[~np.isnan(type_ids.astype(float))] if type_ids.dtype == object else type_ids
+        valid = (
+            type_ids[~np.isnan(type_ids.astype(float))] if type_ids.dtype == object else type_ids
+        )
         unique_ids = np.unique(valid[valid >= 0])
         _SHAPELY_TYPE_NAMES = {
             0: "point",
@@ -197,9 +231,7 @@ def infer_geom_types(ga: GeometryArray) -> frozenset[str] | None:
             6: "multipolygon",
             7: "polygon",  # GeometryCollection -> treat as mixed
         }
-        return frozenset(
-            _SHAPELY_TYPE_NAMES.get(int(tid), "unknown") for tid in unique_ids
-        )
+        return frozenset(_SHAPELY_TYPE_NAMES.get(int(tid), "unknown") for tid in unique_ids)
     return None
 
 
@@ -248,7 +280,13 @@ R1_BUFFER_INTERSECTS = RewriteRule(
     name="R1_buffer_intersects_to_dwithin",
     input_pattern="buffer",
     consumer_operation="intersects",
-    preconditions=("point_only", "positive_distance", "round_cap", "round_join", "not_single_sided"),
+    preconditions=(
+        "point_only",
+        "positive_distance",
+        "round_cap",
+        "round_join",
+        "not_single_sided",
+    ),
     reason="buffer(r).intersects(Y) == dwithin(Y, r) for isotropic point buffers",
 )
 
@@ -272,7 +310,13 @@ R2_SJOIN_BUFFER_INTERSECTS = RewriteRule(
     name="R2_sjoin_buffer_intersects_to_dwithin",
     input_pattern="buffer",
     consumer_operation="sjoin",
-    preconditions=("point_only", "positive_distance", "round_cap", "round_join", "not_single_sided"),
+    preconditions=(
+        "point_only",
+        "positive_distance",
+        "round_cap",
+        "round_join",
+        "not_single_sided",
+    ),
     reason="sjoin(buffer(r, X), Y, intersects) == sjoin(X, Y, dwithin, r) for point buffers",
 )
 
@@ -314,7 +358,9 @@ def _r1_preconditions_met(tag: ProvenanceTag) -> bool:
     return True
 
 
-def _r6_preconditions_met(tag: ProvenanceTag, new_distance: float | int, new_cap: str, new_join: str) -> bool:
+def _r6_preconditions_met(
+    tag: ProvenanceTag, new_distance: float | int, new_cap: str, new_join: str
+) -> bool:
     """Check R6 preconditions: positive radii, same style, point-only."""
     if not _is_point_only(tag.source_geom_types):
         return False

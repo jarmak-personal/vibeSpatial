@@ -5,6 +5,7 @@ Requires cuda-bench: pip install cuda-bench[cu12]
 Usage (standalone):
     python bench_polygon_intersection.py --scale 10000 --output-json results.json
 """
+
 from __future__ import annotations
 
 import argparse
@@ -61,9 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     b = bench.register(intersection_bench)
     b.add_int64_axis("NumElements", [n])
 
-    bench.run_all_benchmarks(
-        ["--json", str(args.output_json)]
-    )
+    bench.run_all_benchmarks(["--json", str(args.output_json)])
     return 0
 
 

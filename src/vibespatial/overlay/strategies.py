@@ -11,6 +11,7 @@ Uses the shared ``WorkloadShape`` enum from ``vibespatial.runtime.crossover``
 for broadcast detection (nsf.5), falling back to overlay-specific detection
 for ``broadcast_left`` (which the shared enum intentionally omits).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -322,10 +323,13 @@ def plan_overlay_operation(
         name = "clip_rewrite"
         many_side = "left"
         reason = (
-            f"single-mask clip rewrite: {left_rows} left rows vs {right_rows} right rows, "
-            f"how={how}"
+            f"single-mask clip rewrite: {left_rows} left rows vs {right_rows} right rows, how={how}"
         )
-    elif workload_shape is not None and workload_shape.value == "broadcast_right" and how == "intersection":
+    elif (
+        workload_shape is not None
+        and workload_shape.value == "broadcast_right"
+        and how == "intersection"
+    ):
         family = OverlayExecutionFamily.BROADCAST_RIGHT_INTERSECTION
         topology_class = OverlayTopologyClass.BROADCAST_MASK
         result_shape = OverlayResultShape.LEFT_ROWS
@@ -335,7 +339,11 @@ def plan_overlay_operation(
             f"N-vs-1 broadcast-right intersection: {left_rows} left rows vs 1 right row, "
             f"how={how}, pairs={candidate_pair_count}"
         )
-    elif workload_shape is not None and workload_shape.value == "broadcast_right" and how == "difference":
+    elif (
+        workload_shape is not None
+        and workload_shape.value == "broadcast_right"
+        and how == "difference"
+    ):
         family = OverlayExecutionFamily.BROADCAST_RIGHT_DIFFERENCE
         topology_class = OverlayTopologyClass.BROADCAST_MASK
         result_shape = OverlayResultShape.LEFT_ROWS
@@ -355,7 +363,11 @@ def plan_overlay_operation(
             f"pairwise coverage-style union: {left_rows} left rows vs {right_rows} right rows, "
             f"pairs={candidate_pair_count}"
         )
-    elif how in ("difference", "symmetric_difference") and right_rows > 1 and candidate_pair_count != 0:
+    elif (
+        how in ("difference", "symmetric_difference")
+        and right_rows > 1
+        and candidate_pair_count != 0
+    ):
         family = OverlayExecutionFamily.GROUPED_UNION
         topology_class = OverlayTopologyClass.GROUPED_SET
         result_shape = OverlayResultShape.GROUPED_LEFT_ROWS

@@ -22,10 +22,11 @@ _POINT_DISTANCE_KERNEL_SOURCE = POINT_DISTANCE_KERNEL_SOURCE_FP64
 
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("point-distance", _POINT_DISTANCE_KERNEL_SOURCE, _POINT_DISTANCE_KERNEL_NAMES),
-])
-
+request_nvrtc_warmup(
+    [
+        ("point-distance", _POINT_DISTANCE_KERNEL_SOURCE, _POINT_DISTANCE_KERNEL_NAMES),
+    ]
+)
 
 
 def _point_distance_kernels(compute_type: str = "double"):
@@ -37,6 +38,7 @@ def _point_distance_kernels(compute_type: str = "double"):
         source=source,
         kernel_names=_POINT_DISTANCE_KERNEL_NAMES,
     )
+
 
 _FAMILY_KERNEL_MAP: dict[GeometryFamily, tuple[str, bool, bool]] = {
     GeometryFamily.LINESTRING: ("point_linestring_distance_from_owned", False, False),
@@ -94,6 +96,7 @@ def compute_point_distance_gpu(
     # Determine compute type from precision plan.
     if compute_precision is PrecisionMode.AUTO:
         from vibespatial.runtime.adaptive import get_cached_snapshot
+
         snapshot = get_cached_snapshot()
         use_fp32 = not snapshot.device_profile.favors_native_fp64
     else:
@@ -128,20 +131,32 @@ def compute_point_distance_gpu(
     # Build argument list following the from_owned convention.
     args = [
         # query point state
-        ptr(query_state.validity), ptr(query_state.tags), ptr(query_state.family_row_offsets),
-        ptr(query_points.geometry_offsets), ptr(query_points.empty_mask),
-        ptr(query_points.x), ptr(query_points.y),
+        ptr(query_state.validity),
+        ptr(query_state.tags),
+        ptr(query_state.family_row_offsets),
+        ptr(query_points.geometry_offsets),
+        ptr(query_points.empty_mask),
+        ptr(query_points.x),
+        ptr(query_points.y),
         FAMILY_TAGS[GeometryFamily.POINT],
         # tree state (common prefix)
-        ptr(tree_state.validity), ptr(tree_state.tags), ptr(tree_state.family_row_offsets),
+        ptr(tree_state.validity),
+        ptr(tree_state.tags),
+        ptr(tree_state.family_row_offsets),
         ptr(tree_buffer.geometry_offsets),
     ]
     arg_types = [
-        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
         KERNEL_PARAM_I32,
-        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
         KERNEL_PARAM_PTR,
     ]
 
@@ -154,28 +169,36 @@ def compute_point_distance_gpu(
         arg_types.append(KERNEL_PARAM_PTR)
 
     # Remaining tree buffer fields + pair / output + center coordinates.
-    args.extend([
-        ptr(tree_buffer.empty_mask),
-        ptr(tree_buffer.x), ptr(tree_buffer.y),
-        FAMILY_TAGS[tree_family],
-        ptr(d_left), ptr(d_right),
-        ptr(d_distances),
-        1 if exclusive else 0,
-        pair_count,
-        center_x,
-        center_y,
-    ])
-    arg_types.extend([
-        KERNEL_PARAM_PTR,
-        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-        KERNEL_PARAM_I32,
-        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-        KERNEL_PARAM_PTR,
-        KERNEL_PARAM_I32,
-        KERNEL_PARAM_I32,
-        KERNEL_PARAM_F64,
-        KERNEL_PARAM_F64,
-    ])
+    args.extend(
+        [
+            ptr(tree_buffer.empty_mask),
+            ptr(tree_buffer.x),
+            ptr(tree_buffer.y),
+            FAMILY_TAGS[tree_family],
+            ptr(d_left),
+            ptr(d_right),
+            ptr(d_distances),
+            1 if exclusive else 0,
+            pair_count,
+            center_x,
+            center_y,
+        ]
+    )
+    arg_types.extend(
+        [
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_F64,
+        ]
+    )
 
     grid, block = runtime.launch_config(kernels[kernel_name], pair_count)
     runtime.launch(

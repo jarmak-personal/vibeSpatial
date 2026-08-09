@@ -49,7 +49,11 @@ from vibespatial.kernels.constructive.shortest_line import (
 )
 from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
-from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
+from vibespatial.runtime.crossover import (
+    WorkloadShape,
+    detect_workload_shape,
+    estimate_pairwise_product_work_from_owned,
+)
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
@@ -60,14 +64,18 @@ from vibespatial.runtime.residency import Residency, TransferTrigger
 # NVRTC warmup (ADR-0034)
 # ---------------------------------------------------------------------------
 
-request_nvrtc_warmup([
-    ("shortest-line", _SHORTEST_LINE_KERNEL_SOURCE, SHORTEST_LINE_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("shortest-line", _SHORTEST_LINE_KERNEL_SOURCE, SHORTEST_LINE_KERNEL_NAMES),
+    ]
+)
 
 
 def _shortest_line_kernels():
     return compile_kernel_group(
-        "shortest-line", _SHORTEST_LINE_KERNEL_SOURCE, SHORTEST_LINE_KERNEL_NAMES,
+        "shortest-line",
+        _SHORTEST_LINE_KERNEL_SOURCE,
+        SHORTEST_LINE_KERNEL_NAMES,
     )
 
 
@@ -112,6 +120,7 @@ _CANONICAL_KERNELS: dict[tuple[GeometryFamily, GeometryFamily], str] = {
 # Family args builder (matches segment_distance pattern)
 # ---------------------------------------------------------------------------
 
+
 def _family_args(state, family, runtime):
     """Build (args, arg_types) for one side of a from_owned kernel."""
     ptr = runtime.pointer
@@ -148,6 +157,7 @@ def _family_args(state, family, runtime):
 # ---------------------------------------------------------------------------
 # Output assembly: build LineString OGA from four coordinate arrays
 # ---------------------------------------------------------------------------
+
 
 def _build_linestring_oga(
     out_ax,
@@ -217,6 +227,7 @@ def _empty_linestring_oga(row_count: int) -> OwnedGeometryArray:
 # GPU kernel dispatch
 # ---------------------------------------------------------------------------
 
+
 def _launch_shortest_line_subgroup(
     left_owned: OwnedGeometryArray,
     right_owned: OwnedGeometryArray,
@@ -275,19 +286,33 @@ def _launch_shortest_line_subgroup(
         # is actually the "right" geometry in the original pairing.
         # We swap the output pointers so the kernel writes A->B correctly.
         tail_args = [
-            ptr(eff_left), ptr(eff_right),
-            ptr(d_out_bx), ptr(d_out_by), ptr(d_out_ax), ptr(d_out_ay),
+            ptr(eff_left),
+            ptr(eff_right),
+            ptr(d_out_bx),
+            ptr(d_out_by),
+            ptr(d_out_ax),
+            ptr(d_out_ay),
             sub_count,
         ]
     else:
         tail_args = [
-            ptr(eff_left), ptr(eff_right),
-            ptr(d_out_ax), ptr(d_out_ay), ptr(d_out_bx), ptr(d_out_by),
+            ptr(eff_left),
+            ptr(eff_right),
+            ptr(d_out_ax),
+            ptr(d_out_ay),
+            ptr(d_out_bx),
+            ptr(d_out_by),
             sub_count,
         ]
-    tail_types = [KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                  KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                  KERNEL_PARAM_I32]
+    tail_types = [
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_I32,
+    ]
 
     all_args = tuple(left_args + right_args + tail_args)
     all_types = tuple(left_types + right_types + tail_types)
@@ -308,8 +333,11 @@ def _launch_shortest_line_subgroup(
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "linestring", "polygon",
-        "multilinestring", "multipolygon",
+        "point",
+        "linestring",
+        "polygon",
+        "multilinestring",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("cuda-python", "constructive", "shortest_line"),
@@ -385,10 +413,18 @@ def _shortest_line_gpu(
         d_sub_by = cp.empty((sub_count,), dtype=cp.float64)
 
         ok = _launch_shortest_line_subgroup(
-            left, right,
-            d_idx, d_idx,  # left_idx == right_idx for element-wise
-            d_sub_ax, d_sub_ay, d_sub_bx, d_sub_by,
-            sub_count, lf, rf, swapped=False,
+            left,
+            right,
+            d_idx,
+            d_idx,  # left_idx == right_idx for element-wise
+            d_sub_ax,
+            d_sub_ay,
+            d_sub_bx,
+            d_sub_by,
+            sub_count,
+            lf,
+            rf,
+            swapped=False,
         )
 
         if ok:
@@ -413,6 +449,7 @@ def _shortest_line_gpu(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def shortest_line_owned(
     left: OwnedGeometryArray,
@@ -445,6 +482,14 @@ def shortest_line_owned(
         kernel_name="shortest_line",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=n,
+        work_estimate=estimate_pairwise_product_work_from_owned(
+            left,
+            right,
+            pair_unit="segment",
+            output_row_count=n,
+            output_byte_count=n * 2 * 16,
+            primary_unit_name="shortest-line-segment-pair",
+        ),
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=combined_residency(left, right),

@@ -31,6 +31,10 @@ from vibespatial.geometry.owned import (  # noqa: E402
 )
 from vibespatial.runtime import ExecutionMode  # noqa: E402
 from vibespatial.runtime.adaptive import plan_dispatch_selection  # noqa: E402
+from vibespatial.runtime.crossover import (  # noqa: E402
+    PhysicalWorkEstimate,
+    estimate_physical_work_from_owned,
+)
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
 from vibespatial.runtime.residency import (  # noqa: E402
     Residency,
@@ -38,13 +42,17 @@ from vibespatial.runtime.residency import (  # noqa: E402
     combined_residency,
 )
 
-request_nvrtc_warmup([
-    ("point-constructive", _POINT_CONSTRUCTIVE_KERNEL_SOURCE, _POINT_CONSTRUCTIVE_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("point-constructive", _POINT_CONSTRUCTIVE_KERNEL_SOURCE, _POINT_CONSTRUCTIVE_KERNEL_NAMES),
+    ]
+)
 
 
 def _point_constructive_kernels():
-    return compile_kernel_group("point-constructive", _POINT_CONSTRUCTIVE_KERNEL_SOURCE, _POINT_CONSTRUCTIVE_KERNEL_NAMES)
+    return compile_kernel_group(
+        "point-constructive", _POINT_CONSTRUCTIVE_KERNEL_SOURCE, _POINT_CONSTRUCTIVE_KERNEL_NAMES
+    )
 
 
 def _device_bool_scalar(value, *, reason: str) -> bool:
@@ -154,6 +162,10 @@ def point_owned_from_xy_device(x: np.ndarray, y: np.ndarray) -> OwnedGeometryArr
         family_row_offsets=d_family_row_offsets,
         execution_mode="gpu",
     )
+    if result.device_state is not None:
+        result.device_state.trusted_all_valid = True
+        result.device_state.trusted_homogeneous_family = GeometryFamily.POINT
+        result.device_state.trusted_all_non_empty = True
     result.families[GeometryFamily.POINT] = FamilyGeometryBuffer(
         family=GeometryFamily.POINT,
         schema=get_geometry_buffer_schema(GeometryFamily.POINT),
@@ -225,7 +237,10 @@ def _point_buffer_host_admission_checked(points: OwnedGeometryArray) -> bool:
 
 
 def _build_point_buffers_cpu(
-    points: OwnedGeometryArray, radii: np.ndarray, *, quad_segs: int = 1,
+    points: OwnedGeometryArray,
+    radii: np.ndarray,
+    *,
+    quad_segs: int = 1,
 ) -> OwnedGeometryArray:
     _, x, y = _point_rows_and_xy(points)
     row_count = x.size
@@ -311,7 +326,7 @@ def _build_device_backed_point_output(
             bounds=None,
         )
     }
-    return build_device_resident_owned(
+    result = build_device_resident_owned(
         device_families=device_families,
         row_count=row_count,
         tags=tags,
@@ -319,6 +334,11 @@ def _build_device_backed_point_output(
         family_row_offsets=family_row_offsets,
         execution_mode="gpu",
     )
+    if result.device_state is not None:
+        result.device_state.trusted_all_valid = True
+        result.device_state.trusted_homogeneous_family = GeometryFamily.POINT
+        result.device_state.trusted_all_non_empty = True
+    return result
 
 
 def _build_device_backed_polygon_output(
@@ -328,17 +348,14 @@ def _build_device_backed_polygon_output(
     row_count: int,
     bounds,
     verts_per_ring: int = 5,
+    axis_aligned_rectangles: bool = False,
 ) -> OwnedGeometryArray:
     import cupy as cp
 
     runtime = get_cuda_runtime()
     bounds_is_device = hasattr(bounds, "__cuda_array_interface__")
     device_bounds = (
-        bounds
-        if bounds_is_device
-        else None
-        if bounds is None
-        else runtime.from_host(bounds)
+        bounds if bounds_is_device else None if bounds is None else runtime.from_host(bounds)
     )
     host_bounds = None if bounds_is_device else bounds
     d_geometry_offsets = cp.arange(row_count + 1, dtype=cp.int32)
@@ -375,6 +392,9 @@ def _build_device_backed_polygon_output(
                 ring_offsets=d_ring_offsets,
                 bounds=device_bounds,
                 dense_single_ring_width=verts_per_ring,
+                axis_aligned_rectangles=(
+                    bool(axis_aligned_rectangles) and int(verts_per_ring) == 5
+                ),
             )
         },
         row_count=row_count,
@@ -385,6 +405,9 @@ def _build_device_backed_polygon_output(
     )
     if result.device_state is not None:
         result.device_state.row_bounds = device_bounds
+        result.device_state.trusted_all_valid = True
+        result.device_state.trusted_homogeneous_family = GeometryFamily.POLYGON
+        result.device_state.trusted_all_non_empty = True
     result.families[GeometryFamily.POLYGON] = polygon_buffer
     return result
 
@@ -401,12 +424,25 @@ def clip_points_rect_owned(
 ) -> OwnedGeometryArray:
     if GeometryFamily.POINT not in points.families or len(points.families) != 1:
         raise ValueError("clip_points_rect_owned requires a point-only OwnedGeometryArray")
+    point_work = estimate_physical_work_from_owned(points)
     selected_mode = plan_dispatch_selection(
         kernel_name="point_clip",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=points.row_count,
         requested_mode=dispatch_mode,
         current_residency=combined_residency(points),
+        work_estimate=PhysicalWorkEstimate(
+            row_count=points.row_count,
+            coordinate_count=point_work.coordinate_count,
+            output_row_count=points.row_count,
+            output_byte_count=int(points.row_count) * 24,
+            temporary_byte_count=int(points.row_count) * 13,
+            primary_unit_count=max(
+                int(points.row_count),
+                int(point_work.coordinate_count),
+            ),
+            primary_unit_name="point-clip-coordinate",
+        ),
     ).selected
     point_buffer = points.families[GeometryFamily.POINT]
     if point_buffer.row_count == 0:
@@ -564,12 +600,25 @@ def point_buffer_owned_array(
     if radii.shape != (points.row_count,):
         raise ValueError("distance must be a scalar or length-matched vector")
 
+    output_coordinate_capacity = int(points.row_count) * (4 * int(quad_segs) + 1)
     selected_mode = plan_dispatch_selection(
         kernel_name="point_buffer",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=points.row_count,
         requested_mode=dispatch_mode,
         current_residency=combined_residency(points),
+        work_estimate=PhysicalWorkEstimate(
+            row_count=points.row_count,
+            coordinate_count=points.row_count,
+            output_row_count=points.row_count,
+            output_byte_count=output_coordinate_capacity * 16,
+            temporary_byte_count=int(points.row_count) * 24,
+            primary_unit_count=max(
+                int(points.row_count),
+                output_coordinate_capacity,
+            ),
+            primary_unit_name="point-buffer-output-coordinate",
+        ),
     ).selected
     if selected_mode is not ExecutionMode.GPU:
         point_buffer = points.families[GeometryFamily.POINT]
@@ -578,7 +627,9 @@ def point_buffer_owned_array(
         if np.any(points.tags != FAMILY_TAGS[GeometryFamily.POINT]):
             raise ValueError("point_buffer_owned_array requires point-only rows")
         if np.any(point_buffer.empty_mask):
-            raise ValueError("point_buffer_owned_array requires non-null, non-empty point rows only")
+            raise ValueError(
+                "point_buffer_owned_array requires non-null, non-empty point rows only"
+            )
         return _build_point_buffers_cpu(points, radii, quad_segs=quad_segs)
 
     host_admission_checked = _point_buffer_host_admission_checked(points)
@@ -593,7 +644,12 @@ def point_buffer_owned_array(
 
     state = points._ensure_device_state()
     point_buffer = state.families[GeometryFamily.POINT]
-    if not host_admission_checked:
+    device_admission_checked = (
+        state.trusted_all_valid is True
+        and state.trusted_homogeneous_family is GeometryFamily.POINT
+        and state.trusted_all_non_empty is True
+    )
+    if not host_admission_checked and not device_admission_checked:
         if not _device_bool_scalar(
             cp.all(state.validity),
             reason="point buffer validity admission scalar fence",
@@ -608,7 +664,9 @@ def point_buffer_owned_array(
             cp.any(point_buffer.empty_mask),
             reason="point buffer empty-point admission scalar fence",
         ):
-            raise ValueError("point_buffer_owned_array requires non-null, non-empty point rows only")
+            raise ValueError(
+                "point_buffer_owned_array requires non-null, non-empty point rows only"
+            )
     device_radii = runtime.from_host(radii)
     device_unit_x = None
     device_unit_y = None

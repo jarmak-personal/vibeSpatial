@@ -61,7 +61,9 @@ def point_buffer_kernel_gpu(
 
     geometries = list(values)
     owned = from_shapely_geometries(geometries)
-    result = point_buffer_owned_array(owned, distance, quad_segs=quad_segs, dispatch_mode=ExecutionMode.GPU)
+    result = point_buffer_owned_array(
+        owned, distance, quad_segs=quad_segs, dispatch_mode=ExecutionMode.GPU
+    )
     row_count = result.row_count
     return BufferKernelResult(
         geometries=None,

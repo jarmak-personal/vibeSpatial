@@ -6,6 +6,7 @@ import pytest
 from vibespatial.testing import DeviceResidencyViolation, device_residency_guard
 
 cp = pytest.importorskip("cupy")
+pytestmark = pytest.mark.gpu
 
 
 class TestScalarExemption:

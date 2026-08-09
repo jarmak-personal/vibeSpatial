@@ -72,6 +72,7 @@ Precision (ADR-0002):
     fp64 per ADR-0002 (same rationale as csv_gpu.py, kml_gpu.py, and
     all other IO readers).
 """
+
 from __future__ import annotations
 
 import ctypes
@@ -121,10 +122,12 @@ logger = logging.getLogger(__name__)
 
 
 # Register for NVRTC precompilation (ADR-0034)
-request_nvrtc_warmup([
-    ("osm-varint-decode", _VARINT_DECODE_SOURCE, _VARINT_DECODE_NAMES),
-    ("osm-way-coord-gather", _WAY_COORD_GATHER_SOURCE, _WAY_COORD_GATHER_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("osm-varint-decode", _VARINT_DECODE_SOURCE, _VARINT_DECODE_NAMES),
+        ("osm-way-coord-gather", _WAY_COORD_GATHER_SOURCE, _WAY_COORD_GATHER_NAMES),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -138,44 +141,44 @@ _WIRE_LENGTH_DELIMITED = 2
 _WIRE_32BIT = 5
 
 # PBF top-level blob structure
-_BLOBHEADER_TYPE_FIELD = 1       # string
-_BLOBHEADER_DATASIZE_FIELD = 3   # int32
+_BLOBHEADER_TYPE_FIELD = 1  # string
+_BLOBHEADER_DATASIZE_FIELD = 3  # int32
 
-_BLOB_RAW_FIELD = 1              # bytes (uncompressed)
-_BLOB_RAW_SIZE_FIELD = 2         # int32
-_BLOB_ZLIB_DATA_FIELD = 3        # bytes (zlib compressed)
+_BLOB_RAW_FIELD = 1  # bytes (uncompressed)
+_BLOB_RAW_SIZE_FIELD = 2  # int32
+_BLOB_ZLIB_DATA_FIELD = 3  # bytes (zlib compressed)
 
 # PrimitiveBlock fields
 _PRIMITIVEBLOCK_STRINGTABLE_FIELD = 1
 _PRIMITIVEBLOCK_PRIMITIVEGROUP_FIELD = 2
-_PRIMITIVEBLOCK_GRANULARITY_FIELD = 17    # int32, default 100
-_PRIMITIVEBLOCK_LAT_OFFSET_FIELD = 19     # int64, default 0
-_PRIMITIVEBLOCK_LON_OFFSET_FIELD = 20     # int64, default 0
+_PRIMITIVEBLOCK_GRANULARITY_FIELD = 17  # int32, default 100
+_PRIMITIVEBLOCK_LAT_OFFSET_FIELD = 19  # int64, default 0
+_PRIMITIVEBLOCK_LON_OFFSET_FIELD = 20  # int64, default 0
 
 # PrimitiveGroup fields
-_PRIMITIVEGROUP_DENSE_FIELD = 2           # DenseNodes
-_PRIMITIVEGROUP_WAYS_FIELD = 3            # repeated Way
-_PRIMITIVEGROUP_RELATIONS_FIELD = 4       # repeated Relation
+_PRIMITIVEGROUP_DENSE_FIELD = 2  # DenseNodes
+_PRIMITIVEGROUP_WAYS_FIELD = 3  # repeated Way
+_PRIMITIVEGROUP_RELATIONS_FIELD = 4  # repeated Relation
 
 # DenseNodes fields
-_DENSENODES_ID_FIELD = 1         # packed sint64 (ZigZag + delta)
-_DENSENODES_LAT_FIELD = 8        # packed sint64 (ZigZag + delta)
-_DENSENODES_LON_FIELD = 9        # packed sint64 (ZigZag + delta)
-_DENSENODES_KEYS_VALS_FIELD = 10 # packed uint32 (interleaved key/val/0)
+_DENSENODES_ID_FIELD = 1  # packed sint64 (ZigZag + delta)
+_DENSENODES_LAT_FIELD = 8  # packed sint64 (ZigZag + delta)
+_DENSENODES_LON_FIELD = 9  # packed sint64 (ZigZag + delta)
+_DENSENODES_KEYS_VALS_FIELD = 10  # packed uint32 (interleaved key/val/0)
 
 # Way fields
-_WAY_ID_FIELD = 1                # int64 (varint)
-_WAY_KEYS_FIELD = 2              # packed uint32
-_WAY_VALS_FIELD = 3              # packed uint32
-_WAY_REFS_FIELD = 8              # packed sint64 (ZigZag + delta)
+_WAY_ID_FIELD = 1  # int64 (varint)
+_WAY_KEYS_FIELD = 2  # packed uint32
+_WAY_VALS_FIELD = 3  # packed uint32
+_WAY_REFS_FIELD = 8  # packed sint64 (ZigZag + delta)
 
 # Relation fields
-_RELATION_ID_FIELD = 1           # int64 (varint)
-_RELATION_KEYS_FIELD = 2         # packed uint32
-_RELATION_VALS_FIELD = 3         # packed uint32
-_RELATION_ROLES_SID_FIELD = 8    # packed int32 (stringtable indices for member roles)
-_RELATION_MEMIDS_FIELD = 9       # packed sint64 (delta-encoded member IDs)
-_RELATION_TYPES_FIELD = 10       # packed int32 (MemberType enum: 0=NODE, 1=WAY, 2=RELATION)
+_RELATION_ID_FIELD = 1  # int64 (varint)
+_RELATION_KEYS_FIELD = 2  # packed uint32
+_RELATION_VALS_FIELD = 3  # packed uint32
+_RELATION_ROLES_SID_FIELD = 8  # packed int32 (stringtable indices for member roles)
+_RELATION_MEMIDS_FIELD = 9  # packed sint64 (delta-encoded member IDs)
+_RELATION_TYPES_FIELD = 10  # packed int32 (MemberType enum: 0=NODE, 1=WAY, 2=RELATION)
 
 # Relation MemberType enum
 _MEMBER_TYPE_NODE = 0
@@ -239,26 +242,27 @@ _OSM_IGNORE_COMMON_PREFIXES = ("openGeoDB:",)
 # Data classes
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class BlockInfo:
     """Metadata for one BlobHeader + Blob pair in the PBF file."""
 
-    offset: int             # byte offset of the BlobHeader size prefix
-    blob_header_size: int   # size of the BlobHeader protobuf
-    blob_size: int          # size of the Blob protobuf (from BlobHeader.datasize)
-    block_type: str         # "OSMHeader" or "OSMData"
+    offset: int  # byte offset of the BlobHeader size prefix
+    blob_header_size: int  # size of the BlobHeader protobuf
+    blob_size: int  # size of the Blob protobuf (from BlobHeader.datasize)
+    block_type: str  # "OSMHeader" or "OSMData"
 
 
 @dataclass(frozen=True)
 class DenseNodesBlock:
     """Extracted varint byte ranges for one DenseNodes within a PrimitiveBlock."""
 
-    id_bytes: bytes         # raw packed varint bytes for delta-encoded IDs
-    lat_bytes: bytes        # raw packed varint bytes for delta-encoded lats
-    lon_bytes: bytes        # raw packed varint bytes for delta-encoded lons
-    granularity: int        # nanodegree granularity (default 100)
-    lat_offset: int         # nanodegree lat offset (default 0)
-    lon_offset: int         # nanodegree lon offset (default 0)
+    id_bytes: bytes  # raw packed varint bytes for delta-encoded IDs
+    lat_bytes: bytes  # raw packed varint bytes for delta-encoded lats
+    lon_bytes: bytes  # raw packed varint bytes for delta-encoded lons
+    granularity: int  # nanodegree granularity (default 100)
+    lat_offset: int  # nanodegree lat offset (default 0)
+    lon_offset: int  # nanodegree lon offset (default 0)
     keys_vals_bytes: bytes = b""  # packed uint32 for DenseNodes tag extraction
     stringtable: list[bytes] | None = None  # block's string table for tag decoding
 
@@ -267,34 +271,34 @@ class DenseNodesBlock:
 class WayBlock:
     """Extracted data for Ways within one PrimitiveBlock."""
 
-    way_ids: list[int]                    # absolute Way IDs
-    refs_per_way: list[list[int]]         # absolute node refs per Way (delta-decoded on CPU)
-    tag_keys_per_way: list[list[int]]     # stringtable indices per Way
-    tag_vals_per_way: list[list[int]]     # stringtable indices per Way
-    stringtable: list[bytes]              # block's string table
+    way_ids: list[int]  # absolute Way IDs
+    refs_per_way: list[list[int]]  # absolute node refs per Way (delta-decoded on CPU)
+    tag_keys_per_way: list[list[int]]  # stringtable indices per Way
+    tag_vals_per_way: list[list[int]]  # stringtable indices per Way
+    stringtable: list[bytes]  # block's string table
 
 
 @dataclass(frozen=True)
 class RelationMember:
     """A single member of an OSM Relation."""
 
-    member_id: int      # absolute ID of the referenced element
-    member_type: int    # 0=Node, 1=Way, 2=Relation
-    role: str           # "outer", "inner", etc.
+    member_id: int  # absolute ID of the referenced element
+    member_type: int  # 0=Node, 1=Way, 2=Relation
+    role: str  # "outer", "inner", etc.
 
 
 @dataclass(frozen=True)
 class RelationBlock:
     """Extracted data for Relations within one PrimitiveBlock."""
 
-    relation_ids: list[int]                           # absolute relation IDs
-    members_per_relation: list[list[RelationMember]]   # parsed members
-    stringtable: list[bytes]                          # block's string table
+    relation_ids: list[int]  # absolute relation IDs
+    members_per_relation: list[list[RelationMember]]  # parsed members
+    stringtable: list[bytes]  # block's string table
     granularity: int
     lat_offset: int
     lon_offset: int
-    tag_keys_per_relation: list[list[int]] | None = None   # stringtable indices
-    tag_vals_per_relation: list[list[int]] | None = None   # stringtable indices
+    tag_keys_per_relation: list[list[int]] | None = None  # stringtable indices
+    tag_vals_per_relation: list[list[int]] | None = None  # stringtable indices
 
 
 @dataclass(frozen=True)
@@ -400,6 +404,7 @@ def _slice_osm_result_rows(
 # CPU: Protobuf low-level helpers
 # ---------------------------------------------------------------------------
 
+
 def _decode_varint(data: bytes | memoryview, offset: int) -> tuple[int, int]:
     """Decode one unsigned protobuf varint at *offset*.
 
@@ -457,7 +462,9 @@ def _skip_field(data: bytes | memoryview, offset: int, wire_type: int) -> int:
         # Unknown wire type — likely lost sync within the message.
         # Return len(data) to terminate the current parse loop gracefully
         # rather than crashing the entire pipeline.
-        logger.debug("Unknown wire type %d at offset %d, skipping rest of message", wire_type, offset)
+        logger.debug(
+            "Unknown wire type %d at offset %d, skipping rest of message", wire_type, offset
+        )
         return len(data)
 
 
@@ -473,6 +480,7 @@ def _parse_field_tag(data: bytes | memoryview, offset: int) -> tuple[int, int, i
 # ---------------------------------------------------------------------------
 # CPU: Block index parsing
 # ---------------------------------------------------------------------------
+
 
 def _parse_block_index(path: Path) -> list[BlockInfo]:
     """Parse a PBF file to build a block index.
@@ -506,7 +514,8 @@ def _parse_block_index(path: Path) -> list[BlockInfo]:
             pos = 0
             while pos < len(blob_header_data):
                 field_num, wire_type, consumed = _parse_field_tag(
-                    blob_header_data, pos,
+                    blob_header_data,
+                    pos,
                 )
                 pos += consumed
 
@@ -521,12 +530,14 @@ def _parse_block_index(path: Path) -> list[BlockInfo]:
                 else:
                     pos = _skip_field(blob_header_data, pos, wire_type)
 
-            blocks.append(BlockInfo(
-                offset=block_start,
-                blob_header_size=blob_header_size,
-                blob_size=blob_size,
-                block_type=block_type,
-            ))
+            blocks.append(
+                BlockInfo(
+                    offset=block_start,
+                    blob_header_size=blob_header_size,
+                    blob_size=blob_size,
+                    block_type=block_type,
+                )
+            )
 
             # Skip past the Blob data
             f.seek(block_start + 4 + blob_header_size + blob_size)
@@ -537,6 +548,7 @@ def _parse_block_index(path: Path) -> list[BlockInfo]:
 # ---------------------------------------------------------------------------
 # CPU: Block decompression
 # ---------------------------------------------------------------------------
+
 
 def _decompress_blob(data: bytes) -> bytes:
     """Decompress a single Blob protobuf message.
@@ -776,7 +788,9 @@ def _accumulate_dense_blocks(
         if dense.keys_vals_bytes and dense.stringtable is not None:
             kv = _decode_packed_uint32(dense.keys_vals_bytes)
             block_tags = _decode_dense_node_tags(
-                kv, dense.stringtable, n_block_nodes,
+                kv,
+                dense.stringtable,
+                n_block_nodes,
             )
             has_any_tags = has_any_tags or any(block_tags)
         else:
@@ -884,8 +898,8 @@ def _extract_stream_block_components(
     extract_relations: bool,
 ) -> tuple[list[DenseNodesBlock], WayBlock | None, RelationBlock | None]:
     """Extract requested PrimitiveBlock components in one pass over group payloads."""
-    stringtable, primitive_groups, granularity, lat_offset, lon_offset = _scan_primitive_block_metadata(
-        block_data
+    stringtable, primitive_groups, granularity, lat_offset, lon_offset = (
+        _scan_primitive_block_metadata(block_data)
     )
 
     dense_blocks: list[DenseNodesBlock] = []
@@ -1084,6 +1098,7 @@ def _stream_extract_ways_and_relations(
 # CPU: Protobuf field extraction -- locate DenseNodes within PrimitiveBlock
 # ---------------------------------------------------------------------------
 
+
 def _extract_dense_nodes_blocks(raw_blocks: list[bytes]) -> list[DenseNodesBlock]:
     """Extract DenseNodes field byte ranges from decompressed PrimitiveBlocks.
 
@@ -1094,9 +1109,9 @@ def _extract_dense_nodes_blocks(raw_blocks: list[bytes]) -> list[DenseNodesBlock
     results: list[DenseNodesBlock] = []
 
     for block_data in raw_blocks:
-        granularity = 100       # default per OSM PBF spec
-        lat_offset = 0          # default
-        lon_offset = 0          # default
+        granularity = 100  # default per OSM PBF spec
+        lat_offset = 0  # default
+        lon_offset = 0  # default
         primitive_groups: list[tuple[int, int]] = []  # (start, length) of each group
         st_start = -1
         st_length = 0
@@ -1157,7 +1172,8 @@ def _extract_dense_nodes_blocks(raw_blocks: list[bytes]) -> list[DenseNodesBlock
                     dpos = 0
                     while dpos < len(dense_data):
                         d_field, d_wire, d_consumed = _parse_field_tag(
-                            dense_data, dpos,
+                            dense_data,
+                            dpos,
                         )
                         dpos += d_consumed
 
@@ -1178,16 +1194,18 @@ def _extract_dense_nodes_blocks(raw_blocks: list[bytes]) -> list[DenseNodesBlock
                             dpos = _skip_field(dense_data, dpos, d_wire)
 
                     if id_bytes and lat_bytes and lon_bytes:
-                        results.append(DenseNodesBlock(
-                            id_bytes=id_bytes,
-                            lat_bytes=lat_bytes,
-                            lon_bytes=lon_bytes,
-                            granularity=granularity,
-                            lat_offset=lat_offset,
-                            lon_offset=lon_offset,
-                            keys_vals_bytes=keys_vals_bytes,
-                            stringtable=stringtable,
-                        ))
+                        results.append(
+                            DenseNodesBlock(
+                                id_bytes=id_bytes,
+                                lat_bytes=lat_bytes,
+                                lon_bytes=lon_bytes,
+                                granularity=granularity,
+                                lat_offset=lat_offset,
+                                lon_offset=lon_offset,
+                                keys_vals_bytes=keys_vals_bytes,
+                                stringtable=stringtable,
+                            )
+                        )
                 else:
                     pos = _skip_field(block_data, pos, wire_type)
 
@@ -1197,6 +1215,7 @@ def _extract_dense_nodes_blocks(raw_blocks: list[bytes]) -> list[DenseNodesBlock
 # ---------------------------------------------------------------------------
 # CPU: Protobuf field extraction -- locate Ways within PrimitiveBlock
 # ---------------------------------------------------------------------------
+
 
 def _parse_stringtable(block_data: bytes, st_start: int, st_length: int) -> list[bytes]:
     """Parse a StringTable message and return the list of byte strings."""
@@ -1288,11 +1307,13 @@ def _decode_dense_node_tags(
             val_sid = keys_vals[i + 1] if i + 1 < len(keys_vals) else 0
             key = (
                 stringtable[key_sid].decode("utf-8", errors="replace")
-                if key_sid < len(stringtable) else str(key_sid)
+                if key_sid < len(stringtable)
+                else str(key_sid)
             )
             val = (
                 stringtable[val_sid].decode("utf-8", errors="replace")
-                if val_sid < len(stringtable) else str(val_sid)
+                if val_sid < len(stringtable)
+                else str(val_sid)
             )
             current[key] = val
             i += 2
@@ -1346,11 +1367,13 @@ def _decode_dense_node_tags_sparse(
         val_sid = keys_vals[i + 1] if i + 1 < len(keys_vals) else 0
         key = (
             stringtable[key_sid].decode("utf-8", errors="replace")
-            if key_sid < len(stringtable) else str(key_sid)
+            if key_sid < len(stringtable)
+            else str(key_sid)
         )
         val = (
             stringtable[val_sid].decode("utf-8", errors="replace")
-            if val_sid < len(stringtable) else str(val_sid)
+            if val_sid < len(stringtable)
+            else str(val_sid)
         )
         current[key] = val
         i += 2
@@ -1613,13 +1636,15 @@ def _extract_way_blocks(raw_blocks: list[bytes]) -> list[WayBlock]:
                     pos = _skip_field(block_data, pos, wire_type)
 
         if block_way_ids:
-            results.append(WayBlock(
-                way_ids=block_way_ids,
-                refs_per_way=block_refs,
-                tag_keys_per_way=block_tag_keys,
-                tag_vals_per_way=block_tag_vals,
-                stringtable=stringtable,
-            ))
+            results.append(
+                WayBlock(
+                    way_ids=block_way_ids,
+                    refs_per_way=block_refs,
+                    tag_keys_per_way=block_tag_keys,
+                    tag_vals_per_way=block_tag_vals,
+                    stringtable=stringtable,
+                )
+            )
 
     return results
 
@@ -1627,6 +1652,7 @@ def _extract_way_blocks(raw_blocks: list[bytes]) -> list[WayBlock]:
 # ---------------------------------------------------------------------------
 # CPU: Protobuf field extraction -- locate Relations within PrimitiveBlock
 # ---------------------------------------------------------------------------
+
 
 def _parse_single_relation(
     relation_data: bytes,
@@ -1689,11 +1715,13 @@ def _parse_single_relation(
         role = ""
         if sid < len(stringtable):
             role = stringtable[sid].decode("utf-8", errors="replace")
-        members.append(RelationMember(
-            member_id=member_ids[i],
-            member_type=member_types[i],
-            role=role,
-        ))
+        members.append(
+            RelationMember(
+                member_id=member_ids[i],
+                member_type=member_types[i],
+                role=role,
+            )
+        )
 
     return relation_id, members, tag_keys, tag_vals
 
@@ -1759,14 +1787,18 @@ def _extract_relation_blocks(raw_blocks: list[bytes]) -> list[RelationBlock]:
                 field_num, wire_type, consumed = _parse_field_tag(block_data, pos)
                 pos += consumed
 
-                if field_num == _PRIMITIVEGROUP_RELATIONS_FIELD and wire_type == _WIRE_LENGTH_DELIMITED:
+                if (
+                    field_num == _PRIMITIVEGROUP_RELATIONS_FIELD
+                    and wire_type == _WIRE_LENGTH_DELIMITED
+                ):
                     length, consumed = _decode_varint(block_data, pos)
                     pos += consumed
                     relation_data = block_data[pos : pos + length]
                     pos += length
 
                     rel_id, members, tag_keys, tag_vals = _parse_single_relation(
-                        relation_data, stringtable,
+                        relation_data,
+                        stringtable,
                     )
                     if members:  # Skip relations with no members
                         block_relation_ids.append(rel_id)
@@ -1777,16 +1809,18 @@ def _extract_relation_blocks(raw_blocks: list[bytes]) -> list[RelationBlock]:
                     pos = _skip_field(block_data, pos, wire_type)
 
         if block_relation_ids:
-            results.append(RelationBlock(
-                relation_ids=block_relation_ids,
-                members_per_relation=block_members,
-                stringtable=stringtable,
-                granularity=granularity,
-                lat_offset=lat_offset,
-                lon_offset=lon_offset,
-                tag_keys_per_relation=block_tag_keys,
-                tag_vals_per_relation=block_tag_vals,
-            ))
+            results.append(
+                RelationBlock(
+                    relation_ids=block_relation_ids,
+                    members_per_relation=block_members,
+                    stringtable=stringtable,
+                    granularity=granularity,
+                    lat_offset=lat_offset,
+                    lon_offset=lon_offset,
+                    tag_keys_per_relation=block_tag_keys,
+                    tag_vals_per_relation=block_tag_vals,
+                )
+            )
 
     return results
 
@@ -1794,6 +1828,7 @@ def _extract_relation_blocks(raw_blocks: list[bytes]) -> list[RelationBlock]:
 # ---------------------------------------------------------------------------
 # CPU: Way chaining for MultiPolygon assembly
 # ---------------------------------------------------------------------------
+
 
 def _build_way_id_to_refs(
     way_blocks: list[WayBlock],
@@ -1898,7 +1933,8 @@ def _collect_way_refs(
         if refs is None:
             logger.debug(
                 "Relation %d: Way member %d not found in dataset, skipping",
-                rel_id, m.member_id,
+                rel_id,
+                m.member_id,
             )
             continue
 
@@ -1914,6 +1950,7 @@ def _collect_way_refs(
 # ---------------------------------------------------------------------------
 # GPU: Relation (MultiPolygon) processing pipeline
 # ---------------------------------------------------------------------------
+
 
 def _process_relations_gpu(
     relation_blocks: list[RelationBlock],
@@ -1978,7 +2015,9 @@ def _process_relations_gpu(
             continue  # defer to pass 2
 
         outer_way_refs, inner_way_refs = _collect_way_refs(
-            rel_id, members, way_lookup,
+            rel_id,
+            members,
+            way_lookup,
         )
 
         if not outer_way_refs:
@@ -1999,7 +2038,9 @@ def _process_relations_gpu(
 
         # Start with Way members (same as pass 1)
         outer_way_refs, inner_way_refs = _collect_way_refs(
-            rel_id, members, way_lookup,
+            rel_id,
+            members,
+            way_lookup,
         )
 
         # Merge rings from resolved child relations
@@ -2012,7 +2053,8 @@ def _process_relations_gpu(
                 logger.debug(
                     "Relation %d: child relation %d not resolved "
                     "(missing or deeper recursion), skipping",
-                    rel_id, m.member_id,
+                    rel_id,
+                    m.member_id,
                 )
                 continue
 
@@ -2107,7 +2149,9 @@ def _process_relations_gpu(
 
     # Build node lookup table on GPU (Tier 2 CuPy)
     d_sorted_ids, d_sorted_x, d_sorted_y = _build_node_lookup(
-        d_node_ids, d_lon, d_lat,
+        d_node_ids,
+        d_lon,
+        d_lat,
     )
 
     # Upload flat refs to GPU and resolve coordinates via binary search
@@ -2115,7 +2159,10 @@ def _process_relations_gpu(
     d_refs = cp.asarray(h_flat_refs)
 
     d_out_x, d_out_y = _gpu_gather_way_coords(
-        d_sorted_ids, d_sorted_x, d_sorted_y, d_refs,
+        d_sorted_ids,
+        d_sorted_x,
+        d_sorted_y,
+        d_refs,
     )
 
     # Build offset arrays on GPU (Tier 2 CuPy)
@@ -2151,7 +2198,9 @@ def _process_relations_gpu(
 
     logger.info(
         "OSM PBF: assembled %d MultiPolygon relations (%d total rings, %d coordinates)",
-        n_relations, len(all_ring_refs), total_coords,
+        n_relations,
+        len(all_ring_refs),
+        total_coords,
     )
 
     return owned, d_relation_ids, n_relations
@@ -2160,6 +2209,7 @@ def _process_relations_gpu(
 # ---------------------------------------------------------------------------
 # CPU: Count varints in a packed byte array
 # ---------------------------------------------------------------------------
+
 
 def _count_varints(data: bytes) -> int:
     """Count the number of varints in a packed varint byte array.
@@ -2196,6 +2246,7 @@ def _locate_varint_positions(data: bytes, count: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # GPU: Varint decoding
 # ---------------------------------------------------------------------------
+
 
 def _compile_varint_kernels():
     """Compile the varint decode NVRTC kernels (cached)."""
@@ -2240,10 +2291,22 @@ def _gpu_decode_varints_zigzag(
 
     ptr = runtime.pointer
     params = (
-        (ptr(d_data), ptr(d_positions), ptr(d_values), ptr(None),
-         ctypes.c_longlong(len(data_bytes)), ctypes.c_int(n)),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_I64, KERNEL_PARAM_I32),
+        (
+            ptr(d_data),
+            ptr(d_positions),
+            ptr(d_values),
+            ptr(None),
+            ctypes.c_longlong(len(data_bytes)),
+            ctypes.c_int(n),
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I64,
+            KERNEL_PARAM_I32,
+        ),
     )
 
     runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -2254,6 +2317,7 @@ def _gpu_decode_varints_zigzag(
 # ---------------------------------------------------------------------------
 # GPU: Delta decode + coordinate scaling
 # ---------------------------------------------------------------------------
+
 
 def _gpu_delta_decode_and_scale(
     dense_blocks: list[DenseNodesBlock],
@@ -2288,7 +2352,9 @@ def _gpu_delta_decode_and_scale(
         if not (n_ids == n_lats == n_lons):
             logger.warning(
                 "DenseNodes field count mismatch: ids=%d, lats=%d, lons=%d; skipping block",
-                n_ids, n_lats, n_lons,
+                n_ids,
+                n_lats,
+                n_lons,
             )
             continue
 
@@ -2316,9 +2382,8 @@ def _gpu_delta_decode_and_scale(
 
     # Check if all blocks share the same granularity/offsets (common case)
     uniform_granularity = all(g == block_granularities[0] for g in block_granularities)
-    uniform_offsets = (
-        all(o == block_lat_offsets[0] for o in block_lat_offsets)
-        and all(o == block_lon_offsets[0] for o in block_lon_offsets)
+    uniform_offsets = all(o == block_lat_offsets[0] for o in block_lat_offsets) and all(
+        o == block_lon_offsets[0] for o in block_lon_offsets
     )
 
     # Delta encoding resets at each PBF block boundary -- cumsum must be
@@ -2331,7 +2396,9 @@ def _gpu_delta_decode_and_scale(
     result_lon_nano: list[cp.ndarray] = []
 
     for d_ids, d_lats, d_lons in zip(
-        all_id_deltas, all_lat_deltas, all_lon_deltas,
+        all_id_deltas,
+        all_lat_deltas,
+        all_lon_deltas,
     ):
         # Per-block cumsum (Tier 2 CuPy) -- resets at block boundary
         result_ids.append(cp.cumsum(d_ids))
@@ -2343,12 +2410,10 @@ def _gpu_delta_decode_and_scale(
     if uniform_granularity and uniform_offsets:
         # Fast path: single scale factor for all blocks
         d_lat_nano_all = (
-            cp.concatenate(result_lat_nano) if len(result_lat_nano) > 1
-            else result_lat_nano[0]
+            cp.concatenate(result_lat_nano) if len(result_lat_nano) > 1 else result_lat_nano[0]
         )
         d_lon_nano_all = (
-            cp.concatenate(result_lon_nano) if len(result_lon_nano) > 1
-            else result_lon_nano[0]
+            cp.concatenate(result_lon_nano) if len(result_lon_nano) > 1 else result_lon_nano[0]
         )
         scale = block_granularities[0] * 1e-9
         d_lat = d_lat_nano_all.astype(cp.float64) * scale + (block_lat_offsets[0] * 1e-9)
@@ -2381,6 +2446,7 @@ def _gpu_delta_decode_and_scale(
 # GPU: Node lookup table for Way coordinate resolution
 # ---------------------------------------------------------------------------
 
+
 def _build_node_lookup(
     d_node_ids: cp.ndarray,
     d_lon: cp.ndarray,
@@ -2403,6 +2469,7 @@ def _build_node_lookup(
 # ---------------------------------------------------------------------------
 # GPU: Way coordinate gathering via NVRTC binary search kernel
 # ---------------------------------------------------------------------------
+
 
 def _compile_way_coord_gather_kernel():
     """Compile the Way coordinate gather NVRTC kernel (cached)."""
@@ -2451,12 +2518,26 @@ def _gpu_gather_way_coords(
 
     ptr = runtime.pointer
     params = (
-        (ptr(d_sorted_ids), ptr(d_sorted_x), ptr(d_sorted_y),
-         ptr(d_way_refs), ptr(d_out_x), ptr(d_out_y),
-         ctypes.c_int(n_refs), ctypes.c_longlong(n_nodes)),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_I32, KERNEL_PARAM_I64),
+        (
+            ptr(d_sorted_ids),
+            ptr(d_sorted_x),
+            ptr(d_sorted_y),
+            ptr(d_way_refs),
+            ptr(d_out_x),
+            ptr(d_out_y),
+            ctypes.c_int(n_refs),
+            ctypes.c_longlong(n_nodes),
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_I64,
+        ),
     )
 
     runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -2467,6 +2548,7 @@ def _gpu_gather_way_coords(
 # ---------------------------------------------------------------------------
 # GPU: Way processing pipeline
 # ---------------------------------------------------------------------------
+
 
 def _process_ways_gpu(
     way_blocks: list[WayBlock],
@@ -2533,12 +2615,17 @@ def _process_ways_gpu(
 
     # Build node lookup table on GPU (Tier 2 CuPy)
     d_sorted_ids, d_sorted_x, d_sorted_y = _build_node_lookup(
-        d_node_ids, d_lon, d_lat,
+        d_node_ids,
+        d_lon,
+        d_lat,
     )
 
     # Resolve coordinates on GPU via binary search (Tier 1 NVRTC)
     d_out_x, d_out_y = _gpu_gather_way_coords(
-        d_sorted_ids, d_sorted_x, d_sorted_y, d_way_refs,
+        d_sorted_ids,
+        d_sorted_x,
+        d_sorted_y,
+        d_way_refs,
     )
 
     # Compute per-way offsets on GPU (Tier 2 CuPy)
@@ -2578,14 +2665,20 @@ def _process_ways_gpu(
     if n_poly == 0:
         # All LineStrings
         owned = _assemble_linestring_ways(
-            d_out_x, d_out_y, d_way_offsets, n_line,
+            d_out_x,
+            d_out_y,
+            d_way_offsets,
+            n_line,
         )
         return owned, d_way_ids, n_ways, None
 
     if n_line == 0:
         # All Polygons
         owned = _assemble_polygon_ways(
-            d_out_x, d_out_y, d_way_offsets, n_poly,
+            d_out_x,
+            d_out_y,
+            d_way_offsets,
+            n_poly,
         )
         return owned, d_way_ids, n_ways, None
 
@@ -2615,7 +2708,9 @@ def _process_ways_gpu(
 
     # Gather LineString coordinates
     d_line_coord_indices = _expand_offsets_to_indices(
-        d_line_offsets_raw, d_line_counts, total_line_coords,
+        d_line_offsets_raw,
+        d_line_counts,
+        total_line_coords,
     )
     d_line_x = d_out_x[d_line_coord_indices]
     d_line_y = d_out_y[d_line_coord_indices]
@@ -2642,7 +2737,9 @@ def _process_ways_gpu(
 
     # Gather Polygon coordinates
     d_poly_coord_indices = _expand_offsets_to_indices(
-        d_poly_offsets_raw, d_poly_counts, total_poly_coords,
+        d_poly_offsets_raw,
+        d_poly_counts,
+        total_poly_coords,
     )
     d_poly_x = d_out_x[d_poly_coord_indices]
     d_poly_y = d_out_y[d_poly_coord_indices]
@@ -2702,7 +2799,9 @@ def _expand_offsets_to_indices(
     cp.cumsum(d_counts, out=d_out_offsets[1:])
 
     # For each output position, determine which segment it belongs to
-    d_segment_ids = cp.searchsorted(d_out_offsets[1:], cp.arange(total, dtype=cp.int32), side="right")
+    d_segment_ids = cp.searchsorted(
+        d_out_offsets[1:], cp.arange(total, dtype=cp.int32), side="right"
+    )
     # Local offset within segment
     d_local = cp.arange(total, dtype=cp.int64) - d_out_offsets[:-1][d_segment_ids].astype(cp.int64)
     # Global index
@@ -2767,6 +2866,7 @@ def _assemble_polygon_ways(
 # GPU: OwnedGeometryArray assembly for Points
 # ---------------------------------------------------------------------------
 
+
 def _assemble_point_geometry(
     d_lon: cp.ndarray,
     d_lat: cp.ndarray,
@@ -2801,7 +2901,8 @@ def _assemble_point_geometry(
         d_family_row_offsets,
         reason="osm point geometry family-row-offset metadata host boundary",
     ).astype(
-        np.int32, copy=False,
+        np.int32,
+        copy=False,
     )
     host_geometry_offsets = np.ascontiguousarray(
         runtime.copy_device_to_host(
@@ -2845,8 +2946,8 @@ def _assemble_point_geometry(
             families={
                 family: DeviceFamilyGeometryBuffer(
                     family=family,
-                    x=d_lon,   # x = longitude
-                    y=d_lat,   # y = latitude
+                    x=d_lon,  # x = longitude
+                    y=d_lat,  # y = latitude
                     geometry_offsets=d_geometry_offsets,
                     empty_mask=d_empty_mask,
                     part_offsets=None,
@@ -2867,6 +2968,7 @@ def _assemble_point_geometry(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def read_osm_pbf_nodes(path: str | Path) -> OsmGpuResult:
     """Extract all nodes from an OSM PBF file as Point geometries.
@@ -3064,7 +3166,10 @@ def read_osm_pbf(
         total_relations = sum(len(rb.relation_ids) for rb in relation_blocks)
         logger.info(
             "OSM PBF: found %d Way blocks (%d ways), %d Relation blocks (%d relations)",
-            len(way_blocks), total_ways, len(relation_blocks), total_relations,
+            len(way_blocks),
+            total_ways,
+            len(relation_blocks),
+            total_relations,
         )
 
     # Phase 7: GPU -- resolve Way coordinates and assemble
@@ -3075,7 +3180,13 @@ def read_osm_pbf(
     decoded_way_tags: list[dict[str, str]] | None = None
     way_blocks_for_geometry = way_blocks
 
-    if need_way_geometry and way_blocks and d_node_ids is not None and d_lon is not None and d_lat is not None:
+    if (
+        need_way_geometry
+        and way_blocks
+        and d_node_ids is not None
+        and d_lon is not None
+        and d_lat is not None
+    ):
         way_blocks_for_geometry, decoded_way_tags = _filter_way_blocks_for_layer(
             way_blocks,
             layer=normalized_layer,
@@ -3139,7 +3250,11 @@ def read_osm_pbf(
         and d_lat is not None
     ):
         relations_owned, d_relation_ids, n_relations = _process_relations_gpu(
-            relation_blocks, way_blocks, d_node_ids, d_lon, d_lat,
+            relation_blocks,
+            way_blocks,
+            d_node_ids,
+            d_lon,
+            d_lat,
         )
         logger.info(
             "OSM PBF: assembled %d relations (%s)",
@@ -3170,9 +3285,7 @@ def read_osm_pbf(
             d_relation_ids,
             reason="osm relation valid-id tag-alignment host boundary",
         )
-        aligned_tags = [
-            rel_id_to_tags.get(int(rid), {}) for rid in h_valid_rel_ids
-        ]
+        aligned_tags = [rel_id_to_tags.get(int(rid), {}) for rid in h_valid_rel_ids]
         if any(aligned_tags):
             relation_tags = aligned_tags
 

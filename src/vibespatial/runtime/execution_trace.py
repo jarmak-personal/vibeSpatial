@@ -128,18 +128,10 @@ class ExecutionTraceContext:
             "h2d_transfer_seconds": sum(t.elapsed_seconds for t in h2d),
             "runtime_d2h_transfers": len(runtime_d2h),
             "runtime_h2d_transfers": len(runtime_h2d),
-            "runtime_d2h_transfer_bytes": sum(
-                t.bytes_transferred for t in runtime_d2h
-            ),
-            "runtime_h2d_transfer_bytes": sum(
-                t.bytes_transferred for t in runtime_h2d
-            ),
-            "runtime_d2h_transfer_seconds": sum(
-                t.elapsed_seconds for t in runtime_d2h
-            ),
-            "runtime_h2d_transfer_seconds": sum(
-                t.elapsed_seconds for t in runtime_h2d
-            ),
+            "runtime_d2h_transfer_bytes": sum(t.bytes_transferred for t in runtime_d2h),
+            "runtime_h2d_transfer_bytes": sum(t.bytes_transferred for t in runtime_h2d),
+            "runtime_d2h_transfer_seconds": sum(t.elapsed_seconds for t in runtime_d2h),
+            "runtime_h2d_transfer_seconds": sum(t.elapsed_seconds for t in runtime_h2d),
             "offramps": offramps,
         }
 
@@ -173,12 +165,14 @@ def notify_dispatch(
     if ctx is None:
         return
     mode = selected if isinstance(selected, ExecutionMode) else ExecutionMode(selected)
-    ctx.record_step(TraceStep(
-        surface=surface,
-        operation=operation,
-        selected=mode,
-        implementation=implementation,
-    ))
+    ctx.record_step(
+        TraceStep(
+            surface=surface,
+            operation=operation,
+            selected=mode,
+            implementation=implementation,
+        )
+    )
 
 
 def notify_transfer(
@@ -195,16 +189,18 @@ def notify_transfer(
     ctx = get_active_trace()
     if ctx is None:
         return
-    ctx.record_transfer(TraceTransfer(
-        direction=direction,
-        trigger=trigger,
-        reason=reason,
-        source=source,
-        item_count=int(item_count),
-        bytes_transferred=int(bytes_transferred),
-        elapsed_seconds=max(float(elapsed_seconds), 0.0),
-        terminal_export=terminal_export,
-    ))
+    ctx.record_transfer(
+        TraceTransfer(
+            direction=direction,
+            trigger=trigger,
+            reason=reason,
+            source=source,
+            item_count=int(item_count),
+            bytes_transferred=int(bytes_transferred),
+            elapsed_seconds=max(float(elapsed_seconds), 0.0),
+            terminal_export=terminal_export,
+        )
+    )
 
 
 class TransferViolationError(AssertionError):
@@ -212,9 +208,7 @@ class TransferViolationError(AssertionError):
 
     def __init__(self, transfers: list[TraceTransfer]):
         self.transfers = transfers
-        details = "; ".join(
-            f"{t.direction} ({t.trigger}: {t.reason})" for t in transfers
-        )
+        details = "; ".join(f"{t.direction} ({t.trigger}: {t.reason})" for t in transfers)
         super().__init__(
             f"Expected zero host/device transfers, but {len(transfers)} occurred: {details}"
         )
@@ -244,9 +238,6 @@ def assert_no_transfers(*, allow_directions: frozenset[str] | None = None):
         yield ctx
     finally:
         _thread_local.trace = parent
-        violations = [
-            t for t in ctx.transfers
-            if t.direction not in blocked
-        ]
+        violations = [t for t in ctx.transfers if t.direction not in blocked]
         if violations:
             raise TransferViolationError(violations)

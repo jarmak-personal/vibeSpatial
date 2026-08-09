@@ -181,6 +181,18 @@ def _comparison_mask(values, index):
     return pd.Series(array, index=index)
 
 
+def _geom_type_arrays_equal(left, right) -> bool:
+    """Compare geometry type labels independently of pandas string storage."""
+    left_values = np.asarray(left, dtype=object)
+    right_values = np.asarray(right, dtype=object)
+    left_missing = np.asarray(pd.isna(left_values), dtype=bool)
+    right_missing = np.asarray(pd.isna(right_values), dtype=bool)
+    if not np.array_equal(left_missing, right_missing):
+        return False
+    present = ~left_missing
+    return bool(np.array_equal(left_values[present], right_values[present]))
+
+
 def _empty_mask(obj, index):
     if isinstance(obj, GeoDataFrame):
         obj = obj.geometry
@@ -291,8 +303,10 @@ def assert_geoseries_equal(
     assert left.index.equals(right.index), f"index: {left.index} != {right.index}"
 
     if check_geom_type:
-        assert (left.geom_type == right.geom_type).all(), (
-            f"type: {left.geom_type} != {right.geom_type}"
+        left_geom_type = left.geom_type
+        right_geom_type = right.geom_type
+        assert _geom_type_arrays_equal(left_geom_type, right_geom_type), (
+            f"type: {left_geom_type} != {right_geom_type}"
         )
 
     if normalize:
@@ -452,6 +466,40 @@ def assert_geodataframe_equal(
     # drop geometries and check remaining columns
     left2 = left.select_dtypes(exclude="geometry")
     right2 = right.select_dtypes(exclude="geometry")
+
+    def _materialize_native_attribute_columns(frame):
+        from vibespatial.api._native_public_arrays import NativeAttributeColumnArray
+
+        native_columns = [
+            column
+            for column in frame.columns
+            if isinstance(getattr(frame[column], "array", None), NativeAttributeColumnArray)
+        ]
+        if not native_columns:
+            return frame
+        result = frame.copy(deep=False)
+        for column in native_columns:
+            native_array = frame[column].array
+            source = native_array.table.to_pandas(copy=False)[native_array.column]
+            positions = native_array.selection_positions
+            if positions is not None:
+                positions = np.asarray(positions, dtype=np.int64)
+                if np.any(positions < 0):
+                    source = pd.Series(
+                        native_array.to_numpy(),
+                        index=pd.RangeIndex(len(native_array)),
+                    )
+                else:
+                    source = source.take(positions)
+            result[column] = pd.Series(
+                source.array,
+                index=result.index,
+                name=column,
+            )
+        return result
+
+    left2 = _materialize_native_attribute_columns(left2)
+    right2 = _materialize_native_attribute_columns(right2)
     assert_frame_equal(
         left2,
         right2,

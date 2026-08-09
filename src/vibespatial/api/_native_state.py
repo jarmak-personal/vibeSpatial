@@ -60,7 +60,7 @@ class NativeFrameState:
             attrs=dict(result.attrs or {}),
             provenance=result.provenance,
             geometry_metadata_cache=getattr(result, "geometry_metadata", None),
-            residency=combined_residency(getattr(geometry, "owned", None)),
+            residency=combined_residency(geometry),
         )
 
     def validate_row_count(self, row_count: int) -> None:
@@ -76,6 +76,8 @@ class NativeFrameState:
             return None
         if self.geometry_name not in requested:
             return None
+        if requested == self.column_order:
+            return self
         projected_attributes = _project_attributes(
             self.attributes,
             tuple(column for column in requested if column != self.geometry_name),
@@ -87,6 +89,84 @@ class NativeFrameState:
             attributes=projected_attributes,
             column_order=requested,
         )
+
+    def _rowset_with_geometry_proofs(self, rowset: NativeRowSet) -> NativeRowSet:
+        """Attach inherited source-geometry proofs to a rowset when possible."""
+        family_domain = rowset.geometry_family_domain
+        trusted_all_valid_rows = rowset.trusted_all_valid_rows
+        owned = (
+            self.geometry.cached_owned()
+            if hasattr(self.geometry, "cached_owned")
+            else getattr(self.geometry, "owned", None)
+        )
+        source_state = getattr(owned, "device_state", None)
+        if source_state is not None:
+            if family_domain is None and source_state.trusted_family_domain is not None:
+                family_domain = source_state.trusted_family_domain
+            if family_domain is None and source_state.trusted_homogeneous_family is not None:
+                family_domain = (source_state.trusted_homogeneous_family,)
+            if (
+                family_domain is None
+                and source_state.trusted_polygonal_only is True
+            ):
+                from vibespatial.geometry.buffers import GeometryFamily
+
+                family_domain = (
+                    GeometryFamily.POLYGON,
+                    GeometryFamily.MULTIPOLYGON,
+                )
+            if trusted_all_valid_rows is None and source_state.trusted_all_valid is True:
+                trusted_all_valid_rows = True
+        if (
+            family_domain is rowset.geometry_family_domain
+            and trusted_all_valid_rows is rowset.trusted_all_valid_rows
+        ):
+            return rowset
+        return NativeRowSet.from_positions(
+            rowset.positions,
+            source_token=rowset.source_token,
+            source_row_count=rowset.source_row_count,
+            ordered=rowset.ordered,
+            unique=rowset.unique,
+            identity=rowset.identity,
+            geometry_family_domain=family_domain,
+            trusted_all_valid_rows=trusted_all_valid_rows,
+        )
+
+    @staticmethod
+    def _apply_rowset_geometry_proofs(geometry: Any, rowset: NativeRowSet) -> None:
+        """Preserve semantic rowset proofs on the taken geometry carrier."""
+        if hasattr(geometry, "apply_rowset_proofs"):
+            geometry.apply_rowset_proofs(rowset)
+            return
+        owned = (
+            geometry.cached_owned()
+            if hasattr(geometry, "cached_owned")
+            else getattr(geometry, "owned", None)
+        )
+        if owned is None:
+            return
+        state = getattr(owned, "device_state", None)
+        if state is None and getattr(owned, "residency", None) is Residency.DEVICE:
+            state = owned._ensure_device_state(preserve_indexed_view=True)
+        if state is None:
+            return
+        if rowset.trusted_all_valid_rows is True:
+            state.trusted_all_valid = True
+        family_domain = rowset.geometry_family_domain
+        if not family_domain:
+            return
+        state.trusted_family_domain = tuple(family_domain)
+        if rowset.trusted_all_valid_rows is True and len(family_domain) == 1:
+            state.trusted_homogeneous_family = family_domain[0]
+        from vibespatial.geometry.buffers import GeometryFamily
+
+        polygonal_families = {
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTIPOLYGON,
+        }
+        if set(family_domain) <= polygonal_families:
+            state.trusted_polygonal_only = True
 
     def rename_columns(self, mapping: dict[Any, Any]) -> NativeFrameState | None:
         if not mapping:
@@ -147,7 +227,7 @@ class NativeFrameState:
             self,
             geometry=geometry,
             geometry_metadata_cache=None,
-            residency=combined_residency(getattr(geometry, "owned", None)),
+            residency=combined_residency(geometry),
         )
 
     def with_active_geometry(self, geometry_name: Any, *, crs: Any | None = None) -> NativeFrameState | None:
@@ -182,7 +262,7 @@ class NativeFrameState:
             geometry_name=geometry_name,
             secondary_geometry=secondary_geometry,
             geometry_metadata_cache=None,
-            residency=combined_residency(getattr(promoted_geometry, "owned", None)),
+            residency=combined_residency(promoted_geometry),
         )
 
     def assign_attributes(
@@ -321,7 +401,7 @@ class NativeFrameState:
             if owned is None:
                 return None
             tags = (
-                owned._ensure_device_state().tags
+                owned._ensure_device_state(preserve_indexed_view=True).tags
                 if getattr(owned, "residency", None) is Residency.DEVICE
                 else owned.tags
             )
@@ -346,6 +426,8 @@ class NativeFrameState:
             source_row_count=self.row_count,
             ordered=True,
             unique=True,
+            geometry_family_domain=(target_family,),
+            trusted_all_valid_rows=True,
         )
 
     def take(
@@ -353,6 +435,7 @@ class NativeFrameState:
         rowset: NativeRowSet,
         *,
         preserve_index: bool = True,
+        index_positions: Any | None = None,
     ) -> NativeFrameState:
         if rowset.source_row_count is not None and rowset.source_row_count != self.row_count:
             raise ValueError(
@@ -361,18 +444,30 @@ class NativeFrameState:
         if rowset.source_token is not None and rowset.source_token != self.lineage_token:
             raise ValueError("NativeRowSet source token does not match NativeFrameState")
 
+        rowset = self._rowset_with_geometry_proofs(rowset)
+
+        if index_positions is not None and len(index_positions) != len(rowset):
+            raise ValueError("index positions must align with NativeRowSet")
+
         if preserve_index and rowset.identity and len(rowset) == self.row_count:
+            self._apply_rowset_geometry_proofs(self.geometry, rowset)
             return self
 
         if rowset.is_device and preserve_index and self.index_plan.kind in {
             "range",
             "device-labels",
+            "host-labels",
+            "host-labels-take",
         }:
             normalized = rowset.positions
             attributes = self.attributes.take(normalized, preserve_index=False)
-            geometry = self.geometry.take(normalized)
+            geometry = self.geometry.take(normalized, unique=rowset.unique)
+            self._apply_rowset_geometry_proofs(geometry, rowset)
             secondary_geometry = tuple(
-                type(column)(column.name, column.geometry.take(normalized))
+                type(column)(
+                    column.name,
+                    column.geometry.take(normalized, unique=rowset.unique),
+                )
                 for column in self.secondary_geometry
             )
             geometry_metadata_cache = (
@@ -385,30 +480,40 @@ class NativeFrameState:
                 if self.provenance is not None and hasattr(self.provenance, "take")
                 else self.provenance
             )
+            index_plan = self.index_plan.take(
+                normalized if index_positions is None else index_positions,
+                preserve_index=True,
+                unique=rowset.unique,
+            )
+            if self.index_plan.admits_unique_label_selection:
+                index_plan = index_plan.with_selection(
+                    normalized,
+                    source_token=self.lineage_token,
+                    source_row_count=self.row_count,
+                    unique=rowset.unique,
+                )
             return type(self)(
                 attributes=attributes,
                 geometry=geometry,
                 geometry_name=self.geometry_name,
                 column_order=self.column_order,
-                index_plan=self.index_plan.take(
-                    normalized,
-                    preserve_index=True,
-                    unique=rowset.unique,
-                ),
+                index_plan=index_plan,
                 row_count=len(rowset),
                 secondary_geometry=secondary_geometry,
                 attrs=self.attrs,
                 provenance=provenance,
                 geometry_metadata_cache=geometry_metadata_cache,
-                residency=combined_residency(getattr(geometry, "owned", None)),
+                residency=combined_residency(geometry),
                 readiness=self.readiness,
             )
 
         taken = self.to_native_tabular_result().take(
-            rowset.positions,
+            rowset,
             preserve_index=preserve_index,
         )
-        return type(self).from_native_tabular_result(taken)
+        result = type(self).from_native_tabular_result(taken)
+        self._apply_rowset_geometry_proofs(result.geometry, rowset)
+        return result
 
     def geometry_area_expression(self):
         """Return a private device area vector for sanctioned native consumers."""
@@ -444,6 +549,7 @@ class NativeFrameState:
         return validity_expression_owned(
             owned,
             source_token=self.lineage_token,
+            exact_collinearity=True,
         )
 
     def geometry_predicate_expression(

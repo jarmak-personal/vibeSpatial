@@ -133,7 +133,7 @@ Walk this ladder in order. Stop as soon as the first wrong stage is found.
    - `_materialize_overlay_execution_plan(...)`
 3. Direct per-op overlay materialization:
    - `_dispatch_overlay_gpu(...)`
-   - `_dispatch_polygon_intersection_overlay_rowwise_gpu(...)`
+   - `_dispatch_polygon_intersection_overlay_exact_batch_gpu(...)`
 4. Split topology:
    - `build_gpu_split_events(...)`
    - inspect overlap rows, event payload, and per-segment `t/x/y`

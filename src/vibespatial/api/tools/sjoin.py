@@ -12,6 +12,7 @@ from vibespatial.api.geometry_array import _check_crs, _crs_mismatch_warn
 from vibespatial.api.tools._pair_cache import cache_intersection_pairs
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_spatial_index_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.precision import KernelClass
@@ -27,6 +28,9 @@ from vibespatial.spatial.query import (
     build_owned_spatial_index,
     query_spatial_index,
     supports_owned_spatial_input,
+)
+from vibespatial.spatial.spatial_index_device import (
+    prefers_pair_mask_spatial_index_query,
 )
 
 
@@ -370,6 +374,7 @@ def _query_with_native_spatial_index(
         right_df,
         right_state,
         right_owned,
+        query_row_count=left_owned.row_count,
     )
     relation, execution = native_index.query_relation(
         left_state,
@@ -383,7 +388,13 @@ def _query_with_native_spatial_index(
     return (relation.left_indices, relation.right_indices), execution
 
 
-def _native_spatial_index_for_sjoin_right(right_df, right_state, right_owned):
+def _native_spatial_index_for_sjoin_right(
+    right_df,
+    right_state,
+    right_owned,
+    *,
+    query_row_count: int | None = None,
+):
     """Return reusable native index state for right-side sjoin geometry.
 
     Physical shape: reusable spatial-index execution state feeding relation
@@ -412,6 +423,41 @@ def _native_spatial_index_for_sjoin_right(right_df, right_state, right_owned):
             source_token=right_state.lineage_token,
         )
 
+    if (
+        query_row_count is not None
+        and right_owned.residency is Residency.DEVICE
+        and has_gpu_runtime()
+        and prefers_pair_mask_spatial_index_query(query_row_count, right_state.row_count)
+    ):
+        selection = plan_dispatch_selection(
+            kernel_name="flat_index_build",
+            kernel_class=KernelClass.COARSE,
+            row_count=right_state.row_count,
+            requested_mode=ExecutionMode.GPU,
+            gpu_available=True,
+            current_residency=Residency.DEVICE,
+            work_estimate=estimate_spatial_index_work_from_owned(right_owned),
+        )
+        flat_index = build_flat_spatial_index(
+            right_owned,
+            runtime_selection=selection.runtime_selection,
+            device_bounds_only=True,
+        )
+        return flat_index.to_native_spatial_index(
+            source_token=right_state.lineage_token,
+        )
+
+    if geometry_values is not None and hasattr(geometry_values, "owned_flat_sindex"):
+        cached_owned, flat_index = geometry_values.owned_flat_sindex()
+        if (
+            cached_owned is right_owned
+            and getattr(flat_index, "geometry_array", None) is right_owned
+            and hasattr(flat_index, "to_native_spatial_index")
+        ):
+            return flat_index.to_native_spatial_index(
+                source_token=right_state.lineage_token,
+            )
+
     selection = plan_dispatch_selection(
         kernel_name="flat_index_build",
         kernel_class=KernelClass.COARSE,
@@ -423,6 +469,7 @@ def _native_spatial_index_for_sjoin_right(right_df, right_state, right_owned):
             if right_owned.residency is Residency.DEVICE
             else Residency.HOST
         ),
+        work_estimate=estimate_spatial_index_work_from_owned(right_owned),
     )
     flat_index = build_flat_spatial_index(
         right_owned,
@@ -633,6 +680,8 @@ def _device_columns_from_native_attributes(attributes, on_attribute):
 
 
 def _device_columns_from_public_frame(frame, on_attribute):
+    if not has_gpu_runtime():
+        return None
     requested = tuple(dict.fromkeys(on_attribute))
     try:
         import pyarrow as pa

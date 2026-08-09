@@ -199,7 +199,9 @@ IO_SUPPORT_MATRIX: dict[IOFormat, IOSupportEntry] = {
 
 def plan_io_support(format: IOFormat | str, operation: IOOperation | str) -> IOPlan:
     normalized_format = format if isinstance(format, IOFormat) else IOFormat(format)
-    normalized_operation = operation if isinstance(operation, IOOperation) else IOOperation(operation)
+    normalized_operation = (
+        operation if isinstance(operation, IOOperation) else IOOperation(operation)
+    )
     entry = IO_SUPPORT_MATRIX[normalized_format]
     if normalized_operation in {IOOperation.READ, IOOperation.SCAN, IOOperation.DECODE}:
         selected = entry.read_path

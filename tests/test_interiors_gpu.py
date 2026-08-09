@@ -8,6 +8,8 @@ and mixed-family arrays.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 from shapely.geometry import (
@@ -29,6 +31,22 @@ def _has_gpu():
 
 
 requires_gpu = pytest.mark.skipif(not _has_gpu(), reason="GPU not available")
+
+
+def test_interiors_uses_source_capacity_without_allocation_fences():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "vibespatial"
+        / "constructive"
+        / "interiors.py"
+    ).read_text()
+
+    assert "NativeDeviceSelection.from_mask(d_is_interior)" in source
+    assert "allocation_capacity=int(d_poly.x.size)" in source
+    assert "count_scatter_total(" not in source
+    assert "interiors ring allocation fence" not in source
+    assert "interiors coordinate allocation fence" not in source
 
 
 def _to_owned(geoms):

@@ -10,7 +10,10 @@ from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 # Cooperative polygon centroid kernel: 1 block per geometry (for complex polygons)
 # ---------------------------------------------------------------------------
 
-_POLYGON_CENTROID_COOPERATIVE_KERNEL_SOURCE = PRECISION_PREAMBLE + STRIP_CLOSURE_DEVICE + r"""
+_POLYGON_CENTROID_COOPERATIVE_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + STRIP_CLOSURE_DEVICE
+    + r"""
 extern "C" __global__ __launch_bounds__(256, 4)
 void polygon_centroid_cooperative(
     const double* __restrict__ x,
@@ -124,11 +127,14 @@ void polygon_centroid_cooperative(
     }}
 }}
 """
+)
 # ---------------------------------------------------------------------------
 # Point centroid kernel: identity copy (x, y -> cx, cy)
 # ---------------------------------------------------------------------------
 
-_POINT_CENTROID_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_POINT_CENTROID_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + r"""
 extern "C" __global__ void point_centroid(
     const double* x,
     const double* y,
@@ -147,11 +153,14 @@ extern "C" __global__ void point_centroid(
     cy[row] = y[idx];
 }}
 """
+)
 # ---------------------------------------------------------------------------
 # MultiPoint centroid kernel: Kahan mean of all points in each geometry
 # ---------------------------------------------------------------------------
 
-_MULTIPOINT_CENTROID_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_MULTIPOINT_CENTROID_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + r"""
 extern "C" __global__ void multipoint_centroid(
     const double* x,
     const double* y,
@@ -189,11 +198,14 @@ extern "C" __global__ void multipoint_centroid(
     cy[row] = (double)(sum_y / (compute_t)n) + center_y;
 }}
 """
+)
 # ---------------------------------------------------------------------------
 # LineString centroid kernel: length-weighted segment midpoints
 # ---------------------------------------------------------------------------
 
-_LINESTRING_CENTROID_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_LINESTRING_CENTROID_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + r"""
 extern "C" __global__ void linestring_centroid(
     const double* x,
     const double* y,
@@ -256,11 +268,14 @@ extern "C" __global__ void linestring_centroid(
     }}
 }}
 """
+)
 # ---------------------------------------------------------------------------
 # MultiLineString centroid kernel: length-weighted across all parts
 # ---------------------------------------------------------------------------
 
-_MULTILINESTRING_CENTROID_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_MULTILINESTRING_CENTROID_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + r"""
 extern "C" __global__ void multilinestring_centroid(
     const double* x,
     const double* y,
@@ -325,15 +340,377 @@ extern "C" __global__ void multilinestring_centroid(
     }}
 }}
 """
+)
 _POINT_CENTROID_FP64 = _POINT_CENTROID_KERNEL_SOURCE.format(compute_type="double")
 _POINT_CENTROID_FP32 = _POINT_CENTROID_KERNEL_SOURCE.format(compute_type="float")
 _MULTIPOINT_CENTROID_FP64 = _MULTIPOINT_CENTROID_KERNEL_SOURCE.format(compute_type="double")
 _MULTIPOINT_CENTROID_FP32 = _MULTIPOINT_CENTROID_KERNEL_SOURCE.format(compute_type="float")
 _LINESTRING_CENTROID_FP64 = _LINESTRING_CENTROID_KERNEL_SOURCE.format(compute_type="double")
 _LINESTRING_CENTROID_FP32 = _LINESTRING_CENTROID_KERNEL_SOURCE.format(compute_type="float")
-_MULTILINESTRING_CENTROID_FP64 = _MULTILINESTRING_CENTROID_KERNEL_SOURCE.format(compute_type="double")
-_MULTILINESTRING_CENTROID_FP32 = _MULTILINESTRING_CENTROID_KERNEL_SOURCE.format(compute_type="float")
+_MULTILINESTRING_CENTROID_FP64 = _MULTILINESTRING_CENTROID_KERNEL_SOURCE.format(
+    compute_type="double"
+)
+_MULTILINESTRING_CENTROID_FP32 = _MULTILINESTRING_CENTROID_KERNEL_SOURCE.format(
+    compute_type="float"
+)
 _POLYGON_CENTROID_FP64 = _POLYGON_CENTROID_KERNEL_SOURCE.format(compute_type="double")
 _POLYGON_CENTROID_FP32 = _POLYGON_CENTROID_KERNEL_SOURCE.format(compute_type="float")
-_POLYGON_CENTROID_COOPERATIVE_FP64 = _POLYGON_CENTROID_COOPERATIVE_KERNEL_SOURCE.format(compute_type="double")
-_POLYGON_CENTROID_COOPERATIVE_FP32 = _POLYGON_CENTROID_COOPERATIVE_KERNEL_SOURCE.format(compute_type="float")
+_POLYGON_CENTROID_COOPERATIVE_FP64 = _POLYGON_CENTROID_COOPERATIVE_KERNEL_SOURCE.format(
+    compute_type="double"
+)
+_POLYGON_CENTROID_COOPERATIVE_FP32 = _POLYGON_CENTROID_COOPERATIVE_KERNEL_SOURCE.format(
+    compute_type="float"
+)
+
+
+_INDEXED_SIMPLE_CENTROID_BODY = r"""
+__device__ __forceinline__ void indexed_line_centroid_terms(
+    const double* x,
+    const double* y,
+    int coord_start,
+    int coord_end,
+    double center_x,
+    double center_y,
+    compute_t* total_len,
+    compute_t* weighted_x,
+    compute_t* weighted_y,
+    compute_t* compensation_len,
+    compute_t* compensation_x,
+    compute_t* compensation_y
+) {
+    for (int i = coord_start; i < coord_end - 1; ++i) {
+        const compute_t x0 = CX(x[i]);
+        const compute_t y0 = CY(y[i]);
+        const compute_t x1 = CX(x[i + 1]);
+        const compute_t y1 = CY(y[i + 1]);
+        const compute_t dx = x1 - x0;
+        const compute_t dy = y1 - y0;
+        const compute_t length = sqrt(dx * dx + dy * dy);
+        KAHAN_ADD(*total_len, length, *compensation_len);
+        KAHAN_ADD(*weighted_x, (x0 + x1) * (compute_t)0.5 * length, *compensation_x);
+        KAHAN_ADD(*weighted_y, (y0 + y1) * (compute_t)0.5 * length, *compensation_y);
+    }
+}
+
+extern "C" __global__ void point_centroid_indexed(
+    const double* x,
+    const double* y,
+    const int* geometry_offsets,
+    const signed char* tags,
+    const int* family_row_offsets,
+    int family_tag,
+    double* cx,
+    double* cy,
+    double center_x,
+    double center_y,
+    int row_count
+) {
+    const int output_row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (output_row >= row_count || tags[output_row] != (signed char)family_tag) return;
+    const int family_row = family_row_offsets[output_row];
+    if (family_row < 0) return;
+    const int coord = geometry_offsets[family_row];
+    cx[output_row] = x[coord];
+    cy[output_row] = y[coord];
+}
+
+extern "C" __global__ void multipoint_centroid_indexed(
+    const double* x,
+    const double* y,
+    const int* geometry_offsets,
+    const signed char* tags,
+    const int* family_row_offsets,
+    int family_tag,
+    double* cx,
+    double* cy,
+    double center_x,
+    double center_y,
+    int row_count
+) {
+    const int output_row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (output_row >= row_count || tags[output_row] != (signed char)family_tag) return;
+    const int family_row = family_row_offsets[output_row];
+    if (family_row < 0) return;
+    const int coord_start = geometry_offsets[family_row];
+    const int coord_end = geometry_offsets[family_row + 1];
+    const int count = coord_end - coord_start;
+    if (count <= 0) return;
+    const double local_center_x = x[coord_start];
+    const double local_center_y = y[coord_start];
+    compute_t sum_x = (compute_t)0.0;
+    compute_t sum_y = (compute_t)0.0;
+    compute_t compensation_x = (compute_t)0.0;
+    compute_t compensation_y = (compute_t)0.0;
+    for (int i = coord_start; i < coord_end; ++i) {
+        KAHAN_ADD(sum_x, (compute_t)(x[i] - local_center_x), compensation_x);
+        KAHAN_ADD(sum_y, (compute_t)(y[i] - local_center_y), compensation_y);
+    }
+    cx[output_row] = (double)(sum_x / (compute_t)count) + local_center_x;
+    cy[output_row] = (double)(sum_y / (compute_t)count) + local_center_y;
+}
+
+extern "C" __global__ void linestring_centroid_indexed(
+    const double* x,
+    const double* y,
+    const int* geometry_offsets,
+    const signed char* tags,
+    const int* family_row_offsets,
+    int family_tag,
+    double* cx,
+    double* cy,
+    double center_x,
+    double center_y,
+    int row_count
+) {
+    const int output_row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (output_row >= row_count || tags[output_row] != (signed char)family_tag) return;
+    const int family_row = family_row_offsets[output_row];
+    if (family_row < 0) return;
+    const int coord_start = geometry_offsets[family_row];
+    const int coord_end = geometry_offsets[family_row + 1];
+    if (coord_start == coord_end) return;
+    if (coord_end - coord_start == 1) {
+        cx[output_row] = x[coord_start];
+        cy[output_row] = y[coord_start];
+        return;
+    }
+    const double local_center_x = x[coord_start];
+    const double local_center_y = y[coord_start];
+    compute_t total_len = (compute_t)0.0;
+    compute_t weighted_x = (compute_t)0.0;
+    compute_t weighted_y = (compute_t)0.0;
+    compute_t compensation_len = (compute_t)0.0;
+    compute_t compensation_x = (compute_t)0.0;
+    compute_t compensation_y = (compute_t)0.0;
+    indexed_line_centroid_terms(
+        x, y, coord_start, coord_end, local_center_x, local_center_y,
+        &total_len, &weighted_x, &weighted_y,
+        &compensation_len, &compensation_x, &compensation_y
+    );
+    if (total_len < (compute_t)1e-30) {
+        cx[output_row] = x[coord_start];
+        cy[output_row] = y[coord_start];
+    } else {
+        cx[output_row] = (double)(weighted_x / total_len) + local_center_x;
+        cy[output_row] = (double)(weighted_y / total_len) + local_center_y;
+    }
+}
+
+extern "C" __global__ void multilinestring_centroid_indexed(
+    const double* x,
+    const double* y,
+    const int* part_offsets,
+    const int* geometry_offsets,
+    const signed char* tags,
+    const int* family_row_offsets,
+    int family_tag,
+    double* cx,
+    double* cy,
+    double center_x,
+    double center_y,
+    int row_count
+) {
+    const int output_row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (output_row >= row_count || tags[output_row] != (signed char)family_tag) return;
+    const int family_row = family_row_offsets[output_row];
+    if (family_row < 0) return;
+    const int first_part = geometry_offsets[family_row];
+    const int last_part = geometry_offsets[family_row + 1];
+    if (first_part == last_part) return;
+    int first_coord = -1;
+    for (int part = first_part; part < last_part; ++part) {
+        if (part_offsets[part + 1] > part_offsets[part]) {
+            first_coord = part_offsets[part];
+            break;
+        }
+    }
+    if (first_coord < 0) return;
+    const double local_center_x = x[first_coord];
+    const double local_center_y = y[first_coord];
+    compute_t total_len = (compute_t)0.0;
+    compute_t weighted_x = (compute_t)0.0;
+    compute_t weighted_y = (compute_t)0.0;
+    compute_t compensation_len = (compute_t)0.0;
+    compute_t compensation_x = (compute_t)0.0;
+    compute_t compensation_y = (compute_t)0.0;
+    for (int part = first_part; part < last_part; ++part) {
+        indexed_line_centroid_terms(
+            x, y, part_offsets[part], part_offsets[part + 1],
+            local_center_x, local_center_y,
+            &total_len, &weighted_x, &weighted_y,
+            &compensation_len, &compensation_x, &compensation_y
+        );
+    }
+    if (total_len < (compute_t)1e-30) {
+        cx[output_row] = x[first_coord];
+        cy[output_row] = y[first_coord];
+    } else {
+        cx[output_row] = (double)(weighted_x / total_len) + local_center_x;
+        cy[output_row] = (double)(weighted_y / total_len) + local_center_y;
+    }
+}
+"""
+
+_POLYGON_CENTROID_INDEXED_BODY = r"""
+extern "C" __global__ void polygon_centroid_indexed(
+    const double* x,
+    const double* y,
+    const int* ring_offsets,
+    const int* geometry_offsets,
+    const signed char* tags,
+    const int* family_row_offsets,
+    int family_tag,
+    double* cx,
+    double* cy,
+    double center_x,
+    double center_y,
+    int row_count
+) {
+    const int output_row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (output_row >= row_count || tags[output_row] != (signed char)family_tag) return;
+    const int family_row = family_row_offsets[output_row];
+    if (family_row < 0) return;
+    const int first_ring = geometry_offsets[family_row];
+    const int last_ring = geometry_offsets[family_row + 1];
+    if (first_ring == last_ring) return;
+    int first_coord = -1;
+    for (int ring = first_ring; ring < last_ring; ++ring) {
+        if (ring_offsets[ring + 1] > ring_offsets[ring]) {
+            first_coord = ring_offsets[ring];
+            break;
+        }
+    }
+    if (first_coord < 0) return;
+    const double local_center_x = x[first_coord];
+    const double local_center_y = y[first_coord];
+
+    compute_t total_area = (compute_t)0.0;
+    compute_t total_cx = (compute_t)0.0;
+    compute_t total_cy = (compute_t)0.0;
+    compute_t compensation_area = (compute_t)0.0;
+    compute_t compensation_cx = (compute_t)0.0;
+    compute_t compensation_cy = (compute_t)0.0;
+    compute_t mean_x = (compute_t)0.0;
+    compute_t mean_y = (compute_t)0.0;
+    int mean_count = 0;
+
+    for (int ring = first_ring; ring < last_ring; ++ring) {
+        compute_t ring_area, ring_cx, ring_cy, ring_mean_x, ring_mean_y;
+        int ring_mean_count;
+        if (!polygon_centroid_ring_terms(
+            x, y, ring_offsets[ring], ring_offsets[ring + 1],
+            local_center_x, local_center_y,
+            &ring_area, &ring_cx, &ring_cy,
+            &ring_mean_x, &ring_mean_y, &ring_mean_count
+        )) continue;
+        if (ring_mean_count > 0) {
+            mean_x += ring_mean_x;
+            mean_y += ring_mean_y;
+            mean_count += ring_mean_count;
+            continue;
+        }
+        const compute_t weight = ring == first_ring ? ring_area : -ring_area;
+        KAHAN_ADD(total_area, weight, compensation_area);
+        KAHAN_ADD(total_cx, ring_cx * weight, compensation_cx);
+        KAHAN_ADD(total_cy, ring_cy * weight, compensation_cy);
+    }
+    if (fabs(total_area) < (compute_t)1e-30) {
+        if (mean_count == 0) return;
+        cx[output_row] = (double)(mean_x / (compute_t)mean_count) + local_center_x;
+        cy[output_row] = (double)(mean_y / (compute_t)mean_count) + local_center_y;
+    } else {
+        cx[output_row] = (double)(total_cx / total_area) + local_center_x;
+        cy[output_row] = (double)(total_cy / total_area) + local_center_y;
+    }
+}
+
+extern "C" __global__ void multipolygon_centroid_indexed(
+    const double* x,
+    const double* y,
+    const int* ring_offsets,
+    const int* part_offsets,
+    const int* geometry_offsets,
+    const signed char* tags,
+    const int* family_row_offsets,
+    int family_tag,
+    double* cx,
+    double* cy,
+    double center_x,
+    double center_y,
+    int row_count
+) {
+    const int output_row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (output_row >= row_count || tags[output_row] != (signed char)family_tag) return;
+    const int family_row = family_row_offsets[output_row];
+    if (family_row < 0) return;
+    const int first_polygon = geometry_offsets[family_row];
+    const int last_polygon = geometry_offsets[family_row + 1];
+    if (first_polygon == last_polygon) return;
+    int first_coord = -1;
+    for (int polygon = first_polygon; polygon < last_polygon && first_coord < 0; ++polygon) {
+        const int first_ring = part_offsets[polygon];
+        const int last_ring = part_offsets[polygon + 1];
+        for (int ring = first_ring; ring < last_ring; ++ring) {
+            if (ring_offsets[ring + 1] > ring_offsets[ring]) {
+                first_coord = ring_offsets[ring];
+                break;
+            }
+        }
+    }
+    if (first_coord < 0) return;
+    const double local_center_x = x[first_coord];
+    const double local_center_y = y[first_coord];
+
+    compute_t total_area = (compute_t)0.0;
+    compute_t total_cx = (compute_t)0.0;
+    compute_t total_cy = (compute_t)0.0;
+    compute_t compensation_area = (compute_t)0.0;
+    compute_t compensation_cx = (compute_t)0.0;
+    compute_t compensation_cy = (compute_t)0.0;
+    compute_t mean_x = (compute_t)0.0;
+    compute_t mean_y = (compute_t)0.0;
+    int mean_count = 0;
+
+    for (int polygon = first_polygon; polygon < last_polygon; ++polygon) {
+        const int first_ring = part_offsets[polygon];
+        const int last_ring = part_offsets[polygon + 1];
+        for (int ring = first_ring; ring < last_ring; ++ring) {
+            compute_t ring_area, ring_cx, ring_cy, ring_mean_x, ring_mean_y;
+            int ring_mean_count;
+            if (!polygon_centroid_ring_terms(
+                x, y, ring_offsets[ring], ring_offsets[ring + 1],
+                local_center_x, local_center_y,
+                &ring_area, &ring_cx, &ring_cy,
+                &ring_mean_x, &ring_mean_y, &ring_mean_count
+            )) continue;
+            if (ring_mean_count > 0) {
+                mean_x += ring_mean_x;
+                mean_y += ring_mean_y;
+                mean_count += ring_mean_count;
+                continue;
+            }
+            const compute_t weight = ring == first_ring ? ring_area : -ring_area;
+            KAHAN_ADD(total_area, weight, compensation_area);
+            KAHAN_ADD(total_cx, ring_cx * weight, compensation_cx);
+            KAHAN_ADD(total_cy, ring_cy * weight, compensation_cy);
+        }
+    }
+    if (fabs(total_area) < (compute_t)1e-30) {
+        if (mean_count == 0) return;
+        cx[output_row] = (double)(mean_x / (compute_t)mean_count) + local_center_x;
+        cy[output_row] = (double)(mean_y / (compute_t)mean_count) + local_center_y;
+    } else {
+        cx[output_row] = (double)(total_cx / total_area) + local_center_x;
+        cy[output_row] = (double)(total_cy / total_area) + local_center_y;
+    }
+}
+"""
+
+_INDEXED_SIMPLE_CENTROID_FP64 = (
+    PRECISION_PREAMBLE.format(compute_type="double") + _INDEXED_SIMPLE_CENTROID_BODY
+)
+_INDEXED_SIMPLE_CENTROID_FP32 = (
+    PRECISION_PREAMBLE.format(compute_type="float") + _INDEXED_SIMPLE_CENTROID_BODY
+)
+_POLYGON_CENTROID_INDEXED_FP64 = _POLYGON_CENTROID_FP64 + _POLYGON_CENTROID_INDEXED_BODY
+_POLYGON_CENTROID_INDEXED_FP32 = _POLYGON_CENTROID_FP32 + _POLYGON_CENTROID_INDEXED_BODY

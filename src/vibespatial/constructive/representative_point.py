@@ -31,19 +31,22 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import Residency, TransferTrigger, combined_residency
 
 from .point import point_owned_from_xy
 
-request_nvrtc_warmup([
-    (
-        "representative-point",
-        _REPRESENTATIVE_POINT_KERNEL_SOURCE,
-        _REPRESENTATIVE_POINT_KERNEL_NAMES,
-    ),
-])
+request_nvrtc_warmup(
+    [
+        (
+            "representative-point",
+            _REPRESENTATIVE_POINT_KERNEL_SOURCE,
+            _REPRESENTATIVE_POINT_KERNEL_NAMES,
+        ),
+    ]
+)
 
 
 def _representative_point_kernels():
@@ -62,9 +65,12 @@ def _build_point_oga_metadata(row_count: int, validity):
     out_tags = cp.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=cp.int8)
     out_family_row_offsets = cp.arange(row_count, dtype=cp.int32)
     d_null = ~d_validity
-    if int(d_null.any()) != 0:
-        out_tags[d_null] = -1
-        out_family_row_offsets[d_null] = -1
+    out_tags = cp.where(d_null, cp.int8(-1), out_tags)
+    out_family_row_offsets = cp.where(
+        d_null,
+        cp.int32(-1),
+        out_family_row_offsets,
+    )
     return d_validity, out_tags, out_family_row_offsets
 
 
@@ -89,7 +95,8 @@ def _build_device_resident_point_output_from_device(
     d_empty = cp.zeros(row_count, dtype=cp.uint8)
 
     d_validity, out_tags, out_family_row_offsets = _build_point_oga_metadata(
-        row_count, validity,
+        row_count,
+        validity,
     )
 
     device_families = {
@@ -136,7 +143,8 @@ def _build_device_resident_point_output_from_host(
     d_empty = cp.zeros(row_count, dtype=cp.uint8)
 
     d_validity, out_tags, out_family_row_offsets = _build_point_oga_metadata(
-        row_count, validity,
+        row_count,
+        validity,
     )
 
     device_families = {
@@ -193,8 +201,26 @@ def representative_point_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
         current_residency=combined_residency(owned),
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            output_byte_count=row_count * 16,
+            primary_unit_name="representative-point-coordinate",
+        ),
     )
     use_gpu = selection.selected is ExecutionMode.GPU
+    if use_gpu and owned.residency is Residency.DEVICE:
+        device_result = _representative_point_polygonal_device(owned)
+        if device_result is not None:
+            record_dispatch_event(
+                surface="representative_point",
+                operation="representative_point",
+                implementation="gpu_indexed_polygon_centroid_pip_ray",
+                reason=selection.reason,
+                detail=f"rows={row_count}; physical_shape=row-capacity",
+                selected=ExecutionMode.GPU,
+            )
+            return device_result
     if not use_gpu:
         owned.move_to(
             Residency.HOST,
@@ -215,7 +241,12 @@ def representative_point_owned(
 
     # --- Polygons / MultiPolygons: centroid + PIP + ray fallback ---
     device_result = _fill_polygon_representatives(
-        owned, tags, family_row_offsets, cx, cy, use_gpu=use_gpu,
+        owned,
+        tags,
+        family_row_offsets,
+        cx,
+        cy,
+        use_gpu=use_gpu,
     )
 
     selected = ExecutionMode.GPU if use_gpu else ExecutionMode.CPU
@@ -242,7 +273,9 @@ def representative_point_owned(
             d_cx[d_null] = cp.nan
             d_cy[d_null] = cp.nan
         return _build_device_resident_point_output_from_device(
-            d_cx, d_cy, owned.validity,
+            d_cx,
+            d_cy,
+            owned.validity,
         )
 
     # CPU path or GPU path without polygon rows: host arrays are authoritative
@@ -253,9 +286,114 @@ def representative_point_owned(
     if use_gpu:
         # GPU was selected but no polygon rows — still build device-resident
         return _build_device_resident_point_output_from_host(
-            cx, cy, owned.validity,
+            cx,
+            cy,
+            owned.validity,
         )
     return point_owned_from_xy(cx, cy)
+
+
+def _representative_point_polygonal_device(
+    owned: OwnedGeometryArray,
+) -> OwnedGeometryArray | None:
+    """Compute polygonal representative points over logical device row capacity."""
+    import cupy as cp
+
+    from vibespatial.constructive.centroid import _centroid_gpu_device_fp64
+    from vibespatial.cuda._runtime import (
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR,
+        get_cuda_runtime,
+    )
+
+    state = owned._ensure_device_state(preserve_indexed_view=True)
+    polygonal_families = {
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+    }
+    family_domain = state.trusted_family_domain
+    polygonal_domain_proven = family_domain is not None and set(family_domain).issubset(
+        polygonal_families
+    )
+    if state.trusted_polygonal_only is not True and not polygonal_domain_proven:
+        return None
+
+    d_cx, d_cy = _centroid_gpu_device_fp64(owned)
+    d_tags = cp.asarray(state.tags, dtype=cp.int8)
+    d_family_rows = cp.asarray(state.family_row_offsets, dtype=cp.int32)
+    runtime = get_cuda_runtime()
+    kernels = _representative_point_kernels()
+    ptr = runtime.pointer
+    row_count = owned.row_count
+    max_intersections = _MAX_INTERSECTIONS_DEFAULT
+    block_size = min(24, max(row_count, 1))
+    shared_mem_bytes = block_size * max_intersections * np.dtype(np.float64).itemsize
+    grid_size = (row_count + block_size - 1) // block_size
+
+    for family, kernel_name in (
+        (GeometryFamily.POLYGON, "representative_point_polygon"),
+        (GeometryFamily.MULTIPOLYGON, "representative_point_multipolygon"),
+    ):
+        device_buf = state.families.get(family)
+        if device_buf is None or int(device_buf.geometry_offsets.size) <= 1:
+            continue
+        values = [
+            ptr(d_cx),
+            ptr(d_cy),
+            ptr(device_buf.x),
+            ptr(device_buf.y),
+            ptr(device_buf.ring_offsets),
+        ]
+        types = [
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+        ]
+        if family is GeometryFamily.MULTIPOLYGON:
+            values.append(ptr(device_buf.part_offsets))
+            types.append(KERNEL_PARAM_PTR)
+        values.extend(
+            (
+                ptr(device_buf.geometry_offsets),
+                ptr(d_tags),
+                ptr(d_family_rows),
+                int(FAMILY_TAGS[family]),
+                ptr(d_cx),
+                ptr(d_cy),
+                row_count,
+                max_intersections,
+            )
+        )
+        types.extend(
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+            )
+        )
+        runtime.launch(
+            kernels[kernel_name],
+            grid=(grid_size, 1, 1),
+            block=(block_size, 1, 1),
+            params=(tuple(values), tuple(types)),
+            shared_mem_bytes=shared_mem_bytes,
+        )
+
+    d_validity = cp.asarray(state.validity, dtype=cp.bool_)
+    d_cx = cp.where(d_validity, d_cx, cp.nan)
+    d_cy = cp.where(d_validity, d_cy, cp.nan)
+    return _build_device_resident_point_output_from_device(
+        d_cx,
+        d_cy,
+        d_validity,
+    )
 
 
 def representative_point_native_tabular_result(
@@ -420,156 +558,123 @@ def _fill_polygon_representatives_gpu(
 
     runtime = get_cuda_runtime()
     kernels = _representative_point_kernels()
-    device_state = owned._ensure_device_state()
+    device_state = owned._ensure_device_state(preserve_indexed_view=True)
 
     # Upload centroid arrays to device
     d_cx = cp.asarray(cx)
     d_cy = cp.asarray(cy)
+    d_tags = cp.asarray(tags, dtype=cp.int8)
+    d_family_row_offsets = cp.asarray(family_row_offsets, dtype=cp.int32)
 
     # Process Polygon family
     poly_tag = FAMILY_TAGS.get(GeometryFamily.POLYGON)
     if poly_tag is not None and GeometryFamily.POLYGON in owned.families:
         device_buf = device_state.families[GeometryFamily.POLYGON]
         if int(device_buf.geometry_offsets.size) > 1:
-            mask = tags == poly_tag
-            global_rows = np.flatnonzero(mask).astype(np.int32)
-            if global_rows.size > 0:
-                family_rows = family_row_offsets[global_rows].astype(np.int32)
-
-                d_poly_x = cp.asarray(device_buf.x)
-                d_poly_y = cp.asarray(device_buf.y)
-                d_ring_offsets = cp.asarray(device_buf.ring_offsets).astype(cp.int32, copy=False)
-                d_geom_offsets = cp.asarray(device_buf.geometry_offsets).astype(cp.int32, copy=False)
-                d_global_rows = cp.asarray(global_rows)
-                d_family_rows = cp.asarray(family_rows)
-
-                # Determine max_intersections from the maximum ring vertex count
-                max_intersections = _compute_max_intersections(device_buf.ring_offsets)
-
-                num_polygons = global_rows.size
-                block_size = min(256, num_polygons)
-                # Shared memory: block_size * max_intersections * sizeof(double)
+            max_intersections = _compute_max_intersections(device_buf.ring_offsets)
+            block_size = min(256, owned.row_count)
+            shared_mem_bytes = block_size * max_intersections * 8
+            if shared_mem_bytes > 48 * 1024:
+                block_size = max(1, (48 * 1024) // (max_intersections * 8))
                 shared_mem_bytes = block_size * max_intersections * 8
-
-                # Cap shared memory at 48 KB (typical limit)
-                if shared_mem_bytes > 48 * 1024:
-                    # Reduce block_size to fit
-                    block_size = max(1, (48 * 1024) // (max_intersections * 8))
-                    shared_mem_bytes = block_size * max_intersections * 8
-
-                grid_size = (num_polygons + block_size - 1) // block_size
-
-                kernel = kernels["representative_point_polygon"]
-                ptr = runtime.pointer
-                params = (
-                    (
-                        ptr(d_cx),
-                        ptr(d_cy),
-                        ptr(d_poly_x),
-                        ptr(d_poly_y),
-                        ptr(d_ring_offsets),
-                        ptr(d_geom_offsets),
-                        ptr(d_global_rows),
-                        ptr(d_family_rows),
-                        ptr(d_cx),  # out_x = in-place update
-                        ptr(d_cy),  # out_y = in-place update
-                        num_polygons,
-                        max_intersections,
-                    ),
-                    (
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_I32,
-                        KERNEL_PARAM_I32,
-                    ),
-                )
-                runtime.launch(
-                    kernel,
-                    grid=(grid_size, 1, 1),
-                    block=(block_size, 1, 1),
-                    params=params,
-                    shared_mem_bytes=shared_mem_bytes,
-                )
+            grid_size = (owned.row_count + block_size - 1) // block_size
+            kernel = kernels["representative_point_polygon"]
+            ptr = runtime.pointer
+            params = (
+                (
+                    ptr(d_cx),
+                    ptr(d_cy),
+                    ptr(device_buf.x),
+                    ptr(device_buf.y),
+                    ptr(device_buf.ring_offsets),
+                    ptr(device_buf.geometry_offsets),
+                    ptr(d_tags),
+                    ptr(d_family_row_offsets),
+                    int(poly_tag),
+                    ptr(d_cx),
+                    ptr(d_cy),
+                    owned.row_count,
+                    max_intersections,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                ),
+            )
+            runtime.launch(
+                kernel,
+                grid=(grid_size, 1, 1),
+                block=(block_size, 1, 1),
+                params=params,
+                shared_mem_bytes=shared_mem_bytes,
+            )
 
     # Process MultiPolygon family
     mpoly_tag = FAMILY_TAGS.get(GeometryFamily.MULTIPOLYGON)
     if mpoly_tag is not None and GeometryFamily.MULTIPOLYGON in owned.families:
         device_buf = device_state.families[GeometryFamily.MULTIPOLYGON]
         if int(device_buf.geometry_offsets.size) > 1:
-            mask = tags == mpoly_tag
-            global_rows = np.flatnonzero(mask).astype(np.int32)
-            if global_rows.size > 0:
-                family_rows = family_row_offsets[global_rows].astype(np.int32)
-
-                d_poly_x = cp.asarray(device_buf.x)
-                d_poly_y = cp.asarray(device_buf.y)
-                d_ring_offsets = cp.asarray(device_buf.ring_offsets).astype(cp.int32, copy=False)
-                d_part_offsets = cp.asarray(device_buf.part_offsets).astype(cp.int32, copy=False)
-                d_geom_offsets = cp.asarray(device_buf.geometry_offsets).astype(cp.int32, copy=False)
-                d_global_rows = cp.asarray(global_rows)
-                d_family_rows = cp.asarray(family_rows)
-
-                max_intersections = _compute_max_intersections(device_buf.ring_offsets)
-
-                num_polygons = global_rows.size
-                block_size = min(256, num_polygons)
+            max_intersections = _compute_max_intersections(device_buf.ring_offsets)
+            block_size = min(256, owned.row_count)
+            shared_mem_bytes = block_size * max_intersections * 8
+            if shared_mem_bytes > 48 * 1024:
+                block_size = max(1, (48 * 1024) // (max_intersections * 8))
                 shared_mem_bytes = block_size * max_intersections * 8
-
-                if shared_mem_bytes > 48 * 1024:
-                    block_size = max(1, (48 * 1024) // (max_intersections * 8))
-                    shared_mem_bytes = block_size * max_intersections * 8
-
-                grid_size = (num_polygons + block_size - 1) // block_size
-
-                kernel = kernels["representative_point_multipolygon"]
-                ptr = runtime.pointer
-                params = (
-                    (
-                        ptr(d_cx),
-                        ptr(d_cy),
-                        ptr(d_poly_x),
-                        ptr(d_poly_y),
-                        ptr(d_ring_offsets),
-                        ptr(d_part_offsets),
-                        ptr(d_geom_offsets),
-                        ptr(d_global_rows),
-                        ptr(d_family_rows),
-                        ptr(d_cx),
-                        ptr(d_cy),
-                        num_polygons,
-                        max_intersections,
-                    ),
-                    (
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_PTR,
-                        KERNEL_PARAM_I32,
-                        KERNEL_PARAM_I32,
-                    ),
-                )
-                runtime.launch(
-                    kernel,
-                    grid=(grid_size, 1, 1),
-                    block=(block_size, 1, 1),
-                    params=params,
-                    shared_mem_bytes=shared_mem_bytes,
-                )
+            grid_size = (owned.row_count + block_size - 1) // block_size
+            kernel = kernels["representative_point_multipolygon"]
+            ptr = runtime.pointer
+            params = (
+                (
+                    ptr(d_cx),
+                    ptr(d_cy),
+                    ptr(device_buf.x),
+                    ptr(device_buf.y),
+                    ptr(device_buf.ring_offsets),
+                    ptr(device_buf.part_offsets),
+                    ptr(device_buf.geometry_offsets),
+                    ptr(d_tags),
+                    ptr(d_family_row_offsets),
+                    int(mpoly_tag),
+                    ptr(d_cx),
+                    ptr(d_cy),
+                    owned.row_count,
+                    max_intersections,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                ),
+            )
+            runtime.launch(
+                kernel,
+                grid=(grid_size, 1, 1),
+                block=(block_size, 1, 1),
+                params=params,
+                shared_mem_bytes=shared_mem_bytes,
+            )
 
     # Return device arrays — caller builds device-resident OGA directly.
     # No D2H transfer: the kernel-modified d_cx/d_cy stay on device.
@@ -632,8 +737,14 @@ def _fill_polygon_representatives_cpu(
                 family_rows = family_row_offsets[global_rows]
                 for gr, fr in zip(global_rows, family_rows):
                     _representative_point_single_polygon_cpu(
-                        buf.x, buf.y, buf.ring_offsets,
-                        buf.geometry_offsets, fr, gr, cx, cy,
+                        buf.x,
+                        buf.y,
+                        buf.ring_offsets,
+                        buf.geometry_offsets,
+                        fr,
+                        gr,
+                        cx,
+                        cy,
                     )
 
     # Process MultiPolygon family
@@ -646,9 +757,15 @@ def _fill_polygon_representatives_cpu(
                 family_rows = family_row_offsets[global_rows]
                 for gr, fr in zip(global_rows, family_rows):
                     _representative_point_single_multipolygon_cpu(
-                        buf.x, buf.y, buf.ring_offsets,
-                        buf.part_offsets, buf.geometry_offsets,
-                        fr, gr, cx, cy,
+                        buf.x,
+                        buf.y,
+                        buf.ring_offsets,
+                        buf.part_offsets,
+                        buf.geometry_offsets,
+                        fr,
+                        gr,
+                        cx,
+                        cy,
                     )
 
 
@@ -679,9 +796,13 @@ def _pip_check_rings(
                 maxx = max(ax, bx)
                 miny = min(ay, by)
                 maxy = max(ay, by)
-                if (px >= minx - 1e-10 and px <= maxx + 1e-10
-                        and py >= miny - 1e-10 and py <= maxy + 1e-10):
-                    return True  # on boundary
+                if (
+                    px >= minx - 1e-10
+                    and px <= maxx + 1e-10
+                    and py >= miny - 1e-10
+                    and py <= maxy + 1e-10
+                ):
+                    return False
             # Even-odd crossing
             if ((ay > py) != (by > py)) and (px < (bx - ax) * (py - ay) / (by - ay) + ax):
                 inside = not inside
@@ -698,6 +819,26 @@ def _horizontal_ray_representative(
     fallback_x: float,
 ) -> float:
     """Find interior point at y=ray_y via horizontal ray intersection."""
+    best_mid, best_width = _horizontal_ray_interval(
+        ray_y,
+        poly_x,
+        poly_y,
+        ring_offsets,
+        ring_start,
+        ring_end,
+    )
+    return best_mid if best_width >= 0.0 else fallback_x
+
+
+def _horizontal_ray_interval(
+    ray_y: float,
+    poly_x: np.ndarray,
+    poly_y: np.ndarray,
+    ring_offsets: np.ndarray,
+    ring_start: int,
+    ring_end: int,
+) -> tuple[float, float]:
+    """Return the midpoint and width of the widest interior scanline interval."""
     x_vals = []
     for ring_idx in range(ring_start, ring_end):
         coord_start = int(ring_offsets[ring_idx])
@@ -711,16 +852,16 @@ def _horizontal_ray_representative(
                 x_int = ax + (ray_y - ay) / (by - ay) * (bx - ax)
                 x_vals.append(x_int)
     if len(x_vals) < 2:
-        return fallback_x
+        return 0.0, -1.0
     x_vals.sort()
-    best_mid = fallback_x
+    best_mid = 0.0
     best_width = -1.0
     for i in range(0, len(x_vals) - 1, 2):
         width = x_vals[i + 1] - x_vals[i]
         if width > best_width:
             best_width = width
             best_mid = (x_vals[i] + x_vals[i + 1]) * 0.5
-    return best_mid
+    return best_mid, best_width
 
 
 def _representative_point_single_polygon_cpu(
@@ -748,7 +889,13 @@ def _representative_point_single_polygon_cpu(
 
     # Centroid is outside - use horizontal ray at centroid Y
     new_x = _horizontal_ray_representative(
-        pt_y, poly_x, poly_y, ring_offsets, ring_start, ring_end, pt_x,
+        pt_y,
+        poly_x,
+        poly_y,
+        ring_offsets,
+        ring_start,
+        ring_end,
+        pt_x,
     )
     cx[gr] = new_x
     # cy stays at centroid Y
@@ -775,15 +922,54 @@ def _representative_point_single_multipolygon_cpu(
     if part_start >= part_end:
         return
 
-    # Collect all ring ranges across all parts for the PIP check
+    # Collect all ring ranges across all parts for the PIP check.
     all_ring_start = int(part_offsets[part_start])
     all_ring_end = int(part_offsets[part_end])
 
     if _pip_check_rings(pt_x, pt_y, poly_x, poly_y, ring_offsets, all_ring_start, all_ring_end):
         return  # centroid is inside
 
-    # Centroid is outside - use horizontal ray
-    new_x = _horizontal_ray_representative(
-        pt_y, poly_x, poly_y, ring_offsets, all_ring_start, all_ring_end, pt_x,
-    )
-    cx[gr] = new_x
+    # A MultiPolygon centroid can lie between disconnected components. Choose
+    # the widest interval from a vertex-safe scanline within each component.
+    best_x = pt_x
+    best_y = pt_y
+    best_width = -1.0
+    for part_idx in range(part_start, part_end):
+        ring_start = int(part_offsets[part_idx])
+        ring_end = int(part_offsets[part_idx + 1])
+        if ring_start >= ring_end:
+            continue
+        exterior_start = int(ring_offsets[ring_start])
+        exterior_end = int(ring_offsets[ring_start + 1])
+        if exterior_end - exterior_start < 4:
+            continue
+        component_y = poly_y[exterior_start:exterior_end]
+        min_y = float(component_y.min())
+        max_y = float(component_y.max())
+        if not min_y < max_y:
+            continue
+        center_y = (min_y + max_y) * 0.5
+        lower_y = max(float(y) for y in component_y if y <= center_y)
+        upper_y = min(float(y) for y in component_y if y > center_y)
+        scan_y = (lower_y + upper_y) * 0.5
+        candidate_x, candidate_width = _horizontal_ray_interval(
+            scan_y,
+            poly_x,
+            poly_y,
+            ring_offsets,
+            ring_start,
+            ring_end,
+        )
+        if candidate_width > best_width:
+            best_x = candidate_x
+            best_y = scan_y
+            best_width = candidate_width
+
+    if best_width >= 0.0:
+        cx[gr] = best_x
+        cy[gr] = best_y
+    else:
+        first_ring = int(part_offsets[part_start])
+        first_coord = int(ring_offsets[first_ring])
+        cx[gr] = float(poly_x[first_coord])
+        cy[gr] = float(poly_y[first_coord])

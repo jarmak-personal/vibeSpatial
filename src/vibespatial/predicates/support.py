@@ -9,6 +9,7 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray, from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_pairwise_product_work_from_owned
 from vibespatial.runtime.precision import (
     KernelClass,
     PrecisionMode,
@@ -102,12 +103,23 @@ def resolve_predicate_context(
             f"{kernel_name} requires aligned inputs; got {left.row_count} and {right.row_count} rows"
         )
 
-    requested_mode = dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
+    requested_mode = (
+        dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
+    )
     geometry_families = tuple(sorted({family.value for family in left.families | right.families}))
+    work_estimate = estimate_pairwise_product_work_from_owned(
+        left,
+        right,
+        pair_unit="segment",
+        output_row_count=left.row_count,
+        output_byte_count=left.row_count,
+        primary_unit_name=f"{kernel_name}-segment-pair",
+    )
     plan = plan_dispatch_selection(
         kernel_name=kernel_name,
         kernel_class=KernelClass.PREDICATE,
         row_count=left.row_count,
+        work_estimate=work_estimate,
         geometry_families=geometry_families,
         mixed_geometry=len(geometry_families) > 1,
         current_residency=left.residency,
@@ -124,6 +136,7 @@ def resolve_predicate_context(
                 kernel_name=kernel_name,
                 kernel_class=KernelClass.PREDICATE,
                 row_count=left.row_count,
+                work_estimate=work_estimate,
                 geometry_families=geometry_families,
                 mixed_geometry=len(geometry_families) > 1,
                 current_residency=left.residency,

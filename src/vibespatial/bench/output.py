@@ -1,4 +1,5 @@
 """Output rendering for vsbench CLI: Rich (human), JSON (agent), quiet (CI)."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -27,6 +28,7 @@ def _has_rich() -> bool:
 # ---------------------------------------------------------------------------
 # Formatting helpers
 # ---------------------------------------------------------------------------
+
 
 def _fmt_time(seconds: float) -> str:
     if seconds <= 0:
@@ -70,6 +72,7 @@ def _status_symbol(status: str) -> str:
 # Quiet mode (CI)
 # ---------------------------------------------------------------------------
 
+
 def _render_quiet(result: BenchmarkResult) -> str:
     status = _status_symbol(result.status)
     parts = [f"[{status}]", result.operation, f"scale={_fmt_scale(result.scale)}"]
@@ -92,6 +95,7 @@ def _render_quiet_suite(suite: SuiteResult) -> str:
 # ---------------------------------------------------------------------------
 # Plain text fallback (no Rich)
 # ---------------------------------------------------------------------------
+
 
 def _render_plain(result: BenchmarkResult) -> str:
     lines = [
@@ -135,6 +139,7 @@ def _render_plain_suite(suite: SuiteResult) -> str:
 # Rich mode
 # ---------------------------------------------------------------------------
 
+
 def _render_rich(result: BenchmarkResult) -> str:
     from rich.console import Console
     from rich.table import Table
@@ -154,7 +159,9 @@ def _render_rich(result: BenchmarkResult) -> str:
 
     if result.speedup is not None:
         style = "bold green" if result.speedup >= 1.0 else "bold red"
-        table.add_row("Speedup", f"[{style}]{_fmt_speedup(result.speedup)}[/] vs {result.baseline_name}")
+        table.add_row(
+            "Speedup", f"[{style}]{_fmt_speedup(result.speedup)}[/] vs {result.baseline_name}"
+        )
 
     if result.transfers:
         xfer_total = result.transfers.d2h_count + result.transfers.h2d_count
@@ -197,10 +204,15 @@ def _render_rich(result: BenchmarkResult) -> str:
             f"[{gate_style}]{gate_str}[/] (threshold: {_fmt_speedup(result.tier_gate_threshold)})",
         )
 
-    status_style = {"pass": "bold green", "fail": "bold red", "error": "bold red", "skip": "dim"}.get(
-        result.status, ""
+    status_style = {
+        "pass": "bold green",
+        "fail": "bold red",
+        "error": "bold red",
+        "skip": "dim",
+    }.get(result.status, "")
+    table.add_row(
+        "Status", f"[{status_style}]{_status_symbol(result.status)}[/] {result.status_reason}"
     )
-    table.add_row("Status", f"[{status_style}]{_status_symbol(result.status)}[/] {result.status_reason}")
 
     console = Console(file=None, force_terminal=False)
     with console.capture() as capture:
@@ -242,7 +254,10 @@ def _render_rich_suite(suite: SuiteResult) -> str:
             gpu_str = f"{r.gpu_util.sm_utilization_pct_avg:.0f}%"
 
         status_style = {
-            "pass": "bold green", "fail": "bold red", "error": "bold red", "skip": "dim",
+            "pass": "bold green",
+            "fail": "bold red",
+            "error": "bold red",
+            "skip": "dim",
         }.get(r.status, "")
         status_str = f"[{status_style}]{_status_symbol(r.status)}[/]"
 
@@ -270,6 +285,7 @@ def _render_rich_suite(suite: SuiteResult) -> str:
 # ---------------------------------------------------------------------------
 # List rendering
 # ---------------------------------------------------------------------------
+
 
 def _render_list_rich(
     items: list[dict[str, Any]],
@@ -306,7 +322,10 @@ def _render_list_plain(
         lines.append("(none)")
         return "\n".join(lines)
 
-    widths = [max(len(cn), max((len(str(item.get(cn, ""))) for item in items), default=0)) for cn in col_names]
+    widths = [
+        max(len(cn), max((len(str(item.get(cn, ""))) for item in items), default=0))
+        for cn in col_names
+    ]
     header = "  ".join(cn.ljust(w) for cn, w in zip(col_names, widths))
     lines.append(header)
     lines.append("  ".join("-" * w for w in widths))
@@ -319,6 +338,7 @@ def _render_list_plain(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def render_result(result: BenchmarkResult, *, mode: str = "human") -> str:
     """Render a single benchmark result.
@@ -368,6 +388,7 @@ def render_list(
 # ---------------------------------------------------------------------------
 # Shootout rendering
 # ---------------------------------------------------------------------------
+
 
 def _shootout_status(run: Any) -> str:
     return "ERR" if run.error else "OK"
@@ -482,7 +503,10 @@ def _render_shootout_rich(result: Any) -> str:
         table.add_row(
             "Speedup",
             f"[{style}]{result.speedup:.2f}x[/] ({label})",
-            "", "", "", "",
+            "",
+            "",
+            "",
+            "",
         )
 
     fp = _fingerprint_label(result)
@@ -491,7 +515,10 @@ def _render_shootout_rich(result: Any) -> str:
         table.add_row(
             "Fingerprint",
             f"[{fp_style}]{fp}[/]",
-            "", "", "", "",
+            "",
+            "",
+            "",
+            "",
         )
     note = _shootout_measurement_note(result)
     if note:

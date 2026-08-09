@@ -9,6 +9,7 @@ power users can import them directly::
 Imports are deferred via ``__getattr__`` to avoid pulling in heavy CUDA
 dependencies (CuPy, NVRTC) at package import time.
 """
+
 from __future__ import annotations
 
 

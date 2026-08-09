@@ -50,7 +50,9 @@ def unary_result_for_missing_input(value: Any) -> None:
     raise ValueError("unary_result_for_missing_input only applies to null inputs")
 
 
-def measurement_result_for_geometry(value: Any, *, kind: str) -> float | tuple[float, float, float, float]:
+def measurement_result_for_geometry(
+    value: Any, *, kind: str
+) -> float | tuple[float, float, float, float]:
     semantics = classify_geometry(value)
     if semantics.presence is GeometryPresence.NULL:
         return None  # type: ignore[return-value]
@@ -60,7 +62,9 @@ def measurement_result_for_geometry(value: Any, *, kind: str) -> float | tuple[f
         if kind in {"area", "length"}:
             return 0.0
         raise ValueError(f"unsupported measurement kind: {kind}")
-    raise ValueError("measurement_result_for_geometry only applies to null or empty geometry inputs")
+    raise ValueError(
+        "measurement_result_for_geometry only applies to null or empty geometry inputs"
+    )
 
 
 def predicate_result_for_pair(left: Any, right: Any) -> bool | None:
@@ -70,4 +74,6 @@ def predicate_result_for_pair(left: Any, right: Any) -> bool | None:
         return None
     if GeometryPresence.EMPTY in {left_state.presence, right_state.presence}:
         return False
-    raise ValueError("predicate_result_for_pair only applies when at least one input is null or empty")
+    raise ValueError(
+        "predicate_result_for_pair only applies when at least one input is null or empty"
+    )

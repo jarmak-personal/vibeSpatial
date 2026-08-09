@@ -1000,6 +1000,7 @@ class GeometryArray(ExtensionArray):
         if self._owned_flat_sindex is None:
             from vibespatial.runtime import ExecutionMode
             from vibespatial.runtime.adaptive import plan_dispatch_selection
+            from vibespatial.runtime.crossover import estimate_spatial_index_work_from_owned
             from vibespatial.runtime.precision import KernelClass
             from vibespatial.spatial.indexing import build_flat_spatial_index
 
@@ -1007,6 +1008,7 @@ class GeometryArray(ExtensionArray):
                 kernel_name="flat_index_build",
                 kernel_class=KernelClass.COARSE,
                 row_count=owned.row_count,
+                work_estimate=estimate_spatial_index_work_from_owned(owned),
                 requested_mode=ExecutionMode.CPU,
             )
             self._owned_flat_sindex = build_flat_spatial_index(
@@ -1034,7 +1036,10 @@ class GeometryArray(ExtensionArray):
         if self._owned is not None:
             from vibespatial.constructive.validity import is_valid_owned
 
-            result = np.asarray(is_valid_owned(self._owned), dtype=bool)
+            result = np.asarray(
+                is_valid_owned(self._owned, _exact_collinearity=True),
+                dtype=bool,
+            )
             if not bool(np.all(self._owned.validity)):
                 result = result.copy()
                 result[~self._owned.validity] = False
@@ -1462,6 +1467,18 @@ class GeometryArray(ExtensionArray):
             keep_collapsed=keep_collapsed,
             prebuilt_owned=self._owned,
         )
+        if result.native_geometry is not None:
+            native = result.native_geometry.with_crs(self.crs)
+            return GeometryArray(
+                np.asarray(
+                    native.to_geoseries(
+                        index=pd.RangeIndex(int(result.row_count)),
+                        name="geometry",
+                    ),
+                    dtype=object,
+                ),
+                crs=self.crs,
+            )
         if result.owned is not None:
             return GeometryArray.from_owned(result.owned, crs=self.crs)
         return GeometryArray(result.geometries, crs=self.crs)
@@ -1715,7 +1732,9 @@ class GeometryArray(ExtensionArray):
     def _constructive_or_fallback(self, op, other, **kwargs) -> GeometryArray:
         """Dispatch binary constructive ops through owned path when available."""
         if self._owned is not None:
-            from vibespatial.constructive.binary_constructive import binary_constructive_owned
+            from vibespatial.constructive.binary_constructive import (
+                binary_constructive_native,
+            )
             from vibespatial.runtime.crossover import WorkloadShape
 
             # Coerce other to OwnedGeometryArray.
@@ -1733,12 +1752,21 @@ class GeometryArray(ExtensionArray):
 
             if other_owned is not None:
                 try:
-                    result_owned = binary_constructive_owned(
+                    result_geometry = binary_constructive_native(
                         op, self._owned, other_owned, workload_shape=workload_shape, **kwargs,
                     )
-                    # binary_constructive_owned records its own dispatch event
+                    # The constructive dispatcher records its own dispatch event
                     # with the accurate selected mode (GPU or CPU).
-                    return GeometryArray.from_owned(result_owned, crs=self.crs)
+                    result_geometry = result_geometry.with_crs(self.crs)
+                    if result_geometry.owned is not None:
+                        return GeometryArray.from_owned(
+                            result_geometry.owned,
+                            crs=self.crs,
+                        )
+                    return result_geometry.to_geoseries(
+                        index=pd.RangeIndex(len(self)),
+                        name="geometry",
+                    ).values
                 except NotImplementedError:
                     # GeometryCollection or other unsupported family in result;
                     # fall through to the Shapely host path below.
@@ -1813,8 +1841,14 @@ class GeometryArray(ExtensionArray):
             from vibespatial.constructive.shared_paths import shared_paths_owned
 
             other_owned = other.to_owned()
-            result = shared_paths_owned(self._owned, other_owned)
-            # shared_paths returns numpy array of Shapely GeometryCollection objects
+            result = shared_paths_owned(self._owned, other_owned, crs=self.crs)
+            from vibespatial.api._native_result_core import GeometryNativeResult
+
+            if isinstance(result, GeometryNativeResult):
+                return result.to_geoseries(
+                    index=pd.RangeIndex(len(self)),
+                    name="geometry",
+                ).values
             return GeometryArray(result, crs=self.crs)
         return GeometryArray(
             self._binary_method("shared_paths", self, other), crs=self.crs
@@ -2250,61 +2284,35 @@ class GeometryArray(ExtensionArray):
         return shapely.intersection_all(self._data)
 
     def _try_gpu_reduction(self, op: str, **kwargs):
-        """Attempt a GPU global reduction, returning a Shapely geometry or None.
+        """Execute one admitted native global reduction atomically."""
+        from vibespatial.constructive.union_all import (
+            coverage_union_all_gpu_owned,
+            intersection_all_gpu_owned,
+            unary_union_gpu_owned,
+            union_all_gpu_owned,
+        )
 
-        Imports and calls the appropriate GPU reduction function from
-        vibespatial.constructive.union_all.  Returns None if the GPU
-        path is unavailable or fails, signalling the caller to fall
-        through to the Shapely CPU path.
-        """
-        try:
-            from vibespatial.constructive.union_all import (
-                coverage_union_all_gpu_owned,
-                intersection_all_gpu_owned,
-                unary_union_gpu_owned,
-                union_all_gpu_owned,
+        dispatch = {
+            "union_all": union_all_gpu_owned,
+            "coverage_union_all": coverage_union_all_gpu_owned,
+            "intersection_all": intersection_all_gpu_owned,
+            "unary_union": unary_union_gpu_owned,
+        }
+        fn = dispatch.get(op)
+        if fn is None:
+            raise ValueError(f"unknown native global reduction {op!r}")
+        kwargs.setdefault("dispatch_mode", _native_strict_dispatch_mode())
+        result_owned = fn(self._owned, **kwargs)
+        if result_owned is None or result_owned.row_count != 1:
+            raise RuntimeError(
+                f"native global reduction {op!r} did not produce one output row"
             )
-            from vibespatial.runtime.residency import Residency
-
-            dispatch = {
-                "union_all": union_all_gpu_owned,
-                "coverage_union_all": coverage_union_all_gpu_owned,
-                "intersection_all": intersection_all_gpu_owned,
-                "unary_union": unary_union_gpu_owned,
-            }
-            fn = dispatch.get(op)
-            if fn is None:
-                return None
-            kwargs.setdefault("dispatch_mode", _native_strict_dispatch_mode())
-            result_owned = fn(self._owned, **kwargs)
-            if result_owned is not None:
-                result_geoms = owned_to_shapely(result_owned)
-                if result_geoms.size > 0:
-                    return result_geoms[0]
-            record_fallback_event(
-                surface=f"geopandas.array.{op}",
-                reason="native global reduction returned no result; falling back to Shapely",
-                detail=f"rows={len(self)}",
-                requested=kwargs["dispatch_mode"],
-                selected=ExecutionMode.CPU,
-                pipeline=f"constructive/{op}",
-                d2h_transfer=getattr(self._owned, "residency", None) is Residency.DEVICE,
+        result_geoms = owned_to_shapely(result_owned)
+        if result_geoms.size != 1:
+            raise RuntimeError(
+                f"native global reduction {op!r} exported an invalid row count"
             )
-        except StrictNativeFallbackError:
-            raise
-        except Exception as exc:
-            from vibespatial.runtime.residency import Residency
-
-            record_fallback_event(
-                surface=f"geopandas.array.{op}",
-                reason="native global reduction failed; falling back to Shapely",
-                detail=f"rows={len(self)}, error={type(exc).__name__}",
-                requested=_native_strict_dispatch_mode(),
-                selected=ExecutionMode.CPU,
-                pipeline=f"constructive/{op}",
-                d2h_transfer=getattr(self._owned, "residency", None) is Residency.DEVICE,
-            )
-        return None
+        return result_geoms[0]
 
     #
     # Affinity operations

@@ -21,6 +21,7 @@ _NVTX_COLORS = {
 
 _SPARKLINE_BARS = " ▁▂▃▄▅▆▇█"
 _CUPY_MODULE: Any | bool | None = None
+PROFILE_BOUNDARY_ROLES = ("compute", "terminal", "reference")
 
 
 def _format_percent(value: float) -> str:
@@ -59,7 +60,9 @@ def _sparkline(values: list[float], *, width: int = 28) -> str:
     pieces = []
     for value in values:
         normalized = (value - minimum) / (maximum - minimum)
-        index = min(len(_SPARKLINE_BARS) - 1, max(1, round(normalized * (len(_SPARKLINE_BARS) - 1))))
+        index = min(
+            len(_SPARKLINE_BARS) - 1, max(1, round(normalized * (len(_SPARKLINE_BARS) - 1)))
+        )
         pieces.append(_SPARKLINE_BARS[index])
     return "".join(pieces)
 
@@ -305,6 +308,75 @@ def _materialization_events() -> list[Any]:
         return []
 
 
+def _normalize_profile_boundary(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower().replace("_", "-")
+    if normalized in {"compute", "hot", "internal"}:
+        return "compute"
+    if normalized in {"terminal", "export", "emit", "user-export"}:
+        return "terminal"
+    if normalized in {"reference", "oracle", "validation", "validate"}:
+        return "reference"
+    return None
+
+
+def profile_boundary_for_stage(
+    name: str,
+    category: str,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Classify a profile stage as compute, terminal export, or reference.
+
+    Raw stage counters remain available, but aggregate profile counters use this
+    boundary so host reference/oracle work and user-visible export work do not
+    masquerade as native compute-path debt.
+    """
+    explicit = _normalize_profile_boundary((metadata or {}).get("profile_boundary"))
+    if explicit is not None:
+        return explicit
+
+    lowered_name = name.lower()
+    lowered_category = category.lower()
+    if (
+        "reference" in lowered_name
+        or "oracle" in lowered_name
+        or lowered_category in {"reference", "oracle", "validate", "validation"}
+    ):
+        return "reference"
+    if lowered_category == "emit" or lowered_name.startswith("write_"):
+        return "terminal"
+    return "compute"
+
+
+def _stage_counter_totals(stages: tuple[ProfileStageTrace, ...]) -> dict[str, Any]:
+    totals: dict[str, Any] = {}
+    for role in PROFILE_BOUNDARY_ROLES:
+        totals[f"{role}_stage_count"] = 0
+        totals[f"{role}_runtime_d2h_transfer_count"] = 0
+        totals[f"{role}_runtime_d2h_transfer_bytes"] = 0
+        totals[f"{role}_runtime_d2h_transfer_seconds"] = 0.0
+        totals[f"{role}_materialization_count"] = 0
+
+    for stage in stages:
+        role = profile_boundary_for_stage(stage.name, stage.category, stage.metadata)
+        metadata = stage.metadata
+        totals[f"{role}_stage_count"] += 1
+        totals[f"{role}_runtime_d2h_transfer_count"] += int(
+            metadata.get("runtime_d2h_transfer_count_delta", 0)
+        )
+        totals[f"{role}_runtime_d2h_transfer_bytes"] += int(
+            metadata.get("runtime_d2h_transfer_bytes_delta", 0)
+        )
+        totals[f"{role}_runtime_d2h_transfer_seconds"] += float(
+            metadata.get("runtime_d2h_transfer_seconds_delta", 0.0)
+        )
+        totals[f"{role}_materialization_count"] += int(
+            metadata.get("materialization_count_delta", 0)
+        )
+    return totals
+
+
 class StageProfiler:
     def __init__(
         self,
@@ -323,10 +395,14 @@ class StageProfiler:
         self.operation = operation
         self.dataset = dataset
         self.requested_runtime = (
-            requested_runtime.value if isinstance(requested_runtime, ExecutionMode) else str(requested_runtime)
+            requested_runtime.value
+            if isinstance(requested_runtime, ExecutionMode)
+            else str(requested_runtime)
         )
         self.selected_runtime = (
-            selected_runtime.value if isinstance(selected_runtime, ExecutionMode) else str(selected_runtime)
+            selected_runtime.value
+            if isinstance(selected_runtime, ExecutionMode)
+            else str(selected_runtime)
         )
         self.enable_nvtx = enable_nvtx
         self._gpu_sampler = gpu_sampler if gpu_sampler is not None else _NvmlGpuSampler()
@@ -390,12 +466,8 @@ class StageProfiler:
             runtime_d2h_bytes_end,
             runtime_d2h_seconds_end,
         ) = _runtime_d2h_transfer_stats()
-        runtime_d2h_delta_events = _runtime_d2h_transfer_events()[
-            runtime_d2h_event_start_count:
-        ]
-        materialization_delta_events = _materialization_events()[
-            materialization_start_count:
-        ]
+        runtime_d2h_delta_events = _runtime_d2h_transfer_events()[runtime_d2h_event_start_count:]
+        materialization_delta_events = _materialization_events()[materialization_start_count:]
         gpu_collector.stop()
         if track_gpu_events:
             gpu_event_timer.stop()
@@ -422,12 +494,27 @@ class StageProfiler:
                 event.to_dict() for event in runtime_d2h_delta_events
             ]
         if materialization_delta_events:
-            measurement.metadata["materialization_count_delta"] = len(
-                materialization_delta_events
-            )
+            measurement.metadata["materialization_count_delta"] = len(materialization_delta_events)
             measurement.metadata["materialization_events"] = [
                 event.to_dict() for event in materialization_delta_events
             ]
+        boundary_role = profile_boundary_for_stage(name, category, measurement.metadata)
+        measurement.metadata["profile_boundary"] = boundary_role
+        for role in PROFILE_BOUNDARY_ROLES:
+            active = role == boundary_role
+            prefix = f"{role}_"
+            measurement.metadata[f"{prefix}runtime_d2h_transfer_count_delta"] = (
+                measurement.metadata["runtime_d2h_transfer_count_delta"] if active else 0
+            )
+            measurement.metadata[f"{prefix}runtime_d2h_transfer_bytes_delta"] = (
+                measurement.metadata["runtime_d2h_transfer_bytes_delta"] if active else 0
+            )
+            measurement.metadata[f"{prefix}runtime_d2h_transfer_seconds_delta"] = (
+                measurement.metadata["runtime_d2h_transfer_seconds_delta"] if active else 0.0
+            )
+            measurement.metadata[f"{prefix}materialization_count_delta"] = (
+                int(measurement.metadata.get("materialization_count_delta", 0)) if active else 0
+            )
         measurement.metadata.update(gpu_collector.summarize())
         if resolved_device == ExecutionMode.GPU.value:
             gpu_event_summary = gpu_event_timer.summarize()
@@ -447,6 +534,9 @@ class StageProfiler:
         )
 
     def finish(self, *, metadata: dict[str, Any] | None = None) -> ProfileTrace:
+        trace_metadata = dict(metadata or {})
+        for key, value in _stage_counter_totals(tuple(self._stages)).items():
+            trace_metadata.setdefault(key, value)
         return ProfileTrace(
             operation=self.operation,
             dataset=self.dataset,
@@ -455,5 +545,5 @@ class StageProfiler:
             total_elapsed_seconds=perf_counter() - self._started,
             nvtx_enabled=self.enable_nvtx,
             stages=tuple(self._stages),
-            metadata=dict(metadata or {}),
+            metadata=trace_metadata,
         )

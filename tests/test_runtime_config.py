@@ -15,7 +15,6 @@ from vibespatial.io.gpu_parse import indexing_kernels as gpu_parse_indexing_kern
 from vibespatial.kernels.constructive import (
     line_merge,
     segmented_union,
-    shared_paths,
     shortest_line,
 )
 from vibespatial.kernels.core import spatial_query_source
@@ -28,7 +27,6 @@ from vibespatial.runtime.config import (
     OVERLAY_GPU_FAILURE_THRESHOLD,
     OVERLAY_GPU_REMAINDER_THRESHOLD,
     OVERLAY_GROUPED_BOX_GPU_THRESHOLD,
-    OVERLAY_PAIR_BATCH_THRESHOLD,
     OVERLAY_UNION_ALL_GPU_THRESHOLD,
     SEGMENT_TILE_SIZE,
 )
@@ -46,7 +44,6 @@ def test_spatial_epsilon_is_centralized_in_kernel_sources() -> None:
         point_relations_kernels._SHARED_DEVICE_HELPERS,
         predicate_polygon_kernels._POLYGON_PREDICATES_KERNEL_SOURCE,
         gpu_kernels._OVERLAY_FACE_WALK_KERNEL_SOURCE,
-        gpu_kernels._OVERLAY_FACE_LABEL_KERNEL_SOURCE,
         spatial_indexing_kernels._INDEXING_KERNEL_SOURCE,
         gpu_parse_indexing_kernels._HILBERT_KERNEL_SOURCE,
         spatial_query_source._SPATIAL_QUERY_KERNEL_SOURCE,
@@ -55,15 +52,18 @@ def test_spatial_epsilon_is_centralized_in_kernel_sources() -> None:
         validity_kernels._HOLES_IN_SHELL_KERNEL_TEMPLATE,
         polygon_kernels._POLYGON_BUFFER_KERNEL_SOURCE,
         clip_rect_kernels._SUTHERLAND_HODGMAN_KERNEL_SOURCE,
-        clip_rect_kernels._LIANG_BARSKY_KERNEL_SOURCE,
+        clip_rect_kernels._LINE_ROW_KERNEL_SOURCE,
         linestring_kernels._LINESTRING_BUFFER_KERNEL_SOURCE,
-        shared_paths._SHARED_PATHS_KERNEL_SOURCE,
         line_merge._LINE_MERGE_KERNEL_SOURCE,
         shortest_line._SHORTEST_LINE_KERNEL_SOURCE,
     )
     for source in sources:
         assert "1e-12" not in source
         assert "VS_SPATIAL_EPSILON" in source
+
+    exact_overlay_source = gpu_kernels._OVERLAY_FACE_LABEL_KERNEL_SOURCE
+    assert "1e-12" not in exact_overlay_source
+    assert "#define OVERLAY_BOUNDARY_TOLERANCE 0.0" in exact_overlay_source
 
 
 def test_tile_size_defaults_are_centralized() -> None:
@@ -86,7 +86,6 @@ def test_overlay_thresholds_are_centralized() -> None:
     assert OVERLAY_GROUPED_BOX_GPU_THRESHOLD == 50_000
     assert OVERLAY_UNION_ALL_GPU_THRESHOLD == 50
     assert OVERLAY_GPU_FAILURE_THRESHOLD == 3
-    assert OVERLAY_PAIR_BATCH_THRESHOLD == 200_000
     assert OVERLAY_GPU_REMAINDER_THRESHOLD == 1_000
 
     assert not hasattr(bypass, "_BATCH_PIP_GPU_THRESHOLD")

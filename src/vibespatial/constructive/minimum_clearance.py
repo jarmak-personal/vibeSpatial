@@ -56,6 +56,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_segment_pair_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
@@ -85,21 +86,48 @@ from vibespatial.constructive.minimum_clearance_kernels import (
 # Background precompilation (ADR-0034)
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 
-request_nvrtc_warmup([
-    ("linestring-clearance-fp64", _LINESTRING_CLEARANCE_FP64, _LINESTRING_CLEARANCE_NAMES),
-    ("polygon-clearance-fp64", _POLYGON_CLEARANCE_FP64, _POLYGON_CLEARANCE_NAMES),
-    ("multipolygon-clearance-fp64", _MULTIPOLYGON_CLEARANCE_FP64, _MULTIPOLYGON_CLEARANCE_NAMES),
-    ("multilinestring-clearance-fp64", _MULTILINESTRING_CLEARANCE_FP64, _MULTILINESTRING_CLEARANCE_NAMES),
-    ("linestring-clearance-line-fp64", _LINESTRING_CLEARANCE_LINE_FP64, _LINESTRING_CLEARANCE_LINE_NAMES),
-    ("polygon-clearance-line-fp64", _POLYGON_CLEARANCE_LINE_FP64, _POLYGON_CLEARANCE_LINE_NAMES),
-    ("multipolygon-clearance-line-fp64", _MULTIPOLYGON_CLEARANCE_LINE_FP64, _MULTIPOLYGON_CLEARANCE_LINE_NAMES),
-    ("multilinestring-clearance-line-fp64", _MULTILINESTRING_CLEARANCE_LINE_FP64, _MULTILINESTRING_CLEARANCE_LINE_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("linestring-clearance-fp64", _LINESTRING_CLEARANCE_FP64, _LINESTRING_CLEARANCE_NAMES),
+        ("polygon-clearance-fp64", _POLYGON_CLEARANCE_FP64, _POLYGON_CLEARANCE_NAMES),
+        (
+            "multipolygon-clearance-fp64",
+            _MULTIPOLYGON_CLEARANCE_FP64,
+            _MULTIPOLYGON_CLEARANCE_NAMES,
+        ),
+        (
+            "multilinestring-clearance-fp64",
+            _MULTILINESTRING_CLEARANCE_FP64,
+            _MULTILINESTRING_CLEARANCE_NAMES,
+        ),
+        (
+            "linestring-clearance-line-fp64",
+            _LINESTRING_CLEARANCE_LINE_FP64,
+            _LINESTRING_CLEARANCE_LINE_NAMES,
+        ),
+        (
+            "polygon-clearance-line-fp64",
+            _POLYGON_CLEARANCE_LINE_FP64,
+            _POLYGON_CLEARANCE_LINE_NAMES,
+        ),
+        (
+            "multipolygon-clearance-line-fp64",
+            _MULTIPOLYGON_CLEARANCE_LINE_FP64,
+            _MULTIPOLYGON_CLEARANCE_LINE_NAMES,
+        ),
+        (
+            "multilinestring-clearance-line-fp64",
+            _MULTILINESTRING_CLEARANCE_LINE_FP64,
+            _MULTILINESTRING_CLEARANCE_LINE_NAMES,
+        ),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # GPU implementation
 # ---------------------------------------------------------------------------
+
 
 @register_kernel_variant(
     "minimum_clearance",
@@ -125,22 +153,42 @@ def _minimum_clearance_gpu(
 
     # --- LineString family ---
     _launch_linestring_clearance(
-        owned, result, tags, family_row_offsets, device_state, runtime,
+        owned,
+        result,
+        tags,
+        family_row_offsets,
+        device_state,
+        runtime,
     )
 
     # --- MultiLineString family ---
     _launch_multilinestring_clearance(
-        owned, result, tags, family_row_offsets, device_state, runtime,
+        owned,
+        result,
+        tags,
+        family_row_offsets,
+        device_state,
+        runtime,
     )
 
     # --- Polygon family ---
     _launch_polygon_clearance(
-        owned, result, tags, family_row_offsets, device_state, runtime,
+        owned,
+        result,
+        tags,
+        family_row_offsets,
+        device_state,
+        runtime,
     )
 
     # --- MultiPolygon family ---
     _launch_multipolygon_clearance(
-        owned, result, tags, family_row_offsets, device_state, runtime,
+        owned,
+        result,
+        tags,
+        family_row_offsets,
+        device_state,
+        runtime,
     )
 
     # Point, MultiPoint: clearance = infinity (already initialized)
@@ -148,7 +196,12 @@ def _minimum_clearance_gpu(
 
 
 def _launch_linestring_clearance(
-    owned, result, tags, family_row_offsets, device_state, runtime,
+    owned,
+    result,
+    tags,
+    family_row_offsets,
+    device_state,
+    runtime,
 ):
     """Launch linestring minimum clearance kernel."""
     tag = FAMILY_TAGS[GeometryFamily.LINESTRING]
@@ -169,9 +222,8 @@ def _launch_linestring_clearance(
     family_rows = family_row_offsets[global_rows]
     n = buf.row_count
 
-    needs_free = (
-        device_state is None
-        or GeometryFamily.LINESTRING not in (device_state.families if device_state else {})
+    needs_free = device_state is None or GeometryFamily.LINESTRING not in (
+        device_state.families if device_state else {}
     )
     allocated = []
     if not needs_free:
@@ -189,8 +241,13 @@ def _launch_linestring_clearance(
         ptr = runtime.pointer
         params = (
             (ptr(d_x), ptr(d_y), ptr(d_geom), ptr(d_out), n),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -206,7 +263,12 @@ def _launch_linestring_clearance(
 
 
 def _launch_multilinestring_clearance(
-    owned, result, tags, family_row_offsets, device_state, runtime,
+    owned,
+    result,
+    tags,
+    family_row_offsets,
+    device_state,
+    runtime,
 ):
     """Launch multilinestring minimum clearance kernel."""
     tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
@@ -227,9 +289,8 @@ def _launch_multilinestring_clearance(
     family_rows = family_row_offsets[global_rows]
     n = buf.row_count
 
-    needs_free = (
-        device_state is None
-        or GeometryFamily.MULTILINESTRING not in (device_state.families if device_state else {})
+    needs_free = device_state is None or GeometryFamily.MULTILINESTRING not in (
+        device_state.families if device_state else {}
     )
     allocated = []
     if not needs_free:
@@ -249,8 +310,14 @@ def _launch_multilinestring_clearance(
         ptr = runtime.pointer
         params = (
             (ptr(d_x), ptr(d_y), ptr(d_part), ptr(d_geom), ptr(d_out), n),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -266,7 +333,12 @@ def _launch_multilinestring_clearance(
 
 
 def _launch_polygon_clearance(
-    owned, result, tags, family_row_offsets, device_state, runtime,
+    owned,
+    result,
+    tags,
+    family_row_offsets,
+    device_state,
+    runtime,
 ):
     """Launch polygon minimum clearance kernel."""
     tag = FAMILY_TAGS[GeometryFamily.POLYGON]
@@ -287,9 +359,8 @@ def _launch_polygon_clearance(
     family_rows = family_row_offsets[global_rows]
     n = buf.row_count
 
-    needs_free = (
-        device_state is None
-        or GeometryFamily.POLYGON not in (device_state.families if device_state else {})
+    needs_free = device_state is None or GeometryFamily.POLYGON not in (
+        device_state.families if device_state else {}
     )
     allocated = []
     if not needs_free:
@@ -309,8 +380,14 @@ def _launch_polygon_clearance(
         ptr = runtime.pointer
         params = (
             (ptr(d_x), ptr(d_y), ptr(d_ring), ptr(d_geom), ptr(d_out), n),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -326,7 +403,12 @@ def _launch_polygon_clearance(
 
 
 def _launch_multipolygon_clearance(
-    owned, result, tags, family_row_offsets, device_state, runtime,
+    owned,
+    result,
+    tags,
+    family_row_offsets,
+    device_state,
+    runtime,
 ):
     """Launch multipolygon minimum clearance kernel."""
     tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
@@ -352,9 +434,8 @@ def _launch_multipolygon_clearance(
     family_rows = family_row_offsets[global_rows]
     n = buf.row_count
 
-    needs_free = (
-        device_state is None
-        or GeometryFamily.MULTIPOLYGON not in (device_state.families if device_state else {})
+    needs_free = device_state is None or GeometryFamily.MULTIPOLYGON not in (
+        device_state.families if device_state else {}
     )
     allocated = []
     if not needs_free:
@@ -375,11 +456,16 @@ def _launch_multipolygon_clearance(
     try:
         ptr = runtime.pointer
         params = (
-            (ptr(d_x), ptr(d_y), ptr(d_ring), ptr(d_part), ptr(d_geom),
-             ptr(d_out), n),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_I32),
+            (ptr(d_x), ptr(d_y), ptr(d_ring), ptr(d_part), ptr(d_geom), ptr(d_out), n),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -397,6 +483,7 @@ def _launch_multipolygon_clearance(
 # ---------------------------------------------------------------------------
 # Public dispatch entry point
 # ---------------------------------------------------------------------------
+
 
 def minimum_clearance_owned(
     owned: OwnedGeometryArray,
@@ -422,6 +509,12 @@ def minimum_clearance_owned(
         kernel_name="minimum_clearance",
         kernel_class=KernelClass.METRIC,
         row_count=row_count,
+        work_estimate=estimate_segment_pair_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            output_byte_count=row_count * np.dtype(np.float64).itemsize,
+            primary_unit_name="minimum-clearance-segment-pair",
+        ),
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=owned.residency,
@@ -494,20 +587,48 @@ def _minimum_clearance_line_gpu(
     device_state = owned.device_state
 
     _launch_linestring_clearance_line(
-        owned, out_ax, out_ay, out_bx, out_by,
-        tags, family_row_offsets, device_state, runtime,
+        owned,
+        out_ax,
+        out_ay,
+        out_bx,
+        out_by,
+        tags,
+        family_row_offsets,
+        device_state,
+        runtime,
     )
     _launch_multilinestring_clearance_line(
-        owned, out_ax, out_ay, out_bx, out_by,
-        tags, family_row_offsets, device_state, runtime,
+        owned,
+        out_ax,
+        out_ay,
+        out_bx,
+        out_by,
+        tags,
+        family_row_offsets,
+        device_state,
+        runtime,
     )
     _launch_polygon_clearance_line(
-        owned, out_ax, out_ay, out_bx, out_by,
-        tags, family_row_offsets, device_state, runtime,
+        owned,
+        out_ax,
+        out_ay,
+        out_bx,
+        out_by,
+        tags,
+        family_row_offsets,
+        device_state,
+        runtime,
     )
     _launch_multipolygon_clearance_line(
-        owned, out_ax, out_ay, out_bx, out_by,
-        tags, family_row_offsets, device_state, runtime,
+        owned,
+        out_ax,
+        out_ay,
+        out_bx,
+        out_by,
+        tags,
+        family_row_offsets,
+        device_state,
+        runtime,
     )
 
     # Mark invalid rows as NaN (empty LineString)
@@ -529,8 +650,15 @@ def _minimum_clearance_line_gpu(
 
 
 def _launch_linestring_clearance_line(
-    owned, out_ax, out_ay, out_bx, out_by,
-    tags, family_row_offsets, device_state, runtime,
+    owned,
+    out_ax,
+    out_ay,
+    out_bx,
+    out_by,
+    tags,
+    family_row_offsets,
+    device_state,
+    runtime,
 ):
     """Launch linestring clearance line kernel."""
     tag = FAMILY_TAGS[GeometryFamily.LINESTRING]
@@ -551,9 +679,8 @@ def _launch_linestring_clearance_line(
     family_rows = family_row_offsets[global_rows]
     n = buf.row_count
 
-    needs_free = (
-        device_state is None
-        or GeometryFamily.LINESTRING not in (device_state.families if device_state else {})
+    needs_free = device_state is None or GeometryFamily.LINESTRING not in (
+        device_state.families if device_state else {}
     )
     allocated = []
     if not needs_free:
@@ -573,11 +700,17 @@ def _launch_linestring_clearance_line(
     try:
         ptr = runtime.pointer
         params = (
-            (ptr(d_x), ptr(d_y), ptr(d_geom),
-             ptr(d_oax), ptr(d_oay), ptr(d_obx), ptr(d_oby), n),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (ptr(d_x), ptr(d_y), ptr(d_geom), ptr(d_oax), ptr(d_oay), ptr(d_obx), ptr(d_oby), n),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -595,8 +728,15 @@ def _launch_linestring_clearance_line(
 
 
 def _launch_multilinestring_clearance_line(
-    owned, out_ax, out_ay, out_bx, out_by,
-    tags, family_row_offsets, device_state, runtime,
+    owned,
+    out_ax,
+    out_ay,
+    out_bx,
+    out_by,
+    tags,
+    family_row_offsets,
+    device_state,
+    runtime,
 ):
     """Launch multilinestring clearance line kernel."""
     tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
@@ -617,9 +757,8 @@ def _launch_multilinestring_clearance_line(
     family_rows = family_row_offsets[global_rows]
     n = buf.row_count
 
-    needs_free = (
-        device_state is None
-        or GeometryFamily.MULTILINESTRING not in (device_state.families if device_state else {})
+    needs_free = device_state is None or GeometryFamily.MULTILINESTRING not in (
+        device_state.families if device_state else {}
     )
     allocated = []
     if not needs_free:
@@ -641,11 +780,28 @@ def _launch_multilinestring_clearance_line(
     try:
         ptr = runtime.pointer
         params = (
-            (ptr(d_x), ptr(d_y), ptr(d_part), ptr(d_geom),
-             ptr(d_oax), ptr(d_oay), ptr(d_obx), ptr(d_oby), n),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(d_x),
+                ptr(d_y),
+                ptr(d_part),
+                ptr(d_geom),
+                ptr(d_oax),
+                ptr(d_oay),
+                ptr(d_obx),
+                ptr(d_oby),
+                n,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -663,8 +819,15 @@ def _launch_multilinestring_clearance_line(
 
 
 def _launch_polygon_clearance_line(
-    owned, out_ax, out_ay, out_bx, out_by,
-    tags, family_row_offsets, device_state, runtime,
+    owned,
+    out_ax,
+    out_ay,
+    out_bx,
+    out_by,
+    tags,
+    family_row_offsets,
+    device_state,
+    runtime,
 ):
     """Launch polygon clearance line kernel."""
     tag = FAMILY_TAGS[GeometryFamily.POLYGON]
@@ -685,9 +848,8 @@ def _launch_polygon_clearance_line(
     family_rows = family_row_offsets[global_rows]
     n = buf.row_count
 
-    needs_free = (
-        device_state is None
-        or GeometryFamily.POLYGON not in (device_state.families if device_state else {})
+    needs_free = device_state is None or GeometryFamily.POLYGON not in (
+        device_state.families if device_state else {}
     )
     allocated = []
     if not needs_free:
@@ -709,11 +871,28 @@ def _launch_polygon_clearance_line(
     try:
         ptr = runtime.pointer
         params = (
-            (ptr(d_x), ptr(d_y), ptr(d_ring), ptr(d_geom),
-             ptr(d_oax), ptr(d_oay), ptr(d_obx), ptr(d_oby), n),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(d_x),
+                ptr(d_y),
+                ptr(d_ring),
+                ptr(d_geom),
+                ptr(d_oax),
+                ptr(d_oay),
+                ptr(d_obx),
+                ptr(d_oby),
+                n,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -731,8 +910,15 @@ def _launch_polygon_clearance_line(
 
 
 def _launch_multipolygon_clearance_line(
-    owned, out_ax, out_ay, out_bx, out_by,
-    tags, family_row_offsets, device_state, runtime,
+    owned,
+    out_ax,
+    out_ay,
+    out_bx,
+    out_by,
+    tags,
+    family_row_offsets,
+    device_state,
+    runtime,
 ):
     """Launch multipolygon clearance line kernel."""
     tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
@@ -758,9 +944,8 @@ def _launch_multipolygon_clearance_line(
     family_rows = family_row_offsets[global_rows]
     n = buf.row_count
 
-    needs_free = (
-        device_state is None
-        or GeometryFamily.MULTIPOLYGON not in (device_state.families if device_state else {})
+    needs_free = device_state is None or GeometryFamily.MULTIPOLYGON not in (
+        device_state.families if device_state else {}
     )
     allocated = []
     if not needs_free:
@@ -784,12 +969,30 @@ def _launch_multipolygon_clearance_line(
     try:
         ptr = runtime.pointer
         params = (
-            (ptr(d_x), ptr(d_y), ptr(d_ring), ptr(d_part), ptr(d_geom),
-             ptr(d_oax), ptr(d_oay), ptr(d_obx), ptr(d_oby), n),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_I32),
+            (
+                ptr(d_x),
+                ptr(d_y),
+                ptr(d_ring),
+                ptr(d_part),
+                ptr(d_geom),
+                ptr(d_oax),
+                ptr(d_oay),
+                ptr(d_obx),
+                ptr(d_oby),
+                n,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -908,6 +1111,12 @@ def minimum_clearance_line_owned(
         kernel_name="minimum_clearance_line",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
+        work_estimate=estimate_segment_pair_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            output_byte_count=row_count * 2 * 16,
+            primary_unit_name="minimum-clearance-line-segment-pair",
+        ),
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=owned.residency,

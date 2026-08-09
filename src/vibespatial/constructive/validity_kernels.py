@@ -17,7 +17,9 @@ from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 # Note: orientation is NOT checked (GEOS does not enforce winding in is_valid).
 # ---------------------------------------------------------------------------
 
-_IS_VALID_RINGS_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_IS_VALID_RINGS_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + r"""
 extern "C" __global__ void is_valid_rings(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -53,6 +55,7 @@ extern "C" __global__ void is_valid_rings(
     ring_valid[ring] = 1;
 }}
 """
+)
 _IS_VALID_RINGS_KERNEL_NAMES = ("is_valid_rings",)
 _IS_VALID_RINGS_FP64 = _IS_VALID_RINGS_KERNEL_SOURCE.format(compute_type="double")
 # ---------------------------------------------------------------------------
@@ -63,7 +66,9 @@ _IS_VALID_RINGS_FP64 = _IS_VALID_RINGS_KERNEL_SOURCE.format(compute_type="double
 # crossing found.
 # ---------------------------------------------------------------------------
 
-_IS_SIMPLE_SEGMENTS_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_IS_SIMPLE_SEGMENTS_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + r"""
 __device__ inline int point_strictly_on_segment_validity(
     const double px,
     const double py,
@@ -95,11 +100,14 @@ void is_simple_segments(
     const double* __restrict__ y,
     const int* __restrict__ span_offsets,
     int* __restrict__ result,
+    const long long* __restrict__ active_span_count,
     int is_ring,
     int span_count
 ) {{
-    const int span = blockIdx.x;
-    if (span >= span_count) return;
+    const int active_count = active_span_count == nullptr
+        ? span_count
+        : min((int)active_span_count[0], span_count);
+    for (int span = blockIdx.x; span < active_count; span += gridDim.x) {{
 
     const int start = span_offsets[span];
     const int end = span_offsets[span + 1];
@@ -108,7 +116,7 @@ void is_simple_segments(
     /* < 4 coords means at most 2 segments which are adjacent — always simple */
     if (n_coords < 4) {{
         if (threadIdx.x == 0) result[span] = 1;
-        return;
+        continue;
     }}
 
     const int n_segs = n_coords - 1;
@@ -127,6 +135,11 @@ void is_simple_segments(
         const double ax1 = x[start + i + 1];
         const double ay1 = y[start + i + 1];
 
+        /* Consecutive duplicate vertices create zero-length segments.  GEOS
+           accepts these in otherwise valid polygon rings, so they must not
+           participate in non-adjacent touch/intersection tests. */
+        if (ax0 == ax1 && ay0 == ay1) continue;
+
         const double dx_a = ax1 - ax0;
         const double dy_a = ay1 - ay0;
 
@@ -138,6 +151,17 @@ void is_simple_segments(
             const double by0 = y[start + j];
             const double bx1 = x[start + j + 1];
             const double by1 = y[start + j + 1];
+
+            if (bx0 == bx1 && by0 == by1) continue;
+            if (is_ring && i == 0 && bx1 == ax0 && by1 == ay0) {{
+                int closure_tail = 1;
+                for (int k = j + 1; k < n_coords && closure_tail; k++) {{
+                    if (x[start + k] != ax0 || y[start + k] != ay0) {{
+                        closure_tail = 0;
+                    }}
+                }}
+                if (closure_tail) continue;
+            }}
 
             /* Check 1: endpoint coincidence (figure-8 patterns where a
                vertex is visited twice at non-adjacent ring positions).
@@ -190,8 +214,11 @@ void is_simple_segments(
     if (threadIdx.x == 0) {{
         result[span] = found_crossing ? 0 : 1;
     }}
+    __syncthreads();
+    }}
 }}
 """
+)
 _IS_SIMPLE_SEGMENTS_KERNEL_NAMES = ("is_simple_segments",)
 _IS_SIMPLE_SEGMENTS_FP64 = _IS_SIMPLE_SEGMENTS_KERNEL_SOURCE.format(
     compute_type="double",
@@ -200,7 +227,7 @@ _IS_SIMPLE_SEGMENTS_EXACT_KERNEL_SOURCE = (
     PRECISION_PREAMBLE
     + ORIENT2D_DEVICE
     + SEGMENT_CROSSING_DEVICE
-    + _IS_SIMPLE_SEGMENTS_KERNEL_SOURCE[len(PRECISION_PREAMBLE):]
+    + _IS_SIMPLE_SEGMENTS_KERNEL_SOURCE[len(PRECISION_PREAMBLE) :]
 )
 _IS_SIMPLE_SEGMENTS_EXACT_KERNEL_SOURCE = _IS_SIMPLE_SEGMENTS_EXACT_KERNEL_SOURCE.replace(
     """    const double dx = bx - ax;
@@ -261,7 +288,9 @@ _IS_SIMPLE_SEGMENTS_EXACT_FP64 = _IS_SIMPLE_SEGMENTS_EXACT_KERNEL_SOURCE.format(
 
 # The device function strings use raw braces and must NOT pass through
 # .format().  They are concatenated in the _HOLES_IN_SHELL_FP64 constant.
-_HOLES_IN_SHELL_KERNEL_TEMPLATE = PRECISION_PREAMBLE + r"""
+_HOLES_IN_SHELL_KERNEL_TEMPLATE = (
+    PRECISION_PREAMBLE
+    + r"""
 #define VALIDITY_BOUNDARY_TOLERANCE VS_SPATIAL_EPSILON
 
 extern "C" __device__ inline bool ring_contains_point_validity(
@@ -291,11 +320,16 @@ extern "C" __global__ void holes_in_shell(
     const int* __restrict__ ring_offsets,
     const int* __restrict__ hole_ring_indices,
     const int* __restrict__ exterior_ring_indices,
+    const unsigned char* __restrict__ hole_active,
     int* __restrict__ hole_valid,
-    int hole_count
+    int hole_capacity
 ) {{
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= hole_count) return;
+    if (idx >= hole_capacity) return;
+    if (hole_active[idx] == 0u) {{
+        hole_valid[idx] = 1;
+        return;
+    }}
 
     const int hole_ring = hole_ring_indices[idx];
     const int ext_ring = exterior_ring_indices[idx];
@@ -311,6 +345,7 @@ extern "C" __global__ void holes_in_shell(
     ) ? 1 : 0;
 }}
 """
+)
 _HOLES_IN_SHELL_KERNEL_NAMES = ("holes_in_shell",)
 _HOLES_IN_SHELL_FP64 = (
     POINT_ON_SEGMENT_DEVICE
@@ -330,7 +365,11 @@ _HOLES_IN_SHELL_FP64 = (
 # orientation predicates (via cuda.device_functions.orient2d).
 # ---------------------------------------------------------------------------
 
-_RING_PAIR_INTERACTION_KERNEL_SOURCE = PRECISION_PREAMBLE + ORIENT2D_DEVICE + SEGMENT_CROSSING_DEVICE + r"""
+_RING_PAIR_INTERACTION_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + ORIENT2D_DEVICE
+    + SEGMENT_CROSSING_DEVICE
+    + r"""
 /* orient2d predicate provided by ORIENT2D_DEVICE (vs_orient2d) */
 /* collinear containment provided by SEGMENT_CROSSING_DEVICE (vs_point_on_segment_collinear) */
 
@@ -585,6 +624,7 @@ ring_pair_interaction(
     }}
 }}
 """
+)
 _RING_PAIR_INTERACTION_KERNEL_NAMES = ("ring_pair_interaction",)
 _RING_PAIR_INTERACTION_FP64 = _RING_PAIR_INTERACTION_KERNEL_SOURCE.format(
     compute_type="double",

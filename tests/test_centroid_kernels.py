@@ -212,6 +212,138 @@ def test_polygon_centroid_delegation_gpu():
     np.testing.assert_allclose(cy, ey, atol=1e-10)
 
 
+@pytest.mark.gpu
+def test_centroid_gpu_consumes_indexed_rows_without_physicalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    from vibespatial import Residency
+    from vibespatial.geometry.owned import OwnedGeometryArray
+
+    geoms = [
+        Point(3, 4),
+        MultiPoint([(0, 0), (4, 2)]),
+        LineString([(0, 0), (3, 0), (3, 4)]),
+        MultiLineString([[(0, 0), (2, 0)], [(0, 2), (4, 2)]]),
+        Polygon(
+            [(0, 0), (8, 0), (8, 8), (0, 8)],
+            holes=[[(1, 1), (1, 3), (3, 3), (3, 1)]],
+        ),
+        MultiPolygon(
+            [
+                Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
+                Polygon([(10, 0), (14, 0), (14, 4), (10, 4)]),
+            ]
+        ),
+    ]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    indices = np.asarray([5, 0, 4, 1, 3, 2, 5], dtype=np.int64)
+    view = OwnedGeometryArray._indexed_view(
+        owned,
+        cp.asarray(indices),
+    )
+
+    def _fail_physicalize(*_args, **_kwargs):
+        raise AssertionError("centroid must consume logical family-row indirection")
+
+    monkeypatch.setattr(
+        OwnedGeometryArray,
+        "physicalize_device_rows",
+        _fail_physicalize,
+    )
+    cx, cy = _extract_cx_cy(_centroid_gpu(view))
+    expected_x, expected_y = _shapely_centroids([geoms[index] for index in indices])
+
+    np.testing.assert_allclose(cx, expected_x, atol=1e-10)
+    np.testing.assert_allclose(cy, expected_y, atol=1e-10)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    ("family", "buffer_kwargs", "expected"),
+    [
+        (
+            GeometryFamily.MULTILINESTRING,
+            {
+                "x": [10.0, 12.0],
+                "y": [4.0, 4.0],
+                "geometry_offsets": [0, 2, 3],
+                "part_offsets": [0, 0, 2, 2],
+            },
+            (11.0, 4.0),
+        ),
+        (
+            GeometryFamily.POLYGON,
+            {
+                "x": [0.0, 2.0, 2.0, 0.0, 0.0],
+                "y": [0.0, 0.0, 2.0, 2.0, 0.0],
+                "geometry_offsets": [0, 2, 3],
+                "ring_offsets": [0, 0, 5, 5],
+            },
+            (1.0, 1.0),
+        ),
+        (
+            GeometryFamily.MULTIPOLYGON,
+            {
+                "x": [0.0, 2.0, 2.0, 0.0, 0.0],
+                "y": [0.0, 0.0, 2.0, 2.0, 0.0],
+                "geometry_offsets": [0, 2, 3],
+                "part_offsets": [0, 0, 1, 2],
+                "ring_offsets": [0, 5, 5],
+            },
+            (1.0, 1.0),
+        ),
+    ],
+)
+def test_indexed_centroid_skips_empty_leading_children_and_all_empty_rows(
+    family,
+    buffer_kwargs,
+    expected,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    from vibespatial.geometry.owned import (
+        FAMILY_TAGS,
+        DeviceFamilyGeometryBuffer,
+        OwnedGeometryArray,
+        build_device_resident_owned,
+    )
+
+    device_kwargs = {
+        key: cp.asarray(value, dtype=cp.float64 if key in {"x", "y"} else cp.int32)
+        for key, value in buffer_kwargs.items()
+    }
+    buffer = DeviceFamilyGeometryBuffer(
+        family=family,
+        empty_mask=cp.asarray([False, True], dtype=cp.bool_),
+        **device_kwargs,
+    )
+    owned = build_device_resident_owned(
+        device_families={family: buffer},
+        row_count=2,
+        tags=cp.full(2, FAMILY_TAGS[family], dtype=cp.int8),
+        validity=cp.ones(2, dtype=cp.bool_),
+        family_row_offsets=cp.arange(2, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+    view = OwnedGeometryArray._indexed_view(
+        owned,
+        cp.asarray([1, 0], dtype=cp.int64),
+        assume_unique_indices=True,
+    )
+
+    cx, cy = _extract_cx_cy(_centroid_gpu(view))
+
+    assert np.isnan(cx[0])
+    assert np.isnan(cy[0])
+    np.testing.assert_allclose([cx[1], cy[1]], expected, atol=1e-10)
+
+
 def test_polygonal_centroid_cpu_handles_holes_and_multipolygons():
     geoms = [
         Polygon(

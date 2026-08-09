@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from scripts.build_intake_index import build_intake_index
+from scripts.build_intake_index import build_intake_index, should_index_file
+from scripts.check_docs import _is_header_scan_excluded
 from scripts.intake import plan_request
 from scripts.update_doc_headers import evaluate_doc_headers
 
@@ -48,3 +49,12 @@ def test_generated_docs_are_current() -> None:
 def test_generated_intake_index_excludes_claude_property_snapshot() -> None:
     index = build_intake_index()
     assert all(entry["path"] != ".claude/.property-before.json" for entry in index["files"])
+
+
+def test_repository_discovery_excludes_nested_worktrees(tmp_path) -> None:
+    nested_doc = tmp_path / ".worktrees" / "branch" / "docs" / "plan.md"
+    nested_doc.parent.mkdir(parents=True)
+    nested_doc.write_text("# Nested checkout\n")
+
+    assert not should_index_file(nested_doc, tmp_path)
+    assert _is_header_scan_excluded(".worktrees/branch/docs/plan.md")

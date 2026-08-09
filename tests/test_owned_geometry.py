@@ -27,6 +27,7 @@ from vibespatial import (
     from_wkb,
     has_gpu_runtime,
 )
+from vibespatial.geometry.buffers import GeometryFamily
 
 
 def test_geometry_host_bridge_d2h_exports_are_runtime_accounted() -> None:
@@ -53,6 +54,371 @@ def test_geometry_host_bridge_d2h_exports_are_runtime_accounted() -> None:
     assert offenders == []
 
 
+def test_device_take_nested_sizing_uses_structure_or_capacity() -> None:
+    source = (
+        Path(__file__)
+        .resolve()
+        .parents[1]
+        .joinpath("src/vibespatial/geometry/owned.py")
+        .read_text()
+    )
+    planner_start = source.index("def _device_take_family_size_plan_from_device(")
+    planner_end = source.index("\ndef ", planner_start + 1)
+    planner_source = source[planner_start:planner_end]
+    take_start = source.index("def _device_take_family_buffer(")
+    take_end = source.index("\ndef ", take_start + 1)
+    take_source = source[take_start:take_end]
+
+    assert "count_scatter_total" not in planner_source
+    assert "device-take nested slice-size allocation fence" not in planner_source
+    assert "_device_take_capacity_multiplier" in take_source
+    assert "if allow_capacity_allocation" not in take_source
+    assert "owned geometry device-take slice-size allocation fence" not in source
+
+
+@pytest.mark.parametrize(
+    ("family", "geometries", "expected"),
+    (
+        (
+            GeometryFamily.MULTIPOINT,
+            (MultiPoint([(0, 0)]), MultiPoint([(0, 0), (1, 1), (2, 2)])),
+            (None, None, None, None, None, 3),
+        ),
+        (
+            GeometryFamily.LINESTRING,
+            (LineString([(0, 0), (1, 1)]), LineString([(0, 0), (1, 1), (2, 1)])),
+            (None, None, None, None, None, 3),
+        ),
+        (
+            GeometryFamily.POLYGON,
+            (
+                Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)]),
+                Polygon(
+                    [(0, 0), (6, 0), (6, 6), (0, 6), (0, 0)],
+                    [[(2, 2), (4, 2), (4, 4), (2, 4), (2, 2)]],
+                ),
+            ),
+            (None, None, None, 2, None, 10),
+        ),
+        (
+            GeometryFamily.MULTILINESTRING,
+            (
+                MultiLineString([[(0, 0), (1, 1)]]),
+                MultiLineString([[(0, 0), (1, 0)], [(2, 0), (3, 0), (4, 0)]]),
+            ),
+            (None, None, None, 2, None, 5),
+        ),
+        (
+            GeometryFamily.MULTIPOLYGON,
+            (
+                MultiPolygon([Polygon([(0, 0), (2, 0), (2, 2), (0, 2), (0, 0)])]),
+                MultiPolygon(
+                    [
+                        Polygon(
+                            [(0, 0), (6, 0), (6, 6), (0, 6), (0, 0)],
+                            [[(2, 2), (4, 2), (4, 4), (2, 4), (2, 2)]],
+                        ),
+                        Polygon([(8, 0), (10, 0), (10, 2), (8, 2), (8, 0)]),
+                    ]
+                ),
+            ),
+            (None, None, None, 2, 3, 15),
+        ),
+    ),
+)
+def test_host_geometry_metadata_preserves_variable_width_capacity_bounds(
+    family: GeometryFamily,
+    geometries,
+    expected: tuple[int | None, int | None, int | None, int | None, int | None, int | None],
+) -> None:
+    from vibespatial.geometry.owned import _host_fixed_geometry_size_metadata
+
+    owned = from_shapely_geometries(geometries, residency=Residency.HOST)
+    metadata = _host_fixed_geometry_size_metadata(family, owned.families[family])
+
+    assert metadata is not None
+    assert (
+        metadata.first_level_count_per_row,
+        metadata.second_level_count_per_row,
+        metadata.coord_count_per_row,
+        metadata.max_first_level_count_per_row,
+        metadata.max_second_level_count_per_row,
+        metadata.max_coord_count_per_row,
+    ) == expected
+
+
+def test_device_take_plan_keeps_variable_width_bounds_as_capacities() -> None:
+    from vibespatial.geometry.owned import (
+        DeviceFamilyGeometryBuffer,
+        DeviceFixedGeometrySizeMetadata,
+        _device_take_family_size_plan_from_device,
+    )
+
+    buffer = DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.POLYGON,
+        x=np.empty(20, dtype=np.float64),
+        y=np.empty(20, dtype=np.float64),
+        geometry_offsets=np.empty(3, dtype=np.int32),
+        empty_mask=np.empty(2, dtype=np.bool_),
+        ring_offsets=np.empty(5, dtype=np.int32),
+        fixed_size=DeviceFixedGeometrySizeMetadata(
+            max_first_level_count_per_row=2,
+            max_coord_count_per_row=10,
+        ),
+    )
+
+    plan = _device_take_family_size_plan_from_device(
+        GeometryFamily.POLYGON,
+        buffer,
+        np.empty(2, dtype=np.int64),
+    )
+
+    assert plan.first_level_count is None
+    assert plan.coord_count is None
+    assert plan.first_level_capacity == 4
+    assert plan.coord_capacity == 20
+
+
+@pytest.mark.gpu
+def test_indexed_variable_width_multipolygon_physicalizes_from_capacity_metadata() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    geometries = [
+        MultiPolygon([Polygon([(0, 0), (2, 0), (2, 2), (0, 2), (0, 0)])]),
+        MultiPolygon(
+            [
+                Polygon(
+                    [(10, 0), (16, 0), (16, 6), (10, 6), (10, 0)],
+                    [[(12, 2), (14, 2), (14, 4), (12, 4), (12, 2)]],
+                ),
+                Polygon([(18, 0), (20, 0), (20, 2), (18, 2), (18, 0)]),
+            ]
+        ),
+    ]
+    owned = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+    indexed = owned._device_indexed_take(cp.asarray([1, 0, 1], dtype=cp.int64))
+    metadata = indexed.device_state.families[GeometryFamily.MULTIPOLYGON].fixed_size
+
+    assert metadata is not None
+    assert metadata.first_level_count_per_row is None
+    assert metadata.second_level_count_per_row is None
+    assert metadata.coord_count_per_row is None
+    assert metadata.max_first_level_count_per_row == 2
+    assert metadata.max_second_level_count_per_row == 3
+    assert metadata.max_coord_count_per_row == 15
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    with assert_zero_d2h_transfers():
+        physical = indexed.physicalize_device_rows(allow_capacity_allocation=True)
+
+    assert physical.row_count == 3
+    assert not physical.is_indexed_view
+    actual = physical.to_shapely()
+    expected = [geometries[1], geometries[0], geometries[1]]
+    assert all(
+        got.equals_exact(want, tolerance=1.0e-9) for got, want in zip(actual, expected, strict=True)
+    )
+
+
+@pytest.mark.gpu
+def test_nested_indexed_physicalization_preserves_activity_and_capacity() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from shapely.geometry import box
+
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+
+    geometries = [
+        box(0.0, 0.0, 1.0, 1.0),
+        box(2.0, 0.0, 3.0, 1.0),
+        box(4.0, 0.0, 5.0, 1.0),
+    ]
+    owned = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+    first = owned._device_indexed_take(
+        cp.asarray([2, 0, 1], dtype=cp.int64),
+        assume_unique_indices=True,
+    )._apply_row_activity(
+        cp.asarray([True, False, True], dtype=cp.bool_),
+        assume_active_indices_unique=True,
+    )
+    nested = first._device_indexed_take(
+        cp.asarray([2, 0, 1], dtype=cp.int64),
+        assume_unique_indices=True,
+    )
+
+    with assert_zero_d2h_transfers():
+        physical = nested.physicalize_device_rows(allow_capacity_allocation=True)
+
+    assert not physical.is_indexed_view
+    polygon = physical.device_state.families[GeometryFamily.POLYGON]
+    source_polygon = owned.device_state.families[GeometryFamily.POLYGON]
+    assert int(polygon.x.size) <= int(source_polygon.x.size)
+    actual = physical.to_shapely()
+    assert actual[0].equals(geometries[1])
+    assert actual[1].equals(geometries[2])
+    assert actual[2] is None
+
+
+@pytest.mark.gpu
+def test_capacity_physicalization_preserves_resident_rectangle_metadata() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from shapely.geometry import box
+
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+    from vibespatial.geometry.owned import (
+        device_physicalize_owned_row_selection_capacity,
+    )
+    from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        device_trusted_rectangle_bounds_matrix,
+    )
+
+    geometries = [
+        box(0.0, 0.0, 1.0, 1.0),
+        box(2.0, 0.0, 3.0, 1.0),
+        box(4.0, 0.0, 5.0, 1.0),
+    ]
+    owned = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+
+    with assert_zero_d2h_transfers():
+        physical = device_physicalize_owned_row_selection_capacity(
+            owned,
+            cp.asarray([True, False, True], dtype=cp.bool_),
+        )
+        bounds = device_trusted_rectangle_bounds_matrix(physical)
+
+    assert bounds is not None
+    assert tuple(bounds.shape) == (3, 4)
+    actual = physical.to_shapely()
+    assert actual[0].equals(geometries[0])
+    assert actual[1] is None
+    assert actual[2].equals(geometries[2])
+
+
+@pytest.mark.gpu
+def test_device_capacity_mask_preserves_duplicate_indexed_rows() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from shapely.geometry import box
+
+    from vibespatial.geometry.owned import device_mask_owned_capacity
+
+    geometry = box(0.0, 0.0, 1.0, 1.0)
+    owned = from_shapely_geometries(
+        [geometry],
+        residency=Residency.DEVICE,
+    )
+    indexed = owned._indexed_view(
+        owned,
+        cp.asarray([0, 0], dtype=cp.int64),
+    )
+
+    masked = device_mask_owned_capacity(
+        indexed,
+        cp.asarray([True, True], dtype=cp.bool_),
+    )
+
+    assert masked.is_indexed_view
+    assert cp.asnumpy(masked._index_map).tolist() == [0, 0]
+    assert all(value.equals(geometry) for value in masked.to_shapely())
+
+
+@pytest.mark.gpu
+def test_device_indexed_concat_interns_shared_physical_root() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from shapely.geometry import box
+
+    from vibespatial.geometry.owned import OwnedGeometryArray
+
+    geometries = [
+        box(0.0, 0.0, 1.0, 1.0),
+        box(2.0, 0.0, 3.0, 1.0),
+        box(4.0, 0.0, 5.0, 1.0),
+    ]
+    owned = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+    left = owned._device_indexed_take(
+        cp.asarray([0, 1], dtype=cp.int64),
+        assume_unique_indices=True,
+    )
+    right = owned._device_indexed_take(
+        cp.asarray([1, 2], dtype=cp.int64),
+        assume_unique_indices=True,
+    )
+
+    combined = OwnedGeometryArray.concat([left, right])
+
+    assert combined.is_indexed_view
+    assert combined._base is owned
+    assert combined._base.row_count == owned.row_count
+    actual = combined.to_shapely()
+    expected = [geometries[0], geometries[1], geometries[1], geometries[2]]
+    assert all(
+        got.equals_exact(want, tolerance=1.0e-9) for got, want in zip(actual, expected, strict=True)
+    )
+
+
+@pytest.mark.gpu
+def test_device_empty_polygon_rows_publish_zero_width_metadata() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    from vibespatial.geometry.owned import build_empty_polygon_rows_device
+
+    empty = build_empty_polygon_rows_device(4)
+    metadata = empty.device_state.families[GeometryFamily.POLYGON].fixed_size
+
+    assert metadata is not None
+    assert metadata.first_level_count_per_row == 0
+    assert metadata.coord_count_per_row == 0
+    assert metadata.max_first_level_count_per_row == 0
+    assert metadata.max_coord_count_per_row == 0
+
+
+def test_capacity_offset_slice_gather_uses_guarded_row_kernels() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source = repo_root.joinpath("src/vibespatial/geometry/owned.py").read_text()
+    gather_start = source.index("def _device_gather_offset_slices(")
+    gather_end = source.index("\n@dataclass", gather_start)
+    gather_source = source[gather_start:gather_end]
+
+    capacity_branch = gather_source.split(
+        "if allocation_capacity is not None and precomputed_total is None:", 1
+    )[1].split("# Build flat gather indices", 1)[0]
+    assert "owned_take_gather_values_i32" in capacity_branch
+    assert "owned_take_gather_values_f64x2" in capacity_branch
+    assert "cp.searchsorted" not in capacity_branch
+    assert "owned geometry offset-slice allocation fence" not in gather_source
+    assert "unknown-size offset-slice gather requires an explicit" in gather_source
+    assert "reason=allocation_reason" in gather_source
+
+    kernel_source = repo_root.joinpath("src/vibespatial/kernels/owned_take.py").read_text()
+    assert "for (int j = threadIdx.x; j < length; j += blockDim.x)" in kernel_source
+    assert '"owned_take_gather_values_i32"' in kernel_source
+    assert '"owned_take_gather_values_f64x2"' in kernel_source
+
+    for relative_path in (
+        "src/vibespatial/io/wkt_gpu.py",
+        "src/vibespatial/io/kml_gpu.py",
+        "src/vibespatial/io/geojson_gpu.py",
+    ):
+        parser_source = repo_root.joinpath(relative_path).read_text()
+        assert parser_source.count("_device_gather_offset_slices(") == (
+            parser_source.count("allocation_reason=")
+        )
+
+
 def test_owned_geometry_has_no_raw_cupy_scalar_syncs() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     path = repo_root / "src" / "vibespatial" / "geometry" / "owned.py"
@@ -75,11 +441,135 @@ def test_owned_geometry_has_no_raw_cupy_scalar_syncs() -> None:
             and isinstance(node.args[0].func.value, ast.Name)
             and node.args[0].func.value.id == "cp"
         ):
-            offenders.append(
-                f"{path.relative_to(repo_root)}:{node.lineno}: {func.id}(cp.*)"
-            )
+            offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}: {func.id}(cp.*)")
 
     assert offenders == []
+
+
+def test_capacity_partition_selection_preserves_row_indirection_contract() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source = (repo_root / "src/vibespatial/geometry/owned.py").read_text()
+    start = source.index("def device_select_owned_capacity_partitions(")
+    end = source.index("\ndef ", start + 1)
+    function_source = source[start:end]
+
+    assert "OwnedGeometryArray.concat(arrays)" in function_source
+    assert "OwnedGeometryArray._indexed_view" in function_source
+    assert "cp.where(d_active" in function_source
+    assert "cp.flatnonzero" not in function_source
+    assert ".device_take(" not in function_source
+
+
+def test_capacity_selection_scatter_preserves_dynamic_row_indirection() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source = (repo_root / "src/vibespatial/geometry/owned.py").read_text()
+    start = source.index("def device_scatter_owned_capacity_selection(")
+    end = source.index("\ndef ", start + 1)
+    function_source = source[start:end]
+
+    assert "selection.active_capacity_mask()" in function_source
+    assert "selection.safe_capacity_positions()" in function_source
+    assert "OwnedGeometryArray.concat([base, replacement])" in function_source
+    assert "OwnedGeometryArray._indexed_view" in function_source
+    assert "cp.flatnonzero" not in function_source
+    assert ".device_take(" not in function_source
+
+
+def test_family_capacity_take_keeps_shared_device_family_storage() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source = (repo_root / "src/vibespatial/geometry/owned.py").read_text()
+    start = source.index("def device_take_owned_family_capacity_selection(")
+    end = source.index("\ndef ", start + 1)
+    function_source = source[start:end]
+
+    assert "selection.active_capacity_mask()" in function_source
+    assert "selection.partition_capacity_positions()" in function_source
+    assert "state.trusted_unique_family_rows is True" in function_source
+    assert "device_families={family: state.families[family]}" in function_source
+    assert "family_row_offsets=d_family_rows" in function_source
+    assert "_device_take_family_buffer(" not in function_source
+    assert "physicalize_device_rows(" not in function_source
+    assert "cp.flatnonzero" not in function_source
+    assert "copy_device_to_host" not in function_source
+
+
+def test_capacity_mask_shares_physical_buffers_without_compaction() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source = (repo_root / "src/vibespatial/geometry/owned.py").read_text()
+    start = source.index("def device_mask_owned_capacity(")
+    end = source.index("\ndef ", start + 1)
+    function_source = source[start:end]
+
+    assert "families=dict(state.families)" in function_source
+    assert "d_validity = cp.asarray(state.validity" in function_source
+    assert "preserve_indexed_view=True" in function_source
+    assert "cp.flatnonzero" not in function_source
+    assert ".device_take(" not in function_source
+    assert "_physical_device_take(" not in function_source
+
+
+@pytest.mark.gpu
+def test_capacity_mask_keeps_polygon_buffers_and_nulls_inactive_rows() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    from shapely.geometry import box
+
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import device_mask_owned_capacity
+
+    owned = from_shapely_geometries(
+        [box(0.0, 0.0, 1.0, 1.0), box(2.0, 0.0, 3.0, 1.0)],
+        residency=Residency.DEVICE,
+    )
+    source_state = owned._ensure_device_state()
+    with assert_zero_d2h_transfers():
+        masked = device_mask_owned_capacity(
+            owned,
+            cp.asarray([True, False]),
+        )
+
+    masked_state = masked._ensure_device_state()
+    assert (
+        masked_state.families[GeometryFamily.POLYGON].x
+        is source_state.families[GeometryFamily.POLYGON].x
+    )
+    assert cp.asnumpy(masked_state.validity).tolist() == [True, False]
+    assert cp.asnumpy(masked_state.tags).tolist()[1] == -1
+
+
+@pytest.mark.gpu
+def test_capacity_mask_preserves_indexed_logical_rows_without_physical_take() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    from shapely.geometry import box
+
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+    from vibespatial.geometry.owned import device_mask_owned_capacity
+
+    base = from_shapely_geometries(
+        [box(0.0, 0.0, 1.0, 1.0), box(2.0, 0.0, 3.0, 1.0)],
+        residency=Residency.DEVICE,
+    )
+    indexed = base.device_take(cp.asarray([1, 0, 1], dtype=cp.int64))
+    with assert_zero_d2h_transfers():
+        masked = device_mask_owned_capacity(
+            indexed,
+            cp.asarray([True, False, True]),
+        )
+
+    assert not masked.is_indexed_view
+    assert masked.row_count == 3
+    state = masked._ensure_device_state(preserve_indexed_view=True)
+    assert cp.asnumpy(state.validity).tolist() == [True, False, True]
+    actual = masked.to_shapely()
+    assert actual[0].equals(box(2.0, 0.0, 3.0, 1.0))
+    assert actual[1] is None
+    assert actual[2].equals(box(2.0, 0.0, 3.0, 1.0))
 
 
 def _sample_geometries() -> list[object | None]:
@@ -432,13 +922,41 @@ def _overallocated_polygon_owned(x_offset: float):
     )
 
 
+def _overallocated_polygon_ring_capacity_owned(x_offset: float):
+    from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+    from vibespatial.geometry.owned import FAMILY_TAGS, FamilyGeometryBuffer, OwnedGeometryArray
+
+    buffer = FamilyGeometryBuffer(
+        family=GeometryFamily.POLYGON,
+        schema=get_geometry_buffer_schema(GeometryFamily.POLYGON),
+        row_count=1,
+        x=np.asarray(
+            [x_offset, x_offset + 1, x_offset + 1, x_offset, x_offset, 999.0, 999.0, 999.0],
+            dtype=np.float64,
+        ),
+        y=np.asarray([0.0, 0.0, 1.0, 1.0, 0.0, 999.0, 999.0, 999.0], dtype=np.float64),
+        geometry_offsets=np.asarray([0, 1], dtype=np.int32),
+        empty_mask=np.asarray([False], dtype=bool),
+        ring_offsets=np.asarray([0, 5, 5], dtype=np.int32),
+    )
+    return OwnedGeometryArray(
+        validity=np.asarray([True], dtype=bool),
+        tags=np.asarray([FAMILY_TAGS[GeometryFamily.POLYGON]], dtype=np.int8),
+        family_row_offsets=np.asarray([0], dtype=np.int32),
+        families={GeometryFamily.POLYGON: buffer},
+        residency=Residency.HOST,
+    )
+
+
 def test_owned_concat_ignores_polygon_coordinate_capacity_tail() -> None:
     from vibespatial.geometry.owned import OwnedGeometryArray
 
-    owned = OwnedGeometryArray.concat([
-        _overallocated_polygon_owned(0.0),
-        _overallocated_polygon_owned(10.0),
-    ])
+    owned = OwnedGeometryArray.concat(
+        [
+            _overallocated_polygon_owned(0.0),
+            _overallocated_polygon_owned(10.0),
+        ]
+    )
 
     restored = owned.to_shapely()
     assert restored[0].equals(Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]))
@@ -446,7 +964,41 @@ def test_owned_concat_ignores_polygon_coordinate_capacity_tail() -> None:
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
+def test_device_host_materialization_copies_only_logical_nested_prefixes() -> None:
+    from vibespatial.geometry.owned import FamilyGeometryBuffer
+
+    owned = _overallocated_polygon_ring_capacity_owned(0.0).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test logical-prefix device host materialization",
+    )
+    host_buffer = owned.families[GeometryFamily.POLYGON]
+    owned._validity = None
+    owned._tags = None
+    owned._family_row_offsets = None
+    owned.families[GeometryFamily.POLYGON] = FamilyGeometryBuffer(
+        family=host_buffer.family,
+        schema=host_buffer.schema,
+        row_count=host_buffer.row_count,
+        x=np.empty(0, dtype=np.float64),
+        y=np.empty(0, dtype=np.float64),
+        geometry_offsets=np.empty(0, dtype=np.int32),
+        empty_mask=np.empty(0, dtype=bool),
+        host_materialized=False,
+    )
+
+    restored = owned.to_shapely()
+
+    assert restored[0].equals(Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]))
+    host_buffer = owned.families[GeometryFamily.POLYGON]
+    assert host_buffer.x.size == 5
+    assert host_buffer.y.size == 5
+    assert host_buffer.ring_offsets.tolist() == [0, 5]
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
 def test_device_owned_concat_ignores_polygon_coordinate_capacity_tail() -> None:
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
     from vibespatial.geometry.owned import OwnedGeometryArray
 
     left = _overallocated_polygon_owned(0.0).move_to(
@@ -460,8 +1012,39 @@ def test_device_owned_concat_ignores_polygon_coordinate_capacity_tail() -> None:
         reason="test device concat capacity tail",
     )
 
-    owned = OwnedGeometryArray.concat([left, right])
+    with assert_zero_d2h_transfers():
+        owned = OwnedGeometryArray.concat([left, right])
 
+    restored = owned.to_shapely()
+    assert restored[0].equals(Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]))
+    assert restored[1].equals(Polygon([(10, 0), (11, 0), (11, 1), (10, 1), (10, 0)]))
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
+def test_device_owned_concat_initializes_inactive_ring_offset_capacity() -> None:
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+    from vibespatial.geometry.owned import OwnedGeometryArray
+
+    left = _overallocated_polygon_ring_capacity_owned(0.0).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test device concat ring capacity tail",
+    )
+    right = _overallocated_polygon_ring_capacity_owned(10.0).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test device concat ring capacity tail",
+    )
+
+    with assert_zero_d2h_transfers():
+        owned = OwnedGeometryArray.concat([left, right])
+
+    d_polygon = owned.device_state.families[GeometryFamily.POLYGON]
+    np.testing.assert_array_equal(
+        cp.asnumpy(d_polygon.ring_offsets),
+        np.asarray([0, 5, 10, 10, 10], dtype=np.int32),
+    )
     restored = owned.to_shapely()
     assert restored[0].equals(Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]))
     assert restored[1].equals(Polygon([(10, 0), (11, 0), (11, 1), (10, 1), (10, 0)]))
@@ -543,6 +1126,35 @@ def test_bounds_and_total_bounds_ignore_nulls_and_empty() -> None:
     assert total == (0.0, 0.0, 21.0, 21.0)
 
 
+def test_cached_bounds_follow_indexed_view_family_rows() -> None:
+    owned = from_shapely_geometries(
+        [
+            Point(1, 2),
+            LineString([(10, 10), (12, 14)]),
+            Polygon([(20, 20), (23, 20), (23, 24), (20, 20)]),
+        ]
+    )
+    compute_geometry_bounds(owned, dispatch_mode=ExecutionMode.CPU)
+    view = type(owned)._indexed_view(
+        owned,
+        np.asarray([2, 0, 2, 1], dtype=np.int64),
+    )
+
+    bounds = compute_geometry_bounds(view, dispatch_mode=ExecutionMode.CPU)
+
+    np.testing.assert_array_equal(
+        bounds,
+        np.asarray(
+            [
+                [20.0, 20.0, 23.0, 24.0],
+                [1.0, 2.0, 1.0, 2.0],
+                [20.0, 20.0, 23.0, 24.0],
+                [10.0, 10.0, 12.0, 14.0],
+            ]
+        ),
+    )
+
+
 def test_offset_spans_expose_payload_hierarchy() -> None:
     owned = from_shapely_geometries(_sample_geometries())
 
@@ -586,6 +1198,99 @@ def test_diagnostics_capture_residency_and_runtime_changes() -> None:
     assert any(event["kind"] == DiagnosticKind.TRANSFER.value for event in report["events"])
     assert any(event["kind"] == DiagnosticKind.MATERIALIZATION.value for event in report["events"])
     assert any("CPU fallback" in reason for reason in report["runtime_history"])
+
+
+def test_fallback_diagnostic_kind_is_reportable() -> None:
+    owned = from_shapely_geometries(_sample_geometries())
+    owned._record(
+        DiagnosticKind.FALLBACK,
+        "GPU operation declined before compatibility fallback",
+        visible=True,
+    )
+
+    report = owned.diagnostics_report()
+
+    assert any(event["kind"] == "fallback" for event in report["events"])
+
+
+def test_device_take_preserves_cached_row_bounds() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device row-bounds propagation")
+    cp = pytest.importorskip("cupy")
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.geometry.owned import device_concat_owned_scatter
+    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
+
+    geoms = [
+        Polygon([(0, 0), (2, 0), (2, 1), (1, 2), (0, 1), (0, 0)]),
+        Polygon([(10, 10), (13, 10), (13, 11), (12, 12), (10, 11), (10, 10)]),
+        Polygon([(20, 20), (21, 20), (22, 22), (20, 21), (20, 20)]),
+    ]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    compute_geometry_bounds_device(owned)
+
+    view = owned.device_take(cp.asarray([2, 0, 1], dtype=cp.int64))
+
+    assert view.device_state is not None
+    assert view.device_state.row_bounds is not None
+
+    bounds = (
+        get_cuda_runtime()
+        .copy_device_to_host(
+            compute_geometry_bounds_device(view, preserve_indexed_view=True),
+            reason="test device-take row-bounds terminal export",
+            terminal_export=True,
+        )
+        .reshape(-1, 4)
+    )
+
+    np.testing.assert_array_equal(
+        bounds,
+        np.asarray(
+            [
+                [20.0, 20.0, 22.0, 22.0],
+                [0.0, 0.0, 2.0, 2.0],
+                [10.0, 10.0, 13.0, 12.0],
+            ],
+            dtype=np.float64,
+        ),
+    )
+
+    replacement = from_shapely_geometries(
+        [Polygon([(100, 100), (101, 100), (101, 101), (100, 100)])],
+        residency=Residency.DEVICE,
+    )
+    compute_geometry_bounds_device(replacement)
+    scattered = device_concat_owned_scatter(
+        owned,
+        replacement,
+        cp.asarray([1], dtype=cp.int64),
+    )
+
+    assert scattered.device_state is not None
+    assert scattered.device_state.row_bounds is not None
+
+    scattered_bounds = (
+        get_cuda_runtime()
+        .copy_device_to_host(
+            compute_geometry_bounds_device(scattered, preserve_indexed_view=True),
+            reason="test device-scatter row-bounds terminal export",
+            terminal_export=True,
+        )
+        .reshape(-1, 4)
+    )
+    np.testing.assert_array_equal(
+        scattered_bounds,
+        np.asarray(
+            [
+                [0.0, 0.0, 2.0, 2.0],
+                [100.0, 100.0, 101.0, 101.0],
+                [20.0, 20.0, 22.0, 22.0],
+            ],
+            dtype=np.float64,
+        ),
+    )
 
 
 def test_move_to_device_allocates_device_mirrors_when_gpu_is_available() -> None:
@@ -642,8 +1347,8 @@ def test_take_preserves_null_and_empty() -> None:
     subset_shapely = subset.to_shapely()
 
     assert subset.row_count == 2
-    assert subset_shapely[0] is None       # null
-    assert subset_shapely[1].is_empty      # empty Point
+    assert subset_shapely[0] is None  # null
+    assert subset_shapely[1].is_empty  # empty Point
 
 
 def test_take_single_row() -> None:
@@ -682,10 +1387,12 @@ def test_take_all_families() -> None:
         Polygon([(0, 0), (3, 0), (3, 3), (0, 0)]),
         MultiPoint([(0, 0), (1, 1)]),
         MultiLineString([[(0, 0), (1, 1)], [(2, 2), (3, 3)]]),
-        MultiPolygon([
-            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
-            Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]),
-        ]),
+        MultiPolygon(
+            [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+                Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]),
+            ]
+        ),
     ]
     owned = from_shapely_geometries(geoms)
     for i, geom in enumerate(geoms):
@@ -791,13 +1498,17 @@ class TestDeviceResidentConcat:
         """Concatenating device-resident multipolygon arrays preserves 3-level offsets."""
         from vibespatial.geometry.owned import OwnedGeometryArray
 
-        mp1 = MultiPolygon([
-            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
-            Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]),
-        ])
-        mp2 = MultiPolygon([
-            Polygon([(10, 10), (11, 10), (11, 11), (10, 10)]),
-        ])
+        mp1 = MultiPolygon(
+            [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+                Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]),
+            ]
+        )
+        mp2 = MultiPolygon(
+            [
+                Polygon([(10, 10), (11, 10), (11, 11), (10, 10)]),
+            ]
+        )
 
         owned1 = _make_device_resident([mp1])
         owned2 = _make_device_resident([mp2])
@@ -860,6 +1571,7 @@ class TestDeviceResidentConcat:
 
         assert result.residency is Residency.DEVICE
         assert result.row_count == 4
+        assert result.device_state.trusted_family_domain == (GeometryFamily.POINT,)
 
         shapely_result = result.to_shapely()
         assert shapely_result[0].equals(Point(0, 0))
@@ -871,14 +1583,18 @@ class TestDeviceResidentConcat:
         """Concatenating arrays with different geometry families."""
         from vibespatial.geometry.owned import OwnedGeometryArray
 
-        owned1 = _make_device_resident([
-            Point(0, 0),
-            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
-        ])
-        owned2 = _make_device_resident([
-            LineString([(2, 2), (3, 3)]),
-            Point(4, 4),
-        ])
+        owned1 = _make_device_resident(
+            [
+                Point(0, 0),
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+            ]
+        )
+        owned2 = _make_device_resident(
+            [
+                LineString([(2, 2), (3, 3)]),
+                Point(4, 4),
+            ]
+        )
 
         result = OwnedGeometryArray.concat([owned1, owned2])
 
@@ -904,25 +1620,27 @@ class TestDeviceResidentConcat:
             calls.append("_ensure_host_state")
 
         monkeypatch.setattr(
-            OwnedGeometryArray, "_ensure_host_state", _spy_host_state,
+            OwnedGeometryArray,
+            "_ensure_host_state",
+            _spy_host_state,
         )
 
         result = OwnedGeometryArray.concat([owned1, owned2])
 
         assert result.residency is Residency.DEVICE
-        assert len(calls) == 0, (
-            "_ensure_host_state was called during device-resident concat"
-        )
+        assert len(calls) == 0, "_ensure_host_state was called during device-resident concat"
 
     def test_device_geometry_copy_no_metadata_d2h(self) -> None:
         """Copying a device-only geometry column must not materialize host metadata."""
         from vibespatial.cuda._runtime import assert_zero_d2h_transfers
         from vibespatial.geometry.device_array import DeviceGeometryArray
 
-        owned = _make_device_resident([
-            Point(0, 0),
-            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
-        ])
+        owned = _make_device_resident(
+            [
+                Point(0, 0),
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+            ]
+        )
         owned._validity = None
         owned._tags = None
         owned._family_row_offsets = None
@@ -931,10 +1649,322 @@ class TestDeviceResidentConcat:
             copied = DeviceGeometryArray._from_owned(owned).copy()
 
         assert copied._owned.residency is Residency.DEVICE
+        assert copied._owned.device_state.trusted_family_domain == (
+            GeometryFamily.POINT,
+            GeometryFamily.POLYGON,
+        )
         assert copied._owned.row_count == 2
         assert copied._owned._validity is None
         assert copied._owned._tags is None
         assert copied._owned._family_row_offsets is None
+
+    def test_device_geometry_nbytes_no_metadata_d2h(self) -> None:
+        """Byte accounting for device arrays should not materialize host metadata."""
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+
+        owned = _make_device_resident(
+            [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+                Polygon([(2, 0), (3, 0), (3, 1), (2, 0)]),
+            ]
+        )
+        owned._validity = None
+        owned._tags = None
+        owned._family_row_offsets = None
+
+        reset_d2h_transfer_count()
+        get_d2h_transfer_events(clear=True)
+        byte_count = DeviceGeometryArray._from_owned(owned).nbytes
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert byte_count > 0
+        assert not any("owned geometry host metadata" in reason for reason in reasons)
+        assert owned._validity is None
+        assert owned._tags is None
+        assert owned._family_row_offsets is None
+
+    def test_provenance_infer_geom_types_uses_device_family_domain_no_d2h(self) -> None:
+        """Provenance type summaries should use resident device family metadata."""
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+        from vibespatial.runtime.provenance import infer_geom_types
+
+        owned = _make_device_resident(
+            [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+                Polygon([(2, 0), (3, 0), (3, 1), (2, 0)]),
+            ]
+        )
+        owned._validity = None
+        owned._tags = None
+        owned._family_row_offsets = None
+
+        reset_d2h_transfer_count()
+        get_d2h_transfer_events(clear=True)
+        geom_types = infer_geom_types(DeviceGeometryArray._from_owned(owned))
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert geom_types == {"polygon"}
+        assert "provenance geometry tag-domain summary scalar fence" not in reasons
+        assert not any("owned geometry host metadata" in reason for reason in reasons)
+        assert owned._validity is None
+        assert owned._tags is None
+        assert owned._family_row_offsets is None
+
+    def test_device_geometry_array_isna_exports_only_validity(self) -> None:
+        """Public NA checks should not materialize full owned host metadata."""
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+
+        owned = _make_device_resident([Point(0, 0), None])
+        owned._validity = None
+        owned._tags = None
+        owned._family_row_offsets = None
+
+        reset_d2h_transfer_count()
+        get_d2h_transfer_events(clear=True)
+        mask = DeviceGeometryArray._from_owned(owned).isna()
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert mask.tolist() == [False, True]
+        assert "DeviceGeometryArray isna validity terminal export" in reasons
+        assert not any("owned geometry host metadata" in reason for reason in reasons)
+        assert owned._validity is None
+        assert owned._tags is None
+        assert owned._family_row_offsets is None
+
+    def test_device_geometry_scalar_getitem_uses_device_row_metadata(self) -> None:
+        """Scalar row export should not materialize full host metadata triplets."""
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+
+        owned = _make_device_resident(
+            [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+            ]
+        )
+        owned._validity = None
+        owned._tags = None
+        owned._family_row_offsets = None
+
+        reset_d2h_transfer_count()
+        get_d2h_transfer_events(clear=True)
+        geom = DeviceGeometryArray._from_owned(owned)[0]
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert geom is not None
+        assert geom.geom_type == "Polygon"
+        assert "DeviceGeometryArray scalar row metadata device export" in reasons
+        assert not any("owned geometry host metadata" in reason for reason in reasons)
+        assert owned._validity is None
+        assert owned._tags is None
+        assert owned._family_row_offsets is None
+
+    def test_device_geometry_buffer_uses_device_admission_metadata(self) -> None:
+        """DeviceGeometryArray.buffer should admit device rows without host metadata."""
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+
+        owned = _make_device_resident([Point(0, 0), Point(1, 1)])
+        owned._validity = None
+        owned._tags = None
+        owned._family_row_offsets = None
+
+        reset_d2h_transfer_count()
+        get_d2h_transfer_events(clear=True)
+        buffered = DeviceGeometryArray._from_owned(owned).buffer(1.0, quad_segs=1)
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert len(buffered) == 2
+        assert "point buffer validity admission scalar fence" not in reasons
+        assert "point buffer empty-point admission scalar fence" not in reasons
+        assert not any("owned geometry host metadata" in reason for reason in reasons)
+        assert owned._validity is None
+        assert owned._tags is None
+        assert owned._family_row_offsets is None
+
+    def test_mixed_device_area_uses_device_row_mapping_metadata(self) -> None:
+        """Mixed-family public area should not export tag/family metadata triplets."""
+        from vibespatial.constructive.measurement import area_owned
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+
+        owned = _make_device_resident(
+            [
+                Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+                MultiPolygon(
+                    [
+                        Polygon([(4, 0), (6, 0), (6, 2), (4, 0)]),
+                    ]
+                ),
+            ]
+        )
+        owned._validity = None
+        owned._tags = None
+        owned._family_row_offsets = None
+
+        reset_d2h_transfer_count()
+        get_d2h_transfer_events(clear=True)
+        areas = area_owned(owned, dispatch_mode=ExecutionMode.GPU, precision="fp64")
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert np.allclose(areas, [2.0, 2.0])
+        assert "geometry area device-result host export" in reasons
+        assert not any("owned geometry host metadata" in reason for reason in reasons)
+        assert owned._validity is None
+        assert owned._tags is None
+        assert owned._family_row_offsets is None
+
+    def test_owned_to_shapely_exports_requested_device_metadata_rows(self) -> None:
+        """Terminal Shapely export should not populate generic host metadata."""
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+        from vibespatial.geometry.host_bridge import owned_to_shapely
+
+        owned = _make_device_resident(
+            [
+                Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+            ]
+        )
+        owned._validity = None
+        owned._tags = None
+        owned._family_row_offsets = None
+
+        reset_d2h_transfer_count()
+        get_d2h_transfer_events(clear=True)
+        values = owned_to_shapely(owned)
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert values[0].geom_type == "Polygon"
+        assert "owned geometry shapely export validity metadata boundary" in reasons
+        assert not any("owned geometry host metadata" in reason for reason in reasons)
+        assert owned._validity is None
+        assert owned._tags is None
+        assert owned._family_row_offsets is None
+
+    def test_owned_to_shapely_indexed_view_uses_base_family_rows(self) -> None:
+        """Row-indirected Shapely export must address the shared base buffers."""
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+        cp = pytest.importorskip("cupy")
+
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+        from vibespatial.geometry.host_bridge import owned_to_shapely
+
+        polygons = []
+        for i in range(14):
+            x0 = float(i * 4)
+            shell = [(x0, 0), (x0 + 3, 0), (x0 + 3, 3), (x0, 3), (x0, 0)]
+            if i % 2:
+                polygons.append(
+                    Polygon(
+                        shell,
+                        [
+                            [
+                                (x0 + 0.5, 0.5),
+                                (x0 + 1.0, 0.5),
+                                (x0 + 1.0, 1.0),
+                                (x0 + 0.5, 0.5),
+                            ]
+                        ],
+                    )
+                )
+            else:
+                polygons.append(Polygon(shell))
+        owned = _make_device_resident(polygons)
+        owned._validity = None
+        owned._tags = None
+        owned._family_row_offsets = None
+
+        view = owned._device_indexed_take(
+            cp.asarray([13, 0, 12], dtype=cp.int64),
+        )
+        view._validity = None
+        view._tags = None
+        view._family_row_offsets = None
+
+        reset_d2h_transfer_count()
+        get_d2h_transfer_events(clear=True)
+        values = owned_to_shapely(view)
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        expected = [polygons[13], polygons[0], polygons[12]]
+        for value, expected_geometry in zip(values, expected, strict=True):
+            assert value.equals(expected_geometry)
+        assert "owned geometry shapely export family-row metadata boundary" in reasons
+        assert not any("owned geometry host metadata" in reason for reason in reasons)
+        assert view.is_indexed_view
+        assert view._validity is None
+        assert view._tags is None
+        assert view._family_row_offsets is None
+
+    def test_owned_to_shapely_composes_nested_device_index_maps(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Terminal export must not physicalize an indexed-view ancestry."""
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+        cp = pytest.importorskip("cupy")
+
+        from vibespatial.geometry.host_bridge import owned_to_shapely
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        polygons = [
+            Polygon(
+                [(i * 4, 0), (i * 4 + 3, 0), (i * 4 + 3, 3), (i * 4, 0)]
+            )
+            for i in range(8)
+        ]
+        owned = _make_device_resident(polygons)
+        first = OwnedGeometryArray._indexed_view(
+            owned,
+            cp.asarray([7, 0, 6, 1, 5, 2], dtype=cp.int64),
+            assume_unique_indices=True,
+        )
+        second = OwnedGeometryArray._indexed_view(
+            first,
+            cp.asarray([4, 0, 2], dtype=cp.int64),
+            assume_unique_indices=True,
+        )
+
+        def _fail_physicalize(*_args, **_kwargs):
+            raise AssertionError("nested terminal export must preserve row indirection")
+
+        monkeypatch.setattr(
+            OwnedGeometryArray,
+            "physicalize_device_rows",
+            _fail_physicalize,
+        )
+        values = owned_to_shapely(second)
+
+        expected = [polygons[5], polygons[7], polygons[6]]
+        assert len(values) == len(expected)
+        for value, expected_geometry in zip(values, expected, strict=True):
+            assert value.equals(expected_geometry)
 
     def test_dense_polygon_device_take_no_d2h(self) -> None:
         """Fixed-width one-ring polygon takes should stay fully device-side."""
@@ -942,11 +1972,14 @@ class TestDeviceResidentConcat:
 
         from vibespatial.cuda._runtime import assert_zero_d2h_transfers
 
-        owned = from_shapely_geometries([
-            Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]),
-            Polygon([(2, 0), (3, 0), (3, 1), (2, 1), (2, 0)]),
-            Polygon([(4, 0), (5, 0), (5, 1), (4, 1), (4, 0)]),
-        ], residency=Residency.DEVICE)
+        owned = from_shapely_geometries(
+            [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]),
+                Polygon([(2, 0), (3, 0), (3, 1), (2, 1), (2, 0)]),
+                Polygon([(4, 0), (5, 0), (5, 1), (4, 1), (4, 0)]),
+            ],
+            residency=Residency.DEVICE,
+        )
 
         with assert_zero_d2h_transfers():
             result = owned.device_take(cp.asarray([2, 0], dtype=cp.int64))
@@ -1002,8 +2035,8 @@ class TestDeviceResidentConcat:
         assert len(restored) == 1
         assert restored[0].equals(simple_polygon)
 
-    def test_variable_polygon_device_index_take_batches_nested_size_fence(self) -> None:
-        """Device-only rowsets should batch nested polygon size totals into one fence."""
+    def test_variable_polygon_device_index_take_preserves_row_indirection_no_d2h(self) -> None:
+        """Device-only variable polygon rowsets should not size a physical gather."""
         import cupy as cp
 
         from vibespatial.cuda._runtime import (
@@ -1027,9 +2060,8 @@ class TestDeviceResidentConcat:
         events = get_d2h_transfer_events(clear=True)
 
         assert result.residency is Residency.DEVICE
-        assert [
-            event.reason for event in events if "device-take" in event.reason
-        ] == ["owned geometry device-take nested slice-size allocation fence"]
+        assert result.is_indexed_view
+        assert [event.reason for event in events if "device-take" in event.reason] == []
         restored = result.to_shapely()
         assert restored[0].equals(simple_polygon)
         assert restored[1].equals(polygon_with_hole)
@@ -1109,8 +2141,8 @@ class TestDeviceResidentConcat:
         assert restored[0].equals(simple_polygon)
         assert restored[1].equals(polygon_with_hole)
 
-    def test_device_scatter_preserves_host_sizing_hint_no_d2h(self) -> None:
-        """Device scatter should reuse host row mirrors for nested family takes."""
+    def test_device_scatter_keeps_host_metadata_lazy_no_d2h(self) -> None:
+        """Variable-width scatter should retain an injective device row map."""
         from vibespatial.cuda._runtime import assert_zero_d2h_transfers
         from vibespatial.geometry.owned import concat_owned_scatter
 
@@ -1137,9 +2169,11 @@ class TestDeviceResidentConcat:
             )
 
         assert result.residency is Residency.DEVICE
-        assert result._validity is not None
-        assert result._tags is not None
-        assert result._family_row_offsets is not None
+        assert result.is_indexed_view
+        assert result._index_map_unique
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
         restored = result.to_shapely()
         assert restored[0].equals(polygon_with_hole)
         assert restored[1].equals(replacement_polygon)
@@ -1174,6 +2208,157 @@ class TestDeviceResidentConcat:
         restored = result.to_shapely()
         assert restored[0].equals(base_polygon)
         assert restored[1].equals(replacement_polygon)
+
+    def test_mixed_device_concat_uses_row_aligned_family_offsets_no_compaction(self) -> None:
+        """Mixed device concat should assemble row offsets without row compaction."""
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+        cp = pytest.importorskip("cupy")
+        from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        left_geoms = [
+            Point(0, 0),
+            Polygon([(1, 0), (2, 0), (2, 1), (1, 0)]),
+            MultiPolygon(
+                [
+                    Polygon([(3, 0), (4, 0), (4, 1), (3, 0)]),
+                ]
+            ),
+        ]
+        right_geoms = [
+            Polygon([(5, 0), (6, 0), (6, 1), (5, 0)]),
+            Point(7, 0),
+        ]
+        left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+        right = from_shapely_geometries(right_geoms, residency=Residency.DEVICE)
+
+        original_flatnonzero = cp.flatnonzero
+        calls = 0
+
+        def _count_flatnonzero(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original_flatnonzero(*args, **kwargs)
+
+        cp.flatnonzero = _count_flatnonzero
+        try:
+            with assert_zero_d2h_transfers():
+                result = OwnedGeometryArray.concat([left, right])
+        finally:
+            cp.flatnonzero = original_flatnonzero
+
+        assert result.residency is Residency.DEVICE
+        assert calls == 0
+        restored = result.to_shapely()
+        expected = left_geoms + right_geoms
+        assert [geom.geom_type for geom in restored] == [geom.geom_type for geom in expected]
+        assert all(
+            actual.equals(expected_geom)
+            for actual, expected_geom in zip(restored, expected, strict=True)
+        )
+
+    def test_device_scatter_device_rowset_returns_indexed_carrier_no_take_fence(self) -> None:
+        """Device scatter rowsets should stay row-indirected instead of gathering."""
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+        cp = pytest.importorskip("cupy")
+        from vibespatial.cuda._runtime import (
+            assert_zero_d2h_transfers,
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+        from vibespatial.geometry.owned import concat_owned_scatter
+
+        polygon_with_hole = Polygon(
+            [(0, 0), (6, 0), (6, 6), (0, 6), (0, 0)],
+            [[(1, 1), (2, 1), (2, 2), (1, 1)]],
+        )
+        simple_polygon = Polygon([(10, 0), (13, 0), (13, 3), (10, 0)])
+        replacement_polygon = Polygon([(20, 0), (24, 0), (24, 4), (20, 0)])
+        base = _make_device_resident([polygon_with_hole, simple_polygon])
+        replacement = _make_device_resident([replacement_polygon])
+
+        reset_d2h_transfer_count()
+        get_d2h_transfer_events(clear=True)
+        with assert_zero_d2h_transfers():
+            result = concat_owned_scatter(
+                base,
+                replacement,
+                cp.asarray([1], dtype=cp.int64),
+            )
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert result.residency is Residency.DEVICE
+        assert result.is_indexed_view
+        assert (
+            getattr(result, "_device_scatter_implementation", None)
+            == "device_scatter_row_indirection"
+        )
+        assert not any("device-take" in reason or "offset-slice" in reason for reason in reasons)
+        restored = result.to_shapely()
+        assert restored[0].equals(polygon_with_hole)
+        assert restored[1].equals(replacement_polygon)
+
+    def test_device_scatter_full_replacement_permutation_no_take_fence(self) -> None:
+        """Full replacement scatter should be a rowset permutation carrier."""
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+        cp = pytest.importorskip("cupy")
+        from vibespatial.cuda._runtime import (
+            assert_zero_d2h_transfers,
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+        from vibespatial.geometry.owned import concat_owned_scatter
+
+        base = _make_device_resident(
+            [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+                Polygon([(2, 0), (3, 0), (3, 1), (2, 0)]),
+                Polygon([(4, 0), (5, 0), (5, 1), (4, 0)]),
+            ]
+        )
+        replacement_geoms = [
+            MultiPolygon(
+                [
+                    Polygon([(10, 0), (12, 0), (12, 2), (10, 0)]),
+                    Polygon([(13, 0), (14, 0), (14, 1), (13, 0)]),
+                ]
+            ),
+            Polygon(
+                [(20, 0), (26, 0), (26, 6), (20, 0)],
+                [[(21, 1), (22, 1), (22, 2), (21, 1)]],
+            ),
+            MultiPolygon(
+                [
+                    Polygon([(30, 0), (32, 0), (32, 2), (30, 0)]),
+                ]
+            ),
+        ]
+        replacement = _make_device_resident(replacement_geoms)
+
+        reset_d2h_transfer_count()
+        get_d2h_transfer_events(clear=True)
+        with assert_zero_d2h_transfers():
+            result = concat_owned_scatter(
+                base,
+                replacement,
+                cp.asarray([2, 0, 1], dtype=cp.int64),
+            )
+        reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+        assert result.residency is Residency.DEVICE
+        assert result.is_indexed_view
+        assert (
+            getattr(result, "_device_scatter_implementation", None)
+            == "device_scatter_row_indirection"
+        )
+        assert not any("device-take" in reason or "offset-slice" in reason for reason in reasons)
+        restored = result.to_shapely()
+        expected = [replacement_geoms[1], replacement_geoms[2], replacement_geoms[0]]
+        for actual, expected_geometry in zip(restored, expected, strict=True):
+            assert actual.equals(expected_geometry)
 
     def test_mixed_family_device_take_uses_rowset_shape_for_presence_no_d2h(self) -> None:
         """Mixed-family device takes should not scalar-probe family presence."""
@@ -1376,9 +2561,11 @@ class TestDeviceResidentConcat:
         geoms2 = [
             MultiPoint([(0, 0), (1, 1)]),
             MultiLineString([[(0, 0), (1, 1)], [(2, 2), (3, 3)]]),
-            MultiPolygon([
-                Polygon([(10, 10), (12, 10), (12, 12), (10, 10)]),
-            ]),
+            MultiPolygon(
+                [
+                    Polygon([(10, 10), (12, 10), (12, 12), (10, 10)]),
+                ]
+            ),
         ]
 
         owned1 = _make_device_resident(geoms1)
@@ -1399,12 +2586,16 @@ class TestDeviceResidentConcat:
         """One array has only polygons, the other has only points."""
         from vibespatial.geometry.owned import OwnedGeometryArray
 
-        owned1 = _make_device_resident([
-            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
-        ])
-        owned2 = _make_device_resident([
-            Point(5, 5),
-        ])
+        owned1 = _make_device_resident(
+            [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+            ]
+        )
+        owned2 = _make_device_resident(
+            [
+                Point(5, 5),
+            ]
+        )
 
         result = OwnedGeometryArray.concat([owned1, owned2])
 
@@ -1478,9 +2669,11 @@ class TestEnsureDeviceStateSafetyCheck:
     @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
     def test_ensure_device_state_shortcircuits_when_device_state_exists(self) -> None:
         """_ensure_device_state returns existing device_state without re-uploading."""
-        owned = _make_device_resident([
-            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
-        ])
+        owned = _make_device_resident(
+            [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+            ]
+        )
         assert owned.device_state is not None
 
         # Families are unmaterialised stubs, but device_state exists

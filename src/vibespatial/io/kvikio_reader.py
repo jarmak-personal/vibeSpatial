@@ -7,6 +7,7 @@ is required — kvikio falls back to buffered IO automatically.
 When kvikio is not installed, falls back to np.fromfile + cp.asarray with a
 manual >2 GiB chunking workaround for CuPy limitations.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -83,9 +84,7 @@ def read_file_to_device(path: Path, file_size: int) -> FileReadResult:
         used, or ``None`` when kvikio handled the transfer.
     """
     if cp is None:
-        raise ImportError(
-            "cupy is required for read_file_to_device but is not installed"
-        )
+        raise ImportError("cupy is required for read_file_to_device but is not installed")
 
     if file_size == 0:
         return FileReadResult(
@@ -98,9 +97,7 @@ def read_file_to_device(path: Path, file_size: int) -> FileReadResult:
         with kvikio.CuFile(str(path), "r") as f:
             nbytes = f.read(d_buf)
         if nbytes != file_size:
-            raise OSError(
-                f"kvikio short read: got {nbytes} bytes, expected {file_size}"
-            )
+            raise OSError(f"kvikio short read: got {nbytes} bytes, expected {file_size}")
         return FileReadResult(device_bytes=d_buf, host_bytes=None)
 
     # Fallback: np.fromfile + cp.asarray with >2 GiB chunking.
@@ -115,9 +112,7 @@ def read_file_to_device(path: Path, file_size: int) -> FileReadResult:
             d_buf[offset:end] = cp.asarray(host_bytes[offset:end])
             offset = end
         return FileReadResult(device_bytes=d_buf, host_bytes=host_bytes)
-    return FileReadResult(
-        device_bytes=cp.asarray(host_bytes), host_bytes=host_bytes
-    )
+    return FileReadResult(device_bytes=cp.asarray(host_bytes), host_bytes=host_bytes)
 
 
 def has_kvikio() -> bool:

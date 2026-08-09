@@ -15,12 +15,18 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.config import COARSE_BOUNDS_TILE_SIZE
 
-request_warmup([
-    "exclusive_scan_i32", "exclusive_scan_i64",
-    "select_i32", "select_i64",
-    "lower_bound_i32", "lower_bound_u64",
-    "upper_bound_i32", "upper_bound_u64",
-])
+request_warmup(
+    [
+        "exclusive_scan_i32",
+        "exclusive_scan_i64",
+        "select_i32",
+        "select_i64",
+        "lower_bound_i32",
+        "lower_bound_u64",
+        "upper_bound_i32",
+        "upper_bound_u64",
+    ]
+)
 from vibespatial.cuda._runtime import (  # noqa: E402
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
@@ -33,6 +39,7 @@ from vibespatial.kernels.core.spatial_query_kernels import (  # noqa: E402
     _spatial_query_kernels,
 )
 from vibespatial.runtime import has_gpu_runtime  # noqa: E402
+from vibespatial.runtime.crossover import PhysicalWorkEstimate  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
 
 from .query_types import _DeviceCandidates  # noqa: E402
@@ -52,6 +59,19 @@ def _candidate_bounds_device_view(runtime, bounds: Any) -> tuple[Any, bool]:
             d_bounds = cp.ascontiguousarray(d_bounds)
         return d_bounds.reshape(-1), False
     return runtime.from_host(np.ascontiguousarray(bounds, dtype=np.float64).ravel()), True
+
+
+def _bbox_candidate_work_estimate(
+    *,
+    query_count: int,
+    tree_count: int,
+    primary_unit_name: str = "bbox-candidate-pair",
+) -> PhysicalWorkEstimate:
+    return PhysicalWorkEstimate.for_candidate_pairs(
+        row_count=int(query_count),
+        candidate_pair_count=int(query_count) * int(tree_count),
+        primary_unit_name=primary_unit_name,
+    )
 
 
 def _generate_distance_pairs(
@@ -97,6 +117,7 @@ def _generate_distance_pairs(
 # ADR-0033: bbox overlap is geometry-specific compute (Tier 1), compaction
 # and exclusive scan use CCCL primitives (Tier 3a) per benchmarked defaults.
 # This replaces the CPU tiled O(N*M) generate_bounds_pairs path.
+
 
 def _generate_candidates_gpu_scalar(
     query_bounds_row: np.ndarray,
@@ -194,7 +215,10 @@ def _generate_candidates_gpu_multi(
         )
         count_grid, count_block = runtime.launch_config(count_kernel, query_count)
         runtime.launch(
-            count_kernel, grid=count_grid, block=count_block, params=count_params,
+            count_kernel,
+            grid=count_grid,
+            block=count_block,
+            params=count_params,
         )
 
         # Exclusive scan for output offsets (CCCL Tier 3a)
@@ -241,7 +265,10 @@ def _generate_candidates_gpu_multi(
         )
         scatter_grid, scatter_block = runtime.launch_config(scatter_kernel, query_count)
         runtime.launch(
-            scatter_kernel, grid=scatter_grid, block=scatter_block, params=scatter_params,
+            scatter_kernel,
+            grid=scatter_grid,
+            block=scatter_block,
+            params=scatter_params,
         )
         runtime.synchronize()
 
@@ -305,7 +332,10 @@ def _generate_candidates_gpu_multi_device(
         )
         count_grid, count_block = runtime.launch_config(count_kernel, query_count)
         runtime.launch(
-            count_kernel, grid=count_grid, block=count_block, params=count_params,
+            count_kernel,
+            grid=count_grid,
+            block=count_block,
+            params=count_params,
         )
 
         # Exclusive scan for output offsets (CCCL Tier 3a)
@@ -351,7 +381,10 @@ def _generate_candidates_gpu_multi_device(
         )
         scatter_grid, scatter_block = runtime.launch_config(scatter_kernel, query_count)
         runtime.launch(
-            scatter_kernel, grid=scatter_grid, block=scatter_block, params=scatter_params,
+            scatter_kernel,
+            grid=scatter_grid,
+            block=scatter_block,
+            params=scatter_params,
         )
 
         # Synchronize before the finally block frees input buffers —
@@ -392,8 +425,12 @@ def _generate_candidates_gpu(
     selection = plan_dispatch_selection(
         kernel_name="bbox_overlap_candidates",
         kernel_class=KernelClass.COARSE,
-        row_count=query_count * tree_count,
+        row_count=query_count,
         gpu_available=has_gpu_runtime(),
+        work_estimate=_bbox_candidate_work_estimate(
+            query_count=query_count,
+            tree_count=tree_count,
+        ),
     )
     if selection.selected is not ExecutionMode.GPU:
         return None
@@ -452,8 +489,12 @@ def _count_candidates_gpu(
     selection = plan_dispatch_selection(
         kernel_name="bbox_overlap_candidates",
         kernel_class=KernelClass.COARSE,
-        row_count=query_count * tree_count,
+        row_count=query_count,
         gpu_available=has_gpu_runtime(),
+        work_estimate=_bbox_candidate_work_estimate(
+            query_count=query_count,
+            tree_count=tree_count,
+        ),
     )
     if selection.selected is not ExecutionMode.GPU:
         return None
@@ -489,7 +530,10 @@ def _count_candidates_gpu(
         )
         count_grid, count_block = runtime.launch_config(count_kernel, query_count)
         runtime.launch(
-            count_kernel, grid=count_grid, block=count_block, params=count_params,
+            count_kernel,
+            grid=count_grid,
+            block=count_block,
+            params=count_params,
         )
 
         device_offsets = exclusive_sum(device_counts)
@@ -527,8 +571,12 @@ def _generate_candidates_gpu_device(
     selection = plan_dispatch_selection(
         kernel_name="bbox_overlap_candidates",
         kernel_class=KernelClass.COARSE,
-        row_count=query_count * tree_count,
+        row_count=query_count,
         gpu_available=has_gpu_runtime(),
+        work_estimate=_bbox_candidate_work_estimate(
+            query_count=query_count,
+            tree_count=tree_count,
+        ),
     )
     if selection.selected is not ExecutionMode.GPU:
         return None
@@ -543,6 +591,7 @@ def _generate_candidates_gpu_device(
         if left_host.size == 0:
             return None
         import cupy as cp
+
         return _DeviceCandidates(
             d_left=cp.asarray(left_host),
             d_right=cp.asarray(right_host),
@@ -559,6 +608,7 @@ def _generate_candidates_gpu_device(
 # binary search uses CCCL lower_bound/upper_bound (Tier 3a), exclusive scan
 # for offset computation uses CCCL exclusive_sum (Tier 3a).
 # Replaces O(N*M) brute-force candidate generation with O(N*log(M)+K).
+
 
 def _generate_candidates_morton_range_gpu(
     flat_index,
@@ -577,8 +627,13 @@ def _generate_candidates_morton_range_gpu(
     selection = plan_dispatch_selection(
         kernel_name="morton_range_candidates",
         kernel_class=KernelClass.COARSE,
-        row_count=query_count * tree_count,
+        row_count=query_count,
         gpu_available=has_gpu_runtime(),
+        work_estimate=_bbox_candidate_work_estimate(
+            query_count=query_count,
+            tree_count=tree_count,
+            primary_unit_name="morton-range-candidate",
+        ),
     )
     if selection.selected is not ExecutionMode.GPU:
         return None
@@ -612,7 +667,8 @@ def _generate_candidates_morton_range_gpu(
     # Prepare host data: sort tree bounds by Morton order for sequential access.
     sorted_keys_host = flat_index.morton_keys[flat_index.order].astype(np.uint64)
     sorted_tree_bounds_host = np.ascontiguousarray(
-        flat_index.bounds[flat_index.order], dtype=np.float64,
+        flat_index.bounds[flat_index.order],
+        dtype=np.float64,
     )
     query_bounds_host = np.ascontiguousarray(query_bounds, dtype=np.float64)
     expanded_bounds_host = np.ascontiguousarray(expanded_bounds, dtype=np.float64)
@@ -642,22 +698,31 @@ def _generate_candidates_morton_range_gpu(
         range_params = (
             (
                 ptr(d_expanded_bounds),
-                float(total_bounds[0]), float(total_bounds[1]),
-                float(total_bounds[2]), float(total_bounds[3]),
-                ptr(d_range_low), ptr(d_range_high),
+                float(total_bounds[0]),
+                float(total_bounds[1]),
+                float(total_bounds[2]),
+                float(total_bounds[3]),
+                ptr(d_range_low),
+                ptr(d_range_high),
                 query_count,
             ),
             (
                 KERNEL_PARAM_PTR,
-                KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-                KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_I32,
             ),
         )
         range_grid, range_block = runtime.launch_config(range_kernel, query_count)
         runtime.launch(
-            range_kernel, grid=range_grid, block=range_block, params=range_params,
+            range_kernel,
+            grid=range_grid,
+            block=range_block,
+            params=range_params,
         )
 
         # Step 2: Binary search on sorted Morton keys (Tier 3a CCCL).
@@ -668,19 +733,28 @@ def _generate_candidates_morton_range_gpu(
         count_kernel = kernels["morton_range_count"]
         count_params = (
             (
-                ptr(d_starts), ptr(d_ends),
-                ptr(d_sorted_tree_bounds), ptr(d_query_bounds),
-                ptr(d_counts), query_count,
+                ptr(d_starts),
+                ptr(d_ends),
+                ptr(d_sorted_tree_bounds),
+                ptr(d_query_bounds),
+                ptr(d_counts),
+                query_count,
             ),
             (
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
             ),
         )
         count_grid, count_block = runtime.launch_config(count_kernel, query_count)
         runtime.launch(
-            count_kernel, grid=count_grid, block=count_block, params=count_params,
+            count_kernel,
+            grid=count_grid,
+            block=count_block,
+            params=count_params,
         )
 
         # Step 4: Exclusive scan for output offsets (Tier 3a CCCL).
@@ -706,23 +780,33 @@ def _generate_candidates_morton_range_gpu(
         scatter_kernel = kernels["morton_range_scatter"]
         scatter_params = (
             (
-                ptr(d_starts), ptr(d_ends),
-                ptr(d_order), ptr(d_sorted_tree_bounds),
-                ptr(d_query_bounds), ptr(d_offsets),
-                ptr(d_left), ptr(d_right),
+                ptr(d_starts),
+                ptr(d_ends),
+                ptr(d_order),
+                ptr(d_sorted_tree_bounds),
+                ptr(d_query_bounds),
+                ptr(d_offsets),
+                ptr(d_left),
+                ptr(d_right),
                 query_count,
             ),
             (
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_I32,
             ),
         )
         scatter_grid, scatter_block = runtime.launch_config(scatter_kernel, query_count)
         runtime.launch(
-            scatter_kernel, grid=scatter_grid, block=scatter_block,
+            scatter_kernel,
+            grid=scatter_grid,
+            block=scatter_block,
             params=scatter_params,
         )
 
@@ -731,7 +815,9 @@ def _generate_candidates_morton_range_gpu(
         runtime.synchronize()
 
         result = _DeviceCandidates(
-            d_left=d_left, d_right=d_right, total_pairs=total_pairs,
+            d_left=d_left,
+            d_right=d_right,
+            total_pairs=total_pairs,
         )
         d_left = None
         d_right = None

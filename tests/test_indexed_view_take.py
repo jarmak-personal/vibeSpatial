@@ -553,6 +553,24 @@ class TestDGATakeIndexedView:
         for i in range(1500, 2000):
             assert result._materialize_row(i) is None
 
+    def test_dga_nested_take_preserves_indexed_fill_activity(self):
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+
+        owned = from_shapely_geometries([Point(i, i) for i in range(20)])
+        dga = DeviceGeometryArray(owned)
+        indices = np.concatenate(
+            [
+                np.tile(np.arange(20, dtype=np.int64), 75),
+                np.full(500, -1, dtype=np.int64),
+            ]
+        )
+
+        filled = dga.take(indices, allow_fill=True)
+        nested = filled.take(np.full(2000, 1500, dtype=np.int64))
+
+        assert nested._owned.is_indexed_view
+        assert all(nested._materialize_row(i) is None for i in range(len(nested)))
+
     def test_dga_take_shapely_cache_propagated(self):
         """When shapely_cache exists, DGA take should propagate it."""
         from vibespatial.geometry.device_array import DeviceGeometryArray

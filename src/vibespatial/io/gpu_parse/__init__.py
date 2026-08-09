@@ -43,6 +43,7 @@ All operations run on the GPU with zero host materialization until
 the caller explicitly requests results via ``.get()`` or
 ``cp.asnumpy()``.
 """
+
 from __future__ import annotations
 
 from vibespatial.io.gpu_parse.numeric import (
@@ -91,6 +92,7 @@ def __getattr__(name: str):
             build_index_from_reader,
             build_spatial_index,
         )
+
         _exports = {
             "build_spatial_index": build_spatial_index,
             "build_index_from_reader": build_index_from_reader,

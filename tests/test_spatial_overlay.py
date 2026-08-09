@@ -5,8 +5,10 @@ geopandas.overlay fallback for mismatched row-count inputs.
 """
 from __future__ import annotations
 
-from types import SimpleNamespace
+import inspect
+from pathlib import Path
 
+import numpy as np
 import pytest
 import shapely
 from shapely.geometry import box
@@ -18,9 +20,85 @@ from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_eve
 from vibespatial.runtime.residency import Residency
 
 
+def test_device_grouped_overlay_difference_uses_full_source_topology() -> None:
+    source = Path("src/vibespatial/overlay/spatial_overlay.py").read_text()
+    start = source.index("def _grouped_difference_device(")
+    end = source.index("\n\ndef _pair_intersection_device", start)
+    grouped_source = source[start:end]
+
+    assert "order: Any" in grouped_source
+    assert "_device_pair_order(" not in grouped_source
+    assert "right._device_indexed_take(" in grouped_source
+    assert "_right_geometry_source_rows=source_rows" in grouped_source
+    assert "_right_segment_source_rows=source_rows" in grouped_source
+    assert "_include_same_side_splits=True" in grouped_source
+    assert "preserve_row_count=left.row_count" in grouped_source
+    assert "overlay_device_to_host(" not in grouped_source
+    assert "to_shapely(" not in grouped_source
+
+
+def test_public_spatial_overlay_uses_relation_grouped_module() -> None:
+    assert spatial_overlay_owned.__module__ == "vibespatial.overlay.spatial_overlay"
+
+
+def test_device_spatial_overlay_requires_canonical_device_relation() -> None:
+    source = Path("src/vibespatial/overlay/spatial_overlay.py").read_text()
+    device_start = source.index("def _device_relation_from_candidate_pairs(")
+    device_end = source.index("\n\ndef _device_pair_order", device_start)
+    relation_source = source[device_start:device_end]
+
+    assert "NativeRelation(" in relation_source
+    assert "device_left_indices is None" in relation_source
+    assert "candidate_pairs.left_indices" not in relation_source
+    assert "candidate_pairs.right_indices" not in relation_source
+    assert "requested_mode=ExecutionMode.GPU if use_device else ExecutionMode.CPU" in source
+
+
+def test_device_relation_lowering_rejects_host_candidate_columns() -> None:
+    from vibespatial.overlay.spatial_overlay import (
+        _device_relation_from_candidate_pairs,
+    )
+    from vibespatial.spatial.indexing import CandidatePairs
+
+    candidates = CandidatePairs(
+        _host_left_indices=np.asarray([0], dtype=np.int32),
+        _host_right_indices=np.asarray([0], dtype=np.int32),
+        left_bounds=np.asarray([[0.0, 0.0, 1.0, 1.0]]),
+        right_bounds=np.asarray([[0.0, 0.0, 1.0, 1.0]]),
+        pairs_examined=1,
+        tile_size=1,
+        same_input=False,
+    )
+
+    with pytest.raises(RuntimeError, match="requires device relation pairs"):
+        _device_relation_from_candidate_pairs(
+            candidates,
+            left_row_count=1,
+            right_row_count=1,
+        )
+
+
+def test_device_spatial_overlay_reuses_each_relation_order() -> None:
+    source = Path("src/vibespatial/overlay/spatial_overlay.py").read_text()
+    start = source.index("def _spatial_overlay_device(")
+    end = source.index("\n\ndef spatial_overlay_owned", start)
+    device_source = source[start:end]
+
+    assert device_source.count("_device_pair_order(") == 2
+    assert "left_order" in device_source
+    assert "right_order" in device_source
+
+
 def _non_empty_geoms(owned):
     """Extract non-empty geometries from an OwnedGeometryArray."""
     return [g for g in owned.to_shapely() if g is not None and not g.is_empty]
+
+
+def _normalized_wkb_rows(owned) -> list[str]:
+    geometries = np.asarray(_non_empty_geoms(owned), dtype=object)
+    if geometries.size == 0:
+        return []
+    return sorted(shapely.to_wkb(shapely.normalize(geometries), hex=True).tolist())
 
 
 class TestSpatialOverlayIntersection:
@@ -111,10 +189,7 @@ class TestSpatialOverlayIntersection:
         assert result is not None
         assert result.residency is Residency.DEVICE
         assert result.row_count == 1
-        assert [event.reason for event in events] == [
-            "overlay rectangle fast-path box certification scalar fence",
-            "overlay rectangle fast-path box certification scalar fence",
-        ]
+        assert events == []
         assert sum(event.bytes_transferred for event in events) <= 2
 
     def test_many_left_vs_one_right_clip(self):
@@ -222,7 +297,7 @@ class TestSpatialOverlayUnion:
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("how", ["intersection", "union"])
-def test_grouped_overlay_batches_row_isolated_plan_once(
+def test_spatial_overlay_batches_each_planar_component_family_once(
     monkeypatch: pytest.MonkeyPatch,
     how: str,
 ) -> None:
@@ -260,16 +335,95 @@ def test_grouped_overlay_batches_row_isolated_plan_once(
 
     monkeypatch.setattr(overlay_gpu, "_build_overlay_execution_plan", _wrapped_build)
 
+    expected = spatial_overlay_owned(
+        left,
+        right,
+        how=how,
+        dispatch_mode=ExecutionMode.CPU,
+    )
     result = spatial_overlay_owned(left, right, how=how, dispatch_mode=ExecutionMode.GPU)
 
-    assert result.row_count == 4
-    assert build_calls == [
-        {
-            "left_rows": 4,
-            "right_rows": 4,
-            "row_isolated": True,
-        }
+    expected_calls = [
+        {"left_rows": 4, "right_rows": 4, "row_isolated": True},
     ]
+    expected_rows = 4
+    if how == "union":
+        expected_calls.extend(
+            [
+                {"left_rows": 2, "right_rows": 4, "row_isolated": True},
+                {"left_rows": 3, "right_rows": 4, "row_isolated": True},
+            ]
+        )
+        expected_rows = 7
+
+    assert result.row_count == expected_rows
+    assert build_calls == expected_calls
+    assert _normalized_wkb_rows(result) == _normalized_wkb_rows(expected)
+
+
+@pytest.mark.parametrize(
+    ("how", "expected_rows", "expected_area"),
+    [
+        ("intersection", 0, 0.0),
+        ("difference", 1, 1.0),
+        ("identity", 1, 1.0),
+        ("symmetric_difference", 2, 2.0),
+        ("union", 2, 2.0),
+    ],
+)
+def test_spatial_overlay_disjoint_relation_preserves_unmatched_rows(
+    how: str,
+    expected_rows: int,
+    expected_area: float,
+) -> None:
+    left = from_shapely_geometries([box(0, 0, 1, 1)])
+    right = from_shapely_geometries([box(10, 0, 11, 1)])
+
+    result = spatial_overlay_owned(
+        left,
+        right,
+        how=how,
+        dispatch_mode=ExecutionMode.CPU,
+    )
+
+    assert result.row_count == expected_rows
+    assert sum(geometry.area for geometry in result.to_shapely()) == pytest.approx(
+        expected_area
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    ("how", "expected_rows", "expected_area"),
+    [
+        ("intersection", 0, 0.0),
+        ("difference", 1, 1.0),
+        ("identity", 1, 1.0),
+        ("symmetric_difference", 2, 2.0),
+        ("union", 2, 2.0),
+    ],
+)
+def test_spatial_overlay_device_disjoint_relation_preserves_unmatched_rows(
+    how: str,
+    expected_rows: int,
+    expected_area: float,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    left = from_shapely_geometries([box(0, 0, 1, 1)])
+    right = from_shapely_geometries([box(10, 0, 11, 1)])
+
+    result = spatial_overlay_owned(
+        left,
+        right,
+        how=how,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result.row_count == expected_rows
+    assert sum(geometry.area for geometry in result.to_shapely()) == pytest.approx(
+        expected_area
+    )
 
 
 class TestSpatialOverlaySymmetricDifference:
@@ -418,44 +572,33 @@ class TestSpatialOverlayEdgeCases:
         for i, g in enumerate(result_geoms):
             assert abs(g.area - left_geoms[i].area) < 1e-10
 
-    def test_centroid_filter_failure_propagates(self, monkeypatch):
-        left = from_shapely_geometries([box(i, 0, i + 0.8, 0.8) for i in range(120)])
-        right = from_shapely_geometries([shapely.Polygon([(0, 0), (120, 0), (60, 20)])])
+    def test_gpu_spatial_overlay_has_no_centroid_or_shapely_rescue(self):
+        source = inspect.getsource(spatial_overlay_owned)
+        module_source = Path(inspect.getsourcefile(spatial_overlay_owned)).read_text()
 
-        from vibespatial.overlay import gpu as overlay_gpu
-
-        def _force_owned_dispatch_fallback(*args, **kwargs):
-            raise NotImplementedError("force shapely overlay fallback")
-
-        monkeypatch.setattr(
-            overlay_gpu,
-            "_combine_bypass_results",
-            _force_owned_dispatch_fallback,
+        assert "_spatial_overlay_device(" in source
+        assert "centroid" not in source
+        assert "except" not in source
+        cpu_branch = source.index("    else:\n", source.index("if use_device:"))
+        host_import = source.index(
+            "from vibespatial.overlay.host_fallback import spatial_overlay_owned_host"
         )
-
-        real_plan_dispatch_selection = overlay_gpu.plan_dispatch_selection
-
-        def _force_gpu_centroid_plan(**kwargs):
-            if kwargs.get("kernel_name") == "polygon_centroid":
-                return SimpleNamespace(selected=overlay_gpu.ExecutionMode.GPU)
-            return real_plan_dispatch_selection(**kwargs)
-
-        monkeypatch.setattr(overlay_gpu, "plan_dispatch_selection", _force_gpu_centroid_plan)
-
-        def _boom(*args, **kwargs):
-            raise RuntimeError("centroid-filter-boom")
-
-        monkeypatch.setattr(
-            "vibespatial.constructive.polygon.polygon_centroids_owned",
-            _boom,
-        )
-
-        with pytest.raises(RuntimeError, match="centroid-filter-boom"):
-            spatial_overlay_owned(left, right, how="intersection")
+        assert host_import > cpu_branch
+        device_start = module_source.index("def _spatial_overlay_device(")
+        device_end = module_source.index("\n\ndef spatial_overlay_owned", device_start)
+        device_source = module_source[device_start:device_end]
+        assert "shapely" not in device_source
+        assert "numpy" not in module_source
+        assert "np." not in module_source
+        assert "fallback" not in device_source
+        assert "to_host(" not in device_source
+        assert "overlay_device_to_host" not in device_source
+        assert "except" not in device_source
+        assert "_grouped_difference_device(" in device_source
 
 
 class TestOverlayDispatchEventWorkloadShape:
-    """Verify dispatch events for overlay include workload_shape in detail (nsf.5)."""
+    """Verify geometry-only overlay reports its native physical shape."""
 
     def test_broadcast_right_dispatch_event_has_workload_shape(self):
         """N-vs-1 pattern should record workload_shape=broadcast_right."""
@@ -471,10 +614,8 @@ class TestOverlayDispatchEventWorkloadShape:
         ]
         assert overlay_events, "Expected at least one spatial_overlay dispatch event"
         ev = overlay_events[0]
-        assert "workload_shape=broadcast_right" in ev.detail
-        assert "execution_family=broadcast_right_intersection" in ev.detail
-        assert "topology_class=broadcast_mask" in ev.detail
-        assert "fusion_stages=" in ev.detail
+        assert "physical_shape=relation_pair_capacity+full_source_grouped" in ev.detail
+        assert "right_rows=1" in ev.detail
 
     def test_pairwise_dispatch_event_has_workload_shape(self):
         """Row-matched case should record workload_shape=pairwise."""
@@ -490,8 +631,9 @@ class TestOverlayDispatchEventWorkloadShape:
         ]
         assert overlay_events, "Expected at least one spatial_overlay dispatch event"
         ev = overlay_events[0]
-        assert "workload_shape=pairwise" in ev.detail
-        assert "execution_family=generic_reconstruction" in ev.detail
+        assert "physical_shape=relation_pair_capacity+full_source_grouped" in ev.detail
+        assert "left_rows=1" in ev.detail
+        assert "right_rows=1" in ev.detail
 
     def test_n_vs_m_dispatch_event_has_workload_shape(self):
         """N-vs-M case should record workload_shape=per_group (strategy name fallback)."""
@@ -507,8 +649,9 @@ class TestOverlayDispatchEventWorkloadShape:
         ]
         assert overlay_events, "Expected at least one spatial_overlay dispatch event"
         ev = overlay_events[0]
-        assert "workload_shape=per_group" in ev.detail
-        assert "execution_family=generic_reconstruction" in ev.detail
+        assert "physical_shape=relation_pair_capacity+full_source_grouped" in ev.detail
+        assert "left_rows=4" in ev.detail
+        assert "right_rows=2" in ev.detail
 
 
 class TestSelectOverlayStrategyWorkloadShape:

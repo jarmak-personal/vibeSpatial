@@ -104,7 +104,6 @@ class ShpHeader:
     n_records: int
 
 
-
 # ---------------------------------------------------------------------------
 # NVRTC warmup (ADR-0034 Level 2)
 # ---------------------------------------------------------------------------
@@ -747,34 +746,85 @@ def _decode_shp_records(
 
     if header.shape_type == SHP_MULTIPOINT:
         result = _count_scatter_complex(
-            d_shp, d_offsets, d_content_lengths, n_records, SHP_MULTIPOINT,
+            d_shp,
+            d_offsets,
+            d_content_lengths,
+            n_records,
+            SHP_MULTIPOINT,
         )
-        (d_x, d_y, d_coord_offsets, d_part_offsets, d_is_null,
-         total_points, total_parts, _, _) = result
+        (d_x, d_y, d_coord_offsets, d_part_offsets, d_is_null, total_points, total_parts, _, _) = (
+            result
+        )
         return _assemble_multipoint(
-            d_x, d_y, d_coord_offsets, d_is_null, n_records, total_points,
+            d_x,
+            d_y,
+            d_coord_offsets,
+            d_is_null,
+            n_records,
+            total_points,
         )
 
     if header.shape_type == SHP_POLYLINE:
         result = _count_scatter_complex(
-            d_shp, d_offsets, d_content_lengths, n_records, SHP_POLYLINE,
+            d_shp,
+            d_offsets,
+            d_content_lengths,
+            n_records,
+            SHP_POLYLINE,
         )
-        (d_x, d_y, d_coord_offsets, d_part_offsets, d_is_null,
-         total_points, total_parts, d_ring_flat, has_multi_part) = result
+        (
+            d_x,
+            d_y,
+            d_coord_offsets,
+            d_part_offsets,
+            d_is_null,
+            total_points,
+            total_parts,
+            d_ring_flat,
+            has_multi_part,
+        ) = result
         return _assemble_linestring(
-            d_x, d_y, d_coord_offsets, d_ring_flat, d_part_offsets,
-            d_is_null, has_multi_part, n_records, total_points, total_parts,
+            d_x,
+            d_y,
+            d_coord_offsets,
+            d_ring_flat,
+            d_part_offsets,
+            d_is_null,
+            has_multi_part,
+            n_records,
+            total_points,
+            total_parts,
         )
 
     if header.shape_type == SHP_POLYGON:
         result = _count_scatter_complex(
-            d_shp, d_offsets, d_content_lengths, n_records, SHP_POLYGON,
+            d_shp,
+            d_offsets,
+            d_content_lengths,
+            n_records,
+            SHP_POLYGON,
         )
-        (d_x, d_y, d_coord_offsets, d_part_offsets, d_is_null,
-         total_points, total_parts, d_ring_flat, _) = result
+        (
+            d_x,
+            d_y,
+            d_coord_offsets,
+            d_part_offsets,
+            d_is_null,
+            total_points,
+            total_parts,
+            d_ring_flat,
+            _,
+        ) = result
         return _assemble_polygon(
-            d_x, d_y, d_coord_offsets, d_ring_flat, d_part_offsets,
-            d_is_null, n_records, total_points, total_parts,
+            d_x,
+            d_y,
+            d_coord_offsets,
+            d_ring_flat,
+            d_part_offsets,
+            d_is_null,
+            n_records,
+            total_points,
+            total_parts,
         )
 
     raise ValueError(f"Unsupported SHP shape type: {header.shape_type}")

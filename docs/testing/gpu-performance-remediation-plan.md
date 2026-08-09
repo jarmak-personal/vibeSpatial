@@ -5,7 +5,7 @@ Scope: Execution plan for the next GPU performance push, including milestone seq
 Read If: You are planning or executing the next GPU performance remediation campaign.
 STOP IF: You already have the active milestone surface open and only need local implementation detail.
 Source Of Truth: Program plan for fixing structural GPU performance issues found in the audit.
-Body Budget: 505/520 lines
+Body Budget: 506/520 lines
 Document: docs/testing/gpu-performance-remediation-plan.md
 
 Section Map (Body Lines)
@@ -349,7 +349,7 @@ microcells, contraction, and constructive reduction flows.
 
 - `src/vibespatial/overlay/gpu.py`
 - `src/vibespatial/overlay/microcells.py`
-- `src/vibespatial/overlay/contract.py`
+- `src/vibespatial/overlay/boundary_graph.py`
 - `src/vibespatial/overlay/assemble.py`
 - `src/vibespatial/constructive/union_all.py`
 - adjacent constructive helpers still forcing same-stream syncs
@@ -359,7 +359,8 @@ microcells, contraction, and constructive reduction flows.
 - grouped overlay materializes group boundaries to host and iterates in Python
 - current stream pool is limited by null-stream NVRTC and wrapper behavior
 - microcell labeling loops row-by-row over host materialized row ids
-- contraction moves full band arrays to host and runs union-find in Python
+- connected oversized-row reconstruction now uses exact native boundary atoms;
+  verify its forced-budget canaries and profile its interval-page saturation
 - some constructive helpers still synchronize after same-stream scatter
 - union-all still performs Python tree reduction over single-row objects
 

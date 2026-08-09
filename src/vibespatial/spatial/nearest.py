@@ -20,14 +20,21 @@ from vibespatial.cuda.cccl_primitives import (
 from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 
-request_warmup([
-    "exclusive_scan_i32", "exclusive_scan_i64",
-    "select_i32", "select_i64",
-    "radix_sort_i32_i32", "radix_sort_u64_i32",
-    "lower_bound_i32", "lower_bound_u64",
-    "upper_bound_i32", "upper_bound_u64",
-    "segmented_reduce_min_f64",
-])
+request_warmup(
+    [
+        "exclusive_scan_i32",
+        "exclusive_scan_i64",
+        "select_i32",
+        "select_i64",
+        "radix_sort_i32_i32",
+        "radix_sort_u64_i32",
+        "lower_bound_i32",
+        "lower_bound_u64",
+        "upper_bound_i32",
+        "upper_bound_u64",
+        "segmented_reduce_min_f64",
+    ]
+)
 from vibespatial.cuda._runtime import (  # noqa: E402
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
@@ -53,6 +60,7 @@ from vibespatial.kernels.core.spatial_query_kernels import (  # noqa: E402
 )
 from vibespatial.runtime import has_gpu_runtime  # noqa: E402
 from vibespatial.runtime.config import SPATIAL_EPSILON  # noqa: E402
+from vibespatial.runtime.crossover import PhysicalWorkEstimate  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
 from vibespatial.runtime.residency import Residency, TransferTrigger  # noqa: E402
 
@@ -84,6 +92,7 @@ from .query_utils import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
 
 def _empty_nearest_result(return_distance: bool):
     """Return a canonical empty nearest result."""
@@ -142,7 +151,9 @@ def _detect_regular_grid_point_index(owned: OwnedGeometryArray) -> RegularGridPo
         return None
     if owned.row_count == 0 or not np.all(owned.validity) or np.any(point_buffer.empty_mask):
         return None
-    if not np.array_equal(point_buffer.geometry_offsets, np.arange(owned.row_count + 1, dtype=np.int32)):
+    if not np.array_equal(
+        point_buffer.geometry_offsets, np.arange(owned.row_count + 1, dtype=np.int32)
+    ):
         return None
 
     xs = point_buffer.x
@@ -179,8 +190,12 @@ def _detect_regular_grid_point_index(owned: OwnedGeometryArray) -> RegularGridPo
     if rows > 1 and not np.allclose(np.diff(unique_y), cell_height, atol=tol, rtol=0.0):
         return None
 
-    expected_x = float(unique_x[0]) + (np.arange(owned.row_count, dtype=np.float64) % cols) * cell_width
-    expected_y = float(unique_y[0]) + (np.arange(owned.row_count, dtype=np.float64) // cols) * cell_height
+    expected_x = (
+        float(unique_x[0]) + (np.arange(owned.row_count, dtype=np.float64) % cols) * cell_width
+    )
+    expected_y = (
+        float(unique_y[0]) + (np.arange(owned.row_count, dtype=np.float64) // cols) * cell_height
+    )
     if not np.allclose(xs, expected_x, atol=tol, rtol=0.0):
         return None
     if not np.allclose(ys, expected_y, atol=tol, rtol=0.0):
@@ -226,6 +241,7 @@ def _tree_distance_family(tree_owned: OwnedGeometryArray) -> GeometryFamily | No
 
 def _point_distance_families() -> frozenset:
     from .point_distance import supported_point_distance_families
+
     return supported_point_distance_families()
 
 
@@ -278,6 +294,7 @@ def _make_point_owned_from_coords(x: np.ndarray, y: np.ndarray) -> OwnedGeometry
 # Shared GPU kernel launch helpers (eliminate point-point distance duplication)
 # ---------------------------------------------------------------------------
 
+
 def _launch_point_point_distance_kernel(
     query_owned: OwnedGeometryArray,
     tree_owned: OwnedGeometryArray,
@@ -307,44 +324,67 @@ def _launch_point_point_distance_kernel(
 
     dist_params = (
         (
-            ptr(qs.validity), ptr(qs.tags), ptr(qs.family_row_offsets),
-            ptr(qp.geometry_offsets), ptr(qp.empty_mask),
-            ptr(qp.x), ptr(qp.y),
+            ptr(qs.validity),
+            ptr(qs.tags),
+            ptr(qs.family_row_offsets),
+            ptr(qp.geometry_offsets),
+            ptr(qp.empty_mask),
+            ptr(qp.x),
+            ptr(qp.y),
             FAMILY_TAGS[point_family],
-            ptr(ts.validity), ptr(ts.tags), ptr(ts.family_row_offsets),
-            ptr(tp.geometry_offsets), ptr(tp.empty_mask),
-            ptr(tp.x), ptr(tp.y),
+            ptr(ts.validity),
+            ptr(ts.tags),
+            ptr(ts.family_row_offsets),
+            ptr(tp.geometry_offsets),
+            ptr(tp.empty_mask),
+            ptr(tp.x),
+            ptr(tp.y),
             FAMILY_TAGS[point_family],
-            ptr(d_left), ptr(d_right),
+            ptr(d_left),
+            ptr(d_right),
             ptr(d_distances),
             1 if exclusive else 0,
             pair_count,
         ),
         (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
             KERNEL_PARAM_I32,
         ),
     )
-    dist_grid, dist_block = runtime.launch_config(kernels["point_point_distance_pairs_from_owned"], pair_count)
+    dist_grid, dist_block = runtime.launch_config(
+        kernels["point_point_distance_pairs_from_owned"], pair_count
+    )
     runtime.launch(
         kernels["point_point_distance_pairs_from_owned"],
-        grid=dist_grid, block=dist_block, params=dist_params,
+        grid=dist_grid,
+        block=dist_block,
+        params=dist_params,
     )
 
 
 # ---------------------------------------------------------------------------
 # Shared nearest refinement pipeline (eliminate 3x duplication)
 # ---------------------------------------------------------------------------
+
 
 def _refine_nearest_from_device_distances(
     d_left,
@@ -381,7 +421,10 @@ def _refine_nearest_from_device_distances(
 
     # Segmented min-distance per query (Tier 3a CCCL).
     min_result = segmented_reduce_min(
-        d_distances, seg_starts_i32, seg_ends_i32, num_segments=n_queries,
+        d_distances,
+        seg_starts_i32,
+        seg_ends_i32,
+        num_segments=n_queries,
     )
     d_min_distances = min_result.values
 
@@ -389,14 +432,18 @@ def _refine_nearest_from_device_distances(
     d_keep = runtime.allocate((pair_count,), np.uint8)
     keep_params = (
         (
-            ptr(d_distances), ptr(d_min_distances),
-            ptr(d_left), ptr(d_keep),
+            ptr(d_distances),
+            ptr(d_min_distances),
+            ptr(d_left),
+            ptr(d_keep),
             float(max_distance),
             pair_count,
         ),
         (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_F64,
             KERNEL_PARAM_I32,
         ),
@@ -404,7 +451,9 @@ def _refine_nearest_from_device_distances(
     keep_grid, keep_block = runtime.launch_config(kernels["nearest_keep_mask"], pair_count)
     runtime.launch(
         kernels["nearest_keep_mask"],
-        grid=keep_grid, block=keep_block, params=keep_params,
+        grid=keep_grid,
+        block=keep_block,
+        params=keep_params,
     )
 
     # (return_all=False) Keep only first match per segment.
@@ -413,20 +462,26 @@ def _refine_nearest_from_device_distances(
         seg_grid = max(1, (n_queries + 255) // 256)
         first_params = (
             (
-                ptr(d_keep), ptr(d_first),
-                ptr(seg_starts_i32), ptr(seg_ends_i32),
+                ptr(d_keep),
+                ptr(d_first),
+                ptr(seg_starts_i32),
+                ptr(seg_ends_i32),
                 n_queries,
             ),
             (
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_I32,
             ),
         )
         seg_grid, seg_block = runtime.launch_config(kernels["nearest_first_per_segment"], n_queries)
         runtime.launch(
             kernels["nearest_first_per_segment"],
-            grid=seg_grid, block=seg_block, params=first_params,
+            grid=seg_grid,
+            block=seg_block,
+            params=first_params,
         )
         d_keep = d_first
 
@@ -472,6 +527,7 @@ def _refine_nearest_from_device_distances(
 # ---------------------------------------------------------------------------
 # Distance strategy classes
 # ---------------------------------------------------------------------------
+
 
 class DistanceStrategy(ABC):
     """Base class for GPU distance computation strategies.
@@ -535,13 +591,18 @@ class PointPointDistanceStrategy(DistanceStrategy):
         exclusive: bool = False,
     ) -> bool:
         self.move_to_device(
-            query_owned, tree_owned,
+            query_owned,
+            tree_owned,
             query_reason="nearest: GPU point-point distance for query",
             tree_reason="nearest: GPU point-point distance for tree",
         )
         _launch_point_point_distance_kernel(
-            query_owned, tree_owned,
-            d_left, d_right, d_distances, pair_count,
+            query_owned,
+            tree_owned,
+            d_left,
+            d_right,
+            d_distances,
+            pair_count,
             exclusive=exclusive,
         )
         return True
@@ -567,13 +628,18 @@ class PointFamilyDistanceStrategy(DistanceStrategy):
         from .point_distance import compute_point_distance_gpu
 
         self.move_to_device(
-            query_owned, tree_owned,
+            query_owned,
+            tree_owned,
             query_reason="nearest: GPU point-distance refinement for query points",
             tree_reason=f"nearest: GPU point-distance refinement for tree {self.tree_family.name}",
         )
         return compute_point_distance_gpu(
-            query_owned, tree_owned,
-            d_left, d_right, d_distances, pair_count,
+            query_owned,
+            tree_owned,
+            d_left,
+            d_right,
+            d_distances,
+            pair_count,
             tree_family=self.tree_family,
             exclusive=exclusive,
         )
@@ -600,13 +666,18 @@ class SegmentFamilyDistanceStrategy(DistanceStrategy):
         from .segment_distance import compute_segment_distance_gpu
 
         self.move_to_device(
-            query_owned, tree_owned,
+            query_owned,
+            tree_owned,
             query_reason=f"nearest: GPU segment-distance refinement for query {self.query_family.name}",
             tree_reason=f"nearest: GPU segment-distance refinement for tree {self.tree_family.name}",
         )
         return compute_segment_distance_gpu(
-            query_owned, tree_owned,
-            d_left, d_right, d_distances, pair_count,
+            query_owned,
+            tree_owned,
+            d_left,
+            d_right,
+            d_distances,
+            pair_count,
             query_family=self.query_family,
             tree_family=self.tree_family,
             exclusive=exclusive,
@@ -616,6 +687,7 @@ class SegmentFamilyDistanceStrategy(DistanceStrategy):
 # ---------------------------------------------------------------------------
 # Unified typed nearest refinement (replaces three near-identical functions)
 # ---------------------------------------------------------------------------
+
 
 def _nearest_refine_gpu_typed(
     query_owned: OwnedGeometryArray,
@@ -652,8 +724,12 @@ def _nearest_refine_gpu_typed(
 
         # Compute distances using the strategy.
         ok = strategy.compute(
-            query_owned, tree_owned,
-            d_left, d_right, d_distances, pair_count,
+            query_owned,
+            tree_owned,
+            d_left,
+            d_right,
+            d_distances,
+            pair_count,
             exclusive=exclusive,
         )
         if not ok:
@@ -661,7 +737,11 @@ def _nearest_refine_gpu_typed(
 
         # Run shared refinement pipeline.
         return _refine_nearest_from_device_distances(
-            d_left, d_right, d_distances, pair_count, n_queries,
+            d_left,
+            d_right,
+            d_distances,
+            pair_count,
+            n_queries,
             max_distance=max_distance,
             return_all=return_all,
             return_distance=return_distance,
@@ -676,6 +756,7 @@ def _nearest_refine_gpu_typed(
 # ---------------------------------------------------------------------------
 # GPU candidate generation
 # ---------------------------------------------------------------------------
+
 
 def _generate_point_nearest_candidates_regular_grid_gpu(
     query_owned: OwnedGeometryArray,
@@ -727,7 +808,9 @@ def _generate_point_nearest_candidates_regular_grid_gpu(
                 KERNEL_PARAM_I32,
             ),
         )
-        count_grid, count_block = runtime.launch_config(kernels["point_regular_grid_nearest_count"], query_owned.row_count)
+        count_grid, count_block = runtime.launch_config(
+            kernels["point_regular_grid_nearest_count"], query_owned.row_count
+        )
         runtime.launch(
             kernels["point_regular_grid_nearest_count"],
             grid=count_grid,
@@ -788,7 +871,9 @@ def _generate_point_nearest_candidates_regular_grid_gpu(
                 KERNEL_PARAM_I32,
             ),
         )
-        scatter_grid, scatter_block = runtime.launch_config(kernels["point_regular_grid_nearest_scatter"], query_owned.row_count)
+        scatter_grid, scatter_block = runtime.launch_config(
+            kernels["point_regular_grid_nearest_scatter"], query_owned.row_count
+        )
         runtime.launch(
             kernels["point_regular_grid_nearest_scatter"],
             grid=scatter_grid,
@@ -948,14 +1033,31 @@ def _nearest_grid_gpu(
         grid_a, block_a = runtime.launch_config(kernels["grid_assign_cells"], n_tree)
         runtime.launch(
             kernels["grid_assign_cells"],
-            grid=grid_a, block=block_a,
+            grid=grid_a,
+            block=block_a,
             params=(
-                (ptr(d_tree_x), ptr(d_tree_y),
-                 origin_x, origin_y, cell_size,
-                 n_cols, n_rows, ptr(d_cell_ids), n_tree),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-                 KERNEL_PARAM_I32, KERNEL_PARAM_I32, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+                (
+                    ptr(d_tree_x),
+                    ptr(d_tree_y),
+                    origin_x,
+                    origin_y,
+                    cell_size,
+                    n_cols,
+                    n_rows,
+                    ptr(d_cell_ids),
+                    n_tree,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
 
@@ -976,12 +1078,17 @@ def _nearest_grid_gpu(
         grid_r, block_r = runtime.launch_config(kernels["grid_build_cell_ranges"], n_tree)
         runtime.launch(
             kernels["grid_build_cell_ranges"],
-            grid=grid_r, block=block_r,
+            grid=grid_r,
+            block=block_r,
             params=(
-                (ptr(d_sorted_cell_ids), ptr(d_cell_start), ptr(d_cell_end),
-                 n_cells, n_tree),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+                (ptr(d_sorted_cell_ids), ptr(d_cell_start), ptr(d_cell_end), n_cells, n_tree),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
 
@@ -1006,26 +1113,47 @@ def _nearest_grid_gpu(
         grid_s, block_s = runtime.launch_config(kernels["grid_nearest_search"], n_query)
         runtime.launch(
             kernels["grid_nearest_search"],
-            grid=grid_s, block=block_s,
+            grid=grid_s,
+            block=block_s,
             params=(
-                (ptr(d_query_x), ptr(d_query_y),
-                 ptr(d_sorted_tree_x), ptr(d_sorted_tree_y),
-                 ptr(d_sorted_global_idx),
-                 ptr(d_cell_start), ptr(d_cell_end),
-                 n_cols, n_rows,
-                 origin_x, origin_y, cell_size,
-                 n_tree, 1 if exclusive else 0,
-                 ptr(d_min_sq), ptr(d_min_idx),
-                 n_query),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32, KERNEL_PARAM_I32,
-                 KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-                 KERNEL_PARAM_I32, KERNEL_PARAM_I32,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32),
+                (
+                    ptr(d_query_x),
+                    ptr(d_query_y),
+                    ptr(d_sorted_tree_x),
+                    ptr(d_sorted_tree_y),
+                    ptr(d_sorted_global_idx),
+                    ptr(d_cell_start),
+                    ptr(d_cell_end),
+                    n_cols,
+                    n_rows,
+                    origin_x,
+                    origin_y,
+                    cell_size,
+                    n_tree,
+                    1 if exclusive else 0,
+                    ptr(d_min_sq),
+                    ptr(d_min_idx),
+                    n_query,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
 
@@ -1072,26 +1200,43 @@ def _nearest_grid_gpu(
         grid_tc, block_tc = runtime.launch_config(kernels["grid_nearest_tie_count"], n_query)
         runtime.launch(
             kernels["grid_nearest_tie_count"],
-            grid=grid_tc, block=block_tc,
+            grid=grid_tc,
+            block=block_tc,
             params=(
-                (ptr(d_query_x), ptr(d_query_y),
-                 ptr(d_sorted_tree_x), ptr(d_sorted_tree_y),
-                 ptr(d_cell_start), ptr(d_cell_end),
-                 n_cols, n_rows,
-                 origin_x, origin_y, cell_size,
-                 ptr(d_min_sq),
-                 1 if exclusive else 0,
-                 ptr(d_counts),
-                 n_query),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32, KERNEL_PARAM_I32,
-                 KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-                 KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32,
-                 KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32),
+                (
+                    ptr(d_query_x),
+                    ptr(d_query_y),
+                    ptr(d_sorted_tree_x),
+                    ptr(d_sorted_tree_y),
+                    ptr(d_cell_start),
+                    ptr(d_cell_end),
+                    n_cols,
+                    n_rows,
+                    origin_x,
+                    origin_y,
+                    cell_size,
+                    ptr(d_min_sq),
+                    1 if exclusive else 0,
+                    ptr(d_counts),
+                    n_query,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
 
@@ -1117,30 +1262,49 @@ def _nearest_grid_gpu(
         grid_ts, block_ts = runtime.launch_config(kernels["grid_nearest_tie_scatter"], n_query)
         runtime.launch(
             kernels["grid_nearest_tie_scatter"],
-            grid=grid_ts, block=block_ts,
+            grid=grid_ts,
+            block=block_ts,
             params=(
-                (ptr(d_query_x), ptr(d_query_y),
-                 ptr(d_sorted_tree_x), ptr(d_sorted_tree_y),
-                 ptr(d_sorted_global_idx),
-                 ptr(d_cell_start), ptr(d_cell_end),
-                 n_cols, n_rows,
-                 origin_x, origin_y, cell_size,
-                 ptr(d_min_sq),
-                 1 if exclusive else 0,
-                 ptr(d_offsets),
-                 ptr(d_out_left), ptr(d_out_right),
-                 n_query),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32, KERNEL_PARAM_I32,
-                 KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-                 KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32,
-                 KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32),
+                (
+                    ptr(d_query_x),
+                    ptr(d_query_y),
+                    ptr(d_sorted_tree_x),
+                    ptr(d_sorted_tree_y),
+                    ptr(d_sorted_global_idx),
+                    ptr(d_cell_start),
+                    ptr(d_cell_end),
+                    n_cols,
+                    n_rows,
+                    origin_x,
+                    origin_y,
+                    cell_size,
+                    ptr(d_min_sq),
+                    1 if exclusive else 0,
+                    ptr(d_offsets),
+                    ptr(d_out_left),
+                    ptr(d_out_right),
+                    n_query,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_F64,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
         runtime.synchronize()
@@ -1228,7 +1392,10 @@ def _nearest_indexed_point_gpu(
         return None
     if not _points_only(query_owned) or not _points_only(tree_owned):
         return None
-    if GeometryFamily.POINT not in query_owned.families or GeometryFamily.POINT not in tree_owned.families:
+    if (
+        GeometryFamily.POINT not in query_owned.families
+        or GeometryFamily.POINT not in tree_owned.families
+    ):
         return None
 
     import cupy as cp
@@ -1247,7 +1414,9 @@ def _nearest_indexed_point_gpu(
 
     query_x, query_y = _device_dense_point_coords(query_owned)
     tree_x, tree_y = _device_dense_point_coords(tree_owned)
-    valid_tree_rows = cp.flatnonzero(cp.isfinite(tree_x) & cp.isfinite(tree_y)).astype(cp.int32, copy=False)
+    valid_tree_rows = cp.flatnonzero(cp.isfinite(tree_x) & cp.isfinite(tree_y)).astype(
+        cp.int32, copy=False
+    )
     if int(valid_tree_rows.size) == 0:
         result = (
             _empty_nearest_result_device(return_distance)
@@ -1258,7 +1427,9 @@ def _nearest_indexed_point_gpu(
 
     sorted_tree = sort_pairs(tree_x[valid_tree_rows], valid_tree_rows, synchronize=False)
     query_probe_x = cp.nan_to_num(query_x, nan=0.0)
-    insert_idx = lower_bound(sorted_tree.keys, query_probe_x, synchronize=False).astype(cp.int32, copy=False)
+    insert_idx = lower_bound(sorted_tree.keys, query_probe_x, synchronize=False).astype(
+        cp.int32, copy=False
+    )
     min_sq = cp.empty(query_owned.row_count, dtype=cp.float64)
     counts = cp.empty(query_owned.row_count, dtype=cp.int32)
     offsets = None
@@ -1294,7 +1465,9 @@ def _nearest_indexed_point_gpu(
                 KERNEL_PARAM_I32,
             ),
         )
-        min_grid, min_block = runtime.launch_config(kernels["point_nearest_min_sq_from_sorted_x"], query_owned.row_count)
+        min_grid, min_block = runtime.launch_config(
+            kernels["point_nearest_min_sq_from_sorted_x"], query_owned.row_count
+        )
         runtime.launch(
             kernels["point_nearest_min_sq_from_sorted_x"],
             grid=min_grid,
@@ -1306,8 +1479,12 @@ def _nearest_indexed_point_gpu(
         tol = 1e-8 + 1e-5 * cp.abs(best)
         query_min_x = cp.where(cp.isfinite(best), query_x - best - tol, 0.0)
         query_max_x = cp.where(cp.isfinite(best), query_x + best + tol, 0.0)
-        start_idx = lower_bound(sorted_tree.keys, query_min_x, synchronize=False).astype(cp.int32, copy=False)
-        end_idx = upper_bound(sorted_tree.keys, query_max_x, synchronize=False).astype(cp.int32, copy=False)
+        start_idx = lower_bound(sorted_tree.keys, query_min_x, synchronize=False).astype(
+            cp.int32, copy=False
+        )
+        end_idx = upper_bound(sorted_tree.keys, query_max_x, synchronize=False).astype(
+            cp.int32, copy=False
+        )
 
         count_params = (
             (
@@ -1337,7 +1514,9 @@ def _nearest_indexed_point_gpu(
                 KERNEL_PARAM_I32,
             ),
         )
-        count_grid, count_block = runtime.launch_config(kernels["point_nearest_tie_count_from_sorted_x"], query_owned.row_count)
+        count_grid, count_block = runtime.launch_config(
+            kernels["point_nearest_tie_count_from_sorted_x"], query_owned.row_count
+        )
         runtime.launch(
             kernels["point_nearest_tie_count_from_sorted_x"],
             grid=count_grid,
@@ -1398,7 +1577,9 @@ def _nearest_indexed_point_gpu(
                 KERNEL_PARAM_I32,
             ),
         )
-        scatter_grid, scatter_block = runtime.launch_config(kernels["point_nearest_tie_scatter_from_sorted_x"], query_owned.row_count)
+        scatter_grid, scatter_block = runtime.launch_config(
+            kernels["point_nearest_tie_scatter_from_sorted_x"], query_owned.row_count
+        )
         runtime.launch(
             kernels["point_nearest_tie_scatter_from_sorted_x"],
             grid=scatter_grid,
@@ -1487,15 +1668,23 @@ def _generate_point_nearest_candidates_gpu(
         return None
     if not _points_only(query_owned) or not _points_only(tree_owned):
         return None
-    if GeometryFamily.POINT not in query_owned.families or GeometryFamily.POINT not in tree_owned.families:
+    if (
+        GeometryFamily.POINT not in query_owned.families
+        or GeometryFamily.POINT not in tree_owned.families
+    ):
         return None
 
     selection = plan_dispatch_selection(
         kernel_name="point_nearest_candidates",
         kernel_class=KernelClass.METRIC,
-        row_count=query_owned.row_count * tree_owned.row_count,
+        row_count=query_owned.row_count,
         gpu_available=True,
         current_residency=combined_residency(query_owned, tree_owned),
+        work_estimate=PhysicalWorkEstimate.for_candidate_pairs(
+            row_count=query_owned.row_count,
+            candidate_pair_count=query_owned.row_count * tree_owned.row_count,
+            primary_unit_name="nearest-candidate-pair",
+        ),
     )
     if selection.selected is not ExecutionMode.GPU:
         return None
@@ -1525,7 +1714,9 @@ def _generate_point_nearest_candidates_gpu(
 
     query_x, query_y = _device_dense_point_coords(query_owned)
     tree_x, tree_y = _device_dense_point_coords(tree_owned)
-    valid_tree_rows = cp.flatnonzero(cp.isfinite(tree_x) & cp.isfinite(tree_y)).astype(cp.int32, copy=False)
+    valid_tree_rows = cp.flatnonzero(cp.isfinite(tree_x) & cp.isfinite(tree_y)).astype(
+        cp.int32, copy=False
+    )
     if int(valid_tree_rows.size) == 0:
         empty = np.empty(0, dtype=np.int32)
         return empty, empty
@@ -1533,8 +1724,12 @@ def _generate_point_nearest_candidates_gpu(
     sorted_tree = sort_pairs(tree_x[valid_tree_rows], valid_tree_rows, synchronize=False)
     query_min_x = cp.nan_to_num(query_x - max_distance, nan=0.0)
     query_max_x = cp.nan_to_num(query_x + max_distance, nan=0.0)
-    start_idx = lower_bound(sorted_tree.keys, query_min_x, synchronize=False).astype(cp.int32, copy=False)
-    end_idx = upper_bound(sorted_tree.keys, query_max_x, synchronize=False).astype(cp.int32, copy=False)
+    start_idx = lower_bound(sorted_tree.keys, query_min_x, synchronize=False).astype(
+        cp.int32, copy=False
+    )
+    end_idx = upper_bound(sorted_tree.keys, query_max_x, synchronize=False).astype(
+        cp.int32, copy=False
+    )
     counts = cp.empty(query_owned.row_count, dtype=cp.int32)
     offsets = None
     out_left = None
@@ -1571,7 +1766,9 @@ def _generate_point_nearest_candidates_gpu(
                 KERNEL_PARAM_I32,
             ),
         )
-        count_grid, count_block = runtime.launch_config(kernels["point_x_window_count"], query_owned.row_count)
+        count_grid, count_block = runtime.launch_config(
+            kernels["point_x_window_count"], query_owned.row_count
+        )
         runtime.launch(
             kernels["point_x_window_count"],
             grid=count_grid,
@@ -1628,7 +1825,9 @@ def _generate_point_nearest_candidates_gpu(
                 KERNEL_PARAM_I32,
             ),
         )
-        scatter_grid, scatter_block = runtime.launch_config(kernels["point_x_window_scatter"], query_owned.row_count)
+        scatter_grid, scatter_block = runtime.launch_config(
+            kernels["point_x_window_scatter"], query_owned.row_count
+        )
         runtime.launch(
             kernels["point_x_window_scatter"],
             grid=scatter_grid,
@@ -1656,6 +1855,7 @@ def _generate_point_nearest_candidates_gpu(
 # ---------------------------------------------------------------------------
 # Distance computation dispatch
 # ---------------------------------------------------------------------------
+
 
 def _compute_pair_distances_gpu(
     query_owned: OwnedGeometryArray,
@@ -1692,39 +1892,60 @@ def _compute_pair_distances_gpu(
             reason="dwithin: GPU point-point distance",
         )
         _launch_point_point_distance_kernel(
-            query_owned, tree_owned,
-            d_left, d_right, d_distances, pair_count,
+            query_owned,
+            tree_owned,
+            d_left,
+            d_right,
+            d_distances,
+            pair_count,
         )
         return True
 
     if query_family == point_family:
         from .point_distance import compute_point_distance_gpu
+
         return compute_point_distance_gpu(
-            query_owned, tree_owned,
-            d_left, d_right, d_distances, pair_count,
+            query_owned,
+            tree_owned,
+            d_left,
+            d_right,
+            d_distances,
+            pair_count,
             tree_family=tree_family,
         )
 
     if tree_family == point_family:
         from .point_distance import compute_point_distance_gpu
+
         return compute_point_distance_gpu(
-            tree_owned, query_owned,
-            d_right, d_left, d_distances, pair_count,
+            tree_owned,
+            query_owned,
+            d_right,
+            d_left,
+            d_distances,
+            pair_count,
             tree_family=query_family,
         )
 
     # Non-point x non-point
     from .segment_distance import compute_segment_distance_gpu
+
     return compute_segment_distance_gpu(
-        query_owned, tree_owned,
-        d_left, d_right, d_distances, pair_count,
-        query_family=query_family, tree_family=tree_family,
+        query_owned,
+        tree_owned,
+        d_left,
+        d_right,
+        d_distances,
+        pair_count,
+        query_family=query_family,
+        tree_family=tree_family,
     )
 
 
 # ---------------------------------------------------------------------------
 # Multipoint distance computation
 # ---------------------------------------------------------------------------
+
 
 def _compute_multipoint_distances_gpu(
     mp_owned: OwnedGeometryArray,
@@ -1778,8 +1999,8 @@ def _compute_multipoint_distances_gpu(
     for i in range(pair_count):
         cs = int(coord_starts[i])
         n = int(coord_counts[i])
-        expanded_point_idx[cursor:cursor + n] = np.arange(cs, cs + n, dtype=np.int32)
-        expanded_target_idx[cursor:cursor + n] = target_idx[i]
+        expanded_point_idx[cursor : cursor + n] = np.arange(cs, cs + n, dtype=np.int32)
+        expanded_target_idx[cursor : cursor + n] = target_idx[i]
         cursor += n
 
     # Create a temporary point OwnedGeometryArray from the MP's coord arrays.
@@ -1804,18 +2025,28 @@ def _compute_multipoint_distances_gpu(
                 reason="multipoint distance: target points",
             )
             _launch_point_point_distance_kernel(
-                temp_point_owned, target_owned,
-                d_exp_left, d_exp_right, d_exp_dist, total_expanded,
+                temp_point_owned,
+                target_owned,
+                d_exp_left,
+                d_exp_right,
+                d_exp_dist,
+                total_expanded,
                 exclusive=exclusive,
             )
             ok = True
         else:
             # Point x {Line, Polygon, ...} via existing point distance kernels.
             from .point_distance import compute_point_distance_gpu
+
             ok = compute_point_distance_gpu(
-                temp_point_owned, target_owned,
-                d_exp_left, d_exp_right, d_exp_dist, total_expanded,
-                tree_family=target_family, exclusive=exclusive,
+                temp_point_owned,
+                target_owned,
+                d_exp_left,
+                d_exp_right,
+                d_exp_dist,
+                total_expanded,
+                tree_family=target_family,
+                exclusive=exclusive,
             )
 
         if not ok:
@@ -1827,7 +2058,10 @@ def _compute_multipoint_distances_gpu(
             d_starts = runtime.from_host(seg_starts_arr.astype(np.int32))
             d_ends = runtime.from_host(seg_ends_arr.astype(np.int32))
             seg_result = segmented_reduce_min(
-                d_exp_dist, d_starts, d_ends, num_segments=pair_count,
+                d_exp_dist,
+                d_starts,
+                d_ends,
+                num_segments=pair_count,
             )
             result = runtime.copy_device_to_host(
                 seg_result.values,
@@ -1854,6 +2088,7 @@ def _compute_multipoint_distances_gpu(
 # ---------------------------------------------------------------------------
 # Mixed-family distance computation
 # ---------------------------------------------------------------------------
+
 
 def _compute_mixed_distances_gpu(
     query_owned: OwnedGeometryArray,
@@ -1895,7 +2130,7 @@ def _compute_mixed_distances_gpu(
 
     point_family = GeometryFamily.POINT
 
-    for (lt, rt) in unique_tag_pairs(left_tags, right_tags):
+    for lt, rt in unique_tag_pairs(left_tags, right_tags):
         lf = TAG_FAMILIES.get(lt)
         rf = TAG_FAMILIES.get(rt)
 
@@ -1910,6 +2145,7 @@ def _compute_mixed_distances_gpu(
         _own_sub_device = True
         if _use_device_idx:
             import cupy as cp
+
             d_sub_idx = cp.asarray(sub_idx.astype(np.int32))
             d_sub_left = _dc.d_left[d_sub_idx]
             d_sub_right = _dc.d_right[d_sub_idx]
@@ -1937,8 +2173,12 @@ def _compute_mixed_distances_gpu(
                     reason="mixed nearest: point-point distance",
                 )
                 _launch_point_point_distance_kernel(
-                    query_owned, tree_owned,
-                    d_sub_left, d_sub_right, d_sub_dist, sub_count,
+                    query_owned,
+                    tree_owned,
+                    d_sub_left,
+                    d_sub_right,
+                    d_sub_dist,
+                    sub_count,
                     exclusive=exclusive,
                 )
                 sub_distances = np.empty(sub_count, dtype=np.float64)
@@ -1964,13 +2204,21 @@ def _compute_mixed_distances_gpu(
             _own_sub_device = False  # already freed
             if lf == GeometryFamily.MULTIPOINT:
                 mp_result = _compute_multipoint_distances_gpu(
-                    query_owned, tree_owned, sub_left, sub_right,
-                    target_family=rf, exclusive=exclusive,
+                    query_owned,
+                    tree_owned,
+                    sub_left,
+                    sub_right,
+                    target_family=rf,
+                    exclusive=exclusive,
                 )
             else:
                 mp_result = _compute_multipoint_distances_gpu(
-                    tree_owned, query_owned, sub_right, sub_left,
-                    target_family=lf, exclusive=exclusive,
+                    tree_owned,
+                    query_owned,
+                    sub_right,
+                    sub_left,
+                    target_family=lf,
+                    exclusive=exclusive,
                 )
             if mp_result is not None:
                 distances[sub_idx] = mp_result
@@ -1979,17 +2227,28 @@ def _compute_mixed_distances_gpu(
             d_sub_dist = runtime.allocate((sub_count,), np.float64)
             try:
                 from .point_distance import compute_point_distance_gpu
+
                 if lf == point_family:
                     ok = compute_point_distance_gpu(
-                        query_owned, tree_owned,
-                        d_sub_left, d_sub_right, d_sub_dist, sub_count,
-                        tree_family=rf, exclusive=exclusive,
+                        query_owned,
+                        tree_owned,
+                        d_sub_left,
+                        d_sub_right,
+                        d_sub_dist,
+                        sub_count,
+                        tree_family=rf,
+                        exclusive=exclusive,
                     )
                 else:
                     ok = compute_point_distance_gpu(
-                        tree_owned, query_owned,
-                        d_sub_right, d_sub_left, d_sub_dist, sub_count,
-                        tree_family=lf, exclusive=exclusive,
+                        tree_owned,
+                        query_owned,
+                        d_sub_right,
+                        d_sub_left,
+                        d_sub_dist,
+                        sub_count,
+                        tree_family=lf,
+                        exclusive=exclusive,
                     )
                 if ok:
                     sub_distances = np.empty(sub_count, dtype=np.float64)
@@ -2008,10 +2267,17 @@ def _compute_mixed_distances_gpu(
             d_sub_dist = runtime.allocate((sub_count,), np.float64)
             try:
                 from .segment_distance import compute_segment_distance_gpu
+
                 ok = compute_segment_distance_gpu(
-                    query_owned, tree_owned,
-                    d_sub_left, d_sub_right, d_sub_dist, sub_count,
-                    query_family=lf, tree_family=rf, exclusive=exclusive,
+                    query_owned,
+                    tree_owned,
+                    d_sub_left,
+                    d_sub_right,
+                    d_sub_dist,
+                    sub_count,
+                    query_family=lf,
+                    tree_family=rf,
+                    exclusive=exclusive,
                 )
                 if ok:
                     sub_distances = np.empty(sub_count, dtype=np.float64)
@@ -2043,7 +2309,9 @@ def _compute_mixed_distances_gpu(
             sub_dists = shapely.distance(query_shapely[sub_left], tree_shapely[sub_right])
             distances[sub_idx] = np.asarray(sub_dists, dtype=np.float64)
             if exclusive:
-                eq = np.asarray(shapely.equals(query_shapely[sub_left], tree_shapely[sub_right]), dtype=bool)
+                eq = np.asarray(
+                    shapely.equals(query_shapely[sub_left], tree_shapely[sub_right]), dtype=bool
+                )
                 distances[sub_idx[eq]] = np.inf
 
     return distances, used_shapely_fallback
@@ -2052,6 +2320,7 @@ def _compute_mixed_distances_gpu(
 # ---------------------------------------------------------------------------
 # dwithin refinement
 # ---------------------------------------------------------------------------
+
 
 def _dwithin_refine_gpu(
     query_owned: OwnedGeometryArray,
@@ -2090,7 +2359,9 @@ def _dwithin_refine_gpu(
 
     _dc = device_candidates
     _use_device_idx = _dc is not None and hasattr(_dc, "d_left")
-    pair_count = left_idx.size if left_idx is not None else (_dc.total_pairs if _use_device_idx else 0)
+    pair_count = (
+        left_idx.size if left_idx is not None else (_dc.total_pairs if _use_device_idx else 0)
+    )
     if pair_count == 0:
         empty = np.empty(0, dtype=np.int32)
         if return_device:
@@ -2100,7 +2371,10 @@ def _dwithin_refine_gpu(
     # --- Device-side distance computation ---
     # Accumulate distances in a device CuPy array instead of host numpy.
     d_distances_result = _compute_mixed_distances_gpu_device(
-        query_owned, tree_owned, left_idx, right_idx,
+        query_owned,
+        tree_owned,
+        left_idx,
+        right_idx,
         device_candidates=device_candidates,
     )
     if d_distances_result is None:
@@ -2110,7 +2384,11 @@ def _dwithin_refine_gpu(
                 return None
             left_idx, right_idx = _dc.to_host()
         distances_result = _compute_mixed_distances_gpu(
-            query_owned, tree_owned, left_idx, right_idx, exclusive=False,
+            query_owned,
+            tree_owned,
+            left_idx,
+            right_idx,
+            exclusive=False,
             device_candidates=device_candidates,
         )
         if distances_result is None:
@@ -2139,7 +2417,10 @@ def _dwithin_refine_gpu(
     if d_keep_idx.size == 0:
         empty = np.empty(0, dtype=np.int32 if left_idx is None else left_idx.dtype)
         if return_device:
-            return (cp.asarray(empty, dtype=cp.int32), cp.asarray(empty, dtype=cp.int32)), used_shapely_fallback
+            return (
+                cp.asarray(empty, dtype=cp.int32),
+                cp.asarray(empty, dtype=cp.int32),
+            ), used_shapely_fallback
         return (empty, empty), used_shapely_fallback
 
     # Gather surviving indices on device.
@@ -2187,15 +2468,25 @@ def _compute_mixed_distances_gpu_device(
 
     _dc = device_candidates
     _use_device_idx = _dc is not None and hasattr(_dc, "d_left")
-    pair_count = left_idx.size if left_idx is not None else (_dc.total_pairs if _use_device_idx else 0)
+    pair_count = (
+        left_idx.size if left_idx is not None else (_dc.total_pairs if _use_device_idx else 0)
+    )
     if pair_count == 0:
         return cp.empty(0, dtype=cp.float64), False
 
     if _use_device_idx:
         _q_ds = query_owned.device_state
         _t_ds = tree_owned.device_state
-        d_query_tags = _q_ds.tags if _q_ds is not None and _q_ds.tags is not None else cp.asarray(query_owned.tags)
-        d_tree_tags = _t_ds.tags if _t_ds is not None and _t_ds.tags is not None else cp.asarray(tree_owned.tags)
+        d_query_tags = (
+            _q_ds.tags
+            if _q_ds is not None and _q_ds.tags is not None
+            else cp.asarray(query_owned.tags)
+        )
+        d_tree_tags = (
+            _t_ds.tags
+            if _t_ds is not None and _t_ds.tags is not None
+            else cp.asarray(tree_owned.tags)
+        )
         left_tags = d_query_tags[_dc.d_left]
         right_tags = d_tree_tags[_dc.d_right]
     else:
@@ -2208,18 +2499,13 @@ def _compute_mixed_distances_gpu_device(
 
     point_family = GeometryFamily.POINT
 
-    if (
-        hasattr(left_tags, "__cuda_array_interface__")
-        and hasattr(right_tags, "__cuda_array_interface__")
+    if hasattr(left_tags, "__cuda_array_interface__") and hasattr(
+        right_tags, "__cuda_array_interface__"
     ):
         # Device-return paths must not summarize tags via host copies.  The
         # family domain is tiny, so probe every possible pair on device and
         # skip empty masks below.
-        tag_pairs = (
-            (lt, rt)
-            for lt in range(len(FAMILY_TAGS))
-            for rt in range(len(FAMILY_TAGS))
-        )
+        tag_pairs = ((lt, rt) for lt in range(len(FAMILY_TAGS)) for rt in range(len(FAMILY_TAGS)))
     else:
         tag_pairs = unique_tag_pairs(left_tags, right_tags)
 
@@ -2265,8 +2551,12 @@ def _compute_mixed_distances_gpu_device(
                     reason="dwithin device: point-point distance",
                 )
                 _launch_point_point_distance_kernel(
-                    query_owned, tree_owned,
-                    d_sub_left, d_sub_right, d_sub_dist, sub_count,
+                    query_owned,
+                    tree_owned,
+                    d_sub_left,
+                    d_sub_right,
+                    d_sub_dist,
+                    sub_count,
                 )
                 # Scatter into device result array (Tier 2 CuPy).
                 d_distances[d_sub_idx] = cp.asarray(d_sub_dist)
@@ -2292,12 +2582,18 @@ def _compute_mixed_distances_gpu_device(
                 ).astype(np.int32, copy=False)
             if lf == GeometryFamily.MULTIPOINT:
                 mp_result = _compute_multipoint_distances_gpu(
-                    query_owned, tree_owned, sub_left, sub_right,
+                    query_owned,
+                    tree_owned,
+                    sub_left,
+                    sub_right,
                     target_family=rf,
                 )
             else:
                 mp_result = _compute_multipoint_distances_gpu(
-                    tree_owned, query_owned, sub_right, sub_left,
+                    tree_owned,
+                    query_owned,
+                    sub_right,
+                    sub_left,
                     target_family=lf,
                 )
             if mp_result is not None:
@@ -2307,16 +2603,25 @@ def _compute_mixed_distances_gpu_device(
             d_sub_dist = runtime.allocate((sub_count,), np.float64)
             try:
                 from .point_distance import compute_point_distance_gpu
+
                 if lf == point_family:
                     ok = compute_point_distance_gpu(
-                        query_owned, tree_owned,
-                        d_sub_left, d_sub_right, d_sub_dist, sub_count,
+                        query_owned,
+                        tree_owned,
+                        d_sub_left,
+                        d_sub_right,
+                        d_sub_dist,
+                        sub_count,
                         tree_family=rf,
                     )
                 else:
                     ok = compute_point_distance_gpu(
-                        tree_owned, query_owned,
-                        d_sub_right, d_sub_left, d_sub_dist, sub_count,
+                        tree_owned,
+                        query_owned,
+                        d_sub_right,
+                        d_sub_left,
+                        d_sub_dist,
+                        sub_count,
                         tree_family=lf,
                     )
                 if ok:
@@ -2330,10 +2635,16 @@ def _compute_mixed_distances_gpu_device(
             d_sub_dist = runtime.allocate((sub_count,), np.float64)
             try:
                 from .segment_distance import compute_segment_distance_gpu
+
                 ok = compute_segment_distance_gpu(
-                    query_owned, tree_owned,
-                    d_sub_left, d_sub_right, d_sub_dist, sub_count,
-                    query_family=lf, tree_family=rf,
+                    query_owned,
+                    tree_owned,
+                    d_sub_left,
+                    d_sub_right,
+                    d_sub_dist,
+                    sub_count,
+                    query_family=lf,
+                    tree_family=rf,
                 )
                 if ok:
                     d_distances[d_sub_idx] = cp.asarray(d_sub_dist)
@@ -2384,6 +2695,7 @@ def _compute_mixed_distances_gpu_device(
 # Host-side nearest from precomputed distances
 # ---------------------------------------------------------------------------
 
+
 def _nearest_from_distances(
     left_idx: np.ndarray,
     right_idx: np.ndarray,
@@ -2409,10 +2721,12 @@ def _nearest_from_distances(
         keep = np.zeros(left_idx.size, dtype=bool)
         keep[order[first]] = True
     keep &= distances <= max_distance
-    indices = np.vstack((
-        left_idx[keep].astype(np.intp, copy=False),
-        right_idx[keep].astype(np.intp, copy=False),
-    ))
+    indices = np.vstack(
+        (
+            left_idx[keep].astype(np.intp, copy=False),
+            right_idx[keep].astype(np.intp, copy=False),
+        )
+    )
     if return_distance:
         return indices, distances[keep]
     return indices
@@ -2421,6 +2735,7 @@ def _nearest_from_distances(
 # ---------------------------------------------------------------------------
 # Full GPU nearest refinement dispatcher
 # ---------------------------------------------------------------------------
+
 
 def _nearest_refine_gpu(
     query_owned: OwnedGeometryArray,
@@ -2442,11 +2757,17 @@ def _nearest_refine_gpu(
     Returns ``(indices_2xN, distances_or_None)`` on success, or ``None``
     when the GPU path is not applicable.
     """
+    if not has_gpu_runtime():
+        return None
+
     # --- Try single-family fast paths first ---
     use_mixed = False
 
     if _points_only(query_owned) and _points_only(tree_owned):
-        if GeometryFamily.POINT not in query_owned.families or GeometryFamily.POINT not in tree_owned.families:
+        if (
+            GeometryFamily.POINT not in query_owned.families
+            or GeometryFamily.POINT not in tree_owned.families
+        ):
             # All rows are null/empty -- return empty result instead of CPU fallback.
             if return_device:
                 return _empty_nearest_result_device(return_distance), False
@@ -2456,10 +2777,16 @@ def _nearest_refine_gpu(
         tree_family = _tree_distance_family(tree_owned)
         if tree_family is not None:
             return _nearest_refine_gpu_typed(
-                query_owned, tree_owned, left_idx, right_idx, n_queries,
+                query_owned,
+                tree_owned,
+                left_idx,
+                right_idx,
+                n_queries,
                 PointFamilyDistanceStrategy(tree_family),
-                max_distance=max_distance, return_all=return_all,
-                exclusive=exclusive, return_distance=return_distance,
+                max_distance=max_distance,
+                return_all=return_all,
+                exclusive=exclusive,
+                return_distance=return_distance,
                 return_device=return_device,
             )
         use_mixed = True
@@ -2467,10 +2794,16 @@ def _nearest_refine_gpu(
         query_family = _single_family(query_owned)
         if query_family is not None and query_family in _point_distance_families():
             return _nearest_refine_gpu_typed(
-                tree_owned, query_owned, right_idx, left_idx, n_queries,
+                tree_owned,
+                query_owned,
+                right_idx,
+                left_idx,
+                n_queries,
                 PointFamilyDistanceStrategy(query_family),
-                max_distance=max_distance, return_all=return_all,
-                exclusive=exclusive, return_distance=return_distance,
+                max_distance=max_distance,
+                return_all=return_all,
+                exclusive=exclusive,
+                return_distance=return_distance,
                 return_device=return_device,
             )
         use_mixed = True
@@ -2479,10 +2812,16 @@ def _nearest_refine_gpu(
         tree_family = _single_family(tree_owned)
         if query_family is not None and tree_family is not None:
             return _nearest_refine_gpu_typed(
-                query_owned, tree_owned, left_idx, right_idx, n_queries,
+                query_owned,
+                tree_owned,
+                left_idx,
+                right_idx,
+                n_queries,
                 SegmentFamilyDistanceStrategy(query_family, tree_family),
-                max_distance=max_distance, return_all=return_all,
-                exclusive=exclusive, return_distance=return_distance,
+                max_distance=max_distance,
+                return_all=return_all,
+                exclusive=exclusive,
+                return_distance=return_distance,
                 return_device=return_device,
             )
         use_mixed = True
@@ -2492,18 +2831,29 @@ def _nearest_refine_gpu(
         if return_device:
             return None
         mixed_distances_result = _compute_mixed_distances_gpu(
-            query_owned, tree_owned, left_idx, right_idx, exclusive=exclusive,
+            query_owned,
+            tree_owned,
+            left_idx,
+            right_idx,
+            exclusive=exclusive,
         )
         if mixed_distances_result is not None:
             mixed_distances, used_shapely_fallback = mixed_distances_result
             return _nearest_from_distances(
-                left_idx, right_idx, mixed_distances, n_queries,
-                max_distance=max_distance, return_all=return_all,
+                left_idx,
+                right_idx,
+                mixed_distances,
+                n_queries,
+                max_distance=max_distance,
+                return_all=return_all,
                 return_distance=return_distance,
             ), used_shapely_fallback
         return None
 
-    if GeometryFamily.POINT not in query_owned.families or GeometryFamily.POINT not in tree_owned.families:
+    if (
+        GeometryFamily.POINT not in query_owned.families
+        or GeometryFamily.POINT not in tree_owned.families
+    ):
         # Degenerate: both _points_only but POINT not in families -- all null.
         if return_device:
             return _empty_nearest_result_device(return_distance), False
@@ -2512,10 +2862,16 @@ def _nearest_refine_gpu(
     # Point-point path: use PointPointDistanceStrategy via the unified pipeline.
     strategy = PointPointDistanceStrategy()
     return _nearest_refine_gpu_typed(
-        query_owned, tree_owned, left_idx, right_idx, n_queries,
+        query_owned,
+        tree_owned,
+        left_idx,
+        right_idx,
+        n_queries,
         strategy,
-        max_distance=max_distance, return_all=return_all,
-        exclusive=exclusive, return_distance=return_distance,
+        max_distance=max_distance,
+        return_all=return_all,
+        exclusive=exclusive,
+        return_distance=return_distance,
         return_device=return_device,
     )
 
@@ -2523,6 +2879,7 @@ def _nearest_refine_gpu(
 # ---------------------------------------------------------------------------
 # Iterative doubling for unbounded nearest on GPU
 # ---------------------------------------------------------------------------
+
 
 def _iterative_nearest_gpu(
     query_owned: OwnedGeometryArray,
@@ -2565,7 +2922,9 @@ def _iterative_nearest_gpu(
         else:
             per_row_dist = np.full(n_queries, distance, dtype=np.float64)
             left_idx, right_idx = _generate_distance_pairs(
-                query_bounds, tree_bounds, per_row_dist,
+                query_bounds,
+                tree_bounds,
+                per_row_dist,
             )
 
         if left_idx.size == 0:
@@ -2585,8 +2944,11 @@ def _iterative_nearest_gpu(
 
         # All queries covered -- run GPU refinement.
         gpu_result = _nearest_refine_gpu(
-            query_owned, tree_owned,
-            left_idx, right_idx, n_queries,
+            query_owned,
+            tree_owned,
+            left_idx,
+            right_idx,
+            n_queries,
             max_distance=distance,
             return_all=return_all,
             exclusive=exclusive,
@@ -2607,6 +2969,7 @@ def _iterative_nearest_gpu(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def nearest_spatial_index(
     tree_geometries: np.ndarray | None,
@@ -2649,9 +3012,12 @@ def nearest_spatial_index(
         and tree_geometries is not None
     ):
         grid_result = _nearest_grid_gpu(
-            tree_geometries, query_values,
-            return_all=return_all, return_distance=return_distance,
-            exclusive=exclusive, max_distance=max_distance,
+            tree_geometries,
+            query_values,
+            return_all=return_all,
+            return_distance=return_distance,
+            exclusive=exclusive,
+            max_distance=max_distance,
         )
         if grid_result is not None:
             return grid_result
@@ -2708,8 +3074,12 @@ def nearest_spatial_index(
             return (indices, knn_result.d_distances), "owned_gpu_nearest"
         return indices, "owned_gpu_nearest"
 
-    query_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode(query_owned))
-    tree_bounds = compute_geometry_bounds(tree_owned, dispatch_mode=_gpu_bounds_dispatch_mode(tree_owned))
+    query_bounds = compute_geometry_bounds(
+        query_owned, dispatch_mode=_gpu_bounds_dispatch_mode(query_owned)
+    )
+    tree_bounds = compute_geometry_bounds(
+        tree_owned, dispatch_mode=_gpu_bounds_dispatch_mode(tree_owned)
+    )
 
     # --- Try device-side k-NN query (vibeSpatial-247.7.2) ---------------------
     # Unified GPU pipeline: candidate generation -> exact distance -> top-k.
@@ -2763,9 +3133,14 @@ def nearest_spatial_index(
         selection = plan_dispatch_selection(
             kernel_name="nearest_knn_brute",
             kernel_class=KernelClass.COARSE,
-            row_count=n_queries * n_tree,
+            row_count=n_queries,
             gpu_available=has_gpu_runtime(),
             current_residency=combined_residency(query_owned, tree_owned),
+            work_estimate=PhysicalWorkEstimate.for_candidate_pairs(
+                row_count=n_queries,
+                candidate_pair_count=n_queries * n_tree,
+                primary_unit_name="nearest-candidate-pair",
+            ),
         )
         if selection.selected is not ExecutionMode.GPU:
             if return_device:
@@ -2804,9 +3179,12 @@ def nearest_spatial_index(
         avg_spacing = full_diagonal / max(1.0, float(np.sqrt(n_tree)))
         initial_estimate = max(avg_spacing * 2.0, 1.0)
         iterative_result = _iterative_nearest_gpu(
-            query_owned, tree_owned,
-            query_bounds, tree_bounds,
-            initial_estimate, full_diagonal,
+            query_owned,
+            tree_owned,
+            query_bounds,
+            tree_bounds,
+            initial_estimate,
+            full_diagonal,
             n_queries=n_queries,
             return_all=return_all,
             exclusive=exclusive,
@@ -2839,7 +3217,9 @@ def nearest_spatial_index(
             impl = "owned_gpu_nearest"
         else:
             per_row_distance = np.full(n_queries, effective_max_distance, dtype=np.float64)
-            left_idx, right_idx = _generate_distance_pairs(query_bounds, tree_bounds, per_row_distance)
+            left_idx, right_idx = _generate_distance_pairs(
+                query_bounds, tree_bounds, per_row_distance
+            )
             impl = "owned_cpu_nearest"
 
     if left_idx.size == 0:
@@ -2911,7 +3291,9 @@ def nearest_spatial_index(
         keep = np.zeros(left_idx.size, dtype=bool)
         keep[order[first]] = True
     keep &= distances <= effective_max_distance
-    indices = np.vstack((left_idx[keep].astype(np.intp, copy=False), right_idx[keep].astype(np.intp, copy=False)))
+    indices = np.vstack(
+        (left_idx[keep].astype(np.intp, copy=False), right_idx[keep].astype(np.intp, copy=False))
+    )
     # ADR-0042: low-level spatial-query kernels still use integer index arrays.
     if __debug__:
         assert isinstance(indices, np.ndarray) and np.issubdtype(indices.dtype, np.integer), (

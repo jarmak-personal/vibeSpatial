@@ -5,28 +5,27 @@ Scope: Compact-invalid-row make_valid pipeline staging and repair-only-invalids 
 Read If: You are changing make_valid, validity checking, or topology repair pipelines.
 STOP IF: Your task already has the make_valid pipeline open and only needs local implementation detail.
 Source Of Truth: Make-valid pipeline architecture for compact-and-repair staging.
-Body Budget: 85/220 lines
+Body Budget: 110/220 lines
 Document: docs/architecture/make-valid.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-2 | Preamble |
-| 3-8 | Intent |
-| 9-18 | Request Signals |
-| 19-25 | Open First |
-| 26-31 | Verify |
-| 32-37 | Risks |
-| 38-55 | Decision |
-| 56-75 | Dispatch |
-| 76-85 | Performance Notes |
+| 3-7 | Intent |
+| 8-17 | Request Signals |
+| 18-24 | Open First |
+| 25-30 | Verify |
+| 31-36 | Risks |
+| 37-65 | Decision |
+| 66-88 | Dispatch |
+| 89-110 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent
 
-Define the repo-owned `make_valid` pipeline so topology repair work only runs on
-invalid rows and can later map onto GPU compaction plus constructive repair
-stages.
+Define the repo-owned `make_valid` pipeline so topology repair runs only on
+logically selected invalid device rows and returns an atomic native result.
 
 ## Request Signals
 
@@ -53,17 +52,28 @@ stages.
 
 ## Risks
 
-- Running repair on all rows instead of compacted invalids wastes compute on already-valid geometries.
+- Running repair on inactive capacity lanes wastes compute on already-valid geometries.
 - Validity checking and repair becoming coupled prevents staging them as separate GPU stages.
 - Undocumented third-party adapter hooks make import-time behavior hard to discover.
 
 ## Decision
 
 - Compute validity first.
-- Compact invalid rows into a dense repair batch.
+- Represent invalid rows with `NativeDeviceSelection` at source capacity.
 - Leave valid rows untouched.
-- Repair only the compacted invalid subset.
-- Scatter repaired rows back into original order.
+- Repair only active selection lanes while retaining bounded row/ring capacity.
+- Scatter repaired rows back through one row-indirected capacity carrier;
+  inactive lanes route to scratch destinations instead of sizing a compact copy.
+- Keep validity, invalid-family, family/global, and repaired mappings as aligned
+  device rowsets. Native repair returns a complete aligned carrier or declines
+  atomically; callers never patch residual rows with host geometry.
+- Repair invalid MultiPolygon rows by exploding polygon parts, repairing parts,
+  reducing them with grouped fp64 constructive topology, and scattering the
+  grouped rows back through the logical row mapping.
+- In `linework` mode, preserve lower-dimensional collapsed/internal boundary
+  output with `NativeGeometryComposition`: repaired polygonal area and source
+  boundary minus repaired-area boundary remain concrete native parts until
+  terminal public GeometryCollection assembly.
 - When constructing a replacement ``GeoSeries`` from repaired geometry,
   always pass ``index=df.index`` (or ``index=gs.index``) to preserve
   non-contiguous index alignment from upstream operations like ``clip()``
@@ -84,6 +94,9 @@ stages.
   ``make_valid/gpu-nvrtc`` (polygon/multipolygon GPU repair) and
   ``make_valid/cpu`` (all families, Shapely fallback).
 - The ``dispatch_mode`` parameter controls GPU/CPU/AUTO selection.
+- A native repair decline records the whole-operation CPU boundary before any
+  host materialization. Strict-native mode rejects the crossover without
+  leaking a partial device result or performing the transfer first.
 - vibeSpatial installs a process-wide ``shapely.make_valid`` adapter at import
   time via ``src/vibespatial/api/_shapely_dispatch.py``. For repo-owned
   ``GeometryArray`` and ``DeviceGeometryArray`` inputs, the wrapper dispatches
@@ -97,11 +110,23 @@ stages.
 
 ## Performance Notes
 
-- Validity checking is much cheaper than topology repair, so compacting invalid
-  rows is the right default for valid-heavy datasets.
-- This staging is directly compatible with CCCL-style `DeviceSelect` and scatter
-  primitives.
-- GPU repair scalar fences are runtime-counted with make-valid-specific reasons
-  so they stay distinguishable from anonymous count-scatter helper copies.
-- The current host implementation already benefits from skipping repair work on
-  valid rows.
+- Validity checking is much cheaper than topology repair, so device selections
+  exclude valid rows from topology work without physically compacting geometry.
+- Device validity expressions become capacity selections; duplicate indexed
+  logical rows stay aligned through repair and row-indirected scatter.
+- GPU repair establishes device state once at entry. The obsolete host
+  coordinate/offset batch builder and Python ring/geometry reconstruction path
+  are deleted; normalized repair rows have one nested-buffer contract.
+- Polygon and multipart area repair stays device-resident. Unsupported native
+  repair shapes decline as a whole; host geometry is otherwise materialized
+  only at an explicit whole-operation compatibility or terminal export boundary.
+- Ring closure allocates the structural upper bound of one extra coordinate per
+  ring. Duplicate removal scans and scatters into retained coordinate capacity;
+  ring offsets carry the logical active prefix into later native consumers.
+- Repaired-ring filtering keeps ring and coordinate capacity, weights grouped
+  ring counts by the active mask, and passes the device logical count into the
+  gathered-buffer carrier. Repair completion has one explicit atomic admission
+  scalar; there are no per-family compact-length reads.
+- Invalid normalized rows polygonize through overlay's paged segment sweep,
+  streamed split-event merge, half-edge graph, and positive bounded-face
+  selector. Make-valid no longer has an active quadratic split/rebuild engine.

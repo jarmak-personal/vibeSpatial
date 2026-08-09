@@ -22,18 +22,19 @@ extern "C" __global__ void representative_point_polygon(
     const double* poly_y,
     const int* ring_offsets,
     const int* geom_offsets,
-    const int* global_row_indices,
+    const signed char* tags,
     const int* family_row_indices,
+    int family_tag,
     double* out_x,
     double* out_y,
-    int num_polygons,
+    int row_count,
     int max_intersections
 ) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_polygons) return;
+    if (idx >= row_count || tags[idx] != family_tag) return;
 
-    const int gr = global_row_indices[idx];
-    const int fr = family_row_indices[idx];
+    const int gr = idx;
+    const int fr = family_row_indices[gr];
     const double cx = centroid_x[gr];
     const double cy = centroid_y[gr];
 
@@ -85,7 +86,7 @@ extern "C" __global__ void representative_point_polygon(
         }
     }
 
-    if (inside || on_boundary) {
+    if (inside && !on_boundary) {
         // Centroid is inside - use it directly
         out_x[gr] = cx;
         out_y[gr] = cy;
@@ -193,18 +194,19 @@ extern "C" __global__ void representative_point_multipolygon(
     const int* ring_offsets,
     const int* part_offsets,
     const int* geom_offsets,
-    const int* global_row_indices,
+    const signed char* tags,
     const int* family_row_indices,
+    int family_tag,
     double* out_x,
     double* out_y,
-    int num_polygons,
+    int row_count,
     int max_intersections
 ) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_polygons) return;
+    if (idx >= row_count || tags[idx] != family_tag) return;
 
-    const int gr = global_row_indices[idx];
-    const int fr = family_row_indices[idx];
+    const int gr = idx;
+    const int fr = family_row_indices[gr];
     const double cx = centroid_x[gr];
     const double cy = centroid_y[gr];
 
@@ -257,45 +259,62 @@ extern "C" __global__ void representative_point_multipolygon(
         }
     }
 
-    if (inside || on_boundary) {
+    if (inside && !on_boundary) {
         out_x[gr] = cx;
         out_y[gr] = cy;
         return;
     }
 
-    // Step 2: Horizontal ray intersection for fallback
-    int n_intersections = 0;
+    // Step 2: Find a safe scanline independently for each polygon component.
+    // An aggregate MultiPolygon centroid can lie between disconnected parts,
+    // so one global scanline is not an interior-point construction.
+    extern __shared__ double shared_scratch[];
+    double* x_vals = &shared_scratch[threadIdx.x * max_intersections];
+    double best_mid_x = cx;
+    double best_y = cy;
+    double best_width = -1.0;
     for (int part_idx = part_start; part_idx < part_end; part_idx++) {
         const int ring_start = part_offsets[part_idx];
         const int ring_end = part_offsets[part_idx + 1];
+        if (ring_start >= ring_end) continue;
+
+        const int exterior_start = ring_offsets[ring_start];
+        const int exterior_end = ring_offsets[ring_start + 1];
+        if (exterior_end - exterior_start < 4) continue;
+        double min_y = poly_y[exterior_start];
+        double max_y = min_y;
+        for (int c = exterior_start + 1; c < exterior_end; ++c) {
+            min_y = fmin(min_y, poly_y[c]);
+            max_y = fmax(max_y, poly_y[c]);
+        }
+        if (!(min_y < max_y)) continue;
+        const double center_y = (min_y + max_y) * 0.5;
+        double lower_y = min_y;
+        double upper_y = max_y;
+        for (int c = exterior_start; c < exterior_end; ++c) {
+            const double vertex_y = poly_y[c];
+            if (vertex_y <= center_y && vertex_y > lower_y) lower_y = vertex_y;
+            if (vertex_y > center_y && vertex_y < upper_y) upper_y = vertex_y;
+        }
+        const double scan_y = (lower_y + upper_y) * 0.5;
+
+        int n_intersections = 0;
         for (int ring_idx = ring_start; ring_idx < ring_end; ring_idx++) {
             const int coord_start = ring_offsets[ring_idx];
             const int coord_end = ring_offsets[ring_idx + 1];
             for (int c = coord_start; c < coord_end - 1; c++) {
                 const double ay = poly_y[c];
                 const double by = poly_y[c + 1];
-                if ((ay <= cy && by > cy) || (by <= cy && ay > cy)) {
+                if ((ay <= scan_y && by > scan_y) ||
+                    (by <= scan_y && ay > scan_y)) {
                     n_intersections++;
                 }
             }
         }
-    }
-
-    if (n_intersections < 2) {
-        out_x[gr] = cx;
-        out_y[gr] = cy;
-        return;
-    }
-
-    int cap = n_intersections < max_intersections ? n_intersections : max_intersections;
-
-    extern __shared__ double shared_scratch[];
-    double* x_vals = &shared_scratch[threadIdx.x * max_intersections];
-
-    int stored = 0;
-    for (int part_idx = part_start; part_idx < part_end; part_idx++) {
-        const int ring_start = part_offsets[part_idx];
-        const int ring_end = part_offsets[part_idx + 1];
+        if (n_intersections < 2) continue;
+        const int cap = n_intersections < max_intersections
+            ? n_intersections : max_intersections;
+        int stored = 0;
         for (int ring_idx = ring_start; ring_idx < ring_end; ring_idx++) {
             const int coord_start = ring_offsets[ring_idx];
             const int coord_end = ring_offsets[ring_idx + 1];
@@ -304,8 +323,10 @@ extern "C" __global__ void representative_point_multipolygon(
                 const double ay = poly_y[c];
                 const double bx = poly_x[c + 1];
                 const double by = poly_y[c + 1];
-                if ((ay <= cy && by > cy) || (by <= cy && ay > cy)) {
-                    double x_int = ax + (cy - ay) / (by - ay) * (bx - ax);
+                if ((ay <= scan_y && by > scan_y) ||
+                    (by <= scan_y && ay > scan_y)) {
+                    const double x_int =
+                        ax + (scan_y - ay) / (by - ay) * (bx - ax);
                     if (stored < cap) {
                         int pos = stored;
                         while (pos > 0 && x_vals[pos - 1] > x_int) {
@@ -318,20 +339,25 @@ extern "C" __global__ void representative_point_multipolygon(
                 }
             }
         }
-    }
-
-    double best_mid_x = cx;
-    double best_width = -1.0;
-    for (int i = 0; i + 1 < stored; i += 2) {
-        double width = x_vals[i + 1] - x_vals[i];
-        if (width > best_width) {
-            best_width = width;
-            best_mid_x = (x_vals[i] + x_vals[i + 1]) * 0.5;
+        for (int i = 0; i + 1 < stored; i += 2) {
+            const double width = x_vals[i + 1] - x_vals[i];
+            if (width > best_width) {
+                best_width = width;
+                best_mid_x = (x_vals[i] + x_vals[i + 1]) * 0.5;
+                best_y = scan_y;
+            }
         }
     }
 
-    out_x[gr] = best_mid_x;
-    out_y[gr] = cy;
+    if (best_width >= 0.0) {
+        out_x[gr] = best_mid_x;
+        out_y[gr] = best_y;
+        return;
+    }
+    const int first_ring = part_offsets[part_start];
+    const int first_coord = ring_offsets[first_ring];
+    out_x[gr] = poly_x[first_coord];
+    out_y[gr] = poly_y[first_coord];
 }
 """
 _REPRESENTATIVE_POINT_KERNEL_NAMES = (

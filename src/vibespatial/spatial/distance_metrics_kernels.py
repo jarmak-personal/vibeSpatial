@@ -8,7 +8,9 @@ from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 # Hausdorff kernel: 1 block per pair, shared-memory max reduction
 # ---------------------------------------------------------------------------
 
-_HAUSDORFF_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_HAUSDORFF_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + r"""
 __device__ compute_t hausdorff_sample_x(
     const double* __restrict__ x,
     int start,
@@ -155,6 +157,7 @@ void hausdorff_distance(
     if (tid == 0) result[pair] = sdata[0];
 }}
 """
+)
 
 _HAUSDORFF_KERNEL_NAMES = ("hausdorff_distance",)
 
@@ -164,7 +167,9 @@ _HAUSDORFF_KERNEL_NAMES = ("hausdorff_distance",)
 
 MAX_FRECHET_B = 2048
 
-_FRECHET_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_FRECHET_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + r"""
 #define MAX_FRECHET_B {max_frechet_b}
 
 __device__ compute_t frechet_sample_x(
@@ -330,6 +335,7 @@ void frechet_distance(
     result[pair] = prev_row[b_samples - 1];
 }}
 """
+)
 
 _FRECHET_KERNEL_NAMES = ("frechet_distance",)
 
@@ -340,8 +346,10 @@ _FRECHET_KERNEL_NAMES = ("frechet_distance",)
 HAUSDORFF_FP64 = _HAUSDORFF_KERNEL_SOURCE.format(compute_type="double")
 HAUSDORFF_FP32 = _HAUSDORFF_KERNEL_SOURCE.format(compute_type="float")
 FRECHET_FP64 = _FRECHET_KERNEL_SOURCE.format(
-    compute_type="double", max_frechet_b=MAX_FRECHET_B,
+    compute_type="double",
+    max_frechet_b=MAX_FRECHET_B,
 )
 FRECHET_FP32 = _FRECHET_KERNEL_SOURCE.format(
-    compute_type="float", max_frechet_b=MAX_FRECHET_B,
+    compute_type="float",
+    max_frechet_b=MAX_FRECHET_B,
 )

@@ -58,10 +58,12 @@ from vibespatial.io.gpu_parse.indexing_kernels import (
 # Warmup registration (ADR-0034)
 # ---------------------------------------------------------------------------
 
-request_nvrtc_warmup([
-    ("fused-index-bounds", _BOUNDS_KERNEL_SOURCE, _BOUNDS_KERNEL_NAMES),
-    ("fused-index-hilbert", _HILBERT_KERNEL_SOURCE, _HILBERT_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("fused-index-bounds", _BOUNDS_KERNEL_SOURCE, _BOUNDS_KERNEL_NAMES),
+        ("fused-index-hilbert", _HILBERT_KERNEL_SOURCE, _HILBERT_KERNEL_NAMES),
+    ]
+)
 
 # CCCL warmup for radix sort used in Hilbert ordering
 request_warmup(["radix_sort_u32_i32"])
@@ -70,6 +72,7 @@ request_warmup(["radix_sort_u32_i32"])
 # ---------------------------------------------------------------------------
 # Kernel compilation helpers
 # ---------------------------------------------------------------------------
+
 
 def _bounds_kernels():
     """Compile (cached) the feature bounds kernel."""
@@ -101,6 +104,7 @@ def _indexing_device_to_host(device_array: object, *, reason: str) -> np.ndarray
 # Data structures
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class GpuSpatialIndex:
     """Packed Hilbert R-tree built entirely on the GPU.
@@ -131,11 +135,11 @@ class GpuSpatialIndex:
         Maximum children per node (fan-out).
     """
 
-    d_sorted_indices: object   # cp.ndarray int32
-    d_node_bounds: object      # cp.ndarray float64 (n_nodes, 4)
-    d_node_children: object    # cp.ndarray int32 (n_internal_nodes, node_capacity)
-    d_feature_bounds: object   # cp.ndarray float64 (n_features, 4)
-    d_hilbert_codes: object    # cp.ndarray uint32
+    d_sorted_indices: object  # cp.ndarray int32
+    d_node_bounds: object  # cp.ndarray float64 (n_nodes, 4)
+    d_node_children: object  # cp.ndarray int32 (n_internal_nodes, node_capacity)
+    d_feature_bounds: object  # cp.ndarray float64 (n_features, 4)
+    d_hilbert_codes: object  # cp.ndarray uint32
     n_features: int
     n_nodes: int
     n_leaf_nodes: int
@@ -145,6 +149,7 @@ class GpuSpatialIndex:
 # ---------------------------------------------------------------------------
 # Core implementation
 # ---------------------------------------------------------------------------
+
 
 def _compute_bounds_gpu(
     d_x: cp.ndarray,
@@ -384,6 +389,7 @@ def _build_packed_rtree(
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def build_spatial_index(
     d_x: cp.ndarray,
     d_y: cp.ndarray,
@@ -449,7 +455,10 @@ def build_spatial_index(
 
     # Step 4: Build packed R-tree from sorted order (Tier 2 CuPy)
     d_node_bounds, d_node_children, n_nodes, n_leaf_nodes = _build_packed_rtree(
-        d_sorted_indices, d_feature_bounds, n_features, node_capacity=node_capacity,
+        d_sorted_indices,
+        d_feature_bounds,
+        n_features,
+        node_capacity=node_capacity,
     )
 
     return GpuSpatialIndex(
@@ -491,5 +500,8 @@ def build_index_from_reader(
     GpuSpatialIndex
     """
     return build_spatial_index(
-        d_x, d_y, geometry_offsets, node_capacity=node_capacity,
+        d_x,
+        d_y,
+        geometry_offsets,
+        node_capacity=node_capacity,
     )

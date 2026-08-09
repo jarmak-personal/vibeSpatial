@@ -6,6 +6,7 @@ coordinate decode kernels.
 
 Extracted from wkb_decode.py -- dispatch logic remains there.
 """
+
 from __future__ import annotations
 
 _WKB_DECODE_SHARED_HELPERS = r"""
@@ -26,7 +27,9 @@ __device__ inline double read_f64_le(const unsigned char* src) {
 }
 """
 
-_WKB_DECODE_KERNEL_SOURCE = _WKB_DECODE_SHARED_HELPERS + r"""
+_WKB_DECODE_KERNEL_SOURCE = (
+    _WKB_DECODE_SHARED_HELPERS
+    + r"""
 extern "C" {
 
 /* ---------- Stage 1: Header scan ----------
@@ -474,6 +477,7 @@ __global__ void decode_multipolygon_wkb(
 
 }  /* extern "C" */
 """
+)
 
 _WKB_DECODE_KERNEL_NAMES = (
     "wkb_header_scan",

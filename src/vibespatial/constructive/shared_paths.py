@@ -1,301 +1,201 @@
-"""GPU-accelerated shared_paths (binary constructive).
-
-Detects collinear overlapping segments shared between two linear geometries
-and classifies them as forward (same direction) or backward (opposite
-direction).  Returns a numpy array of Shapely GeometryCollection objects,
-each containing two MultiLineStrings: [forward_paths, backward_paths].
-
-Architecture (ADR-0033): Tier 1 NVRTC -- geometry-specific inner loops
-iterating all segment pairs across two geometries to detect collinearity
-and overlap.
-
-Precision (ADR-0002): CONSTRUCTIVE class -- stays fp64 on all devices per
-policy.  PrecisionPlan wired through dispatch for observability.
-
-Zero D2H transfers in the hot path.  Geometry data stays device-resident;
-only the final shared segment coordinates (small output) cross the bus for
-GeometryCollection assembly on host.
-"""
+"""Native shared-path classification and ordered collection assembly."""
 
 from __future__ import annotations
 
-import logging
-
 import numpy as np
 
-from vibespatial.constructive.shared_paths_cpu import (
-    empty_shared_paths_result,
-    init_shared_paths_result_array,
-    merge_shared_paths_segments,
-    shared_paths_cpu,
-)
-from vibespatial.cuda._runtime import (
-    KERNEL_PARAM_I32,
-    KERNEL_PARAM_PTR,
-    compile_kernel_group,
-    count_scatter_total,
-    get_cuda_runtime,
-)
-from vibespatial.cuda.cccl_primitives import exclusive_sum
-from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
+from vibespatial.constructive.shared_paths_cpu import shared_paths_cpu
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
-    TAG_FAMILIES,
+    DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
+    build_device_resident_owned,
     tile_single_row,
-    unique_tag_pairs,
-)
-from vibespatial.kernels.constructive.shared_paths import (
-    _SHARED_PATHS_KERNEL_SOURCE,
-    SHARED_PATHS_KERNEL_NAMES,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
-from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
+from vibespatial.runtime.crossover import (
+    WorkloadShape,
+    detect_workload_shape,
+    estimate_pairwise_work_from_owned,
+)
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
-from vibespatial.runtime.residency import Residency, TransferTrigger, combined_residency
+from vibespatial.runtime.residency import combined_residency
 
-logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# NVRTC warmup (ADR-0034)
-# ---------------------------------------------------------------------------
-
-request_nvrtc_warmup([
-    ("shared-paths", _SHARED_PATHS_KERNEL_SOURCE, SHARED_PATHS_KERNEL_NAMES),
-])
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover - CPU-only installs
+    cp = None
 
 
-def _shared_paths_kernels():
-    return compile_kernel_group(
-        "shared-paths", _SHARED_PATHS_KERNEL_SOURCE, SHARED_PATHS_KERNEL_NAMES,
-    )
+_LINEAL_FAMILIES = frozenset({GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING})
 
 
-# ---------------------------------------------------------------------------
-# Family definitions
-# ---------------------------------------------------------------------------
-
-_LS = GeometryFamily.LINESTRING
-_MLS = GeometryFamily.MULTILINESTRING
-
-# Supported kernel pairs: (left_family, right_family) -> (count_kernel, scatter_kernel)
-_KERNEL_PAIRS: dict[tuple[GeometryFamily, GeometryFamily], tuple[str, str]] = {
-    (_LS, _LS): ("shared_paths_ls_ls_count", "shared_paths_ls_ls_scatter"),
-    (_MLS, _LS): ("shared_paths_mls_ls_count", "shared_paths_mls_ls_scatter"),
-    (_LS, _MLS): ("shared_paths_mls_ls_count", "shared_paths_mls_ls_scatter"),
-    (_MLS, _MLS): ("shared_paths_mls_mls_count", "shared_paths_mls_mls_scatter"),
-}
+def _lineal_structure_only(owned: OwnedGeometryArray) -> bool:
+    """Admit lineal/null structure without exporting row tags."""
+    return all(family in _LINEAL_FAMILIES for family in owned.families)
 
 
-# ---------------------------------------------------------------------------
-# Family args builder
-# ---------------------------------------------------------------------------
-
-def _family_args(state, family, runtime):
-    """Build (args, arg_types) for one side of the kernel."""
-    ptr = runtime.pointer
-    P = KERNEL_PARAM_PTR
-
-    buf = state.families[family]
-
-    args = [ptr(state.validity), ptr(state.tags), ptr(state.family_row_offsets)]
-    types = [P, P, P]
-
-    args.append(ptr(buf.geometry_offsets))
-    types.append(P)
-
-    if family == _MLS:
-        args.append(ptr(buf.part_offsets))
-        types.append(P)
-
-    args.extend([ptr(buf.empty_mask), ptr(buf.x), ptr(buf.y)])
-    types.extend([P, P, P])
-
-    args.append(FAMILY_TAGS[family])
-    types.append(KERNEL_PARAM_I32)
-
-    return args, types
-
-
-# ---------------------------------------------------------------------------
-# GPU kernel dispatch
-# ---------------------------------------------------------------------------
-
-def _launch_shared_paths_subgroup(
-    left_owned: OwnedGeometryArray,
-    right_owned: OwnedGeometryArray,
-    d_left_idx,
-    d_right_idx,
-    sub_count: int,
-    left_family: GeometryFamily,
-    right_family: GeometryFamily,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    """Launch shared_paths count+scatter kernels for a family pair.
-
-    Returns (counts, offsets, seg_x1, seg_y1, seg_x2, seg_y2, seg_dir) on host,
-    or None if the family pair is not supported.
-    """
-    # Determine the kernel pair, handling left/right swap for LS x MLS
-    canonical_key = (left_family, right_family)
-    if canonical_key not in _KERNEL_PAIRS:
-        return None
-
-    # For LS x MLS, swap to MLS x LS (the kernel is MLS-left, LS-right)
-    if canonical_key == (_LS, _MLS):
-        eff_left_owned, eff_right_owned = right_owned, left_owned
-        eff_left_idx, eff_right_idx = d_right_idx, d_left_idx
-        eff_left_family, eff_right_family = _MLS, _LS
-    else:
-        eff_left_owned, eff_right_owned = left_owned, right_owned
-        eff_left_idx, eff_right_idx = d_left_idx, d_right_idx
-        eff_left_family, eff_right_family = left_family, right_family
-
-    count_kernel_name, scatter_kernel_name = _KERNEL_PAIRS[(eff_left_family, eff_right_family)]
-
-    left_state = eff_left_owned._ensure_device_state()
-    right_state = eff_right_owned._ensure_device_state()
+def _release_classified_page(page) -> None:
+    state = page.device_state
+    if state is None:
+        return
+    from vibespatial.cuda._runtime import get_cuda_runtime
 
     runtime = get_cuda_runtime()
-    ptr = runtime.pointer
-    kernels = _shared_paths_kernels()
+    for values in (
+        state.left_rows,
+        state.left_segments,
+        state.left_lookup,
+        state.right_rows,
+        state.right_segments,
+        state.right_lookup,
+        state.kinds,
+        state.point_x,
+        state.point_y,
+        state.overlap_x0,
+        state.overlap_y0,
+        state.overlap_x1,
+        state.overlap_y1,
+        state.ambiguous_rows,
+    ):
+        runtime.free(values)
 
-    left_args, left_types = _family_args(left_state, eff_left_family, runtime)
-    right_args, right_types = _family_args(right_state, eff_right_family, runtime)
 
-    # --- Count pass ---
-    d_counts = runtime.allocate((sub_count,), np.int32, zero=True)
-
-    count_tail_args = [ptr(eff_left_idx), ptr(eff_right_idx), ptr(d_counts), sub_count]
-    count_tail_types = [KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32]
-
-    all_count_args = tuple(left_args + right_args + count_tail_args)
-    all_count_types = tuple(left_types + right_types + count_tail_types)
-
-    grid, block = runtime.launch_config(kernels[count_kernel_name], sub_count)
-    runtime.launch(
-        kernels[count_kernel_name],
-        grid=grid,
-        block=block,
-        params=(all_count_args, all_count_types),
+def _build_candidate_overlap_lines(
+    d_x0,
+    d_y0,
+    d_x1,
+    d_y1,
+) -> OwnedGeometryArray:
+    capacity = int(d_x0.size)
+    d_x = cp.empty(capacity * 2, dtype=cp.float64)
+    d_y = cp.empty(capacity * 2, dtype=cp.float64)
+    d_x[0::2] = d_x0
+    d_y[0::2] = d_y0
+    d_x[1::2] = d_x1
+    d_y[1::2] = d_y1
+    return build_device_resident_owned(
+        device_families={
+            GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.LINESTRING,
+                x=d_x,
+                y=d_y,
+                geometry_offsets=(cp.arange(capacity + 1, dtype=cp.int32) * cp.int32(2)),
+                empty_mask=cp.zeros(capacity, dtype=cp.bool_),
+                bounds=None,
+            )
+        },
+        row_count=capacity,
+        tags=cp.full(
+            capacity,
+            FAMILY_TAGS[GeometryFamily.LINESTRING],
+            dtype=cp.int8,
+        ),
+        validity=cp.ones(capacity, dtype=cp.bool_),
+        family_row_offsets=cp.arange(capacity, dtype=cp.int32),
+        execution_mode="gpu",
     )
 
-    # --- Prefix sum + total ---
-    d_offsets = exclusive_sum(d_counts, synchronize=False)
-    total = count_scatter_total(
-        runtime,
-        d_counts,
-        d_offsets,
-        reason="constructive shared segment-path allocation fence",
+
+def _direction_atomic_lines(
+    overlap_geometry: OwnedGeometryArray,
+    d_rows,
+    d_active,
+    *,
+    row_count: int,
+):
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+    from vibespatial.constructive.binary_constructive import LinePartCapacitySelection
+    from vibespatial.constructive.grouped_mixed_union import (
+        atomic_line_union_from_part_capacity_device,
     )
 
-    if total == 0:
-        h_counts = np.zeros(sub_count, dtype=np.int32)
-        h_offsets = np.zeros(sub_count, dtype=np.int32)
-        runtime.free(d_counts)
-        runtime.free(d_offsets)
-        return (h_counts, h_offsets,
-                np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64),
-                np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64),
-                np.empty(0, dtype=np.int32))
-
-    # --- Allocate output arrays ---
-    d_out_x1 = runtime.allocate((total,), np.float64)
-    d_out_y1 = runtime.allocate((total,), np.float64)
-    d_out_x2 = runtime.allocate((total,), np.float64)
-    d_out_y2 = runtime.allocate((total,), np.float64)
-    d_out_dir = runtime.allocate((total,), np.int32, zero=True)
-
-    # --- Scatter pass ---
-    scatter_tail_args = [
-        ptr(eff_left_idx), ptr(eff_right_idx), ptr(d_offsets),
-        ptr(d_out_x1), ptr(d_out_y1), ptr(d_out_x2), ptr(d_out_y2),
-        ptr(d_out_dir), sub_count,
-    ]
-    scatter_tail_types = [
-        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-        KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-    ]
-
-    all_scatter_args = tuple(left_args + right_args + scatter_tail_args)
-    all_scatter_types = tuple(left_types + right_types + scatter_tail_types)
-
-    grid, block = runtime.launch_config(kernels[scatter_kernel_name], sub_count)
-    runtime.launch(
-        kernels[scatter_kernel_name],
-        grid=grid,
-        block=block,
-        params=(all_scatter_args, all_scatter_types),
+    selection = NativeDeviceSelection.from_mask(d_active)
+    d_capacity_active = selection.active_capacity_mask()
+    capacity_geometry = overlap_geometry._device_indexed_take(
+        selection.partition_capacity_positions(),
+        assume_unique_indices=True,
+    )._apply_row_activity(
+        d_capacity_active,
+        assume_active_indices_unique=True,
+    )
+    d_capacity_rows = selection.gather_capacity(
+        d_rows,
+        fill_value=0,
+    ).astype(cp.int32, copy=False)
+    return atomic_line_union_from_part_capacity_device(
+        LinePartCapacitySelection(
+            geometry=capacity_geometry,
+            source_rows=d_capacity_rows,
+            selection=selection.as_capacity_prefix(),
+            coord_capacity=int(overlap_geometry.row_count) * 2,
+        ),
+        d_capacity_rows,
+        output_row_count=row_count,
+        preserve_source_orientation=True,
     )
 
-    # --- Transfer results to host (single sync) ---
-    runtime.synchronize()
 
-    h_counts = np.empty(sub_count, dtype=np.int32)
-    h_offsets = np.empty(sub_count, dtype=np.int32)
-    h_x1 = np.empty(total, dtype=np.float64)
-    h_y1 = np.empty(total, dtype=np.float64)
-    h_x2 = np.empty(total, dtype=np.float64)
-    h_y2 = np.empty(total, dtype=np.float64)
-    h_dir = np.empty(total, dtype=np.int32)
+def _atomic_lines_to_multilinestring_capacity(
+    atomic_lines,
+    *,
+    d_validity,
+    row_count: int,
+) -> OwnedGeometryArray:
+    """Represent every direction as a valid-empty or populated MultiLineString."""
+    if atomic_lines is None:
+        edge_capacity = 0
+        d_edge_offsets = cp.zeros(row_count + 1, dtype=cp.int32)
+        d_edge_x0 = cp.empty(0, dtype=cp.float64)
+        d_edge_y0 = cp.empty(0, dtype=cp.float64)
+        d_edge_x1 = cp.empty(0, dtype=cp.float64)
+        d_edge_y1 = cp.empty(0, dtype=cp.float64)
+    else:
+        edge_capacity = int(atomic_lines.edge_x0.size)
+        d_edge_offsets = cp.asarray(
+            atomic_lines.edge_group_offsets,
+            dtype=cp.int32,
+        )
+        d_edge_x0 = cp.asarray(atomic_lines.edge_x0, dtype=cp.float64)
+        d_edge_y0 = cp.asarray(atomic_lines.edge_y0, dtype=cp.float64)
+        d_edge_x1 = cp.asarray(atomic_lines.edge_x1, dtype=cp.float64)
+        d_edge_y1 = cp.asarray(atomic_lines.edge_y1, dtype=cp.float64)
 
-    runtime.copy_device_to_host(
-        d_counts,
-        h_counts,
-        reason="shared-paths output counts host export",
+    d_x = cp.empty(edge_capacity * 2, dtype=cp.float64)
+    d_y = cp.empty(edge_capacity * 2, dtype=cp.float64)
+    d_x[0::2] = d_edge_x0
+    d_y[0::2] = d_edge_y0
+    d_x[1::2] = d_edge_x1
+    d_y[1::2] = d_edge_y1
+    d_part_offsets = cp.arange(edge_capacity + 1, dtype=cp.int32) * cp.int32(2)
+    d_part_counts = d_edge_offsets[1:] - d_edge_offsets[:-1]
+    return build_device_resident_owned(
+        device_families={
+            GeometryFamily.MULTILINESTRING: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.MULTILINESTRING,
+                x=d_x,
+                y=d_y,
+                geometry_offsets=d_edge_offsets,
+                empty_mask=d_part_counts == 0,
+                part_offsets=d_part_offsets,
+                bounds=None,
+            )
+        },
+        row_count=row_count,
+        tags=cp.full(
+            row_count,
+            FAMILY_TAGS[GeometryFamily.MULTILINESTRING],
+            dtype=cp.int8,
+        ),
+        validity=cp.asarray(d_validity, dtype=cp.bool_),
+        family_row_offsets=cp.arange(row_count, dtype=cp.int32),
+        execution_mode="gpu",
     )
-    runtime.copy_device_to_host(
-        d_offsets,
-        h_offsets,
-        reason="shared-paths output offsets host export",
-    )
-    runtime.copy_device_to_host(
-        d_out_x1,
-        h_x1,
-        reason="shared-paths first-path x-coordinate host export",
-    )
-    runtime.copy_device_to_host(
-        d_out_y1,
-        h_y1,
-        reason="shared-paths first-path y-coordinate host export",
-    )
-    runtime.copy_device_to_host(
-        d_out_x2,
-        h_x2,
-        reason="shared-paths second-path x-coordinate host export",
-    )
-    runtime.copy_device_to_host(
-        d_out_y2,
-        h_y2,
-        reason="shared-paths second-path y-coordinate host export",
-    )
-    runtime.copy_device_to_host(
-        d_out_dir,
-        h_dir,
-        reason="shared-paths direction-classification host export",
-    )
-
-    # Direction classification is symmetric: if A and B share a collinear
-    # segment in the same direction, it's "forward" regardless of which
-    # operand is called "left" or "right" in the kernel.  Verified against
-    # Shapely: shared_paths(LS, MLS) and shared_paths(MLS, LS) both
-    # classify direction identically.  No direction flip needed on swap.
-
-    # Cleanup
-    runtime.free(d_counts)
-    runtime.free(d_offsets)
-    runtime.free(d_out_x1)
-    runtime.free(d_out_y1)
-    runtime.free(d_out_x2)
-    runtime.free(d_out_y2)
-    runtime.free(d_out_dir)
-
-    return (h_counts, h_offsets, h_x1, h_y1, h_x2, h_y2, h_dir)
 
 
 @register_kernel_variant(
@@ -303,161 +203,156 @@ def _launch_shared_paths_subgroup(
     "gpu-cuda-python",
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
-    geometry_families=(
-        "linestring", "multilinestring",
-    ),
+    geometry_families=("linestring", "multilinestring"),
     supports_mixed=True,
     tags=("cuda-python", "constructive", "shared_paths"),
 )
 def _shared_paths_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
-) -> np.ndarray:
-    """Pure-GPU element-wise shared_paths.
+    *,
+    crs=None,
+):
+    """Classify overlap capacity and assemble ordered forward/backward parts."""
+    if cp is None:
+        raise RuntimeError("CuPy is required for native shared_paths")
+    if left.row_count != right.row_count:
+        raise ValueError("shared_paths GPU inputs must have equal row counts")
 
-    Groups rows by (left_tag, right_tag) and dispatches to the appropriate
-    NVRTC kernel per group.  Geometry data stays device-resident; only
-    the final shared segment coordinates (small output) cross the bus.
-
-    Returns a numpy array of Shapely GeometryCollection objects.
-    """
-    n = left.row_count
-    runtime = get_cuda_runtime()
-
-    # Ensure geometry buffers are device-resident
-    left.move_to(
-        Residency.DEVICE,
-        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-        reason="shared_paths: left geometry for GPU kernel",
+    from vibespatial.api._native_results import (
+        _ordered_geometry_collection_from_owned_parts_at_capacity,
     )
-    right.move_to(
-        Residency.DEVICE,
-        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-        reason="shared_paths: right geometry for GPU kernel",
+    from vibespatial.spatial.segment_primitives import (
+        PagedSegmentIntersectionResult,
+        SegmentIntersectionKind,
+        SegmentIntersectionResult,
+        _extract_segments_gpu,
+        classify_segment_intersections,
     )
 
-    left_tags = left.tags
-    right_tags = right.tags
-    left_valid = left.validity
-    right_valid = right.validity
+    row_count = int(left.row_count)
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right._ensure_device_state(preserve_indexed_view=True)
+    d_validity = cp.asarray(left_state.validity, dtype=cp.bool_) & cp.asarray(
+        right_state.validity,
+        dtype=cp.bool_,
+    )
+    left_segments = _extract_segments_gpu(left)
+    right_segments = _extract_segments_gpu(right)
+    pages = []
 
-    both_valid = left_valid & right_valid
-    valid_idx = np.flatnonzero(both_valid)
+    def _retain_page(page):
+        if page.count > 0:
+            pages.append(page)
 
-    results = init_shared_paths_result_array(n)
-
-    if valid_idx.size == 0:
-        return results
-
-    valid_left_tags = left_tags[valid_idx]
-    valid_right_tags = right_tags[valid_idx]
-
-    all_ok = True
-
-    # Collect all sub-group results then assemble
-    all_pair_counts = []
-    all_pair_offsets = []
-    all_seg_x1 = []
-    all_seg_y1 = []
-    all_seg_x2 = []
-    all_seg_y2 = []
-    all_seg_dir = []
-    all_pair_to_row = []
-
-    for lt, rt in unique_tag_pairs(valid_left_tags, valid_right_tags):
-        lf = TAG_FAMILIES[lt] if lt in TAG_FAMILIES else None
-        rf = TAG_FAMILIES[rt] if rt in TAG_FAMILIES else None
-        if lf is None or rf is None:
-            all_ok = False
-            continue
-
-        # Only support lineal geometry families
-        if lf not in (_LS, _MLS) or rf not in (_LS, _MLS):
-            all_ok = False
-            continue
-
-        sub_mask = (valid_left_tags == lt) & (valid_right_tags == rt)
-        sub_valid_pos = np.flatnonzero(sub_mask)
-        sub_idx = valid_idx[sub_valid_pos]
-        sub_count = sub_idx.size
-        if sub_count == 0:
-            continue
-
-        d_idx = runtime.from_host(sub_idx.astype(np.int32))
-
-        result = _launch_shared_paths_subgroup(
-            left, right,
-            d_idx, d_idx,  # left_idx == right_idx for element-wise
-            sub_count, lf, rf,
+    try:
+        classified = classify_segment_intersections(
+            left,
+            right,
+            dispatch_mode=ExecutionMode.GPU,
+            precision=PrecisionMode.FP64,
+            _cached_left_device_segments=left_segments,
+            _cached_right_device_segments=right_segments,
+            _require_same_row=True,
+            _collect_ambiguous_rows=False,
+            _compact_paged_non_disjoint=True,
+            _classified_page_consumer=_retain_page,
         )
+        if isinstance(classified, SegmentIntersectionResult):
+            if classified.count > 0:
+                pages.append(classified)
+        elif not isinstance(classified, PagedSegmentIntersectionResult):
+            raise RuntimeError("shared_paths received an unknown classifier result")
+        if classified.runtime_selection.selected is not ExecutionMode.GPU:
+            raise RuntimeError("shared_paths classifier did not remain on GPU")
 
-        runtime.free(d_idx)
+        forward_atomic = None
+        backward_atomic = None
+        if pages:
+            states = tuple(page.device_state for page in pages)
+            if any(state is None for state in states):
+                raise RuntimeError("shared_paths classification returned a host page")
 
-        if result is not None:
-            h_counts, h_offsets, h_x1, h_y1, h_x2, h_y2, h_dir = result
-            all_pair_counts.append(h_counts)
-            all_pair_offsets.append(h_offsets)
-            all_seg_x1.append(h_x1)
-            all_seg_y1.append(h_y1)
-            all_seg_x2.append(h_x2)
-            all_seg_y2.append(h_y2)
-            all_seg_dir.append(h_dir)
-            all_pair_to_row.append(sub_idx)
-        else:
-            all_ok = False
+            def _concat(field):
+                values = tuple(cp.asarray(getattr(state, field)) for state in states)
+                return values[0] if len(values) == 1 else cp.concatenate(values)
 
-    # Assemble GeometryCollections from all sub-groups
-    for sg_idx in range(len(all_pair_counts)):
-        counts = all_pair_counts[sg_idx]
-        offsets = all_pair_offsets[sg_idx]
-        x1 = all_seg_x1[sg_idx]
-        y1 = all_seg_y1[sg_idx]
-        x2 = all_seg_x2[sg_idx]
-        y2 = all_seg_y2[sg_idx]
-        dirs = all_seg_dir[sg_idx]
-        pair_rows = all_pair_to_row[sg_idx]
+            d_rows = _concat("left_rows").astype(cp.int32, copy=False)
+            d_left_lookup = _concat("left_lookup").astype(cp.int64, copy=False)
+            d_right_lookup = _concat("right_lookup").astype(cp.int64, copy=False)
+            d_kinds = _concat("kinds").astype(cp.int8, copy=False)
+            d_overlap = d_kinds == cp.int8(SegmentIntersectionKind.OVERLAP)
 
-        for pair_idx in range(len(counts)):
-            count = counts[pair_idx]
-            if count == 0:
-                continue
+            d_left_dx = (
+                cp.asarray(left_segments.x1)[d_left_lookup]
+                - cp.asarray(left_segments.x0)[d_left_lookup]
+            )
+            d_left_dy = (
+                cp.asarray(left_segments.y1)[d_left_lookup]
+                - cp.asarray(left_segments.y0)[d_left_lookup]
+            )
+            d_right_dx = (
+                cp.asarray(right_segments.x1)[d_right_lookup]
+                - cp.asarray(right_segments.x0)[d_right_lookup]
+            )
+            d_right_dy = (
+                cp.asarray(right_segments.y1)[d_right_lookup]
+                - cp.asarray(right_segments.y0)[d_right_lookup]
+            )
+            d_use_x = cp.abs(d_left_dx) >= cp.abs(d_left_dy)
+            d_left_positive = cp.where(d_use_x, d_left_dx > 0, d_left_dy > 0)
+            d_right_positive = cp.where(d_use_x, d_right_dx > 0, d_right_dy > 0)
+            d_same_direction = d_left_positive == d_right_positive
+            d_reverse_overlap = ~d_left_positive
 
-            row_idx = pair_rows[pair_idx]
-            offset = offsets[pair_idx]
-
-            forward_segs = []
-            backward_segs = []
-
-            for s in range(count):
-                idx = offset + s
-                seg = [(x1[idx], y1[idx]), (x2[idx], y2[idx])]
-                if dirs[idx] == 0:
-                    forward_segs.append(seg)
-                else:
-                    backward_segs.append(seg)
-
-            # Merge with any existing segments from previous sub-groups
-            existing = results[row_idx]
-            results[row_idx] = merge_shared_paths_segments(
-                existing if existing is not None else empty_shared_paths_result(),
-                forward_segs,
-                backward_segs,
+            d_raw_x0 = _concat("overlap_x0").astype(cp.float64, copy=False)
+            d_raw_y0 = _concat("overlap_y0").astype(cp.float64, copy=False)
+            d_raw_x1 = _concat("overlap_x1").astype(cp.float64, copy=False)
+            d_raw_y1 = _concat("overlap_y1").astype(cp.float64, copy=False)
+            overlap_geometry = _build_candidate_overlap_lines(
+                cp.where(d_reverse_overlap, d_raw_x1, d_raw_x0),
+                cp.where(d_reverse_overlap, d_raw_y1, d_raw_y0),
+                cp.where(d_reverse_overlap, d_raw_x0, d_raw_x1),
+                cp.where(d_reverse_overlap, d_raw_y0, d_raw_y1),
+            )
+            forward_atomic = _direction_atomic_lines(
+                overlap_geometry,
+                d_rows,
+                d_overlap & d_same_direction,
+                row_count=row_count,
+            )
+            backward_atomic = _direction_atomic_lines(
+                overlap_geometry,
+                d_rows,
+                d_overlap & ~d_same_direction,
+                row_count=row_count,
             )
 
-    if not all_ok:
-        # Some rows had unsupported family pairs — reject the entire batch
-        # and let the dispatch system route to the CPU variant.
-        raise NotImplementedError(
-            "shared_paths GPU path encountered unsupported geometry families; "
-            "falling back to CPU variant"
+        output_rows = cp.arange(row_count, dtype=cp.int64)
+        forward = _atomic_lines_to_multilinestring_capacity(
+            forward_atomic,
+            d_validity=d_validity,
+            row_count=row_count,
         )
+        backward = _atomic_lines_to_multilinestring_capacity(
+            backward_atomic,
+            d_validity=d_validity,
+            row_count=row_count,
+        )
+        result = _ordered_geometry_collection_from_owned_parts_at_capacity(
+            ((forward, output_rows), (backward, output_rows)),
+            row_count=row_count,
+            crs=crs,
+        )
+        if result is None:
+            raise RuntimeError("shared_paths lost ordered native composition")
+        return result
+    finally:
+        for page in pages:
+            _release_classified_page(page)
+        left_segments.free()
+        right_segments.free()
 
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def shared_paths_owned(
     left: OwnedGeometryArray,
@@ -465,68 +360,70 @@ def shared_paths_owned(
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
-) -> np.ndarray:
-    """Element-wise shared_paths between two OwnedGeometryArrays.
-
-    Returns a numpy array of Shapely GeometryCollection objects.  Each
-    GeometryCollection contains two MultiLineStrings:
-      - geoms[0]: forward shared paths (same direction)
-      - geoms[1]: backward shared paths (opposite direction)
-
-    Supports pairwise (N vs N) and broadcast-right (N vs 1) modes.
-    """
-    n = left.row_count
-    workload = detect_workload_shape(n, right.row_count)
-
+    crs=None,
+):
+    """Return native ordered shared paths on GPU or explicit Shapely output on CPU."""
+    row_count = int(left.row_count)
+    workload = detect_workload_shape(row_count, right.row_count)
     if workload is WorkloadShape.BROADCAST_RIGHT:
-        right = tile_single_row(right, n)
-
-    if n == 0:
+        right = tile_single_row(right, row_count)
+    if row_count == 0:
         return np.empty(0, dtype=object)
-
     if isinstance(precision, str):
         precision = PrecisionMode(precision)
 
     selection = plan_dispatch_selection(
         kernel_name="shared_paths",
         kernel_class=KernelClass.CONSTRUCTIVE,
-        row_count=n,
+        row_count=row_count,
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=combined_residency(left, right),
+        work_estimate=estimate_pairwise_work_from_owned(
+            left,
+            right,
+            workload=workload,
+            output_row_count=row_count,
+            primary_unit_name="shared-segment-candidate",
+        ),
     )
-
     precision_plan = selection.precision_plan
 
     if selection.selected is ExecutionMode.GPU:
-        try:
-            result = _shared_paths_gpu(left, right)
+        if _lineal_structure_only(left) and _lineal_structure_only(right):
+            result = _shared_paths_gpu(left, right, crs=crs)
             record_dispatch_event(
                 surface="shared_paths_owned",
                 operation="shared_paths",
-                implementation="shared_paths_gpu",
-                reason="element-wise shared_paths via owned GPU kernels",
-                detail=(
-                    f"rows={n}, precision={precision_plan.compute_precision.value}, "
-                    f"workload={workload.value}"
+                implementation="shared_segment_topology_gpu",
+                reason=(
+                    "same-row segment overlap classification assembled ordered "
+                    "forward/backward native MultiLineString capacity"
                 ),
+                detail=(
+                    f"rows={row_count}, "
+                    f"precision={precision_plan.compute_precision.value}, "
+                    f"workload={workload.value}, "
+                    "physical_shape=segment_candidate_atomic_line_capacity"
+                ),
+                requested=dispatch_mode,
                 selected=ExecutionMode.GPU,
             )
             return result
-        except Exception as exc:
-            record_fallback_event(
-                surface="shared_paths_owned",
-                reason=f"GPU shared_paths kernel failed: {exc}",
-                detail=f"rows={n}, falling back to CPU Shapely path",
-                pipeline="shared_paths",
-            )
+        record_fallback_event(
+            surface="shared_paths_owned",
+            reason="native shared_paths requires lineal or null geometry structure",
+            detail=f"rows={row_count}",
+            pipeline="shared_paths",
+        )
 
     record_dispatch_event(
         surface="shared_paths_owned",
         operation="shared_paths",
         implementation="shapely_cpu",
-        reason="GPU not available or not selected for shared_paths",
-        detail=f"rows={n}",
+        reason="GPU not available, not selected, or structurally inadmissible",
+        detail=f"rows={row_count}",
+        requested=dispatch_mode,
         selected=ExecutionMode.CPU,
     )
     return shared_paths_cpu(left, right)

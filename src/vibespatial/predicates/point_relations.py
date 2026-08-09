@@ -22,18 +22,36 @@ POINT_LOCATION_OUTSIDE = np.uint8(0)
 POINT_LOCATION_BOUNDARY = np.uint8(1)
 POINT_LOCATION_INTERIOR = np.uint8(2)
 
-request_nvrtc_warmup([
-    ("point-binary-relations", _POINT_BINARY_RELATIONS_KERNEL_SOURCE, _POINT_BINARY_RELATIONS_KERNEL_NAMES),
-    ("multipoint-binary-relations", _MULTIPOINT_BINARY_RELATIONS_KERNEL_SOURCE, _MULTIPOINT_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        (
+            "point-binary-relations",
+            _POINT_BINARY_RELATIONS_KERNEL_SOURCE,
+            _POINT_BINARY_RELATIONS_KERNEL_NAMES,
+        ),
+        (
+            "multipoint-binary-relations",
+            _MULTIPOINT_BINARY_RELATIONS_KERNEL_SOURCE,
+            _MULTIPOINT_KERNEL_NAMES,
+        ),
+    ]
+)
 
 
 def _point_binary_relation_kernels():
-    return compile_kernel_group("point-binary-relations", _POINT_BINARY_RELATIONS_KERNEL_SOURCE, _POINT_BINARY_RELATIONS_KERNEL_NAMES)
+    return compile_kernel_group(
+        "point-binary-relations",
+        _POINT_BINARY_RELATIONS_KERNEL_SOURCE,
+        _POINT_BINARY_RELATIONS_KERNEL_NAMES,
+    )
 
 
 def _multipoint_relation_kernels():
-    return compile_kernel_group("multipoint-binary-relations", _MULTIPOINT_BINARY_RELATIONS_KERNEL_SOURCE, _MULTIPOINT_KERNEL_NAMES)
+    return compile_kernel_group(
+        "multipoint-binary-relations",
+        _MULTIPOINT_BINARY_RELATIONS_KERNEL_SOURCE,
+        _MULTIPOINT_KERNEL_NAMES,
+    )
 
 
 def _is_device_array(value) -> bool:
@@ -121,6 +139,7 @@ def _point_equals_to_predicate_array(predicate: str, relation):
 # _launch_rows_kernel, _launch_indexed_kernel, _launch_indexed_mp_kernel.
 # ---------------------------------------------------------------------------
 
+
 def _launch_kernel(
     kernel_dict_fn,
     kernel_name: str,
@@ -199,6 +218,7 @@ def _launch_kernel(
 # device-side family_row_offsets directly.
 # ---------------------------------------------------------------------------
 
+
 def classify_point_equals_gpu(
     candidate_rows: np.ndarray,
     left: OwnedGeometryArray,
@@ -212,8 +232,8 @@ def classify_point_equals_gpu(
 
             return cp.empty(0, dtype=cp.uint8)
         return np.empty(0, dtype=np.uint8)
-    left_state = left._ensure_device_state()
-    right_state = right._ensure_device_state()
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right._ensure_device_state(preserve_indexed_view=True)
     left_buffer = left_state.families[GeometryFamily.POINT]
     right_buffer = right_state.families[GeometryFamily.POINT]
     runtime = get_cuda_runtime()
@@ -253,8 +273,8 @@ def classify_point_line_gpu(
 
             return cp.empty(0, dtype=cp.uint8)
         return np.empty(0, dtype=np.uint8)
-    point_state = points._ensure_device_state()
-    line_state = lines._ensure_device_state()
+    point_state = points._ensure_device_state(preserve_indexed_view=True)
+    line_state = lines._ensure_device_state(preserve_indexed_view=True)
     point_buffer = point_state.families[GeometryFamily.POINT]
     line_buffer = line_state.families[line_family]
     runtime = get_cuda_runtime()
@@ -275,14 +295,19 @@ def classify_point_line_gpu(
     ]
     if line_family is not GeometryFamily.LINESTRING:
         args.append(ptr(line_buffer.part_offsets))
-    args.extend([
-        ptr(line_buffer.empty_mask),
-        ptr(line_buffer.x),
-        ptr(line_buffer.y),
-    ])
+    args.extend(
+        [
+            ptr(line_buffer.empty_mask),
+            ptr(line_buffer.x),
+            ptr(line_buffer.y),
+        ]
+    )
     return _launch_kernel(
-        _point_binary_relation_kernels, kernel_name,
-        candidate_rows, tuple(args), (KERNEL_PARAM_PTR,) * len(args),
+        _point_binary_relation_kernels,
+        kernel_name,
+        candidate_rows,
+        tuple(args),
+        (KERNEL_PARAM_PTR,) * len(args),
         return_device=return_device,
     )
 
@@ -301,8 +326,8 @@ def classify_point_region_gpu(
 
             return cp.empty(0, dtype=cp.uint8)
         return np.empty(0, dtype=np.uint8)
-    point_state = points._ensure_device_state()
-    region_state = regions._ensure_device_state()
+    point_state = points._ensure_device_state(preserve_indexed_view=True)
+    region_state = regions._ensure_device_state(preserve_indexed_view=True)
     point_buffer = point_state.families[GeometryFamily.POINT]
     region_buffer = region_state.families[region_family]
     runtime = get_cuda_runtime()
@@ -324,14 +349,19 @@ def classify_point_region_gpu(
     ]
     if region_family is not GeometryFamily.POLYGON:
         args.append(ptr(region_buffer.part_offsets))
-    args.extend([
-        ptr(region_buffer.ring_offsets),
-        ptr(region_buffer.x),
-        ptr(region_buffer.y),
-    ])
+    args.extend(
+        [
+            ptr(region_buffer.ring_offsets),
+            ptr(region_buffer.x),
+            ptr(region_buffer.y),
+        ]
+    )
     return _launch_kernel(
-        _point_binary_relation_kernels, kernel_name,
-        candidate_rows, tuple(args), (KERNEL_PARAM_PTR,) * len(args),
+        _point_binary_relation_kernels,
+        kernel_name,
+        candidate_rows,
+        tuple(args),
+        (KERNEL_PARAM_PTR,) * len(args),
         return_device=return_device,
     )
 
@@ -354,7 +384,7 @@ def _prepare_indexed_fro(owned, indices, runtime):
     if _is_device_array(indices):
         import cupy as cp
 
-        state = owned._ensure_device_state()
+        state = owned._ensure_device_state(preserve_indexed_view=True)
         return state.family_row_offsets[indices].astype(cp.int32, copy=False)
     mapped = owned.family_row_offsets[indices].astype(np.int32, copy=False)
     return runtime.from_host(mapped)
@@ -375,8 +405,8 @@ def _classify_indexed_point_equals(
 
             return cp.empty(0, dtype=cp.uint8)
         return np.empty(0, dtype=np.uint8)
-    left_state = left_owned._ensure_device_state()
-    right_state = right_owned._ensure_device_state()
+    left_state = left_owned._ensure_device_state(preserve_indexed_view=True)
+    right_state = right_owned._ensure_device_state(preserve_indexed_view=True)
     left_buffer = left_state.families[GeometryFamily.POINT]
     right_buffer = right_state.families[GeometryFamily.POINT]
     runtime = get_cuda_runtime()
@@ -387,7 +417,8 @@ def _classify_indexed_point_equals(
     identity_rows = _identity_rows(n, device=return_device)
     return _launch_kernel(
         _point_binary_relation_kernels,
-        "point_equals_compacted", identity_rows,
+        "point_equals_compacted",
+        identity_rows,
         (
             ptr(device_left_fro),
             ptr(left_buffer.geometry_offsets),
@@ -422,8 +453,8 @@ def _classify_indexed_point_line(
 
             return cp.empty(0, dtype=cp.uint8)
         return np.empty(0, dtype=np.uint8)
-    point_state = point_owned._ensure_device_state()
-    line_state = line_owned._ensure_device_state()
+    point_state = point_owned._ensure_device_state(preserve_indexed_view=True)
+    line_state = line_owned._ensure_device_state(preserve_indexed_view=True)
     point_buffer = point_state.families[GeometryFamily.POINT]
     line_buffer = line_state.families[line_family]
     runtime = get_cuda_runtime()
@@ -448,14 +479,19 @@ def _classify_indexed_point_line(
     ]
     if line_family is not GeometryFamily.LINESTRING:
         args.append(ptr(line_buffer.part_offsets))
-    args.extend([
-        ptr(line_buffer.empty_mask),
-        ptr(line_buffer.x),
-        ptr(line_buffer.y),
-    ])
+    args.extend(
+        [
+            ptr(line_buffer.empty_mask),
+            ptr(line_buffer.x),
+            ptr(line_buffer.y),
+        ]
+    )
     return _launch_kernel(
-        _point_binary_relation_kernels, kernel_name,
-        identity_rows, tuple(args), (KERNEL_PARAM_PTR,) * len(args),
+        _point_binary_relation_kernels,
+        kernel_name,
+        identity_rows,
+        tuple(args),
+        (KERNEL_PARAM_PTR,) * len(args),
         extra_device_allocs=[device_point_fro, device_line_fro],
         return_device=return_device,
     )
@@ -477,8 +513,8 @@ def _classify_indexed_point_region(
 
             return cp.empty(0, dtype=cp.uint8)
         return np.empty(0, dtype=np.uint8)
-    point_state = point_owned._ensure_device_state()
-    region_state = region_owned._ensure_device_state()
+    point_state = point_owned._ensure_device_state(preserve_indexed_view=True)
+    region_state = region_owned._ensure_device_state(preserve_indexed_view=True)
     point_buffer = point_state.families[GeometryFamily.POINT]
     region_buffer = region_state.families[region_family]
     runtime = get_cuda_runtime()
@@ -504,14 +540,19 @@ def _classify_indexed_point_region(
     ]
     if region_family is not GeometryFamily.POLYGON:
         args.append(ptr(region_buffer.part_offsets))
-    args.extend([
-        ptr(region_buffer.ring_offsets),
-        ptr(region_buffer.x),
-        ptr(region_buffer.y),
-    ])
+    args.extend(
+        [
+            ptr(region_buffer.ring_offsets),
+            ptr(region_buffer.x),
+            ptr(region_buffer.y),
+        ]
+    )
     return _launch_kernel(
-        _point_binary_relation_kernels, kernel_name,
-        identity_rows, tuple(args), (KERNEL_PARAM_PTR,) * len(args),
+        _point_binary_relation_kernels,
+        kernel_name,
+        identity_rows,
+        tuple(args),
+        (KERNEL_PARAM_PTR,) * len(args),
         extra_device_allocs=[device_point_fro, device_region_fro],
         return_device=return_device,
     )
@@ -550,7 +591,10 @@ def classify_point_predicates_indexed(
     if pp_mask.any():
         idx = np.flatnonzero(pp_mask)
         relation = _classify_indexed_point_equals(
-            left_owned, right_owned, left_indices[idx], right_indices[idx],
+            left_owned,
+            right_owned,
+            left_indices[idx],
+            right_indices[idx],
         )
         _apply_relation_rows(out, idx, _point_equals_to_predicate(predicate, relation))
 
@@ -560,39 +604,61 @@ def classify_point_predicates_indexed(
         if pl_mask.any():
             idx = np.flatnonzero(pl_mask)
             relation = _classify_indexed_point_line(
-                left_owned, right_owned, left_indices[idx], right_indices[idx],
+                left_owned,
+                right_owned,
+                left_indices[idx],
+                right_indices[idx],
                 line_family=line_family,
             )
-            _apply_relation_rows(out, idx, _point_relation_to_predicate(predicate, relation, point_on_left=True))
+            _apply_relation_rows(
+                out, idx, _point_relation_to_predicate(predicate, relation, point_on_left=True)
+            )
 
         lp_mask = (left_tags == line_tag) & (right_tags == _POINT_TAG_INDEXED)
         if lp_mask.any():
             idx = np.flatnonzero(lp_mask)
             relation = _classify_indexed_point_line(
-                right_owned, left_owned, right_indices[idx], left_indices[idx],
+                right_owned,
+                left_owned,
+                right_indices[idx],
+                left_indices[idx],
                 line_family=line_family,
             )
-            _apply_relation_rows(out, idx, _point_relation_to_predicate(predicate, relation, point_on_left=False))
+            _apply_relation_rows(
+                out, idx, _point_relation_to_predicate(predicate, relation, point_on_left=False)
+            )
 
     # Point x region and region x point
-    for region_family, region_tag in zip(_REGION_FAMILIES_INDEXED, _REGION_TAGS_INDEXED, strict=True):
+    for region_family, region_tag in zip(
+        _REGION_FAMILIES_INDEXED, _REGION_TAGS_INDEXED, strict=True
+    ):
         pr_mask = (left_tags == _POINT_TAG_INDEXED) & (right_tags == region_tag)
         if pr_mask.any():
             idx = np.flatnonzero(pr_mask)
             relation = _classify_indexed_point_region(
-                left_owned, right_owned, left_indices[idx], right_indices[idx],
+                left_owned,
+                right_owned,
+                left_indices[idx],
+                right_indices[idx],
                 region_family=region_family,
             )
-            _apply_relation_rows(out, idx, _point_relation_to_predicate(predicate, relation, point_on_left=True))
+            _apply_relation_rows(
+                out, idx, _point_relation_to_predicate(predicate, relation, point_on_left=True)
+            )
 
         rp_mask = (region_tag == left_tags) & (right_tags == _POINT_TAG_INDEXED)
         if rp_mask.any():
             idx = np.flatnonzero(rp_mask)
             relation = _classify_indexed_point_region(
-                right_owned, left_owned, right_indices[idx], left_indices[idx],
+                right_owned,
+                left_owned,
+                right_indices[idx],
+                left_indices[idx],
                 region_family=region_family,
             )
-            _apply_relation_rows(out, idx, _point_relation_to_predicate(predicate, relation, point_on_left=False))
+            _apply_relation_rows(
+                out, idx, _point_relation_to_predicate(predicate, relation, point_on_left=False)
+            )
 
     # Multipoint x anything and anything x multipoint
     mp_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
@@ -601,11 +667,16 @@ def classify_point_predicates_indexed(
 
     if mp_left_mask.any() or mp_right_mask.any():
         _dispatch_multipoint_pairs(
-            predicate, out,
-            left_owned, right_owned,
-            left_indices, right_indices,
-            left_tags, right_tags,
-            mp_left_mask, mp_right_mask,
+            predicate,
+            out,
+            left_owned,
+            right_owned,
+            left_indices,
+            right_indices,
+            left_tags,
+            right_tags,
+            mp_left_mask,
+            mp_right_mask,
             _apply_relation_rows,
         )
 
@@ -637,8 +708,8 @@ def classify_point_predicates_indexed_device(
     if n == 0:
         return cp.empty(0, dtype=cp.bool_)
 
-    left_state = left_owned._ensure_device_state()
-    right_state = right_owned._ensure_device_state()
+    left_state = left_owned._ensure_device_state(preserve_indexed_view=True)
+    right_state = right_owned._ensure_device_state(preserve_indexed_view=True)
     left_tags = (
         cp.asarray(left_tags, dtype=cp.int8)
         if left_tags is not None
@@ -652,10 +723,7 @@ def classify_point_predicates_indexed_device(
 
     out = cp.zeros(n, dtype=cp.bool_)
 
-    if (
-        GeometryFamily.POINT in left_state.families
-        and GeometryFamily.POINT in right_state.families
-    ):
+    if GeometryFamily.POINT in left_state.families and GeometryFamily.POINT in right_state.families:
         pp_mask = (left_tags == _POINT_TAG_INDEXED) & (right_tags == _POINT_TAG_INDEXED)
         idx = cp.flatnonzero(pp_mask).astype(cp.int32, copy=False)
         relation = _classify_indexed_point_equals(
@@ -668,10 +736,7 @@ def classify_point_predicates_indexed_device(
         out[idx] = _point_equals_to_predicate_array(predicate, relation)
 
     for line_family, line_tag in zip(_LINE_FAMILIES_INDEXED, _LINE_TAGS_INDEXED, strict=True):
-        if (
-            GeometryFamily.POINT in left_state.families
-            and line_family in right_state.families
-        ):
+        if GeometryFamily.POINT in left_state.families and line_family in right_state.families:
             pl_mask = (left_tags == _POINT_TAG_INDEXED) & (right_tags == line_tag)
             idx = cp.flatnonzero(pl_mask).astype(cp.int32, copy=False)
             relation = _classify_indexed_point_line(
@@ -688,10 +753,7 @@ def classify_point_predicates_indexed_device(
                 point_on_left=True,
             )
 
-        if (
-            line_family in left_state.families
-            and GeometryFamily.POINT in right_state.families
-        ):
+        if line_family in left_state.families and GeometryFamily.POINT in right_state.families:
             lp_mask = (left_tags == line_tag) & (right_tags == _POINT_TAG_INDEXED)
             idx = cp.flatnonzero(lp_mask).astype(cp.int32, copy=False)
             relation = _classify_indexed_point_line(
@@ -708,11 +770,10 @@ def classify_point_predicates_indexed_device(
                 point_on_left=False,
             )
 
-    for region_family, region_tag in zip(_REGION_FAMILIES_INDEXED, _REGION_TAGS_INDEXED, strict=True):
-        if (
-            GeometryFamily.POINT in left_state.families
-            and region_family in right_state.families
-        ):
+    for region_family, region_tag in zip(
+        _REGION_FAMILIES_INDEXED, _REGION_TAGS_INDEXED, strict=True
+    ):
+        if GeometryFamily.POINT in left_state.families and region_family in right_state.families:
             pr_mask = (left_tags == _POINT_TAG_INDEXED) & (right_tags == region_tag)
             idx = cp.flatnonzero(pr_mask).astype(cp.int32, copy=False)
             relation = _classify_indexed_point_region(
@@ -729,10 +790,7 @@ def classify_point_predicates_indexed_device(
                 point_on_left=True,
             )
 
-        if (
-            region_family in left_state.families
-            and GeometryFamily.POINT in right_state.families
-        ):
+        if region_family in left_state.families and GeometryFamily.POINT in right_state.families:
             rp_mask = (left_tags == region_tag) & (right_tags == _POINT_TAG_INDEXED)
             idx = cp.flatnonzero(rp_mask).astype(cp.int32, copy=False)
             relation = _classify_indexed_point_region(
@@ -860,6 +918,7 @@ def _multipoint_bits_to_predicate(
 # Indexed multipoint classify functions
 # ---------------------------------------------------------------------------
 
+
 def _classify_indexed_mp_point(
     mp_owned: OwnedGeometryArray,
     pt_owned: OwnedGeometryArray,
@@ -876,8 +935,8 @@ def _classify_indexed_mp_point(
 
             return cp.empty(0, dtype=cp.uint8)
         return np.empty(0, dtype=np.uint8)
-    mp_state = mp_owned._ensure_device_state()
-    pt_state = pt_owned._ensure_device_state()
+    mp_state = mp_owned._ensure_device_state(preserve_indexed_view=True)
+    pt_state = pt_owned._ensure_device_state(preserve_indexed_view=True)
     mp_buffer = mp_state.families[GeometryFamily.MULTIPOINT]
     pt_buffer = pt_state.families[GeometryFamily.POINT]
     runtime = get_cuda_runtime()
@@ -888,7 +947,8 @@ def _classify_indexed_mp_point(
     identity_rows = _identity_rows(n, device=return_device)
     return _launch_kernel(
         _multipoint_relation_kernels,
-        "multipoint_point_relation_compacted", identity_rows,
+        "multipoint_point_relation_compacted",
+        identity_rows,
         (
             ptr(device_mp_fro),
             ptr(mp_buffer.geometry_offsets),
@@ -924,8 +984,8 @@ def _classify_indexed_mp_line(
 
             return cp.empty(0, dtype=cp.uint8)
         return np.empty(0, dtype=np.uint8)
-    mp_state = mp_owned._ensure_device_state()
-    line_state = line_owned._ensure_device_state()
+    mp_state = mp_owned._ensure_device_state(preserve_indexed_view=True)
+    line_state = line_owned._ensure_device_state(preserve_indexed_view=True)
     mp_buffer = mp_state.families[GeometryFamily.MULTIPOINT]
     line_buffer = line_state.families[line_family]
     runtime = get_cuda_runtime()
@@ -950,14 +1010,19 @@ def _classify_indexed_mp_line(
     ]
     if line_family is not GeometryFamily.LINESTRING:
         args.append(ptr(line_buffer.part_offsets))
-    args.extend([
-        ptr(line_buffer.empty_mask),
-        ptr(line_buffer.x),
-        ptr(line_buffer.y),
-    ])
+    args.extend(
+        [
+            ptr(line_buffer.empty_mask),
+            ptr(line_buffer.x),
+            ptr(line_buffer.y),
+        ]
+    )
     return _launch_kernel(
-        _multipoint_relation_kernels, kernel_name,
-        identity_rows, tuple(args), (KERNEL_PARAM_PTR,) * len(args),
+        _multipoint_relation_kernels,
+        kernel_name,
+        identity_rows,
+        tuple(args),
+        (KERNEL_PARAM_PTR,) * len(args),
         extra_device_allocs=[device_mp_fro, device_line_fro],
         return_device=return_device,
     )
@@ -980,8 +1045,8 @@ def _classify_indexed_mp_region(
 
             return cp.empty(0, dtype=cp.uint8)
         return np.empty(0, dtype=np.uint8)
-    mp_state = mp_owned._ensure_device_state()
-    region_state = region_owned._ensure_device_state()
+    mp_state = mp_owned._ensure_device_state(preserve_indexed_view=True)
+    region_state = region_owned._ensure_device_state(preserve_indexed_view=True)
     mp_buffer = mp_state.families[GeometryFamily.MULTIPOINT]
     region_buffer = region_state.families[region_family]
     runtime = get_cuda_runtime()
@@ -1007,14 +1072,19 @@ def _classify_indexed_mp_region(
     ]
     if region_family is not GeometryFamily.POLYGON:
         args.append(ptr(region_buffer.part_offsets))
-    args.extend([
-        ptr(region_buffer.ring_offsets),
-        ptr(region_buffer.x),
-        ptr(region_buffer.y),
-    ])
+    args.extend(
+        [
+            ptr(region_buffer.ring_offsets),
+            ptr(region_buffer.x),
+            ptr(region_buffer.y),
+        ]
+    )
     return _launch_kernel(
-        _multipoint_relation_kernels, kernel_name,
-        identity_rows, tuple(args), (KERNEL_PARAM_PTR,) * len(args),
+        _multipoint_relation_kernels,
+        kernel_name,
+        identity_rows,
+        tuple(args),
+        (KERNEL_PARAM_PTR,) * len(args),
         extra_device_allocs=[device_mp_fro, device_region_fro],
         return_device=return_device,
     )
@@ -1036,8 +1106,8 @@ def _classify_indexed_mp_mp(
 
             return cp.empty(0, dtype=cp.uint8)
         return np.empty(0, dtype=np.uint8)
-    left_state = left_owned._ensure_device_state()
-    right_state = right_owned._ensure_device_state()
+    left_state = left_owned._ensure_device_state(preserve_indexed_view=True)
+    right_state = right_owned._ensure_device_state(preserve_indexed_view=True)
     left_buffer = left_state.families[GeometryFamily.MULTIPOINT]
     right_buffer = right_state.families[GeometryFamily.MULTIPOINT]
     runtime = get_cuda_runtime()
@@ -1048,7 +1118,8 @@ def _classify_indexed_mp_mp(
     identity_rows = _identity_rows(n, device=return_device)
     return _launch_kernel(
         _multipoint_relation_kernels,
-        "multipoint_multipoint_relation_compacted", identity_rows,
+        "multipoint_multipoint_relation_compacted",
+        identity_rows,
         (
             ptr(device_left_fro),
             ptr(left_buffer.geometry_offsets),
@@ -1090,11 +1161,21 @@ def _dispatch_multipoint_pairs(
     if mask.any():
         idx = np.flatnonzero(mask)
         bits = _classify_indexed_mp_point(
-            left_owned, right_owned, left_indices[idx], right_indices[idx],
+            left_owned,
+            right_owned,
+            left_indices[idx],
+            right_indices[idx],
         )
-        _apply_relation_rows(out, idx, _multipoint_bits_to_predicate(
-            predicate, bits, mp_on_left=True, target_family=GeometryFamily.POINT,
-        ))
+        _apply_relation_rows(
+            out,
+            idx,
+            _multipoint_bits_to_predicate(
+                predicate,
+                bits,
+                mp_on_left=True,
+                target_family=GeometryFamily.POINT,
+            ),
+        )
 
     # MP x line families
     for lf, lt in zip(_LINE_FAMILIES_INDEXED, _LINE_TAGS_INDEXED, strict=True):
@@ -1102,13 +1183,22 @@ def _dispatch_multipoint_pairs(
         if mask.any():
             idx = np.flatnonzero(mask)
             bits = _classify_indexed_mp_line(
-                left_owned, right_owned, left_indices[idx], right_indices[idx],
+                left_owned,
+                right_owned,
+                left_indices[idx],
+                right_indices[idx],
                 line_family=lf,
             )
-            _apply_relation_rows(out, idx, _multipoint_bits_to_predicate(
-                predicate, bits, mp_on_left=True, target_family=lf,
-            ))
-
+            _apply_relation_rows(
+                out,
+                idx,
+                _multipoint_bits_to_predicate(
+                    predicate,
+                    bits,
+                    mp_on_left=True,
+                    target_family=lf,
+                ),
+            )
 
 
 def _dispatch_multipoint_pairs_device(
@@ -1126,11 +1216,14 @@ def _dispatch_multipoint_pairs_device(
     """Dispatch multipoint relation-pair rows without exporting masks to host."""
     import cupy as cp
 
-    left_state = left_owned._ensure_device_state()
-    right_state = right_owned._ensure_device_state()
+    left_state = left_owned._ensure_device_state(preserve_indexed_view=True)
+    right_state = right_owned._ensure_device_state(preserve_indexed_view=True)
     pt_tag = _POINT_TAG_INDEXED
 
-    if GeometryFamily.MULTIPOINT in left_state.families and GeometryFamily.POINT in right_state.families:
+    if (
+        GeometryFamily.MULTIPOINT in left_state.families
+        and GeometryFamily.POINT in right_state.families
+    ):
         idx = cp.flatnonzero(mp_left_mask & (right_tags == pt_tag)).astype(
             cp.int32,
             copy=False,
@@ -1150,10 +1243,7 @@ def _dispatch_multipoint_pairs_device(
         )
 
     for line_family, line_tag in zip(_LINE_FAMILIES_INDEXED, _LINE_TAGS_INDEXED, strict=True):
-        if (
-            GeometryFamily.MULTIPOINT in left_state.families
-            and line_family in right_state.families
-        ):
+        if GeometryFamily.MULTIPOINT in left_state.families and line_family in right_state.families:
             idx = cp.flatnonzero(mp_left_mask & (right_tags == line_tag)).astype(
                 cp.int32,
                 copy=False,
@@ -1173,7 +1263,9 @@ def _dispatch_multipoint_pairs_device(
                 target_family=line_family,
             )
 
-    for region_family, region_tag in zip(_REGION_FAMILIES_INDEXED, _REGION_TAGS_INDEXED, strict=True):
+    for region_family, region_tag in zip(
+        _REGION_FAMILIES_INDEXED, _REGION_TAGS_INDEXED, strict=True
+    ):
         if (
             GeometryFamily.MULTIPOINT in left_state.families
             and region_family in right_state.families
@@ -1241,7 +1333,10 @@ def _dispatch_multipoint_pairs_device(
             )
         out[idx] = result
 
-    if GeometryFamily.POINT in left_state.families and GeometryFamily.MULTIPOINT in right_state.families:
+    if (
+        GeometryFamily.POINT in left_state.families
+        and GeometryFamily.MULTIPOINT in right_state.families
+    ):
         idx = cp.flatnonzero((left_tags == pt_tag) & mp_right_mask).astype(
             cp.int32,
             copy=False,
@@ -1261,10 +1356,7 @@ def _dispatch_multipoint_pairs_device(
         )
 
     for line_family, line_tag in zip(_LINE_FAMILIES_INDEXED, _LINE_TAGS_INDEXED, strict=True):
-        if (
-            line_family in left_state.families
-            and GeometryFamily.MULTIPOINT in right_state.families
-        ):
+        if line_family in left_state.families and GeometryFamily.MULTIPOINT in right_state.families:
             idx = cp.flatnonzero((left_tags == line_tag) & mp_right_mask).astype(
                 cp.int32,
                 copy=False,
@@ -1284,7 +1376,9 @@ def _dispatch_multipoint_pairs_device(
                 target_family=line_family,
             )
 
-    for region_family, region_tag in zip(_REGION_FAMILIES_INDEXED, _REGION_TAGS_INDEXED, strict=True):
+    for region_family, region_tag in zip(
+        _REGION_FAMILIES_INDEXED, _REGION_TAGS_INDEXED, strict=True
+    ):
         if (
             region_family in left_state.families
             and GeometryFamily.MULTIPOINT in right_state.families

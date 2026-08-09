@@ -40,6 +40,7 @@ Precision (ADR-0002):
     Coordinate parsing delegates to gpu_parse.parse_ascii_floats which
     always produces fp64 -- storage precision is always fp64 per ADR-0002.
 """
+
 from __future__ import annotations
 
 import ctypes
@@ -185,15 +186,17 @@ def _wkt_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
 
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("wkt-classify-type", _WKT_CLASSIFY_SOURCE, _WKT_CLASSIFY_NAMES),
-    ("wkt-find-paren-starts", _WKT_FIND_PAREN_STARTS_SOURCE, _WKT_FIND_PAREN_STARTS_NAMES),
-    ("wkt-count-coords", _WKT_COUNT_COORDS_SOURCE, _WKT_COUNT_COORDS_NAMES),
-    ("wkt-count-rings", _WKT_COUNT_RINGS_SOURCE, _WKT_COUNT_RINGS_NAMES),
-    ("wkt-num-bounds", _WKT_NUM_BOUNDS_SOURCE, _WKT_NUM_BOUNDS_NAMES),
-    ("wkt-count-parts", _WKT_COUNT_PARTS_SOURCE, _WKT_COUNT_PARTS_NAMES),
-    ("wkt-assign-ring-coords", _WKT_ASSIGN_RING_COORDS_SOURCE, _WKT_ASSIGN_RING_COORDS_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("wkt-classify-type", _WKT_CLASSIFY_SOURCE, _WKT_CLASSIFY_NAMES),
+        ("wkt-find-paren-starts", _WKT_FIND_PAREN_STARTS_SOURCE, _WKT_FIND_PAREN_STARTS_NAMES),
+        ("wkt-count-coords", _WKT_COUNT_COORDS_SOURCE, _WKT_COUNT_COORDS_NAMES),
+        ("wkt-count-rings", _WKT_COUNT_RINGS_SOURCE, _WKT_COUNT_RINGS_NAMES),
+        ("wkt-num-bounds", _WKT_NUM_BOUNDS_SOURCE, _WKT_NUM_BOUNDS_NAMES),
+        ("wkt-count-parts", _WKT_COUNT_PARTS_SOURCE, _WKT_COUNT_PARTS_NAMES),
+        ("wkt-assign-ring-coords", _WKT_ASSIGN_RING_COORDS_SOURCE, _WKT_ASSIGN_RING_COORDS_NAMES),
+    ]
+)
 
 # CCCL warmup for exclusive_sum used in offset building
 from vibespatial.cuda.cccl_precompile import request_warmup  # noqa: E402
@@ -205,52 +208,67 @@ request_warmup(["exclusive_scan_i32"])
 # Kernel compilation helpers
 # ---------------------------------------------------------------------------
 
+
 def _classify_type_kernels() -> dict:
     """Compile (or retrieve cached) WKT type classification kernel."""
     return compile_kernel_group(
-        "wkt-classify-type", _WKT_CLASSIFY_SOURCE, _WKT_CLASSIFY_NAMES,
+        "wkt-classify-type",
+        _WKT_CLASSIFY_SOURCE,
+        _WKT_CLASSIFY_NAMES,
     )
 
 
 def _find_paren_starts_kernels() -> dict:
     """Compile (or retrieve cached) WKT paren-start finder kernel."""
     return compile_kernel_group(
-        "wkt-find-paren-starts", _WKT_FIND_PAREN_STARTS_SOURCE, _WKT_FIND_PAREN_STARTS_NAMES,
+        "wkt-find-paren-starts",
+        _WKT_FIND_PAREN_STARTS_SOURCE,
+        _WKT_FIND_PAREN_STARTS_NAMES,
     )
 
 
 def _count_coords_kernels() -> dict:
     """Compile (or retrieve cached) WKT coordinate counting kernel."""
     return compile_kernel_group(
-        "wkt-count-coords", _WKT_COUNT_COORDS_SOURCE, _WKT_COUNT_COORDS_NAMES,
+        "wkt-count-coords",
+        _WKT_COUNT_COORDS_SOURCE,
+        _WKT_COUNT_COORDS_NAMES,
     )
 
 
 def _count_rings_kernels() -> dict:
     """Compile (or retrieve cached) WKT ring counting kernel."""
     return compile_kernel_group(
-        "wkt-count-rings", _WKT_COUNT_RINGS_SOURCE, _WKT_COUNT_RINGS_NAMES,
+        "wkt-count-rings",
+        _WKT_COUNT_RINGS_SOURCE,
+        _WKT_COUNT_RINGS_NAMES,
     )
 
 
 def _wkt_num_bounds_kernels() -> dict:
     """Compile (or retrieve cached) WKT number boundary kernel."""
     return compile_kernel_group(
-        "wkt-num-bounds", _WKT_NUM_BOUNDS_SOURCE, _WKT_NUM_BOUNDS_NAMES,
+        "wkt-num-bounds",
+        _WKT_NUM_BOUNDS_SOURCE,
+        _WKT_NUM_BOUNDS_NAMES,
     )
 
 
 def _count_parts_kernels() -> dict:
     """Compile (or retrieve cached) WKT part counting kernel."""
     return compile_kernel_group(
-        "wkt-count-parts", _WKT_COUNT_PARTS_SOURCE, _WKT_COUNT_PARTS_NAMES,
+        "wkt-count-parts",
+        _WKT_COUNT_PARTS_SOURCE,
+        _WKT_COUNT_PARTS_NAMES,
     )
 
 
 def _assign_ring_coords_kernels() -> dict:
     """Compile (or retrieve cached) WKT ring-coordinate assignment kernel."""
     return compile_kernel_group(
-        "wkt-assign-ring-coords", _WKT_ASSIGN_RING_COORDS_SOURCE, _WKT_ASSIGN_RING_COORDS_NAMES,
+        "wkt-assign-ring-coords",
+        _WKT_ASSIGN_RING_COORDS_SOURCE,
+        _WKT_ASSIGN_RING_COORDS_NAMES,
     )
 
 
@@ -263,6 +281,7 @@ def _launch_kernel(runtime, kernel, n, params):
 # ---------------------------------------------------------------------------
 # Result dataclass
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True, slots=True)
 class WktStructuralResult:
@@ -298,6 +317,7 @@ class WktStructuralResult:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def wkt_structural_analysis(d_bytes: cp.ndarray) -> WktStructuralResult:
     """Perform structural analysis and geometry type detection on WKT input.
@@ -367,7 +387,10 @@ def wkt_structural_analysis(d_bytes: cp.ndarray) -> WktStructuralResult:
     # This makes bracket_depth treat every '(' and ')' as structural.
     d_quote_parity = cp.zeros(n, dtype=cp.uint8)
     d_depth = bracket_depth(
-        d_bytes, d_quote_parity, open_chars="(", close_chars=")",
+        d_bytes,
+        d_quote_parity,
+        open_chars="(",
+        close_chars=")",
     )
     del d_quote_parity  # free immediately
 
@@ -379,7 +402,7 @@ def wkt_structural_analysis(d_bytes: cp.ndarray) -> WktStructuralResult:
     # subsequent geometries start at newline_pos + 1.
     #
     # Tier 2 (CuPy): element-wise comparison + flatnonzero.
-    d_is_newline = (d_bytes == ord('\n'))
+    d_is_newline = d_bytes == ord("\n")
     d_newline_positions = cp.flatnonzero(d_is_newline).astype(cp.int64)
     del d_is_newline
 
@@ -417,7 +440,7 @@ def wkt_structural_analysis(d_bytes: cp.ndarray) -> WktStructuralResult:
     # whitespace across line boundaries into the next geometry.
     if d_geom_starts.shape[0] > 0:
         d_start_bytes = d_bytes[d_geom_starts]
-        d_non_empty = (d_start_bytes != ord('\n')) & (d_start_bytes != ord('\r'))
+        d_non_empty = (d_start_bytes != ord("\n")) & (d_start_bytes != ord("\r"))
         d_geom_starts = d_geom_starts[d_non_empty]
         del d_start_bytes, d_non_empty
 
@@ -478,6 +501,7 @@ def wkt_structural_analysis(d_bytes: cp.ndarray) -> WktStructuralResult:
 # ---------------------------------------------------------------------------
 # Coordinate extraction pipeline
 # ---------------------------------------------------------------------------
+
 
 def _find_paren_starts(
     d_bytes: cp.ndarray,
@@ -748,14 +772,14 @@ def _extract_wkt_coordinates(
     d_bytes: cp.ndarray,
     structural: WktStructuralResult,
 ) -> tuple[
-    cp.ndarray,   # d_x
-    cp.ndarray,   # d_y
-    cp.ndarray,   # d_coord_value_counts (per geometry)
-    cp.ndarray,   # d_ring_counts (per geometry)
-    cp.ndarray,   # d_part_counts (per geometry)
-    cp.ndarray,   # d_paren_starts
-    cp.ndarray,   # d_span_ends
-    cp.ndarray,   # d_is_num_start (kept for ring assignment)
+    cp.ndarray,  # d_x
+    cp.ndarray,  # d_y
+    cp.ndarray,  # d_coord_value_counts (per geometry)
+    cp.ndarray,  # d_ring_counts (per geometry)
+    cp.ndarray,  # d_part_counts (per geometry)
+    cp.ndarray,  # d_paren_starts
+    cp.ndarray,  # d_span_ends
+    cp.ndarray,  # d_is_num_start (kept for ring assignment)
 ]:
     """Extract coordinates from WKT bytes using structural analysis results.
 
@@ -776,8 +800,11 @@ def _extract_wkt_coordinates(
     # ------------------------------------------------------------------
     # For each geometry, find the opening '(' of its coordinate data.
     d_paren_starts = _find_paren_starts(
-        d_bytes, structural.d_geom_starts, structural.d_empty_flags,
-        n_geoms, n_bytes,
+        d_bytes,
+        structural.d_geom_starts,
+        structural.d_empty_flags,
+        n_geoms,
+        n_bytes,
     )
 
     # Find span ends using depth-based scanning from gpu_parse.
@@ -786,7 +813,7 @@ def _extract_wkt_coordinates(
     # kernel on those, and scatter results back.
     from vibespatial.io.gpu_parse import mark_spans, span_boundaries
 
-    d_valid_mask = (d_paren_starts >= 0)
+    d_valid_mask = d_paren_starts >= 0
     d_valid_indices = cp.flatnonzero(d_valid_mask).astype(cp.int32)
     n_valid = d_valid_indices.shape[0]
 
@@ -795,7 +822,10 @@ def _extract_wkt_coordinates(
     if n_valid > 0:
         d_valid_paren_starts = d_paren_starts[d_valid_indices]
         d_valid_span_ends = span_boundaries(
-            structural.d_depth, d_valid_paren_starts, n_bytes, skip_bytes=0,
+            structural.d_depth,
+            d_valid_paren_starts,
+            n_bytes,
+            skip_bytes=0,
         )
         d_span_ends[d_valid_indices] = d_valid_span_ends
         del d_valid_span_ends
@@ -830,8 +860,14 @@ def _extract_wkt_coordinates(
         d_ring_counts = cp.zeros(n_geoms, dtype=cp.int32)
         d_part_counts = cp.zeros(n_geoms, dtype=cp.int32)
         return (
-            d_x, d_y, d_coord_value_counts, d_ring_counts, d_part_counts,
-            d_paren_starts, d_span_ends, d_is_num_start,
+            d_x,
+            d_y,
+            d_coord_value_counts,
+            d_ring_counts,
+            d_part_counts,
+            d_paren_starts,
+            d_span_ends,
+            d_is_num_start,
         )
 
     d_values = parse_ascii_floats(d_bytes, d_num_starts, d_num_ends)
@@ -846,22 +882,38 @@ def _extract_wkt_coordinates(
     # Stage 4: Count coordinates, rings, and parts per geometry
     # ------------------------------------------------------------------
     d_coord_value_counts = _count_coords_per_geometry(
-        d_is_num_start, d_paren_starts, d_span_ends, n_geoms,
+        d_is_num_start,
+        d_paren_starts,
+        d_span_ends,
+        n_geoms,
     )
 
     d_ring_counts = _count_rings(
-        structural.d_depth, d_paren_starts, d_span_ends,
-        structural.d_family_tags, n_geoms,
+        structural.d_depth,
+        d_paren_starts,
+        d_span_ends,
+        structural.d_family_tags,
+        n_geoms,
     )
 
     d_part_counts = _count_parts(
-        structural.d_depth, d_paren_starts, d_span_ends,
-        structural.d_family_tags, structural.d_empty_flags, n_geoms,
+        structural.d_depth,
+        d_paren_starts,
+        d_span_ends,
+        structural.d_family_tags,
+        structural.d_empty_flags,
+        n_geoms,
     )
 
     return (
-        d_x, d_y, d_coord_value_counts, d_ring_counts, d_part_counts,
-        d_paren_starts, d_span_ends, d_is_num_start,
+        d_x,
+        d_y,
+        d_coord_value_counts,
+        d_ring_counts,
+        d_part_counts,
+        d_paren_starts,
+        d_span_ends,
+        d_is_num_start,
     )
 
 
@@ -946,7 +998,7 @@ def _assemble_wkt_homogeneous(
     """Build OwnedGeometryArray for a homogeneous WKT file (single family)."""
     from vibespatial.io.pylibcudf import _build_device_single_family_owned
 
-    d_empty_mask = (d_coord_value_counts == 0)
+    d_empty_mask = d_coord_value_counts == 0
     d_validity = ~d_empty_mask
 
     if family == GeometryFamily.POINT:
@@ -991,11 +1043,18 @@ def _assemble_wkt_homogeneous(
         # Pass the n-element prefix (without the terminal) as ring_base
         d_ring_base = d_ring_base_full[:-1]
         d_ring_coord_counts = _assign_ring_coords(
-            d_is_num_start, d_depth, d_paren_starts, d_span_ends,
-            d_family_tags, d_ring_base, total_rings, n_geoms,
+            d_is_num_start,
+            d_depth,
+            d_paren_starts,
+            d_span_ends,
+            d_family_tags,
+            d_ring_base,
+            total_rings,
+            n_geoms,
         )
         d_geom_offsets, d_ring_offsets = _build_polygon_offsets(
-            d_ring_counts, d_ring_coord_counts,
+            d_ring_counts,
+            d_ring_coord_counts,
         )
         return _build_device_single_family_owned(
             family=GeometryFamily.POLYGON,
@@ -1031,8 +1090,14 @@ def _assemble_wkt_homogeneous(
             )
             d_ring_base = d_ring_base_full[:-1]
             d_ring_coord_counts = _assign_ring_coords(
-                d_is_num_start, d_depth, d_paren_starts, d_span_ends,
-                d_family_tags, d_ring_base, total_rings, n_geoms,
+                d_is_num_start,
+                d_depth,
+                d_paren_starts,
+                d_span_ends,
+                d_family_tags,
+                d_ring_base,
+                total_rings,
+                n_geoms,
             )
             d_ring_offsets = _device_compact_offsets(d_ring_coord_counts // 2)
 
@@ -1098,7 +1163,7 @@ def _assemble_wkt_mixed(
     # Mark EMPTY geometries as -1
     d_oga_tags[d_empty_flags.astype(cp.bool_)] = -1
 
-    d_validity = (d_oga_tags >= 0)
+    d_validity = d_oga_tags >= 0
 
     # Build per-geometry pair counts and coordinate offsets (n+1 array)
     d_pair_counts = d_coord_value_counts // 2
@@ -1117,11 +1182,7 @@ def _assemble_wkt_mixed(
     )
 
     # Pre-compute 2D coordinate array for gather operations
-    coords_2d = (
-        cp.column_stack([d_x, d_y])
-        if d_x.size > 0
-        else cp.empty((0, 2), dtype=cp.float64)
-    )
+    coords_2d = cp.column_stack([d_x, d_y]) if d_x.size > 0 else cp.empty((0, 2), dtype=cp.float64)
 
     for tag_val in h_unique_tags:
         tag_int = int(tag_val)
@@ -1149,17 +1210,22 @@ def _assemble_wkt_mixed(
 
         elif family == GeometryFamily.LINESTRING:
             gathered, ls_geom_offsets = _device_gather_offset_slices(
-                coords_2d, d_coord_offsets, rows,
+                coords_2d,
+                d_coord_offsets,
+                rows,
+                allocation_reason="wkt mixed-family coordinate allocation fence",
             )
             family_devices[family] = DeviceFamilyGeometryBuffer(
                 family=family,
                 x=(
                     cp.ascontiguousarray(gathered[:, 0])
-                    if gathered.size else cp.empty(0, dtype=cp.float64)
+                    if gathered.size
+                    else cp.empty(0, dtype=cp.float64)
                 ),
                 y=(
                     cp.ascontiguousarray(gathered[:, 1])
-                    if gathered.size else cp.empty(0, dtype=cp.float64)
+                    if gathered.size
+                    else cp.empty(0, dtype=cp.float64)
                 ),
                 geometry_offsets=ls_geom_offsets,
                 empty_mask=(ls_geom_offsets[1:] == ls_geom_offsets[:-1]),
@@ -1171,15 +1237,20 @@ def _assemble_wkt_mixed(
             # d_coord_offsets[row] to d_coord_offsets[row+1] in the
             # global flat array.
             gathered, sub_coord_offsets = _device_gather_offset_slices(
-                coords_2d, d_coord_offsets, rows,
+                coords_2d,
+                d_coord_offsets,
+                rows,
+                allocation_reason="wkt mixed-family polygon allocation fence",
             )
             pg_x = (
                 cp.ascontiguousarray(gathered[:, 0])
-                if gathered.size else cp.empty(0, dtype=cp.float64)
+                if gathered.size
+                else cp.empty(0, dtype=cp.float64)
             )
             pg_y = (
                 cp.ascontiguousarray(gathered[:, 1])
-                if gathered.size else cp.empty(0, dtype=cp.float64)
+                if gathered.size
+                else cp.empty(0, dtype=cp.float64)
             )
 
             # Build ring offsets for the polygon subset.
@@ -1198,9 +1269,14 @@ def _assemble_wkt_mixed(
             d_sub_paren_starts = d_paren_starts[rows]
             d_sub_span_ends = d_span_ends[rows]
             sub_ring_coord_counts = _assign_ring_coords(
-                d_is_num_start, d_depth, d_sub_paren_starts,
-                d_sub_span_ends, d_sub_family_tags,
-                sub_ring_base, sub_total_rings, n_f,
+                d_is_num_start,
+                d_depth,
+                d_sub_paren_starts,
+                d_sub_span_ends,
+                d_sub_family_tags,
+                sub_ring_base,
+                sub_total_rings,
+                n_f,
             )
             sub_ring_offsets = _device_compact_offsets(
                 sub_ring_coord_counts // 2,
@@ -1222,17 +1298,22 @@ def _assemble_wkt_mixed(
             GeometryFamily.MULTILINESTRING,
         ):
             gathered, geom_offsets = _device_gather_offset_slices(
-                coords_2d, d_coord_offsets, rows,
+                coords_2d,
+                d_coord_offsets,
+                rows,
+                allocation_reason="wkt mixed-family multipart allocation fence",
             )
             family_devices[family] = DeviceFamilyGeometryBuffer(
                 family=family,
                 x=(
                     cp.ascontiguousarray(gathered[:, 0])
-                    if gathered.size else cp.empty(0, dtype=cp.float64)
+                    if gathered.size
+                    else cp.empty(0, dtype=cp.float64)
                 ),
                 y=(
                     cp.ascontiguousarray(gathered[:, 1])
-                    if gathered.size else cp.empty(0, dtype=cp.float64)
+                    if gathered.size
+                    else cp.empty(0, dtype=cp.float64)
                 ),
                 geometry_offsets=geom_offsets,
                 empty_mask=(geom_offsets[1:] == geom_offsets[:-1]),
@@ -1255,6 +1336,7 @@ def _assemble_wkt_mixed(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def read_wkt_gpu(d_bytes: cp.ndarray) -> OwnedGeometryArray:
     """Parse WKT bytes on GPU and return device-resident geometry.
@@ -1328,8 +1410,14 @@ def read_wkt_gpu(d_bytes: cp.ndarray) -> OwnedGeometryArray:
     # Stage 2: Coordinate extraction
     # ------------------------------------------------------------------
     (
-        d_x, d_y, d_coord_value_counts, d_ring_counts, d_part_counts,
-        d_paren_starts, d_span_ends, d_is_num_start,
+        d_x,
+        d_y,
+        d_coord_value_counts,
+        d_ring_counts,
+        d_part_counts,
+        d_paren_starts,
+        d_span_ends,
+        d_is_num_start,
     ) = _extract_wkt_coordinates(d_bytes, structural)
 
     # ------------------------------------------------------------------
@@ -1355,20 +1443,35 @@ def read_wkt_gpu(d_bytes: cp.ndarray) -> OwnedGeometryArray:
             msg = f"Unsupported WKT geometry tag: {h_unique_tags[0]}"
             raise ValueError(msg)
         return _assemble_wkt_homogeneous(
-            family, n_geoms, d_x, d_y,
-            d_coord_value_counts, d_ring_counts, d_part_counts,
-            d_is_num_start, structural.d_depth,
-            d_paren_starts, d_span_ends,
-            structural.d_family_tags, structural.d_empty_flags,
+            family,
+            n_geoms,
+            d_x,
+            d_y,
+            d_coord_value_counts,
+            d_ring_counts,
+            d_part_counts,
+            d_is_num_start,
+            structural.d_depth,
+            d_paren_starts,
+            d_span_ends,
+            structural.d_family_tags,
+            structural.d_empty_flags,
         )
 
     # Mixed file
     return _assemble_wkt_mixed(
-        n_geoms, d_x, d_y,
-        d_coord_value_counts, d_ring_counts, d_part_counts,
-        structural.d_family_tags, structural.d_empty_flags,
-        d_is_num_start, structural.d_depth,
-        d_paren_starts, d_span_ends,
+        n_geoms,
+        d_x,
+        d_y,
+        d_coord_value_counts,
+        d_ring_counts,
+        d_part_counts,
+        structural.d_family_tags,
+        structural.d_empty_flags,
+        d_is_num_start,
+        structural.d_depth,
+        d_paren_starts,
+        d_span_ends,
     )
 
 

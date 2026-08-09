@@ -32,7 +32,9 @@ MAX_SEGMENTS = 256
 MAX_COORDS = 8192
 
 
-_LINE_MERGE_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
+_LINE_MERGE_KERNEL_SOURCE = (
+    SPATIAL_TOLERANCE_PREAMBLE
+    + r"""
 /* ------------------------------------------------------------------ */
 /* line_merge NVRTC kernel                                            */
 /*                                                                    */
@@ -45,8 +47,12 @@ _LINE_MERGE_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
 /* Others: pass through as empty.                                     */
 /* ------------------------------------------------------------------ */
 
-#define MAX_SEGMENTS """ + str(MAX_SEGMENTS) + r"""
-#define MAX_COORDS """ + str(MAX_COORDS) + r"""
+#define MAX_SEGMENTS """
+    + str(MAX_SEGMENTS)
+    + r"""
+#define MAX_COORDS """
+    + str(MAX_COORDS)
+    + r"""
 #define COORD_EQ_TOL VS_SPATIAL_EPSILON
 
 /* ------------------------------------------------------------------ */
@@ -97,9 +103,9 @@ line_merge_count(
     const int ls_row_count,
 
     /* Row mapping */
-    const int* __restrict__ global_rows,    /* global row indices for this launch */
     const int* __restrict__ family_codes,   /* 0=MLS, 1=LS */
     const int* __restrict__ fam_local_rows, /* family-local row index */
+    const unsigned char* __restrict__ eligible,
     const int directed,                     /* 1=directed, 0=undirected */
 
     /* Output */
@@ -109,6 +115,7 @@ line_merge_count(
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_rows) return;
+    if (eligible[tid] == 0u) return;
 
     const int fam_code = family_codes[tid];
     const int fam_row = fam_local_rows[tid];
@@ -403,9 +410,9 @@ line_merge_scatter(
     const int ls_row_count,
 
     /* Row mapping */
-    const int* __restrict__ global_rows,
     const int* __restrict__ family_codes,
     const int* __restrict__ fam_local_rows,
+    const unsigned char* __restrict__ eligible,
     const int directed,
 
     /* Output offsets (from prefix sum) */
@@ -421,6 +428,7 @@ line_merge_scatter(
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_rows) return;
+    if (eligible[tid] == 0u) return;
 
     const int fam_code = family_codes[tid];
     const int fam_row = fam_local_rows[tid];
@@ -700,6 +708,7 @@ line_merge_scatter(
     }
 }
 """
+)
 
 
 LINE_MERGE_KERNEL_NAMES: tuple[str, ...] = (

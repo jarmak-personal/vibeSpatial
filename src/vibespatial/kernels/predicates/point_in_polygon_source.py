@@ -6,11 +6,9 @@ Contains NVRTC kernel source templates for:
 
 Extracted from point_in_polygon.py -- dispatch logic remains there.
 """
+
 from __future__ import annotations
 
-from vibespatial.cuda.device_functions.point_in_ring import (
-    POINT_IN_RING_BOUNDARY_DEVICE,
-)
 from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
 
 # The device function strings use raw braces and must NOT pass through
@@ -33,6 +31,8 @@ extern "C" __device__ inline compute_t vibespatial_max(compute_t left, compute_t
 extern "C" __device__ inline bool ring_contains_even_odd(
     compute_t px,
     compute_t py,
+    double raw_px,
+    double raw_py,
     const double* x,
     const double* y,
     double center_x,
@@ -41,19 +41,33 @@ extern "C" __device__ inline bool ring_contains_even_odd(
     int coord_end,
     bool* on_boundary
 ) {{
-  /* Delegate to shared vs_ring_contains_point_with_boundary (fp64).
-     Convert centered compute_t point back to uncentered double coords
-     so the shared function can work on raw coordinate arrays. */
-  const double dpx = (double)px + center_x;
-  const double dpy = (double)py + center_y;
-  return vs_ring_contains_point_with_boundary(
-      dpx, dpy, x, y, coord_start, coord_end,
-      PIP_BOUNDARY_TOLERANCE, on_boundary);
+  *on_boundary = false;
+  bool inside = false;
+  for (int i = coord_start, j = coord_end - 1; i < coord_end; j = i++) {{
+    const double raw_ax = x[j], raw_ay = y[j];
+    const double raw_bx = x[i], raw_by = y[i];
+    if (vs_point_on_segment(
+            raw_px, raw_py, raw_ax, raw_ay, raw_bx, raw_by,
+            PIP_BOUNDARY_TOLERANCE)) {{
+      *on_boundary = true;
+      return true;
+    }}
+    const compute_t ax = CX(raw_ax), ay = CY(raw_ay);
+    const compute_t bx = CX(raw_bx), by = CY(raw_by);
+    if ((ay > py) != (by > py)) {{
+      if (px < (bx - ax) * (py - ay) / (by - ay) + ax) {{
+        inside = !inside;
+      }}
+    }}
+  }}
+  return inside;
 }}
 
 extern "C" __device__ inline bool polygon_contains_point(
     compute_t px,
     compute_t py,
+    double raw_px,
+    double raw_py,
     const double* x,
     const double* y,
     double center_x,
@@ -69,7 +83,9 @@ extern "C" __device__ inline bool polygon_contains_point(
     bool on_boundary = false;
     const int coord_start = ring_offsets[ring];
     const int coord_end = ring_offsets[ring + 1];
-    const bool ring_inside = ring_contains_even_odd(px, py, x, y, center_x, center_y, coord_start, coord_end, &on_boundary);
+    const bool ring_inside = ring_contains_even_odd(
+        px, py, raw_px, raw_py, x, y, center_x, center_y,
+        coord_start, coord_end, &on_boundary);
     if (on_boundary) {{
       return true;
     }}
@@ -83,6 +99,8 @@ extern "C" __device__ inline bool polygon_contains_point(
 extern "C" __device__ inline bool multipolygon_contains_point(
     compute_t px,
     compute_t py,
+    double raw_px,
+    double raw_py,
     const double* x,
     const double* y,
     double center_x,
@@ -102,7 +120,9 @@ extern "C" __device__ inline bool multipolygon_contains_point(
       bool on_boundary = false;
       const int coord_start = ring_offsets[ring];
       const int coord_end = ring_offsets[ring + 1];
-      const bool ring_inside = ring_contains_even_odd(px, py, x, y, center_x, center_y, coord_start, coord_end, &on_boundary);
+      const bool ring_inside = ring_contains_even_odd(
+          px, py, raw_px, raw_py, x, y, center_x, center_y,
+          coord_start, coord_end, &on_boundary);
       if (on_boundary) {{
         return true;
       }}
@@ -213,6 +233,8 @@ extern "C" __global__ void point_in_polygon_polygon_dense(
   out[row] = polygon_contains_point(
       px,
       py,
+      point_x[point_coord],
+      point_y[point_coord],
       polygon_x,
       polygon_y,
       center_x,
@@ -257,6 +279,8 @@ extern "C" __global__ void point_in_polygon_polygon_compacted(
   out[index] = polygon_contains_point(
       px,
       py,
+      point_x[point_coord],
+      point_y[point_coord],
       polygon_x,
       polygon_y,
       center_x,
@@ -308,6 +332,8 @@ extern "C" __global__ void point_in_polygon_multipolygon_dense(
   out[row] = multipolygon_contains_point(
       px,
       py,
+      point_x[point_coord],
+      point_y[point_coord],
       multipolygon_x,
       multipolygon_y,
       center_x,
@@ -354,6 +380,8 @@ extern "C" __global__ void point_in_polygon_multipolygon_compacted(
   out[index] = multipolygon_contains_point(
       px,
       py,
+      point_x[point_coord],
+      point_y[point_coord],
       multipolygon_x,
       multipolygon_y,
       center_x,
@@ -405,6 +433,8 @@ extern "C" __global__ void point_in_polygon_polygon_compacted_tagged(
   out[index] = polygon_contains_point(
       px,
       py,
+      point_x[point_coord],
+      point_y[point_coord],
       polygon_x,
       polygon_y,
       center_x,
@@ -456,6 +486,8 @@ extern "C" __global__ void point_in_polygon_multipolygon_compacted_tagged(
   out[index] = multipolygon_contains_point(
       px,
       py,
+      point_x[point_coord],
+      point_y[point_coord],
       multipolygon_x,
       multipolygon_y,
       center_x,
@@ -540,7 +572,7 @@ extern "C" __global__ void point_in_polygon_fused(
     const compute_t cpx = CX(px);
     const compute_t cpy = CY(py);
     out[row] = polygon_contains_point(
-        cpx, cpy, polygon_x, polygon_y,
+        cpx, cpy, px, py, polygon_x, polygon_y,
         center_x, center_y,
         polygon_geometry_offsets, polygon_ring_offsets, family_row
     ) ? 1 : 0;
@@ -558,7 +590,7 @@ extern "C" __global__ void point_in_polygon_fused(
     const compute_t cpx = CX(px);
     const compute_t cpy = CY(py);
     out[row] = multipolygon_contains_point(
-        cpx, cpy, multipolygon_x, multipolygon_y,
+        cpx, cpy, px, py, multipolygon_x, multipolygon_y,
         center_x, center_y,
         multipolygon_geometry_offsets, multipolygon_part_offsets,
         multipolygon_ring_offsets, family_row
@@ -567,7 +599,9 @@ extern "C" __global__ void point_in_polygon_fused(
 }}
 """
 
-_PIP_BLOCK_PER_PAIR_KERNEL_SOURCE_TEMPLATE = POINT_ON_SEGMENT_DEVICE + """
+_PIP_BLOCK_PER_PAIR_KERNEL_SOURCE_TEMPLATE = (
+    POINT_ON_SEGMENT_DEVICE
+    + """
 typedef {compute_type} compute_t;
 
 #define CX(val) ((compute_t)((val) - center_x))
@@ -819,6 +853,7 @@ extern "C" __global__ void pip_block_per_pair_multipolygon(
     }}
 }}
 """
+)
 
 _PIP_BLOCK_PER_PAIR_KERNEL_NAMES = (
     "pip_block_per_pair_polygon",
@@ -845,4 +880,4 @@ _POINT_IN_POLYGON_KERNEL_NAMES = (
 
 def _format_pip_kernel_source(compute_type: str = "double") -> str:
     body = _POINT_IN_POLYGON_KERNEL_SOURCE_TEMPLATE.format(compute_type=compute_type)
-    return POINT_ON_SEGMENT_DEVICE + POINT_IN_RING_BOUNDARY_DEVICE + body
+    return POINT_ON_SEGMENT_DEVICE + body

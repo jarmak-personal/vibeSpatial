@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from vibespatial.constructive.measurement import (
-    _coord_stats_from_owned,
     _fp32_center_coords,
 )
 from vibespatial.constructive.polygon_buffer_cpu import build_polygon_buffers_cpu
@@ -14,7 +13,6 @@ from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
     compile_kernel_group,
-    count_scatter_total_with_transfer,
     get_cuda_runtime,
 )
 from vibespatial.cuda.cccl_primitives import exclusive_sum
@@ -27,6 +25,10 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import (
+    PhysicalWorkEstimate,
+    estimate_physical_work_from_owned,
+)
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import Residency, TransferTrigger
@@ -46,12 +48,14 @@ from vibespatial.constructive.polygon_kernels import (
 )
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 
-request_nvrtc_warmup([
-    ("polygon-buffer", _POLYGON_BUFFER_KERNEL_SOURCE, _POLYGON_BUFFER_KERNEL_NAMES),
-    ("ring-winding", _RING_WINDING_KERNEL_SOURCE, _RING_WINDING_KERNEL_NAMES),
-    ("polygon-centroid-fp64", _POLYGON_CENTROID_FP64_SOURCE, _POLYGON_CENTROID_KERNEL_NAMES),
-    ("polygon-centroid-fp32", _POLYGON_CENTROID_FP32_SOURCE, _POLYGON_CENTROID_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("polygon-buffer", _POLYGON_BUFFER_KERNEL_SOURCE, _POLYGON_BUFFER_KERNEL_NAMES),
+        ("ring-winding", _RING_WINDING_KERNEL_SOURCE, _RING_WINDING_KERNEL_NAMES),
+        ("polygon-centroid-fp64", _POLYGON_CENTROID_FP64_SOURCE, _POLYGON_CENTROID_KERNEL_NAMES),
+        ("polygon-centroid-fp32", _POLYGON_CENTROID_FP32_SOURCE, _POLYGON_CENTROID_KERNEL_NAMES),
+    ]
+)
 
 from vibespatial.cuda.cccl_precompile import request_warmup  # noqa: E402
 
@@ -61,12 +65,84 @@ _CAP_STYLE_MAP = {"round": 0, "flat": 1, "square": 2}
 _JOIN_STYLE_MAP = {"round": 0, "mitre": 1, "bevel": 2}
 
 
+def _device_scalar_bool(value, *, reason: str) -> bool:
+    import cupy as cp
+
+    host = get_cuda_runtime().copy_device_to_host(
+        cp.asarray(value, dtype=cp.bool_).reshape(1),
+        reason=reason,
+    )
+    return bool(np.asarray(host).reshape(-1)[0])
+
+
+def _polygon_device_input_valid(polygons: OwnedGeometryArray) -> bool:
+    state = polygons.device_state
+    if (
+        state is not None
+        and state.trusted_all_valid is True
+        and state.trusted_homogeneous_family is GeometryFamily.POLYGON
+    ):
+        return True
+    if polygons._validity is not None and polygons._tags is not None:
+        return bool(
+            np.asarray(polygons._validity, dtype=bool).all()
+            and np.all(polygons._tags == FAMILY_TAGS[GeometryFamily.POLYGON])
+        )
+    if polygons.device_state is None:
+        return bool(
+            np.asarray(polygons.validity, dtype=bool).all()
+            and np.all(polygons.tags == FAMILY_TAGS[GeometryFamily.POLYGON])
+        )
+    try:
+        import cupy as cp
+    except ModuleNotFoundError:  # pragma: no cover
+        return bool(
+            np.asarray(polygons.validity, dtype=bool).all()
+            and np.all(polygons.tags == FAMILY_TAGS[GeometryFamily.POLYGON])
+        )
+    state = polygons._ensure_device_state()
+    return _device_scalar_bool(
+        cp.all(
+            cp.asarray(state.validity)
+            & (cp.asarray(state.tags) == FAMILY_TAGS[GeometryFamily.POLYGON])
+        ),
+        reason="polygon buffer input admissibility scalar fence",
+    )
+
+
+def _polygon_device_has_empty_rows(polygons: OwnedGeometryArray) -> bool:
+    state = polygons.device_state
+    if state is not None and state.trusted_all_non_empty is True:
+        return False
+    poly_buffer = polygons.families[GeometryFamily.POLYGON]
+    if poly_buffer.host_materialized:
+        return bool(np.any(poly_buffer.empty_mask))
+    if state is None:
+        return bool(np.any(poly_buffer.empty_mask))
+    try:
+        import cupy as cp
+    except ModuleNotFoundError:  # pragma: no cover
+        return bool(np.any(poly_buffer.empty_mask))
+    state = polygons._ensure_device_state()
+    device_poly_buffer = state.families.get(GeometryFamily.POLYGON)
+    if device_poly_buffer is None:
+        return bool(np.any(poly_buffer.empty_mask))
+    return _device_scalar_bool(
+        cp.any(device_poly_buffer.empty_mask),
+        reason="polygon buffer input empty-mask scalar fence",
+    )
+
+
 def _ring_winding_kernels():
-    return compile_kernel_group("ring-winding", _RING_WINDING_KERNEL_SOURCE, _RING_WINDING_KERNEL_NAMES)
+    return compile_kernel_group(
+        "ring-winding", _RING_WINDING_KERNEL_SOURCE, _RING_WINDING_KERNEL_NAMES
+    )
 
 
 def _polygon_centroid_kernels(compute_type: str = "double"):
-    source = _POLYGON_CENTROID_FP64_SOURCE if compute_type == "double" else _POLYGON_CENTROID_FP32_SOURCE
+    source = (
+        _POLYGON_CENTROID_FP64_SOURCE if compute_type == "double" else _POLYGON_CENTROID_FP32_SOURCE
+    )
     prefix = f"polygon-centroid-{compute_type[:2]}"  # fp64 / fl (float)
     return compile_kernel_group(prefix, source, _POLYGON_CENTROID_KERNEL_NAMES)
 
@@ -131,7 +207,10 @@ def _polygon_centroids_gpu(
     # Track family results for return_owned device-side scatter.
     family_results: list[tuple[np.ndarray, np.ndarray, object, object]] = []
 
-    for tag, family_key in ((poly_tag, GeometryFamily.POLYGON), (mpoly_tag, GeometryFamily.MULTIPOLYGON)):
+    for tag, family_key in (
+        (poly_tag, GeometryFamily.POLYGON),
+        (mpoly_tag, GeometryFamily.MULTIPOLYGON),
+    ):
         row_mask = tags == tag
         if not np.any(row_mask):
             continue
@@ -161,7 +240,9 @@ def _polygon_centroids_gpu(
             d_y = device_buffer.y
             d_ring_offsets = device_buffer.ring_offsets
             d_geom_offsets = device_buffer.geometry_offsets
-            d_part_offsets = None if family_key is GeometryFamily.POLYGON else device_buffer.part_offsets
+            d_part_offsets = (
+                None if family_key is GeometryFamily.POLYGON else device_buffer.part_offsets
+            )
         else:
             d_x = runtime.from_host(buf.x)
             d_y = runtime.from_host(buf.y)
@@ -181,20 +262,56 @@ def _polygon_centroids_gpu(
             if family_key is GeometryFamily.POLYGON:
                 kernel = kernels["polygon_centroid"]
                 params = (
-                    (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_geom_offsets),
-                     ptr(d_cx), ptr(d_cy), center_x, center_y, family_rows_count),
-                    (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                     KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-                     KERNEL_PARAM_I32),
+                    (
+                        ptr(d_x),
+                        ptr(d_y),
+                        ptr(d_ring_offsets),
+                        ptr(d_geom_offsets),
+                        ptr(d_cx),
+                        ptr(d_cy),
+                        center_x,
+                        center_y,
+                        family_rows_count,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_I32,
+                    ),
                 )
             else:
                 kernel = kernels["multipolygon_centroid"]
                 params = (
-                    (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_part_offsets), ptr(d_geom_offsets),
-                     ptr(d_cx), ptr(d_cy), center_x, center_y, family_rows_count),
-                    (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                     KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-                     KERNEL_PARAM_I32),
+                    (
+                        ptr(d_x),
+                        ptr(d_y),
+                        ptr(d_ring_offsets),
+                        ptr(d_part_offsets),
+                        ptr(d_geom_offsets),
+                        ptr(d_cx),
+                        ptr(d_cy),
+                        center_x,
+                        center_y,
+                        family_rows_count,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_I32,
+                    ),
                 )
             grid, block = runtime.launch_config(kernel, family_rows_count)
             runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -237,6 +354,7 @@ def _polygon_centroids_gpu(
     # ------------------------------------------------------------------
     if not family_results:
         from vibespatial.constructive.point import _empty_point_output
+
         return _empty_point_output()
 
     if len(family_results) == 1:
@@ -277,12 +395,16 @@ def _polygon_centroids_gpu(
             runtime.free(d_cy_family)
 
     return _build_device_backed_point_output(
-        d_cx_global, d_cy_global, row_count=row_count,
+        d_cx_global,
+        d_cy_global,
+        row_count=row_count,
     )
 
 
 def _polygon_buffer_kernels():
-    return compile_kernel_group("polygon-buffer", _POLYGON_BUFFER_KERNEL_SOURCE, _POLYGON_BUFFER_KERNEL_NAMES)
+    return compile_kernel_group(
+        "polygon-buffer", _POLYGON_BUFFER_KERNEL_SOURCE, _POLYGON_BUFFER_KERNEL_NAMES
+    )
 
 
 def _build_device_backed_polygon_output_variable(
@@ -296,16 +418,29 @@ def _build_device_backed_polygon_output_variable(
 ) -> OwnedGeometryArray:
     import cupy as cp
 
-    return build_device_resident_owned(
+    runtime = get_cuda_runtime()
+
+    def _as_device_i32(values):
+        if hasattr(values, "__cuda_array_interface__"):
+            return cp.asarray(values, dtype=cp.int32)
+        return runtime.from_host(np.asarray(values, dtype=np.int32))
+
+    result = build_device_resident_owned(
         device_families={
             GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
                 family=GeometryFamily.POLYGON,
                 x=device_x,
                 y=device_y,
-                geometry_offsets=get_cuda_runtime().from_host(geometry_offsets),
+                geometry_offsets=_as_device_i32(geometry_offsets),
                 empty_mask=cp.zeros(row_count, dtype=cp.bool_),
-                ring_offsets=get_cuda_runtime().from_host(ring_offsets),
-                bounds=None if bounds is None else get_cuda_runtime().from_host(bounds),
+                ring_offsets=_as_device_i32(ring_offsets),
+                bounds=(
+                    None
+                    if bounds is None
+                    else cp.asarray(bounds)
+                    if hasattr(bounds, "__cuda_array_interface__")
+                    else runtime.from_host(bounds)
+                ),
             )
         },
         row_count=row_count,
@@ -314,6 +449,11 @@ def _build_device_backed_polygon_output_variable(
         family_row_offsets=cp.arange(row_count, dtype=cp.int32),
         execution_mode="gpu",
     )
+    if result.device_state is not None:
+        result.device_state.trusted_all_valid = True
+        result.device_state.trusted_homogeneous_family = GeometryFamily.POLYGON
+        result.device_state.trusted_all_non_empty = True
+    return result
 
 
 def polygon_buffer_owned_array(
@@ -327,13 +467,9 @@ def polygon_buffer_owned_array(
 ) -> OwnedGeometryArray:
     if GeometryFamily.POLYGON not in polygons.families or len(polygons.families) != 1:
         raise ValueError("polygon_buffer_owned_array requires a polygon-only OwnedGeometryArray")
-    if not np.all(polygons.validity):
+    if not _polygon_device_input_valid(polygons):
         raise ValueError("polygon_buffer_owned_array requires non-null rows only")
-    if np.any(polygons.tags != FAMILY_TAGS[GeometryFamily.POLYGON]):
-        raise ValueError("polygon_buffer_owned_array requires polygon-only rows")
-
-    poly_buffer = polygons.families[GeometryFamily.POLYGON]
-    if np.any(poly_buffer.empty_mask):
+    if _polygon_device_has_empty_rows(polygons):
         raise ValueError("polygon_buffer_owned_array requires non-empty rows only")
 
     radii = (
@@ -346,23 +482,46 @@ def polygon_buffer_owned_array(
 
     join_int = _JOIN_STYLE_MAP.get(join_style, 0)
 
+    base_work = estimate_physical_work_from_owned(polygons)
+    output_coordinate_capacity = int(base_work.coordinate_count) * (4 * int(quad_segs) + 1)
     selected_mode = plan_dispatch_selection(
         kernel_name="polygon_buffer",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=polygons.row_count,
         requested_mode=dispatch_mode,
         current_residency=polygons.residency,
+        work_estimate=PhysicalWorkEstimate(
+            row_count=polygons.row_count,
+            coordinate_count=base_work.coordinate_count,
+            segment_count=base_work.segment_count,
+            ring_count=base_work.ring_count,
+            output_row_count=polygons.row_count,
+            output_byte_count=output_coordinate_capacity * 16,
+            temporary_byte_count=(int(base_work.ring_count) * 25 + int(polygons.row_count) * 8),
+            primary_unit_count=max(
+                int(polygons.row_count),
+                int(base_work.coordinate_count),
+                output_coordinate_capacity,
+            ),
+            primary_unit_name="polygon-buffer-output-coordinate",
+        ),
     ).selected
 
     if selected_mode is not ExecutionMode.GPU:
         return build_polygon_buffers_cpu(
-            polygons, radii, quad_segs=quad_segs,
-            join_style=join_style, mitre_limit=mitre_limit,
+            polygons,
+            radii,
+            quad_segs=quad_segs,
+            join_style=join_style,
+            mitre_limit=mitre_limit,
         )
 
     return _build_polygon_buffers_gpu(
-        polygons, radii, quad_segs=quad_segs,
-        join_style=join_int, mitre_limit=mitre_limit,
+        polygons,
+        radii,
+        quad_segs=quad_segs,
+        join_style=join_int,
+        mitre_limit=mitre_limit,
     )
 
 
@@ -410,43 +569,49 @@ def _build_polygon_buffers_gpu(
     join_style: int = 0,
     mitre_limit: float = 5.0,
 ) -> OwnedGeometryArray:
+    import cupy as cp
+
     polygons.move_to(
         Residency.DEVICE,
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
         reason="polygon_buffer_owned_array selected GPU execution",
     )
+    if polygons.is_indexed_view:
+        polygons = polygons.physicalize_device_rows(allow_capacity_allocation=True)
     runtime = get_cuda_runtime()
     state = polygons._ensure_device_state()
     poly_buf = state.families[GeometryFamily.POLYGON]
 
-    # Build ring-level mapping arrays on host
-    host_poly_buf = polygons.families[GeometryFamily.POLYGON]
-    input_geo_offsets = host_poly_buf.geometry_offsets
-    ring_counts_per_poly = np.diff(input_geo_offsets).astype(np.int32)
-    total_rings = int(input_geo_offsets[-1])
+    input_geo_offsets = cp.asarray(poly_buf.geometry_offsets, dtype=cp.int32)
+    total_rings = int(poly_buf.ring_offsets.size - 1)
 
     if total_rings == 0:
         device_x = runtime.allocate((0,), np.float64)
         device_y = runtime.allocate((0,), np.float64)
         return _build_device_backed_polygon_output_variable(
-            device_x, device_y,
+            device_x,
+            device_y,
             row_count=polygons.row_count,
             geometry_offsets=input_geo_offsets.copy(),
-            ring_offsets=np.zeros(1, dtype=np.int32),
+            ring_offsets=cp.zeros(1, dtype=cp.int32),
         )
 
-    ring_to_row = np.repeat(
-        np.arange(polygons.row_count, dtype=np.int32), ring_counts_per_poly
-    )
-    ring_is_hole = np.ones(total_rings, dtype=np.int32)
-    ring_is_hole[input_geo_offsets[:-1]] = 0
+    ring_indices = cp.arange(total_rings, dtype=cp.int32)
+    device_ring_to_row = cp.searchsorted(
+        input_geo_offsets,
+        ring_indices,
+        side="right",
+    ).astype(cp.int32, copy=False) - np.int32(1)
+    device_ring_is_hole = cp.ones(total_rings, dtype=cp.int32)
+    device_ring_is_hole[input_geo_offsets[:-1]] = np.int32(0)
 
     # Compute actual winding direction per ring via signed area (shoelace)
     # on GPU — one thread per ring, no Python loop.
     winding_kernels = _ring_winding_kernels()
     device_ring_winding = runtime.allocate((total_rings,), np.float64)
     winding_grid, winding_block = runtime.launch_config(
-        winding_kernels["compute_ring_winding"], total_rings,
+        winding_kernels["compute_ring_winding"],
+        total_rings,
     )
     winding_params = (
         (
@@ -466,12 +631,12 @@ def _build_polygon_buffers_gpu(
     )
     runtime.launch(
         winding_kernels["compute_ring_winding"],
-        grid=winding_grid, block=winding_block, params=winding_params,
+        grid=winding_grid,
+        block=winding_block,
+        params=winding_params,
     )
 
     device_radii = runtime.from_host(radii)
-    device_ring_to_row = runtime.from_host(ring_to_row)
-    device_ring_is_hole = runtime.from_host(ring_is_hole)
     device_ring_counts = runtime.allocate((total_rings,), np.int32)
     device_ring_offsets = None
     device_x = None
@@ -513,41 +678,25 @@ def _build_polygon_buffers_gpu(
                 KERNEL_PARAM_I32,
             ),
         )
-        count_grid, count_block = runtime.launch_config(kernels["polygon_buffer_ring_count"], total_rings)
-        runtime.launch(kernels["polygon_buffer_ring_count"],
-                       grid=count_grid, block=count_block, params=count_params)
+        count_grid, count_block = runtime.launch_config(
+            kernels["polygon_buffer_ring_count"], total_rings
+        )
+        runtime.launch(
+            kernels["polygon_buffer_ring_count"],
+            grid=count_grid,
+            block=count_block,
+            params=count_params,
+        )
 
         # Compute exclusive prefix sum for scatter offsets
         device_ring_offsets = exclusive_sum(device_ring_counts)
 
-        # Get total and start async full-counts D2H transfer.  The
-        # transfer runs on a dedicated stream, overlapping with the
-        # scatter kernel on the null stream.
-        total_verts, xfer_stream, pinned_counts = count_scatter_total_with_transfer(
-            runtime,
-            device_ring_counts,
-            device_ring_offsets,
-            total_reason="polygon buffer vertex allocation fence",
-            counts_transfer_reason="polygon buffer ring-count host transfer",
-        )
-
-        if total_verts == 0:
-            xfer_stream.synchronize()
-            runtime.destroy_stream(xfer_stream)
-            device_x = runtime.allocate((0,), np.float64)
-            device_y = runtime.allocate((0,), np.float64)
-            out_ring_offsets = np.zeros(total_rings + 1, dtype=np.int32)
-            success = True
-            return _build_device_backed_polygon_output_variable(
-                device_x, device_y,
-                row_count=polygons.row_count,
-                geometry_offsets=input_geo_offsets.copy(),
-                ring_offsets=out_ring_offsets,
-            )
-
-        # Allocate output coordinate arrays
-        device_x = runtime.allocate((total_verts,), np.float64)
-        device_y = runtime.allocate((total_verts,), np.float64)
+        # A round polygon join sweeps at most one full turn, or 4*q arc
+        # steps, plus its arrival vertex. Stored closure coordinates provide
+        # the extra terminal slot for every ring.
+        vertex_capacity = int(poly_buf.x.size) * (4 * quad_segs + 1)
+        device_x = runtime.allocate((vertex_capacity,), np.float64)
+        device_y = runtime.allocate((vertex_capacity,), np.float64)
 
         # Pass 2: scatter vertices
         scatter_params = (
@@ -584,28 +733,28 @@ def _build_polygon_buffers_gpu(
                 KERNEL_PARAM_I32,
             ),
         )
-        scatter_grid, scatter_block = runtime.launch_config(kernels["polygon_buffer_ring_scatter"], total_rings)
-        runtime.launch(kernels["polygon_buffer_ring_scatter"],
-                       grid=scatter_grid, block=scatter_block, params=scatter_params)
-        runtime.synchronize()
-
-        # Counts D2H transfer was started before the scatter kernel;
-        # wait for it now (should already be done).
-        xfer_stream.synchronize()
-        runtime.destroy_stream(xfer_stream)
-        host_ring_counts = pinned_counts
-        out_ring_offsets = np.empty(total_rings + 1, dtype=np.int32)
+        scatter_grid, scatter_block = runtime.launch_config(
+            kernels["polygon_buffer_ring_scatter"], total_rings
+        )
+        runtime.launch(
+            kernels["polygon_buffer_ring_scatter"],
+            grid=scatter_grid,
+            block=scatter_block,
+            params=scatter_params,
+        )
+        out_ring_offsets = cp.empty(total_rings + 1, dtype=cp.int32)
         out_ring_offsets[0] = 0
-        np.cumsum(host_ring_counts, out=out_ring_offsets[1:])
-
-        # geometry_offsets mirrors input (same ring structure per polygon)
-        out_geometry_offsets = input_geo_offsets.copy()
+        out_ring_offsets[1:] = (
+            cp.asarray(device_ring_offsets)[:total_rings]
+            + cp.asarray(device_ring_counts)[:total_rings]
+        )
 
         success = True
         return _build_device_backed_polygon_output_variable(
-            device_x, device_y,
+            device_x,
+            device_y,
             row_count=polygons.row_count,
-            geometry_offsets=out_geometry_offsets,
+            geometry_offsets=input_geo_offsets.copy(),
             ring_offsets=out_ring_offsets,
         )
     finally:
@@ -653,6 +802,7 @@ def polygon_centroids_owned(
     if row_count == 0:
         if return_owned:
             from vibespatial.constructive.point import _empty_point_output
+
             return _empty_point_output()
         return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
 
@@ -663,11 +813,16 @@ def polygon_centroids_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
         current_residency=owned.residency,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            output_byte_count=row_count * 16,
+            primary_unit_name="polygon-centroid-ring-coordinate",
+        ),
     )
     if selection.selected is ExecutionMode.GPU:
         from vibespatial.runtime.precision import CoordinateStats
-        max_abs, coord_min, coord_max = _coord_stats_from_owned(owned)
-        span = coord_max - coord_min if np.isfinite(coord_min) else 0.0
+
         # The centroid shoelace formula involves products of coordinates
         # (xi*yi1 - xi1*yi) which require constructive-level precision.
         # fp32 introduces unacceptable absolute errors even with Kahan
@@ -681,12 +836,20 @@ def polygon_centroids_owned(
             requested_mode=dispatch_mode,
             requested_precision=precision,
             precision_kernel_class=KernelClass.CONSTRUCTIVE,
-            coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
+            coordinate_stats=CoordinateStats(),
             current_residency=owned.residency,
+            work_estimate=estimate_physical_work_from_owned(
+                owned,
+                output_row_count=row_count,
+                output_byte_count=row_count * 16,
+                primary_unit_name="polygon-centroid-ring-coordinate",
+            ),
         )
         precision_plan = selection.precision_plan
         result = _polygon_centroids_gpu(
-            owned, precision_plan=precision_plan, return_owned=return_owned,
+            owned,
+            precision_plan=precision_plan,
+            return_owned=return_owned,
         )
         if result is not None:
             return result
@@ -695,6 +858,7 @@ def polygon_centroids_owned(
     cx_cpu, cy_cpu = _polygon_centroids_cpu(owned)
     if return_owned:
         from vibespatial.constructive.point import point_owned_from_xy_device
+
         return point_owned_from_xy_device(cx_cpu, cy_cpu)
     return cx_cpu, cy_cpu
 
@@ -745,7 +909,10 @@ def _polygon_centroids_cpu(
         ring_cy = float(((ys + ys_next) * cross).sum() / (6.0 * signed_area))
         return abs(signed_area), ring_cx, ring_cy, 0.0, 0.0, 0
 
-    for tag, family_key in ((poly_tag, GeometryFamily.POLYGON), (mpoly_tag, GeometryFamily.MULTIPOLYGON)):
+    for tag, family_key in (
+        (poly_tag, GeometryFamily.POLYGON),
+        (mpoly_tag, GeometryFamily.MULTIPOLYGON),
+    ):
         row_mask = tags == tag
         if not np.any(row_mask):
             continue
@@ -789,7 +956,9 @@ def _polygon_centroids_cpu(
                     coord_end = int(ring_offsets[ring_idx + 1])
                     xs = x[coord_start:coord_end]
                     ys = y[coord_start:coord_end]
-                    ring_area, ring_cx, ring_cy, mean_x, mean_y, mean_n = _ring_centroid_terms(xs, ys)
+                    ring_area, ring_cx, ring_cy, mean_x, mean_y, mean_n = _ring_centroid_terms(
+                        xs, ys
+                    )
                     if mean_n > 0:
                         fallback_x += mean_x
                         fallback_y += mean_y

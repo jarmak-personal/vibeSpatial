@@ -8,6 +8,7 @@ Extracted from ``overlay/gpu.py`` to reduce module size; see ADR-0016.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -17,11 +18,7 @@ from vibespatial.cuda._runtime import (
     DeviceArray,
     get_cuda_runtime,
 )
-from vibespatial.cuda.cccl_primitives import (
-    exclusive_sum,
-    segmented_reduce_sum,
-    sort_pairs,
-)
+from vibespatial.cuda.cccl_primitives import exclusive_sum, sort_pairs
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -35,6 +32,7 @@ from vibespatial.runtime.config import SPATIAL_EPSILON
 from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
 from vibespatial.runtime.residency import Residency
 
+from .graph import _stable_radix_order_pass
 from .types import (
     HalfEdgeGraph,
     OverlayFaceTable,
@@ -46,6 +44,21 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
     cp = None
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _FaceBoundaryRings:
+    """Capacity-backed boundary cycles for one device face selection."""
+
+    area: DeviceArray
+    edge_counts: DeviceArray
+    coord_offsets: DeviceArray
+    x: DeviceArray
+    y: DeviceArray
+    active: DeviceArray
+    source_rows: DeviceArray
+    ring_count: int
+    coord_capacity: int
 
 
 def _sync_hotpath(runtime) -> None:
@@ -63,134 +76,9 @@ def _device_bool_scalar(value, *, reason: str) -> bool:
     return bool(np.asarray(host).reshape(-1)[0])
 
 
-def _ring_segment_signatures_gpu(
-    *,
-    kernels,
-    runtime,
-    d_all_coord_offsets: cp.ndarray,
-    d_all_edge_counts: cp.ndarray,
-    d_all_x: cp.ndarray,
-    d_all_y: cp.ndarray,
-    total_ring_count: int,
-) -> tuple[cp.ndarray, cp.ndarray]:
-    """Compute orientation-independent ring segment signatures on device."""
-    d_hash_sum = cp.empty(total_ring_count, dtype=cp.uint64)
-    d_hash_xor = cp.empty(total_ring_count, dtype=cp.uint64)
-    grid, block = runtime.launch_config(
-        kernels["compute_ring_segment_signatures"],
-        total_ring_count,
-    )
-    runtime.launch(
-        kernels["compute_ring_segment_signatures"],
-        grid=grid,
-        block=block,
-        params=(
-            (
-                runtime.pointer(d_all_coord_offsets),
-                runtime.pointer(d_all_edge_counts),
-                runtime.pointer(d_all_x),
-                runtime.pointer(d_all_y),
-                runtime.pointer(d_hash_sum),
-                runtime.pointer(d_hash_xor),
-                total_ring_count,
-            ),
-            (
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_I32,
-            ),
-        ),
-    )
-    _sync_hotpath(runtime)
-    return d_hash_sum, d_hash_xor
-
-
-def _filter_duplicate_output_holes_gpu(
-    *,
-    kernels,
-    runtime,
-    d_output_ring_ids: cp.ndarray,
-    d_out_ext_id: cp.ndarray,
-    d_out_source_row: cp.ndarray,
-    d_out_is_ext: cp.ndarray,
-    d_all_coord_offsets: cp.ndarray,
-    d_all_edge_counts: cp.ndarray,
-    d_all_x: cp.ndarray,
-    d_all_y: cp.ndarray,
-    boundary_ring_count: int,
-    total_ring_count: int,
-) -> cp.ndarray:
-    """Drop duplicate hole rings emitted by both boundary and hole walks.
-
-    Overlay union can expose the same hole boundary twice: once as a selected
-    boundary cycle and once as the unselected bounded face. Prefer the
-    extracted unselected-face ring per (row, exterior, undirected segment set)
-    because it carries hole semantics even when the boundary copy has positive
-    orientation.
-    """
-    if d_output_ring_ids.size <= 1:
-        return d_output_ring_ids
-
-    d_hole_positions = cp.flatnonzero(d_out_is_ext == 0).astype(cp.int32, copy=False)
-    if int(d_hole_positions.size) <= 1:
-        return d_output_ring_ids
-
-    d_hash_sum, d_hash_xor = _ring_segment_signatures_gpu(
-        kernels=kernels,
-        runtime=runtime,
-        d_all_coord_offsets=d_all_coord_offsets,
-        d_all_edge_counts=d_all_edge_counts,
-        d_all_x=d_all_x,
-        d_all_y=d_all_y,
-        total_ring_count=total_ring_count,
-    )
-
-    d_hole_ring_ids = d_output_ring_ids[d_hole_positions]
-    d_is_extracted = (d_hole_ring_ids >= boundary_ring_count).astype(cp.int32, copy=False)
-    d_extracted_first = 1 - d_is_extracted
-    d_sort_order = cp.lexsort(
-        cp.stack((
-            d_extracted_first,
-            d_hash_xor[d_hole_ring_ids],
-            d_hash_sum[d_hole_ring_ids],
-            d_all_edge_counts[d_hole_ring_ids].astype(cp.int64, copy=False),
-            d_out_ext_id[d_hole_positions].astype(cp.int64, copy=False),
-            d_out_source_row[d_hole_positions].astype(cp.int64, copy=False),
-        ))
-    )
-    if int(d_sort_order.size) <= 1:
-        return d_output_ring_ids
-
-    d_sorted_positions = d_hole_positions[d_sort_order]
-    d_sorted_rings = d_output_ring_ids[d_sorted_positions]
-    d_same_previous = cp.zeros(int(d_sort_order.size), dtype=cp.bool_)
-    d_same_previous[1:] = (
-        (d_out_source_row[d_sorted_positions[1:]] == d_out_source_row[d_sorted_positions[:-1]])
-        & (d_out_ext_id[d_sorted_positions[1:]] == d_out_ext_id[d_sorted_positions[:-1]])
-        & (d_all_edge_counts[d_sorted_rings[1:]] == d_all_edge_counts[d_sorted_rings[:-1]])
-        & (d_hash_sum[d_sorted_rings[1:]] == d_hash_sum[d_sorted_rings[:-1]])
-        & (d_hash_xor[d_sorted_rings[1:]] == d_hash_xor[d_sorted_rings[:-1]])
-    )
-
-    d_duplicate_positions = d_sorted_positions[d_same_previous]
-    if int(d_duplicate_positions.size) == 0:
-        return d_output_ring_ids
-
-    d_keep = cp.ones(int(d_output_ring_ids.size), dtype=cp.bool_)
-    d_keep[d_duplicate_positions] = False
-    return d_output_ring_ids[d_keep]
-
-
 def _has_polygonal_families(geom: OwnedGeometryArray) -> bool:
     """Return True if the geometry array has POLYGON or MULTIPOLYGON families."""
-    return (
-        GeometryFamily.POLYGON in geom.families
-        or GeometryFamily.MULTIPOLYGON in geom.families
-    )
+    return GeometryFamily.POLYGON in geom.families or GeometryFamily.MULTIPOLYGON in geom.families
 
 
 def _empty_polygon_output(
@@ -230,6 +118,14 @@ def _build_device_backed_fixed_polygon_output(
     row_count: int,
     runtime_selection: RuntimeSelection,
 ) -> OwnedGeometryArray:
+    bounds = cp.column_stack(
+        (
+            device_x[0::5],
+            device_y[0::5],
+            device_x[2::5],
+            device_y[2::5],
+        )
+    )
     result = build_device_resident_owned(
         device_families={
             GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
@@ -239,8 +135,9 @@ def _build_device_backed_fixed_polygon_output(
                 geometry_offsets=cp.arange(row_count + 1, dtype=cp.int32),
                 empty_mask=cp.zeros(row_count, dtype=cp.bool_),
                 ring_offsets=cp.arange(0, (row_count + 1) * 5, 5, dtype=cp.int32),
-                bounds=None,
+                bounds=bounds,
                 dense_single_ring_width=5,
+                axis_aligned_rectangles=True,
             )
         },
         row_count=row_count,
@@ -263,9 +160,13 @@ def _axis_aligned_box_bounds(values: OwnedGeometryArray) -> np.ndarray | None:
         return None
     if polygon_buffer.ring_offsets is None:
         return None
-    if not np.array_equal(polygon_buffer.geometry_offsets, np.arange(row_count + 1, dtype=np.int32)):
+    if not np.array_equal(
+        polygon_buffer.geometry_offsets, np.arange(row_count + 1, dtype=np.int32)
+    ):
         return None
-    if not np.array_equal(polygon_buffer.ring_offsets, np.arange(0, (row_count + 1) * 5, 5, dtype=np.int32)):
+    if not np.array_equal(
+        polygon_buffer.ring_offsets, np.arange(0, (row_count + 1) * 5, 5, dtype=np.int32)
+    ):
         return None
     if np.any(polygon_buffer.empty_mask):
         return None
@@ -283,7 +184,7 @@ def _axis_aligned_box_bounds(values: OwnedGeometryArray) -> np.ndarray | None:
 
     dx = np.diff(x, axis=1)
     dy = np.diff(y, axis=1)
-    axis_aligned = ((np.abs(dx) < SPATIAL_EPSILON) ^ (np.abs(dy) < SPATIAL_EPSILON))
+    axis_aligned = (np.abs(dx) < SPATIAL_EPSILON) ^ (np.abs(dy) < SPATIAL_EPSILON)
     if not np.all(axis_aligned):
         return None
     return np.column_stack(
@@ -314,6 +215,21 @@ def _axis_aligned_box_bounds_device(values: OwnedGeometryArray):
         return None
     if device_buffer.dense_single_ring_width != 5:
         return None
+    if bool(getattr(device_buffer, "axis_aligned_rectangles", False)):
+        if device_buffer.bounds is not None:
+            bounds = cp.asarray(device_buffer.bounds)
+            if tuple(int(dim) for dim in bounds.shape) == (row_count, 4):
+                return bounds
+        x = cp.asarray(device_buffer.x).reshape(row_count, 5)
+        y = cp.asarray(device_buffer.y).reshape(row_count, 5)
+        return cp.column_stack(
+            (
+                cp.min(x[:, :4], axis=1),
+                cp.min(y[:, :4], axis=1),
+                cp.max(x[:, :4], axis=1),
+                cp.max(y[:, :4], axis=1),
+            )
+        )
 
     x = cp.asarray(device_buffer.x).reshape(row_count, 5)
     y = cp.asarray(device_buffer.y).reshape(row_count, 5)
@@ -322,9 +238,7 @@ def _axis_aligned_box_bounds_device(values: OwnedGeometryArray):
     )
     dx = cp.diff(x, axis=1)
     dy = cp.diff(y, axis=1)
-    axis_aligned_edges = (cp.abs(dx) < SPATIAL_EPSILON) ^ (
-        cp.abs(dy) < SPATIAL_EPSILON
-    )
+    axis_aligned_edges = (cp.abs(dx) < SPATIAL_EPSILON) ^ (cp.abs(dy) < SPATIAL_EPSILON)
     bounds = cp.column_stack(
         (
             cp.min(x[:, :4], axis=1),
@@ -342,42 +256,356 @@ def _axis_aligned_box_bounds_device(values: OwnedGeometryArray):
     return bounds
 
 
+def _extract_face_boundary_rings_gpu(
+    half_edge_graph: HalfEdgeGraph,
+    *,
+    d_face_offsets,
+    d_face_edge_ids,
+    d_face_selected,
+    kernels,
+    runtime,
+    area_epsilon: float,
+    stage: str,
+) -> _FaceBoundaryRings | None:
+    """Extract collective boundary cycles for a device face-selection mask."""
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+
+    device = half_edge_graph.device_state
+    if device is None:
+        return None
+    ptr = runtime.pointer
+    edge_count = half_edge_graph.edge_count
+    face_count = int(d_face_selected.size)
+    if edge_count < 3 or face_count == 0:
+        return None
+
+    with hotpath_stage(f"{stage}.edge_selection", category="setup"):
+        d_edge_selected = cp.zeros(edge_count, dtype=cp.int8)
+        runtime.launch(
+            kernels["scatter_edge_face_selection"],
+            grid=(max(face_count, 1), 1, 1),
+            block=(256, 1, 1),
+            params=(
+                (
+                    ptr(d_face_offsets),
+                    ptr(d_face_edge_ids),
+                    ptr(d_face_selected),
+                    ptr(d_edge_selected),
+                    face_count,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
+            ),
+        )
+
+    with hotpath_stage(f"{stage}.boundary_edges", category="refine"):
+        d_is_boundary = cp.empty(edge_count, dtype=cp.int8)
+        edge_grid, edge_block = runtime.launch_config(
+            kernels["compute_boundary_edges"],
+            edge_count,
+        )
+        runtime.launch(
+            kernels["compute_boundary_edges"],
+            grid=edge_grid,
+            block=edge_block,
+            params=(
+                (ptr(d_edge_selected), ptr(d_is_boundary), edge_count),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            ),
+        )
+        _sync_hotpath(runtime)
+
+    with hotpath_stage(f"{stage}.boundary_cycles", category="sort"):
+        boundary_selection = NativeDeviceSelection.from_mask(d_is_boundary != 0)
+        boundary_edge_indices = boundary_selection.partition_capacity_positions().astype(
+            cp.int32,
+            copy=False,
+        )
+        d_boundary_active = boundary_selection.active_capacity_mask()
+        boundary_capacity = boundary_selection.capacity
+        d_boundary_next_full = cp.empty(boundary_capacity, dtype=cp.int32)
+        boundary_next_grid, boundary_next_block = runtime.launch_config(
+            kernels["compute_boundary_next"],
+            boundary_capacity,
+        )
+        runtime.launch(
+            kernels["compute_boundary_next"],
+            grid=boundary_next_grid,
+            block=boundary_next_block,
+            params=(
+                (
+                    ptr(boundary_edge_indices),
+                    ptr(d_boundary_active),
+                    ptr(device.next_edge_ids),
+                    ptr(d_is_boundary),
+                    ptr(d_boundary_next_full),
+                    boundary_capacity,
+                    edge_count,
+                    edge_count,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                ),
+            ),
+        )
+        d_boundary_inverse = cp.empty(edge_count, dtype=cp.int32)
+        d_boundary_inverse[boundary_edge_indices] = cp.where(
+            d_boundary_active,
+            cp.arange(boundary_capacity, dtype=cp.int32),
+            cp.int32(-1),
+        )
+        compact_next = cp.where(
+            d_boundary_active,
+            d_boundary_inverse[d_boundary_next_full],
+            cp.arange(boundary_capacity, dtype=cp.int32),
+        ).astype(cp.int32, copy=False)
+
+        cycle_label = cp.arange(boundary_capacity, dtype=cp.int32)
+        jump = compact_next.copy()
+        max_iter = max(1, int(np.ceil(np.log2(max(1, boundary_capacity)))))
+        for _ in range(max_iter):
+            cycle_label = cp.minimum(cycle_label, cycle_label[jump])
+            jump = jump[jump]
+
+        sorted_cycles = sort_pairs(
+            cycle_label,
+            cp.arange(boundary_capacity, dtype=cp.int32),
+            synchronize=False,
+        )
+        sorted_compact_ids = sorted_cycles.values
+        sorted_labels = sorted_cycles.keys
+        cycle_start_mask = cp.empty(boundary_capacity, dtype=cp.bool_)
+        cycle_start_mask[0] = True
+        if boundary_capacity > 1:
+            cycle_start_mask[1:] = sorted_labels[1:] != sorted_labels[:-1]
+        cycle_selection = NativeDeviceSelection.from_mask(cycle_start_mask)
+        cycle_starts = cycle_selection.partition_capacity_positions().astype(
+            cp.int32,
+            copy=False,
+        )
+        d_cycle_active = cycle_selection.active_capacity_mask()
+        d_cycle_lanes = cp.arange(boundary_capacity, dtype=cp.int64)
+        d_has_next_cycle = (
+            d_cycle_lanes + 1 < cp.asarray(cycle_selection.logical_count, dtype=cp.int64)[0]
+        )
+        cycle_ends = cp.where(
+            d_cycle_active & d_has_next_cycle,
+            cycle_starts[cp.minimum(d_cycle_lanes + 1, boundary_capacity - 1)],
+            cp.int32(boundary_capacity),
+        )
+        cycle_lengths = cp.where(
+            d_cycle_active,
+            cycle_ends - cycle_starts,
+            cp.int32(0),
+        )
+        valid_cycles = NativeDeviceSelection.from_mask(d_cycle_active & (cycle_lengths >= 3))
+        ring_count = boundary_capacity // 3
+        if ring_count == 0:
+            return None
+        valid_cycles = NativeDeviceSelection(
+            positions=valid_cycles.positions[:ring_count],
+            logical_count=valid_cycles.logical_count,
+            source_row_count=boundary_capacity,
+        )
+        d_ring_active = valid_cycles.active_capacity_mask()
+        valid_cycle_starts = valid_cycles.gather_capacity(
+            cycle_starts,
+            fill_value=0,
+        ).astype(cp.int32, copy=False)
+        valid_cycle_ends = valid_cycles.gather_capacity(
+            cycle_ends,
+            fill_value=0,
+        ).astype(cp.int32, copy=False)
+        d_ring_edge_counts = valid_cycles.gather_capacity(
+            cycle_lengths,
+            fill_value=0,
+        ).astype(cp.int32, copy=False)
+        d_ring_edge_starts = sorted_compact_ids[valid_cycle_starts]
+
+    with hotpath_stage(f"{stage}.boundary_metrics", category="refine"):
+        d_ring_area = cp.empty(ring_count, dtype=cp.float64)
+        area_block_size = min(
+            256,
+            runtime.optimal_block_size(kernels["compute_centered_boundary_ring_areas"]),
+        )
+        area_block_size = 1 << (max(1, int(area_block_size)).bit_length() - 1)
+        runtime.launch(
+            kernels["compute_centered_boundary_ring_areas"],
+            grid=(ring_count, 1, 1),
+            block=(area_block_size, 1, 1),
+            params=(
+                (
+                    ptr(device.src_x),
+                    ptr(device.src_y),
+                    ptr(boundary_edge_indices),
+                    ptr(sorted_compact_ids),
+                    ptr(valid_cycle_starts),
+                    ptr(valid_cycle_ends),
+                    ptr(d_ring_active),
+                    ptr(d_boundary_next_full),
+                    ptr(d_ring_area),
+                    ring_count,
+                    boundary_capacity,
+                    edge_count,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                ),
+            ),
+        )
+        _sync_hotpath(runtime)
+
+    d_row_indices = cp.asarray(device.row_indices)
+    d_cycle_source_rows = cp.where(
+        d_ring_active,
+        d_row_indices[boundary_edge_indices[d_ring_edge_starts]],
+        cp.int32(-1),
+    ).astype(cp.int32, copy=False)
+
+    with hotpath_stage(f"{stage}.boundary_scatter", category="emit"):
+        ring_coord_counts = cp.where(
+            d_ring_active,
+            d_ring_edge_counts + 1,
+            cp.int32(0),
+        )
+        d_ring_coord_offsets = exclusive_sum(ring_coord_counts.astype(cp.int32, copy=False))
+        coord_capacity = int(boundary_capacity + ring_count)
+        d_out_x = cp.zeros(coord_capacity, dtype=cp.float64)
+        d_out_y = cp.zeros(coord_capacity, dtype=cp.float64)
+        ring_grid, ring_block = runtime.launch_config(
+            kernels["scatter_boundary_ring_coordinates"],
+            ring_count,
+        )
+        runtime.launch(
+            kernels["scatter_boundary_ring_coordinates"],
+            grid=ring_grid,
+            block=ring_block,
+            params=(
+                (
+                    ptr(device.src_x),
+                    ptr(device.src_y),
+                    ptr(boundary_edge_indices),
+                    ptr(d_ring_edge_starts),
+                    ptr(d_ring_coord_offsets),
+                    ptr(d_ring_edge_counts),
+                    ptr(d_ring_active),
+                    ptr(compact_next),
+                    ptr(d_out_x),
+                    ptr(d_out_y),
+                    ring_count,
+                    boundary_capacity,
+                    edge_count,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                ),
+            ),
+        )
+        _sync_hotpath(runtime)
+
+    # Bounded cycles come from the exact half-edge arrangement. Their output
+    # dimension is the exact sign of the represented fp64 ring, not an error
+    # interval around how an intersection coordinate was constructed.
+    d_nondegenerate = d_ring_active & (cp.abs(d_ring_area) > area_epsilon)
+    return _FaceBoundaryRings(
+        area=cp.where(d_nondegenerate, d_ring_area, 0.0),
+        edge_counts=cp.where(d_nondegenerate, d_ring_edge_counts, cp.int32(0)),
+        coord_offsets=d_ring_coord_offsets,
+        x=d_out_x,
+        y=d_out_y,
+        active=d_nondegenerate,
+        source_rows=cp.where(d_nondegenerate, d_cycle_source_rows, cp.int32(-1)),
+        ring_count=ring_count,
+        coord_capacity=coord_capacity,
+    )
+
+
 def _build_polygon_output_from_faces_gpu(
     half_edge_graph: HalfEdgeGraph,
     faces: OverlayFaceTable,
-    selected_face_indices: np.ndarray | cp.ndarray,
+    selected_face_indices,
     *,
     preserve_row_count: int | None = None,
+    d_valid_empty_rows=None,
+    area_epsilon: float = 0.0,
 ) -> OwnedGeometryArray | None:
     """GPU face-to-polygon assembly (Phase 11: GPU boundary cycle detection).
 
     Full GPU pipeline:
-      Steps 1-2: Edge-to-face mapping and face selection via CuPy scatter.
+      Steps 1-2: Face selection scattered to an edge-selection bit carrier.
       Step 3: Boundary edge identification via NVRTC kernel.
       Step 4: Boundary next-edge computation via NVRTC kernel.
-      Step 5: Cycle detection via GPU pointer jumping + list ranking;
-              per-cycle area/centroid via segmented reduction.
+      Step 5: Compact boundary cycle detection via GPU pointer jumping;
+              per-cycle area via segmented reduction.
       Steps 6-7: Coordinate offset computation and ring scatter via GPU.
-      Steps 7b-8: Hole ring extraction and merge on device.
-      Step 8b: GPU nesting depth for boundary rings (even depth = exterior).
-      Step 9: Hole-to-exterior assignment via GPU PIP kernel.
-      Step 9b: GPU sibling hole nesting depth (even = valid hole, odd = skip).
-      Step 10: GPU output assembly with device-side sorting, grouping,
-              and host-side row_polygons construction; D->H transfer at the
-              ADR-0005 materialization boundary.
+      Step 8: Classify oriented boundary cycles into shells and holes.
+      Step 9: Assign holes to exteriors via GPU PIP kernel.
+      Step 10: GPU output assembly with device-side sorting and grouping.
 
     Returns None if GPU is unavailable (caller falls back to CPU path).
     """
     if cp is None or half_edge_graph.device_state is None or faces.device_state is None:
         return None
-    if selected_face_indices.size == 0:
+
+    def _empty_preserved_output() -> OwnedGeometryArray:
+        if preserve_row_count is not None and d_valid_empty_rows is not None:
+            from vibespatial.geometry.owned import build_empty_polygon_rows_device
+
+            result = build_empty_polygon_rows_device(
+                preserve_row_count,
+                validity=cp.asarray(d_valid_empty_rows, dtype=cp.bool_),
+            )
+            result.runtime_history.append(faces.runtime_selection)
+            return result
         return _empty_polygon_output(
             faces.runtime_selection,
             row_count=preserve_row_count or 0,
         )
 
+    selection_capacity = getattr(selected_face_indices, "capacity", None)
+    if (
+        selection_capacity is None and int(selected_face_indices.size) == 0
+    ) or selection_capacity == 0:
+        return _empty_preserved_output()
+
     # Lazy import: kernel compile functions stay in gpu.py to avoid
     # circular imports (they depend on gpu_kernels module-level state).
+    from vibespatial.api._native_rowset import NativeDeviceSelection
     from vibespatial.overlay.gpu import (
         _overlay_face_assembly_kernels,
         _overlay_face_walk_kernels,
@@ -388,410 +616,57 @@ def _build_polygon_output_from_faces_gpu(
     walk_kernels = _overlay_face_walk_kernels()
     kernels.update(walk_kernels)
     ptr = runtime.pointer
-    edge_count = half_edge_graph.edge_count
     face_count = faces.face_count
 
-    device = half_edge_graph.device_state
     face_device = faces.device_state
 
-    with hotpath_stage("overlay.assemble.face_edge_map", category="setup"):
-        # --- Step 1: Map edges to faces (Tier 2: CuPy vectorised scatter) ---
-        # Build edge_face_ids on device: for each edge, which face does it belong to?
-        d_edge_face_ids = cp.full(edge_count, -1, dtype=cp.int32)
-        d_face_offsets = cp.asarray(face_device.face_offsets)
-        d_face_edge_ids = cp.asarray(face_device.face_edge_ids)
-        total_face_edges = int(d_face_edge_ids.size)
-        if total_face_edges > 0:
-            # For each slot in face_edge_ids, find which face it belongs to
-            slot_ids = cp.arange(total_face_edges, dtype=cp.int32)
-            slot_face = cp.searchsorted(d_face_offsets[1:], slot_ids, side='right').astype(cp.int32)
-            d_edge_face_ids[d_face_edge_ids] = slot_face
-
-        # --- Step 2: Build face selection mask on device ---
+    d_face_offsets = cp.asarray(face_device.face_offsets)
+    d_face_edge_ids = cp.asarray(face_device.face_edge_ids)
+    if selection_capacity is not None:
+        if int(selection_capacity) != face_count:
+            raise ValueError("selected face capacity must match overlay face count")
+        d_face_selected = selected_face_indices.source_mask().astype(
+            cp.int8,
+            copy=False,
+        )
+    else:
         d_face_selected = cp.zeros(face_count, dtype=cp.int8)
         d_face_selected[cp.asarray(selected_face_indices)] = 1
 
-    with hotpath_stage("overlay.assemble.boundary_edges", category="refine"):
-        # --- Step 3: Identify boundary edges via GPU kernel ---
-        d_is_boundary = cp.empty(edge_count, dtype=cp.int8)
-        edge_grid, edge_block = runtime.launch_config(
-            kernels["compute_boundary_edges"],
-            edge_count,
-        )
-        runtime.launch(
-            kernels["compute_boundary_edges"],
-            grid=edge_grid, block=edge_block,
-            params=(
-                (ptr(d_edge_face_ids), ptr(d_face_selected), ptr(device.next_edge_ids),
-                 ptr(d_is_boundary), edge_count),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-            ),
-        )
-        _sync_hotpath(runtime)
+    selected_rings = _extract_face_boundary_rings_gpu(
+        half_edge_graph,
+        d_face_offsets=d_face_offsets,
+        d_face_edge_ids=d_face_edge_ids,
+        d_face_selected=d_face_selected,
+        kernels=kernels,
+        runtime=runtime,
+        area_epsilon=area_epsilon,
+        stage="overlay.assemble.selected",
+    )
+    if selected_rings is None:
+        return _empty_preserved_output()
 
-    with hotpath_stage("overlay.assemble.boundary_next", category="refine"):
-        # --- Step 4: Compute boundary next pointers via GPU kernel ---
-        d_boundary_next = cp.full(edge_count, -1, dtype=cp.int32)
-        max_steps = edge_count
-        boundary_next_grid, boundary_next_block = runtime.launch_config(
-            kernels["compute_boundary_next"],
-            edge_count,
-        )
-        runtime.launch(
-            kernels["compute_boundary_next"],
-            grid=boundary_next_grid, block=boundary_next_block,
-            params=(
-                (ptr(d_edge_face_ids), ptr(d_face_selected), ptr(device.next_edge_ids),
-                 ptr(d_is_boundary), ptr(d_boundary_next), edge_count, max_steps),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
-            ),
-        )
-        _sync_hotpath(runtime)
+    d_ring_area = selected_rings.area
+    d_ring_edge_counts = selected_rings.edge_counts
+    d_ring_coord_offsets = selected_rings.coord_offsets
+    d_out_x = selected_rings.x
+    d_out_y = selected_rings.y
+    d_ring_active = selected_rings.active
+    d_cycle_source_rows = selected_rings.source_rows
+    ring_count = selected_rings.ring_count
 
-    with hotpath_stage("overlay.assemble.boundary_cycles", category="sort"):
-        # --- Step 5: Detect boundary cycles via GPU pointer jumping ---
-        boundary_edge_indices = cp.flatnonzero(d_is_boundary != 0).astype(cp.int32, copy=False)
-        boundary_count = int(boundary_edge_indices.size)
-        if boundary_count == 0:
-            return _empty_polygon_output(
-                faces.runtime_selection,
-                row_count=preserve_row_count or 0,
-            )
-        # Phase 25 memory: d_is_boundary, d_edge_face_ids, d_face_selected,
-        # and the Step 1 face_offsets/edge_ids copies are dead.
-        del d_is_boundary, d_edge_face_ids, d_face_selected
-        del d_face_offsets, d_face_edge_ids
-
-        # Build compact boundary-local next array
-        edge_to_compact = cp.full(edge_count, -1, dtype=cp.int32)
-        edge_to_compact[boundary_edge_indices] = cp.arange(boundary_count, dtype=cp.int32)
-        compact_next = edge_to_compact[d_boundary_next[boundary_edge_indices]]
-        # Phase 25 memory: edge_to_compact is dead after compact_next is built.
-        del edge_to_compact
-
-        # Pointer jumping to find cycle labels (minimum compact index in cycle)
-        cycle_label = cp.arange(boundary_count, dtype=cp.int32)
-        jump_b = compact_next.copy()
-        max_iter_b = max(1, int(np.ceil(np.log2(max(1, boundary_count)))))
-        for _ in range(max_iter_b):
-            cycle_label = cp.minimum(cycle_label, cycle_label[jump_b])
-            jump_b = jump_b[jump_b]
-        # Phase 25 memory: jump_b is dead after pointer jumping.
-        del jump_b
-
-        # List ranking: compute position within each cycle using NVRTC kernel
-        d_rank_b = cp.empty(boundary_count, dtype=cp.int32)
-        d_compact_next_i64 = compact_next.astype(cp.int64)
-        boundary_grid, boundary_block = runtime.launch_config(
-            kernels["list_rank_within_cycle"],
-            boundary_count,
-        )
-        rank_params = (
-            (ptr(cycle_label), ptr(d_compact_next_i64),
-             ptr(d_rank_b), boundary_count, boundary_count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
-        )
-        runtime.launch(
-            kernels["list_rank_within_cycle"],
-            grid=boundary_grid, block=boundary_block, params=rank_params,
-        )
-        _sync_hotpath(runtime)
-
-        # Sort by (cycle_label, rank) to get cycle-ordered boundary edges
-        packed_b = cycle_label.astype(cp.int64) * int(boundary_count) + d_rank_b.astype(cp.int64)
-        # Phase 25 memory: d_rank_b and d_compact_next_i64 are dead.
-        del d_rank_b, d_compact_next_i64
-        b_sort = sort_pairs(packed_b, cp.arange(boundary_count, dtype=cp.int32), synchronize=False)
-        del packed_b
-        sorted_compact_ids = b_sort.values
-        sorted_labels = cycle_label[sorted_compact_ids]
-        # Phase 25 memory: cycle_label consumed; compact_next dead.
-        del cycle_label, compact_next
-
-        # Find unique cycles and their segment boundaries
-        b_start_mask = cp.empty(boundary_count, dtype=cp.bool_)
-        b_start_mask[0] = True
-        if boundary_count > 1:
-            b_start_mask[1:] = sorted_labels[1:] != sorted_labels[:-1]
-        cycle_starts = cp.flatnonzero(b_start_mask).astype(cp.int32, copy=False)
-        cycle_ends = cp.concatenate((cycle_starts[1:], cp.asarray([boundary_count], dtype=cp.int32)))
-        cycle_lengths = cycle_ends - cycle_starts
-        del b_start_mask, sorted_labels
-
-        # Filter cycles with >= 3 edges
-        valid_cycle_mask = cycle_lengths >= 3
-        valid_cycle_indices = cp.flatnonzero(valid_cycle_mask).astype(cp.int32, copy=False)
-        ring_count = int(valid_cycle_indices.size)
-        del valid_cycle_mask
-
-    if ring_count == 0:
-        return _empty_polygon_output(
-            faces.runtime_selection,
-            row_count=preserve_row_count or 0,
-        )
-
-    valid_cycle_starts = cycle_starts[valid_cycle_indices]
-    valid_cycle_ends = cycle_ends[valid_cycle_indices]
-    valid_cycle_lengths = cycle_lengths[valid_cycle_indices]
-    del cycle_starts, cycle_ends, cycle_lengths, valid_cycle_indices
-
-    # Map sorted compact ids back to full edge ids for the valid cycles
-    sorted_full_edge_ids = boundary_edge_indices[sorted_compact_ids]
-    del sorted_compact_ids
-
-    with hotpath_stage("overlay.assemble.boundary_metrics", category="refine"):
-        # Compute per-boundary-edge shoelace contributions on device
-        d_src_x_b = cp.asarray(device.src_x)
-        d_src_y_b = cp.asarray(device.src_y)
-        b_x0 = d_src_x_b[sorted_full_edge_ids]
-        b_y0 = d_src_y_b[sorted_full_edge_ids]
-        b_next_edges = d_boundary_next[sorted_full_edge_ids]
-        b_x1 = d_src_x_b[b_next_edges]
-        b_y1 = d_src_y_b[b_next_edges]
-        del b_next_edges
-        b_cross = b_x0 * b_y1 - b_x1 * b_y0
-        # Phase 25 memory: boundary coordinate arrays consumed by cross products.
-        del b_x0, b_y0, b_x1, b_y1
-
-        # Segmented reduce for per-cycle area and centroid
-        cross_sums_b = segmented_reduce_sum(
-            b_cross,
-            valid_cycle_starts,
-            valid_cycle_ends,
-            num_segments=ring_count,
-        ).values
-        del b_cross
-        d_ring_area = cross_sums_b * 0.5
-        del cross_sums_b
-
-    # Ring edge starts (first full edge id of each valid cycle) and counts
-    d_ring_edge_starts = sorted_full_edge_ids[valid_cycle_starts]
-    d_ring_edge_counts = valid_cycle_lengths
-    del sorted_full_edge_ids, valid_cycle_starts, valid_cycle_ends, valid_cycle_lengths
-
-    # Source row per cycle: take the row_index of the first edge (device-resident
-    # until Step 10 materialization boundary per ADR-0005).
-    # Read from device_state directly to avoid D->H->D round-trip.
-    d_row_indices = cp.asarray(device.row_indices)
-    d_cycle_source_rows = d_row_indices[d_ring_edge_starts].astype(cp.int32)
-
-    with hotpath_stage("overlay.assemble.boundary_scatter", category="emit"):
-        # --- Step 6: Compute ring coordinate offsets (Tier 3a: exclusive_scan) ---
-        # Each ring needs edge_count + 1 coordinates (for closure)
-        ring_coord_counts = d_ring_edge_counts + 1
-        d_ring_coord_offsets = exclusive_sum(ring_coord_counts.astype(cp.int32, copy=False))
-        # Allocate by the known boundary-edge upper bound instead of copying
-        # the exact device sum to host. Invalid tiny cycles may leave unused
-        # tail slots, but downstream offsets reference only written coords.
-        total_coords = int(boundary_count + ring_count)
-
-        # --- Step 7: Scatter ring coordinates via GPU kernel ---
-        # Zero-fill to prevent denormalized garbage in unwritten positions if the
-        # scatter kernel skips any coordinate slot due to an out-of-bounds
-        # boundary_next index.  cp.empty() would recycle a pool block containing
-        # stale int32 metadata, which reinterprets as denormalized float64 values
-        # (e.g. 4e-316) that crash GEOS with TopologyException.
-        d_out_x = cp.zeros(total_coords, dtype=cp.float64)
-        d_out_y = cp.zeros(total_coords, dtype=cp.float64)
-        ring_grid, ring_block = runtime.launch_config(
-            kernels["scatter_ring_coordinates"],
-            ring_count,
-        )
-        runtime.launch(
-            kernels["scatter_ring_coordinates"],
-            grid=ring_grid, block=ring_block,
-            params=(
-                (ptr(device.src_x), ptr(device.src_y),
-                 ptr(d_ring_edge_starts), ptr(d_ring_coord_offsets),
-                 ptr(d_ring_edge_counts), ptr(d_boundary_next),
-                 ptr(d_out_x), ptr(d_out_y), ring_count,
-                 edge_count),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                 KERNEL_PARAM_I32),
-            ),
-        )
-        _sync_hotpath(runtime)
-
-    # Phase 25 memory: d_ring_edge_starts, d_ring_coord_offsets, and
-    # d_ring_edge_counts are still needed for Step 8 merge.
-
-    # --- Step 7b: Extract hole rings from unselected bounded faces ---
-    # Per ADR-0016, holes are unselected bounded faces whose ring coordinates
-    # form interior rings of the output polygons.
-    # GPU filter: hole faces are unselected bounded faces (Tier 2: CuPy).
-    d_bounded_mask_dev = cp.asarray(face_device.bounded_mask)
-    d_face_selected_bool = cp.zeros(face_count, dtype=cp.bool_)
-    d_face_selected_bool[cp.asarray(selected_face_indices)] = True
-    d_hole_mask = (d_bounded_mask_dev != 0) & (~d_face_selected_bool)
-    del d_bounded_mask_dev, d_face_selected_bool
-    d_hole_fi = cp.flatnonzero(d_hole_mask).astype(cp.int32)
-    del d_hole_mask
-
-    # Extract hole ring coordinates using scatter_ring_coordinates kernel.
-    # Hole faces use next_edge_ids (not boundary_next) for edge traversal.
-    d_face_offsets_dev = cp.asarray(face_device.face_offsets)
-    d_face_edge_ids_dev = cp.asarray(face_device.face_edge_ids)
-    d_next_i32 = cp.asarray(device.next_edge_ids).astype(cp.int32)
-
-    with hotpath_stage("overlay.assemble.hole_extract", category="refine"):
-        hole_device_data = None
-        if d_hole_fi.size > 0:
-            d_hole_starts_in_face = d_face_offsets_dev[d_hole_fi]
-            d_hole_ends_in_face = d_face_offsets_dev[d_hole_fi + 1]
-            d_hole_lengths = d_hole_ends_in_face - d_hole_starts_in_face
-
-            d_valid_hole_mask = d_hole_lengths >= 3
-            d_valid_hole_idx = cp.flatnonzero(d_valid_hole_mask).astype(cp.int32)
-            n_valid_holes = int(d_valid_hole_idx.size)
-
-            if n_valid_holes > 0:
-                d_vh_starts = d_hole_starts_in_face[d_valid_hole_idx]
-                d_vh_lengths = d_hole_lengths[d_valid_hole_idx]
-
-                d_hole_edge_starts = d_face_edge_ids_dev[d_vh_starts]
-                d_hole_source_rows = d_row_indices[d_hole_edge_starts].astype(cp.int32)
-
-                d_hole_coord_counts = d_vh_lengths + 1
-                d_hole_coord_offsets_partial = exclusive_sum(d_hole_coord_counts.astype(cp.int32))
-                _last_offset = d_hole_coord_offsets_partial[-1:] + d_hole_coord_counts[-1:]
-                d_hole_coord_offsets = cp.concatenate([d_hole_coord_offsets_partial, _last_offset])
-                # Allocate by host-known face-edge capacity instead of
-                # synchronizing for the exact valid-hole coordinate total.
-                # Exact offsets below still delimit every referenced ring.
-                total_hole_coords = int(d_face_edge_ids_dev.size + n_valid_holes)
-
-                d_hole_x = cp.zeros(total_hole_coords, dtype=cp.float64)
-                d_hole_y = cp.zeros(total_hole_coords, dtype=cp.float64)
-                hole_grid, hole_block = runtime.launch_config(
-                    kernels["scatter_ring_coordinates"],
-                    n_valid_holes,
-                )
-                runtime.launch(
-                    kernels["scatter_ring_coordinates"],
-                    grid=hole_grid, block=hole_block,
-                    params=(
-                        (ptr(device.src_x), ptr(device.src_y),
-                         ptr(d_hole_edge_starts), ptr(d_hole_coord_offsets),
-                         ptr(d_vh_lengths), ptr(d_next_i32),
-                         ptr(d_hole_x), ptr(d_hole_y), n_valid_holes,
-                         edge_count),
-                        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                         KERNEL_PARAM_I32),
-                    ),
-                )
-                _sync_hotpath(runtime)
-
-                h_x0 = d_hole_x[:-1] if total_hole_coords > 1 else d_hole_x
-                h_y0 = d_hole_y[:-1] if total_hole_coords > 1 else d_hole_y
-                h_x1 = d_hole_x[1:] if total_hole_coords > 1 else d_hole_x
-                h_y1 = d_hole_y[1:] if total_hole_coords > 1 else d_hole_y
-                h_cross = h_x0 * h_y1 - h_x1 * h_y0
-                del h_x0, h_y0, h_x1, h_y1
-
-                hole_seg_starts = d_hole_coord_offsets[:-1]
-                hole_seg_ends = d_hole_coord_offsets[1:] - 1
-                h_area = segmented_reduce_sum(
-                    h_cross,
-                    hole_seg_starts,
-                    hole_seg_ends,
-                    num_segments=n_valid_holes,
-                ).values * 0.5
-                del h_cross, hole_seg_starts, hole_seg_ends
-
-                d_nondegenerate = cp.abs(h_area) >= SPATIAL_EPSILON
-                d_nondegen_idx = cp.flatnonzero(d_nondegenerate).astype(cp.int32)
-                n_valid_nondegenerate = int(d_nondegen_idx.size)
-                del d_nondegenerate
-
-                if n_valid_nondegenerate > 0:
-                    _d_hole_area = h_area[d_nondegen_idx]
-                    _d_hole_lengths = d_vh_lengths[d_nondegen_idx]
-                    _d_hole_starts = d_hole_coord_offsets[:-1][d_nondegen_idx]
-                    _d_hole_source_rows = d_hole_source_rows[d_nondegen_idx]
-                    hole_device_data = (
-                        _d_hole_area,
-                        _d_hole_lengths,
-                        _d_hole_starts,
-                        _d_hole_source_rows,
-                        d_hole_x,
-                        d_hole_y,
-                        d_hole_coord_offsets,
-                        n_valid_nondegenerate,
-                    )
-
-    _hole_device_data = hole_device_data
-
-    # --- Step 8: Merge boundary + hole ring data on device ---
-    boundary_ring_count = ring_count
-
-    with hotpath_stage("overlay.assemble.ring_merge", category="emit"):
-        if _hole_device_data is not None:
-            (
-                _d_hole_area,
-                _d_hole_lengths,
-                _d_hole_starts,
-                _d_hole_source_rows,
-                _d_hole_all_x,
-                _d_hole_all_y,
-                _d_hole_coord_offsets_full,
-                n_holes,
-            ) = _hole_device_data
-
-            d_hole_coord_counts = _d_hole_lengths + 1
-            d_hole_offsets_compact = exclusive_sum(d_hole_coord_counts.astype(cp.int32))
-            total_hole_compact = int(_d_hole_all_x.size)
-
-            if total_hole_compact > 0:
-                slot_ids_h = cp.arange(total_hole_compact, dtype=cp.int32)
-                hole_used = d_hole_offsets_compact[-1:] + d_hole_coord_counts[-1:]
-                safe_slots_h = cp.minimum(slot_ids_h, hole_used[0] - 1)
-                slot_ring_h = cp.searchsorted(
-                    d_hole_offsets_compact[1:],
-                    safe_slots_h,
-                    side="right",
-                ).astype(cp.int32)
-                slot_local_h = safe_slots_h - d_hole_offsets_compact[slot_ring_h]
-                slot_src_h = _d_hole_starts[slot_ring_h] + slot_local_h
-                d_hole_compact_x = _d_hole_all_x[slot_src_h]
-                d_hole_compact_y = _d_hole_all_y[slot_src_h]
-            else:
-                d_hole_compact_x = cp.empty(0, dtype=cp.float64)
-                d_hole_compact_y = cp.empty(0, dtype=cp.float64)
-
-            d_hole_edge_counts = _d_hole_lengths
-            d_all_area = cp.concatenate((d_ring_area, -cp.abs(_d_hole_area)))
-            d_all_x = cp.concatenate((d_out_x, d_hole_compact_x))
-            d_all_y = cp.concatenate((d_out_y, d_hole_compact_y))
-            d_hole_offsets_shifted = d_hole_offsets_compact + total_coords
-            d_all_coord_offsets = cp.concatenate((d_ring_coord_offsets, d_hole_offsets_shifted))
-            d_all_edge_counts = cp.concatenate((d_ring_edge_counts, d_hole_edge_counts))
-            del d_ring_area
-            del d_out_x, d_out_y, d_ring_coord_offsets, d_ring_edge_counts
-            del d_hole_compact_x, d_hole_compact_y, d_hole_offsets_compact
-            del _d_hole_area, d_hole_edge_counts
-            del d_hole_offsets_shifted
-        else:
-            n_holes = 0
-            d_all_area = d_ring_area
-            d_all_x = d_out_x
-            d_all_y = d_out_y
-            d_all_coord_offsets = d_ring_coord_offsets
-            d_all_edge_counts = d_ring_edge_counts
-
-    # Phase 25 memory: boundary_next, face data copies, and hole-detection
-    # arrays are dead after the merge.
-    del d_boundary_next, d_face_offsets_dev, d_face_edge_ids_dev, d_next_i32
-    del d_hole_fi, d_src_x_b, d_src_y_b
-    total_ring_count = boundary_ring_count + n_holes
+    # Selected-region cycles already carry every selected/excluded interface:
+    # positive cycles are exteriors and negative cycles are holes. Extracting
+    # the inverse excluded-face set duplicates those edges and inflates ring
+    # capacity to the full face table without adding output topology.
+    del d_face_selected
+    total_ring_count = ring_count
+    d_all_area = d_ring_area
+    d_all_x = d_out_x
+    d_all_y = d_out_y
+    d_all_coord_offsets = d_ring_coord_offsets
+    d_all_edge_counts = d_ring_edge_counts
+    d_all_ring_active = d_ring_active
 
     with hotpath_stage("overlay.assemble.sample_points", category="refine"):
         # Compute one in-ring sample point per assembled ring. Unlike centroids,
@@ -811,6 +686,7 @@ def _build_polygon_output_from_faces_gpu(
                 (
                     ptr(d_all_coord_offsets),
                     ptr(d_all_edge_counts),
+                    ptr(d_all_ring_active),
                     ptr(d_all_x),
                     ptr(d_all_y),
                     ptr(d_ring_sample_x),
@@ -824,70 +700,31 @@ def _build_polygon_output_from_faces_gpu(
                     KERNEL_PARAM_PTR,
                     KERNEL_PARAM_PTR,
                     KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
                     KERNEL_PARAM_I32,
                 ),
             ),
         )
         _sync_hotpath(runtime)
 
-    # --- Source rows for ALL rings on device ---
-    # Boundary rings: from cycle walk; holes: inherit from exterior later.
-    d_all_source_rows = cp.full(total_ring_count, -1, dtype=cp.int32)
-    d_all_source_rows[:boundary_ring_count] = d_cycle_source_rows
-    if _hole_device_data is not None:
-        d_all_source_rows[boundary_ring_count:] = _d_hole_source_rows
-
-    # --- Step 8b: GPU nesting depth for boundary rings ---
-    # Boundary rings with positive area might be nested inside other
-    # positive-area boundary rings from the same source row. Count
-    # containment depth: even → true exterior, odd → nested interior.
-    d_is_boundary_flag = cp.zeros(total_ring_count, dtype=cp.bool_)
-    d_is_boundary_flag[:boundary_ring_count] = True
-    d_pos_area_boundary = d_is_boundary_flag & (d_all_area > 0.0)
-    n_pos_boundary = int(
-        cp.flatnonzero(d_pos_area_boundary).astype(cp.int32, copy=False).size
+    # Boundary rings get their source row from the selected face. Holes inherit
+    # the exterior row after assignment below.
+    d_all_source_rows = cp.where(
+        d_ring_active,
+        d_cycle_source_rows,
+        cp.int32(-1),
     )
 
-    with hotpath_stage("overlay.assemble.nesting_depth", category="refine"):
-        if n_pos_boundary > 1:
-            d_boundary_depth = cp.zeros(boundary_ring_count, dtype=cp.int32)
-            boundary_depth_grid, boundary_depth_block = runtime.launch_config(
-                kernels["count_boundary_nesting_depth"],
-                boundary_ring_count,
-            )
-            runtime.launch(
-                kernels["count_boundary_nesting_depth"],
-                grid=boundary_depth_grid, block=boundary_depth_block,
-                params=(
-                    (ptr(d_ring_sample_x), ptr(d_ring_sample_y), ptr(d_all_area),
-                     ptr(d_all_source_rows), ptr(d_all_coord_offsets),
-                     ptr(d_all_edge_counts), ptr(d_all_x), ptr(d_all_y),
-                     ptr(d_boundary_depth), boundary_ring_count),
-                    (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                     KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                     KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                     KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-                ),
-            )
-            _sync_hotpath(runtime)
-            d_even_depth = (d_boundary_depth % 2) == 0
-            d_exterior_mask = (d_all_area[:boundary_ring_count] > 0.0) & d_even_depth
-            d_exterior_mask_full = cp.zeros(total_ring_count, dtype=cp.bool_)
-            d_exterior_mask_full[:boundary_ring_count] = d_exterior_mask
-        else:
-            d_exterior_mask_full = cp.zeros(total_ring_count, dtype=cp.bool_)
-            d_exterior_mask_full[:boundary_ring_count] = (
-                d_all_area[:boundary_ring_count] > 0.0
-            )
+    # --- Step 8: Classify selected-side boundary orientation. ---
+    # The half-edge boundary walk keeps the selected region on the left:
+    # positive cycles are exteriors and negative cycles are holes.
+    d_exterior_mask_full = d_ring_active & (d_all_area > 0.0)
 
-    d_exterior_indices = cp.flatnonzero(d_exterior_mask_full).astype(cp.int32)
-    exterior_count = int(d_exterior_indices.size)
-
-    if exterior_count == 0:
-        return _empty_polygon_output(
-            faces.runtime_selection,
-            row_count=preserve_row_count or 0,
-        )
+    exterior_selection = NativeDeviceSelection.from_mask(d_exterior_mask_full)
+    d_exterior_indices = exterior_selection.partition_capacity_positions().astype(
+        cp.int32,
+        copy=False,
+    )
 
     with hotpath_stage("overlay.assemble.hole_assignment", category="refine"):
         # --- Step 9: Assign holes to exteriors via GPU kernel ---
@@ -898,21 +735,39 @@ def _build_polygon_output_from_faces_gpu(
         )
         runtime.launch(
             kernels["assign_holes_to_exteriors"],
-            grid=ring_grid_all, block=ring_block_all,
+            grid=ring_grid_all,
+            block=ring_block_all,
             params=(
-                (ptr(d_ring_sample_x), ptr(d_ring_sample_y), ptr(d_all_area),
-                 ptr(d_exterior_mask_full.astype(cp.int8, copy=False)),
-                 ptr(d_all_source_rows),
-                 ptr(d_all_coord_offsets), ptr(d_all_edge_counts),
-                 ptr(d_all_x), ptr(d_all_y),
-                 ptr(d_exterior_indices), exterior_count,
-                 ptr(d_exterior_id), total_ring_count),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+                (
+                    ptr(d_ring_sample_x),
+                    ptr(d_ring_sample_y),
+                    ptr(d_all_area),
+                    ptr(d_exterior_mask_full.astype(cp.int8, copy=False)),
+                    ptr(d_all_source_rows),
+                    ptr(d_all_coord_offsets),
+                    ptr(d_all_edge_counts),
+                    ptr(d_all_x),
+                    ptr(d_all_y),
+                    ptr(d_exterior_indices),
+                    ptr(exterior_selection.logical_count),
+                    ptr(d_exterior_id),
+                    total_ring_count,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
             ),
         )
         _sync_hotpath(runtime)
@@ -924,35 +779,64 @@ def _build_polygon_output_from_faces_gpu(
     d_sibling_depth = cp.zeros(total_ring_count, dtype=cp.int32)
 
     # Check if there are any holes assigned
-    d_is_hole = (d_exterior_id >= 0) & (d_exterior_id != cp.arange(total_ring_count, dtype=cp.int32))
-    d_can_be_hole = cp.ones(total_ring_count, dtype=cp.int8)
-    d_can_be_hole[:boundary_ring_count] = (
-        d_all_area[:boundary_ring_count] <= 0.0
-    ).astype(cp.int8, copy=False)
-    n_assigned_holes = int(
-        cp.flatnonzero(d_is_hole).astype(cp.int32, copy=False).size
+    d_is_hole = (
+        d_all_ring_active
+        & (d_exterior_id >= 0)
+        & (d_exterior_id != cp.arange(total_ring_count, dtype=cp.int32))
     )
-
-    if n_assigned_holes > 1:
-        sibling_depth_grid, sibling_depth_block = runtime.launch_config(
-            kernels["count_sibling_hole_depth"],
-            total_ring_count,
-        )
-        runtime.launch(
-            kernels["count_sibling_hole_depth"],
-            grid=sibling_depth_grid, block=sibling_depth_block,
-            params=(
-                (ptr(d_ring_sample_x), ptr(d_ring_sample_y), ptr(d_all_area),
-                 ptr(d_exterior_id), ptr(d_can_be_hole), ptr(d_all_coord_offsets),
-                 ptr(d_all_edge_counts), ptr(d_all_x), ptr(d_all_y),
-                 ptr(d_sibling_depth), total_ring_count),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+    d_can_be_hole = (
+        d_ring_active & (d_all_area <= 0.0)
+    ).astype(cp.int8, copy=False)
+    d_hole_candidates = d_is_hole & (d_can_be_hole != 0)
+    assigned_hole_selection = NativeDeviceSelection.from_mask(
+        d_hole_candidates,
+    )
+    d_assigned_hole_ids = assigned_hole_selection.partition_capacity_positions().astype(
+        cp.int32,
+        copy=False,
+    )
+    sibling_depth_grid, sibling_depth_block = runtime.launch_config(
+        kernels["count_sibling_hole_depth"],
+        total_ring_count,
+    )
+    runtime.launch(
+        kernels["count_sibling_hole_depth"],
+        grid=sibling_depth_grid,
+        block=sibling_depth_block,
+        params=(
+            (
+                ptr(d_ring_sample_x),
+                ptr(d_ring_sample_y),
+                ptr(d_all_area),
+                ptr(d_exterior_id),
+                ptr(d_can_be_hole),
+                ptr(d_all_coord_offsets),
+                ptr(d_all_edge_counts),
+                ptr(d_all_x),
+                ptr(d_all_y),
+                ptr(d_assigned_hole_ids),
+                ptr(assigned_hole_selection.logical_count),
+                ptr(d_sibling_depth),
+                total_ring_count,
             ),
-        )
-        _sync_hotpath(runtime)
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+    _sync_hotpath(runtime)
 
     with hotpath_stage("overlay.assemble.output_grouping", category="sort"):
         # --- Step 10: Device-resident output assembly ---
@@ -972,86 +856,179 @@ def _build_polygon_output_from_faces_gpu(
             d_all_source_rows,
         )
 
-        # Build the ordered ring list: for each exterior, gather its holes.
-        d_is_output_ring = d_exterior_mask_full | d_valid_hole_mask
-        d_output_ring_ids = cp.flatnonzero(d_is_output_ring).astype(cp.int32)
-        n_output_rings = int(d_output_ring_ids.size)
-
-        if n_output_rings == 0:
-            return _empty_polygon_output(
-                faces.runtime_selection,
-                row_count=preserve_row_count or 0,
+        d_explicit_polygon_output_rows = None
+        d_explicit_polygon_active = None
+        if preserve_row_count is not None:
+            polygon_capacity = total_ring_count
+            d_polygon_lanes = cp.arange(polygon_capacity, dtype=cp.int32)
+            d_polygon_active = exterior_selection.active_capacity_mask()
+            d_exterior_ring_ids = d_exterior_indices.astype(cp.int32, copy=False)
+            d_polygon_output_rows = cp.where(
+                d_polygon_active,
+                d_all_source_rows[d_exterior_ring_ids],
+                cp.int32(0),
             )
 
-        d_out_ext_id = cp.where(
-            d_exterior_mask_full[d_output_ring_ids],
-            d_output_ring_ids,
-            d_exterior_id[d_output_ring_ids],
-        )
-        d_out_source_row = d_all_source_rows[d_output_ring_ids]
-        d_out_is_ext = d_exterior_mask_full[d_output_ring_ids].astype(cp.int32)
-        d_output_ring_ids = _filter_duplicate_output_holes_gpu(
-            kernels=kernels,
-            runtime=runtime,
-            d_output_ring_ids=d_output_ring_ids,
-            d_out_ext_id=d_out_ext_id,
-            d_out_source_row=d_out_source_row,
-            d_out_is_ext=d_out_is_ext,
-            d_all_coord_offsets=d_all_coord_offsets,
-            d_all_edge_counts=d_all_edge_counts,
-            d_all_x=d_all_x,
-            d_all_y=d_all_y,
-            boundary_ring_count=boundary_ring_count,
-            total_ring_count=total_ring_count,
-        )
-        n_output_rings = int(d_output_ring_ids.size)
-        if n_output_rings == 0:
-            return _empty_polygon_output(
-                faces.runtime_selection,
-                row_count=preserve_row_count or 0,
+            d_exterior_lane_extended = cp.full(
+                total_ring_count + polygon_capacity,
+                -1,
+                dtype=cp.int32,
             )
-        d_out_ext_id = cp.where(
-            d_exterior_mask_full[d_output_ring_ids],
-            d_output_ring_ids,
-            d_exterior_id[d_output_ring_ids],
-        )
-        d_out_source_row = d_all_source_rows[d_output_ring_ids]
-        d_out_is_ext = d_exterior_mask_full[d_output_ring_ids].astype(cp.int32)
-
-        d_sort_order = cp.lexsort(cp.stack((
-            d_output_ring_ids,
-            1 - d_out_is_ext,
-            d_out_ext_id,
-            d_out_source_row,
-        )))
-        d_sorted_output_ids = d_output_ring_ids[d_sort_order]
-
-        d_sorted_is_ext = d_exterior_mask_full[d_sorted_output_ids]
-        d_sorted_source_row = d_all_source_rows[d_sorted_output_ids]
-
-        d_poly_start_mask = d_sorted_is_ext
-        d_poly_starts = cp.flatnonzero(d_poly_start_mask).astype(cp.int32)
-        n_polygons = int(d_poly_starts.size)
-
-        if n_polygons == 0:
-            return _empty_polygon_output(
-                faces.runtime_selection,
-                row_count=preserve_row_count or 0,
+            d_exterior_lane_destinations = cp.where(
+                d_polygon_active,
+                d_exterior_ring_ids,
+                cp.int32(total_ring_count) + d_polygon_lanes,
             )
+            d_exterior_lane_extended[d_exterior_lane_destinations] = cp.where(
+                d_polygon_active,
+                d_polygon_lanes,
+                cp.int32(-1),
+            )
+            d_exterior_lanes = d_exterior_lane_extended[:total_ring_count]
+            d_hole_polygon_lanes = d_exterior_lanes[d_exterior_id.clip(0, total_ring_count - 1)]
+            d_count_destinations = cp.where(
+                d_valid_hole_mask & (d_hole_polygon_lanes >= 0),
+                d_hole_polygon_lanes,
+                cp.int32(polygon_capacity),
+            )
+            d_holes_per_polygon = cp.bincount(
+                d_count_destinations,
+                weights=d_valid_hole_mask.astype(cp.int32, copy=False),
+                minlength=polygon_capacity + 1,
+            )[:polygon_capacity].astype(cp.int32, copy=False)
+            d_rings_per_poly = cp.where(
+                d_polygon_active,
+                d_holes_per_polygon + cp.int32(1),
+                cp.int32(0),
+            )
+            d_polygon_ring_offsets = cp.zeros(
+                polygon_capacity + 1,
+                dtype=cp.int64,
+            )
+            cp.cumsum(
+                d_rings_per_poly,
+                dtype=cp.int64,
+                out=d_polygon_ring_offsets[1:],
+            )
+            d_poly_starts = d_polygon_ring_offsets[:-1]
 
-        d_poly_ends = cp.concatenate((d_poly_starts[1:], cp.asarray([n_output_rings], dtype=cp.int32)))
-        d_rings_per_poly = d_poly_ends - d_poly_starts
-        d_poly_source_row = d_sorted_source_row[d_poly_starts]
+            ring_capacity = total_ring_count
+            d_output_ring_extended = cp.zeros(
+                ring_capacity + polygon_capacity,
+                dtype=cp.int32,
+            )
+            d_exterior_destinations = cp.where(
+                d_polygon_active,
+                d_polygon_ring_offsets[:-1],
+                np.int64(ring_capacity) + d_polygon_lanes.astype(cp.int64),
+            )
+            d_output_ring_extended[d_exterior_destinations] = cp.where(
+                d_polygon_active,
+                d_exterior_ring_ids,
+                cp.int32(0),
+            )
+            d_sorted_output_ids = d_output_ring_extended[:ring_capacity]
+            d_hole_counters = cp.zeros(polygon_capacity, dtype=cp.int32)
+            hole_grid, hole_block = runtime.launch_config(
+                kernels["scatter_output_holes"],
+                total_ring_count,
+            )
+            runtime.launch(
+                kernels["scatter_output_holes"],
+                grid=hole_grid,
+                block=hole_block,
+                params=(
+                    (
+                        ptr(d_valid_hole_mask.astype(cp.uint8, copy=False)),
+                        ptr(d_hole_polygon_lanes),
+                        ptr(d_polygon_ring_offsets),
+                        ptr(d_hole_counters),
+                        ptr(d_sorted_output_ids),
+                        total_ring_count,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                    ),
+                ),
+            )
+            _sync_hotpath(runtime)
 
-        d_row_change = cp.empty(n_polygons, dtype=cp.bool_)
-        d_row_change[0] = True
-        if n_polygons > 1:
-            d_row_change[1:] = d_poly_source_row[1:] != d_poly_source_row[:-1]
-        d_row_starts = cp.flatnonzero(d_row_change).astype(cp.int32)
-        d_row_ends = cp.concatenate((d_row_starts[1:], cp.asarray([n_polygons], dtype=cp.int32)))
-        d_polys_per_row = d_row_ends - d_row_starts
-        n_output_rows = int(d_row_starts.size)
-        d_output_source_rows = d_poly_source_row[d_row_starts]
+            d_row_count_destinations = cp.where(
+                d_polygon_active,
+                d_polygon_output_rows,
+                cp.int32(preserve_row_count),
+            )
+            d_polys_per_row = cp.bincount(
+                d_row_count_destinations,
+                weights=d_polygon_active.astype(cp.int32, copy=False),
+                minlength=preserve_row_count + 1,
+            )[:preserve_row_count].astype(cp.int32, copy=False)
+            n_output_rows = preserve_row_count
+            d_output_source_rows = cp.arange(
+                preserve_row_count,
+                dtype=cp.int32,
+            )
+            d_explicit_polygon_output_rows = d_polygon_output_rows
+            d_explicit_polygon_active = d_polygon_active
+        else:
+            # Dynamic public cardinality still crosses the explicit Owned-array
+            # physicalization boundary. Native callers pass preserve_row_count.
+            d_is_output_ring = d_exterior_mask_full | d_valid_hole_mask
+            d_output_ring_ids = cp.flatnonzero(d_is_output_ring).astype(cp.int32)
+            n_output_rings = int(d_output_ring_ids.size)
+            if n_output_rings == 0:
+                return _empty_polygon_output(faces.runtime_selection)
+
+            d_out_ext_id = cp.where(
+                d_exterior_mask_full[d_output_ring_ids],
+                d_output_ring_ids,
+                d_exterior_id[d_output_ring_ids],
+            )
+            d_out_source_row = d_all_source_rows[d_output_ring_ids]
+            d_out_is_ext = d_exterior_mask_full[d_output_ring_ids].astype(cp.int32)
+
+            d_sort_order = cp.arange(n_output_rings, dtype=cp.int32)
+            for key in (
+                d_output_ring_ids,
+                1 - d_out_is_ext,
+                d_out_ext_id,
+                d_out_source_row,
+            ):
+                d_sort_order = _stable_radix_order_pass(d_sort_order, key)
+            d_sorted_output_ids = d_output_ring_ids[d_sort_order]
+            d_sorted_is_ext = d_exterior_mask_full[d_sorted_output_ids]
+            d_sorted_source_row = d_all_source_rows[d_sorted_output_ids]
+            d_poly_starts = cp.flatnonzero(d_sorted_is_ext).astype(cp.int32)
+            n_polygons = int(d_poly_starts.size)
+            if n_polygons == 0:
+                return _empty_polygon_output(faces.runtime_selection)
+            d_poly_ends = cp.concatenate(
+                (
+                    d_poly_starts[1:],
+                    cp.asarray([n_output_rings], dtype=cp.int32),
+                )
+            )
+            d_rings_per_poly = d_poly_ends - d_poly_starts
+            d_poly_source_row = d_sorted_source_row[d_poly_starts]
+            d_row_change = cp.empty(n_polygons, dtype=cp.bool_)
+            d_row_change[0] = True
+            if n_polygons > 1:
+                d_row_change[1:] = d_poly_source_row[1:] != d_poly_source_row[:-1]
+            d_row_starts = cp.flatnonzero(d_row_change).astype(cp.int32)
+            d_row_ends = cp.concatenate(
+                (
+                    d_row_starts[1:],
+                    cp.asarray([n_polygons], dtype=cp.int32),
+                )
+            )
+            d_polys_per_row = d_row_ends - d_row_starts
+            n_output_rows = int(d_row_starts.size)
+            d_output_source_rows = d_poly_source_row[d_row_starts]
 
     with hotpath_stage("overlay.assemble.output_materialize", category="emit"):
         return _build_device_resident_polygon_output(
@@ -1067,6 +1044,9 @@ def _build_polygon_output_from_faces_gpu(
             n_output_rows=n_output_rows,
             runtime_selection=faces.runtime_selection,
             preserve_row_count=preserve_row_count,
+            d_valid_empty_rows=d_valid_empty_rows,
+            d_explicit_polygon_output_rows=d_explicit_polygon_output_rows,
+            d_explicit_polygon_active=d_explicit_polygon_active,
         )
 
 
@@ -1084,194 +1064,1036 @@ def _build_device_resident_polygon_output(
     n_output_rows: int,
     runtime_selection: RuntimeSelection,
     preserve_row_count: int | None = None,
+    d_valid_empty_rows: cp.ndarray | None = None,
+    coord_capacity: int | None = None,
+    d_explicit_polygon_output_rows: cp.ndarray | None = None,
+    d_explicit_polygon_active: cp.ndarray | None = None,
 ) -> OwnedGeometryArray:
-    """Build device-resident OwnedGeometryArray from GPU face assembly results.
+    """Build row-capacity Polygon/MultiPolygon buffers without compaction.
 
-    Accepts GPU-computed ring grouping (Phase 12 sibling hole nesting) and
-    builds GeoArrow offset arrays on device via CuPy vectorisation.
-
-    Phase 14 (ADR-0005): eliminates dominant D->H coordinate transfer.
-    Phase 26: Vectorised output assembly -- eliminates per-row and per-ring
-    Python loops that dominated wall time for large polygon counts.
-    Phase KPI: structural metadata also stays on device for device-resident
-    callers like GPU make_valid repolygonization.
+    Polygon and MultiPolygon family buffers each retain public-row capacity.
+    Ring and part membership is packed into capacity arrays with device logical
+    prefixes; tags and validity select the active family for every public row.
     """
-    # --- Vectorised classification: polygon vs multipolygon per row ---
-    # A row with exactly 1 polygon is a POLYGON; otherwise MULTIPOLYGON.
-    is_polygon_row = d_polys_per_row == 1
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+
     output_row_count = preserve_row_count if preserve_row_count is not None else n_output_rows
     if output_row_count == 0:
-        return _empty_polygon_output(runtime_selection, row_count=preserve_row_count or 0)
+        return _empty_polygon_output(
+            runtime_selection,
+            row_count=preserve_row_count or 0,
+        )
 
-    validity = cp.zeros(output_row_count, dtype=cp.bool_)
-    tags = cp.full(output_row_count, -1, dtype=cp.int8)
-    family_row_offsets = cp.full(output_row_count, -1, dtype=cp.int32)
-    compact_row_ids = (
-        d_output_source_rows.astype(cp.int32, copy=False)
+    d_compact_row_ids = (
+        cp.asarray(d_output_source_rows, dtype=cp.int32)
         if preserve_row_count is not None
         else cp.arange(n_output_rows, dtype=cp.int32)
     )
+    d_full_polys_per_row = cp.zeros(output_row_count, dtype=cp.int32)
+    d_full_polys_per_row[d_compact_row_ids] = cp.asarray(
+        d_polys_per_row,
+        dtype=cp.int32,
+    )
+    d_nonempty_polygon_rows = d_full_polys_per_row == 1
+    d_multipolygon_rows = d_full_polys_per_row > 1
+    d_valid_empty = (
+        cp.zeros(output_row_count, dtype=cp.bool_)
+        if d_valid_empty_rows is None
+        else cp.asarray(d_valid_empty_rows, dtype=cp.bool_)
+    )
+    if int(d_valid_empty.size) != output_row_count:
+        raise ValueError("valid-empty row mask must match polygon output rows")
+    d_valid_empty &= d_full_polys_per_row == 0
+    d_polygon_rows = d_nonempty_polygon_rows | d_valid_empty
+    d_validity = d_polygon_rows | d_multipolygon_rows
 
-    poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
-    mpoly_tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
+    polygon_capacity = int(d_rings_per_poly.size)
+    ring_capacity = int(d_sorted_output_ids.size)
+    if polygon_capacity == 0 or ring_capacity == 0:
+        from vibespatial.geometry.owned import build_empty_polygon_rows_device
 
-    # Total polygon count: sum of polys_per_row for polygon-type rows (== 1).
-    # Total multipolygon count: number of multipolygon rows.
-    n_total_polys = int(d_rings_per_poly.size)  # total output polygons
+        result = build_empty_polygon_rows_device(
+            output_row_count,
+            validity=d_valid_empty,
+        )
+        result.runtime_history.append(runtime_selection)
+        return result
 
-    # Expand polygon index -> its output rings (all sorted_output_ids entries
-    # are already in [exterior, hole0, hole1, ...] order from GPU sort).
-    # Flat ring order for ALL polygons (both POLYGON and MULTIPOLYGON families):
-    # ring_indices[i] = the i-th ring in output order across all polygons.
-    # Use vectorised expansion: repeat each polygon's ring range.
-    ring_counts_per_poly = d_rings_per_poly.astype(cp.int32, copy=False)
-    total_output_rings = int(d_sorted_output_ids.size)
-    if total_output_rings == 0:
-        return _empty_polygon_output(runtime_selection, row_count=preserve_row_count or 0)
+    explicit_mapping = d_explicit_polygon_output_rows is not None
+    if explicit_mapping != (d_explicit_polygon_active is not None):
+        raise ValueError("explicit polygon output rows and activity must be provided together")
+    if explicit_mapping:
+        d_polygon_output_rows = cp.asarray(
+            d_explicit_polygon_output_rows,
+            dtype=cp.int32,
+        )
+        d_active_polygons = cp.asarray(
+            d_explicit_polygon_active,
+            dtype=cp.bool_,
+        )
+        if (
+            int(d_polygon_output_rows.size) != polygon_capacity
+            or int(d_active_polygons.size) != polygon_capacity
+        ):
+            raise ValueError("explicit polygon output mapping must match polygon capacity")
+    else:
+        d_polygon_offsets = cp.zeros(
+            int(d_polys_per_row.size) + 1,
+            dtype=cp.int64,
+        )
+        cp.cumsum(
+            cp.asarray(d_polys_per_row, dtype=cp.int64),
+            out=d_polygon_offsets[1:],
+        )
+        d_polygon_logical_count = d_polygon_offsets[-1:]
+        d_polygon_slots = cp.arange(polygon_capacity, dtype=cp.int64)
+        d_active_polygons = d_polygon_slots < d_polygon_logical_count[0]
+        d_safe_polygon_slots = cp.minimum(
+            d_polygon_slots,
+            cp.maximum(d_polygon_logical_count[0] - 1, 0),
+        )
+        d_polygon_compact_rows = cp.searchsorted(
+            d_polygon_offsets[1:],
+            d_safe_polygon_slots,
+            side="right",
+        ).astype(cp.int32, copy=False)
+        d_polygon_compact_rows = cp.minimum(
+            d_polygon_compact_rows,
+            max(int(d_polys_per_row.size) - 1, 0),
+        )
+        d_polygon_output_rows = d_compact_row_ids[d_polygon_compact_rows]
+    d_multipolygon_family_mask = d_active_polygons & d_multipolygon_rows[d_polygon_output_rows]
 
-    # Build per-polygon -> row mapping: polygon p belongs to the row
-    # determined by cumulative polys_per_row.
-    # poly_to_row[p] = which output row polygon p belongs to.
-    poly_to_row = _expand_by_counts(d_polys_per_row, total=n_total_polys)
+    d_ring_offsets_by_polygon = cp.zeros(polygon_capacity + 1, dtype=cp.int64)
+    cp.cumsum(
+        cp.asarray(d_rings_per_poly, dtype=cp.int64),
+        out=d_ring_offsets_by_polygon[1:],
+    )
+    d_ring_logical_count = d_ring_offsets_by_polygon[-1:]
+    d_ring_slots = cp.arange(ring_capacity, dtype=cp.int64)
+    d_active_rings = d_ring_slots < d_ring_logical_count[0]
+    d_safe_ring_slots = cp.minimum(
+        d_ring_slots,
+        cp.maximum(d_ring_logical_count[0] - 1, 0),
+    )
+    d_ring_polygon_ids = cp.searchsorted(
+        d_ring_offsets_by_polygon[1:],
+        d_safe_ring_slots,
+        side="right",
+    ).astype(cp.int32, copy=False)
+    d_ring_polygon_ids = cp.minimum(
+        d_ring_polygon_ids,
+        polygon_capacity - 1,
+    )
+    d_ring_local = d_safe_ring_slots - d_ring_offsets_by_polygon[d_ring_polygon_ids]
+    d_ring_lookup = cp.asarray(d_poly_starts, dtype=cp.int64)[d_ring_polygon_ids] + d_ring_local
+    d_ring_lookup = cp.minimum(
+        d_ring_lookup,
+        max(ring_capacity - 1, 0),
+    )
+    d_all_ring_order = cp.asarray(
+        d_sorted_output_ids,
+        dtype=cp.int32,
+    )[d_ring_lookup]
+    d_all_ring_order = cp.where(d_active_rings, d_all_ring_order, cp.int32(0))
+    d_all_ring_coord_counts = cp.where(
+        d_active_rings,
+        cp.asarray(d_all_edge_counts, dtype=cp.int32)[d_all_ring_order] + 1,
+        cp.int32(0),
+    )
 
-    # For each polygon, the rings in sorted_output_ids
-    # are at positions [poly_starts[p], poly_starts[p]+rings_per_poly[p]).
-    # Vectorised expansion: for each ring slot, compute which polygon it
-    # belongs to and its offset within that polygon's ring list.
-    ring_poly_ids = _expand_by_counts(ring_counts_per_poly, total=total_output_rings)
-    poly_ring_offsets_prefix = cp.zeros(n_total_polys + 1, dtype=cp.int32)
-    cp.cumsum(ring_counts_per_poly, out=poly_ring_offsets_prefix[1:])
-    ring_local_offsets = cp.arange(total_output_rings, dtype=cp.int32) - poly_ring_offsets_prefix[ring_poly_ids]
-    # Global ring indices in the all-rings coordinate arrays
-    all_ring_order = d_sorted_output_ids[d_poly_starts[ring_poly_ids] + ring_local_offsets]
+    d_rings_per_output_row = cp.zeros(output_row_count, dtype=cp.int32)
+    cp.add.at(
+        d_rings_per_output_row,
+        d_polygon_output_rows,
+        cp.where(
+            d_active_polygons,
+            cp.asarray(d_rings_per_poly, dtype=cp.int32),
+            cp.int32(0),
+        ),
+    )
 
-    # Coord counts per ring: edge_count + 1
-    all_ring_coord_counts = d_all_edge_counts[all_ring_order].astype(cp.int32, copy=False) + 1
+    output_coord_capacity = int(d_all_x.size) if coord_capacity is None else int(coord_capacity)
+    if output_coord_capacity < 0:
+        raise ValueError("polygon output coordinate capacity must be nonnegative")
 
-    # --- Separate POLYGON and MULTIPOLYGON families ---
-    # Polygon family: rows with exactly 1 polygon
-    poly_row_mask = is_polygon_row
-    mpoly_row_mask = ~is_polygon_row
-
-    # Map rows to polygon indices (within poly_to_row)
-    # A polygon belongs to the polygon family if its row is a polygon row.
-    poly_mask_per_polygon = poly_row_mask[poly_to_row]
-    mpoly_mask_per_polygon = mpoly_row_mask[poly_to_row]
-
-    # Ring-level masks: a ring belongs to the polygon family if its polygon does.
-    ring_is_poly = poly_mask_per_polygon[ring_poly_ids]
-    ring_is_mpoly = mpoly_mask_per_polygon[ring_poly_ids]
-
-    # Assign family tags and family_row_offsets (vectorised, no Python loop).
-    # Use compaction result cardinality instead of a separate device-sum fence.
-    poly_row_positions = cp.flatnonzero(poly_row_mask).astype(cp.int32, copy=False)
-    polygon_count = int(poly_row_positions.size)
-    multipolygon_count = int(n_output_rows) - polygon_count
-    # Family-local sequential index: polygon rows get 0..polygon_count-1,
-    # multipolygon rows get 0..multipolygon_count-1.
-    if polygon_count > 0:
-        poly_rows = compact_row_ids[poly_row_positions]
-        family_row_offsets[poly_rows] = cp.arange(polygon_count, dtype=cp.int32)
-        validity[poly_rows] = True
-        tags[poly_rows] = poly_tag
-    if multipolygon_count > 0:
-        mpoly_rows = compact_row_ids[mpoly_row_mask]
-        family_row_offsets[mpoly_rows] = cp.arange(multipolygon_count, dtype=cp.int32)
-        validity[mpoly_rows] = True
-        tags[mpoly_rows] = mpoly_tag
-    device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
-
-    if polygon_count > 0:
-        # Extract polygon rings
-        poly_ring_indices = cp.flatnonzero(ring_is_poly).astype(cp.int32, copy=False)
-        poly_ring_order = all_ring_order[poly_ring_indices]
-        poly_coord_counts = all_ring_coord_counts[poly_ring_indices]
-        # Ring offsets = cumulative coord counts
-        d_poly_ring_offsets = cp.zeros(int(poly_ring_indices.size) + 1, dtype=cp.int32)
-        cp.cumsum(poly_coord_counts, out=d_poly_ring_offsets[1:])
-        # Geometry offsets: each polygon has rings_per_poly rings.
-        # Since polygon rows have exactly 1 polygon each, geometry offsets
-        # are just the cumulative ring-per-polygon counts for polygon family.
-        rings_per_family_poly = ring_counts_per_poly[poly_mask_per_polygon]
-        d_poly_geom_offsets = cp.zeros(polygon_count + 1, dtype=cp.int32)
-        cp.cumsum(rings_per_family_poly, out=d_poly_geom_offsets[1:])
-        # Vectorised coordinate gather
-        d_poly_x, d_poly_y = _gather_coords_vectorised(
+    def _family_ring_storage(d_family_ring_mask):
+        selection = NativeDeviceSelection.from_mask(d_family_ring_mask)
+        d_ring_order = selection.gather_capacity(
+            d_all_ring_order,
+            fill_value=0,
+        ).astype(cp.int32, copy=False)
+        d_coord_counts = selection.gather_capacity(
+            d_all_ring_coord_counts,
+            fill_value=0,
+        ).astype(cp.int32, copy=False)
+        d_ring_offsets = cp.zeros(ring_capacity + 1, dtype=cp.int32)
+        cp.cumsum(d_coord_counts, out=d_ring_offsets[1:])
+        d_x, d_y = _gather_coords_vectorised(
             d_all_x,
             d_all_y,
             d_all_coord_offsets,
-            poly_ring_order,
-            poly_coord_counts,
-            total_capacity=int(d_all_x.size),
+            d_ring_order,
+            d_coord_counts,
+            total_capacity=output_coord_capacity,
         )
-        device_families[GeometryFamily.POLYGON] = DeviceFamilyGeometryBuffer(
+        return d_x, d_y, d_ring_offsets
+
+    d_ring_polygon_rows = d_polygon_output_rows[d_ring_polygon_ids]
+    d_polygon_ring_mask = d_active_rings & d_polygon_rows[d_ring_polygon_rows]
+    d_multipolygon_ring_mask = d_active_rings & d_multipolygon_rows[d_ring_polygon_rows]
+    d_poly_x, d_poly_y, d_poly_ring_offsets = _family_ring_storage(
+        d_polygon_ring_mask,
+    )
+    d_mpoly_x, d_mpoly_y, d_mpoly_ring_offsets = _family_ring_storage(
+        d_multipolygon_ring_mask,
+    )
+
+    d_poly_geometry_offsets = cp.zeros(output_row_count + 1, dtype=cp.int32)
+    cp.cumsum(
+        cp.where(
+            d_polygon_rows,
+            d_rings_per_output_row,
+            cp.int32(0),
+        ),
+        out=d_poly_geometry_offsets[1:],
+    )
+
+    multipolygon_selection = NativeDeviceSelection.from_mask(
+        d_multipolygon_family_mask,
+    )
+    d_mpoly_part_ring_counts = multipolygon_selection.gather_capacity(
+        cp.asarray(d_rings_per_poly, dtype=cp.int32),
+        fill_value=0,
+    ).astype(cp.int32, copy=False)
+    d_mpoly_part_offsets = cp.zeros(polygon_capacity + 1, dtype=cp.int32)
+    cp.cumsum(d_mpoly_part_ring_counts, out=d_mpoly_part_offsets[1:])
+    d_mpoly_geometry_offsets = cp.zeros(output_row_count + 1, dtype=cp.int32)
+    cp.cumsum(
+        cp.where(
+            d_multipolygon_rows,
+            d_full_polys_per_row,
+            cp.int32(0),
+        ),
+        out=d_mpoly_geometry_offsets[1:],
+    )
+
+    device_families = {
+        GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
             family=GeometryFamily.POLYGON,
             x=d_poly_x,
             y=d_poly_y,
-            geometry_offsets=d_poly_geom_offsets,
-            empty_mask=cp.zeros(polygon_count, dtype=cp.bool_),
+            geometry_offsets=d_poly_geometry_offsets,
+            empty_mask=~d_nonempty_polygon_rows,
             ring_offsets=d_poly_ring_offsets,
             bounds=None,
-        )
-
-    if multipolygon_count > 0:
-        # Extract multipolygon rings
-        mpoly_rows = compact_row_ids[mpoly_row_mask]
-        mpoly_ring_indices = cp.flatnonzero(ring_is_mpoly).astype(cp.int32, copy=False)
-        mpoly_ring_order = all_ring_order[mpoly_ring_indices]
-        mpoly_coord_counts = all_ring_coord_counts[mpoly_ring_indices]
-        # Ring offsets
-        d_mpoly_ring_offsets = cp.zeros(int(mpoly_ring_indices.size) + 1, dtype=cp.int32)
-        cp.cumsum(mpoly_coord_counts, out=d_mpoly_ring_offsets[1:])
-        # Part offsets: each polygon (part) within a multipolygon
-        # has rings_per_poly rings. Cumulative within each multipolygon row.
-        mpoly_polygons = cp.flatnonzero(mpoly_mask_per_polygon).astype(cp.int32, copy=False)
-        rings_per_mpoly_part = ring_counts_per_poly[mpoly_polygons]
-        d_mpoly_part_offsets = cp.zeros(int(mpoly_polygons.size) + 1, dtype=cp.int32)
-        cp.cumsum(rings_per_mpoly_part, out=d_mpoly_part_offsets[1:])
-        # Geometry offsets: parts per multipolygon row
-        # Under preserve_row_count, compact_row_ids holds sparse source-row ids.
-        # Use those source ids when mapping polygons back to multipolygon
-        # family-local row ids; poly_to_row alone is only a compact row position.
-        mpoly_row_indices = compact_row_ids[poly_to_row[mpoly_polygons]]
-        # Map row indices to family-local multipolygon index
-        mpoly_row_to_family = cp.full(output_row_count, -1, dtype=cp.int32)
-        mpoly_row_to_family[mpoly_rows] = cp.arange(multipolygon_count, dtype=cp.int32)
-        mpoly_family_ids = mpoly_row_to_family[mpoly_row_indices]
-        parts_per_geom = cp.bincount(mpoly_family_ids, minlength=multipolygon_count).astype(cp.int32, copy=False)
-        d_mpoly_geom_offsets = cp.zeros(multipolygon_count + 1, dtype=cp.int32)
-        cp.cumsum(parts_per_geom, out=d_mpoly_geom_offsets[1:])
-        # Vectorised coordinate gather
-        d_mpoly_x, d_mpoly_y = _gather_coords_vectorised(
-            d_all_x,
-            d_all_y,
-            d_all_coord_offsets,
-            mpoly_ring_order,
-            mpoly_coord_counts,
-            total_capacity=int(d_all_x.size),
-        )
-        device_families[GeometryFamily.MULTIPOLYGON] = DeviceFamilyGeometryBuffer(
+        ),
+        GeometryFamily.MULTIPOLYGON: DeviceFamilyGeometryBuffer(
             family=GeometryFamily.MULTIPOLYGON,
             x=d_mpoly_x,
             y=d_mpoly_y,
-            geometry_offsets=d_mpoly_geom_offsets,
-            empty_mask=cp.zeros(multipolygon_count, dtype=cp.bool_),
+            geometry_offsets=d_mpoly_geometry_offsets,
+            empty_mask=~d_multipolygon_rows,
             part_offsets=d_mpoly_part_offsets,
             ring_offsets=d_mpoly_ring_offsets,
             bounds=None,
-        )
-
+        ),
+    }
+    d_tags = cp.where(
+        d_polygon_rows,
+        cp.int8(FAMILY_TAGS[GeometryFamily.POLYGON]),
+        cp.where(
+            d_multipolygon_rows,
+            cp.int8(FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]),
+            cp.int8(-1),
+        ),
+    )
+    d_family_row_offsets = cp.where(
+        d_validity,
+        cp.arange(output_row_count, dtype=cp.int32),
+        cp.int32(-1),
+    )
     result = build_device_resident_owned(
         device_families=device_families,
         row_count=output_row_count,
-        tags=tags,
-        validity=validity,
-        family_row_offsets=family_row_offsets,
+        tags=d_tags,
+        validity=d_validity,
+        family_row_offsets=d_family_row_offsets,
         execution_mode="gpu",
     )
+    result.device_state.trusted_unique_family_rows = True
     result.runtime_history.append(runtime_selection)
-    if preserve_row_count is None or int(n_output_rows) == output_row_count:
-        seed_all_validity_cache(result)
+    result._cached_is_valid_mask = None
+    return result
+
+
+def classify_grouped_polygonal_complement_parts_gpu(
+    left: OwnedGeometryArray,
+    right_parts: OwnedGeometryArray,
+    grouped,
+):
+    """Return a device mask for right parts properly contained by their left row."""
+    if cp is None or not getattr(grouped, "is_device", False):
+        return None
+    row_count = int(left.row_count)
+    part_count = int(right_parts.row_count)
+    resolved_group_count = int(
+        getattr(
+            grouped,
+            "resolved_group_count",
+            getattr(grouped, "group_count", -1),
+        )
+    )
+    if row_count <= 0 or part_count <= 0 or row_count != resolved_group_count:
+        return None
+
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right_parts._ensure_device_state(preserve_indexed_view=True)
+    if left_state.families.get(GeometryFamily.POLYGON) is None:
+        return None
+    if right_state.families.get(GeometryFamily.POLYGON) is None:
+        return None
+    left_polygon = left_state.families[GeometryFamily.POLYGON]
+    right_polygon = right_state.families[GeometryFamily.POLYGON]
+    if (
+        int(left_polygon.geometry_offsets.size) <= 1
+        or int(right_polygon.geometry_offsets.size) <= 1
+    ):
+        return cp.zeros(part_count, dtype=cp.bool_)
+    d_part_group_codes = cp.asarray(grouped.group_codes, dtype=cp.int32)
+    if int(d_part_group_codes.size) != part_count:
+        return None
+    selection = getattr(grouped, "selection", None)
+    d_part_active = (
+        cp.asarray(selection.active_capacity_mask(), dtype=cp.bool_)
+        if selection is not None
+        else cp.ones(part_count, dtype=cp.bool_)
+    )
+    d_safe_part_group_codes = cp.where(
+        d_part_active,
+        d_part_group_codes,
+        cp.int32(0),
+    )
+
+    from vibespatial.predicates.binary import binary_predicate_expression
+
+    pair_left = left._device_indexed_take(
+        d_safe_part_group_codes.astype(cp.int64, copy=False),
+    )
+    proper = binary_predicate_expression(
+        "contains_properly",
+        pair_left,
+        right_parts,
+        dispatch_mode=ExecutionMode.GPU,
+        operation="overlay.grouped_difference.polygonal_complement_admission",
+    )
+    if proper is None:
+        return None
+    d_part_supported = cp.asarray(proper.values, dtype=cp.bool_)
+    if int(d_part_supported.size) != part_count:
+        return None
+    polygon_tag = cp.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
+    d_left_family_rows = cp.asarray(left_state.family_row_offsets, dtype=cp.int64)
+    d_right_family_rows = cp.asarray(right_state.family_row_offsets, dtype=cp.int64)
+    d_part_supported &= d_part_active & (
+        cp.asarray(left_state.validity, dtype=cp.bool_)[d_safe_part_group_codes]
+        & cp.asarray(right_state.validity, dtype=cp.bool_)
+        & (cp.asarray(left_state.tags, dtype=cp.int8)[d_safe_part_group_codes] == polygon_tag)
+        & (cp.asarray(right_state.tags, dtype=cp.int8) == polygon_tag)
+        & (d_left_family_rows[d_safe_part_group_codes] >= 0)
+        & (d_right_family_rows >= 0)
+    )
+    return d_part_supported
+
+
+def classify_grouped_polygonal_complement_groups_gpu(
+    left: OwnedGeometryArray,
+    right_parts: OwnedGeometryArray,
+    grouped,
+):
+    """Return a device mask for groups admitted by complement assembly."""
+    d_part_supported = classify_grouped_polygonal_complement_parts_gpu(
+        left,
+        right_parts,
+        grouped,
+    )
+    if d_part_supported is None:
+        return None
+    row_count = int(left.row_count)
+    part_count = int(right_parts.row_count)
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right_parts._ensure_device_state(preserve_indexed_view=True)
+    d_part_group_codes = cp.asarray(grouped.group_codes, dtype=cp.int32)
+    selection = getattr(grouped, "selection", None)
+    d_part_active = (
+        cp.asarray(selection.active_capacity_mask(), dtype=cp.bool_)
+        if selection is not None
+        else cp.ones(part_count, dtype=cp.bool_)
+    )
+    d_safe_part_group_codes = cp.where(
+        d_part_active,
+        d_part_group_codes,
+        cp.int32(0),
+    )
+
+    d_group_part_counts = cp.zeros(row_count, dtype=cp.int32)
+    d_group_supported_counts = cp.zeros(row_count, dtype=cp.int32)
+    d_group_structural_counts = cp.zeros(row_count, dtype=cp.int32)
+    cp.add.at(
+        d_group_part_counts,
+        d_safe_part_group_codes,
+        d_part_active.astype(cp.int32, copy=False),
+    )
+    cp.add.at(
+        d_group_supported_counts,
+        d_safe_part_group_codes,
+        d_part_supported.astype(cp.int32, copy=False),
+    )
+    left_polygon = left_state.families[GeometryFamily.POLYGON]
+    right_polygon = right_state.families[GeometryFamily.POLYGON]
+    d_left_validity = cp.asarray(left_state.validity, dtype=cp.bool_)
+    d_right_validity = cp.asarray(right_state.validity, dtype=cp.bool_)
+    polygon_tag = cp.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
+    d_left_family_rows = cp.asarray(
+        left_state.family_row_offsets,
+        dtype=cp.int64,
+    )
+    d_right_family_rows = cp.asarray(
+        right_state.family_row_offsets,
+        dtype=cp.int64,
+    )
+    d_left_polygon_rows = (
+        d_left_validity
+        & (cp.asarray(left_state.tags, dtype=cp.int8) == polygon_tag)
+        & (d_left_family_rows >= 0)
+    )
+    d_right_polygon_rows = (
+        d_right_validity
+        & (cp.asarray(right_state.tags, dtype=cp.int8) == polygon_tag)
+        & (d_right_family_rows >= 0)
+    )
+    d_left_rows = cp.where(
+        d_left_polygon_rows,
+        d_left_family_rows,
+        cp.int64(0),
+    )
+    d_right_rows = cp.where(
+        d_right_polygon_rows,
+        d_right_family_rows,
+        cp.int64(0),
+    )
+    d_left_geometry_offsets = cp.asarray(
+        left_polygon.geometry_offsets,
+        dtype=cp.int32,
+    )
+    d_right_geometry_offsets = cp.asarray(
+        right_polygon.geometry_offsets,
+        dtype=cp.int32,
+    )
+    d_left_ring_counts = (
+        d_left_geometry_offsets[d_left_rows + 1] - d_left_geometry_offsets[d_left_rows]
+    )
+    d_right_ring_counts = (
+        d_right_geometry_offsets[d_right_rows + 1] - d_right_geometry_offsets[d_right_rows]
+    )
+    d_left_ring_counts = cp.where(
+        d_left_polygon_rows,
+        d_left_ring_counts,
+        cp.int32(0),
+    )
+    d_right_ring_counts = cp.where(
+        d_right_polygon_rows,
+        d_right_ring_counts,
+        cp.int32(0),
+    )
+    cp.add.at(
+        d_group_structural_counts,
+        d_safe_part_group_codes,
+        (d_part_active & (d_right_ring_counts > 0)).astype(
+            cp.int32,
+            copy=False,
+        ),
+    )
+    return (
+        (d_group_part_counts > 0)
+        & (d_group_supported_counts == d_group_part_counts)
+        & (d_group_structural_counts == d_group_part_counts)
+        & (d_left_ring_counts > 0)
+    )
+
+
+def assemble_grouped_polygonal_complement_gpu(
+    left: OwnedGeometryArray,
+    right_parts: OwnedGeometryArray,
+    grouped,
+    *,
+    support_mask=None,
+    right_ring_capacity: int | None = None,
+    right_coord_capacity: int | None = None,
+) -> OwnedGeometryArray | None:
+    """Assemble ``left - grouped_union(right_parts)`` from polygon rings.
+
+    Physical shape: one logical Polygon row on the left per group, a
+    row-indirected Polygon-part capacity on the right, and a device
+    ``NativeGrouped`` carrier mapping those parts back to left rows. Every right
+    exterior is a subtraction boundary. Every right interior is retained as an
+    island, and nested right parts are attached to the nearest containing island
+    so valid MultiPolygon nesting survives without rowwise constructive fallback.
+    """
+    if cp is None or not getattr(grouped, "is_device", False):
+        return None
+    if left.row_count <= 0 or right_parts.row_count <= 0:
+        return None
+    resolved_group_count = int(
+        getattr(
+            grouped,
+            "resolved_group_count",
+            getattr(grouped, "group_count", -1),
+        )
+    )
+    if left.row_count != resolved_group_count:
+        return None
+    selection = getattr(grouped, "selection", None)
+    if selection is None and getattr(grouped, "all_groups_observed", None) is not True:
+        return None
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right_parts._ensure_device_state(preserve_indexed_view=True)
+    left_polygon = left_state.families.get(GeometryFamily.POLYGON)
+    right_polygon = right_state.families.get(GeometryFamily.POLYGON)
+    if left_polygon is None or right_polygon is None:
+        return None
+    if left_polygon.ring_offsets is None or right_polygon.ring_offsets is None:
+        return None
+
+    row_count = int(left.row_count)
+    part_count = int(right_parts.row_count)
+    d_part_group_codes = cp.asarray(grouped.group_codes, dtype=cp.int32)
+    if int(d_part_group_codes.size) != part_count:
+        return None
+    if selection is None:
+        d_part_active = cp.ones(part_count, dtype=cp.bool_)
+        d_group_offsets = cp.asarray(grouped.group_offsets, dtype=cp.int32)
+        d_group_ids = cp.asarray(grouped.group_ids, dtype=cp.int32)
+        d_sorted_part_rows = cp.asarray(grouped.sorted_order, dtype=cp.int64)
+        if (
+            int(d_group_offsets.size) != row_count + 1
+            or int(d_group_ids.size) != row_count
+            or int(d_sorted_part_rows.size) != part_count
+        ):
+            return None
+    else:
+        d_part_active = cp.asarray(
+            selection.active_capacity_mask(),
+            dtype=cp.bool_,
+        )
+        d_sort_codes = cp.where(
+            d_part_active,
+            d_part_group_codes,
+            cp.int32(row_count),
+        )
+        d_sorted_part_rows = cp.argsort(d_sort_codes).astype(
+            cp.int64,
+            copy=False,
+        )
+        d_group_counts = cp.bincount(
+            cp.where(d_part_active, d_part_group_codes, cp.int32(row_count)),
+            weights=d_part_active.astype(cp.int32, copy=False),
+            minlength=row_count + 1,
+        )[:row_count].astype(cp.int32, copy=False)
+        d_group_offsets = cp.zeros(row_count + 1, dtype=cp.int32)
+        cp.cumsum(d_group_counts, out=d_group_offsets[1:])
+        d_group_ids = cp.arange(row_count, dtype=cp.int32)
+
+    d_left_validity = cp.asarray(left_state.validity, dtype=cp.bool_)
+    d_right_validity = cp.asarray(right_state.validity, dtype=cp.bool_)
+    polygon_tag = cp.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
+    d_left_family_rows = cp.asarray(
+        left_state.family_row_offsets,
+        dtype=cp.int64,
+    )
+    d_right_family_rows = cp.asarray(
+        right_state.family_row_offsets,
+        dtype=cp.int64,
+    )
+    d_left_polygon_rows = (
+        d_left_validity
+        & (cp.asarray(left_state.tags, dtype=cp.int8) == polygon_tag)
+        & (d_left_family_rows >= 0)
+    )
+    d_right_polygon_rows = (
+        d_right_validity
+        & (cp.asarray(right_state.tags, dtype=cp.int8) == polygon_tag)
+        & (d_right_family_rows >= 0)
+    )
+    d_left_rows = cp.where(
+        d_left_polygon_rows,
+        d_left_family_rows,
+        cp.int64(0),
+    )
+    d_right_rows = cp.where(
+        d_right_polygon_rows,
+        d_right_family_rows,
+        cp.int64(0),
+    )
+    d_left_geometry_offsets = cp.asarray(
+        left_polygon.geometry_offsets,
+        dtype=cp.int32,
+    )
+    d_right_geometry_offsets = cp.asarray(
+        right_polygon.geometry_offsets,
+        dtype=cp.int32,
+    )
+    d_left_ring_offsets = cp.asarray(left_polygon.ring_offsets, dtype=cp.int32)
+    d_right_ring_offsets = cp.asarray(right_polygon.ring_offsets, dtype=cp.int32)
+    d_left_ring_starts = d_left_geometry_offsets[d_left_rows]
+    d_left_ring_counts = (d_left_geometry_offsets[d_left_rows + 1] - d_left_ring_starts).astype(
+        cp.int32, copy=False
+    )
+    d_left_ring_counts = cp.where(
+        d_left_polygon_rows,
+        d_left_ring_counts,
+        cp.int32(0),
+    )
+    d_sorted_right_rows = d_right_rows[d_sorted_part_rows]
+    d_sorted_part_active = (d_part_active & d_right_polygon_rows)[d_sorted_part_rows]
+    d_part_ring_starts = d_right_geometry_offsets[d_sorted_right_rows]
+    d_part_ring_counts = (
+        d_right_geometry_offsets[d_sorted_right_rows + 1] - d_part_ring_starts
+    ).astype(cp.int32, copy=False)
+    d_part_ring_counts = cp.where(
+        d_sorted_part_active,
+        d_part_ring_counts,
+        cp.int32(0),
+    )
+    if support_mask is None:
+        support_mask = classify_grouped_polygonal_complement_groups_gpu(
+            left,
+            right_parts,
+            grouped,
+        )
+    if support_mask is None:
+        return None
+    d_support_mask = cp.asarray(support_mask, dtype=cp.bool_)
+    if int(d_support_mask.size) != row_count:
+        return None
+
+    d_sorted_part_positions = cp.arange(part_count, dtype=cp.int32)
+    d_part_logical_count = d_group_offsets[-1]
+    d_safe_sorted_part_positions = cp.minimum(
+        d_sorted_part_positions,
+        cp.maximum(d_part_logical_count - 1, 0),
+    )
+    d_part_group_rows = cp.searchsorted(
+        d_group_offsets[1:],
+        d_safe_sorted_part_positions,
+        side="right",
+    ).astype(cp.int32, copy=False)
+    d_part_group_rows = cp.minimum(d_part_group_rows, row_count - 1)
+    d_part_interior_counts = cp.maximum(d_part_ring_counts - 1, 0)
+    d_part_interior_offsets = cp.zeros(part_count + 1, dtype=cp.int32)
+    cp.cumsum(d_part_interior_counts, out=d_part_interior_offsets[1:])
+
+    physical_left_ring_capacity = max(int(d_left_ring_offsets.size) - 1, 0)
+    physical_left_coord_capacity = int(left_polygon.x.size)
+    if left.is_indexed_view and left_state.trusted_unique_family_rows is not True:
+        fixed_size = getattr(left_polygon, "fixed_size", None)
+        fixed_ring_count = getattr(
+            fixed_size,
+            "first_level_count_per_row",
+            None,
+        )
+        fixed_coord_count = getattr(fixed_size, "coord_count_per_row", None)
+        if fixed_ring_count is None and left_polygon.dense_single_ring_width is not None:
+            fixed_ring_count = 1
+            fixed_coord_count = int(left_polygon.dense_single_ring_width)
+        if fixed_ring_count is None or fixed_coord_count is None:
+            return None
+        left_ring_capacity = row_count * int(fixed_ring_count)
+        left_coord_capacity = row_count * int(fixed_coord_count)
+    else:
+        left_ring_capacity = physical_left_ring_capacity
+        left_coord_capacity = physical_left_coord_capacity
+    physical_right_ring_capacity = max(int(d_right_ring_offsets.size) - 1, 0)
+    right_ring_capacity = (
+        physical_right_ring_capacity if right_ring_capacity is None else int(right_ring_capacity)
+    )
+    right_coord_capacity = (
+        int(right_polygon.x.size) if right_coord_capacity is None else int(right_coord_capacity)
+    )
+    if right_ring_capacity < 0 or right_coord_capacity < 0:
+        return None
+    interior_capacity = right_ring_capacity
+
+    if interior_capacity > 0:
+        d_interior_positions = cp.arange(interior_capacity, dtype=cp.int32)
+        d_interior_logical_count = d_part_interior_offsets[-1]
+        d_interior_active = d_interior_positions < d_interior_logical_count
+        d_safe_interior_positions = cp.minimum(
+            d_interior_positions,
+            cp.maximum(d_interior_logical_count - 1, 0),
+        )
+        d_interior_part_rows = cp.searchsorted(
+            d_part_interior_offsets[1:],
+            d_safe_interior_positions,
+            side="right",
+        ).astype(cp.int32, copy=False)
+        d_interior_part_rows = cp.minimum(d_interior_part_rows, part_count - 1)
+        d_interior_local = d_safe_interior_positions - d_part_interior_offsets[d_interior_part_rows]
+        d_interior_ring_ids = (
+            d_part_ring_starts[d_interior_part_rows] + 1 + d_interior_local
+        ).astype(cp.int32, copy=False)
+        d_interior_ring_ids = cp.where(
+            d_interior_active,
+            d_interior_ring_ids,
+            cp.int32(0),
+        )
+        d_interior_group_rows = d_part_group_rows[d_interior_part_rows]
+        d_group_interior_counts = cp.bincount(
+            d_interior_group_rows,
+            weights=d_interior_active.astype(cp.int32, copy=False),
+            minlength=row_count,
+        ).astype(cp.int32, copy=False)
+    else:
+        d_interior_positions = cp.empty(0, dtype=cp.int32)
+        d_interior_active = cp.empty(0, dtype=cp.bool_)
+        d_interior_part_rows = cp.empty(0, dtype=cp.int32)
+        d_interior_ring_ids = cp.empty(0, dtype=cp.int32)
+        d_interior_group_rows = cp.empty(0, dtype=cp.int32)
+        d_group_interior_counts = cp.zeros(row_count, dtype=cp.int32)
+
+    d_group_interior_offsets = cp.zeros(row_count + 1, dtype=cp.int32)
+    cp.cumsum(d_group_interior_counts, out=d_group_interior_offsets[1:])
+    d_parent_interior = cp.full(part_count, -1, dtype=cp.int32)
+    if interior_capacity > 0:
+        from vibespatial.overlay.gpu import _overlay_face_assembly_kernels
+
+        runtime = get_cuda_runtime()
+        kernels = _overlay_face_assembly_kernels()
+        ptr = runtime.pointer
+        d_interior_abs_area = cp.empty(interior_capacity, dtype=cp.float64)
+        d_interior_bounds = cp.empty((interior_capacity, 4), dtype=cp.float64)
+        metrics = kernels["grouped_complement_hole_metrics"]
+        grid, block = runtime.launch_config(metrics, interior_capacity)
+        runtime.launch(
+            metrics,
+            grid=grid,
+            block=block,
+            params=(
+                (
+                    ptr(cp.asarray(right_polygon.x, dtype=cp.float64)),
+                    ptr(cp.asarray(right_polygon.y, dtype=cp.float64)),
+                    ptr(d_right_ring_offsets),
+                    ptr(d_interior_ring_ids),
+                    ptr(d_interior_abs_area),
+                    ptr(d_interior_bounds),
+                    interior_capacity,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
+            ),
+        )
+        assign = kernels["assign_grouped_complement_exterior_parents"]
+        grid, block = runtime.launch_config(assign, part_count)
+        runtime.launch(
+            assign,
+            grid=grid,
+            block=block,
+            params=(
+                (
+                    ptr(cp.asarray(right_polygon.x, dtype=cp.float64)),
+                    ptr(cp.asarray(right_polygon.y, dtype=cp.float64)),
+                    ptr(d_right_ring_offsets),
+                    ptr(d_part_ring_starts.astype(cp.int32, copy=False)),
+                    ptr(d_part_group_rows),
+                    ptr(d_interior_ring_ids),
+                    ptr(d_group_interior_offsets),
+                    ptr(d_interior_abs_area),
+                    ptr(d_interior_bounds),
+                    ptr(d_parent_interior),
+                    part_count,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
+            ),
+        )
+
+    d_parts_per_group = (1 + d_group_interior_counts).astype(cp.int32, copy=False)
+    d_geometry_offsets = cp.zeros(row_count + 1, dtype=cp.int32)
+    cp.cumsum(d_parts_per_group, out=d_geometry_offsets[1:])
+    total_part_capacity = row_count + interior_capacity
+    d_main_part_rows = d_geometry_offsets[:-1]
+    if interior_capacity > 0:
+        d_interior_output_parts = (
+            d_main_part_rows[d_interior_group_rows]
+            + 1
+            + cp.minimum(
+                d_interior_positions,
+                cp.maximum(d_part_interior_offsets[-1] - 1, 0),
+            )
+            - d_group_interior_offsets[d_interior_group_rows]
+        ).astype(cp.int32, copy=False)
+        d_interior_output_parts = cp.where(
+            d_interior_active,
+            d_interior_output_parts,
+            cp.int32(0),
+        )
+    else:
+        d_interior_output_parts = cp.empty(0, dtype=cp.int32)
+
+    d_left_ring_positions = cp.arange(left_ring_capacity, dtype=cp.int32)
+    d_left_logical_offsets = cp.zeros(row_count + 1, dtype=cp.int32)
+    cp.cumsum(d_left_ring_counts, out=d_left_logical_offsets[1:])
+    d_left_ring_active = d_left_ring_positions < d_left_logical_offsets[-1]
+    d_safe_left_ring_positions = cp.minimum(
+        d_left_ring_positions,
+        cp.maximum(d_left_logical_offsets[-1] - 1, 0),
+    )
+    d_left_ring_groups = cp.searchsorted(
+        d_left_logical_offsets[1:],
+        d_safe_left_ring_positions,
+        side="right",
+    ).astype(cp.int32, copy=False)
+    d_left_ring_groups = cp.minimum(d_left_ring_groups, row_count - 1)
+    d_left_local_rings = d_safe_left_ring_positions - d_left_logical_offsets[d_left_ring_groups]
+    d_left_source_rings = (d_left_ring_starts[d_left_ring_groups] + d_left_local_rings).astype(
+        cp.int32, copy=False
+    )
+    d_left_source_rings = cp.where(
+        d_left_ring_active,
+        d_left_source_rings,
+        cp.int32(0),
+    )
+    d_left_output_parts = d_main_part_rows[d_left_ring_groups]
+    d_left_ring_kind = cp.where(
+        d_left_local_rings == 0,
+        cp.zeros((), dtype=cp.int32),
+        cp.ones((), dtype=cp.int32),
+    )
+
+    d_right_ring_positions = cp.arange(right_ring_capacity, dtype=cp.int32)
+    d_part_logical_ring_offsets = cp.zeros(part_count + 1, dtype=cp.int32)
+    cp.cumsum(d_part_ring_counts, out=d_part_logical_ring_offsets[1:])
+    d_right_ring_active = d_right_ring_positions < d_part_logical_ring_offsets[-1]
+    d_safe_right_ring_positions = cp.minimum(
+        d_right_ring_positions,
+        cp.maximum(d_part_logical_ring_offsets[-1] - 1, 0),
+    )
+    d_right_ring_parts = cp.searchsorted(
+        d_part_logical_ring_offsets[1:],
+        d_safe_right_ring_positions,
+        side="right",
+    ).astype(cp.int32, copy=False)
+    d_right_ring_parts = cp.minimum(d_right_ring_parts, part_count - 1)
+    d_right_local_rings = (
+        d_safe_right_ring_positions - d_part_logical_ring_offsets[d_right_ring_parts]
+    )
+    d_right_source_rings = (d_part_ring_starts[d_right_ring_parts] + d_right_local_rings).astype(
+        cp.int32, copy=False
+    )
+    d_right_source_rings = cp.where(
+        d_right_ring_active,
+        d_right_source_rings,
+        cp.int32(0),
+    )
+    d_right_ring_groups = d_part_group_rows[d_right_ring_parts]
+    d_right_is_exterior = d_right_local_rings == 0
+    if interior_capacity > 0:
+        d_safe_interior_positions = cp.maximum(
+            d_part_interior_offsets[d_right_ring_parts] + d_right_local_rings - 1,
+            0,
+        ).astype(cp.int32, copy=False)
+        d_safe_interior_positions = cp.minimum(
+            d_safe_interior_positions,
+            interior_capacity - 1,
+        )
+        d_safe_parent = cp.maximum(d_parent_interior[d_right_ring_parts], 0)
+        d_safe_parent = cp.minimum(d_safe_parent, interior_capacity - 1)
+        d_exterior_output_parts = cp.where(
+            d_parent_interior[d_right_ring_parts] >= 0,
+            d_interior_output_parts[d_safe_parent],
+            d_main_part_rows[d_right_ring_groups],
+        )
+        d_right_output_parts = cp.where(
+            d_right_is_exterior,
+            d_exterior_output_parts,
+            d_interior_output_parts[d_safe_interior_positions],
+        ).astype(cp.int32, copy=False)
+    else:
+        d_right_output_parts = d_main_part_rows[d_right_ring_groups]
+    d_right_output_parts = cp.where(
+        d_right_ring_active,
+        d_right_output_parts,
+        cp.int32(0),
+    )
+    d_right_ring_kind = cp.where(
+        d_right_is_exterior,
+        cp.full((), 2, dtype=cp.int32),
+        cp.zeros((), dtype=cp.int32),
+    )
+
+    total_ring_capacity = left_ring_capacity + right_ring_capacity
+    d_ring_active = cp.concatenate((d_left_ring_active, d_right_ring_active))
+    d_ring_side = cp.concatenate(
+        (
+            cp.zeros(left_ring_capacity, dtype=cp.bool_),
+            cp.ones(right_ring_capacity, dtype=cp.bool_),
+        ),
+    )
+    d_ring_output_parts = cp.concatenate(
+        (d_left_output_parts, d_right_output_parts),
+    )
+    d_ring_kind = cp.concatenate((d_left_ring_kind, d_right_ring_kind))
+    d_left_sources = cp.concatenate(
+        (d_left_source_rings, cp.zeros(right_ring_capacity, dtype=cp.int32)),
+    )
+    d_right_sources = cp.concatenate(
+        (cp.zeros(left_ring_capacity, dtype=cp.int32), d_right_source_rings),
+    )
+    d_ring_output_sort_key = cp.where(
+        d_ring_active,
+        d_ring_output_parts,
+        cp.int32(total_part_capacity),
+    )
+    d_stable_ring_order = cp.arange(total_ring_capacity, dtype=cp.int32)
+    d_ring_order = cp.arange(total_ring_capacity, dtype=cp.int32)
+    for key in (d_stable_ring_order, d_ring_kind, d_ring_output_sort_key):
+        d_ring_order = _stable_radix_order_pass(d_ring_order, key)
+    d_ring_active = d_ring_active[d_ring_order]
+    d_ring_side = d_ring_side[d_ring_order]
+    d_left_sources = d_left_sources[d_ring_order]
+    d_right_sources = d_right_sources[d_ring_order]
+    d_ring_output_parts = d_ring_output_parts[d_ring_order]
+
+    d_rings_per_part = cp.bincount(
+        cp.where(d_ring_active, d_ring_output_parts, cp.int32(0)),
+        weights=d_ring_active.astype(cp.int32, copy=False),
+        minlength=total_part_capacity,
+    )[:total_part_capacity].astype(cp.int32, copy=False)
+    d_part_offsets = cp.zeros(total_part_capacity + 1, dtype=cp.int32)
+    cp.cumsum(d_rings_per_part, out=d_part_offsets[1:])
+    d_left_lengths = d_left_ring_offsets[1:] - d_left_ring_offsets[:-1]
+    d_right_lengths = d_right_ring_offsets[1:] - d_right_ring_offsets[:-1]
+    d_ring_lengths = cp.where(
+        d_ring_active,
+        cp.where(
+            d_ring_side,
+            d_right_lengths[d_right_sources],
+            d_left_lengths[d_left_sources],
+        ),
+        cp.int32(0),
+    ).astype(cp.int32, copy=False)
+    d_output_ring_offsets = cp.zeros(total_ring_capacity + 1, dtype=cp.int32)
+    cp.cumsum(d_ring_lengths, out=d_output_ring_offsets[1:])
+
+    total_coord_capacity = left_coord_capacity + right_coord_capacity
+    d_coord_positions = cp.arange(total_coord_capacity, dtype=cp.int64)
+    d_coord_active = d_coord_positions < d_output_ring_offsets[-1]
+    d_safe_coord_positions = cp.minimum(
+        d_coord_positions,
+        cp.maximum(d_output_ring_offsets[-1] - 1, 0),
+    )
+    d_coord_rings = cp.searchsorted(
+        d_output_ring_offsets[1:],
+        d_safe_coord_positions,
+        side="right",
+    ).astype(cp.int32, copy=False)
+    d_coord_rings = cp.minimum(d_coord_rings, total_ring_capacity - 1)
+    d_coord_local = d_safe_coord_positions - d_output_ring_offsets[d_coord_rings]
+    d_coord_side = d_ring_side[d_coord_rings]
+    d_coord_left_rings = d_left_sources[d_coord_rings]
+    d_coord_right_rings = d_right_sources[d_coord_rings]
+    d_left_coord_rows = (d_left_ring_offsets[d_coord_left_rings] + d_coord_local).astype(
+        cp.int64, copy=False
+    )
+    d_right_coord_rows = (d_right_ring_offsets[d_coord_right_rings + 1] - 1 - d_coord_local).astype(
+        cp.int64, copy=False
+    )
+    d_x = cp.zeros(total_coord_capacity, dtype=cp.float64)
+    d_y = cp.zeros(total_coord_capacity, dtype=cp.float64)
+    d_left_coord_mask = d_coord_active & ~d_coord_side
+    d_x[d_left_coord_mask] = cp.asarray(left_polygon.x, dtype=cp.float64)[
+        d_left_coord_rows[d_left_coord_mask]
+    ]
+    d_y[d_left_coord_mask] = cp.asarray(left_polygon.y, dtype=cp.float64)[
+        d_left_coord_rows[d_left_coord_mask]
+    ]
+    d_right_coord_mask = d_coord_active & d_coord_side
+    d_x[d_right_coord_mask] = cp.asarray(right_polygon.x, dtype=cp.float64)[
+        d_right_coord_rows[d_right_coord_mask]
+    ]
+    d_y[d_right_coord_mask] = cp.asarray(right_polygon.y, dtype=cp.float64)[
+        d_right_coord_rows[d_right_coord_mask]
+    ]
+
+    result = _build_device_resident_polygon_output(
+        d_all_x=d_x,
+        d_all_y=d_y,
+        d_all_coord_offsets=d_output_ring_offsets[:-1],
+        d_all_edge_counts=d_ring_lengths - 1,
+        d_sorted_output_ids=cp.arange(total_ring_capacity, dtype=cp.int32),
+        d_rings_per_poly=d_rings_per_part,
+        d_polys_per_row=d_parts_per_group,
+        d_poly_starts=d_part_offsets[:-1],
+        d_output_source_rows=cp.arange(row_count, dtype=cp.int32),
+        n_output_rows=row_count,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason=(
+                "grouped polygonal complement assembled from part, ring, and coordinate carriers"
+            ),
+        ),
+        preserve_row_count=row_count,
+    )
+    if result.device_state is not None:
+        cached_bounds = getattr(left_state, "row_bounds", None)
+        if cached_bounds is not None and int(cached_bounds.shape[0]) == row_count:
+            result.device_state.row_bounds = cached_bounds
+    if result.device_state is not None:
+        result_state = result.device_state
+        d_result_validity = cp.asarray(result_state.validity, dtype=cp.bool_)
+        d_result_validity &= d_support_mask
+        result_state.validity = d_result_validity
+        result_state.tags = cp.where(
+            d_result_validity,
+            cp.asarray(result_state.tags, dtype=cp.int8),
+            cp.int8(-1),
+        )
+        result_state.family_row_offsets = cp.where(
+            d_result_validity,
+            cp.asarray(result_state.family_row_offsets, dtype=cp.int32),
+            cp.int32(-1),
+        )
+        for device_buffer in result_state.families.values():
+            if int(device_buffer.empty_mask.size) == row_count:
+                device_buffer.empty_mask = (
+                    cp.asarray(
+                        device_buffer.empty_mask,
+                        dtype=cp.bool_,
+                    )
+                    | ~d_support_mask
+                )
+        result_state.trusted_all_valid = None
+        result_state.trusted_all_non_empty = None
+    result._cached_is_valid_mask = None
     return result
 
 
@@ -1282,7 +2104,7 @@ def _gather_coords_vectorised(
     ring_order: cp.ndarray,
     coord_counts: cp.ndarray,
     *,
-    total_capacity: int | None = None,
+    total_capacity: int,
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """Vectorised coordinate gather: build flat index array without Python loops.
 
@@ -1291,59 +2113,61 @@ def _gather_coords_vectorised(
     """
     if ring_order.size == 0:
         return cp.empty(0, dtype=cp.float64), cp.empty(0, dtype=cp.float64)
-    total_coords = (
-        _device_int_scalar(
-            coord_counts.sum(dtype=cp.int64),
-            reason="overlay assemble coordinate-gather total-coords allocation fence",
+    total_coords = int(total_capacity)
+    if total_coords == 0:
+        return cp.empty(0, dtype=cp.float64), cp.empty(0, dtype=cp.float64)
+    if int(d_all_x.size) == 0:
+        return (
+            cp.zeros(total_coords, dtype=cp.float64),
+            cp.zeros(total_coords, dtype=cp.float64),
         )
-        if total_capacity is None
-        else int(total_capacity)
-    )
-    # Build per-ring start positions in source coordinate array
     ring_starts = d_all_coord_offsets[ring_order].astype(cp.int64, copy=False)
     # Expand: for each coordinate slot, compute source index.
     # slot_ring[i] = which ring does coordinate slot i belong to?
     ring_offsets = cp.zeros(int(ring_order.size) + 1, dtype=cp.int64)
     cp.cumsum(coord_counts.astype(cp.int64, copy=False), out=ring_offsets[1:])
     slots = cp.arange(total_coords, dtype=cp.int64)
-    if total_capacity is not None:
-        # The caller deliberately overallocates to avoid an exact allocation
-        # fence.  Keep unused tail slots in-bounds by repeating the last valid
-        # coordinate; offsets prevent the tail from becoming geometry data.
-        slots = cp.minimum(slots, ring_offsets[-1] - 1)
+    d_logical_total = ring_offsets[-1]
+    slots = cp.minimum(slots, cp.maximum(d_logical_total - 1, 0))
     slot_ring = _expand_by_counts(
         coord_counts.astype(cp.int32, copy=False),
         total=total_coords,
         slots=slots,
     )
+    slot_ring = cp.minimum(slot_ring, int(ring_order.size) - 1)
     slot_local = slots - ring_offsets[slot_ring]
-    d_gather = ring_starts[slot_ring] + slot_local
-    return d_all_x[d_gather], d_all_y[d_gather]
+    d_gather = cp.minimum(
+        ring_starts[slot_ring] + slot_local,
+        int(d_all_x.size) - 1,
+    )
+    d_active = cp.arange(total_coords, dtype=cp.int64) < d_logical_total
+    return (
+        cp.where(d_active, d_all_x[d_gather], cp.float64(0.0)),
+        cp.where(d_active, d_all_y[d_gather], cp.float64(0.0)),
+    )
 
 
 def _expand_by_counts(
     counts: cp.ndarray,
     *,
-    total: int | None = None,
+    total: int,
     slots: cp.ndarray | None = None,
 ) -> cp.ndarray:
     """Return the repeated source index for each slot implied by ``counts``."""
     if counts.size == 0:
         return cp.empty(0, dtype=cp.int32)
-    if total is None:
-        total = _device_int_scalar(
-            counts.sum(dtype=cp.int64),
-            reason="overlay assemble expand-by-counts total allocation fence",
-        )
-    else:
-        total = int(total)
+    total = int(total)
     if total == 0:
         return cp.empty(0, dtype=cp.int32)
     offsets = cp.zeros(int(counts.size) + 1, dtype=cp.int64)
     cp.cumsum(counts.astype(cp.int64, copy=False), out=offsets[1:])
     if slots is None:
         slots = cp.arange(total, dtype=cp.int64)
-    return cp.searchsorted(offsets[1:], slots, side="right").astype(cp.int32, copy=False)
+    expanded = cp.searchsorted(offsets[1:], slots, side="right")
+    return cp.minimum(expanded, int(counts.size) - 1).astype(
+        cp.int32,
+        copy=False,
+    )
 
 
 def _overlay_intersection_rectangles_gpu(

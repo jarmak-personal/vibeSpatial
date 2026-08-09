@@ -179,7 +179,7 @@ Required kernel families:
 The existing carrier substrate remains the execution currency:
 
 - `NativeFrameState`
-- `NativeRowSet`
+- `NativeRowSet` and capacity-backed `NativeDeviceSelection`
 - `NativeRelation`
 - `NativeGrouped`
 - `NativeSpatialIndex`
@@ -233,7 +233,7 @@ export behavior.
   boundaries, native rows, and valid empty unobserved categorical groups. Unary
   rewrites stay conservative until identically noded coverage is proved.
   Disjoint-subset dissolve batches named structural/area/neighbor proofs;
-  coverage-edge union reuses host code/validity mirrors and all-valid full/observed-group device proofs; low-fan-in all-valid device coverage groups, including dropped-row cases, can reduce through exact grouped coverage union without scalar admission probes; OGC validity has no-repair/compact-repair expressions; unobserved groups use device metadata scatter instead of variable-width owned takes; invalid grouped outputs try native make-valid repair before host recompute fallback; global tree reductions expose GPU/pairwise strict declines before CPU reduction; optional bbox grouping declines on device-only rows instead of exporting row-bounds matrices.
+  coverage-edge union reuses host code/validity mirrors and all-valid full/observed-group device proofs; low-fan-in all-valid device coverage groups, including dropped-row cases, can reduce through exact grouped coverage union without scalar admission probes; OGC validity has no-repair/compact-repair expressions; unobserved groups use device metadata scatter instead of variable-width owned takes; invalid grouped outputs use atomic native repair and fail incomplete admitted plans; global polygon and coverage union lower to one all-observed `NativeGrouped` carrier, while remaining pairwise reductions propagate execution failures instead of switching to CPU; optional bbox grouping and host spatial coloring are deleted from global union execution.
 - [x] M5. Predicate and relation refinement kernels cover admitted DE-9IM and
   relation-pair consumers without public bool Series or host pair export. Spatial
   join filters empties before pair generation and remaps original positions;

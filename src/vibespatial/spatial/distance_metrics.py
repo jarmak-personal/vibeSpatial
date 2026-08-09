@@ -25,6 +25,7 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray, tile_single_row
 from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_pairwise_work_from_owned
 from vibespatial.runtime.fallbacks import StrictNativeFallbackError, record_fallback_event
 from vibespatial.runtime.precision import CoordinateStats, KernelClass, PrecisionMode
 from vibespatial.runtime.residency import Residency
@@ -34,36 +35,43 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Geometry families that carry meaningful coordinate sequences.
 # ---------------------------------------------------------------------------
-_LINESTRING_FAMILIES: frozenset[GeometryFamily] = frozenset({
-    GeometryFamily.LINESTRING,
-    GeometryFamily.MULTILINESTRING,
-})
+_LINESTRING_FAMILIES: frozenset[GeometryFamily] = frozenset(
+    {
+        GeometryFamily.LINESTRING,
+        GeometryFamily.MULTILINESTRING,
+    }
+)
 
-_COORD_FAMILIES: frozenset[GeometryFamily] = frozenset({
-    GeometryFamily.POINT,
-    GeometryFamily.LINESTRING,
-    GeometryFamily.POLYGON,
-    GeometryFamily.MULTIPOINT,
-    GeometryFamily.MULTILINESTRING,
-    GeometryFamily.MULTIPOLYGON,
-})
+_COORD_FAMILIES: frozenset[GeometryFamily] = frozenset(
+    {
+        GeometryFamily.POINT,
+        GeometryFamily.LINESTRING,
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOINT,
+        GeometryFamily.MULTILINESTRING,
+        GeometryFamily.MULTIPOLYGON,
+    }
+)
 
 # Tag values for linestring families (used for Frechet type check).
 _LINESTRING_TAG = FAMILY_TAGS[GeometryFamily.LINESTRING]
 
 # GPU families supported by the flat-offset builder (no 3-level indirection).
-_GPU_SUPPORTED_FAMILIES: frozenset[GeometryFamily] = frozenset({
-    GeometryFamily.POINT,
-    GeometryFamily.MULTIPOINT,
-    GeometryFamily.LINESTRING,
-    GeometryFamily.MULTILINESTRING,
-    GeometryFamily.POLYGON,
-})
+_GPU_SUPPORTED_FAMILIES: frozenset[GeometryFamily] = frozenset(
+    {
+        GeometryFamily.POINT,
+        GeometryFamily.MULTIPOINT,
+        GeometryFamily.LINESTRING,
+        GeometryFamily.MULTILINESTRING,
+        GeometryFamily.POLYGON,
+    }
+)
 
 
 # ---------------------------------------------------------------------------
 # Internal: extract coordinate arrays for a single row
 # ---------------------------------------------------------------------------
+
 
 def _coords_for_row(
     owned: OwnedGeometryArray,
@@ -184,6 +192,7 @@ def _linestring_coords_for_row(
 # Euclidean distance helpers
 # ---------------------------------------------------------------------------
 
+
 def _euclidean(a: np.ndarray, b: np.ndarray) -> float:
     """Euclidean distance between two (2,) coordinate arrays."""
     dx = a[0] - b[0]
@@ -239,12 +248,14 @@ _MAX_FRECHET_B = MAX_FRECHET_B
 
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("hausdorff-fp64", _HAUSDORFF_FP64, _HAUSDORFF_KERNEL_NAMES),
-    ("hausdorff-fp32", _HAUSDORFF_FP32, _HAUSDORFF_KERNEL_NAMES),
-    ("frechet-fp64", _FRECHET_FP64, _FRECHET_KERNEL_NAMES),
-    ("frechet-fp32", _FRECHET_FP32, _FRECHET_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("hausdorff-fp64", _HAUSDORFF_FP64, _HAUSDORFF_KERNEL_NAMES),
+        ("hausdorff-fp32", _HAUSDORFF_FP32, _HAUSDORFF_KERNEL_NAMES),
+        ("frechet-fp64", _FRECHET_FP64, _FRECHET_KERNEL_NAMES),
+        ("frechet-fp32", _FRECHET_FP32, _FRECHET_KERNEL_NAMES),
+    ]
+)
 
 # ---------------------------------------------------------------------------
 # GPU infrastructure imports (guarded)
@@ -264,6 +275,7 @@ from vibespatial.runtime.kernel_registry import register_kernel_variant  # noqa:
 # Build flat coordinate offsets on device (per-geometry coord range)
 # ---------------------------------------------------------------------------
 
+
 def _build_flat_coord_offsets(device_buf, family):
     """Build a device array mapping each geometry to its flat coord range.
 
@@ -272,8 +284,7 @@ def _build_flat_coord_offsets(device_buf, family):
 
     Returns ``None`` for unsupported families (MultiPolygon).
     """
-    if family in (GeometryFamily.POINT, GeometryFamily.MULTIPOINT,
-                  GeometryFamily.LINESTRING):
+    if family in (GeometryFamily.POINT, GeometryFamily.MULTIPOINT, GeometryFamily.LINESTRING):
         # geometry_offsets directly index into coords
         return cp.asarray(device_buf.geometry_offsets)
 
@@ -324,10 +335,12 @@ def _distance_int_scalar(value, *, reason: str) -> int:
     if cp is None:
         return int(np.asarray(value).reshape(-1)[0])
     return int(
-        get_cuda_runtime().copy_device_to_host(
+        get_cuda_runtime()
+        .copy_device_to_host(
             cp.asarray(value).reshape(1),
             reason=reason,
-        ).reshape(-1)[0]
+        )
+        .reshape(-1)[0]
     )
 
 
@@ -335,8 +348,10 @@ def _distance_int_scalar(value, *, reason: str) -> int:
 # Kernel compilation helper
 # ---------------------------------------------------------------------------
 
-def _compile_distance_kernel(name_prefix, fp64_source, fp32_source,
-                             kernel_names, compute_type="double"):
+
+def _compile_distance_kernel(
+    name_prefix, fp64_source, fp32_source, kernel_names, compute_type="double"
+):
     """Compile and cache the fp64 or fp32 variant of a distance kernel."""
     return _compile_precision_kernel(
         name_prefix,
@@ -375,10 +390,14 @@ def _fp32_center_coords_for_pair(
                 if int(d_buf.x.size) > 0:
                     d_x = cp.asarray(d_buf.x)
                     d_y = cp.asarray(d_buf.y)
-                    device_scalars.extend([
-                        cp.min(d_x), cp.max(d_x),
-                        cp.min(d_y), cp.max(d_y),
-                    ])
+                    device_scalars.extend(
+                        [
+                            cp.min(d_x),
+                            cp.max(d_x),
+                            cp.min(d_y),
+                            cp.max(d_y),
+                        ]
+                    )
                 continue
             if buf.x.size > 0:
                 min_x = min(min_x, float(buf.x.min()))
@@ -423,13 +442,13 @@ def _coord_stats_for_pair(
 # GPU dispatch: Hausdorff distance
 # ---------------------------------------------------------------------------
 
+
 @register_kernel_variant(
     "hausdorff_distance",
     "gpu-cuda-python",
     kernel_class=KernelClass.METRIC,
     execution_modes=(ExecutionMode.GPU,),
-    geometry_families=("point", "multipoint", "linestring",
-                       "multilinestring", "polygon"),
+    geometry_families=("point", "multipoint", "linestring", "multilinestring", "polygon"),
     supports_mixed=False,
     tags=("cuda-python", "metric", "hausdorff"),
 )
@@ -447,12 +466,9 @@ def _hausdorff_gpu(owned_a, owned_b, precision_plan=None, *, densify_steps: int 
     family_b = next(iter(d_state_b.families))
 
     if family_a not in _GPU_SUPPORTED_FAMILIES or family_b not in _GPU_SUPPORTED_FAMILIES:
-        raise NotImplementedError(
-            f"GPU hausdorff does not support {family_a.name}/{family_b.name}"
-        )
+        raise NotImplementedError(f"GPU hausdorff does not support {family_a.name}/{family_b.name}")
     if densify_steps > 1 and (
-        family_a is not GeometryFamily.LINESTRING
-        or family_b is not GeometryFamily.LINESTRING
+        family_a is not GeometryFamily.LINESTRING or family_b is not GeometryFamily.LINESTRING
     ):
         raise NotImplementedError("GPU hausdorff densify currently supports LineString pairs")
 
@@ -493,8 +509,11 @@ def _hausdorff_gpu(owned_a, owned_b, precision_plan=None, *, densify_steps: int 
     d_result = runtime.allocate((n,), np.float64)
 
     kernels = _compile_distance_kernel(
-        "hausdorff", _HAUSDORFF_FP64, _HAUSDORFF_FP32,
-        _HAUSDORFF_KERNEL_NAMES, compute_type,
+        "hausdorff",
+        _HAUSDORFF_FP64,
+        _HAUSDORFF_FP32,
+        _HAUSDORFF_KERNEL_NAMES,
+        compute_type,
     )
     kernel = kernels["hausdorff_distance"]
 
@@ -506,13 +525,32 @@ def _hausdorff_gpu(owned_a, owned_b, precision_plan=None, *, densify_steps: int 
     bx = d_bcast_x if d_bcast_x is not None else buf_b.x
     by = d_bcast_y if d_bcast_y is not None else buf_b.y
     params = (
-        (ptr(buf_a.x), ptr(buf_a.y), ptr(d_offsets_a),
-         ptr(bx), ptr(by), ptr(d_offsets_b),
-         ptr(d_result), center_x, center_y, densify_steps, n),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-         KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+        (
+            ptr(buf_a.x),
+            ptr(buf_a.y),
+            ptr(d_offsets_a),
+            ptr(bx),
+            ptr(by),
+            ptr(d_offsets_b),
+            ptr(d_result),
+            center_x,
+            center_y,
+            densify_steps,
+            n,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_I32,
+        ),
     )
     runtime.launch(kernel, grid=grid, block=block, params=params)
 
@@ -526,6 +564,7 @@ def _hausdorff_gpu(owned_a, owned_b, precision_plan=None, *, densify_steps: int 
 # ---------------------------------------------------------------------------
 # GPU dispatch: Frechet distance
 # ---------------------------------------------------------------------------
+
 
 @register_kernel_variant(
     "frechet_distance",
@@ -590,8 +629,7 @@ def _frechet_gpu(owned_a, owned_b, *, densify_steps: int = 1):
 
     if max_b_len > _MAX_FRECHET_B:
         raise NotImplementedError(
-            f"Frechet B-sequence too long for GPU kernel "
-            f"(max_b_len={max_b_len} > {_MAX_FRECHET_B})"
+            f"Frechet B-sequence too long for GPU kernel (max_b_len={max_b_len} > {_MAX_FRECHET_B})"
         )
 
     # Precision plan: METRIC class, default fp64
@@ -601,8 +639,11 @@ def _frechet_gpu(owned_a, owned_b, *, densify_steps: int = 1):
     d_result = runtime.allocate((n,), np.float64)
 
     kernels = _compile_distance_kernel(
-        "frechet", _FRECHET_FP64, _FRECHET_FP32,
-        _FRECHET_KERNEL_NAMES, compute_type,
+        "frechet",
+        _FRECHET_FP64,
+        _FRECHET_FP32,
+        _FRECHET_KERNEL_NAMES,
+        compute_type,
     )
     kernel = kernels["frechet_distance"]
 
@@ -613,13 +654,34 @@ def _frechet_gpu(owned_a, owned_b, *, densify_steps: int = 1):
     bx = d_bcast_x if d_bcast_x is not None else buf_b.x
     by = d_bcast_y if d_bcast_y is not None else buf_b.y
     params = (
-        (ptr(buf_a.x), ptr(buf_a.y), ptr(d_offsets_a),
-         ptr(bx), ptr(by), ptr(d_offsets_b),
-         ptr(d_result), center_x, center_y, n, max_b_len, densify_steps),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-         KERNEL_PARAM_I32, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+        (
+            ptr(buf_a.x),
+            ptr(buf_a.y),
+            ptr(d_offsets_a),
+            ptr(bx),
+            ptr(by),
+            ptr(d_offsets_b),
+            ptr(d_result),
+            center_x,
+            center_y,
+            n,
+            max_b_len,
+            densify_steps,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_I32,
+        ),
     )
     runtime.launch(kernel, grid=grid, block=block, params=params)
 
@@ -638,6 +700,7 @@ def _frechet_gpu(owned_a, owned_b, *, densify_steps: int = 1):
 # Hausdorff distance
 # ---------------------------------------------------------------------------
 
+
 def _densify_coords(coords: np.ndarray, densify_steps: int) -> np.ndarray:
     if densify_steps <= 1 or coords.shape[0] <= 1:
         return coords
@@ -648,7 +711,7 @@ def _densify_coords(coords: np.ndarray, densify_steps: int) -> np.ndarray:
     for segment in range(segment_count):
         start = coords[segment]
         delta = coords[segment + 1] - start
-        out[out_index:out_index + densify_steps] = start + fractions[:, None] * delta
+        out[out_index : out_index + densify_steps] = start + fractions[:, None] * delta
         out_index += densify_steps
     out[out_index] = coords[-1]
     return out
@@ -679,8 +742,14 @@ def _hausdorff_pair(
     "cpu",
     kernel_class=KernelClass.METRIC,
     execution_modes=(ExecutionMode.CPU,),
-    geometry_families=("point", "multipoint", "linestring",
-                       "multilinestring", "polygon", "multipolygon"),
+    geometry_families=(
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
+    ),
     supports_mixed=True,
     tags=("cpu", "metric", "hausdorff"),
 )
@@ -701,6 +770,7 @@ def _hausdorff_cpu(owned_a, owned_b, n, *, densify_steps: int = 1):
 # ---------------------------------------------------------------------------
 # Discrete Frechet distance
 # ---------------------------------------------------------------------------
+
 
 def _frechet_pair(coords_a: np.ndarray, coords_b: np.ndarray) -> float:
     """Discrete Frechet distance between two ordered coordinate sequences.
@@ -770,6 +840,7 @@ def _frechet_cpu(owned_a, owned_b, n, *, densify_steps: int = 1):
 # Public dispatch APIs
 # ===========================================================================
 
+
 def hausdorff_distance_owned(
     owned_a: OwnedGeometryArray,
     owned_b: OwnedGeometryArray,
@@ -810,6 +881,12 @@ def hausdorff_distance_owned(
         requested_precision=precision,
         coordinate_stats=_coord_stats_for_pair(owned_a, owned_b),
         current_residency=combined_residency(owned_a, owned_b),
+        work_estimate=estimate_pairwise_work_from_owned(
+            owned_a,
+            owned_b,
+            workload=workload,
+            primary_unit_name="hausdorff-coordinate",
+        ),
     )
 
     if selection.selected is ExecutionMode.GPU:
@@ -837,8 +914,7 @@ def hausdorff_distance_owned(
                 requested=selection.requested,
                 selected=ExecutionMode.CPU,
                 d2h_transfer=(
-                    owned_a.residency is Residency.DEVICE
-                    or owned_b.residency is Residency.DEVICE
+                    owned_a.residency is Residency.DEVICE or owned_b.residency is Residency.DEVICE
                 ),
             )
         else:
@@ -904,6 +980,12 @@ def frechet_distance_owned(
         row_count=n,
         requested_mode=ExecutionMode.AUTO,
         current_residency=combined_residency(owned_a, owned_b),
+        work_estimate=estimate_pairwise_work_from_owned(
+            owned_a,
+            owned_b,
+            workload=workload,
+            primary_unit_name="frechet-coordinate",
+        ),
     )
 
     if selection.selected is ExecutionMode.GPU:
@@ -924,8 +1006,7 @@ def frechet_distance_owned(
                 requested=selection.requested,
                 selected=ExecutionMode.CPU,
                 d2h_transfer=(
-                    owned_a.residency is Residency.DEVICE
-                    or owned_b.residency is Residency.DEVICE
+                    owned_a.residency is Residency.DEVICE or owned_b.residency is Residency.DEVICE
                 ),
             )
         else:
@@ -934,10 +1015,7 @@ def frechet_distance_owned(
                 operation="frechet_distance",
                 implementation="frechet_gpu_nvrtc",
                 reason=selection.reason,
-                detail=(
-                    f"rows={n}, workload={workload.value}, "
-                    f"densify_steps={densify_steps}"
-                ),
+                detail=(f"rows={n}, workload={workload.value}, densify_steps={densify_steps}"),
                 requested=selection.requested,
                 selected=ExecutionMode.GPU,
             )

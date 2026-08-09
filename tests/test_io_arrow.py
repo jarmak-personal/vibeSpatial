@@ -60,7 +60,7 @@ from vibespatial.api._native_results import (
     native_attribute_table_from_arrow_table,
     to_native_tabular_result,
 )
-from vibespatial.api._native_rowset import NativeRowSet
+from vibespatial.api._native_rowset import NativeIndexPlan, NativeRowSet
 from vibespatial.api._native_state import get_native_state
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.geometry_array import to_wkb as array_to_wkb
@@ -703,6 +703,44 @@ def test_native_tabular_to_arrow_wkb_owned_records_gpu_dispatch() -> None:
     )
 
 
+def test_encode_owned_wkb_array_uses_cached_device_state_after_host_residency_restore() -> None:
+    if not has_gpu_runtime():
+        return
+
+    import shapely
+
+    owned = from_shapely_geometries(
+        [Point(0, 0), Point(1, 1)],
+        residency=Residency.DEVICE,
+    )
+    owned.move_to(
+        Residency.HOST,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test restores logical host residency while retaining device cache",
+    )
+
+    assert owned.residency is Residency.HOST
+    assert owned.device_state is not None
+
+    geopandas.clear_fallback_events()
+    _field, arr, selected = io_wkb._encode_owned_wkb_array(
+        owned,
+        return_mode=True,
+    )
+    fallbacks = geopandas.get_fallback_events(clear=True)
+
+    assert selected is ExecutionMode.GPU
+    assert [shapely.from_wkb(value.as_py()).wkt for value in arr] == [
+        "POINT (0 0)",
+        "POINT (1 1)",
+    ]
+    assert not any(
+        event.surface == "vibespatial.io.wkb"
+        and "GPU WKB encode unavailable" in event.reason
+        for event in fallbacks
+    )
+
+
 def test_wkb_decode_device_pipeline_has_no_raw_cupy_scalar_syncs() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     path = repo_root / "src" / "vibespatial" / "kernels" / "core" / "wkb_decode.py"
@@ -892,7 +930,9 @@ def test_geoparquet_scan_plan_prefers_bbox_pushdown_when_covering_exists() -> No
 
     assert plan.row_group_pushdown is True
     assert plan.uses_covering_bbox is True
-    assert plan.uses_pylibcudf is has_pylibcudf_support()
+    assert plan.uses_pylibcudf is (
+        has_pylibcudf_support() and has_gpu_runtime()
+    )
 
 
 def test_geoparquet_scan_plan_supports_point_encoding_pushdown_without_covering() -> None:
@@ -1507,6 +1547,7 @@ def test_read_geoparquet_owned_uses_chunked_backend_and_concatenates(monkeypatch
 
     monkeypatch.setattr(io_geoparquet, "has_pyarrow_support", lambda: True)
     monkeypatch.setattr(io_geoparquet, "has_pylibcudf_support", lambda: True)
+    monkeypatch.setattr(io_geoparquet, "has_gpu_runtime", lambda: True)
     monkeypatch.setattr(io_geoparquet, "_is_local_geoparquet_file", lambda path: True)
     monkeypatch.setattr(
         io_geoparquet,
@@ -1980,8 +2021,8 @@ def test_read_geoparquet_gpu_geometry_only_skips_non_geometry_sidecar_read(monke
 
 
 def test_read_geoparquet_gpu_backend_returns_dga_with_live_pylibcudf(tmp_path) -> None:
-    if not has_pylibcudf_support():
-        return
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("GPU pylibcudf runtime unavailable")
 
     gdf = geopandas.GeoDataFrame(
         {
@@ -2191,7 +2232,10 @@ def test_decode_wkb_arrow_uniform_fast_paths_skip_generic_gpu_bridge(
     assert polygon_restored[1].equals(Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]))
 
 
-@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU pylibcudf runtime unavailable",
+)
 def test_encode_owned_wkb_device_preserves_empty_point_rows() -> None:
     import pyarrow as pa
     import shapely
@@ -2381,6 +2425,8 @@ def test_native_tabular_to_arrow_mixed_geoarrow_uses_wkb_bridge_without_geoserie
 def test_geoseries_to_arrow_device_mixed_family_uses_native_wkb_bridge_without_host_materialization(
     monkeypatch,
 ) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime unavailable")
     geopandas.clear_fallback_events()
     gdf, owned = _make_device_dga_gdf(
         [Point(0, 0), Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])]
@@ -2661,6 +2707,8 @@ def test_owned_geoarrow_family_gate_uses_family_keys_without_host_metadata() -> 
 def test_geodataframe_to_arrow_device_geoarrow_records_fallback_before_host_materialization(
     monkeypatch,
 ) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime unavailable")
     geopandas.clear_fallback_events()
     gdf, _owned = _make_device_dga_gdf([Point(0, 0), Point(1, 1)])
 
@@ -2690,6 +2738,8 @@ def test_geodataframe_to_arrow_device_geoarrow_records_fallback_before_host_mate
 def test_geodataframe_to_arrow_device_geoarrow_raises_strict_native_before_host_materialization(
     monkeypatch,
 ) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime unavailable")
     from vibespatial.runtime.fallbacks import StrictNativeFallbackError
     from vibespatial.testing import strict_native_environment
 
@@ -2720,6 +2770,8 @@ def test_geodataframe_to_arrow_device_geoarrow_raises_strict_native_before_host_
 
 
 def test_geodataframe_to_arrow_device_supported_single_multi_mix_avoids_fallback_and_materialization() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime unavailable")
     geopandas.clear_fallback_events()
     geopandas.clear_dispatch_events()
     gdf, owned = _make_device_dga_gdf([Point(0, 0), MultiPoint([(1, 1), (2, 2)])])
@@ -2953,8 +3005,8 @@ def test_wkb_bridge_benchmark_encode_uses_host_bridge_and_native_arrow_encode(mo
 
 
 def test_read_geoparquet_owned_gpu_backend_with_live_pylibcudf(tmp_path) -> None:
-    if not has_pylibcudf_support():
-        return
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("GPU pylibcudf runtime unavailable")
 
     gdf = geopandas.GeoDataFrame({"geometry": [Point(0, 0), Point(1, 1), Point(2, 2)]})
     path = tmp_path / "gpu-points.parquet"
@@ -2971,8 +3023,12 @@ def test_read_geoparquet_owned_gpu_backend_with_live_pylibcudf(tmp_path) -> None
 
 
 def test_read_geoparquet_table_with_pylibcudf_preserves_source_schema(tmp_path) -> None:
-    if not has_pylibcudf_support() or not io_arrow.has_pyarrow_support():
-        return
+    if (
+        not has_gpu_runtime()
+        or not has_pylibcudf_support()
+        or not io_arrow.has_pyarrow_support()
+    ):
+        pytest.skip("GPU pylibcudf runtime unavailable")
 
     gdf = geopandas.GeoDataFrame({"geometry": [Point(0, 0), Point(1, 1), Point(2, 2)]})
     path = tmp_path / "gpu-schema.parquet"
@@ -3192,6 +3248,27 @@ def test_read_non_geometry_geoparquet_columns_as_arrow_preserves_hidden_index_co
     assert list(attributes.columns) == []
     assert attributes.index.name == "iso"
     assert list(attributes.index) == ["AAA", "BBB", "CCC"]
+
+
+def test_native_arrow_attributes_preserve_non_index_pandas_dtype_metadata() -> None:
+    from pandas import ArrowDtype
+
+    frame = pd.DataFrame(
+        {
+            "value": pd.Series([1, 2], dtype=ArrowDtype(pa.int64())),
+        },
+        index=pd.Index(["AAA", "BBB"], name="iso"),
+    )
+    table = pa.Table.from_pandas(frame, preserve_index=True)
+
+    attributes = native_attribute_table_from_arrow_table(table)
+    materialized = attributes.to_pandas()
+    pandas_metadata = attributes.arrow_table.schema.pandas_metadata
+
+    assert pandas_metadata["index_columns"] == []
+    assert [column["field_name"] for column in pandas_metadata["columns"]] == ["value"]
+    assert materialized["value"].dtype == ArrowDtype(pa.int64())
+    assert materialized.index.equals(frame.index)
 
 
 def test_read_geoparquet_native_chunked_preserves_secondary_geometry_and_index(tmp_path) -> None:
@@ -3505,6 +3582,70 @@ def test_native_tabular_to_parquet_bytesio_uses_native_payload_writer() -> None:
     assert list(result.geometry.astype(str)) == ["POINT (0 0)", "POINT (1 1)"]
 
 
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU GeoParquet writer unavailable",
+)
+def test_native_tabular_to_parquet_device_payload_preserves_unnamed_index(
+    tmp_path,
+) -> None:
+    payload = NativeTabularResult(
+        attributes=NativeAttributeTable(
+            dataframe=pd.DataFrame(
+                {"building_id": [101, 202]},
+                index=pd.Index([7, 11]),
+            )
+        ),
+        geometry=GeometryNativeResult.from_owned(
+            from_shapely_geometries(
+                [Point(0, 0), Point(1, 1)],
+                residency=Residency.DEVICE,
+            ),
+            crs="EPSG:4326",
+        ),
+        geometry_name="geometry",
+        column_order=("building_id", "geometry"),
+    )
+    path = tmp_path / "native-payload-unnamed-index.parquet"
+
+    payload.to_parquet(path, geometry_encoding="geoarrow")
+
+    result = geopandas.read_parquet(path)
+    assert list(result.index) == [7, 11]
+    assert result.index.name is None
+    assert list(result["building_id"]) == [101, 202]
+    assert list(result.geometry.astype(str)) == ["POINT (0 0)", "POINT (1 1)"]
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU GeoParquet writer unavailable",
+)
+def test_native_tabular_to_parquet_device_payload_preserves_named_index_only(
+    tmp_path,
+) -> None:
+    payload = NativeTabularResult(
+        attributes=NativeAttributeTable(
+            dataframe=pd.DataFrame(index=pd.Index([0], name="group"))
+        ),
+        geometry=GeometryNativeResult.from_owned(
+            from_shapely_geometries([box(0, 0, 1, 1)], residency=Residency.DEVICE),
+            crs="EPSG:4326",
+        ),
+        geometry_name="geometry",
+        column_order=("geometry",),
+    )
+    path = tmp_path / "native-payload-named-index.parquet"
+
+    payload.to_parquet(path, geometry_encoding="geoarrow")
+
+    result = geopandas.read_parquet(path)
+    assert list(result.index) == [0]
+    assert result.index.name == "group"
+    assert list(result.columns) == ["geometry"]
+    assert result.geometry.iloc[0].equals(box(0, 0, 1, 1))
+
+
 def test_native_tabular_geometry_only_to_parquet_populates_schema_metadata(tmp_path) -> None:
     import pyarrow.parquet as pq
 
@@ -3561,6 +3702,8 @@ def test_native_tabular_to_parquet_compatibility_decline_records_dispatch_not_fa
     monkeypatch,
     tmp_path,
 ) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime unavailable")
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
     payload = to_native_tabular_result(
@@ -3660,7 +3803,7 @@ def test_device_geodataframe_to_parquet_records_gpu_dispatch_when_native_writer_
     )
 
 
-def test_device_geodataframe_small_terminal_write_prefers_arrow_export(
+def test_device_geodataframe_small_terminal_write_uses_arrow_terminal_export(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -3672,10 +3815,11 @@ def test_device_geodataframe_small_terminal_write_prefers_arrow_export(
     geoms = [box(float(i), float(i), float(i) + 1.0, float(i) + 1.0) for i in range(300)]
     gdf, _owned = _make_device_dga_gdf(geoms)
 
-    def _fail(*_args, **_kwargs):
-        raise AssertionError("small terminal write should skip the native device writer")
+    def _write_success(*args, **_kwargs):
+        Path(args[1]).touch()
+        return io_wkb._NativeDeviceWriteStatus(written=True)
 
-    monkeypatch.setattr(io_geoparquet, "_write_geoparquet_native_device", _fail)
+    monkeypatch.setattr(io_geoparquet, "_write_geoparquet_native_device", _write_success)
 
     path = tmp_path / "device-gdf-small-terminal.parquet"
     gdf.to_parquet(path)
@@ -3693,7 +3837,7 @@ def test_device_geodataframe_small_terminal_write_prefers_arrow_export(
     )
     assert not any(
         event.surface == "geopandas.geodataframe.to_parquet"
-        and event.implementation == "native_payload_arrow_terminal_export"
+        and event.implementation == "native_geodataframe_device_export"
         for event in dispatches
     )
 
@@ -3824,10 +3968,12 @@ def test_device_geodataframe_to_parquet_fallback_decline_raises_in_strict_native
     assert any("test-only missing pylibcudf support" in event.detail for event in fallbacks)
 
 
-def test_native_tabular_small_terminal_write_prefers_arrow_export(
+def test_native_tabular_small_terminal_write_uses_arrow_terminal_export(
     monkeypatch,
     tmp_path,
 ) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime unavailable")
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
     payload = to_native_tabular_result(
@@ -3841,10 +3987,15 @@ def test_native_tabular_small_terminal_write_prefers_arrow_export(
     )
     assert payload is not None
 
-    def _fail(*_args, **_kwargs):
-        raise AssertionError("small terminal payload write should skip the native device writer")
+    def _write_success(*args, **_kwargs):
+        Path(args[2]).touch()
+        return io_wkb._NativeDeviceWriteStatus(written=True)
 
-    monkeypatch.setattr(io_geoparquet, "_write_geoparquet_native_device_payload", _fail)
+    monkeypatch.setattr(
+        io_geoparquet,
+        "_write_geoparquet_native_device_payload",
+        _write_success,
+    )
 
     path = tmp_path / "native-payload-small-terminal.parquet"
     payload.to_parquet(path)
@@ -3862,10 +4013,51 @@ def test_native_tabular_small_terminal_write_prefers_arrow_export(
     )
 
 
+def test_native_tabular_host_owned_small_terminal_write_uses_device_wkb_encoder(
+    tmp_path,
+) -> None:
+    if not has_gpu_runtime():
+        return
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    payload = to_native_tabular_result(
+        GeometryNativeResult.from_owned(
+            from_shapely_geometries(
+                [box(0.0, 0.0, 1.0, 1.0), box(2.0, 2.0, 3.0, 3.0)]
+            ),
+            crs="EPSG:4326",
+        )
+    )
+    assert payload is not None
+    assert payload.geometry.owned is not None
+    assert payload.geometry.owned.residency is Residency.HOST
+
+    path = tmp_path / "host-owned-small-terminal-device-wkb.parquet"
+    payload.to_parquet(path)
+    dispatches = geopandas.get_dispatch_events(clear=True)
+    fallbacks = geopandas.get_fallback_events(clear=True)
+
+    assert path.exists()
+    assert not any(
+        event.surface == "vibespatial.io.wkb"
+        and "GPU WKB encode unavailable" in event.reason
+        for event in fallbacks
+    )
+    assert any(
+        event.surface == "vibespatial.io.wkb"
+        and event.implementation == "device_wkb_encode"
+        and event.selected is ExecutionMode.GPU
+        for event in dispatches
+    )
+
+
 def test_native_tabular_to_parquet_records_gpu_dispatch_when_device_writer_succeeds(
     monkeypatch,
     tmp_path,
 ) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime unavailable")
     geopandas.clear_dispatch_events()
     payload = to_native_tabular_result(
         GeometryNativeResult.from_owned(
@@ -3974,7 +4166,10 @@ def test_arrow_backed_native_attributes_feather_without_pandas_materialization(
     assert result.crs == "EPSG:4326"
 
 
-@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU pylibcudf runtime unavailable",
+)
 def test_arrow_backed_native_attributes_device_parquet_without_pandas_materialization(
     tmp_path,
     monkeypatch,
@@ -4006,7 +4201,10 @@ def test_arrow_backed_native_attributes_device_parquet_without_pandas_materializ
     assert b"geo" in table.schema.metadata
 
 
-@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU pylibcudf runtime unavailable",
+)
 def test_native_tabular_device_parquet_skips_geoseries_materialization(
     tmp_path,
     monkeypatch,
@@ -4096,7 +4294,7 @@ def test_lazy_native_tabular_export_resolves_late_attribute_columns() -> None:
     assert table.column_names == ["value", "geometry"]
 
 
-def test_create_metadata_uses_device_geometry_fast_path(monkeypatch) -> None:
+def test_create_metadata_exports_required_device_bbox_without_shapely_types(monkeypatch) -> None:
     if not has_gpu_runtime():
         return
 
@@ -4108,11 +4306,6 @@ def test_create_metadata_uses_device_geometry_fast_path(monkeypatch) -> None:
         raise AssertionError("device metadata fast path should not consult shapely type ids")
 
     monkeypatch.setattr(api_io_arrow.shapely, "get_type_id", _fail)
-    monkeypatch.setattr(
-        DeviceGeometryArray,
-        "total_bounds",
-        property(lambda self: np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float64)),
-    )
 
     metadata = api_io_arrow._create_metadata(
         gdf,
@@ -4125,7 +4318,7 @@ def test_create_metadata_uses_device_geometry_fast_path(monkeypatch) -> None:
     assert metadata["columns"]["geometry"]["bbox"] == [0.0, 0.0, 1.0, 1.0]
 
 
-def test_create_geometry_metadata_uses_device_geometry_fast_path(monkeypatch) -> None:
+def test_create_geometry_metadata_uses_device_geometry_fast_path_without_total_bounds(monkeypatch) -> None:
     if not has_gpu_runtime():
         return
 
@@ -4137,11 +4330,14 @@ def test_create_geometry_metadata_uses_device_geometry_fast_path(monkeypatch) ->
     def _fail(*_args, **_kwargs):
         raise AssertionError("device metadata fast path should not consult shapely type ids")
 
+    def _fail_total_bounds(_self):
+        raise AssertionError("bbox must not force total_bounds")
+
     monkeypatch.setattr(api_io_arrow.shapely, "get_type_id", _fail)
     monkeypatch.setattr(
         DeviceGeometryArray,
         "total_bounds",
-        property(lambda self: np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float64)),
+        property(_fail_total_bounds),
     )
 
     metadata = api_io_arrow._create_geometry_metadata(
@@ -4153,7 +4349,7 @@ def test_create_geometry_metadata_uses_device_geometry_fast_path(monkeypatch) ->
     )
 
     assert metadata["columns"]["geometry"]["geometry_types"] == ["Point"]
-    assert metadata["columns"]["geometry"]["bbox"] == [0.0, 0.0, 1.0, 1.0]
+    assert "bbox" not in metadata["columns"]["geometry"]
 
 
 def test_native_to_parquet_rejects_existing_bbox_column(tmp_path) -> None:
@@ -4380,6 +4576,76 @@ def test_wkb_encode_from_device_owned_ignores_stale_host_metadata() -> None:
     assert restored[2].equals(mpoly)
 
 
+def test_indexed_view_mixed_polygon_multipolygon_parquet_roundtrip_no_take_fence(
+    tmp_path,
+) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    import cupy as cp
+    import shapely
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    poly = Polygon([(0, 0), (2, 0), (2, 2), (0, 0)])
+    poly_with_hole = Polygon(
+        [(3, 0), (8, 0), (8, 5), (3, 0)],
+        [[(4, 1), (5, 1), (5, 2), (4, 1)]],
+    )
+    mpoly = MultiPolygon(
+        [
+            Polygon([(9, 0), (11, 0), (11, 2), (9, 0)]),
+            Polygon([(11, 2), (13, 2), (13, 4), (11, 2)]),
+        ]
+    )
+    mpoly_with_hole = MultiPolygon(
+        [
+            Polygon(
+                [(14, 0), (19, 0), (19, 5), (14, 0)],
+                [[(15, 1), (16, 1), (16, 2), (15, 1)]],
+            )
+        ]
+    )
+    expected = [mpoly_with_hole, poly_with_hole, poly, mpoly]
+    owned = from_shapely_geometries(
+        [poly, poly_with_hole, mpoly, mpoly_with_hole],
+        residency=Residency.DEVICE,
+    )
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    indexed = owned.device_take(cp.asarray([3, 1, 0, 2], dtype=cp.int64))
+    take_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert indexed.is_indexed_view
+    assert "owned geometry device-take nested slice-size allocation fence" not in take_reasons
+    assert "owned geometry device-take slice-size allocation fence" not in take_reasons
+
+    ga = GeometryArray.from_owned(indexed, crs="EPSG:4326")
+    gdf = geopandas.GeoDataFrame(
+        {"value": [3, 2, 1, 3], "geometry": geopandas.GeoSeries(ga, crs="EPSG:4326")},
+        geometry="geometry",
+    )
+    exported = np.asarray(gdf.geometry.array, dtype=object)
+    assert [
+        shapely.equals_exact(shapely.normalize(got), shapely.normalize(want), tolerance=0.0)
+        for got, want in zip(exported, expected, strict=True)
+    ] == [True, True, True, True]
+
+    path = tmp_path / "indexed-view-mixed.parquet"
+    gdf.to_parquet(path, geometry_encoding="WKB")
+    roundtripped = geopandas.read_parquet(path)
+
+    assert roundtripped["value"].tolist() == [3, 2, 1, 3]
+    assert [
+        shapely.equals_exact(shapely.normalize(got), shapely.normalize(want), tolerance=0.0)
+        for got, want in zip(roundtripped.geometry, expected, strict=True)
+    ] == [True, True, True, True]
+
+
 def test_write_geoparquet_device_wkb_has_no_transfer_or_materialization(tmp_path) -> None:
     if not has_gpu_runtime() or not has_pylibcudf_support():
         return
@@ -4418,7 +4684,7 @@ def test_read_parquet_pylibcudf_keeps_device_geometry_unmaterialized(tmp_path) -
     assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.MATERIALIZATION] == []
 
 
-def test_read_parquet_pylibcudf_wkb_scalar_fences_are_runtime_observable(
+def test_read_parquet_pylibcudf_wkb_decode_stays_zero_d2h_for_native_metadata(
     tmp_path,
 ) -> None:
     if not has_gpu_runtime() or not has_pylibcudf_support():
@@ -4449,11 +4715,7 @@ def test_read_parquet_pylibcudf_wkb_scalar_fences_are_runtime_observable(
 
     assert len(result) == 2
     assert result.geometry.iloc[0].equals(gdf.geometry.iloc[0])
-    assert "pylibcudf WKB header native-count scalar fence" in reasons
-    assert any(
-        reason.startswith("pylibcudf WKB linestring")
-        for reason in reasons
-    )
+    assert reasons == []
 
 
 def test_read_parquet_pylibcudf_geoarrow_polygon_uses_child_sizes_without_d2h(
@@ -4486,8 +4748,50 @@ def test_read_parquet_pylibcudf_geoarrow_polygon_uses_child_sizes_without_d2h(
     assert "pylibcudf GeoArrow polygon ring-count scalar fence" not in reasons
     assert "pylibcudf GeoArrow polygon coord-count scalar fence" not in reasons
     assert "pylibcudf GeoArrow dense-ring coord-count scalar fence" not in reasons
+    assert "pylibcudf GeoArrow dense-ring check scalar fence" not in reasons
     assert "pylibcudf GeoArrow child-count scalar fence" not in reasons
     assert "pylibcudf geometry validity-count scalar fence" not in reasons
+
+
+def test_geoparquet_regular_grid_shape_proof_survives_device_read_and_index(
+    tmp_path,
+) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.spatial.indexing import build_flat_spatial_index
+
+    polygons = [
+        box(float(col), float(row), float(col + 1), float(row + 1))
+        for row in range(2)
+        for col in range(3)
+    ]
+    gdf = geopandas.GeoDataFrame({"geometry": polygons}, geometry="geometry")
+    path = tmp_path / "regular_grid_shape_proof.parquet"
+
+    write_geoparquet(gdf, path, geometry_encoding="geoarrow")
+    owned = read_geoparquet_owned(path, backend="gpu")
+    assert owned.residency is Residency.DEVICE
+    assert owned.device_state is not None
+    proof = owned.device_state.families[GeometryFamily.POLYGON].regular_grid_rect
+    assert proof is not None
+    assert proof.cols == 3
+    assert proof.rows == 2
+    assert proof.size == 6
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    flat = build_flat_spatial_index(owned)
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert flat.regular_grid is not None
+    assert flat.regular_grid.cols == 3
+    assert flat.regular_grid.rows == 2
+    assert "spatial index regular-grid summary scalar fence" not in reasons
 
 
 def test_device_geoarrow_homogeneous_family_uses_structure_without_d2h() -> None:
@@ -4901,6 +5205,146 @@ def test_write_geoparquet_device_geoarrow_numeric_attributes_skip_from_pandas(
     result = geopandas.read_parquet(path)
     assert list(result["idx"]) == [0, 1, 2]
     assert result.geometry.iloc[0].equals(Point(0, 0))
+
+
+def test_geodataframe_to_parquet_native_device_attrs_and_index_skip_public_exports(
+    tmp_path,
+) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    import cupy as cp
+    import pylibcudf as plc
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    source = pa.table(
+        {
+            "value": pa.array([101, 202], type=pa.int64()),
+            "score": pa.array([1.5, 2.5], type=pa.float64()),
+        }
+    )
+    owned = from_shapely_geometries(
+        [Point(0, 0), Point(1, 1)],
+        residency=Residency.DEVICE,
+    )
+    index_plan = NativeIndexPlan.from_index(
+        pd.RangeIndex(10, 12, name="site")
+    ).take(
+        cp.asarray([1, 0], dtype=cp.int64),
+        preserve_index=True,
+        unique=True,
+    )
+    native_result = NativeTabularResult(
+        attributes=NativeAttributeTable(
+            device_table=plc.Table.from_arrow(source),
+            index_override=pd.RangeIndex(2),
+            column_override=tuple(source.column_names),
+            schema_override=source.schema,
+        ),
+        geometry=GeometryNativeResult.from_owned(owned, crs="EPSG:4326"),
+        geometry_name="geometry",
+        column_order=("value", "score", "geometry"),
+        index_plan=index_plan,
+    )
+    frame = native_result.to_geodataframe()
+    path = tmp_path / "native-device-attrs-index.parquet"
+
+    geopandas.clear_materialization_events()
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    frame.to_parquet(path, geometry_encoding="geoarrow")
+    materializations = geopandas.get_materialization_events(clear=True)
+    d2h_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert not any(
+        event.surface == "vibespatial.api.GeoDataFrame.__getitem__"
+        for event in materializations
+    )
+    assert not any(
+        event.operation
+        in {
+            "device_attributes_to_arrow",
+            "device_numeric_attributes_to_pandas",
+            "index_plan_to_host",
+            "index_plan_take_positions_to_host",
+        }
+        for event in materializations
+    )
+    assert not any(event.d2h_transfer for event in materializations)
+    assert d2h_reasons == []
+
+    result = geopandas.read_parquet(path)
+    assert list(result.index) == [11, 10]
+    assert result.index.name == "site"
+    assert list(result["value"]) == [101, 202]
+    assert list(result["score"]) == [1.5, 2.5]
+    assert list(result.geometry.astype(str)) == ["POINT (0 0)", "POINT (1 1)"]
+
+
+def test_native_wkb_to_parquet_exports_host_label_take_index_once(tmp_path) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device index-plan export accounting")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    index_plan = NativeIndexPlan.from_index(
+        pd.Index(["parcel-b", "parcel-a"], name="parcel")
+    ).take(
+        cp.asarray([1, 0], dtype=cp.int64),
+        preserve_index=True,
+        unique=True,
+        strict_disallowed=False,
+    )
+    native_result = NativeTabularResult(
+        attributes=NativeAttributeTable(
+            dataframe=pd.DataFrame({"value": [101, 202]}, index=pd.RangeIndex(2))
+        ),
+        geometry=GeometryNativeResult.from_owned(
+            from_shapely_geometries(
+                [box(0, 0, 1, 1), box(1, 1, 2, 2)],
+                residency=Residency.DEVICE,
+            ),
+            crs="EPSG:4326",
+        ),
+        geometry_name="geometry",
+        column_order=("value", "geometry"),
+        index_plan=index_plan,
+    )
+    path = tmp_path / "native-wkb-index-once.parquet"
+
+    geopandas.clear_materialization_events()
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    native_result.to_parquet(path, geometry_encoding="WKB", index=True)
+    materializations = geopandas.get_materialization_events(clear=True)
+    d2h_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert (
+        sum(
+            event.operation == "index_plan_take_positions_to_host"
+            for event in materializations
+        )
+        == 1
+    )
+    assert (
+        d2h_reasons.count(
+            "vibespatial.api.NativeIndexPlan.take_public_index"
+            "::index_plan_take_positions_to_host"
+        )
+        == 1
+    )
+
+    result = geopandas.read_parquet(path)
+    assert list(result.index) == ["parcel-a", "parcel-b"]
+    assert result.index.name == "parcel"
+    assert list(result["value"]) == [101, 202]
 
 
 def test_write_geoparquet_device_geoarrow_ignores_stale_host_metadata(tmp_path) -> None:

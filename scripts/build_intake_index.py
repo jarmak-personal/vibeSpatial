@@ -17,6 +17,7 @@ TEXT_SUFFIXES = {".md", ".py", ".toml", ".json", ".yaml", ".yml"}
 EXCLUDED_DIRS = {
     ".brainstorm",
     ".git",
+    ".worktrees",
     ".venv",
     ".pytest_cache",
     ".ruff_cache",

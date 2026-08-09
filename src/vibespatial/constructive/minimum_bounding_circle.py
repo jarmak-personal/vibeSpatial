@@ -74,6 +74,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import (
     StrictNativeFallbackError,
@@ -91,15 +92,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("ritter-bounding-circle", _RITTER_KERNEL_SOURCE, _RITTER_KERNEL_NAMES),
-    ("tessellate-circle", _TESSELLATE_KERNEL_SOURCE, _TESSELLATE_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("ritter-bounding-circle", _RITTER_KERNEL_SOURCE, _RITTER_KERNEL_NAMES),
+        ("tessellate-circle", _TESSELLATE_KERNEL_SOURCE, _TESSELLATE_KERNEL_NAMES),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # Helper: flat coordinate offsets per geometry (reused from convex_hull)
 # ---------------------------------------------------------------------------
+
 
 def _compute_flat_coord_offsets(device_buf, family):
     """Compute per-geometry flat coordinate offset array on device.
@@ -110,8 +114,7 @@ def _compute_flat_coord_offsets(device_buf, family):
     For families with multi-level offset indirection (Polygon,
     MultiPolygon, MultiLineString), the indirection is resolved.
     """
-    if family in (GeometryFamily.POINT, GeometryFamily.MULTIPOINT,
-                  GeometryFamily.LINESTRING):
+    if family in (GeometryFamily.POINT, GeometryFamily.MULTIPOINT, GeometryFamily.LINESTRING):
         return cp.asarray(device_buf.geometry_offsets)
 
     if family is GeometryFamily.POLYGON:
@@ -139,6 +142,7 @@ def _compute_flat_coord_offsets(device_buf, family):
 # GPU: core Ritter's kernel launcher
 # ---------------------------------------------------------------------------
 
+
 def _ritter_family_gpu(runtime, device_buf, family, row_count):
     """Run Ritter's bounding circle for one family on GPU.
 
@@ -154,7 +158,9 @@ def _ritter_family_gpu(runtime, device_buf, family, row_count):
     d_y = cp.asarray(device_buf.y)
 
     kernels = compile_kernel_group(
-        "ritter-bounding-circle", _RITTER_KERNEL_SOURCE, _RITTER_KERNEL_NAMES,
+        "ritter-bounding-circle",
+        _RITTER_KERNEL_SOURCE,
+        _RITTER_KERNEL_NAMES,
     )
     kernel = kernels["ritter_bounding_circle"]
 
@@ -165,13 +171,21 @@ def _ritter_family_gpu(runtime, device_buf, family, row_count):
     ptr = runtime.pointer
     params = (
         (
-            ptr(d_x), ptr(d_y), ptr(d_flat_offsets_i32),
-            ptr(d_cx), ptr(d_cy), ptr(d_radius),
+            ptr(d_x),
+            ptr(d_y),
+            ptr(d_flat_offsets_i32),
+            ptr(d_cx),
+            ptr(d_cy),
+            ptr(d_radius),
             row_count,
         ),
         (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
         ),
     )
@@ -194,20 +208,28 @@ def _tessellate_circles_gpu(runtime, d_cx, d_cy, d_radius, row_count):
     d_oy = runtime.allocate((max(total_coords, 1),), np.float64)
 
     kernels = compile_kernel_group(
-        "tessellate-circle", _TESSELLATE_KERNEL_SOURCE, _TESSELLATE_KERNEL_NAMES,
+        "tessellate-circle",
+        _TESSELLATE_KERNEL_SOURCE,
+        _TESSELLATE_KERNEL_NAMES,
     )
     kernel = kernels["tessellate_circle"]
 
     ptr = runtime.pointer
     params = (
         (
-            ptr(d_cx), ptr(d_cy), ptr(d_radius),
-            ptr(d_ox), ptr(d_oy),
+            ptr(d_cx),
+            ptr(d_cy),
+            ptr(d_radius),
+            ptr(d_ox),
+            ptr(d_oy),
             row_count,
         ),
         (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
         ),
     )
@@ -236,14 +258,19 @@ def _tessellate_circles_gpu(runtime, d_cx, d_cy, d_radius, row_count):
 # GPU kernel variants (registered)
 # ---------------------------------------------------------------------------
 
+
 @register_kernel_variant(
     "minimum_bounding_circle",
     "gpu-cuda-python",
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=False,
     tags=("cuda-python", "constructive", "minimum_bounding_circle"),
@@ -259,7 +286,8 @@ def _minimum_bounding_circle_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArra
 
     # Find the single active family (supports_mixed=False)
     active_families = [
-        (fam, dbuf) for fam, dbuf in d_state.families.items()
+        (fam, dbuf)
+        for fam, dbuf in d_state.families.items()
         if int(dbuf.geometry_offsets.size) >= 2
     ]
 
@@ -306,8 +334,12 @@ def _minimum_bounding_circle_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArra
     kernel_class=KernelClass.METRIC,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=False,
     tags=("cuda-python", "metric", "minimum_bounding_radius"),
@@ -324,7 +356,8 @@ def _minimum_bounding_radius_gpu(owned: OwnedGeometryArray) -> np.ndarray:
 
     # Find the single active family (supports_mixed=False)
     active_families = [
-        (fam, dbuf) for fam, dbuf in d_state.families.items()
+        (fam, dbuf)
+        for fam, dbuf in d_state.families.items()
         if int(dbuf.geometry_offsets.size) >= 2
     ]
 
@@ -354,6 +387,7 @@ def _minimum_bounding_radius_gpu(owned: OwnedGeometryArray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # CPU implementations
 # ---------------------------------------------------------------------------
+
 
 def _ritter_cpu(x, y, start, end):
     """Ritter's bounding circle for coordinates x[start:end], y[start:end].
@@ -473,8 +507,12 @@ def _tessellate_circle_cpu(cx, cy, radius, n_verts=_N_TESSELLATION_VERTS):
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.CPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("numpy", "constructive", "minimum_bounding_circle"),
@@ -484,6 +522,7 @@ def _minimum_bounding_circle_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArra
     row_count = owned.row_count
     if row_count == 0:
         from vibespatial.geometry.owned import from_shapely_geometries
+
         return from_shapely_geometries([])
 
     tags = owned.tags
@@ -560,8 +599,12 @@ def _minimum_bounding_circle_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArra
     kernel_class=KernelClass.METRIC,
     execution_modes=(ExecutionMode.CPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("numpy", "metric", "minimum_bounding_radius"),
@@ -598,6 +641,7 @@ def _minimum_bounding_radius_cpu(owned: OwnedGeometryArray) -> np.ndarray:
 # Public dispatch APIs
 # ---------------------------------------------------------------------------
 
+
 def minimum_bounding_circle_owned(
     owned: OwnedGeometryArray,
     *,
@@ -627,12 +671,25 @@ def minimum_bounding_circle_owned(
     row_count = owned.row_count
     if row_count == 0:
         from vibespatial.geometry.owned import from_shapely_geometries
+
         return from_shapely_geometries([])
 
+    input_work = estimate_physical_work_from_owned(owned)
     selection = plan_dispatch_selection(
         kernel_name="minimum_bounding_circle",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            output_byte_count=row_count * (_N_TESSELLATION_VERTS + 1) * 16,
+            temporary_byte_count=row_count * 24,
+            primary_unit_count=max(
+                input_work.coordinate_count,
+                row_count * (_N_TESSELLATION_VERTS + 1),
+            ),
+            primary_unit_name="minimum-bounding-circle-output-coordinate",
+        ),
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=owned.residency,
@@ -644,10 +701,7 @@ def minimum_bounding_circle_owned(
 
     if selected_mode is ExecutionMode.GPU and cp is not None:
         precision_plan = selection.precision_plan
-        families_with_rows = [
-            fam for fam in owned.families
-            if owned.family_has_rows(fam)
-        ]
+        families_with_rows = [fam for fam in owned.families if owned.family_has_rows(fam)]
         is_single_family = len(families_with_rows) == 1
 
         if is_single_family:
@@ -773,6 +827,13 @@ def minimum_bounding_radius_owned(
         kernel_name="minimum_bounding_radius",
         kernel_class=KernelClass.METRIC,
         row_count=row_count,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            output_byte_count=row_count * np.dtype(np.float64).itemsize,
+            temporary_byte_count=row_count * 24,
+            primary_unit_name="minimum-bounding-radius-coordinate",
+        ),
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=owned.residency,
@@ -784,10 +845,7 @@ def minimum_bounding_radius_owned(
 
     if selected_mode is ExecutionMode.GPU and cp is not None:
         precision_plan = selection.precision_plan
-        families_with_rows = [
-            fam for fam in owned.families
-            if owned.family_has_rows(fam)
-        ]
+        families_with_rows = [fam for fam in owned.families if owned.family_has_rows(fam)]
         is_single_family = len(families_with_rows) == 1
 
         if is_single_family:

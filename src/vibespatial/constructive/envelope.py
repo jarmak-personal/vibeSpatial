@@ -35,6 +35,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
@@ -50,10 +51,12 @@ from vibespatial.constructive.envelope_kernels import (
 )
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 
-request_nvrtc_warmup([
-    ("envelope-fp64", _ENVELOPE_FP64, _ENVELOPE_KERNEL_NAMES),
-    ("envelope-fp32", _ENVELOPE_FP32, _ENVELOPE_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("envelope-fp64", _ENVELOPE_FP64, _ENVELOPE_KERNEL_NAMES),
+        ("envelope-fp32", _ENVELOPE_FP32, _ENVELOPE_KERNEL_NAMES),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +101,9 @@ def _build_device_boxes_from_bounds(
         d_x_out,
         d_y_out,
         row_count=row_count,
-        bounds=None,
+        bounds=device_bounds,
         verts_per_ring=5,
+        axis_aligned_rectangles=True,
     )
 
 
@@ -108,7 +112,14 @@ def _build_device_boxes_from_bounds(
     "gpu-cuda-python",
     kernel_class=KernelClass.COARSE,
     execution_modes=(ExecutionMode.GPU,),
-    geometry_families=("point", "multipoint", "linestring", "multilinestring", "polygon", "multipolygon"),
+    geometry_families=(
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
+    ),
     supports_mixed=True,
     tags=("cuda-python", "constructive", "envelope"),
 )
@@ -133,14 +144,19 @@ def _envelope_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 # CPU fallback
 # ---------------------------------------------------------------------------
 
+
 @register_kernel_variant(
     "envelope",
     "cpu",
     kernel_class=KernelClass.COARSE,
     execution_modes=(ExecutionMode.CPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
+        "polygon",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("shapely", "constructive", "envelope"),
@@ -198,6 +214,7 @@ def _envelope_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 # Public dispatch API
 # ---------------------------------------------------------------------------
 
+
 def envelope_owned(
     owned: OwnedGeometryArray,
     *,
@@ -214,10 +231,18 @@ def envelope_owned(
 
         return from_shapely_geometries([])
 
+    source_work = estimate_physical_work_from_owned(owned)
     selection = plan_dispatch_selection(
         kernel_name="envelope",
         kernel_class=KernelClass.COARSE,
         row_count=row_count,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            output_byte_count=row_count * 5 * 16,
+            primary_unit_count=max(source_work.coordinate_count, row_count * 5),
+            primary_unit_name="envelope-coordinate",
+        ),
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=combined_residency(owned),

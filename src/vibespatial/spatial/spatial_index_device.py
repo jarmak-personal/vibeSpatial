@@ -31,6 +31,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
+    KERNEL_PARAM_I64,
     KERNEL_PARAM_PTR,
     count_scatter_total,
     get_cuda_runtime,
@@ -48,19 +49,22 @@ from vibespatial.kernels.core.spatial_query_kernels import (
 )
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import PhysicalWorkEstimate
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 from .query_types import SpatialQueryExecution, _DeviceCandidates
 
 # Eagerly request CCCL spec warmup at module import (ADR-0034 Level 1).
-request_warmup([
-    "exclusive_scan_i32",
-    "exclusive_scan_i64",
-    "select_i32",
-    "select_i64",
-    "lower_bound_u64",
-    "upper_bound_u64",
-])
+request_warmup(
+    [
+        "exclusive_scan_i32",
+        "exclusive_scan_i64",
+        "select_i32",
+        "select_i64",
+        "lower_bound_u64",
+        "upper_bound_u64",
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +76,21 @@ request_warmup([
 # ~1M (roughly 1K x 1K) with warm kernels (ADR-0034) — the overhead delta
 # is ~0.5ms, dominated by the binary search + range expansion cost.
 _MORTON_RANGE_CROSSOVER = 1_000_000
+
+# Small many-by-few bbox joins are bounded by the pair product.  A device
+# pair-mask plus compaction avoids scalarizing the count/scan output size.
+_PAIR_MASK_BRUTE_FORCE_MAX_PRODUCT = 262_144
+
+
+def prefers_pair_mask_spatial_index_query(query_count: int, tree_count: int) -> bool:
+    """Return True when device pair-mask query is the preferred physical shape."""
+    query_count = int(query_count)
+    tree_count = int(tree_count)
+    return (
+        1 < query_count
+        and 1 < tree_count
+        and query_count * tree_count <= _PAIR_MASK_BRUTE_FORCE_MAX_PRODUCT
+    )
 
 
 def _is_device_array(value) -> bool:
@@ -125,9 +144,7 @@ def _prepare_tree_bounds_device(
             prepared = cp.ascontiguousarray(prepared)
         return prepared.ravel(), None if prepared is base else prepared
 
-    d_bounds = runtime.from_host(
-        np.ascontiguousarray(flat_index.bounds, dtype=np.float64).ravel()
-    )
+    d_bounds = runtime.from_host(np.ascontiguousarray(flat_index.bounds, dtype=np.float64).ravel())
     return d_bounds, d_bounds
 
 
@@ -172,10 +189,15 @@ def spatial_index_device_query(
         plan = plan_dispatch_selection(
             kernel_name="bbox_overlap_candidates",
             kernel_class=KernelClass.COARSE,
-            row_count=query_count * tree_count,
+            row_count=query_count,
             requested_mode=ExecutionMode.GPU,
             requested_precision=precision,
             gpu_available=has_gpu_runtime(),
+            work_estimate=PhysicalWorkEstimate.for_candidate_pairs(
+                row_count=query_count,
+                candidate_pair_count=query_count * tree_count,
+                primary_unit_name="bbox-candidate-pair",
+            ),
         )
     except RuntimeError:
         return None, SpatialQueryExecution(
@@ -233,8 +255,15 @@ def spatial_index_device_query(
                 ),
             )
 
-    # Fall through to brute-force O(N*M).
-    if query_count == 1 and not _is_device_array(effective_bounds):
+    # Fall through to brute-force O(N*M).  A one-row tree has bounded output
+    # cardinality (at most one pair per query), so use mask compaction instead
+    # of the generic count/scan/scatter path that scalarizes total pairs for
+    # allocation.
+    if tree_count == 1 and query_count > 1:
+        result = _brute_force_single_tree_multi(effective_bounds, flat_index)
+    elif prefers_pair_mask_spatial_index_query(query_count, tree_count):
+        result = _brute_force_pair_mask_multi(effective_bounds, flat_index)
+    elif query_count == 1 and not _is_device_array(effective_bounds):
         result = _brute_force_scalar(effective_bounds[0], flat_index)
     else:
         result = _brute_force_multi(effective_bounds, flat_index)
@@ -439,9 +468,7 @@ def _brute_force_multi(
                 KERNEL_PARAM_PTR,
             ),
         )
-        scatter_grid, scatter_block = runtime.launch_config(
-            scatter_kernel, query_count
-        )
+        scatter_grid, scatter_block = runtime.launch_config(scatter_kernel, query_count)
         runtime.launch(
             scatter_kernel,
             grid=scatter_grid,
@@ -462,6 +489,134 @@ def _brute_force_multi(
         runtime.free(temp_tree_bounds)
         runtime.free(d_counts)
         runtime.free(d_offsets)
+
+
+def _brute_force_pair_mask_multi(
+    query_bounds,
+    flat_index,
+) -> _DeviceCandidates | None:
+    """GPU brute-force for bounded N*M using pair-mask compaction."""
+    import cupy as cp
+
+    runtime = get_cuda_runtime()
+    query_count = int(query_bounds.shape[0])
+    tree_count = flat_index.size
+    pair_count = query_count * tree_count
+    if pair_count <= 0:
+        return _empty_device_candidates()
+
+    d_query_bounds, temp_query_bounds = _prepare_query_bounds_device(
+        query_bounds,
+        runtime,
+    )
+    d_tree_bounds, temp_tree_bounds = _prepare_tree_bounds_device(flat_index, runtime)
+    d_mask = runtime.allocate((pair_count,), cp.uint8)
+    try:
+        kernels = _spatial_query_kernels()
+        kernel = kernels["bbox_overlap_multi_pair_mask"]
+        ptr = runtime.pointer
+        params = (
+            (
+                ptr(d_query_bounds),
+                ptr(d_tree_bounds),
+                query_count,
+                tree_count,
+                ptr(d_mask),
+                pair_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I64,
+            ),
+        )
+        grid, block = runtime.launch_config(kernel, pair_count)
+        runtime.launch(kernel, grid=grid, block=block, params=params)
+        compacted = compact_indices(d_mask)
+        d_flat = cp.asarray(compacted.values, dtype=cp.int64)
+        if int(d_flat.size) == 0:
+            return _empty_device_candidates()
+        d_left = (d_flat // np.int64(tree_count)).astype(cp.int32, copy=False)
+        d_right = (d_flat - d_left.astype(cp.int64) * np.int64(tree_count)).astype(
+            cp.int32,
+            copy=False,
+        )
+        return _DeviceCandidates(
+            d_left=d_left,
+            d_right=d_right,
+            total_pairs=int(d_flat.size),
+        )
+    finally:
+        runtime.free(temp_query_bounds)
+        runtime.free(temp_tree_bounds)
+        runtime.free(d_mask)
+
+
+def _brute_force_single_tree_multi(
+    query_bounds,
+    flat_index,
+) -> _DeviceCandidates | None:
+    """GPU brute-force for M=1 using bounded mask compaction.
+
+    Each query can contribute at most one candidate pair, so the output shape
+    is naturally query-row shaped.  This avoids the generic total-pair
+    allocation fence used by the N*M scatter path.
+    """
+    import cupy as cp
+
+    runtime = get_cuda_runtime()
+    query_count = int(query_bounds.shape[0])
+    d_query_bounds, temp_query_bounds = _prepare_query_bounds_device(
+        query_bounds,
+        runtime,
+    )
+    d_tree_bounds, temp_tree_bounds = _prepare_tree_bounds_device(flat_index, runtime)
+    d_counts = runtime.allocate((query_count,), cp.int32)
+    try:
+        kernels = _spatial_query_kernels()
+        ptr = runtime.pointer
+        count_kernel = kernels["bbox_overlap_multi_count"]
+        count_params = (
+            (
+                ptr(d_query_bounds),
+                ptr(d_tree_bounds),
+                query_count,
+                1,
+                ptr(d_counts),
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_PTR,
+            ),
+        )
+        count_grid, count_block = runtime.launch_config(count_kernel, query_count)
+        runtime.launch(
+            count_kernel,
+            grid=count_grid,
+            block=count_block,
+            params=count_params,
+        )
+
+        compacted = compact_indices(d_counts)
+        if compacted.values.size == 0:
+            return _empty_device_candidates()
+        d_left = cp.asarray(compacted.values, dtype=cp.int32)
+        d_right = cp.zeros(d_left.size, dtype=cp.int32)
+        return _DeviceCandidates(
+            d_left=d_left,
+            d_right=d_right,
+            total_pairs=int(d_left.size),
+        )
+    finally:
+        runtime.free(temp_query_bounds)
+        runtime.free(temp_tree_bounds)
+        runtime.free(d_counts)
 
 
 def _morton_range_query(
@@ -511,7 +666,8 @@ def _morton_range_query(
     # Prepare host data in Morton-sorted order.
     sorted_keys_host = flat_index.morton_keys[flat_index.order].astype(np.uint64)
     sorted_tree_bounds_host = np.ascontiguousarray(
-        flat_index.bounds[flat_index.order], dtype=np.float64,
+        flat_index.bounds[flat_index.order],
+        dtype=np.float64,
     )
     order_host = np.ascontiguousarray(flat_index.order, dtype=np.int32)
 
@@ -519,10 +675,12 @@ def _morton_range_query(
     d_sorted_keys = runtime.from_host(sorted_keys_host)
     d_sorted_tree_bounds = runtime.from_host(sorted_tree_bounds_host.ravel())
     d_query_bounds, temp_query_bounds = _prepare_query_bounds_device(
-        original_bounds, runtime,
+        original_bounds,
+        runtime,
     )
     d_expanded_bounds, temp_expanded_bounds = _prepare_query_bounds_device(
-        expanded_bounds, runtime,
+        expanded_bounds,
+        runtime,
     )
     d_order = runtime.from_host(order_host)
     d_range_low = runtime.allocate((query_count,), cp.uint64)
@@ -562,9 +720,7 @@ def _morton_range_query(
                 KERNEL_PARAM_I32,
             ),
         )
-        range_grid, range_block = runtime.launch_config(
-            range_kernel, query_count
-        )
+        range_grid, range_block = runtime.launch_config(range_kernel, query_count)
         runtime.launch(
             range_kernel,
             grid=range_grid,
@@ -596,9 +752,7 @@ def _morton_range_query(
                 KERNEL_PARAM_I32,
             ),
         )
-        count_grid, count_block = runtime.launch_config(
-            count_kernel, query_count
-        )
+        count_grid, count_block = runtime.launch_config(count_kernel, query_count)
         runtime.launch(
             count_kernel,
             grid=count_grid,
@@ -650,9 +804,7 @@ def _morton_range_query(
                 KERNEL_PARAM_I32,
             ),
         )
-        scatter_grid, scatter_block = runtime.launch_config(
-            scatter_kernel, query_count
-        )
+        scatter_grid, scatter_block = runtime.launch_config(scatter_kernel, query_count)
         runtime.launch(
             scatter_kernel,
             grid=scatter_grid,

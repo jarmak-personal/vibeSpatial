@@ -57,7 +57,9 @@ class SyntheticSpec:
 @dataclass(frozen=True)
 class SyntheticDataset:
     spec: SyntheticSpec
-    geometries: tuple[Point | LineString | Polygon | MultiPoint | MultiLineString | MultiPolygon, ...]
+    geometries: tuple[
+        Point | LineString | Polygon | MultiPoint | MultiLineString | MultiPolygon, ...
+    ]
 
     def to_geoseries(self) -> geopandas.GeoSeries:
         return geopandas.GeoSeries(list(self.geometries), crs=self.spec.crs)
@@ -163,9 +165,7 @@ def generate_points_xy(spec: SyntheticSpec) -> tuple[np.ndarray, np.ndarray]:
         ys = np.clip(ys, ymin, ymax)
     elif spec.distribution == "grid":
         side = _grid_side(count)
-        xs_grid, ys_grid = np.meshgrid(
-            _linspace(xmin, xmax, side), _linspace(ymin, ymax, side)
-        )
+        xs_grid, ys_grid = np.meshgrid(_linspace(xmin, xmax, side), _linspace(ymin, ymax, side))
         xs = xs_grid.ravel()[:count]
         ys = ys_grid.ravel()[:count]
     elif spec.distribution == "along-line":
@@ -238,7 +238,9 @@ def generate_lines(spec: SyntheticSpec) -> SyntheticDataset:
     return _coerce_dataset(spec, geometries)
 
 
-def _star_polygon(cx: float, cy: float, outer_radius: float, inner_radius: float, vertices: int) -> Polygon:
+def _star_polygon(
+    cx: float, cy: float, outer_radius: float, inner_radius: float, vertices: int
+) -> Polygon:
     coords: list[tuple[float, float]] = []
     for i in range(vertices * 2):
         angle = math.pi * i / vertices

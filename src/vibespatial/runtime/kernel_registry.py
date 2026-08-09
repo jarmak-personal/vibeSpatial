@@ -74,7 +74,9 @@ def register_kernel_variant(
             kernel_name=kernel_name,
             variant=variant,
             qualified_name=f"{func.__module__}.{func.__qualname__}",
-            kernel_class=kernel_class if isinstance(kernel_class, KernelClass) or kernel_class is None else KernelClass(kernel_class),
+            kernel_class=kernel_class
+            if isinstance(kernel_class, KernelClass) or kernel_class is None
+            else KernelClass(kernel_class),
             execution_modes=_normalize_execution_modes(variant, execution_modes),
             geometry_families=tuple(geometry_families),
             supports_mixed=supports_mixed,

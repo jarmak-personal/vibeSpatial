@@ -21,7 +21,7 @@ from vibespatial.geometry.owned import (
     from_shapely_geometries,
     from_wkb,
 )
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.materialization import NativeExportBoundary, record_native_export_boundary
@@ -57,6 +57,7 @@ class GeoArrowCodecPlan:
     lazy_materialization: bool
     reason: str
 
+
 @dataclass(frozen=True)
 class GeoArrowBridgeBenchmark:
     operation: str
@@ -66,6 +67,7 @@ class GeoArrowBridgeBenchmark:
     elapsed_seconds: float
     shares_memory: bool
 
+
 @dataclass(frozen=True)
 class NativeGeometryBenchmark:
     operation: str
@@ -74,6 +76,7 @@ class NativeGeometryBenchmark:
     rows: int
     elapsed_seconds: float
     rows_per_second: float
+
 
 @dataclass(frozen=True)
 class WKBBridgeBenchmark:
@@ -114,6 +117,7 @@ def plan_geoarrow_codec(operation: IOOperation | str) -> GeoArrowCodecPlan:
         ),
     )
 
+
 def _geoarrow_field_metadata(*, extension_name: str, crs: Any | None = None) -> dict[bytes, bytes]:
     import json
 
@@ -133,6 +137,7 @@ def _geoarrow_field_metadata(*, extension_name: str, crs: Any | None = None) -> 
         metadata[b"ARROW:extension:metadata"] = json.dumps({"crs": crs_metadata}).encode()
     return metadata
 
+
 def encode_owned_geoarrow(array: OwnedGeometryArray) -> MixedGeoArrowView:
     record_dispatch_event(
         surface="vibespatial.io.geoarrow",
@@ -145,18 +150,20 @@ def encode_owned_geoarrow(array: OwnedGeometryArray) -> MixedGeoArrowView:
         selected=ExecutionMode.CPU,
     )
     view = array.to_geoarrow(sharing=BufferSharingMode.SHARE)
-    record_native_export_boundary(NativeExportBoundary(
-        surface="vibespatial.io.geoarrow.encode_owned_geoarrow",
-        operation="owned_geometry_to_geoarrow",
-        target="geoarrow",
-        reason="owned geometry exported to host-visible GeoArrow buffers",
-        detail=(
-            f"families={len(array.families)}, "
-            f"sharing={'shared' if view.shares_memory else 'copy'}"
-        ),
-        row_count=array.row_count,
-        d2h_transfer=array.device_state is not None,
-    ))
+    record_native_export_boundary(
+        NativeExportBoundary(
+            surface="vibespatial.io.geoarrow.encode_owned_geoarrow",
+            operation="owned_geometry_to_geoarrow",
+            target="geoarrow",
+            reason="owned geometry exported to host-visible GeoArrow buffers",
+            detail=(
+                f"families={len(array.families)}, "
+                f"sharing={'shared' if view.shares_memory else 'copy'}"
+            ),
+            row_count=array.row_count,
+            d2h_transfer=array.device_state is not None,
+        )
+    )
     return view
 
 
@@ -173,6 +180,7 @@ def decode_owned_geoarrow(view: MixedGeoArrowView) -> OwnedGeometryArray:
     )
     return from_geoarrow(view, sharing=BufferSharingMode.AUTO)
 
+
 def _full_offsets_from_local(
     array: OwnedGeometryArray,
     buffer: FamilyGeometryBuffer,
@@ -187,7 +195,15 @@ def _full_offsets_from_local(
         offsets[row_index + 1] = offsets[row_index] + length
     return offsets
 
-def _encode_point_family(buffer: FamilyGeometryBuffer, array: OwnedGeometryArray, *, field_name: str, crs: Any | None, interleaved: bool):
+
+def _encode_point_family(
+    buffer: FamilyGeometryBuffer,
+    array: OwnedGeometryArray,
+    *,
+    field_name: str,
+    crs: Any | None,
+    interleaved: bool,
+):
     import pyarrow as pa
 
     x_full = np.full(array.row_count, np.nan, dtype=np.float64)
@@ -207,7 +223,10 @@ def _encode_point_family(buffer: FamilyGeometryBuffer, array: OwnedGeometryArray
     else:
         geom_arr = pa.StructArray.from_arrays(
             [pa.array(x_full), pa.array(y_full)],
-            fields=[pa.field("x", pa.float64(), nullable=False), pa.field("y", pa.float64(), nullable=False)],
+            fields=[
+                pa.field("x", pa.float64(), nullable=False),
+                pa.field("y", pa.float64(), nullable=False),
+            ],
             mask=mask,
         )
     field = pa.field(
@@ -217,6 +236,7 @@ def _encode_point_family(buffer: FamilyGeometryBuffer, array: OwnedGeometryArray
         metadata=_geoarrow_field_metadata(extension_name="geoarrow.point", crs=crs),
     )
     return field, geom_arr
+
 
 def _encode_list_family(
     *,
@@ -248,28 +268,47 @@ def _encode_list_family(
     else:
         point_values = pa.StructArray.from_arrays(
             [pa.array(buffer.x), pa.array(buffer.y)],
-            fields=[pa.field("x", pa.float64(), nullable=False), pa.field("y", pa.float64(), nullable=False)],
+            fields=[
+                pa.field("x", pa.float64(), nullable=False),
+                pa.field("y", pa.float64(), nullable=False),
+            ],
         )
 
     if nested_kind == "linestring":
         geom_offsets = _full_offsets_from_local(array, buffer)
-        geom_arr = pa.ListArray.from_arrays(pa.array(geom_offsets), point_values, type=_linestring_type(point_values.type), mask=mask)
+        geom_arr = pa.ListArray.from_arrays(
+            pa.array(geom_offsets),
+            point_values,
+            type=_linestring_type(point_values.type),
+            mask=mask,
+        )
     elif nested_kind == "polygon":
         geom_offsets = _full_offsets_from_local(array, buffer)
         rings = pa.ListArray.from_arrays(pa.array(buffer.ring_offsets), point_values)
-        geom_arr = pa.ListArray.from_arrays(pa.array(geom_offsets), rings, mask=mask).cast(_polygon_type(point_values.type))
+        geom_arr = pa.ListArray.from_arrays(pa.array(geom_offsets), rings, mask=mask).cast(
+            _polygon_type(point_values.type)
+        )
     elif nested_kind == "multipoint":
         geom_offsets = _full_offsets_from_local(array, buffer)
-        geom_arr = pa.ListArray.from_arrays(pa.array(geom_offsets), point_values, type=_multipoint_type(point_values.type), mask=mask)
+        geom_arr = pa.ListArray.from_arrays(
+            pa.array(geom_offsets),
+            point_values,
+            type=_multipoint_type(point_values.type),
+            mask=mask,
+        )
     elif nested_kind == "multilinestring":
         geom_offsets = _full_offsets_from_local(array, buffer)
         parts = pa.ListArray.from_arrays(pa.array(buffer.part_offsets), point_values)
-        geom_arr = pa.ListArray.from_arrays(pa.array(geom_offsets), parts, mask=mask).cast(_multilinestring_type(point_values.type))
+        geom_arr = pa.ListArray.from_arrays(pa.array(geom_offsets), parts, mask=mask).cast(
+            _multilinestring_type(point_values.type)
+        )
     elif nested_kind == "multipolygon":
         geom_offsets = _full_offsets_from_local(array, buffer)
         rings = pa.ListArray.from_arrays(pa.array(buffer.ring_offsets), point_values)
         polygons = pa.ListArray.from_arrays(pa.array(buffer.part_offsets), rings)
-        geom_arr = pa.ListArray.from_arrays(pa.array(geom_offsets), polygons, mask=mask).cast(_multipolygon_type(point_values.type))
+        geom_arr = pa.ListArray.from_arrays(pa.array(geom_offsets), polygons, mask=mask).cast(
+            _multipolygon_type(point_values.type)
+        )
     else:
         raise ValueError(f"Unsupported nested_kind: {nested_kind}")
     field = pa.field(
@@ -279,6 +318,7 @@ def _encode_list_family(
         metadata=_geoarrow_field_metadata(extension_name=extension_name, crs=crs),
     )
     return field, geom_arr
+
 
 def encode_owned_geoarrow_array(
     array: OwnedGeometryArray,
@@ -306,7 +346,9 @@ def encode_owned_geoarrow_array(
             family_row_offsets=family_row_offsets,
         )
     if family.value == "point":
-        return _encode_point_family(buffer, view, field_name=field_name, crs=crs, interleaved=interleaved)
+        return _encode_point_family(
+            buffer, view, field_name=field_name, crs=crs, interleaved=interleaved
+        )
     mapping = {
         "linestring": ("geoarrow.linestring", "linestring"),
         "polygon": ("geoarrow.polygon", "polygon"),
@@ -324,6 +366,7 @@ def encode_owned_geoarrow_array(
         interleaved=interleaved,
         nested_kind=nested_kind,
     )
+
 
 def _owned_geoarrow_fast_path_reason(series, *, include_z: bool | None) -> str | None:
     import shapely
@@ -486,7 +529,9 @@ _SUPPORTED_GEOARROW_MIXES = {
 
 _SUPPORTED_GEOARROW_PROMOTIONS = {
     frozenset({GeometryFamily.POINT, GeometryFamily.MULTIPOINT}): GeometryFamily.MULTIPOINT,
-    frozenset({GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING}): GeometryFamily.MULTILINESTRING,
+    frozenset(
+        {GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING}
+    ): GeometryFamily.MULTILINESTRING,
     frozenset({GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}): GeometryFamily.MULTIPOLYGON,
 }
 
@@ -503,11 +548,7 @@ def _geoarrow_export_family_from_family_set(
 
 
 def _owned_geoarrow_family_set(owned: OwnedGeometryArray) -> frozenset[GeometryFamily]:
-    return frozenset(
-        family
-        for family in owned.families
-        if owned.family_has_rows(family)
-    )
+    return frozenset(family for family in owned.families if owned.family_has_rows(family))
 
 
 def _geoarrow_export_family_from_tags(
@@ -787,10 +828,7 @@ def _device_geoarrow_constructor_fallback_reason(owned: OwnedGeometryArray) -> s
     if not family_set:
         return None
 
-    geom_types = frozenset(
-        _TAG_TO_GEOM_TYPE_NAME[FAMILY_TAGS[family]]
-        for family in family_set
-    )
+    geom_types = frozenset(_TAG_TO_GEOM_TYPE_NAME[FAMILY_TAGS[family]] for family in family_set)
     if len(geom_types) <= 1 or geom_types in _SUPPORTED_GEOARROW_MIXES:
         return None
     return "Geometry type combination is not supported for native GeoArrow encoding"
@@ -824,8 +862,11 @@ def _geoarrow_constructor_fallback_reason(series) -> str | None:
         "MultiLineString",
         "MultiPolygon",
     }:
-        return f"Geometry type combination is not supported for native GeoArrow encoding: {geom_type}"
+        return (
+            f"Geometry type combination is not supported for native GeoArrow encoding: {geom_type}"
+        )
     return None
+
 
 def _construct_geoarrow_array_with_explicit_fallback(
     series,
@@ -940,7 +981,8 @@ def _construct_geoarrow_array_with_explicit_fallback(
         record_fallback_event(
             surface=surface,
             reason="explicit CPU compatibility export for GeoArrow materialization",
-            detail=fast_path_reason or "native GeoArrow constructor semantics require host materialization",
+            detail=fast_path_reason
+            or "native GeoArrow constructor semantics require host materialization",
             selected=ExecutionMode.CPU,
             pipeline="io/geoarrow_encode",
             d2h_transfer=True,
@@ -976,9 +1018,7 @@ def _owned_wkb_arrow_array_host_bridge(
         except AttributeError:
             crs_json = None
         if crs_json is not None:
-            field_metadata[b"ARROW:extension:metadata"] = json.dumps(
-                {"crs": crs_json}
-            ).encode()
+            field_metadata[b"ARROW:extension:metadata"] = json.dumps({"crs": crs_json}).encode()
     field = pa.field(field_name, pa.binary(), nullable=True, metadata=field_metadata)
     result = (field, pa.array(values, type=pa.binary()))
     return (*result, ExecutionMode.CPU) if return_mode else result
@@ -1025,8 +1065,7 @@ def _construct_geoarrow_array_from_owned(
             record_fallback_event(
                 surface=surface,
                 reason=(
-                    "device GeoArrow encode failed; falling back to host GeoArrow "
-                    "terminal export"
+                    "device GeoArrow encode failed; falling back to host GeoArrow terminal export"
                 ),
                 detail=f"{type(exc).__name__}: {exc}",
                 selected=ExecutionMode.CPU,
@@ -1103,18 +1142,20 @@ def _record_arrow_native_export_boundary(
 ) -> None:
     if not any(column.owned for column in columns):
         return
-    record_native_export_boundary(NativeExportBoundary(
-        surface=surface,
-        operation=operation,
-        target="arrow",
-        reason="native geometry exported to host-visible Arrow buffers",
-        detail=(
-            f"encoding={geometry_encoding.lower()}, "
-            f"implementation={'device' if selected is ExecutionMode.GPU else 'owned'}"
-        ),
-        row_count=row_count,
-        d2h_transfer=any(column.device_backed for column in columns),
-    ))
+    record_native_export_boundary(
+        NativeExportBoundary(
+            surface=surface,
+            operation=operation,
+            target="arrow",
+            reason="native geometry exported to host-visible Arrow buffers",
+            detail=(
+                f"encoding={geometry_encoding.lower()}, "
+                f"implementation={'device' if selected is ExecutionMode.GPU else 'owned'}"
+            ),
+            row_count=row_count,
+            d2h_transfer=any(column.device_backed for column in columns),
+        )
+    )
 
 
 def _geoarrow_point_type(*, interleaved: bool):
@@ -1268,13 +1309,16 @@ def _encode_owned_geoarrow_array_device(
     )
     return field, geom_arr
 
+
 def _arrow_validity_mask(array) -> np.ndarray:
     if array.null_count == 0:
         return np.ones(len(array), dtype=bool)
     return np.asarray(array.is_valid().to_numpy(zero_copy_only=False), dtype=bool)
 
 
-def _child_selection_mask(offsets: np.ndarray, parent_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _child_selection_mask(
+    offsets: np.ndarray, parent_mask: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     lengths = np.diff(offsets)
     selected_lengths = lengths[parent_mask]
     compact_offsets = np.empty(selected_lengths.size + 1, dtype=np.int32)
@@ -1294,7 +1338,9 @@ def _extract_point_xy(values) -> tuple[np.ndarray, np.ndarray]:
 
     if isinstance(values, pa.FixedSizeListArray):
         width = values.type.list_size
-        coords = np.asarray(values.values.to_numpy(zero_copy_only=False), dtype=np.float64).reshape(-1, width)
+        coords = np.asarray(values.values.to_numpy(zero_copy_only=False), dtype=np.float64).reshape(
+            -1, width
+        )
         return coords[:, 0], coords[:, 1]
     if isinstance(values, pa.StructArray):
         field_names = [field.name for field in values.type]
@@ -1309,6 +1355,7 @@ def _extract_point_xy(values) -> tuple[np.ndarray, np.ndarray]:
             np.asarray(y_values.to_numpy(zero_copy_only=False), dtype=np.float64),
         )
     raise TypeError(f"Unsupported GeoArrow point storage: {type(values)!r}")
+
 
 def _arrow_primitive_numpy(array, *, dtype, zero_copy: bool = False) -> np.ndarray:
     try:
@@ -1325,7 +1372,9 @@ def _extract_point_xy_zero_copy(values) -> tuple[np.ndarray, np.ndarray]:
 
     if isinstance(values, pa.FixedSizeListArray):
         width = values.type.list_size
-        coords = _arrow_primitive_numpy(values.values, dtype=np.float64, zero_copy=True).reshape(-1, width)
+        coords = _arrow_primitive_numpy(values.values, dtype=np.float64, zero_copy=True).reshape(
+            -1, width
+        )
         return coords[:, 0], coords[:, 1]
     if isinstance(values, pa.StructArray):
         field_names = [field.name for field in values.type]
@@ -1425,6 +1474,7 @@ def _family_decode_state(family, array):
         tags[validity] = FAMILY_TAGS[family]
         family_row_offsets[validity] = np.arange(row_count, dtype=np.int32)
     return validity, tags, family_row_offsets, GeoArrowBufferView
+
 
 def _decode_geoarrow_point(array, family):
     validity, tags, family_row_offsets, GeoArrowBufferView = _family_decode_state(family, array)
@@ -1631,9 +1681,13 @@ def _decode_geoarrow_multipolygon(array, family):
         try:
             geometry_offsets = _arrow_primitive_numpy(array.offsets, dtype=np.int32, zero_copy=True)
             polygon_array = array.values
-            part_offsets = _arrow_primitive_numpy(polygon_array.offsets, dtype=np.int32, zero_copy=True)
+            part_offsets = _arrow_primitive_numpy(
+                polygon_array.offsets, dtype=np.int32, zero_copy=True
+            )
             ring_array = polygon_array.values
-            ring_offsets = _arrow_primitive_numpy(ring_array.offsets, dtype=np.int32, zero_copy=True)
+            ring_offsets = _arrow_primitive_numpy(
+                ring_array.offsets, dtype=np.int32, zero_copy=True
+            )
             x_all, y_all = _extract_point_xy_zero_copy(ring_array.values)
         except Exception:
             pass
@@ -1659,7 +1713,9 @@ def _decode_geoarrow_multipolygon(array, family):
     top_offsets = np.asarray(array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
     geometry_offsets, polygon_mask = _child_selection_mask(top_offsets, validity)
     polygon_array = array.values
-    polygon_offsets = np.asarray(polygon_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
+    polygon_offsets = np.asarray(
+        polygon_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32
+    )
     part_offsets, ring_mask = _child_selection_mask(polygon_offsets, polygon_mask)
     ring_array = polygon_array.values
     ring_offsets_src = np.asarray(ring_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int32)
@@ -1681,6 +1737,7 @@ def _decode_geoarrow_multipolygon(array, family):
         family_row_offsets=family_row_offsets,
         view=view,
     )
+
 
 def _decode_geoarrow_array_to_owned(
     field,
@@ -1780,12 +1837,19 @@ def _geoarrow_native_import_support(field, array) -> tuple[bool, str]:
         "geoarrow.multipolygon",
     }
     if ext_name not in family_exts:
-        return False, f"Unsupported GeoArrow extension type {ext_name!r} routes through the explicit compatibility bridge."
+        return (
+            False,
+            f"Unsupported GeoArrow extension type {ext_name!r} routes through the explicit compatibility bridge.",
+        )
 
     if not _geoarrow_storage_type_supports_native_2d_import(field.type):
-        return False, "Z-enabled GeoArrow import currently routes through the explicit compatibility bridge."
+        return (
+            False,
+            "Z-enabled GeoArrow import currently routes through the explicit compatibility bridge.",
+        )
 
     return True, ""
+
 
 def _sample_owned_for_geoarrow_benchmark(
     *,
@@ -1817,6 +1881,7 @@ def _benchmark_measurement_repeat(*, rows: int, repeat: int, min_repeat: int = 2
     if rows < 10_000:
         return repeat
     return max(repeat, min_repeat)
+
 
 def benchmark_geoarrow_bridge(
     *,
@@ -1866,14 +1931,15 @@ def benchmark_geoarrow_bridge(
         results.append(
             GeoArrowBridgeBenchmark(
                 operation=operation,
-                    sharing=sharing.value,
-                    geometry_type=geometry_type,
-                    rows=rows,
-                    elapsed_seconds=elapsed,
-                    shares_memory=np.shares_memory(adopted.validity, aligned_view.validity),
-                )
+                sharing=sharing.value,
+                geometry_type=geometry_type,
+                rows=rows,
+                elapsed_seconds=elapsed,
+                shares_memory=np.shares_memory(adopted.validity, aligned_view.validity),
             )
+        )
     return results
+
 
 def benchmark_native_geometry_codec(
     *,
@@ -1958,6 +2024,7 @@ def benchmark_native_geometry_codec(
         )
     )
     return results
+
 
 def benchmark_wkb_bridge(
     *,
@@ -2057,6 +2124,7 @@ def benchmark_wkb_bridge(
     )
     return results
 
+
 def geodataframe_to_arrow(
     df,
     *,
@@ -2086,9 +2154,7 @@ def geodataframe_to_arrow(
     normalized_encoding = geometry_encoding.lower()
     for column_index, column_name in zip(geometry_indices, geometry_columns):
         series = df[column_name]
-        geometry_dispatch_columns.append(
-            _arrow_geometry_column_dispatch(series, str(column_name))
-        )
+        geometry_dispatch_columns.append(_arrow_geometry_column_dispatch(series, str(column_name)))
         if normalized_encoding == "geoarrow":
             field, geom_arr, selected = _construct_geoarrow_array_with_explicit_fallback(
                 series,
@@ -2243,12 +2309,8 @@ def native_tabular_to_arrow(
                     else None
                 )
                 if wkb_bridge_reason is not None:
-                    device_backed = (
-                        owned is not None
-                        and (
-                            owned.residency is Residency.DEVICE
-                            or owned.device_state is not None
-                        )
+                    device_backed = owned is not None and (
+                        owned.residency is Residency.DEVICE or owned.device_state is not None
                     )
                     record_dispatch_event(
                         surface="vibespatial.native_tabular.to_arrow",
@@ -2291,9 +2353,7 @@ def native_tabular_to_arrow(
             else:
                 field, geom_arr, selected = direct
             encoded_name = (
-                field.metadata[b"ARROW:extension:name"]
-                .decode()
-                .removeprefix("geoarrow.")
+                field.metadata[b"ARROW:extension:name"].decode().removeprefix("geoarrow.")
             )
             geometry_encoding_dict[geometry_column.name] = (
                 "WKB" if encoded_name == "wkb" else encoded_name
@@ -2363,6 +2423,7 @@ def native_tabular_to_arrow(
         )
     return table, geometry_encoding_dict
 
+
 def geoseries_to_arrow(
     series,
     *,
@@ -2375,9 +2436,7 @@ def geoseries_to_arrow(
     from vibespatial.api.io._geoarrow import GeoArrowArray, construct_wkb_array
 
     field_name = series.name if series.name is not None else ""
-    geometry_dispatch_columns = [
-        _arrow_geometry_column_dispatch(series, str(field_name))
-    ]
+    geometry_dispatch_columns = [_arrow_geometry_column_dispatch(series, str(field_name))]
     normalized_encoding = geometry_encoding.lower()
     if normalized_encoding == "geoarrow":
         field, geom_arr, selected = _construct_geoarrow_array_with_explicit_fallback(
@@ -2406,10 +2465,7 @@ def geoseries_to_arrow(
             )
             selected = ExecutionMode.CPU
     else:
-        raise ValueError(
-            "Expected geometry encoding 'WKB' or 'geoarrow' "
-            f"got {geometry_encoding}"
-        )
+        raise ValueError(f"Expected geometry encoding 'WKB' or 'geoarrow' got {geometry_encoding}")
     compatibility_writer = _public_arrow_compatibility_writer(
         selected=selected,
         columns=geometry_dispatch_columns,
@@ -2446,7 +2502,10 @@ def geoseries_to_arrow(
         )
     return GeoArrowArray(field, geom_arr)
 
-def geodataframe_from_arrow(table, *, geometry: str | None = None, to_pandas_kwargs: dict | None = None):
+
+def geodataframe_from_arrow(
+    table, *, geometry: str | None = None, to_pandas_kwargs: dict | None = None
+):
     import pyarrow as pa
 
     from vibespatial.api import GeoDataFrame
@@ -2589,6 +2648,7 @@ def geodataframe_from_arrow(table, *, geometry: str | None = None, to_pandas_kwa
     )
     return result
 
+
 def geoseries_from_arrow(arr, **kwargs):
     import pandas as pd
     import pyarrow as pa
@@ -2647,7 +2707,11 @@ def geoseries_from_arrow(arr, **kwargs):
                 geometry_metadata=NativeGeometryMetadata.from_cached_owned(owned),
             ),
         )
-        selected = ExecutionMode.GPU if isinstance(series.values, DeviceGeometryArray) else ExecutionMode.CPU
+        selected = (
+            ExecutionMode.GPU
+            if isinstance(series.values, DeviceGeometryArray)
+            else ExecutionMode.CPU
+        )
     except _GeoArrowNativeCompatibilityRoute as exc:
         series = GeoSeries(arrow_to_geometry_array(arr), **kwargs)
         selected = ExecutionMode.CPU
@@ -2688,6 +2752,7 @@ def geoseries_from_arrow(arr, **kwargs):
     )
     return series
 
+
 def geoseries_from_owned(
     array: OwnedGeometryArray,
     *,
@@ -2706,7 +2771,7 @@ def geoseries_from_owned(
     # DeviceGeometryArray fast path so downstream operations stay on host.
     from vibespatial.runtime import ExecutionMode, get_requested_mode
 
-    if get_requested_mode() is ExecutionMode.CPU:
+    if get_requested_mode() is ExecutionMode.CPU or not has_gpu_runtime():
         use_device_array = False
 
     # Fast path: wrap in DeviceGeometryArray to avoid D->H->Shapely roundtrip.
@@ -2716,29 +2781,26 @@ def geoseries_from_owned(
         from vibespatial.api.geoseries import GeoSeries
 
         dga = DeviceGeometryArray._from_owned(array, crs=crs)
+        kwargs.setdefault("copy", False)
         series = GeoSeries(dga, **kwargs)
         series.name = name
         return series
 
-    # Legacy path: materialise through the GeoArrow bridge.
+    # Host public export keeps the owned carrier authoritative.  GeometryArray
+    # materializes Shapely lazily only when an object consumer requests it.
     if array.residency is Residency.DEVICE:
         array.move_to(
             Residency.HOST,
             trigger=TransferTrigger.USER_MATERIALIZATION,
-            reason="materialized GeoSeries via GeoArrow bridge",
+            reason="exported device-owned geometry to a host GeometryArray",
         )
     else:
         array._ensure_host_state()
-    array._record(DiagnosticKind.MATERIALIZATION, "materialized GeoSeries via GeoArrow bridge", visible=True)
 
-    from vibespatial.api.io._geoarrow import GeoArrowArray
+    from vibespatial.api.geometry_array import GeometryArray
+    from vibespatial.api.geoseries import GeoSeries
 
-    field, geom_arr = encode_owned_geoarrow_array(
-        array,
-        field_name=name,
-        crs=crs,
-        interleaved=interleaved,
-    )
-    series = geoseries_from_arrow(GeoArrowArray(field, geom_arr), crs=crs, **kwargs)
+    kwargs.setdefault("copy", False)
+    series = GeoSeries(GeometryArray.from_owned(array, crs=crs), crs=crs, **kwargs)
     series.name = name
     return series

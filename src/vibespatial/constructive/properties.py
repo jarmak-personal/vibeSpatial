@@ -61,16 +61,22 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import (
+    estimate_physical_work_from_owned,
+    estimate_segment_pair_work_from_owned,
+)
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
-request_nvrtc_warmup([
-    ("is-closed-fp64", _IS_CLOSED_FP64, _IS_CLOSED_KERNEL_NAMES),
-    ("is-ccw-fp64", _IS_CCW_FP64, _IS_CCW_KERNEL_NAMES),
-    ("offset-diff", _OFFSET_DIFF_FP64, _OFFSET_DIFF_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("is-closed-fp64", _IS_CLOSED_FP64, _IS_CLOSED_KERNEL_NAMES),
+        ("is-ccw-fp64", _IS_CCW_FP64, _IS_CCW_KERNEL_NAMES),
+        ("offset-diff", _OFFSET_DIFF_FP64, _OFFSET_DIFF_KERNEL_NAMES),
+    ]
+)
 
 
 def _runtime_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
@@ -94,7 +100,9 @@ def _offset_diff_gpu(d_offsets, d_family_rows, result, global_rows, *, kernel_na
     runtime = get_cuda_runtime()
     n = int(d_family_rows.size)
     kernel_group = compile_kernel_group(
-        "offset-diff", _OFFSET_DIFF_FP64, _OFFSET_DIFF_KERNEL_NAMES,
+        "offset-diff",
+        _OFFSET_DIFF_FP64,
+        _OFFSET_DIFF_KERNEL_NAMES,
     )
     kernel = kernel_group[kernel_name]
     d_out = runtime.allocate((n,), np.int32, zero=True)
@@ -114,9 +122,11 @@ def _offset_diff_gpu(d_offsets, d_family_rows, result, global_rows, *, kernel_na
         runtime.free(d_out)
 
 
-request_nvrtc_warmup([
-    ("num-coords-fp64", _NUM_COORDS_FP64, _NUM_COORDS_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("num-coords-fp64", _NUM_COORDS_FP64, _NUM_COORDS_KERNEL_NAMES),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +174,10 @@ def num_coordinates_owned(owned: OwnedGeometryArray) -> np.ndarray:
                 GeometryFamily.MULTIPOINT,
             ):
                 _offset_diff_gpu(
-                    d_buf.geometry_offsets, d_family_rows, result, global_rows,
+                    d_buf.geometry_offsets,
+                    d_family_rows,
+                    result,
+                    global_rows,
                 )
 
             elif family is GeometryFamily.POLYGON:
@@ -232,16 +245,28 @@ def _num_coords_polygon_gpu(d_buf, d_family_rows, result, global_rows):
     """Launch NVRTC kernel for polygon coordinate counting (ring indirection)."""
     runtime = get_cuda_runtime()
     n = int(d_family_rows.size)
-    kernel_group = compile_kernel_group("num-coords-fp64", _NUM_COORDS_FP64, _NUM_COORDS_KERNEL_NAMES)
+    kernel_group = compile_kernel_group(
+        "num-coords-fp64", _NUM_COORDS_FP64, _NUM_COORDS_KERNEL_NAMES
+    )
     kernel = kernel_group["num_coords_polygon"]
     d_out = runtime.allocate((n,), np.int32, zero=True)
     try:
         ptr = runtime.pointer
         params = (
-            (ptr(d_buf.ring_offsets), ptr(d_buf.geometry_offsets),
-             ptr(d_family_rows), ptr(d_out), n),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(d_buf.ring_offsets),
+                ptr(d_buf.geometry_offsets),
+                ptr(d_family_rows),
+                ptr(d_out),
+                n,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -257,16 +282,28 @@ def _num_coords_multilinestring_gpu(d_buf, d_family_rows, result, global_rows):
     """Launch NVRTC kernel for multilinestring coordinate counting (part indirection)."""
     runtime = get_cuda_runtime()
     n = int(d_family_rows.size)
-    kernel_group = compile_kernel_group("num-coords-fp64", _NUM_COORDS_FP64, _NUM_COORDS_KERNEL_NAMES)
+    kernel_group = compile_kernel_group(
+        "num-coords-fp64", _NUM_COORDS_FP64, _NUM_COORDS_KERNEL_NAMES
+    )
     kernel = kernel_group["num_coords_multilinestring"]
     d_out = runtime.allocate((n,), np.int32, zero=True)
     try:
         ptr = runtime.pointer
         params = (
-            (ptr(d_buf.part_offsets), ptr(d_buf.geometry_offsets),
-             ptr(d_family_rows), ptr(d_out), n),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(d_buf.part_offsets),
+                ptr(d_buf.geometry_offsets),
+                ptr(d_family_rows),
+                ptr(d_out),
+                n,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -282,16 +319,30 @@ def _num_coords_multipolygon_gpu(d_buf, d_family_rows, result, global_rows):
     """Launch NVRTC kernel for multipolygon coordinate counting (part + ring indirection)."""
     runtime = get_cuda_runtime()
     n = int(d_family_rows.size)
-    kernel_group = compile_kernel_group("num-coords-fp64", _NUM_COORDS_FP64, _NUM_COORDS_KERNEL_NAMES)
+    kernel_group = compile_kernel_group(
+        "num-coords-fp64", _NUM_COORDS_FP64, _NUM_COORDS_KERNEL_NAMES
+    )
     kernel = kernel_group["num_coords_multipolygon"]
     d_out = runtime.allocate((n,), np.int32, zero=True)
     try:
         ptr = runtime.pointer
         params = (
-            (ptr(d_buf.ring_offsets), ptr(d_buf.part_offsets),
-             ptr(d_buf.geometry_offsets), ptr(d_family_rows), ptr(d_out), n),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(d_buf.ring_offsets),
+                ptr(d_buf.part_offsets),
+                ptr(d_buf.geometry_offsets),
+                ptr(d_family_rows),
+                ptr(d_out),
+                n,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -344,7 +395,10 @@ def num_geometries_owned(owned: OwnedGeometryArray) -> np.ndarray:
             else:
                 d_family_rows = cp.asarray(family_rows)
                 _offset_diff_gpu(
-                    d_buf.geometry_offsets, d_family_rows, result, global_rows,
+                    d_buf.geometry_offsets,
+                    d_family_rows,
+                    result,
+                    global_rows,
                 )
 
             continue  # skip host fallback
@@ -393,7 +447,10 @@ def num_interior_rings_owned(owned: OwnedGeometryArray) -> np.ndarray:
             d_buf = owned.device_state.families[GeometryFamily.POLYGON]
             d_family_rows = cp.asarray(family_rows)
             _offset_diff_gpu(
-                d_buf.geometry_offsets, d_family_rows, result, global_rows,
+                d_buf.geometry_offsets,
+                d_family_rows,
+                result,
+                global_rows,
                 kernel_name="offset_diff_interior_rings",
             )
         else:
@@ -574,7 +631,9 @@ def is_closed_owned(owned: OwnedGeometryArray) -> np.ndarray:
 
             runtime = get_cuda_runtime()
             kernel_group = compile_kernel_group(
-                "is-closed-fp64", _IS_CLOSED_FP64, _IS_CLOSED_KERNEL_NAMES,
+                "is-closed-fp64",
+                _IS_CLOSED_FP64,
+                _IS_CLOSED_KERNEL_NAMES,
             )
             d_out = runtime.allocate((n,), np.int32, zero=True)
             try:
@@ -582,22 +641,44 @@ def is_closed_owned(owned: OwnedGeometryArray) -> np.ndarray:
                 if family is GeometryFamily.LINESTRING:
                     kernel = kernel_group["is_closed_linestring"]
                     params = (
-                        (ptr(d_buf.x), ptr(d_buf.y),
-                         ptr(d_buf.geometry_offsets), ptr(d_family_rows),
-                         ptr(d_out), n),
-                        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                         KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+                        (
+                            ptr(d_buf.x),
+                            ptr(d_buf.y),
+                            ptr(d_buf.geometry_offsets),
+                            ptr(d_family_rows),
+                            ptr(d_out),
+                            n,
+                        ),
+                        (
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_I32,
+                        ),
                     )
                 else:  # MULTILINESTRING
                     kernel = kernel_group["is_closed_multilinestring"]
                     params = (
-                        (ptr(d_buf.x), ptr(d_buf.y),
-                         ptr(d_buf.part_offsets), ptr(d_buf.geometry_offsets),
-                         ptr(d_family_rows), ptr(d_out), n),
-                        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+                        (
+                            ptr(d_buf.x),
+                            ptr(d_buf.y),
+                            ptr(d_buf.part_offsets),
+                            ptr(d_buf.geometry_offsets),
+                            ptr(d_family_rows),
+                            ptr(d_out),
+                            n,
+                        ),
+                        (
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_I32,
+                        ),
                     )
                 grid, block = runtime.launch_config(kernel, n)
                 runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -620,8 +701,7 @@ def is_closed_owned(owned: OwnedGeometryArray) -> np.ndarray:
                 if end - start < 2:
                     result[gi] = True
                     continue
-                result[gi] = (buf.x[start] == buf.x[end - 1] and
-                              buf.y[start] == buf.y[end - 1])
+                result[gi] = buf.x[start] == buf.x[end - 1] and buf.y[start] == buf.y[end - 1]
 
         elif family is GeometryFamily.MULTILINESTRING:
             geom_offsets = buf.geometry_offsets
@@ -692,6 +772,12 @@ def is_ring_owned(
         kernel_name="is_ring",
         kernel_class=KernelClass.PREDICATE,
         row_count=row_count,
+        work_estimate=estimate_segment_pair_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            output_byte_count=row_count,
+            primary_unit_name="is-ring-segment-pair",
+        ),
         requested_mode=dispatch_mode,
         current_residency=owned.residency,
     )
@@ -804,9 +890,7 @@ def is_ring_owned(
                 result[gi] = True
                 continue
             # is_ring=True: treat first-last as adjacent (closure endpoint).
-            if not _linestring_self_intersects(
-                x, y, start, end, is_ring=True
-            ):
+            if not _linestring_self_intersects(x, y, start, end, is_ring=True):
                 result[gi] = True
 
         if selection.selected is ExecutionMode.GPU:
@@ -816,18 +900,12 @@ def is_ring_owned(
                 d2h_transfer=True,
             )
 
-    impl = (
-        "is_ring_gpu_composed"
-        if actually_used_gpu
-        else "is_ring_cpu_composed"
-    )
+    impl = "is_ring_gpu_composed" if actually_used_gpu else "is_ring_cpu_composed"
     record_dispatch_event(
         surface="geopandas.array.is_ring",
         operation="is_ring",
         requested=dispatch_mode,
-        selected=(
-            ExecutionMode.GPU if actually_used_gpu else ExecutionMode.CPU
-        ),
+        selected=(ExecutionMode.GPU if actually_used_gpu else ExecutionMode.CPU),
         implementation=impl,
         reason=selection.reason,
         detail="fused is_closed + ring-aware is_simple composition",
@@ -882,7 +960,9 @@ def is_ccw_owned(owned: OwnedGeometryArray) -> np.ndarray:
 
             runtime = get_cuda_runtime()
             kernel_group = compile_kernel_group(
-                "is-ccw-fp64", _IS_CCW_FP64, _IS_CCW_KERNEL_NAMES,
+                "is-ccw-fp64",
+                _IS_CCW_FP64,
+                _IS_CCW_KERNEL_NAMES,
             )
             d_out = runtime.allocate((n,), np.int32, zero=True)
             try:
@@ -890,24 +970,48 @@ def is_ccw_owned(owned: OwnedGeometryArray) -> np.ndarray:
                 if family is GeometryFamily.POLYGON:
                     kernel = kernel_group["is_ccw_polygon"]
                     params = (
-                        (ptr(d_buf.x), ptr(d_buf.y),
-                         ptr(d_buf.ring_offsets), ptr(d_buf.geometry_offsets),
-                         ptr(d_family_rows), ptr(d_out), n),
-                        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+                        (
+                            ptr(d_buf.x),
+                            ptr(d_buf.y),
+                            ptr(d_buf.ring_offsets),
+                            ptr(d_buf.geometry_offsets),
+                            ptr(d_family_rows),
+                            ptr(d_out),
+                            n,
+                        ),
+                        (
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_I32,
+                        ),
                     )
                 else:  # MULTIPOLYGON
                     kernel = kernel_group["is_ccw_multipolygon"]
                     params = (
-                        (ptr(d_buf.x), ptr(d_buf.y),
-                         ptr(d_buf.ring_offsets), ptr(d_buf.part_offsets),
-                         ptr(d_buf.geometry_offsets), ptr(d_family_rows),
-                         ptr(d_out), n),
-                        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                         KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+                        (
+                            ptr(d_buf.x),
+                            ptr(d_buf.y),
+                            ptr(d_buf.ring_offsets),
+                            ptr(d_buf.part_offsets),
+                            ptr(d_buf.geometry_offsets),
+                            ptr(d_family_rows),
+                            ptr(d_out),
+                            n,
+                        ),
+                        (
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_I32,
+                        ),
                     )
                 grid, block = runtime.launch_config(kernel, n)
                 runtime.launch(kernel, grid=grid, block=block, params=params)
@@ -957,16 +1061,19 @@ _MULTI_TO_SIMPLE: dict[GeometryFamily, GeometryFamily] = {
 }
 
 # Simple families (identity at index 0).
-_SIMPLE_FAMILIES: frozenset[GeometryFamily] = frozenset({
-    GeometryFamily.POINT,
-    GeometryFamily.LINESTRING,
-    GeometryFamily.POLYGON,
-})
+_SIMPLE_FAMILIES: frozenset[GeometryFamily] = frozenset(
+    {
+        GeometryFamily.POINT,
+        GeometryFamily.LINESTRING,
+        GeometryFamily.POLYGON,
+    }
+)
 
 
 # ---------------------------------------------------------------------------
 # GPU helpers: per-family sub-geometry extraction
 # ---------------------------------------------------------------------------
+
 
 def _get_geometry_multipoint_gpu(
     device_buf: DeviceFamilyGeometryBuffer,
@@ -1122,7 +1229,9 @@ def _get_geometry_multilinestring_gpu(
             reason="constructive get-geometry multilinestring coordinate lengths host export",
         )
         d_row_ids = cp.repeat(cp.arange(n_valid, dtype=cp.int32), h_coord_lengths)
-        d_local_offsets = cp.arange(total_coords, dtype=cp.int32) - d_out_geom_offsets[:-1][d_row_ids]
+        d_local_offsets = (
+            cp.arange(total_coords, dtype=cp.int32) - d_out_geom_offsets[:-1][d_row_ids]
+        )
         d_src_indices = d_coord_starts[d_row_ids] + d_local_offsets
         d_out_x = device_buf.x[d_src_indices]
         d_out_y = device_buf.y[d_src_indices]
@@ -1228,7 +1337,9 @@ def _get_geometry_multipolygon_gpu(
         reason="constructive get-geometry multipolygon ring counts host export",
     )
     d_row_ids_ring = cp.repeat(cp.arange(n_valid, dtype=cp.int32), h_ring_counts)
-    d_local_ring_offsets = cp.arange(total_rings, dtype=cp.int32) - d_out_geom_offsets[:-1][d_row_ids_ring]
+    d_local_ring_offsets = (
+        cp.arange(total_rings, dtype=cp.int32) - d_out_geom_offsets[:-1][d_row_ids_ring]
+    )
     d_src_ring_indices = d_ring_starts[d_row_ids_ring] + d_local_ring_offsets
 
     # Coordinate range for each ring
@@ -1251,13 +1362,12 @@ def _get_geometry_multipolygon_gpu(
         # Gather coordinates
         h_ring_coord_lengths = _runtime_device_to_host_list(
             d_ring_coord_lengths,
-            reason=(
-                "constructive get-geometry multipolygon ring-coordinate "
-                "lengths host export"
-            ),
+            reason=("constructive get-geometry multipolygon ring-coordinate lengths host export"),
         )
         d_ring_ids = cp.repeat(cp.arange(total_rings, dtype=cp.int32), h_ring_coord_lengths)
-        d_local_coord_offsets = cp.arange(total_coords, dtype=cp.int32) - d_out_ring_offsets[:-1][d_ring_ids]
+        d_local_coord_offsets = (
+            cp.arange(total_coords, dtype=cp.int32) - d_out_ring_offsets[:-1][d_ring_ids]
+        )
         d_src_coord_indices = d_ring_coord_starts[d_ring_ids] + d_local_coord_offsets
         d_out_x = device_buf.x[d_src_coord_indices]
         d_out_y = device_buf.y[d_src_coord_indices]
@@ -1347,7 +1457,9 @@ def _pass_through_simple_gpu(
             )
             # Gather source ring indices
             d_row_ids = cp.repeat(cp.arange(n, dtype=cp.int32), h_lengths)
-            d_local_ring = cp.arange(total_rings, dtype=cp.int32) - d_out_geom_offsets[:-1][d_row_ids]
+            d_local_ring = (
+                cp.arange(total_rings, dtype=cp.int32) - d_out_geom_offsets[:-1][d_row_ids]
+            )
             d_src_ring_idx = d_starts[d_row_ids] + d_local_ring
 
             d_ring_coord_starts = d_ring_offsets[d_src_ring_idx]
@@ -1368,12 +1480,13 @@ def _pass_through_simple_gpu(
                 h_ring_coord_lengths = _runtime_device_to_host_list(
                     d_ring_coord_lengths,
                     reason=(
-                        "constructive get-geometry polygon ring-coordinate "
-                        "lengths host export"
+                        "constructive get-geometry polygon ring-coordinate lengths host export"
                     ),
                 )
                 d_ring_ids = cp.repeat(cp.arange(total_rings, dtype=cp.int32), h_ring_coord_lengths)
-                d_local_coord = cp.arange(total_coords, dtype=cp.int32) - d_out_ring_offsets[:-1][d_ring_ids]
+                d_local_coord = (
+                    cp.arange(total_coords, dtype=cp.int32) - d_out_ring_offsets[:-1][d_ring_ids]
+                )
                 d_src_coord_idx = d_ring_coord_starts[d_ring_ids] + d_local_coord
                 d_out_x = device_buf.x[d_src_coord_idx]
                 d_out_y = device_buf.y[d_src_coord_idx]
@@ -1403,7 +1516,9 @@ def _pass_through_simple_gpu(
             reason="constructive get-geometry simple coordinate lengths host export",
         )
         d_row_ids = cp.repeat(cp.arange(n, dtype=cp.int32), h_lengths)
-        d_local_offsets = cp.arange(total_coords, dtype=cp.int32) - d_out_geom_offsets[:-1][d_row_ids]
+        d_local_offsets = (
+            cp.arange(total_coords, dtype=cp.int32) - d_out_geom_offsets[:-1][d_row_ids]
+        )
         d_src_indices = d_starts[d_row_ids] + d_local_offsets
         d_out_x = device_buf.x[d_src_indices]
         d_out_y = device_buf.y[d_src_indices]
@@ -1423,14 +1538,19 @@ def _pass_through_simple_gpu(
 # GPU kernel: get_geometry
 # ---------------------------------------------------------------------------
 
+
 @register_kernel_variant(
     "get_geometry",
     "gpu",
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "multipoint", "polygon", "linestring",
-        "multilinestring", "multipolygon",
+        "point",
+        "multipoint",
+        "polygon",
+        "linestring",
+        "multilinestring",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("cupy", "constructive", "get_geometry"),
@@ -1488,15 +1608,21 @@ def _get_geometry_gpu(
             simple_family = _MULTI_TO_SIMPLE[family]
             if family is GeometryFamily.MULTIPOINT:
                 new_buf, valid_mask = _get_geometry_multipoint_gpu(
-                    device_buf, index, family_rows,
+                    device_buf,
+                    index,
+                    family_rows,
                 )
             elif family is GeometryFamily.MULTILINESTRING:
                 new_buf, valid_mask = _get_geometry_multilinestring_gpu(
-                    device_buf, index, family_rows,
+                    device_buf,
+                    index,
+                    family_rows,
                 )
             else:  # MULTIPOLYGON
                 new_buf, valid_mask = _get_geometry_multipolygon_gpu(
-                    device_buf, index, family_rows,
+                    device_buf,
+                    index,
+                    family_rows,
                 )
 
             # Remap tags: Multi* -> simple counterpart for valid rows
@@ -1512,7 +1638,9 @@ def _get_geometry_gpu(
             # produce the same output family)
             if simple_family in new_device_families:
                 new_device_families[simple_family] = _merge_device_family_buffers(
-                    new_device_families[simple_family], new_buf, simple_family,
+                    new_device_families[simple_family],
+                    new_buf,
+                    simple_family,
                 )
                 family_global_rows_ordered[simple_family].append(valid_global)
             else:
@@ -1521,7 +1649,10 @@ def _get_geometry_gpu(
 
         elif family in _SIMPLE_FAMILIES:
             new_buf, valid_mask = _pass_through_simple_gpu(
-                device_buf, family, family_rows, index,
+                device_buf,
+                family,
+                family_rows,
+                index,
             )
             # Invalidate out-of-bounds rows
             out_validity[global_rows[~valid_mask]] = False
@@ -1531,7 +1662,9 @@ def _get_geometry_gpu(
 
             if family in new_device_families:
                 new_device_families[family] = _merge_device_family_buffers(
-                    new_device_families[family], new_buf, family,
+                    new_device_families[family],
+                    new_buf,
+                    family,
                 )
                 family_global_rows_ordered[family].append(valid_global)
             else:
@@ -1545,7 +1678,8 @@ def _get_geometry_gpu(
     for row_chunks in family_global_rows_ordered.values():
         ordered_rows = cp.concatenate(row_chunks) if len(row_chunks) > 1 else row_chunks[0]
         new_family_row_offsets[ordered_rows] = cp.arange(
-            int(ordered_rows.size), dtype=cp.int32,
+            int(ordered_rows.size),
+            dtype=cp.int32,
         )
 
     return build_device_resident_owned(
@@ -1579,15 +1713,21 @@ def _merge_device_family_buffers(
 
         # Shift new ring_offsets by existing coordinate count
         shifted_ring_offsets = new.ring_offsets + existing_coord_count
-        d_ring_offsets = cp.concatenate([
-            existing.ring_offsets, shifted_ring_offsets[1:],
-        ])
+        d_ring_offsets = cp.concatenate(
+            [
+                existing.ring_offsets,
+                shifted_ring_offsets[1:],
+            ]
+        )
 
         # Shift new geometry_offsets by existing ring count
         shifted_geom_offsets = new.geometry_offsets + existing_ring_count
-        d_geom_offsets = cp.concatenate([
-            existing.geometry_offsets, shifted_geom_offsets[1:],
-        ])
+        d_geom_offsets = cp.concatenate(
+            [
+                existing.geometry_offsets,
+                shifted_geom_offsets[1:],
+            ]
+        )
 
         return DeviceFamilyGeometryBuffer(
             family=family,
@@ -1600,9 +1740,12 @@ def _merge_device_family_buffers(
 
     # Point / LineString: geometry_offsets -> coordinates
     shifted_geom_offsets = new.geometry_offsets + existing_coord_count
-    d_geom_offsets = cp.concatenate([
-        existing.geometry_offsets, shifted_geom_offsets[1:],
-    ])
+    d_geom_offsets = cp.concatenate(
+        [
+            existing.geometry_offsets,
+            shifted_geom_offsets[1:],
+        ]
+    )
 
     return DeviceFamilyGeometryBuffer(
         family=family,
@@ -1664,7 +1807,9 @@ def get_geometry_owned(
             surface="geopandas.array.get_geometry",
             reason="array-like index requires element-wise Shapely dispatch",
             detail=f"rows={row_count}, index_type={type(index).__name__}",
-            requested=dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode),
+            requested=dispatch_mode
+            if isinstance(dispatch_mode, ExecutionMode)
+            else ExecutionMode(dispatch_mode),
             d2h_transfer=True,
         )
         record_dispatch_event(
@@ -1673,7 +1818,9 @@ def get_geometry_owned(
             implementation="get_geometry_cpu_shapely",
             reason="array-like index fallback",
             detail=f"rows={row_count}",
-            requested=dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode),
+            requested=dispatch_mode
+            if isinstance(dispatch_mode, ExecutionMode)
+            else ExecutionMode(dispatch_mode),
             selected=ExecutionMode.CPU,
         )
         return result
@@ -1682,6 +1829,11 @@ def get_geometry_owned(
         kernel_name="get_geometry",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            primary_unit_name="get-geometry-coordinate",
+        ),
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=owned.residency,

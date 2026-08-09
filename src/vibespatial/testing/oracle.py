@@ -93,7 +93,10 @@ def get_oracle_config(func: object) -> OracleConfig | None:
 
 def _call_with_supported_kwargs(func: Any, *args: Any, **kwargs: Any) -> Any:
     signature = inspect.signature(func)
-    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
         accepted_kwargs = kwargs
     else:
         accepted_kwargs = {
@@ -158,7 +161,9 @@ def _render_value(value: Any, *, config: OracleConfig) -> str:
     return repr(value)
 
 
-def _summarize_inputs(args: tuple[Any, ...], index: int, result_length: int, *, config: OracleConfig) -> tuple[str, ...]:
+def _summarize_inputs(
+    args: tuple[Any, ...], index: int, result_length: int, *, config: OracleConfig
+) -> tuple[str, ...]:
     context: list[str] = []
     for position, argument in enumerate(args):
         values = _to_sequence(argument)
@@ -220,13 +225,19 @@ def assert_matches_shapely(
     reference: ReferenceCallable | None = None,
     **kwargs: Any,
 ) -> OracleComparison:
-    resolved_mode = dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
+    resolved_mode = (
+        dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
+    )
     selection = select_runtime(resolved_mode)
-    effective_config = replace(config or OracleConfig(), reference=reference or (config.reference if config else None))
+    effective_config = replace(
+        config or OracleConfig(), reference=reference or (config.reference if config else None)
+    )
     if effective_config.reference is None:
         raise ValueError("Reference oracle requires a reference callable")
 
-    actual_raw = _call_with_supported_kwargs(operation, *args, dispatch_mode=resolved_mode, **kwargs)
+    actual_raw = _call_with_supported_kwargs(
+        operation, *args, dispatch_mode=resolved_mode, **kwargs
+    )
     expected_raw = _call_with_supported_kwargs(effective_config.reference, *args, **kwargs)
     actual = _to_sequence(actual_raw)
     expected = _to_sequence(expected_raw)
@@ -344,4 +355,3 @@ def build_point_in_polygon_scenario(
 ORACLE_SCENARIOS = {
     "point_in_polygon": build_point_in_polygon_scenario,
 }
-

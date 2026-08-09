@@ -4,12 +4,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from vibespatial import has_gpu_runtime
 from vibespatial.io.kvikio_reader import has_kvikio, read_file_to_device
 
 try:
     import cupy as cp
 
-    HAS_GPU = True
+    HAS_GPU = has_gpu_runtime()
 except (ImportError, ModuleNotFoundError):
     HAS_GPU = False
 

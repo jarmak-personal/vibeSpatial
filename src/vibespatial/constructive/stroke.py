@@ -11,6 +11,7 @@ import numpy as np
 from vibespatial.constructive.stroke_cpu import (
     benchmark_offset_curve_baseline,
     benchmark_point_buffer_baseline,
+    host_geometry_coordinate_count,
     offset_curve_owned_cpu,
     point_buffer_owned_cpu,
     supports_linestring_buffer_gpu_surface,
@@ -31,6 +32,10 @@ if TYPE_CHECKING:
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.config import LINESTRING_TWO_POINT_BUFFER_GPU_THRESHOLD
+from vibespatial.runtime.crossover import (
+    PhysicalWorkEstimate,
+    estimate_physical_work_from_owned,
+)
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
 from vibespatial.runtime.precision import KernelClass
@@ -62,6 +67,55 @@ def _empty_device_buffer_result(row_count: int):
         validity=cp.zeros(row_count, dtype=cp.bool_),
         family_row_offsets=cp.full(row_count, -1, dtype=cp.int32),
         execution_mode="gpu",
+    )
+
+
+def _stroke_buffer_work_estimate(
+    geometries: np.ndarray,
+    *,
+    prebuilt_owned,
+    active_row_count: int,
+    quad_segs: int,
+    family: str,
+) -> PhysicalWorkEstimate:
+    """Estimate host-boundary or owned buffer expansion without crossover."""
+    if prebuilt_owned is not None:
+        source = estimate_physical_work_from_owned(prebuilt_owned)
+        coordinate_count = source.coordinate_count
+        segment_count = source.segment_count
+        part_count = source.part_count
+        ring_count = source.ring_count
+    elif family == "point":
+        coordinate_count = int(active_row_count)
+        segment_count = 0
+        part_count = 0
+        ring_count = 0
+    else:
+        coordinate_count = host_geometry_coordinate_count(geometries)
+        segment_count = coordinate_count
+        part_count = 0
+        ring_count = 0
+    expansion = {
+        "point": 4 * int(quad_segs) + 1,
+        "linestring": 4 * int(quad_segs) + 2,
+        "polygon": 4 * int(quad_segs) + 1,
+    }[family]
+    output_coordinate_capacity = coordinate_count * expansion
+    return PhysicalWorkEstimate(
+        row_count=int(active_row_count),
+        coordinate_count=coordinate_count,
+        segment_count=segment_count,
+        part_count=part_count,
+        ring_count=ring_count,
+        output_row_count=int(active_row_count),
+        output_byte_count=output_coordinate_capacity * 16,
+        temporary_byte_count=(coordinate_count + ring_count) * 16,
+        primary_unit_count=max(
+            int(active_row_count),
+            coordinate_count,
+            output_coordinate_capacity,
+        ),
+        primary_unit_name=f"{family}-buffer-output-coordinate",
     )
 
 
@@ -130,9 +184,7 @@ class BufferKernelResult:
     def geometries(self) -> np.ndarray:
         if self._geometries is None:
             if self.owned_result is not None:
-                self._geometries = np.asarray(
-                    self.owned_result.to_shapely(), dtype=object
-                )
+                self._geometries = np.asarray(self.owned_result.to_shapely(), dtype=object)
             else:
                 raise ValueError(
                     "BufferKernelResult has no geometries and no owned_result; "
@@ -338,8 +390,7 @@ def offset_curve_native_tabular_result(
     )
     if result.owned_result is None:
         raise ValueError(
-            "offset_curve native tabular lowering requires admitted row-aligned "
-            "LineString output"
+            "offset_curve native tabular lowering requires admitted row-aligned LineString output"
         )
     return _unary_constructive_owned_to_native_tabular_result(
         result.owned_result,
@@ -368,9 +419,7 @@ def evaluate_geopandas_buffer(
     with execution_trace("buffer"):
         geometries = np.asarray(values, dtype=object)
         current_residency = (
-            combined_residency(prebuilt_owned)
-            if prebuilt_owned is not None
-            else Residency.HOST
+            combined_residency(prebuilt_owned) if prebuilt_owned is not None else Residency.HOST
         )
         detail = (
             f"cap_style={cap_style}, join_style={join_style}, mitre_limit={mitre_limit}, "
@@ -395,11 +444,22 @@ def evaluate_geopandas_buffer(
                 kernel_name="point_buffer",
                 kernel_class=KernelClass.CONSTRUCTIVE,
                 row_count=int(gpu_rows.size),
+                work_estimate=_stroke_buffer_work_estimate(
+                    geometries,
+                    prebuilt_owned=prebuilt_owned,
+                    active_row_count=int(gpu_rows.size),
+                    quad_segs=quad_segs,
+                    family="point",
+                ),
                 gpu_available=gpu_available,
                 current_residency=current_residency,
             )
             if selection.selected is ExecutionMode.GPU:
-                owned = prebuilt_owned if prebuilt_owned is not None else from_shapely_geometries(geometries.tolist())
+                owned = (
+                    prebuilt_owned
+                    if prebuilt_owned is not None
+                    else from_shapely_geometries(geometries.tolist())
+                )
                 active_owned = owned if gpu_rows.size == len(geometries) else owned.take(gpu_rows)
                 active_distance = distance
                 if not np.isscalar(distance):
@@ -449,11 +509,21 @@ def evaluate_geopandas_buffer(
                 kernel_name="linestring_buffer",
                 kernel_class=KernelClass.CONSTRUCTIVE,
                 row_count=len(geometries),
+                work_estimate=_stroke_buffer_work_estimate(
+                    geometries,
+                    prebuilt_owned=prebuilt_owned,
+                    active_row_count=len(geometries),
+                    quad_segs=quad_segs,
+                    family="linestring",
+                ),
                 current_residency=current_residency,
             )
             owned = prebuilt_owned if prebuilt_owned is not None else None
             force_two_point_gpu = False
-            if selection.selected is not ExecutionMode.GPU and len(geometries) >= LINESTRING_TWO_POINT_BUFFER_GPU_THRESHOLD:
+            if (
+                selection.selected is not ExecutionMode.GPU
+                and len(geometries) >= LINESTRING_TWO_POINT_BUFFER_GPU_THRESHOLD
+            ):
                 if owned is None:
                     owned = from_shapely_geometries(geometries.tolist())
                 force_two_point_gpu = supports_two_point_linestring_buffer_fast_path(
@@ -486,13 +556,27 @@ def evaluate_geopandas_buffer(
         ):
             from .polygon import polygon_buffer_owned_array
 
-            if plan_dispatch_selection(
-                kernel_name="polygon_buffer",
-                kernel_class=KernelClass.CONSTRUCTIVE,
-                row_count=len(geometries),
-                current_residency=current_residency,
-            ).selected is ExecutionMode.GPU:
-                owned = prebuilt_owned if prebuilt_owned is not None else from_shapely_geometries(geometries.tolist())
+            if (
+                plan_dispatch_selection(
+                    kernel_name="polygon_buffer",
+                    kernel_class=KernelClass.CONSTRUCTIVE,
+                    row_count=len(geometries),
+                    work_estimate=_stroke_buffer_work_estimate(
+                        geometries,
+                        prebuilt_owned=prebuilt_owned,
+                        active_row_count=len(geometries),
+                        quad_segs=quad_segs,
+                        family="polygon",
+                    ),
+                    current_residency=current_residency,
+                ).selected
+                is ExecutionMode.GPU
+            ):
+                owned = (
+                    prebuilt_owned
+                    if prebuilt_owned is not None
+                    else from_shapely_geometries(geometries.tolist())
+                )
                 result = polygon_buffer_owned_array(
                     owned,
                     distance,
@@ -548,7 +632,9 @@ def evaluate_geopandas_offset_curve(
         return np.asarray(result.geometries, dtype=object), ExecutionMode.CPU
 
 
-def benchmark_point_buffer(values, *, distance: float, quad_segs: int = 16, dataset: str = "point-buffer") -> StrokeBenchmark:
+def benchmark_point_buffer(
+    values, *, distance: float, quad_segs: int = 16, dataset: str = "point-buffer"
+) -> StrokeBenchmark:
     geometries = np.asarray(values, dtype=object)
 
     # Try GPU dispatch via point_buffer_owned_array (the real GPU kernel path)
@@ -559,19 +645,33 @@ def benchmark_point_buffer(values, *, distance: float, quad_segs: int = 16, data
         join_style="round",
         single_sided=False,
     )
-    if plan_dispatch_selection(
-        kernel_name="point_buffer",
-        kernel_class=KernelClass.CONSTRUCTIVE,
-        row_count=len(geometries),
-        gpu_available=gpu_available,
-    ).selected is ExecutionMode.GPU:
+    if (
+        plan_dispatch_selection(
+            kernel_name="point_buffer",
+            kernel_class=KernelClass.CONSTRUCTIVE,
+            row_count=len(geometries),
+            work_estimate=_stroke_buffer_work_estimate(
+                geometries,
+                prebuilt_owned=None,
+                active_row_count=len(geometries),
+                quad_segs=quad_segs,
+                family="point",
+            ),
+            gpu_available=gpu_available,
+        ).selected
+        is ExecutionMode.GPU
+    ):
         from vibespatial.geometry.owned import from_shapely_geometries
 
         owned_array = from_shapely_geometries(list(geometries))
         # Warmup run to exclude JIT/compilation overhead
-        point_buffer_owned_array(owned_array, distance, quad_segs=quad_segs, dispatch_mode=ExecutionMode.GPU)
+        point_buffer_owned_array(
+            owned_array, distance, quad_segs=quad_segs, dispatch_mode=ExecutionMode.GPU
+        )
         start = perf_counter()
-        point_buffer_owned_array(owned_array, distance, quad_segs=quad_segs, dispatch_mode=ExecutionMode.GPU)
+        point_buffer_owned_array(
+            owned_array, distance, quad_segs=quad_segs, dispatch_mode=ExecutionMode.GPU
+        )
         owned_elapsed = perf_counter() - start
         fast_rows = len(geometries)
         fallback_rows = 0
@@ -598,7 +698,9 @@ def benchmark_point_buffer(values, *, distance: float, quad_segs: int = 16, data
     )
 
 
-def benchmark_offset_curve(values, *, distance: float, join_style: str = "mitre", dataset: str = "offset-curve") -> StrokeBenchmark:
+def benchmark_offset_curve(
+    values, *, distance: float, join_style: str = "mitre", dataset: str = "offset-curve"
+) -> StrokeBenchmark:
     geometries = np.asarray(values, dtype=object)
 
     offset_curve_owned(geometries, distance, join_style=join_style)

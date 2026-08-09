@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from vibespatial.overlay.contract import contract_overlay_microcells
 from vibespatial.overlay.contraction_reconstruct import (
     reconstruct_overlay_from_microcells as _reconstruct_overlay_from_microcells,
 )
@@ -58,11 +57,9 @@ def overlay_contraction_owned(
         dispatch_mode=dispatch_mode,
         selection_operation=operation,
     )
-    components = contract_overlay_microcells(labels)
     return _reconstruct_overlay_from_microcells(
         labels,
         operation,
-        components=components,
         row_count=left.row_count,
         dispatch_mode=dispatch_mode,
     )

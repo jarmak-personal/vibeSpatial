@@ -9,10 +9,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from vibespatial import has_gpu_runtime
+
 try:
     import cupy as cp
 
-    HAS_GPU = True
+    HAS_GPU = has_gpu_runtime()
 except (ImportError, ModuleNotFoundError):
     HAS_GPU = False
 
@@ -493,6 +495,41 @@ class TestParseAsciiFloats:
 
         result = cp.asnumpy(parse_ascii_floats(d_bytes, d_starts, d_ends))
         assert abs(result[0] - (-80.92302345678)) < 1e-10
+
+    @needs_gpu
+    def test_coordinate_scale_tokens_match_python_float_bits(self):
+        """Coordinate-scale decimals preserve the same fp64 values as Python parsing."""
+        from vibespatial.io.gpu_parse import parse_ascii_floats
+
+        tokens = [
+            "-82.496",
+            "-82.41799999999999",
+            "27.81",
+            "27.810000000000002",
+            "0.00123",
+            "1.5e-4",
+            "-2.3E4",
+            "79097.48514162877e-2",
+        ]
+        data = ",".join(tokens).encode("ascii")
+        starts: list[int] = []
+        ends: list[int] = []
+        cursor = 0
+        for token in tokens:
+            starts.append(cursor)
+            cursor += len(token)
+            ends.append(cursor)
+            cursor += 1
+
+        d_bytes = _to_device(data)
+        d_starts = cp.asarray(starts, dtype=cp.int64)
+        d_ends = cp.asarray(ends, dtype=cp.int64)
+
+        result = cp.asnumpy(parse_ascii_floats(d_bytes, d_starts, d_ends))
+
+        assert [float(value).hex() for value in result] == [
+            float(token).hex() for token in tokens
+        ]
 
     @needs_gpu
     def test_multiple_values(self):

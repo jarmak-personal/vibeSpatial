@@ -12,21 +12,30 @@ from vibespatial.kernels.core.spatial_query_source import (
     _SPATIAL_QUERY_KERNEL_SOURCE,
 )
 
-request_warmup([
-    "exclusive_scan_i32", "exclusive_scan_i64",
-    "select_i32", "select_i64",
-    "radix_sort_i32_i32", "radix_sort_u64_i32",
-    "merge_sort_u64_i32",
-    "lower_bound_i32", "lower_bound_u64",
-    "upper_bound_i32", "upper_bound_u64",
-    "segmented_reduce_min_f64",
-])
+request_warmup(
+    [
+        "exclusive_scan_i32",
+        "exclusive_scan_i64",
+        "select_i32",
+        "select_i64",
+        "radix_sort_i32_i32",
+        "radix_sort_u64_i32",
+        "merge_sort_u64_i32",
+        "lower_bound_i32",
+        "lower_bound_u64",
+        "upper_bound_i32",
+        "upper_bound_u64",
+        "segmented_reduce_min_f64",
+    ]
+)
 
-request_nvrtc_warmup([
-    ("spatial-query", _SPATIAL_QUERY_KERNEL_SOURCE, _SPATIAL_QUERY_KERNEL_NAMES),
-    ("morton-range", _MORTON_RANGE_KERNEL_SOURCE, _MORTON_RANGE_KERNEL_NAMES),
-    ("grid-nearest", _GRID_NEAREST_KERNEL_SOURCE, _GRID_NEAREST_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("spatial-query", _SPATIAL_QUERY_KERNEL_SOURCE, _SPATIAL_QUERY_KERNEL_NAMES),
+        ("morton-range", _MORTON_RANGE_KERNEL_SOURCE, _MORTON_RANGE_KERNEL_NAMES),
+        ("grid-nearest", _GRID_NEAREST_KERNEL_SOURCE, _GRID_NEAREST_KERNEL_NAMES),
+    ]
+)
 
 
 def _spatial_query_kernels():

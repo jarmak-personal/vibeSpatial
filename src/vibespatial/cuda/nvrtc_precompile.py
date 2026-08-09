@@ -11,6 +11,7 @@ threads finish in ~200-400ms wall time.
 
 Uses the same VIBESPATIAL_PRECOMPILE toggle as CCCL warmup.
 """
+
 from __future__ import annotations
 
 import logging
@@ -77,7 +78,8 @@ class NVRTCPrecompiler:
         return self._executor
 
     def request(
-        self, units: list[tuple[str, str, tuple[str, ...]]],
+        self,
+        units: list[tuple[str, str, tuple[str, ...]]],
     ) -> None:
         """Submit (prefix, source, kernel_names) for background compile.
 
@@ -133,7 +135,11 @@ class NVRTCPrecompiler:
 
                 # Cache miss: submit for background compilation
                 self._futures[cache_key] = self._ensure_executor().submit(
-                    self._compile_one, runtime, cache_key, source, kernel_names,
+                    self._compile_one,
+                    runtime,
+                    cache_key,
+                    source,
+                    kernel_names,
                 )
 
     def _compile_one(
@@ -173,9 +179,7 @@ class NVRTCPrecompiler:
             "deferred": len(self._deferred_disk),
             "pending": sum(1 for f in self._futures.values() if not f.done()),
             "failed": sum(1 for d in self._diagnostics if not d.success),
-            "wall_ms": (perf_counter() - self._start_time) * 1000
-            if self._start_time
-            else 0,
+            "wall_ms": (perf_counter() - self._start_time) * 1000 if self._start_time else 0,
             "per_unit": [
                 {"key": d.cache_key, "ms": round(d.elapsed_ms, 1), "ok": d.success}
                 for d in self._diagnostics
@@ -198,9 +202,11 @@ class NVRTCPrecompiler:
             prefix, source, kernel_names = unit_info
             try:
                 from ._runtime import get_cuda_runtime
+
                 runtime = get_cuda_runtime()
                 runtime.compile_kernels(
-                    cache_key=cache_key, source=source,
+                    cache_key=cache_key,
+                    source=source,
                     kernel_names=kernel_names,
                 )
                 self._deferred_disk.discard(cache_key)
@@ -228,6 +234,7 @@ class NVRTCPrecompiler:
 # ---------------------------------------------------------------------------
 # Module-level convenience function
 # ---------------------------------------------------------------------------
+
 
 def request_nvrtc_warmup(
     units: list[tuple[str, str, tuple[str, ...]]],

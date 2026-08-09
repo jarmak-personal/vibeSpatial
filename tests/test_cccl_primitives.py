@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from vibespatial import has_gpu_runtime
 from vibespatial.cuda._runtime import get_cuda_runtime
 from vibespatial.cuda.cccl_primitives import (
     CompactionStrategy,
@@ -16,6 +17,7 @@ from vibespatial.cuda.cccl_primitives import (
     counting_iterator,
     exclusive_sum,
     has_cccl_primitives,
+    inclusive_max,
     lower_bound,
     lower_bound_counting,
     segmented_reduce_max,
@@ -33,8 +35,8 @@ from vibespatial.cuda.cccl_primitives import (
 
 
 def _cupy():
-    if not has_cccl_primitives():
-        pytest.skip("CCCL Python primitives are not available")
+    if not has_gpu_runtime() or not has_cccl_primitives():
+        pytest.skip("CCCL Python primitives require an available CUDA runtime")
     import cupy as cp
 
     return cp
@@ -92,6 +94,18 @@ def test_exclusive_sum_cccl_scan_matches_numpy_prefix_sum() -> None:
     result = exclusive_sum(values, strategy=ScanStrategy.CCCL_EXCLUSIVE_SCAN)
 
     np.testing.assert_array_equal(result.get(), np.asarray([0, 3, 4, 8, 9], dtype=np.int32))
+
+
+def test_inclusive_max_matches_numpy_prefix_maximum() -> None:
+    cp = _cupy()
+    values = cp.asarray([-3.0, 1.0, -4.0, 5.0, 2.0], dtype=cp.float64)
+
+    result = inclusive_max(values, synchronize=True)
+
+    np.testing.assert_array_equal(
+        result.get(),
+        np.asarray([-3.0, 1.0, 1.0, 5.0, 5.0], dtype=np.float64),
+    )
 
 
 def test_sort_pairs_auto_routes_numeric_keys_to_radix() -> None:

@@ -84,6 +84,105 @@ def _single_family_geom_type_if_no_nulls(owned: OwnedGeometryArray) -> str | Non
     return _TAG_TO_GEOM_TYPE_NAME.get(FAMILY_TAGS[family])
 
 
+def _device_bool_scalar(value: Any, *, reason: str) -> bool:
+    """Read one device boolean through the runtime so profiles see the fence."""
+    if hasattr(value, "__cuda_array_interface__") or type(value).__module__.startswith("cupy"):
+        import cupy as cp
+
+        host = get_cuda_runtime().copy_device_to_host(
+            cp.asarray(value).reshape(1),
+            reason=reason,
+        )
+        return bool(np.asarray(host, dtype=bool).reshape(-1)[0])
+    return bool(value)
+
+
+def _device_row_metadata(
+    owned: OwnedGeometryArray,
+    row_index: int,
+    *,
+    reason: str,
+) -> tuple[bool, int, int] | None:
+    """Return validity, family tag, and family row for one device-backed row."""
+    if owned.residency is not Residency.DEVICE or owned.device_state is None:
+        return None
+    try:
+        import cupy as cp
+    except ModuleNotFoundError:  # pragma: no cover - guarded by runtime
+        return None
+
+    state = owned._ensure_device_state(preserve_indexed_view=True)
+    d_metadata = cp.empty(3, dtype=cp.int64)
+    d_metadata[0] = cp.asarray(state.validity)[row_index].astype(cp.int64)
+    d_metadata[1] = cp.asarray(state.tags)[row_index].astype(cp.int64)
+    d_metadata[2] = cp.asarray(state.family_row_offsets)[row_index].astype(cp.int64)
+    host_metadata = np.asarray(
+        get_cuda_runtime().copy_device_to_host(d_metadata, reason=reason),
+        dtype=np.int64,
+    )
+    return (
+        bool(host_metadata[0]),
+        int(host_metadata[1]),
+        int(host_metadata[2]),
+    )
+
+
+def _buffer_all_valid(
+    owned: OwnedGeometryArray,
+    families: set[GeometryFamily],
+) -> bool:
+    cached = getattr(owned, "_validity", None)
+    if cached is not None:
+        return bool(np.all(cached))
+    if owned.residency is Residency.DEVICE and owned.device_state is not None:
+        state = owned._ensure_device_state(preserve_indexed_view=True)
+        if state.trusted_all_valid is not None:
+            return bool(state.trusted_all_valid)
+        try:
+            import cupy as cp
+        except ModuleNotFoundError:  # pragma: no cover - guarded by runtime
+            cp = None
+        if cp is not None:
+            reason = (
+                "point buffer validity admission scalar fence"
+                if families == {GeometryFamily.POINT}
+                else "DeviceGeometryArray.buffer all-valid scalar fence"
+            )
+            result = _device_bool_scalar(cp.all(cp.asarray(state.validity)), reason=reason)
+            if result:
+                state.trusted_all_valid = True
+            return result
+    return bool(np.all(owned.validity))
+
+
+def _buffer_has_empties(
+    owned: OwnedGeometryArray,
+    family: GeometryFamily,
+) -> bool:
+    state = owned.device_state
+    if owned.residency is Residency.DEVICE and state is not None and family in state.families:
+        if state.trusted_all_non_empty is True:
+            return False
+        try:
+            import cupy as cp
+        except ModuleNotFoundError:  # pragma: no cover - guarded by runtime
+            cp = None
+        if cp is not None:
+            reason = (
+                "point buffer empty-point admission scalar fence"
+                if family is GeometryFamily.POINT
+                else f"DeviceGeometryArray.buffer {family.value} empty-mask scalar fence"
+            )
+            has_empties = _device_bool_scalar(
+                cp.any(cp.asarray(state.families[family].empty_mask)),
+                reason=reason,
+            )
+            if not has_empties:
+                state.trusted_all_non_empty = True
+            return has_empties
+    return bool(np.any(owned.families[family].empty_mask))
+
+
 def _record_shapely_fallback_event(
     *,
     surface: str,
@@ -127,9 +226,7 @@ class DeviceGeometryDtype(ExtensionDtype):
     @classmethod
     def construct_from_string(cls, string: str) -> DeviceGeometryDtype:
         if not isinstance(string, str):
-            raise TypeError(
-                f"'construct_from_string' expects a string, got {type(string)}"
-            )
+            raise TypeError(f"'construct_from_string' expects a string, got {type(string)}")
         if string == cls.name:
             return cls()
         raise TypeError(f"Cannot construct a '{cls.__name__}' from '{string}'")
@@ -242,6 +339,30 @@ class DeviceGeometryArray(ExtensionArray):
 
     @property
     def nbytes(self) -> int:
+        if (
+            self._owned.residency is Residency.DEVICE
+            and self._owned.device_state is not None
+            and (
+                self._owned._validity is None
+                or self._owned._tags is None
+                or self._owned._family_row_offsets is None
+            )
+        ):
+            state = self._owned._ensure_device_state(preserve_indexed_view=True)
+            total = state.validity.nbytes + state.tags.nbytes
+            total += state.family_row_offsets.nbytes
+            for buffer in state.families.values():
+                total += buffer.x.nbytes + buffer.y.nbytes
+                total += buffer.geometry_offsets.nbytes
+                total += buffer.empty_mask.nbytes
+                if buffer.part_offsets is not None:
+                    total += buffer.part_offsets.nbytes
+                if buffer.ring_offsets is not None:
+                    total += buffer.ring_offsets.nbytes
+                if buffer.bounds is not None:
+                    total += buffer.bounds.nbytes
+            return total
+
         total = 0
         total += self._owned.validity.nbytes
         total += self._owned.tags.nbytes
@@ -259,6 +380,19 @@ class DeviceGeometryArray(ExtensionArray):
         return total
 
     def isna(self) -> np.ndarray:
+        if getattr(self._owned, "_validity", None) is not None:
+            return ~np.asarray(self._owned._validity, dtype=bool)
+        state = getattr(self._owned, "device_state", None)
+        if state is not None:
+            if state.trusted_all_valid is True:
+                return np.zeros(int(self._owned.row_count), dtype=bool)
+            device_state = self._owned._ensure_device_state(preserve_indexed_view=True)
+            host_validity = get_cuda_runtime().copy_device_to_host(
+                device_state.validity,
+                reason="DeviceGeometryArray isna validity terminal export",
+                terminal_export=True,
+            )
+            return ~np.asarray(host_validity, dtype=bool)
         return ~self._owned.validity
 
     @property
@@ -376,9 +510,7 @@ class DeviceGeometryArray(ExtensionArray):
             from vibeproj import Transformer as _VibeTransformer
 
             t = _VibeTransformer.from_crs(self._crs, "EPSG:4326", always_xy=True)
-            minx, miny, maxx, maxy = t.transform_bounds(
-                minx, miny, maxx, maxy
-            )
+            minx, miny, maxx, maxy = t.transform_bounds(minx, miny, maxx, maxy)
             y_center = (miny + maxy) / 2
             if minx > maxx:
                 maxx += 360
@@ -408,8 +540,7 @@ class DeviceGeometryArray(ExtensionArray):
 
         if self._crs is None:
             raise ValueError(
-                "Cannot transform naive geometries.  "
-                "Please set a crs on the object first."
+                "Cannot transform naive geometries.  Please set a crs on the object first."
             )
         if crs is not None:
             crs = PyprojCRS.from_user_input(crs)
@@ -475,7 +606,10 @@ class DeviceGeometryArray(ExtensionArray):
         """
         from vibespatial.constructive.validity import is_valid_owned
 
-        result = np.asarray(is_valid_owned(self._owned), dtype=bool)
+        result = np.asarray(
+            is_valid_owned(self._owned, _exact_collinearity=True),
+            dtype=bool,
+        )
         if not bool(np.all(self._owned.validity)):
             # GeoPandas-facing is_valid treats missing rows as False even though
             # the owned structural-validity helper treats null slots as valid.
@@ -662,6 +796,7 @@ class DeviceGeometryArray(ExtensionArray):
                     "aliases for the same parameter. Use `quad_segs` only instead."
                 )
             import warnings
+
             warnings.warn(
                 "The `resolution` argument to `buffer` is deprecated, `quad_segs` "
                 "should be used instead to align with shapely.",
@@ -687,31 +822,27 @@ class DeviceGeometryArray(ExtensionArray):
 
         # Route via owned metadata -- no Shapely materialization for classification
         owned = self._owned
+        if (
+            owned.residency is Residency.DEVICE
+            and owned.device_state is not None
+            and owned.is_indexed_view
+        ):
+            # Unary stroke kernels own contiguous family-row work. Resolve the
+            # logical indexed rows once on device so unused ancestral family
+            # buffers cannot masquerade as logical mixed input.
+            owned = owned.physicalize_device_rows(allow_capacity_allocation=True)
         families = set(owned.families.keys())
-        all_valid = bool(np.all(owned.validity))
+        all_valid = _buffer_all_valid(owned, families)
 
         if len(families) == 1 and all_valid and not single_sided:
             family = next(iter(families))
-            buf = owned.families[family]
-            # Check for empties using whichever side is authoritative.
-            # Device-resident stubs have host_materialized=False with a
-            # zero-length empty_mask that cannot be trusted.  Query the
-            # device-side empty_mask instead so we don't pessimistically
-            # fall through to Shapely for every device-resident buffer call.
-            if not buf.host_materialized:
-                try:
-                    import cupy as _cp
-
-                    ds = owned.device_state
-                    if ds is not None and family in ds.families:
-                        d_empty = ds.families[family].empty_mask
-                        has_empties = bool(_cp.any(d_empty))
-                    else:
-                        has_empties = False  # no device state -> no empties detectable
-                except Exception:
-                    has_empties = True  # conservative fallback
-            else:
-                has_empties = bool(np.any(buf.empty_mask))
+            has_empties = _buffer_has_empties(owned, family)
+            if (
+                not has_empties
+                and owned.residency is Residency.DEVICE
+                and owned.device_state is not None
+            ):
+                owned.device_state.trusted_homogeneous_family = family
 
             if (
                 family is GeometryFamily.POINT
@@ -721,29 +852,24 @@ class DeviceGeometryArray(ExtensionArray):
             ):
                 from vibespatial.constructive.point import point_buffer_owned_array
 
-                try:
-                    result = point_buffer_owned_array(
-                        owned, distance, quad_segs=quad_segs,
-                    )
-                    record_dispatch_event(
-                        surface="DeviceGeometryArray.buffer",
-                        operation="buffer",
-                        implementation="point_buffer_owned_array",
-                        reason="DGA direct point buffer dispatch",
-                        detail=f"rows={len(self)}, family=point",
-                        selected=ExecutionMode.GPU,
-                    )
-                    return DeviceGeometryArray._from_owned(
-                        result,
-                        crs=self._crs,
-                        provenance=provenance,
-                    )
-                except Exception as exc:
-                    owned._record(
-                        DiagnosticKind.FALLBACK,
-                        f"DeviceGeometryArray.buffer: GPU point kernel failed: {exc!r}",
-                        visible=True,
-                    )
+                result = point_buffer_owned_array(
+                    owned,
+                    distance,
+                    quad_segs=quad_segs,
+                )
+                record_dispatch_event(
+                    surface="DeviceGeometryArray.buffer",
+                    operation="buffer",
+                    implementation="point_buffer_owned_array",
+                    reason="DGA direct point buffer dispatch",
+                    detail=f"rows={len(self)}, family=point",
+                    selected=ExecutionMode.GPU,
+                )
+                return DeviceGeometryArray._from_owned(
+                    result,
+                    crs=self._crs,
+                    provenance=provenance,
+                )
 
             elif family is GeometryFamily.LINESTRING and not has_empties:
                 from vibespatial.constructive.linestring import (
@@ -751,14 +877,36 @@ class DeviceGeometryArray(ExtensionArray):
                     supports_two_point_linestring_buffer_fast_path,
                 )
                 from vibespatial.runtime.adaptive import plan_dispatch_selection
+                from vibespatial.runtime.crossover import (
+                    PhysicalWorkEstimate,
+                    estimate_physical_work_from_owned,
+                )
                 from vibespatial.runtime.precision import KernelClass
 
                 # The direct DGA path bypasses GeometryArray.buffer(), so it
                 # must honor the normal AUTO crossover itself.
+                source_work = estimate_physical_work_from_owned(owned)
+                output_coordinate_capacity = source_work.coordinate_count * (4 * int(quad_segs) + 2)
                 selection = plan_dispatch_selection(
                     kernel_name="linestring_buffer",
                     kernel_class=KernelClass.CONSTRUCTIVE,
                     row_count=len(self),
+                    work_estimate=PhysicalWorkEstimate(
+                        row_count=len(self),
+                        coordinate_count=source_work.coordinate_count,
+                        segment_count=source_work.segment_count,
+                        part_count=source_work.part_count,
+                        output_row_count=len(self),
+                        output_byte_count=output_coordinate_capacity * 16,
+                        temporary_byte_count=len(self) * 24,
+                        primary_unit_count=max(
+                            len(self),
+                            source_work.coordinate_count,
+                            output_coordinate_capacity,
+                        ),
+                        primary_unit_name="linestring-buffer-output-coordinate",
+                    ),
+                    current_residency=owned.residency,
                 )
                 preserve_device_native = owned.residency is Residency.DEVICE
                 force_two_point_gpu = (
@@ -785,70 +933,33 @@ class DeviceGeometryArray(ExtensionArray):
                         visible=True,
                     )
                 else:
-                    try:
-                        result = linestring_buffer_owned_array(
-                            owned, distance,
-                            quad_segs=quad_segs,
-                            cap_style=cap_style,
-                            join_style=join_style,
-                            mitre_limit=mitre_limit,
-                            dispatch_mode=ExecutionMode.GPU,
-                        )
-                        record_dispatch_event(
-                            surface="DeviceGeometryArray.buffer",
-                            operation="buffer",
-                            implementation="linestring_buffer_owned_array",
-                            reason=(
-                                "device-resident DGA linestring buffer stayed on GPU"
-                                if preserve_device_native and selection.selected is not ExecutionMode.GPU
-                                else
-                                "DGA direct two-point linestring buffer dispatch"
-                                if force_two_point_gpu and selection.selected is not ExecutionMode.GPU
-                                else "DGA direct linestring buffer dispatch"
-                            ),
-                            detail=(
-                                f"rows={len(self)}, family=linestring"
-                                + (
-                                    ", residency=device"
-                                    if preserve_device_native
-                                    else ""
-                                )
-                                + (
-                                    ", shape=simple_two_point"
-                                    if force_two_point_gpu
-                                    else ""
-                                )
-                            ),
-                            selected=ExecutionMode.GPU,
-                        )
-                        return DeviceGeometryArray._from_owned(
-                            result,
-                            crs=self._crs,
-                            provenance=provenance,
-                        )
-                    except Exception as exc:
-                        owned._record(
-                            DiagnosticKind.FALLBACK,
-                            f"DeviceGeometryArray.buffer: GPU linestring kernel failed: {exc!r}",
-                            visible=True,
-                        )
-
-            elif family is GeometryFamily.POLYGON and not has_empties:
-                from vibespatial.constructive.polygon import polygon_buffer_owned_array
-
-                try:
-                    result = polygon_buffer_owned_array(
-                        owned, distance,
+                    result = linestring_buffer_owned_array(
+                        owned,
+                        distance,
                         quad_segs=quad_segs,
+                        cap_style=cap_style,
                         join_style=join_style,
                         mitre_limit=mitre_limit,
+                        dispatch_mode=ExecutionMode.GPU,
                     )
                     record_dispatch_event(
                         surface="DeviceGeometryArray.buffer",
                         operation="buffer",
-                        implementation="polygon_buffer_owned_array",
-                        reason="DGA direct polygon buffer dispatch",
-                        detail=f"rows={len(self)}, family=polygon",
+                        implementation="linestring_buffer_owned_array",
+                        reason=(
+                            "device-resident DGA linestring buffer stayed on GPU"
+                            if preserve_device_native
+                            and selection.selected is not ExecutionMode.GPU
+                            else "DGA direct two-point linestring buffer dispatch"
+                            if force_two_point_gpu
+                            and selection.selected is not ExecutionMode.GPU
+                            else "DGA direct linestring buffer dispatch"
+                        ),
+                        detail=(
+                            f"rows={len(self)}, family=linestring"
+                            + (", residency=device" if preserve_device_native else "")
+                            + (", shape=simple_two_point" if force_two_point_gpu else "")
+                        ),
                         selected=ExecutionMode.GPU,
                     )
                     return DeviceGeometryArray._from_owned(
@@ -856,12 +967,30 @@ class DeviceGeometryArray(ExtensionArray):
                         crs=self._crs,
                         provenance=provenance,
                     )
-                except Exception as exc:
-                    owned._record(
-                        DiagnosticKind.FALLBACK,
-                        f"DeviceGeometryArray.buffer: GPU polygon kernel failed: {exc!r}",
-                        visible=True,
-                    )
+
+            elif family is GeometryFamily.POLYGON and not has_empties:
+                from vibespatial.constructive.polygon import polygon_buffer_owned_array
+
+                result = polygon_buffer_owned_array(
+                    owned,
+                    distance,
+                    quad_segs=quad_segs,
+                    join_style=join_style,
+                    mitre_limit=mitre_limit,
+                )
+                record_dispatch_event(
+                    surface="DeviceGeometryArray.buffer",
+                    operation="buffer",
+                    implementation="polygon_buffer_owned_array",
+                    reason="DGA direct polygon buffer dispatch",
+                    detail=f"rows={len(self)}, family=polygon",
+                    selected=ExecutionMode.GPU,
+                )
+                return DeviceGeometryArray._from_owned(
+                    result,
+                    crs=self._crs,
+                    provenance=provenance,
+                )
 
         # Shapely fallback for mixed families, nulls, empties, or unsupported params
         import shapely
@@ -881,9 +1010,13 @@ class DeviceGeometryArray(ExtensionArray):
         )
         shapely_geoms = owned_to_shapely(self._owned)
         result = shapely.buffer(
-            shapely_geoms, distance, quad_segs=quad_segs,
-            cap_style=cap_style, join_style=join_style,
-            mitre_limit=mitre_limit, single_sided=single_sided,
+            shapely_geoms,
+            distance,
+            quad_segs=quad_segs,
+            cap_style=cap_style,
+            join_style=join_style,
+            mitre_limit=mitre_limit,
+            single_sided=single_sided,
             **kwargs,
         )
         record_dispatch_event(
@@ -905,8 +1038,7 @@ class DeviceGeometryArray(ExtensionArray):
         from vibespatial.constructive.simplify import simplify_owned
 
         result_owned = simplify_owned(self._owned, tolerance, preserve_topology=preserve_topology)
-        return DeviceGeometryArray._from_owned(result_owned, crs=self._crs
-        )
+        return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     def remove_repeated_points(self, tolerance=0.0):
         from vibespatial.constructive.remove_repeated_points import (
@@ -931,9 +1063,7 @@ class DeviceGeometryArray(ExtensionArray):
         # Check eligibility from owned metadata: linestring-only + non-round join
         families = set(owned.families.keys())
         is_eligible = (
-            join_style != "round"
-            and len(families) == 1
-            and GeometryFamily.LINESTRING in families
+            join_style != "round" and len(families) == 1 and GeometryFamily.LINESTRING in families
         )
 
         # Materialize once -- reuse in both eligible and fallback paths
@@ -1017,9 +1147,7 @@ class DeviceGeometryArray(ExtensionArray):
             detail=f"rows={len(self)}, join_style={join_style}",
             selected=ExecutionMode.CPU,
         )
-        new_owned = from_shapely_geometries(
-            np.asarray(fallback, dtype=object).tolist()
-        )
+        new_owned = from_shapely_geometries(np.asarray(fallback, dtype=object).tolist())
         return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
 
     def make_valid(self, method="linework", keep_collapsed=True):
@@ -1033,6 +1161,10 @@ class DeviceGeometryArray(ExtensionArray):
             method=method,
             keep_collapsed=keep_collapsed,
         )
+        if result.native_geometry is not None:
+            from vibespatial.api.geometry_array import GeometryArray
+
+            return GeometryArray(result.geometries, crs=self._crs)
         # When all rows are already valid, result.owned carries the original
         # OwnedGeometryArray — reuse it directly to avoid a Shapely round-trip.
         if result.owned is not None:
@@ -1062,25 +1194,19 @@ class DeviceGeometryArray(ExtensionArray):
     def rotate(self, angle, origin="center", use_radians=False):
         from vibespatial.constructive.affine_transform import rotate_owned
 
-        result_owned = rotate_owned(
-            self._owned, angle, origin=origin, use_radians=use_radians
-        )
+        result_owned = rotate_owned(self._owned, angle, origin=origin, use_radians=use_radians)
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     def scale(self, xfact=1.0, yfact=1.0, zfact=1.0, origin="center"):
         from vibespatial.constructive.affine_transform import scale_owned
 
-        result_owned = scale_owned(
-            self._owned, xfact, yfact, zfact, origin=origin
-        )
+        result_owned = scale_owned(self._owned, xfact, yfact, zfact, origin=origin)
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     def skew(self, xs=0.0, ys=0.0, origin="center", use_radians=False):
         from vibespatial.constructive.affine_transform import skew_owned
 
-        result_owned = skew_owned(
-            self._owned, xs, ys, origin=origin, use_radians=use_radians
-        )
+        result_owned = skew_owned(self._owned, xs, ys, origin=origin, use_radians=use_radians)
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     def count_coordinates(self):
@@ -1102,7 +1228,9 @@ class DeviceGeometryArray(ExtensionArray):
         hex_output = bool(kwargs.pop("hex", False))
         if kwargs:
             raise TypeError(f"Unsupported to_wkb kwargs: {', '.join(sorted(kwargs))}")
-        return np.asarray(_encode_owned_wkb_values(self._owned, hex_output=hex_output), dtype=object)
+        return np.asarray(
+            _encode_owned_wkb_values(self._owned, hex_output=hex_output), dtype=object
+        )
 
     def to_wkt(self, **kwargs):
         return np.asarray(_encode_owned_wkt_values(self._owned, **kwargs), dtype=object)
@@ -1129,6 +1257,7 @@ class DeviceGeometryArray(ExtensionArray):
             return self._owned, self._owned_flat_sindex_cache
 
         from vibespatial.runtime.adaptive import plan_dispatch_selection
+        from vibespatial.runtime.crossover import estimate_spatial_index_work_from_owned
         from vibespatial.runtime.precision import KernelClass
         from vibespatial.spatial.indexing import build_flat_spatial_index
 
@@ -1136,6 +1265,8 @@ class DeviceGeometryArray(ExtensionArray):
             kernel_name="flat_index_build",
             kernel_class=KernelClass.COARSE,
             row_count=self._owned.row_count,
+            work_estimate=estimate_spatial_index_work_from_owned(self._owned),
+            current_residency=self._owned.residency,
         )
         self._owned_flat_sindex_cache = build_flat_spatial_index(
             self._owned,
@@ -1186,7 +1317,11 @@ class DeviceGeometryArray(ExtensionArray):
         from vibespatial.runtime.dispatch import record_dispatch_event
         from vibespatial.spatial.query import _extract_box_query_bounds, _query_point_tree_box_index
 
-        if predicate == "intersects" and isinstance(other, BaseGeometry) and get_requested_mode() is not ExecutionMode.CPU:
+        if (
+            predicate == "intersects"
+            and isinstance(other, BaseGeometry)
+            and get_requested_mode() is not ExecutionMode.CPU
+        ):
             box_bounds = _extract_box_query_bounds(predicate, np.asarray([other], dtype=object))
             if box_bounds is not None:
                 point_box_pairs = _query_point_tree_box_index(
@@ -1388,38 +1523,28 @@ class DeviceGeometryArray(ExtensionArray):
         """
         if isinstance(other, DeviceGeometryArray):
             if len(other) != len(self):
-                raise ValueError(
-                    f"Lengths do not match: {len(self)} vs {len(other)}"
-                )
+                raise ValueError(f"Lengths do not match: {len(self)} vs {len(other)}")
             return other._owned
         other_values = getattr(other, "values", other)
         if isinstance(other_values, DeviceGeometryArray):
             if len(other_values) != len(self):
-                raise ValueError(
-                    f"Lengths do not match: {len(self)} vs {len(other_values)}"
-                )
+                raise ValueError(f"Lengths do not match: {len(self)} vs {len(other_values)}")
             return other_values._owned
         other_owned = getattr(other_values, "_owned", None)
         if isinstance(other_owned, OwnedGeometryArray):
             if len(other_values) != len(self):
-                raise ValueError(
-                    f"Lengths do not match: {len(self)} vs {len(other_values)}"
-                )
+                raise ValueError(f"Lengths do not match: {len(self)} vs {len(other_values)}")
             return other_owned
         if _is_host_geometry_array_like(other_values):
             if len(other_values) != len(self):
-                raise ValueError(
-                    f"Lengths do not match: {len(self)} vs {len(other_values)}"
-                )
+                raise ValueError(f"Lengths do not match: {len(self)} vs {len(other_values)}")
             try:
                 return from_shapely_geometries(other_values._data.tolist())
             except NotImplementedError:
                 return None
         if hasattr(other_values, "to_owned"):
             if len(other_values) != len(self):
-                raise ValueError(
-                    f"Lengths do not match: {len(self)} vs {len(other_values)}"
-                )
+                raise ValueError(f"Lengths do not match: {len(self)} vs {len(other_values)}")
             try:
                 coerced_owned = other_values.to_owned()
             except NotImplementedError:
@@ -1427,6 +1552,7 @@ class DeviceGeometryArray(ExtensionArray):
             if isinstance(coerced_owned, OwnedGeometryArray):
                 return coerced_owned
         from shapely.geometry.base import BaseGeometry as _BG
+
         if isinstance(other, _BG):
             try:
                 return from_shapely_geometries([other])
@@ -1434,9 +1560,7 @@ class DeviceGeometryArray(ExtensionArray):
                 return None
         if isinstance(other, np.ndarray) and other.dtype == object:
             if len(other) != len(self):
-                raise ValueError(
-                    f"Lengths do not match: {len(self)} vs {len(other)}"
-                )
+                raise ValueError(f"Lengths do not match: {len(self)} vs {len(other)}")
             try:
                 return from_shapely_geometries(other.tolist())
             except NotImplementedError:
@@ -1448,6 +1572,7 @@ class DeviceGeometryArray(ExtensionArray):
         other_owned = self._coerce_other_to_owned(other)
         if other_owned is not None:
             from vibespatial.spatial.distance_owned import distance_owned
+
             return distance_owned(self._owned, other_owned)
 
         # Shapely fallback for unsupported 'other' types.
@@ -1479,10 +1604,12 @@ class DeviceGeometryArray(ExtensionArray):
         other_owned = self._coerce_other_to_owned(other)
         if other_owned is not None:
             from vibespatial.spatial.distance_owned import dwithin_owned
+
             return dwithin_owned(self._owned, other_owned, distance)
         # Shapely fallback for unsupported 'other' types.
         from vibespatial.runtime import ExecutionMode
         from vibespatial.runtime.dispatch import record_dispatch_event
+
         d = self.distance(other)
         record_dispatch_event(
             surface="DeviceGeometryArray.dwithin",
@@ -1493,6 +1620,26 @@ class DeviceGeometryArray(ExtensionArray):
             selected=ExecutionMode.CPU,
         )
         return np.where(np.isnan(d), False, d <= distance)
+
+    def _dwithin_scalar_with_native_rowset(
+        self,
+        other,
+        distance,
+        *,
+        source_token=None,
+        source_row_count=None,
+    ):
+        """Return public scalar-dwithin mask plus private device row positions."""
+        if not isinstance(other, BaseGeometry):
+            return None
+        return _dwithin_scalar(
+            self,
+            other,
+            distance,
+            return_rowset=True,
+            source_token=source_token,
+            source_row_count=source_row_count,
+        )
 
     def hausdorff_distance(self, other, densify=None):
         other_owned = self._coerce_other_to_owned(other)
@@ -1521,9 +1668,7 @@ class DeviceGeometryArray(ExtensionArray):
         )
         if isinstance(other, DeviceGeometryArray):
             other = other._ensure_shapely_cache()
-        return shapely.hausdorff_distance(
-            self._ensure_shapely_cache(), other, densify=densify
-        )
+        return shapely.hausdorff_distance(self._ensure_shapely_cache(), other, densify=densify)
 
     def frechet_distance(self, other, densify=None):
         other_owned = self._coerce_other_to_owned(other)
@@ -1552,9 +1697,7 @@ class DeviceGeometryArray(ExtensionArray):
         )
         if isinstance(other, DeviceGeometryArray):
             other = other._ensure_shapely_cache()
-        return shapely.frechet_distance(
-            self._ensure_shapely_cache(), other, densify=densify
-        )
+        return shapely.frechet_distance(self._ensure_shapely_cache(), other, densify=densify)
 
     def clip_by_rect(self, xmin, ymin, xmax, ymax):
         import shapely
@@ -1581,15 +1724,18 @@ class DeviceGeometryArray(ExtensionArray):
                 and self._owned.residency is Residency.DEVICE
             )
             else (
-            ExecutionMode.CPU
-            if requested_mode is not ExecutionMode.GPU and not gpu_family_supported
-            else requested_mode
+                ExecutionMode.CPU
+                if requested_mode is not ExecutionMode.GPU and not gpu_family_supported
+                else requested_mode
             )
         )
 
         result = clip_by_rect_owned(
             self._owned,
-            xmin, ymin, xmax, ymax,
+            xmin,
+            ymin,
+            xmax,
+            ymax,
             dispatch_mode=dispatch_mode,
         )
         selected = result.runtime_selection.selected
@@ -1643,23 +1789,33 @@ class DeviceGeometryArray(ExtensionArray):
         other_owned = self._coerce_other_to_owned(other)
         if other_owned is not None:
             from vibespatial.constructive.binary_constructive import (
-                binary_constructive_owned,
+                binary_constructive_native,
             )
             from vibespatial.runtime.crossover import WorkloadShape
 
             grid_size = kwargs.get("grid_size", None)
             workload_shape = None
             from shapely.geometry.base import BaseGeometry as _BG
+
             if isinstance(other, _BG):
                 workload_shape = WorkloadShape.SCALAR_RIGHT
-            result_owned = binary_constructive_owned(
+            result_geometry = binary_constructive_native(
                 op,
                 self._owned,
                 other_owned,
                 grid_size=grid_size,
                 workload_shape=workload_shape,
             )
-            return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
+            result_geometry = result_geometry.with_crs(self._crs)
+            if result_geometry.owned is not None:
+                return DeviceGeometryArray._from_owned(
+                    result_geometry.owned,
+                    crs=self._crs,
+                )
+            return result_geometry.to_geoseries(
+                index=pd.RangeIndex(len(self)),
+                name="geometry",
+            ).values
 
         # Shapely fallback for unsupported other types
         import shapely
@@ -1681,9 +1837,7 @@ class DeviceGeometryArray(ExtensionArray):
         )
         if isinstance(other, DeviceGeometryArray):
             other = other._ensure_shapely_cache()
-        result = getattr(shapely, op)(
-            self._ensure_shapely_cache(), other, *args, **kwargs
-        )
+        result = getattr(shapely, op)(self._ensure_shapely_cache(), other, *args, **kwargs)
         try:
             new_owned = from_shapely_geometries(result.tolist())
         except NotImplementedError:
@@ -1723,16 +1877,42 @@ class DeviceGeometryArray(ExtensionArray):
 
     def _materialize_row(self, row_index: int) -> BaseGeometry | None:
         """Materialize a single row without populating the full cache."""
-        if not bool(self._owned.validity[row_index]):
-            return None
-        # Check cache first
         if self._shapely_cache is not None:
             return self._shapely_cache[row_index]
+        if self._owned.is_indexed_view:
+            self._owned._ensure_host_state()
+            if not bool(self._owned.validity[row_index]):
+                return None
+            family_tag = int(self._owned.tags[row_index])
+            family_row = int(self._owned.family_row_offsets[row_index])
+            family = TAG_FAMILIES[family_tag]
+            family_buffer = self._owned.families[family]
+            return materialize_family_row(family_buffer, family_row)
+
+        row_metadata = None
+        if (
+            getattr(self._owned, "_validity", None) is None
+            or getattr(self._owned, "_tags", None) is None
+            or getattr(self._owned, "_family_row_offsets", None) is None
+        ):
+            row_metadata = _device_row_metadata(
+                self._owned,
+                row_index,
+                reason="DeviceGeometryArray scalar row metadata device export",
+            )
+        if row_metadata is None:
+            if not bool(self._owned.validity[row_index]):
+                return None
+            family_tag = int(self._owned.tags[row_index])
+            family_row = int(self._owned.family_row_offsets[row_index])
+        else:
+            valid, family_tag, family_row = row_metadata
+            if not valid:
+                return None
         # Ensure host state for the specific family
         self._owned._ensure_host_state()
-        family = TAG_FAMILIES[int(self._owned.tags[row_index])]
+        family = TAG_FAMILIES[family_tag]
         family_buffer = self._owned.families[family]
-        family_row = int(self._owned.family_row_offsets[row_index])
         return materialize_family_row(family_buffer, family_row)
 
     # ------------------------------------------------------------------
@@ -1762,12 +1942,7 @@ class DeviceGeometryArray(ExtensionArray):
                 idx += len(self)
             return self._materialize_row(idx)
 
-        if (
-            isinstance(idx, slice)
-            and idx.start is None
-            and idx.stop is None
-            and idx.step is None
-        ):
+        if isinstance(idx, slice) and idx.start is None and idx.stop is None and idx.step is None:
             return self.view()
 
         # Slice or array-like
@@ -1806,8 +1981,11 @@ class DeviceGeometryArray(ExtensionArray):
                     return
                 if len(indices) == value._owned.row_count:
                     from vibespatial.geometry.owned import concat_owned_scatter
+
                     self._owned = concat_owned_scatter(
-                        self._owned, value._owned, indices,
+                        self._owned,
+                        value._owned,
+                        indices,
                     )
                     self._shapely_cache = None
                     self._provenance = None
@@ -1831,7 +2009,8 @@ class DeviceGeometryArray(ExtensionArray):
 
     @staticmethod
     def _resolve_setitem_indices(
-        key: Any, value_len: int,
+        key: Any,
+        value_len: int,
     ) -> np.ndarray | None:
         """Convert a __setitem__ key to a flat int64 index array, or None."""
         if isinstance(key, np.ndarray):
@@ -1890,10 +2069,7 @@ class DeviceGeometryArray(ExtensionArray):
                 safe_indices = indices.copy()
                 safe_indices[mask] = 0
                 new_owned = self._owned.take(safe_indices)
-                # Patch nulls into fill positions
-                new_owned.validity[mask] = False
-                new_owned.tags[mask] = NULL_TAG
-                new_owned.family_row_offsets[mask] = -1
+                new_owned._apply_row_activity(~mask)
                 return DeviceGeometryArray._from_owned(
                     new_owned,
                     crs=self._crs,
@@ -1924,9 +2100,7 @@ class DeviceGeometryArray(ExtensionArray):
         return result
 
     @classmethod
-    def _concat_same_type(
-        cls, to_concat: Sequence[DeviceGeometryArray]
-    ) -> DeviceGeometryArray:
+    def _concat_same_type(cls, to_concat: Sequence[DeviceGeometryArray]) -> DeviceGeometryArray:
         if not to_concat:
             empty_owned = OwnedGeometryArray(
                 validity=np.array([], dtype=bool),
@@ -1956,9 +2130,7 @@ class DeviceGeometryArray(ExtensionArray):
                 except NotImplementedError:
                     from vibespatial.api.geometry_array import GeometryArray
 
-                    data = np.concatenate(
-                        [np.asarray(ga, dtype=object) for ga in to_concat]
-                    )
+                    data = np.concatenate([np.asarray(ga, dtype=object) for ga in to_concat])
                     crs = None
                     for ga in to_concat:
                         if getattr(ga, "_crs", None) is not None:
@@ -1995,7 +2167,9 @@ class DeviceGeometryArray(ExtensionArray):
         wkb = _serialize_owned_wkb(self._owned)
         return (wkb, self._crs, self._owned.residency.value)
 
-    def __setstate__(self, state: tuple[list[bytes | None], Any] | tuple[list[bytes | None], Any, str]) -> None:
+    def __setstate__(
+        self, state: tuple[list[bytes | None], Any] | tuple[list[bytes | None], Any, str]
+    ) -> None:
         from vibespatial.io.arrow import decode_wkb_owned
 
         if len(state) == 2:
@@ -2031,13 +2205,14 @@ class DeviceGeometryArray(ExtensionArray):
                 wkb[i] = shapely.to_wkb(geom)
         return wkb, None
 
-    def _reduce(self, name: str, *, skipna: bool = True, keepdims: bool = False, **kwargs: Any) -> Any:
+    def _reduce(
+        self, name: str, *, skipna: bool = True, keepdims: bool = False, **kwargs: Any
+    ) -> Any:
         if name in ("any", "all"):
             cache = self._ensure_shapely_cache()
             return getattr(cache, name)(keepdims=keepdims)
         raise TypeError(
-            f"'{type(self).__name__}' with dtype {self.dtype} "
-            f"does not support reduction '{name}'"
+            f"'{type(self).__name__}' with dtype {self.dtype} does not support reduction '{name}'"
         )
 
     def __array__(self, dtype: Any = None, copy: Any = None) -> np.ndarray:
@@ -2046,18 +2221,20 @@ class DeviceGeometryArray(ExtensionArray):
             record_native_export_boundary,
         )
 
-        record_native_export_boundary(NativeExportBoundary(
-            surface="vibespatial.geometry.DeviceGeometryArray.__array__",
-            operation="device_geometryarray_to_numpy",
-            target="numpy",
-            reason="device geometry array exported through NumPy array protocol",
-            detail=(
-                "residency="
-                f"{getattr(getattr(self._owned, 'residency', None), 'value', 'unknown')}"
-            ),
-            row_count=self._owned.row_count,
-            d2h_transfer=self._owned.device_state is not None,
-        ))
+        record_native_export_boundary(
+            NativeExportBoundary(
+                surface="vibespatial.geometry.DeviceGeometryArray.__array__",
+                operation="device_geometryarray_to_numpy",
+                target="numpy",
+                reason="device geometry array exported through NumPy array protocol",
+                detail=(
+                    "residency="
+                    f"{getattr(getattr(self._owned, 'residency', None), 'value', 'unknown')}"
+                ),
+                row_count=self._owned.row_count,
+                d2h_transfer=self._owned.device_state is not None,
+            )
+        )
         cache = self._ensure_shapely_cache()
         if dtype is not None:
             return cache.astype(dtype)
@@ -2097,7 +2274,11 @@ def _concat_family_buffers(
     for b in buffers:
         shifted = b.geometry_offsets[:-1] + coord_cursor
         geom_offset_parts.append(shifted)
-        if family in (GeometryFamily.POLYGON, GeometryFamily.MULTILINESTRING, GeometryFamily.MULTIPOLYGON):
+        if family in (
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTILINESTRING,
+            GeometryFamily.MULTIPOLYGON,
+        ):
             # geometry_offsets index into ring/part offsets, not coords
             coord_cursor += int(b.geometry_offsets[-1])
         else:
@@ -2180,7 +2361,9 @@ def _copy_family_buffer(buf: FamilyGeometryBuffer) -> FamilyGeometryBuffer:
     )
 
 
-def _copy_device_family_buffer(device_buf: DeviceFamilyGeometryBuffer) -> DeviceFamilyGeometryBuffer:
+def _copy_device_family_buffer(
+    device_buf: DeviceFamilyGeometryBuffer,
+) -> DeviceFamilyGeometryBuffer:
     import cupy as cp
 
     return DeviceFamilyGeometryBuffer(
@@ -2193,17 +2376,50 @@ def _copy_device_family_buffer(device_buf: DeviceFamilyGeometryBuffer) -> Device
         ring_offsets=None if device_buf.ring_offsets is None else cp.copy(device_buf.ring_offsets),
         bounds=None if device_buf.bounds is None else cp.copy(device_buf.bounds),
         dense_single_ring_width=device_buf.dense_single_ring_width,
+        axis_aligned_rectangles=device_buf.axis_aligned_rectangles,
+        regular_grid_rect=device_buf.regular_grid_rect,
     )
 
 
 def _copy_owned_array(owned: OwnedGeometryArray) -> OwnedGeometryArray:
+    if getattr(owned, "_is_lazy_grouped_union_owned", False):
+        return owned.copy()
+    if owned.is_indexed_view and owned._base is not None and owned._index_map is not None:
+        index_map = (
+            _copy_device_array(owned._index_map)
+            if hasattr(owned._index_map, "__cuda_array_interface__")
+            else np.asarray(owned._index_map, dtype=np.int64).copy()
+        )
+        new_owned = OwnedGeometryArray._indexed_view(owned._base, index_map)
+        new_owned._validity = None if owned._validity is None else owned._validity.copy()
+        new_owned._tags = None if owned._tags is None else owned._tags.copy()
+        new_owned._family_row_offsets = (
+            None if owned._family_row_offsets is None else owned._family_row_offsets.copy()
+        )
+        new_owned.residency = owned.residency
+        new_owned.geoarrow_backed = owned.geoarrow_backed
+        new_owned.shares_geoarrow_memory = owned.shares_geoarrow_memory
+        new_owned.device_adopted = owned.device_adopted
+        if (
+            owned.device_state is not None
+            and new_owned.device_state is not None
+            and owned.device_state.row_bounds is not None
+        ):
+            new_owned.device_state.row_bounds = _copy_device_array(owned.device_state.row_bounds)
+        if owned.device_state is not None and new_owned.device_state is not None:
+            _copy_device_state_semantic_metadata(owned.device_state, new_owned.device_state)
+        cached_validity = owned._current_cached_validity_mask()
+        if cached_validity is not None:
+            new_owned._cached_is_valid_mask = cached_validity.copy()
+        if hasattr(owned, "_grouped_convex_hull_source"):
+            new_owned._grouped_convex_hull_source = owned._grouped_convex_hull_source
+        return new_owned
+
     new_owned = OwnedGeometryArray(
         validity=None if owned._validity is None else owned._validity.copy(),
         tags=None if owned._tags is None else owned._tags.copy(),
         family_row_offsets=(
-            None
-            if owned._family_row_offsets is None
-            else owned._family_row_offsets.copy()
+            None if owned._family_row_offsets is None else owned._family_row_offsets.copy()
         ),
         families={family: _copy_family_buffer(buf) for family, buf in owned.families.items()},
         residency=owned.residency,
@@ -2226,12 +2442,22 @@ def _copy_owned_array(owned: OwnedGeometryArray) -> OwnedGeometryArray:
                 else None
             ),
         )
+        _copy_device_state_semantic_metadata(owned.device_state, new_owned.device_state)
     cached_validity = owned._current_cached_validity_mask()
     if cached_validity is not None:
         new_owned._cached_is_valid_mask = cached_validity.copy()
     if hasattr(owned, "_grouped_convex_hull_source"):
         new_owned._grouped_convex_hull_source = owned._grouped_convex_hull_source
     return new_owned
+
+
+def _copy_device_state_semantic_metadata(source, target) -> None:
+    target.trusted_all_valid = source.trusted_all_valid
+    target.trusted_homogeneous_family = source.trusted_homogeneous_family
+    target.trusted_all_non_empty = source.trusted_all_non_empty
+    target.trusted_polygonal_only = source.trusted_polygonal_only
+    target.trusted_unique_family_rows = source.trusted_unique_family_rows
+    target.trusted_family_domain = source.trusted_family_domain
 
 
 def _copy_device_array(device_array):
@@ -2273,7 +2499,9 @@ def _serialize_owned_wkb(owned: OwnedGeometryArray) -> list[bytes | None]:
     return [None if value is None else value for value in _encode_owned_wkb_values(owned)]
 
 
-def _host_view_family_buffer(owned: OwnedGeometryArray, family: GeometryFamily) -> dict[str, np.ndarray | None]:
+def _host_view_family_buffer(
+    owned: OwnedGeometryArray, family: GeometryFamily
+) -> dict[str, np.ndarray | None]:
     buf = owned.families[family]
     if buf.host_materialized:
         return {
@@ -2345,7 +2573,9 @@ def _normalize_wkt_kwargs(kwargs: dict[str, Any]) -> tuple[int, bool]:
     if output_dimension not in (2, None):
         raise NotImplementedError("DeviceGeometryArray.to_wkt currently supports only 2D output")
     if old_3d not in (False, None):
-        raise NotImplementedError("DeviceGeometryArray.to_wkt does not support legacy 3D formatting")
+        raise NotImplementedError(
+            "DeviceGeometryArray.to_wkt does not support legacy 3D formatting"
+        )
     return rounding_precision, trim
 
 
@@ -2379,7 +2609,9 @@ def _format_wkt_coord_range(
     trim: bool,
 ) -> str:
     return ", ".join(
-        _format_wkt_coord(float(x[idx]), float(y[idx]), rounding_precision=rounding_precision, trim=trim)
+        _format_wkt_coord(
+            float(x[idx]), float(y[idx]), rounding_precision=rounding_precision, trim=trim
+        )
         for idx in range(int(start), int(stop))
     )
 
@@ -2399,7 +2631,9 @@ def _encode_family_row_wkt(
     part_offsets = host_view["part_offsets"]
     ring_offsets = host_view["ring_offsets"]
 
-    assert x is not None and y is not None and geometry_offsets is not None and empty_mask is not None
+    assert (
+        x is not None and y is not None and geometry_offsets is not None and empty_mask is not None
+    )
     if bool(empty_mask[row]):
         return f"{family.value.upper()} EMPTY"
 
@@ -2429,7 +2663,9 @@ def _encode_family_row_wkt(
         for ring_idx in range(ring_start, ring_stop):
             start = int(ring_offsets[ring_idx])
             stop = int(ring_offsets[ring_idx + 1])
-            rings.append(f"({_format_wkt_coord_range(x, y, start, stop, rounding_precision=rounding_precision, trim=trim)})")
+            rings.append(
+                f"({_format_wkt_coord_range(x, y, start, stop, rounding_precision=rounding_precision, trim=trim)})"
+            )
         return f"POLYGON ({', '.join(rings)})"
 
     if family is GeometryFamily.MULTILINESTRING:
@@ -2440,7 +2676,9 @@ def _encode_family_row_wkt(
         for part_idx in range(part_start, part_stop):
             start = int(part_offsets[part_idx])
             stop = int(part_offsets[part_idx + 1])
-            parts.append(f"({_format_wkt_coord_range(x, y, start, stop, rounding_precision=rounding_precision, trim=trim)})")
+            parts.append(
+                f"({_format_wkt_coord_range(x, y, start, stop, rounding_precision=rounding_precision, trim=trim)})"
+            )
         return f"MULTILINESTRING ({', '.join(parts)})"
 
     if family is GeometryFamily.MULTIPOLYGON:
@@ -2455,7 +2693,9 @@ def _encode_family_row_wkt(
             for ring_idx in range(ring_start, ring_stop):
                 start = int(ring_offsets[ring_idx])
                 stop = int(ring_offsets[ring_idx + 1])
-                rings.append(f"({_format_wkt_coord_range(x, y, start, stop, rounding_precision=rounding_precision, trim=trim)})")
+                rings.append(
+                    f"({_format_wkt_coord_range(x, y, start, stop, rounding_precision=rounding_precision, trim=trim)})"
+                )
             polygons.append(f"({', '.join(rings)})")
         return f"MULTIPOLYGON ({', '.join(polygons)})"
 
@@ -2464,10 +2704,9 @@ def _encode_family_row_wkt(
 
 def _encode_owned_wkt_values(owned: OwnedGeometryArray, **kwargs: Any) -> list[str | None]:
     rounding_precision, trim = _normalize_wkt_kwargs(dict(kwargs))
-    family_views = {
-        family: _host_view_family_buffer(owned, family)
-        for family in owned.families
-    }
+    if owned.device_state is not None:
+        owned._ensure_device_state()
+    family_views = {family: _host_view_family_buffer(owned, family) for family in owned.families}
     values: list[str | None] = [None] * owned.row_count
     for row_index in range(owned.row_count):
         if not bool(owned.validity[row_index]):
@@ -2564,6 +2803,33 @@ def _compute_total_bounds_from_owned_device(owned: OwnedGeometryArray) -> np.nda
     except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
         return _compute_total_bounds_from_owned_host(owned)
 
+    if getattr(owned, "is_indexed_view", False):
+        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
+
+        d_bounds = compute_geometry_bounds_device(
+            owned,
+            preserve_indexed_view=True,
+        )
+        finite = ~cp.isnan(d_bounds[:, 0])
+        runtime = get_cuda_runtime()
+        has_finite = runtime.copy_device_to_host(
+            cp.asarray(cp.any(finite), dtype=cp.bool_).reshape(1),
+            reason="DeviceGeometryArray total-bounds row-indirected finite scalar boundary",
+        )
+        if not bool(np.asarray(has_finite, dtype=np.bool_).reshape(1)[0]):
+            return np.array([np.nan, np.nan, np.nan, np.nan], dtype=np.float64)
+        selected = d_bounds[finite]
+        bounds_device = cp.concatenate(
+            (
+                cp.amin(selected[:, :2], axis=0),
+                cp.amax(selected[:, 2:], axis=0),
+            )
+        ).astype(cp.float64)
+        return runtime.copy_device_to_host(
+            bounds_device,
+            reason="DeviceGeometryArray total-bounds row-indirected device summary host boundary",
+        )
+
     state = owned._ensure_device_state()
     mins: list[object] = []
     maxs: list[object] = []
@@ -2590,9 +2856,7 @@ def _compute_total_bounds_from_owned_device(owned: OwnedGeometryArray) -> np.nda
 def _compute_total_bounds_from_owned_host(owned: OwnedGeometryArray) -> np.ndarray:
     b = _compute_bounds_from_owned_host(owned)
     with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore", r"All-NaN slice encountered", RuntimeWarning
-        )
+        warnings.filterwarnings("ignore", r"All-NaN slice encountered", RuntimeWarning)
         return np.array(
             (
                 np.nanmin(b[:, 0]),
@@ -2618,8 +2882,7 @@ def _compute_bounds_from_owned_host(owned: OwnedGeometryArray) -> np.ndarray:
     # pre-computed bounds.  Device-backed buffers store x/y on the GPU and
     # keep host arrays empty; _compute_family_bounds needs the host arrays.
     needs_host = any(
-        buf.bounds is None and not buf.host_materialized
-        for buf in owned.families.values()
+        buf.bounds is None and not buf.host_materialized for buf in owned.families.values()
     )
     if needs_host:
         owned._ensure_host_state()
@@ -2650,7 +2913,13 @@ def _compute_bounds_from_owned(owned: OwnedGeometryArray) -> np.ndarray:
 
 
 def _dwithin_scalar(
-    dga: DeviceGeometryArray, geom: BaseGeometry, dist: float
+    dga: DeviceGeometryArray,
+    geom: BaseGeometry,
+    dist: float,
+    *,
+    return_rowset: bool = False,
+    source_token=None,
+    source_row_count=None,
 ) -> np.ndarray:
     """dwithin against a single geometry — fully device-native.
 
@@ -2661,6 +2930,12 @@ def _dwithin_scalar(
       4. CuPy threshold filter + scatter into device boolean result (Tier 2)
       5. Single cp.asnumpy D→H for the final boolean array
     """
+
+    def _return(mask, rowset=None):
+        if return_rowset:
+            return mask, rowset
+        return mask
+
     from vibespatial.runtime import ExecutionMode, get_requested_mode
     from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 
@@ -2682,7 +2957,7 @@ def _dwithin_scalar(
             detail=f"rows={len(dga)}",
             selected=ExecutionMode.CPU,
         )
-        return result
+        return _return(result)
 
     n = len(dga)
     owned = dga._owned
@@ -2694,14 +2969,27 @@ def _dwithin_scalar(
     # 1. Bbox candidate filter on device (Tier 2 CuPy).
     bx0, by0, bx1, by1 = geom.bounds
     d_cand_mask = (
-        (d_bounds[:, 2] >= bx0 - dist) & (d_bounds[:, 0] <= bx1 + dist) &
-        (d_bounds[:, 3] >= by0 - dist) & (d_bounds[:, 1] <= by1 + dist)
+        (d_bounds[:, 2] >= bx0 - dist)
+        & (d_bounds[:, 0] <= bx1 + dist)
+        & (d_bounds[:, 3] >= by0 - dist)
+        & (d_bounds[:, 1] <= by1 + dist)
     )
     d_candidates = cp.flatnonzero(d_cand_mask)
     cand_count = int(d_candidates.size)
 
     if cand_count == 0:
-        return np.zeros(n, dtype=bool)
+        rowset = None
+        if return_rowset:
+            from vibespatial.api._native_rowset import NativeRowSet
+
+            rowset = NativeRowSet.from_positions(
+                cp.empty(0, dtype=cp.int64),
+                source_token=source_token,
+                source_row_count=source_row_count if source_row_count is not None else n,
+                ordered=True,
+                unique=True,
+            )
+        return _return(np.zeros(n, dtype=bool), rowset)
 
     # 2. Build 1-row query owned and move to device (~30 bytes H→D).
     query_owned = from_shapely_geometries([geom])
@@ -2718,6 +3006,7 @@ def _dwithin_scalar(
 
     # Resolve precision for the distance kernel (METRIC class per ADR-0002).
     from vibespatial.runtime._runtime import RuntimeSelection
+
     precision_selection = RuntimeSelection(
         requested=ExecutionMode.GPU,
         selected=ExecutionMode.GPU,
@@ -2731,7 +3020,12 @@ def _dwithin_scalar(
 
     # Dispatch to the appropriate distance kernel based on families.
     ok = _dwithin_dispatch_distance(
-        query_owned, owned, d_left, d_right, d_distances, cand_count,
+        query_owned,
+        owned,
+        d_left,
+        d_right,
+        d_distances,
+        cand_count,
         compute_precision=precision_plan.compute_precision,
     )
 
@@ -2746,10 +3040,21 @@ def _dwithin_scalar(
             detail=f"rows={n}, candidates={cand_count}",
             selected=ExecutionMode.CPU,
         )
-        return _dwithin_scalar_cpu(dga, geom, dist)
+        return _return(_dwithin_scalar_cpu(dga, geom, dist))
 
     # 4. Threshold filter + scatter on device (Tier 2 CuPy).
     d_within = cp.asarray(d_distances) <= dist
+    rowset = None
+    if return_rowset:
+        from vibespatial.api._native_rowset import NativeRowSet
+
+        rowset = NativeRowSet.from_positions(
+            d_candidates[d_within].astype(cp.int64, copy=False),
+            source_token=source_token,
+            source_row_count=source_row_count if source_row_count is not None else n,
+            ordered=True,
+            unique=True,
+        )
     d_result = cp.zeros(n, dtype=cp.bool_)
     d_result[d_candidates[d_within]] = True
     runtime.free(d_distances)
@@ -2763,10 +3068,11 @@ def _dwithin_scalar(
         detail=f"rows={n}, candidates={cand_count}",
         selected=ExecutionMode.GPU,
     )
-    return get_cuda_runtime().copy_device_to_host(
+    result = get_cuda_runtime().copy_device_to_host(
         d_result,
         reason="DeviceGeometryArray dwithin scalar result host boundary",
     )
+    return _return(result, rowset)
 
 
 def _ensure_device_row_bounds(owned: OwnedGeometryArray):
@@ -2823,10 +3129,14 @@ def _dwithin_dispatch_distance(
         return False
 
     PT = GeometryFamily.POINT
-    _POINT_DISTANCE_FAMILIES = frozenset({
-        GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING,
-        GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON,
-    })
+    _POINT_DISTANCE_FAMILIES = frozenset(
+        {
+            GeometryFamily.LINESTRING,
+            GeometryFamily.MULTILINESTRING,
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTIPOLYGON,
+        }
+    )
     _SEGMENT_FAMILIES = _POINT_DISTANCE_FAMILIES
 
     # Point query — most common for dwithin (centroid, POI, etc.)
@@ -2834,13 +3144,24 @@ def _dwithin_dispatch_distance(
         for tree_family in tree_families:
             if tree_family == PT:
                 from vibespatial.spatial.nearest import _launch_point_point_distance_kernel
+
                 _launch_point_point_distance_kernel(
-                    query_owned, tree_owned, d_left, d_right, d_distances, pair_count,
+                    query_owned,
+                    tree_owned,
+                    d_left,
+                    d_right,
+                    d_distances,
+                    pair_count,
                 )
                 return True
             if tree_family in _POINT_DISTANCE_FAMILIES:
                 return compute_point_distance_gpu(
-                    query_owned, tree_owned, d_left, d_right, d_distances, pair_count,
+                    query_owned,
+                    tree_owned,
+                    d_left,
+                    d_right,
+                    d_distances,
+                    pair_count,
                     tree_family=tree_family,
                     compute_precision=compute_precision,
                 )
@@ -2849,7 +3170,12 @@ def _dwithin_dispatch_distance(
     # Non-point query vs point tree — swap so point is on the query side.
     if PT in tree_families and query_family in _POINT_DISTANCE_FAMILIES:
         return compute_point_distance_gpu(
-            tree_owned, query_owned, d_right, d_left, d_distances, pair_count,
+            tree_owned,
+            query_owned,
+            d_right,
+            d_left,
+            d_distances,
+            pair_count,
             tree_family=query_family,
             compute_precision=compute_precision,
         )
@@ -2859,16 +3185,20 @@ def _dwithin_dispatch_distance(
         for tree_family in tree_families:
             if tree_family in _SEGMENT_FAMILIES:
                 return compute_segment_distance_gpu(
-                    query_owned, tree_owned, d_left, d_right, d_distances, pair_count,
-                    query_family=query_family, tree_family=tree_family,
+                    query_owned,
+                    tree_owned,
+                    d_left,
+                    d_right,
+                    d_distances,
+                    pair_count,
+                    query_family=query_family,
+                    tree_family=tree_family,
                 )
 
     return False
 
 
-def _dwithin_scalar_cpu(
-    dga: DeviceGeometryArray, geom: BaseGeometry, dist: float
-) -> np.ndarray:
+def _dwithin_scalar_cpu(dga: DeviceGeometryArray, geom: BaseGeometry, dist: float) -> np.ndarray:
     """CPU fallback for dwithin — sindex prefilter + Shapely distance on candidates."""
     import shapely
 

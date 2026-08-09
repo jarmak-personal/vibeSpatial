@@ -162,6 +162,7 @@ def test_geopandas_buffer_gpu_preserves_null_point_rows() -> None:
     )
 
 
+@pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
 def test_linestring_buffer_owned_gpu_matches_shapely_after_normalize() -> None:
     line = LineString([(0, 0), (0, 2), (2, 2)])
     owned = from_shapely_geometries([line])
@@ -219,6 +220,7 @@ def test_buffer_native_tabular_results_cover_row_aligned_stroke_families() -> No
         assert result.geometry_metadata.row_count == 1
 
 
+@pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
 def test_linestring_buffer_owned_gpu_two_point_grid_segments_match_shapely() -> None:
     lines = np.asarray(
         [
@@ -252,6 +254,7 @@ def test_linestring_buffer_owned_gpu_two_point_grid_segments_match_shapely() -> 
     )
 
 
+@pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
 def test_linestring_buffer_owned_gpu_square_cap_elbow_matches_shapely_after_normalize() -> None:
     line = LineString([(0, 0), (10, 0), (10, 10)])
     owned = from_shapely_geometries([line])
@@ -282,6 +285,7 @@ def test_linestring_buffer_owned_gpu_square_cap_elbow_matches_shapely_after_norm
     )
 
 
+@pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
 def test_linestring_buffer_owned_gpu_real_vegetation_corridor_line_has_stable_vertex_count() -> None:
     line = LineString(
         [

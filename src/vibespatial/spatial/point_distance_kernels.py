@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 
-_POINT_DISTANCE_KERNEL_SOURCE_TEMPLATE = PRECISION_PREAMBLE + """
+_POINT_DISTANCE_KERNEL_SOURCE_TEMPLATE = (
+    PRECISION_PREAMBLE
+    + """
 
 #if !defined(INFINITY)
 #define INFINITY __longlong_as_double(0x7FF0000000000000LL)
@@ -407,6 +409,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void point_multipolygon_distance
   out_distances[i] = (double)sqrt((double)best);
 }}
 """
+)
 
 _POINT_DISTANCE_KERNEL_NAMES = (
     "point_linestring_distance_from_owned",

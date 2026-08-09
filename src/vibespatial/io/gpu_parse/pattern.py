@@ -15,6 +15,7 @@ Typical pipeline:
 All functions operate on device-resident arrays with zero host
 materialization.
 """
+
 from __future__ import annotations
 
 import ctypes
@@ -70,9 +71,7 @@ def _generate_pattern_match_source(
 
     # Build the quote-parity check clause
     if check_quote:
-        quote_param = (
-            "    const unsigned char* __restrict__ quote_parity,\n"
-        )
+        quote_param = "    const unsigned char* __restrict__ quote_parity,\n"
         quote_check = (
             f"    if (match && quote_parity[idx + {quote_check_offset}] != 0) {{\n"
             f"        match = 0;\n"
@@ -108,9 +107,7 @@ def _generate_pattern_match_source(
     return source
 
 
-def _compile_pattern_match(
-    pattern: bytes, check_quote: bool, quote_check_offset: int
-) -> dict:
+def _compile_pattern_match(pattern: bytes, check_quote: bool, quote_check_offset: int) -> dict:
     """Compile (or retrieve from cache) a pattern-specific kernel."""
     # Cache key incorporates the full pattern bytes and quote-check config
     cache_key_tuple = (pattern, check_quote, quote_check_offset)
@@ -118,9 +115,7 @@ def _compile_pattern_match(
     if cached is not None:
         return cached
 
-    source = _generate_pattern_match_source(
-        pattern, check_quote, quote_check_offset
-    )
+    source = _generate_pattern_match_source(pattern, check_quote, quote_check_offset)
     # Use pattern hex in the NVRTC cache key for uniqueness
     pat_hex = pattern.hex()
     qc_suffix = f"-qc{quote_check_offset}" if check_quote else "-noqc"
@@ -151,15 +146,18 @@ def _compile_pattern_match(
 # pattern_match kernels are generated per-pattern and compiled on demand.
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("parse-span-boundaries", _SPAN_BOUNDARIES_SOURCE, _SPAN_BOUNDARIES_NAMES),
-    ("parse-mark-spans", _MARK_SPANS_SOURCE, _MARK_SPANS_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("parse-span-boundaries", _SPAN_BOUNDARIES_SOURCE, _SPAN_BOUNDARIES_NAMES),
+        ("parse-mark-spans", _MARK_SPANS_SOURCE, _MARK_SPANS_NAMES),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # Kernel compilation helpers (static kernels)
 # ---------------------------------------------------------------------------
+
 
 def _span_boundaries_kernels():
     return compile_kernel_group(
@@ -168,14 +166,13 @@ def _span_boundaries_kernels():
 
 
 def _mark_spans_kernels():
-    return compile_kernel_group(
-        "parse-mark-spans", _MARK_SPANS_SOURCE, _MARK_SPANS_NAMES
-    )
+    return compile_kernel_group("parse-mark-spans", _MARK_SPANS_SOURCE, _MARK_SPANS_NAMES)
 
 
 # ---------------------------------------------------------------------------
 # Launch helper
 # ---------------------------------------------------------------------------
+
 
 def _launch_kernel(runtime, kernel, n, params):
     """Launch a kernel with occupancy-based grid/block sizing."""
@@ -186,6 +183,7 @@ def _launch_kernel(runtime, kernel, n, params):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def pattern_match(
     d_bytes: cp.ndarray,

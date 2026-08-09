@@ -71,6 +71,42 @@ def point_distance(device_array):
     assert [error.code for error in errors] == ["ARCH004"]
 
 
+def test_kernel_host_transfer_rule_allows_mapping_get(tmp_path: Path) -> None:
+    write_file(
+        tmp_path / "src" / "vibespatial" / "kernels" / "distance.py",
+        """
+from vibespatial.runtime.kernel_registry import register_kernel_variant
+
+
+@register_kernel_variant("point_distance", "cpu")
+def point_distance(state, family):
+    first = state.families.get(family)
+    return state.families.get(family, first)
+""".strip()
+        + "\n",
+    )
+
+    assert run_checks(tmp_path) == []
+
+
+def test_kernel_host_transfer_rule_blocks_keyword_only_device_get(tmp_path: Path) -> None:
+    write_file(
+        tmp_path / "src" / "vibespatial" / "kernels" / "distance.py",
+        """
+from vibespatial.runtime.kernel_registry import register_kernel_variant
+
+
+@register_kernel_variant("point_distance", "cpu")
+def point_distance(device_array, stream):
+    return device_array.get(stream=stream)
+""".strip()
+        + "\n",
+    )
+
+    errors = run_checks(tmp_path)
+    assert [error.code for error in errors] == ["ARCH004"]
+
+
 def test_materialization_methods_may_transfer_to_host(tmp_path: Path) -> None:
     write_file(
         tmp_path / "src" / "vibespatial" / "kernels" / "distance.py",
@@ -180,6 +216,25 @@ def area_owned(owned: OwnedGeometryArray, dispatch_mode):
     )
 """.strip()
         + "\n",
+    )
+
+    assert run_checks(tmp_path) == []
+
+
+def test_compute_paths_cannot_invoke_mutating_device_resolution(tmp_path: Path) -> None:
+    write_file(
+        tmp_path / "src" / "vibespatial" / "constructive" / "ops.py",
+        "def execute(owned):\n    owned._device_resolve()\n",
+    )
+
+    errors = run_checks(tmp_path)
+    assert [error.code for error in errors] == ["ARCH009"]
+
+
+def test_owned_carrier_may_implement_mutating_device_resolution(tmp_path: Path) -> None:
+    write_file(
+        tmp_path / "src" / "vibespatial" / "geometry" / "owned.py",
+        "def resolve(owned):\n    owned._device_resolve()\n",
     )
 
     assert run_checks(tmp_path) == []

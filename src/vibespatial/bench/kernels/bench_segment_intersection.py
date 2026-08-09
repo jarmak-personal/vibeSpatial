@@ -10,6 +10,7 @@ The benchmark exercises the full GPU-native pipeline:
   Kernel 2: GPU candidate generation (sort-sweep with CCCL radix sort)
   Kernel 3: GPU classification with Shewchuk adaptive refinement
 """
+
 from __future__ import annotations
 
 import argparse
@@ -44,7 +45,9 @@ def main(argv: list[str] | None = None) -> int:
     # x-ranges all overlap, producing O(n^2) candidate pairs that exceed
     # any GPU at >=10k scale.  Random-walk produces spatially-local
     # multi-segment lines with realistic candidate counts at all scales.
-    base = list(generate_lines(SyntheticSpec("line", "random-walk", count=args.scale, seed=0)).geometries)
+    base = list(
+        generate_lines(SyntheticSpec("line", "random-walk", count=args.scale, seed=0)).geometries
+    )
     shifted = [translate(g, xoff=0.5, yoff=0.5) for g in base]
     left = from_shapely_geometries(base)
     right = from_shapely_geometries(shifted)
@@ -53,7 +56,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Warmup: full pipeline including GPU extraction + candidate gen + classify
     classify_segment_intersections(
-        left, right,
+        left,
+        right,
         dispatch_mode=dispatch_mode,
         precision=args.precision,
     )
@@ -63,7 +67,8 @@ def main(argv: list[str] | None = None) -> int:
 
         def launcher(launch: bench.Launch) -> None:
             classify_segment_intersections(
-                left, right,
+                left,
+                right,
                 dispatch_mode=dispatch_mode,
                 precision=args.precision,
             )
@@ -74,9 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     b = bench.register(seg_bench)
     b.add_int64_axis("NumElements", [args.scale])
 
-    bench.run_all_benchmarks(
-        ["--json", str(args.output_json)]
-    )
+    bench.run_all_benchmarks(["--json", str(args.output_json)])
     return 0
 
 

@@ -24,8 +24,5 @@ def _line_merge_cpu(
 ) -> OwnedGeometryArray:
     """Compute line_merge via Shapely."""
     geoms = owned.to_shapely()
-    results = [
-        shapely.line_merge(g, directed=directed) if g is not None else None
-        for g in geoms
-    ]
+    results = [shapely.line_merge(g, directed=directed) if g is not None else None for g in geoms]
     return from_shapely_geometries(results)

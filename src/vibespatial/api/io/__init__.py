@@ -6,10 +6,11 @@ import sys
 
 def _alias_compat_submodule(name: str) -> None:
     module = importlib.import_module(f"vibespatial.api.io.{name}")
-    sys.modules.setdefault(f"geopandas.io.{name}", module)
+    sys.modules[f"geopandas.io.{name}"] = module
+    globals()[name] = module
 
 
-for _name in ("arrow", "_geoarrow"):
+for _name in ("arrow", "_geoarrow", "file", "sql", "util"):
     _alias_compat_submodule(_name)
 
 del _alias_compat_submodule

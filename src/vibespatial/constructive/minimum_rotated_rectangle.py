@@ -54,6 +54,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import (
     StrictNativeFallbackError,
@@ -74,14 +75,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("min-rotated-rect", _MIN_RECT_KERNEL_SOURCE, _MIN_RECT_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("min-rotated-rect", _MIN_RECT_KERNEL_SOURCE, _MIN_RECT_KERNEL_NAMES),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # GPU implementation
 # ---------------------------------------------------------------------------
+
 
 @register_kernel_variant(
     "minimum_rotated_rectangle",
@@ -89,7 +93,10 @@ request_nvrtc_warmup([
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
+        "point",
+        "multipoint",
+        "linestring",
+        "multilinestring",
         "polygon",
     ),
     supports_mixed=False,
@@ -130,22 +137,30 @@ def _min_rect_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
     # Step 3: Launch rotating calipers kernel
     kernels = compile_kernel_group(
-        "min-rotated-rect", _MIN_RECT_KERNEL_SOURCE, _MIN_RECT_KERNEL_NAMES,
+        "min-rotated-rect",
+        _MIN_RECT_KERNEL_SOURCE,
+        _MIN_RECT_KERNEL_NAMES,
     )
     kernel = kernels["minimum_rotated_rectangle"]
 
     ptr = runtime.pointer
     params = (
         (
-            ptr(d_hull_x), ptr(d_hull_y),
-            ptr(d_ring_offsets), ptr(d_geom_offsets),
-            ptr(d_out_x), ptr(d_out_y),
+            ptr(d_hull_x),
+            ptr(d_hull_y),
+            ptr(d_ring_offsets),
+            ptr(d_geom_offsets),
+            ptr(d_out_x),
+            ptr(d_out_y),
             row_count,
         ),
         (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_I32,
         ),
     )
@@ -167,6 +182,7 @@ def _min_rect_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 # ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
+
 
 def minimum_rotated_rectangle_owned(
     owned: OwnedGeometryArray,
@@ -202,10 +218,19 @@ def minimum_rotated_rectangle_owned(
 
         return from_shapely_geometries([])
 
+    input_work = estimate_physical_work_from_owned(owned)
     selection = plan_dispatch_selection(
         kernel_name="minimum_rotated_rectangle",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            output_byte_count=row_count * 5 * 16,
+            temporary_byte_count=row_count * 5 * 16,
+            primary_unit_count=max(input_work.coordinate_count, row_count * 5),
+            primary_unit_name="minimum-rotated-rectangle-coordinate",
+        ),
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=owned.residency,
@@ -218,10 +243,7 @@ def minimum_rotated_rectangle_owned(
     if selected_mode is ExecutionMode.GPU and cp is not None:
         precision_plan = selection.precision_plan
         # GPU path supports single-family non-MultiPolygon inputs
-        families_with_rows = [
-            fam for fam in owned.families
-            if owned.family_has_rows(fam)
-        ]
+        families_with_rows = [fam for fam in owned.families if owned.family_has_rows(fam)]
         is_single_family = len(families_with_rows) == 1
         has_multipolygon = GeometryFamily.MULTIPOLYGON in families_with_rows
 

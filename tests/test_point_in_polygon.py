@@ -413,3 +413,31 @@ def test_point_in_polygon_expression_feeds_native_rowset_without_public_export()
     )
     assert cp.asnumpy(expression.values).tolist() == [True, False, True]
     assert cp.asnumpy(rowset.positions).tolist() == [0, 2]
+
+
+@pytest.mark.gpu
+def test_point_in_polygon_projected_boundary_uses_raw_fp64_coordinates() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    p1 = (362084.1914861024, 3075556.618107719)
+    p2 = (362173.59818072635, 3076109.62579047)
+    p3 = (362090.5054597832, 3076110.5708671827)
+    polygon = Polygon([p1, p2, p3])
+    midpoint = Point(
+        p2[0] + (p3[0] - p2[0]) * 0.5,
+        p2[1] + (p3[1] - p2[1]) * 0.5,
+    )
+    points = from_shapely_geometries([midpoint], residency=Residency.DEVICE)
+    polygons = from_shapely_geometries([polygon], residency=Residency.DEVICE)
+
+    expression = point_in_polygon_expression(
+        points,
+        polygons,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert polygon.covers(midpoint)
+    assert cp.asnumpy(expression.values).tolist() == [True]

@@ -6,6 +6,7 @@ warp-level reduction).
 
 Extracted from geometry_analysis.py -- dispatch logic remains there.
 """
+
 from __future__ import annotations
 
 from vibespatial.geometry.buffers import GeometryFamily

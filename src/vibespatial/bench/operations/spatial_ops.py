@@ -1,4 +1,5 @@
 """Spatial operation benchmarks: bounds, spatial-query, bounds-pairs."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -129,7 +130,10 @@ def bench_spatial_query(
     cutoff = int(scale * overlap_ratio)
     if cutoff < scale:
         query_geoms[cutoff:] = np.asarray(
-            [translate(geometry, xoff=10_000.0, yoff=10_000.0) for geometry in query_geoms[cutoff:]],
+            [
+                translate(geometry, xoff=10_000.0, yoff=10_000.0)
+                for geometry in query_geoms[cutoff:]
+            ],
             dtype=object,
         )
 
@@ -267,7 +271,9 @@ def bench_bounds_pairs(
     baseline_total = 0.0
     read_seconds = 0.0
     for dataset_name in datasets:
-        metadata, elapsed_seconds, baseline_elapsed_seconds, read_s = _run_single_dataset(dataset_name)
+        metadata, elapsed_seconds, baseline_elapsed_seconds, read_s = _run_single_dataset(
+            dataset_name
+        )
         dataset_results.append(metadata)
         elapsed_total += elapsed_seconds
         baseline_total += baseline_elapsed_seconds

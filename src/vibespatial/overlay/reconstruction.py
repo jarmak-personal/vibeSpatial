@@ -131,10 +131,16 @@ def _selection_stage(operation: OverlayOperation) -> ReconstructionStage:
 
 
 def _emit_stage(operation: OverlayOperation) -> ReconstructionStage:
-    if operation in {OverlayOperation.INTERSECTION, OverlayOperation.UNION, OverlayOperation.IDENTITY}:
+    if operation in {
+        OverlayOperation.INTERSECTION,
+        OverlayOperation.UNION,
+        OverlayOperation.IDENTITY,
+    }:
         purpose = "Emit final polygon, line, and point geometry buffers in deterministic row order."
     else:
-        purpose = "Emit final face and chain buffers for geometry-producing difference-style outputs."
+        purpose = (
+            "Emit final face and chain buffers for geometry-producing difference-style outputs."
+        )
     return ReconstructionStage(
         name="emit_geometry",
         primitive=ReconstructionPrimitive.SCATTER,
@@ -150,13 +156,17 @@ def _emit_stage(operation: OverlayOperation) -> ReconstructionStage:
 def plan_overlay_reconstruction(
     operation: OverlayOperation | str,
 ) -> OverlayReconstructionPlan:
-    normalized = operation if isinstance(operation, OverlayOperation) else OverlayOperation(operation)
+    normalized = (
+        operation if isinstance(operation, OverlayOperation) else OverlayOperation(operation)
+    )
     stages = (*_shared_prefix(), _selection_stage(normalized), _emit_stage(normalized))
     fusion_steps = (
         PipelineStep(name="segment_classes", kind=StepKind.GEOMETRY, output_name="segment_classes"),
         PipelineStep(name="node_events", kind=StepKind.DERIVED, output_name="node_events"),
         PipelineStep(name="directed_edges", kind=StepKind.DERIVED, output_name="directed_edges"),
-        PipelineStep(name="sorted_half_edges", kind=StepKind.ORDERING, output_name="sorted_half_edges"),
+        PipelineStep(
+            name="sorted_half_edges", kind=StepKind.ORDERING, output_name="sorted_half_edges"
+        ),
         PipelineStep(name="candidate_rings", kind=StepKind.GEOMETRY, output_name="candidate_rings"),
         PipelineStep(name="labeled_faces", kind=StepKind.FILTER, output_name="labeled_faces"),
         PipelineStep(name="selected_faces", kind=StepKind.FILTER, output_name="selected_faces"),

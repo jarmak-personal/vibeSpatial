@@ -215,7 +215,7 @@ def test_strict_viewport_matrix_documents_current_public_api_behavior(
 
 
 @pytest.mark.gpu
-def test_strict_clip_box_line_fixture_uses_direct_bbox_candidates_before_gpu_intersection(
+def test_strict_clip_box_line_fixture_uses_exact_polygon_topology(
     tmp_path: Path,
 ) -> None:
     _require_gpu_runtime()
@@ -245,8 +245,13 @@ def test_strict_clip_box_line_fixture_uses_direct_bbox_candidates_before_gpu_int
     assert sindex._tree is None
     assert not any(event.surface == "geopandas.sindex.query" for event in events)
     assert any(
-        event.surface == "geopandas.array.intersection"
-        and event.implementation == "binary_constructive_gpu"
+        event.surface == "DeviceGeometryArray.clip_by_rect"
+        and event.implementation == "owned_clip_by_rect"
+        for event in events
+    )
+    assert any(
+        event.surface == "vibespatial.constructive.binary"
+        and event.implementation == "lineal_polygonal_collective_split_topology_gpu"
         for event in events
     )
 
@@ -378,7 +383,7 @@ def test_strict_clip_concave_polygon_mask_drops_bbox_false_positives() -> None:
 
 
 @pytest.mark.gpu
-def test_strict_clip_polygon_mask_uses_rectangle_kernel_fast_path() -> None:
+def test_strict_clip_polygon_mask_uses_exact_broadcast_topology() -> None:
     _require_gpu_runtime()
     buildings = vibespatial.GeoDataFrame(
         {"geometry": [box(0.0, 0.0, 4.0, 4.0), box(10.0, 10.0, 14.0, 14.0)]},
@@ -408,8 +413,13 @@ def test_strict_clip_polygon_mask_uses_rectangle_kernel_fast_path() -> None:
 
     assert len(result) == 2
     assert any(
-        event.surface == "vibespatial.kernels.constructive.polygon_rect_intersection"
-        and event.selected.value == "gpu"
+        event.surface == "geopandas.clip"
+        and event.implementation == "polygon_mask_broadcast_right_capacity_gpu"
+        for event in events
+    )
+    assert any(
+        event.surface == "geopandas.clip"
+        and event.implementation == "polygon_device_candidate_direct_rowset_assembly_gpu"
         for event in events
     )
 
@@ -447,8 +457,8 @@ def test_strict_clip_concave_polygon_mask_keeps_exact_subset_on_gpu() -> None:
 
     assert len(result) == 1
     assert any(
-        event.surface == "vibespatial.predicates.binary"
-        and event.operation == "intersects"
+        event.surface == "vibespatial.constructive.binary"
+        and event.implementation == "broadcast_right_virtual_segment_topology_gpu"
         and event.selected.value == "gpu"
         for event in events
     )
@@ -567,7 +577,7 @@ def test_strict_clip_box_skips_internal_geoseries_area_warning() -> None:
 
 
 @pytest.mark.gpu
-def test_strict_overlay_polygon_query_requests_device_indices(
+def test_strict_overlay_polygon_query_requests_device_relation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _require_gpu_runtime()
@@ -582,17 +592,17 @@ def test_strict_overlay_polygon_query_requests_device_indices(
 
     sindex_module = importlib.import_module("vibespatial.api.sindex")
     overlay_module = importlib.import_module("vibespatial.api.tools.overlay")
-    original_query = sindex_module.SpatialIndex.query
+    original_query_relation = sindex_module.SpatialIndex.query_relation
     seen_return_device = []
 
-    def _wrapped_query(self, geometry, *args, **kwargs):
+    def _wrapped_query_relation(self, geometry, *args, **kwargs):
         seen_return_device.append(kwargs.get("return_device", False))
-        return original_query(self, geometry, *args, **kwargs)
+        return original_query_relation(self, geometry, *args, **kwargs)
 
     monkeypatch.setattr(
         sindex_module.SpatialIndex,
-        "query",
-        _wrapped_query,
+        "query_relation",
+        _wrapped_query_relation,
     )
     monkeypatch.setattr(
         overlay_module,
@@ -639,8 +649,8 @@ def test_strict_clip_box_mixed_fixture_uses_direct_bbox_candidates_before_gpu_in
     assert sindex._tree is None
     assert not any(event.surface == "geopandas.sindex.query" for event in events)
     assert any(
-        event.surface == "geopandas.array.intersection"
-        and event.implementation == "binary_constructive_gpu"
+        event.surface == "geopandas.clip"
+        and event.implementation == "mixed_device_candidate_native"
         for event in events
     )
 

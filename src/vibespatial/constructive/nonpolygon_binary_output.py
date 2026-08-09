@@ -21,7 +21,9 @@ from vibespatial.runtime.residency import Residency
 
 def _require_cupy() -> None:
     if cp is None:  # pragma: no cover - exercised on CPU-only installs
-        raise RuntimeError("CuPy is not installed; GPU constructive output builders are unavailable")
+        raise RuntimeError(
+            "CuPy is not installed; GPU constructive output builders are unavailable"
+        )
 
 
 def build_device_backed_point_output(
@@ -153,43 +155,61 @@ def build_point_result_from_source(
     d_new_validity: DeviceArray | None = None,
 ) -> OwnedGeometryArray:
     """Build an OwnedGeometryArray sharing Point buffers with new validity."""
-    new_device_state = None
-    host_validity = new_validity
-    host_tags = points.tags.copy()
-    host_family_row_offsets = points.family_row_offsets.copy()
     if points.device_state is not None:
         runtime = get_cuda_runtime()
         if d_new_validity is not None:
-            d_validity = d_new_validity
+            d_validity = cp.asarray(d_new_validity, dtype=cp.bool_)
         elif new_validity is not None:
             d_validity = runtime.from_host(new_validity)
         else:
-            raise ValueError(
-                "Either new_validity or d_new_validity must be provided"
-            )
+            raise ValueError("Either new_validity or d_new_validity must be provided")
+        source_state = points.device_state
         new_device_state = OwnedGeometryDeviceState(
             validity=d_validity,
-            tags=points.device_state.tags,
-            family_row_offsets=points.device_state.family_row_offsets,
-            families=dict(points.device_state.families),
+            tags=source_state.tags,
+            family_row_offsets=source_state.family_row_offsets,
+            families=dict(source_state.families),
+            row_bounds=(
+                None
+                if source_state.row_bounds is None
+                else cp.where(
+                    d_validity[:, None],
+                    cp.asarray(source_state.row_bounds, dtype=cp.float64).reshape(
+                        points.row_count,
+                        4,
+                    ),
+                    cp.asarray(cp.nan, dtype=cp.float64),
+                )
+            ),
+            trusted_homogeneous_family=GeometryFamily.POINT,
+            trusted_polygonal_only=False,
+            trusted_unique_family_rows=source_state.trusted_unique_family_rows,
+            trusted_family_domain=(GeometryFamily.POINT,),
         )
-        host_validity = None
-        host_tags = None
-        host_family_row_offsets = None
+        result = OwnedGeometryArray(
+            validity=None,
+            tags=None,
+            family_row_offsets=None,
+            families=dict(points.families),
+            residency=Residency.DEVICE,
+            device_state=new_device_state,
+            _row_count=points.row_count,
+        )
+        result._cached_is_valid_mask = np.ones(points.row_count, dtype=bool)
+        return result
 
-    return OwnedGeometryArray(
-        validity=host_validity,
-        tags=host_tags,
-        family_row_offsets=host_family_row_offsets,
+    if new_validity is None:
+        raise ValueError("host point result requires new_validity")
+    result = OwnedGeometryArray(
+        validity=new_validity,
+        tags=points.tags.copy(),
+        family_row_offsets=points.family_row_offsets.copy(),
         families=dict(points.families),
-        residency=(
-            Residency.DEVICE
-            if new_device_state is not None
-            else points.residency
-        ),
-        device_state=new_device_state,
+        residency=points.residency,
         _row_count=points.row_count,
     )
+    result._cached_is_valid_mask = np.ones(points.row_count, dtype=bool)
+    return result
 
 
 def host_prefix_offsets(counts: np.ndarray) -> np.ndarray:

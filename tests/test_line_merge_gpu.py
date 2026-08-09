@@ -8,6 +8,8 @@ Geometry families tested: LineString, MultiLineString.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import shapely
@@ -132,35 +134,59 @@ def test_line_merge_stays_device_resident(strict_device_guard):
     assert result.residency == Residency.DEVICE
 
 
+def test_line_merge_uses_public_row_and_source_buffer_capacity():
+    repo_root = Path(__file__).resolve().parents[1]
+    source = (
+        repo_root / "src" / "vibespatial" / "constructive" / "line_merge.py"
+    ).read_text()
+    kernel_source = (
+        repo_root
+        / "src"
+        / "vibespatial"
+        / "kernels"
+        / "constructive"
+        / "line_merge.py"
+    ).read_text()
+
+    assert "d_eligible = d_validity" in source
+    assert "coordinate_capacity = (" in source
+    assert "part_capacity = (" in source
+    assert "count_scatter_totals(" not in source
+    assert "line-merge output totals allocation fence" not in source
+    assert "const unsigned char* __restrict__ eligible" in kernel_source
+    assert kernel_source.count("if (eligible[tid] == 0u) return;") == 2
+
+
 @requires_gpu
-def test_line_merge_batches_output_size_scalar_fence(monkeypatch: pytest.MonkeyPatch):
-    """Coordinate and part output sizes share one D2H scalar fence."""
-    import vibespatial.constructive.line_merge as line_merge_mod
+def test_line_merge_device_only_input_has_no_allocation_or_metadata_fence():
+    from vibespatial.constructive.line_merge import line_merge_owned
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.geometry.owned import build_device_resident_owned
     from vibespatial.runtime import ExecutionMode
     from vibespatial.runtime.residency import Residency
 
     geoms = [_three_segment_chain(), _disconnected_mls()]
     owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
-    calls: list[int] = []
-    original = line_merge_mod.count_scatter_totals
-
-    def _record_count_scatter_totals(runtime, count_offset_pairs, *, reason=None):
-        calls.append(len(count_offset_pairs))
-        return original(runtime, count_offset_pairs, reason=reason)
-
-    monkeypatch.setattr(
-        line_merge_mod,
-        "count_scatter_totals",
-        _record_count_scatter_totals,
+    state = owned.device_state
+    assert state is not None
+    device_only = build_device_resident_owned(
+        device_families=dict(state.families),
+        row_count=owned.row_count,
+        tags=state.tags,
+        validity=state.validity,
+        family_row_offsets=state.family_row_offsets,
+        execution_mode="gpu",
     )
 
-    result = line_merge_mod.line_merge_owned(
-        owned,
+    reset_d2h_transfer_count()
+    result = line_merge_owned(
+        device_only,
         directed=False,
         dispatch_mode=ExecutionMode.GPU,
     )
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
 
-    assert calls == [2]
+    assert reasons == []
     _compare_line_merge(result.to_shapely(), geoms, directed=False)
 
 

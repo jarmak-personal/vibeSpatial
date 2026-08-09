@@ -126,7 +126,7 @@ def test_broadcast_device_bounds_cache_uses_physical_family_rows() -> None:
     broadcast = tile_single_row(base, 8)
 
     bounds = compute_geometry_bounds(broadcast, dispatch_mode=ExecutionMode.GPU)
-    state = broadcast._ensure_device_state()
+    state = broadcast._ensure_device_state(preserve_indexed_view=True)
     polygon_family = next(family for family in broadcast.families if family.value == "polygon")
     family_bounds = get_cuda_runtime().copy_device_to_host(state.families[polygon_family].bounds)
 

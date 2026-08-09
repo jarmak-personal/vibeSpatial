@@ -12,6 +12,7 @@ from vibespatial.kernels.core.geometry_analysis import (
 )
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_spatial_index_work_from_owned
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import Residency
 
@@ -103,10 +104,12 @@ def _device_candidates_to_result(
     d_right = device_cands.d_right
     if sort and d_left.size > 0:
         order = _cp.lexsort(
-            _cp.stack([
-                _cp.asarray(d_right, dtype=_cp.int64),
-                _cp.asarray(d_left, dtype=_cp.int64),
-            ])
+            _cp.stack(
+                [
+                    _cp.asarray(d_right, dtype=_cp.int64),
+                    _cp.asarray(d_left, dtype=_cp.int64),
+                ]
+            )
         )
         d_left = d_left[order]
         d_right = d_right[order]
@@ -134,15 +137,44 @@ def _indices_to_device_result(
 
     if sort and d_left.size > 0:
         order = _cp.lexsort(
-            _cp.stack([
-                _cp.asarray(d_right, dtype=_cp.int64),
-                _cp.asarray(d_left, dtype=_cp.int64),
-            ])
+            _cp.stack(
+                [
+                    _cp.asarray(d_right, dtype=_cp.int64),
+                    _cp.asarray(d_left, dtype=_cp.int64),
+                ]
+            )
         )
         d_left = d_left[order]
         d_right = d_right[order]
     result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
     return (result, execution) if return_metadata else result
+
+
+def _regular_grid_max_cells_per_query(
+    flat_index,
+    query_owned: OwnedGeometryArray | None,
+) -> int | None:
+    metadata = getattr(flat_index, "regular_grid", None)
+    if metadata is None or query_owned is None:
+        return None
+    if query_owned.residency is not Residency.DEVICE:
+        return None
+    state = query_owned.device_state
+    if state is None:
+        return None
+    polygon_buffer = state.families.get(GeometryFamily.POLYGON)
+    if polygon_buffer is None:
+        return None
+    proof = getattr(polygon_buffer, "regular_grid_rect", None)
+    if proof is None:
+        return None
+    if float(metadata.cell_width) <= 0.0 or float(metadata.cell_height) <= 0.0:
+        return None
+    max_cols = int(np.ceil(float(proof.cell_width) / float(metadata.cell_width))) + 3
+    max_rows = int(np.ceil(float(proof.cell_height) / float(metadata.cell_height))) + 3
+    max_cols = min(max(max_cols, 1), int(metadata.cols))
+    max_rows = min(max(max_rows, 1), int(metadata.rows))
+    return max_cols * max_rows
 
 
 def query_spatial_index(
@@ -204,7 +236,9 @@ def query_spatial_index(
         else:
             _rg_bounds = _extract_box_query_bounds_shapely(query_values)
         regular_grid_box_pairs = _query_regular_grid_rect_box_index(
-            flat_index, _rg_bounds, predicate=predicate,
+            flat_index,
+            _rg_bounds,
+            predicate=predicate,
         )
         if regular_grid_box_pairs is not None:
             execution = SpatialQueryExecution(
@@ -261,8 +295,7 @@ def query_spatial_index(
     # Only attempt the expensive per-element box detection when the tree
     # contains points (the only case where this path can succeed).
     _tree_is_point_only = (
-        GeometryFamily.POINT in tree_owned.families
-        and len(tree_owned.families) == 1
+        GeometryFamily.POINT in tree_owned.families and len(tree_owned.families) == 1
     )
 
     # For predicate=None with Shapely input, use shapely.bounds() directly
@@ -278,7 +311,9 @@ def query_spatial_index(
         if predicate is None and _shapely_query_bounds is not None:
             point_box_bounds = _shapely_query_bounds
         elif predicate is None and query_owned is not None:
-            point_box_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode(query_owned))
+            point_box_bounds = compute_geometry_bounds(
+                query_owned, dispatch_mode=_gpu_bounds_dispatch_mode(query_owned)
+            )
         else:
             point_box_bounds = _extract_box_query_bounds(predicate, query_values)
         point_box_pairs = _query_point_tree_box_index(
@@ -345,12 +380,23 @@ def query_spatial_index(
             and getattr(flat_index, "regular_grid", None) is not None
             and predicate in (None, "intersects")
         ):
-            regular_grid_box_bounds = _extract_box_query_bounds_from_owned("intersects", query_owned)
+            bounds_predicate = None if predicate is None else "intersects"
+            regular_grid_box_bounds = _extract_box_query_bounds_from_owned(
+                bounds_predicate,
+                query_owned,
+                return_device=True,
+            )
+            if regular_grid_box_bounds is None:
+                regular_grid_box_bounds = _extract_box_query_bounds_from_owned(
+                    bounds_predicate,
+                    query_owned,
+                )
 
     regular_grid_box_pairs = _query_regular_grid_rect_box_index(
         flat_index,
         regular_grid_box_bounds,
         predicate=predicate,
+        max_cells_per_query=_regular_grid_max_cells_per_query(flat_index, query_owned),
     )
     if regular_grid_box_pairs is not None:
         execution = SpatialQueryExecution(
@@ -392,7 +438,11 @@ def query_spatial_index(
                     right_idx.astype(np.intp, copy=False),
                 )
             )
-        query_size = 1 if scalar else (len(query_values) if query_values is not None else query_owned.row_count)
+        query_size = (
+            1
+            if scalar
+            else (len(query_values) if query_values is not None else query_owned.row_count)
+        )
         formatted = _format_query_indices(
             indices,
             tree_size=tree_size,
@@ -512,21 +562,14 @@ def query_spatial_index(
     if _shapely_query_bounds is not None:
         query_bounds = _shapely_query_bounds
     else:
-        if (
-            has_gpu_runtime()
-            and (
-                (
-                    predicate == "dwithin"
-                    and query_owned.residency is Residency.DEVICE
-                )
-                or (
-                    return_device
-                    and not scalar
-                    and output_format == "indices"
-                )
-            )
+        if has_gpu_runtime() and (
+            (predicate == "dwithin" and query_owned.residency is Residency.DEVICE)
+            or (return_device and not scalar and output_format == "indices")
         ):
-            query_bounds = compute_geometry_bounds_device(query_owned)
+            query_bounds = compute_geometry_bounds_device(
+                query_owned,
+                preserve_indexed_view=True,
+            )
             query_bounds_on_device = True
         else:
             query_bounds = compute_geometry_bounds(
@@ -539,7 +582,7 @@ def query_spatial_index(
     # paths avoid to_shapely() entirely; these are only materialised when the
     # Shapely fallback is actually needed.
     _query_shapely = query_shapely if query_shapely is not None else query_values
-    _tree_shapely = tree_shapely   # caller-provided or None
+    _tree_shapely = tree_shapely  # caller-provided or None
 
     gpu_candidate_gen = False
     device_indices_materialized_from_gpu = False
@@ -547,7 +590,9 @@ def query_spatial_index(
     if predicate == "dwithin":
         if distance is None:
             raise ValueError("'distance' parameter is required for 'dwithin' predicate")
-        query_size_for_dist = len(query_values) if query_values is not None else query_owned.row_count
+        query_size_for_dist = (
+            len(query_values) if query_values is not None else query_owned.row_count
+        )
         if np.isscalar(distance):
             per_row_distance = np.full(query_size_for_dist, float(distance), dtype=np.float64)
         else:
@@ -556,7 +601,9 @@ def query_spatial_index(
                 raise ValueError("distance array must be broadcastable to the geometry input")
         # Try GPU candidate generation first (device-resident), then GPU refinement.
         device_dist_cands, _dwithin_exec = spatial_index_device_query(
-            flat_index, query_bounds, distance=per_row_distance,
+            flat_index,
+            query_bounds,
+            distance=per_row_distance,
         )
         if device_dist_cands is not None:
             gpu_candidate_gen = True
@@ -584,7 +631,11 @@ def query_spatial_index(
         # When return_device is requested, ask _dwithin_refine_gpu to keep
         # results on device (CuPy arrays) to avoid D->H + H->D round-trip.
         gpu_dwithin_result = _dwithin_refine_gpu(
-            query_owned, tree_owned, left_idx, right_idx, per_row_distance,
+            query_owned,
+            tree_owned,
+            left_idx,
+            right_idx,
+            per_row_distance,
             device_candidates=device_dist_cands if gpu_candidate_gen else None,
             return_device=return_device,
         )
@@ -614,6 +665,7 @@ def query_spatial_index(
                 and hasattr(left_idx, "__cuda_array_interface__")
             ):
                 import cupy as _cp_dw
+
                 execution = SpatialQueryExecution(
                     requested=ExecutionMode.AUTO,
                     selected=ExecutionMode.GPU,
@@ -623,7 +675,9 @@ def query_spatial_index(
                 d_left = left_idx.astype(_cp_dw.int32, copy=False)
                 d_right = right_idx.astype(_cp_dw.int32, copy=False)
                 if sort and d_left.size > 0:
-                    order = _cp_dw.lexsort(_cp_dw.stack([d_right.astype(_cp_dw.int64), d_left.astype(_cp_dw.int64)]))
+                    order = _cp_dw.lexsort(
+                        _cp_dw.stack([d_right.astype(_cp_dw.int64), d_left.astype(_cp_dw.int64)])
+                    )
                     d_left = d_left[order]
                     d_right = d_right[order]
                 device_result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
@@ -667,7 +721,8 @@ def query_spatial_index(
             gpu_count = _count_candidates_gpu(query_bounds, flat_index.bounds)
             if gpu_count is not None:
                 execution = SpatialQueryExecution(
-                    requested=ExecutionMode.AUTO, selected=ExecutionMode.GPU,
+                    requested=ExecutionMode.AUTO,
+                    selected=ExecutionMode.GPU,
                     implementation="owned_gpu_spatial_query",
                     reason="count-only query: GPU count kernel returned without pair materialization",
                 )
@@ -694,7 +749,8 @@ def query_spatial_index(
         # available, sub-arrays are extracted on-device via CuPy fancy indexing
         # to avoid redundant host→device transfers.
         device_cands, _sidq_exec = spatial_index_device_query(
-            flat_index, query_bounds,
+            flat_index,
+            query_bounds,
         )
         if device_cands is not None:
             gpu_candidate_gen = True
@@ -733,7 +789,9 @@ def query_spatial_index(
             execution = SpatialQueryExecution(
                 requested=ExecutionMode.AUTO,
                 selected=ExecutionMode.CPU if dwithin_used_shapely_fallback else ExecutionMode.GPU,
-                implementation="owned_cpu_spatial_query" if dwithin_used_shapely_fallback else "owned_gpu_spatial_query",
+                implementation="owned_cpu_spatial_query"
+                if dwithin_used_shapely_fallback
+                else "owned_gpu_spatial_query",
                 reason=(
                     "repo-owned GPU bbox candidate generation with Shapely dwithin refinement"
                     if dwithin_used_shapely_fallback
@@ -847,6 +905,7 @@ def build_owned_spatial_index(geometry: np.ndarray) -> tuple[OwnedGeometryArray,
         kernel_name="flat_index_build",
         kernel_class=KernelClass.COARSE,
         row_count=owned.row_count,
+        work_estimate=estimate_spatial_index_work_from_owned(owned),
     )
     index = build_flat_spatial_index(owned, runtime_selection=selection.runtime_selection)
 

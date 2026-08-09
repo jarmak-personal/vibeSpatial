@@ -60,7 +60,9 @@ compute_feature_bounds(
 _BOUNDS_KERNEL_NAMES = ("compute_feature_bounds",)
 
 
-_HILBERT_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
+_HILBERT_KERNEL_SOURCE = (
+    SPATIAL_TOLERANCE_PREAMBLE
+    + r"""
 // 32-bit Hilbert curve encoding from (x, y) integer coordinates on [0, 2^16).
 // Input: d_bounds (float64, N*4), extent (minx, miny, maxx, maxy)
 // Output: d_hilbert_codes (uint32, N)
@@ -158,5 +160,6 @@ compute_hilbert_codes(
     d_hilbert_codes[idx] = ((interleave_bits(i1) << 1) | interleave_bits(i0));
 }
 """
+)
 
 _HILBERT_KERNEL_NAMES = ("compute_hilbert_codes",)

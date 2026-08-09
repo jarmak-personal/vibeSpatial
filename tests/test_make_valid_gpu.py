@@ -112,6 +112,33 @@ def test_duplicate_vertices():
     assert shapely.is_valid(result.geometries[0])
 
 
+@requires_gpu
+def test_valid_multipolygon_with_duplicate_closure_is_not_repaired() -> None:
+    """Duplicate closing coordinates are valid and must not trigger CPU repair."""
+    import vibespatial
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.residency import Residency
+
+    geom = shapely.from_wkt(
+        "MULTIPOLYGON (((0 0, 2 0, 0 2, 0 0, 0 0)))"
+    )
+    assert shapely.is_valid(geom)
+    owned = from_shapely_geometries([geom], residency=Residency.DEVICE)
+
+    vibespatial.clear_fallback_events()
+    result = make_valid_owned(
+        owned=owned,
+        method="linework",
+        keep_collapsed=True,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    fallback_events = vibespatial.get_fallback_events(clear=True)
+
+    assert result.repaired_rows.size == 0
+    assert result.owned is owned
+    assert not fallback_events
+
+
 # ---------------------------------------------------------------------------
 # Test: wrong orientation (CW exterior)
 # ---------------------------------------------------------------------------
@@ -340,9 +367,14 @@ def test_build_batch_repaired_device_keeps_metadata_lazy(strict_device_guard):
     d_y = cp.asarray([0.0, 0.0, 1.0, 1.0, 0.0], dtype=cp.float64)
     d_ring_offsets = cp.asarray([0, 5], dtype=cp.int32)
     d_geom_offsets = cp.asarray([0, 1], dtype=cp.int32)
+    planned_owned = from_shapely_geometries(
+        [Polygon([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)])],
+        residency=Residency.DEVICE,
+    )
     runtime_selection = _planned_make_valid_runtime_selection(
         kernel_name="make_valid_gpu_batch_repair",
-        row_count=1,
+        owned=planned_owned,
+        selected_row_count=1,
         reason="test",
     )
 
@@ -379,7 +411,7 @@ def test_device_scatter_repaired_keeps_merged_metadata_lazy(strict_device_guard)
         repaired_batch,
         "polygon",
         np.asarray([0], dtype=np.int32),
-        {0: 0},
+        np.asarray([0], dtype=np.int32),
     )
 
     assert result.residency is Residency.DEVICE
@@ -422,7 +454,7 @@ def test_device_scatter_repaired_remaps_mixed_family_outputs(strict_device_guard
         repaired_batch,
         "polygon",
         np.asarray([0, 1], dtype=np.int32),
-        {0: 0, 1: 1},
+        np.asarray([0, 1], dtype=np.int32),
     )
 
     state = result._ensure_device_state()
@@ -468,6 +500,87 @@ def test_gpu_repair_invalid_polygons_keeps_public_result_metadata_lazy(strict_de
     assert result.repaired_owned._validity is None
     assert result.repaired_owned._tags is None
     assert result.repaired_owned._family_row_offsets is None
+
+
+@requires_gpu
+def test_gpu_repair_preserves_duplicate_indexed_logical_rows(strict_device_guard):
+    """One physical invalid polygon can repair multiple logical indexed rows."""
+    import cupy as cp
+
+    from vibespatial.constructive.make_valid_gpu import gpu_repair_invalid_polygons
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.runtime.residency import Residency
+
+    bowtie = shapely.from_wkt("POLYGON ((0 0, 2 2, 2 0, 0 2, 0 0))")
+    base = from_shapely_geometries([bowtie], residency=Residency.DEVICE)
+    indexed = base.device_take(cp.asarray([0, 0], dtype=cp.int64))
+
+    reset_d2h_transfer_count()
+    result = gpu_repair_invalid_polygons(
+        indexed,
+        cp.asarray([0, 1], dtype=cp.int32),
+    )
+    reasons = {event.reason for event in get_d2h_transfer_events(clear=True)}
+
+    assert result is not None
+    assert result.repaired_owned is not None
+    assert result.repaired_owned.row_count == 2
+    assert result.repaired_count == 2
+    assert "make-valid device invalid-family-row compact fence" not in reasons
+    assert "make-valid device invalid-global-row compact fence" not in reasons
+    assert "make-valid device invalid-family-offset compact fence" not in reasons
+    assert "make-valid repaired-batch valid-row compact fence" not in reasons
+
+
+@requires_gpu
+@pytest.mark.parametrize("method", ["linework", "structure"])
+def test_invalid_overlapping_multipolygon_uses_grouped_topology_and_linework_composition(
+    method,
+):
+    """Multipart repair must match GEOS area and collapsed-line semantics."""
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.residency import Residency
+
+    invalid = MultiPolygon([box(0, 0, 2, 2), box(1, 0, 3, 2)])
+    expected = shapely.make_valid(
+        invalid,
+        method=method,
+        keep_collapsed=True,
+    )
+    owned = from_shapely_geometries([invalid], residency=Residency.DEVICE)
+    result = make_valid_owned(
+        owned=owned,
+        method=method,
+        keep_collapsed=True,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    actual = result.geometries[0]
+
+    assert result.owned is not None
+    if method == "linework":
+        assert result.native_geometry is not None
+        assert actual.geom_type == "GeometryCollection"
+        actual_area = shapely.union_all(
+            [part for part in actual.geoms if "Polygon" in part.geom_type]
+        )
+        expected_area = shapely.union_all(
+            [part for part in expected.geoms if "Polygon" in part.geom_type]
+        )
+        actual_lines = shapely.union_all(
+            [part for part in actual.geoms if "LineString" in part.geom_type]
+        )
+        expected_lines = shapely.union_all(
+            [part for part in expected.geoms if "LineString" in part.geom_type]
+        )
+        assert shapely.equals(actual_area, expected_area)
+        assert shapely.equals(actual_lines, expected_lines)
+    else:
+        assert result.native_geometry is None
+        assert actual.geom_type == "Polygon"
+        assert shapely.equals(actual, expected)
 
 
 @requires_gpu

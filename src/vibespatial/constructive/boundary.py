@@ -29,17 +29,20 @@ except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
 from vibespatial.constructive.boundary_cpu import _boundary_cpu as _boundary_cpu
-from vibespatial.cuda._runtime import count_scatter_total, get_cuda_runtime
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
+    DeviceFixedGeometrySizeMetadata,
     OwnedGeometryArray,
+    _device_gather_offset_index_ranges,
+    _device_gather_xy_offset_slices,
     build_device_resident_owned,
     from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
@@ -49,47 +52,11 @@ from vibespatial.runtime.precision import KernelClass, PrecisionMode
 # ---------------------------------------------------------------------------
 
 
-def _gather_ranged_coordinates(
-    d_x,
-    d_y,
-    d_starts,
-    d_ends,
-    *,
-    precomputed_total: int | None = None,
-):
-    d_lengths = d_ends - d_starts
-    d_offsets = cp.empty(int(d_lengths.size) + 1, dtype=cp.int32)
-    d_offsets[0] = 0
-    cp.cumsum(d_lengths, out=d_offsets[1:])
-
-    total_coords = (
-        int(precomputed_total)
-        if precomputed_total is not None
-        else count_scatter_total(
-            get_cuda_runtime(),
-            d_lengths,
-            d_offsets[:-1],
-            reason="boundary coordinate allocation fence",
-        )
-    )
-    if total_coords == 0:
-        return (
-            cp.empty(0, dtype=cp.float64),
-            cp.empty(0, dtype=cp.float64),
-            d_offsets,
-        )
-
-    d_out_idx = cp.arange(total_coords, dtype=cp.int32)
-    d_range_idx = cp.searchsorted(d_offsets[1:], d_out_idx, side="right")
-    d_src_idx = d_starts[d_range_idx] + (d_out_idx - d_offsets[d_range_idx])
-    return d_x[d_src_idx], d_y[d_src_idx], d_offsets
-
-
 def _polygon_rows_to_linestring_boundary_gpu(
     device_buf,
     d_polygon_rows,
     *,
-    coord_total: int | None = None,
+    fixed_coord_count: int | None = None,
 ):
     d_geom_offsets = cp.asarray(device_buf.geometry_offsets)
     d_ring_offsets = cp.asarray(device_buf.ring_offsets)
@@ -97,16 +64,14 @@ def _polygon_rows_to_linestring_boundary_gpu(
     d_y = cp.asarray(device_buf.y)
 
     d_ring_idx = d_geom_offsets[d_polygon_rows]
-    d_coord_starts = d_ring_offsets[d_ring_idx]
-    d_coord_ends = d_ring_offsets[d_ring_idx + 1]
-    d_x_out, d_y_out, d_geom_offsets_out = _gather_ranged_coordinates(
+    d_x_out, d_y_out, d_geom_offsets_out = _device_gather_xy_offset_slices(
         d_x,
         d_y,
-        d_coord_starts,
-        d_coord_ends,
-        precomputed_total=coord_total,
+        d_ring_offsets,
+        d_ring_idx,
+        allocation_capacity=int(d_x.size),
     )
-    d_empty = (d_coord_ends - d_coord_starts) == 0
+    d_empty = d_ring_offsets[d_ring_idx + 1] == d_ring_offsets[d_ring_idx]
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.LINESTRING,
         x=d_x_out,
@@ -116,60 +81,40 @@ def _polygon_rows_to_linestring_boundary_gpu(
         part_offsets=None,
         ring_offsets=None,
         bounds=None,
+        fixed_size=(
+            None
+            if fixed_coord_count is None
+            else DeviceFixedGeometrySizeMetadata(
+                coord_count_per_row=int(fixed_coord_count),
+            )
+        ),
     )
 
 
 def _polygon_rows_to_multilinestring_boundary_gpu(
     device_buf,
     d_polygon_rows,
-    *,
-    ring_total: int | None = None,
-    coord_total: int | None = None,
 ):
     d_geom_offsets = cp.asarray(device_buf.geometry_offsets)
     d_ring_offsets = cp.asarray(device_buf.ring_offsets)
     d_x = cp.asarray(device_buf.x)
     d_y = cp.asarray(device_buf.y)
 
-    d_ring_starts = d_geom_offsets[d_polygon_rows]
-    d_ring_ends = d_geom_offsets[d_polygon_rows + 1]
-    d_ring_counts = d_ring_ends - d_ring_starts
-
-    d_out_geom_offsets = cp.empty(int(d_polygon_rows.size) + 1, dtype=cp.int32)
-    d_out_geom_offsets[0] = 0
-    cp.cumsum(d_ring_counts, out=d_out_geom_offsets[1:])
-
-    total_rings = (
-        int(ring_total)
-        if ring_total is not None
-        else count_scatter_total(
-            get_cuda_runtime(),
-            d_ring_counts,
-            d_out_geom_offsets[:-1],
-            reason="boundary multiline ring allocation fence",
-        )
+    ring_capacity = max(int(d_ring_offsets.size) - 1, 0)
+    d_source_ring, d_out_geom_offsets = _device_gather_offset_index_ranges(
+        d_geom_offsets,
+        d_polygon_rows,
+        allocation_capacity=ring_capacity,
     )
-    if total_rings == 0:
-        d_part_offsets = cp.empty(1, dtype=cp.int32)
-        d_part_offsets[0] = 0
-        d_x_out = cp.empty(0, dtype=cp.float64)
-        d_y_out = cp.empty(0, dtype=cp.float64)
-    else:
-        d_part_idx = cp.arange(total_rings, dtype=cp.int32)
-        d_geom_idx = cp.searchsorted(d_out_geom_offsets[1:], d_part_idx, side="right")
-        d_source_ring = (
-            d_ring_starts[d_geom_idx]
-            + (d_part_idx - d_out_geom_offsets[d_geom_idx])
-        )
-        d_coord_starts = d_ring_offsets[d_source_ring]
-        d_coord_ends = d_ring_offsets[d_source_ring + 1]
-        d_x_out, d_y_out, d_part_offsets = _gather_ranged_coordinates(
-            d_x,
-            d_y,
-            d_coord_starts,
-            d_coord_ends,
-            precomputed_total=coord_total,
-        )
+    d_x_out, d_y_out, d_part_offsets = _device_gather_xy_offset_slices(
+        d_x,
+        d_y,
+        d_ring_offsets,
+        d_source_ring,
+        allocation_capacity=int(d_x.size),
+        active_row_count=d_out_geom_offsets[-1:],
+    )
+    d_ring_counts = d_geom_offsets[d_polygon_rows + 1] - d_geom_offsets[d_polygon_rows]
 
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.MULTILINESTRING,
@@ -183,47 +128,22 @@ def _polygon_rows_to_multilinestring_boundary_gpu(
     )
 
 
-def _host_polygon_boundary_size_plan(host_buf, geom_count):
+def _fixed_linestring_boundary_width(device_buf) -> int | None:
+    """Return fixed line coordinate count for polygon boundary rows."""
+    fixed_size = getattr(device_buf, "fixed_size", None)
     if (
-        host_buf is None
-        or not host_buf.host_materialized
-        or host_buf.ring_offsets is None
-        or int(host_buf.geometry_offsets.size) != geom_count + 1
+        fixed_size is not None
+        and fixed_size.first_level_count_per_row == 1
+        and fixed_size.coord_count_per_row is not None
     ):
-        return None
-
-    geom_offsets = host_buf.geometry_offsets
-    ring_offsets = host_buf.ring_offsets
-    ring_counts = geom_offsets[1:] - geom_offsets[:-1]
-
-    single_rows_host = (ring_counts == 1).nonzero()[0]
-    multi_rows_host = (ring_counts != 1).nonzero()[0]
-
-    single_coord_total = 0
-    if single_rows_host.size:
-        single_ring_rows = geom_offsets[single_rows_host]
-        single_coord_total = int(
-            (
-                ring_offsets[single_ring_rows + 1]
-                - ring_offsets[single_ring_rows]
-            ).sum()
-        )
-
-    multi_ring_total = int(ring_counts[multi_rows_host].sum())
-    multi_coord_total = 0
-    if multi_rows_host.size:
-        multi_start = geom_offsets[multi_rows_host]
-        multi_end = geom_offsets[multi_rows_host + 1]
-        multi_coord_total = int((ring_offsets[multi_end] - ring_offsets[multi_start]).sum())
-
-    return {
-        "single_coord_total": single_coord_total,
-        "multi_ring_total": multi_ring_total,
-        "multi_coord_total": multi_coord_total,
-    }
+        return int(fixed_size.coord_count_per_row)
+    width = getattr(device_buf, "dense_single_ring_width", None)
+    if width is not None:
+        return int(width)
+    return None
 
 
-def _boundary_polygon_gpu(device_buf, geom_count, host_buf=None):
+def _boundary_polygon_gpu(device_buf, geom_count):
     """Polygon boundary: row-aware device offset relabeling.
 
     Single-ring polygons match Shapely's LineString boundary type.  Polygons
@@ -232,7 +152,14 @@ def _boundary_polygon_gpu(device_buf, geom_count, host_buf=None):
     mixed batches compact each output family on device so per-row geometry
     types remain correct.
     """
-    host_size_plan = _host_polygon_boundary_size_plan(host_buf, geom_count)
+    fixed_boundary_width = _fixed_linestring_boundary_width(device_buf)
+    fixed_boundary_size = (
+        None
+        if fixed_boundary_width is None
+        else DeviceFixedGeometrySizeMetadata(
+            coord_count_per_row=int(fixed_boundary_width),
+        )
+    )
     d_geom_offsets = cp.asarray(device_buf.geometry_offsets)
     d_ring_counts = d_geom_offsets[1:] - d_geom_offsets[:-1]
 
@@ -251,6 +178,7 @@ def _boundary_polygon_gpu(device_buf, geom_count, host_buf=None):
                 part_offsets=None,
                 ring_offsets=None,
                 bounds=None,
+                fixed_size=fixed_boundary_size,
             ),
             cp.arange(geom_count, dtype=cp.int32),
         )
@@ -259,11 +187,7 @@ def _boundary_polygon_gpu(device_buf, geom_count, host_buf=None):
             _polygon_rows_to_linestring_boundary_gpu(
                 device_buf,
                 d_single_rows,
-                coord_total=(
-                    None
-                    if host_size_plan is None
-                    else host_size_plan["single_coord_total"]
-                ),
+                fixed_coord_count=fixed_boundary_width,
             ),
             d_single_rows,
         )
@@ -287,16 +211,6 @@ def _boundary_polygon_gpu(device_buf, geom_count, host_buf=None):
             _polygon_rows_to_multilinestring_boundary_gpu(
                 device_buf,
                 d_multi_rows,
-                ring_total=(
-                    None
-                    if host_size_plan is None
-                    else host_size_plan["multi_ring_total"]
-                ),
-                coord_total=(
-                    None
-                    if host_size_plan is None
-                    else host_size_plan["multi_coord_total"]
-                ),
             ),
             d_multi_rows,
         )
@@ -505,15 +419,19 @@ def _merge_multipoint_buffers(buf_a, buf_b):
 
     # Adjust second buffer's geometry_offsets (skip its leading 0)
     d_geom_offsets_b_shifted = cp.asarray(buf_b.geometry_offsets[1:]) + n_coords_a
-    d_geom_offsets = cp.concatenate([
-        cp.asarray(buf_a.geometry_offsets),
-        d_geom_offsets_b_shifted,
-    ])
+    d_geom_offsets = cp.concatenate(
+        [
+            cp.asarray(buf_a.geometry_offsets),
+            d_geom_offsets_b_shifted,
+        ]
+    )
 
-    d_empty = cp.concatenate([
-        cp.asarray(buf_a.empty_mask),
-        cp.asarray(buf_b.empty_mask),
-    ])
+    d_empty = cp.concatenate(
+        [
+            cp.asarray(buf_a.empty_mask),
+            cp.asarray(buf_b.empty_mask),
+        ]
+    )
 
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.MULTIPOINT,
@@ -542,22 +460,28 @@ def _merge_multilinestring_buffers(buf_a, buf_b):
 
     # Merge part_offsets: shift B's coord references by A's coord count
     d_part_offsets_b_shifted = cp.asarray(buf_b.part_offsets[1:]) + n_coords_a
-    d_part_offsets = cp.concatenate([
-        cp.asarray(buf_a.part_offsets),
-        d_part_offsets_b_shifted,
-    ])
+    d_part_offsets = cp.concatenate(
+        [
+            cp.asarray(buf_a.part_offsets),
+            d_part_offsets_b_shifted,
+        ]
+    )
 
     # Merge geometry_offsets: shift B's part references by A's part count
     d_geom_offsets_b_shifted = cp.asarray(buf_b.geometry_offsets[1:]) + n_parts_a
-    d_geom_offsets = cp.concatenate([
-        cp.asarray(buf_a.geometry_offsets),
-        d_geom_offsets_b_shifted,
-    ])
+    d_geom_offsets = cp.concatenate(
+        [
+            cp.asarray(buf_a.geometry_offsets),
+            d_geom_offsets_b_shifted,
+        ]
+    )
 
-    d_empty = cp.concatenate([
-        cp.asarray(buf_a.empty_mask),
-        cp.asarray(buf_b.empty_mask),
-    ])
+    d_empty = cp.concatenate(
+        [
+            cp.asarray(buf_a.empty_mask),
+            cp.asarray(buf_b.empty_mask),
+        ]
+    )
 
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.MULTILINESTRING,
@@ -571,9 +495,43 @@ def _merge_multilinestring_buffers(buf_a, buf_b):
     )
 
 
+def _family_local_to_global_capacity(d_state, family, geom_count):
+    """Map physical family lanes to active logical rows without compaction."""
+    d_validity = cp.asarray(d_state.validity, dtype=cp.bool_)
+    d_tags = cp.asarray(d_state.tags, dtype=cp.int8)
+    d_family_rows = cp.asarray(d_state.family_row_offsets, dtype=cp.int32)
+    d_is_family = d_validity & (d_tags == FAMILY_TAGS[family])
+    d_safe_family_rows = cp.where(d_is_family, d_family_rows, cp.int32(0))
+    d_global_values = cp.where(
+        d_is_family,
+        cp.arange(int(d_tags.size), dtype=cp.int32),
+        cp.int32(-1),
+    )
+    d_local_to_global = cp.full(geom_count, -1, dtype=cp.int32)
+    if geom_count:
+        cp.maximum.at(d_local_to_global, d_safe_family_rows, d_global_values)
+    return d_local_to_global
+
+
+def _record_boundary_output_mapping(
+    output_mappings,
+    out_family,
+    d_source_global_rows,
+    output_row_offset,
+):
+    d_source_global_rows = cp.asarray(d_source_global_rows, dtype=cp.int32)
+    output_mappings.setdefault(out_family, []).append(
+        (
+            d_source_global_rows,
+            cp.arange(int(d_source_global_rows.size), dtype=cp.int32) + cp.int32(output_row_offset),
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # GPU dispatch: registered kernel variant
 # ---------------------------------------------------------------------------
+
 
 @register_kernel_variant(
     "boundary",
@@ -581,7 +539,10 @@ def _merge_multilinestring_buffers(buf_a, buf_b):
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "polygon", "linestring", "multilinestring", "multipolygon",
+        "polygon",
+        "linestring",
+        "multilinestring",
+        "multipolygon",
     ),
     supports_mixed=True,
     tags=("cuda-python", "constructive", "boundary"),
@@ -599,7 +560,28 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     outputs are merged via coordinate concatenation + offset adjustment.
     Similarly for LineString + MultiLineString producing two MultiPoint outputs.
     """
-    d_state = owned._ensure_device_state()
+    if owned.is_indexed_view:
+        base = owned._base
+        d_index_map = owned._index_map
+        if (
+            base is None
+            or d_index_map is None
+            or not hasattr(d_index_map, "__cuda_array_interface__")
+        ):
+            raise RuntimeError("GPU boundary requires a device rowset for indexed geometry")
+        base_boundary = _boundary_gpu(base)
+        result = base_boundary._device_indexed_take(
+            cp.asarray(d_index_map, dtype=cp.int64),
+            assume_unique_indices=bool(owned._index_map_unique),
+        )
+        if owned._row_active_mask is not None:
+            result._apply_row_activity(
+                cp.asarray(owned._row_active_mask, dtype=cp.bool_),
+                assume_active_indices_unique=bool(owned._active_index_map_unique),
+            )
+        return result
+
+    d_state = owned._ensure_device_state(preserve_indexed_view=True)
 
     new_device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
     out_tags = cp.asarray(d_state.tags).copy()
@@ -610,98 +592,98 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     # MultiPolygon -> MultiLineString would pollute the MultiLineString ->
     # MultiPoint remap if we matched against the already-modified out_tags.
     src_tags = cp.asarray(d_state.tags)
-    family_global_rows_ordered: dict[GeometryFamily, list] = {}
+    family_output_mappings: dict[GeometryFamily, list[tuple]] = {}
 
     for family, device_buf in d_state.families.items():
         geom_count = int(device_buf.geometry_offsets.shape[0]) - 1
         if geom_count == 0:
             continue
+        d_local_to_global = _family_local_to_global_capacity(
+            d_state,
+            family,
+            geom_count,
+        )
 
         if family is GeometryFamily.POLYGON:
-            src_rows = cp.flatnonzero(src_tags == FAMILY_TAGS[GeometryFamily.POLYGON])
-            boundary_buffers = _boundary_polygon_gpu(
-                device_buf,
-                geom_count,
-                host_buf=owned.families.get(family),
-            )
+            boundary_buffers = _boundary_polygon_gpu(device_buf, geom_count)
             for out_family, (new_buf, local_rows) in boundary_buffers.items():
                 if int(local_rows.size) == 0:
                     continue
-                if (
-                    out_family is GeometryFamily.MULTILINESTRING
-                    and GeometryFamily.MULTILINESTRING in new_device_families
-                ):
+                existing = new_device_families.get(out_family)
+                output_row_offset = (
+                    0 if existing is None else int(existing.geometry_offsets.size) - 1
+                )
+                if out_family is GeometryFamily.MULTILINESTRING and existing is not None:
                     new_device_families[GeometryFamily.MULTILINESTRING] = (
                         _merge_multilinestring_buffers(
-                            new_device_families[GeometryFamily.MULTILINESTRING],
+                            existing,
                             new_buf,
                         )
                     )
                 else:
                     new_device_families[out_family] = new_buf
-                output_rows = src_rows[local_rows]
-                family_global_rows_ordered.setdefault(out_family, []).append(output_rows)
-                out_tags[output_rows] = FAMILY_TAGS[out_family]
+                _record_boundary_output_mapping(
+                    family_output_mappings,
+                    out_family,
+                    d_local_to_global[local_rows],
+                    output_row_offset,
+                )
 
         elif family is GeometryFamily.MULTIPOLYGON:
-            src_rows = cp.flatnonzero(src_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
             new_buf = _boundary_multipolygon_gpu(device_buf, geom_count)
-            if GeometryFamily.MULTILINESTRING in new_device_families:
+            existing = new_device_families.get(GeometryFamily.MULTILINESTRING)
+            output_row_offset = 0 if existing is None else int(existing.geometry_offsets.size) - 1
+            if existing is not None:
                 new_device_families[GeometryFamily.MULTILINESTRING] = (
                     _merge_multilinestring_buffers(
-                        new_device_families[GeometryFamily.MULTILINESTRING],
+                        existing,
                         new_buf,
                     )
                 )
             else:
                 new_device_families[GeometryFamily.MULTILINESTRING] = new_buf
-            family_global_rows_ordered.setdefault(GeometryFamily.MULTILINESTRING, []).append(
-                src_rows,
+            _record_boundary_output_mapping(
+                family_output_mappings,
+                GeometryFamily.MULTILINESTRING,
+                d_local_to_global,
+                output_row_offset,
             )
-            # Remap tags: MultiPolygon rows -> MultiLineString
-            mpoly_tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
-            mls_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
-            out_tags[src_tags == mpoly_tag] = mls_tag
 
         elif family is GeometryFamily.LINESTRING:
-            src_rows = cp.flatnonzero(src_tags == FAMILY_TAGS[GeometryFamily.LINESTRING])
             new_buf = _boundary_linestring_gpu(device_buf, geom_count)
-            if GeometryFamily.MULTIPOINT in new_device_families:
-                new_device_families[GeometryFamily.MULTIPOINT] = (
-                    _merge_multipoint_buffers(
-                        new_device_families[GeometryFamily.MULTIPOINT],
-                        new_buf,
-                    )
+            existing = new_device_families.get(GeometryFamily.MULTIPOINT)
+            output_row_offset = 0 if existing is None else int(existing.geometry_offsets.size) - 1
+            if existing is not None:
+                new_device_families[GeometryFamily.MULTIPOINT] = _merge_multipoint_buffers(
+                    existing,
+                    new_buf,
                 )
             else:
                 new_device_families[GeometryFamily.MULTIPOINT] = new_buf
-            family_global_rows_ordered.setdefault(GeometryFamily.MULTIPOINT, []).append(
-                src_rows,
+            _record_boundary_output_mapping(
+                family_output_mappings,
+                GeometryFamily.MULTIPOINT,
+                d_local_to_global,
+                output_row_offset,
             )
-            # Remap tags: LineString rows -> MultiPoint
-            ls_tag = FAMILY_TAGS[GeometryFamily.LINESTRING]
-            mp_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
-            out_tags[src_tags == ls_tag] = mp_tag
 
         elif family is GeometryFamily.MULTILINESTRING:
-            src_rows = cp.flatnonzero(src_tags == FAMILY_TAGS[GeometryFamily.MULTILINESTRING])
             new_buf = _boundary_multilinestring_gpu(device_buf, geom_count)
-            if GeometryFamily.MULTIPOINT in new_device_families:
-                new_device_families[GeometryFamily.MULTIPOINT] = (
-                    _merge_multipoint_buffers(
-                        new_device_families[GeometryFamily.MULTIPOINT],
-                        new_buf,
-                    )
+            existing = new_device_families.get(GeometryFamily.MULTIPOINT)
+            output_row_offset = 0 if existing is None else int(existing.geometry_offsets.size) - 1
+            if existing is not None:
+                new_device_families[GeometryFamily.MULTIPOINT] = _merge_multipoint_buffers(
+                    existing,
+                    new_buf,
                 )
             else:
                 new_device_families[GeometryFamily.MULTIPOINT] = new_buf
-            family_global_rows_ordered.setdefault(GeometryFamily.MULTIPOINT, []).append(
-                src_rows,
+            _record_boundary_output_mapping(
+                family_output_mappings,
+                GeometryFamily.MULTIPOINT,
+                d_local_to_global,
+                output_row_offset,
             )
-            # Remap tags: MultiLineString rows -> MultiPoint
-            mls_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
-            mp_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
-            out_tags[src_tags == mls_tag] = mp_tag
 
         elif family in (GeometryFamily.POINT, GeometryFamily.MULTIPOINT):
             # Boundary of Point / MultiPoint is empty -- mark rows invalid
@@ -714,10 +696,26 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     # LineString -> MultiPoint, etc.), so the mapping from global row ->
     # family-local row must be rebuilt.
     new_family_row_offsets = cp.full(owned.row_count, -1, dtype=cp.int32)
-    for row_chunks in family_global_rows_ordered.values():
-        ordered_rows = cp.concatenate(row_chunks) if len(row_chunks) > 1 else row_chunks[0]
-        new_family_row_offsets[ordered_rows] = cp.arange(
-            int(ordered_rows.size), dtype=cp.int32,
+    for out_family, mappings in family_output_mappings.items():
+        d_output_positions = cp.full(owned.row_count, -1, dtype=cp.int32)
+        for d_global_rows, d_local_output_positions in mappings:
+            d_active = d_global_rows >= 0
+            d_safe_global_rows = cp.where(d_active, d_global_rows, cp.int32(0))
+            cp.maximum.at(
+                d_output_positions,
+                d_safe_global_rows,
+                cp.where(d_active, d_local_output_positions, cp.int32(-1)),
+            )
+        d_has_output = d_output_positions >= 0
+        new_family_row_offsets = cp.where(
+            d_has_output,
+            d_output_positions,
+            new_family_row_offsets,
+        )
+        out_tags = cp.where(
+            d_has_output,
+            cp.int8(FAMILY_TAGS[out_family]),
+            out_tags,
         )
 
     return build_device_resident_owned(
@@ -733,6 +731,7 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 # ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
+
 
 def boundary_owned(
     owned: OwnedGeometryArray,
@@ -777,6 +776,11 @@ def boundary_owned(
         requested_mode=dispatch_mode,
         requested_precision=precision,
         current_residency=owned.residency,
+        work_estimate=estimate_physical_work_from_owned(
+            owned,
+            output_row_count=row_count,
+            primary_unit_name="boundary-coordinate",
+        ),
     )
 
     if selection.selected is ExecutionMode.GPU:

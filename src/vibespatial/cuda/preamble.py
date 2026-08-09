@@ -13,7 +13,9 @@ __all__ = ["PRECISION_PREAMBLE", "SPATIAL_TOLERANCE_PREAMBLE"]
 
 SPATIAL_TOLERANCE_PREAMBLE = f"#define VS_SPATIAL_EPSILON {SPATIAL_EPSILON:.17g}\n"
 
-PRECISION_PREAMBLE = SPATIAL_TOLERANCE_PREAMBLE + r"""
+PRECISION_PREAMBLE = (
+    SPATIAL_TOLERANCE_PREAMBLE
+    + r"""
 typedef {compute_type} compute_t;
 
 /* Centered coordinate read: subtract center in fp64, then cast to compute_t.
@@ -40,3 +42,4 @@ typedef {compute_type} compute_t;
     }} \
 }} while(0)
 """
+)

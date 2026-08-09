@@ -65,7 +65,9 @@ extern "C" __global__ void is_closed_multilinestring(
 _IS_CLOSED_KERNEL_NAMES = ("is_closed_linestring", "is_closed_multilinestring")
 _IS_CLOSED_FP64 = _IS_CLOSED_KERNEL_SOURCE.format()
 # is_ccw: shoelace signed area on exterior ring (uses shared vs_ring_signed_area_2x)
-_IS_CCW_KERNEL_SOURCE = SIGNED_AREA_DEVICE + r"""
+_IS_CCW_KERNEL_SOURCE = (
+    SIGNED_AREA_DEVICE
+    + r"""
 extern "C" __global__ void is_ccw_polygon(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -122,6 +124,7 @@ extern "C" __global__ void is_ccw_multipolygon(
     out[i] = (area2 > 0.0) ? 1 : 0;
 }}
 """
+)
 _IS_CCW_KERNEL_NAMES = ("is_ccw_polygon", "is_ccw_multipolygon")
 _IS_CCW_FP64 = _IS_CCW_KERNEL_SOURCE.format()
 # ---------------------------------------------------------------------------

@@ -15,7 +15,14 @@ from vibespatial.runtime.precision import KernelClass
     "cpu",
     kernel_class=KernelClass.COARSE,
     execution_modes=(ExecutionMode.CPU,),
-    geometry_families=("polygon", "multipolygon", "linestring", "multilinestring", "point", "multipoint"),
+    geometry_families=(
+        "polygon",
+        "multipolygon",
+        "linestring",
+        "multilinestring",
+        "point",
+        "multipoint",
+    ),
     supports_mixed=True,
     tags=("shapely",),
 )

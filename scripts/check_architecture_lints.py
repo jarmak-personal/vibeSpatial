@@ -9,6 +9,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_DOC = "docs/architecture/runtime.md"
 RESIDENCY_DOC = "docs/architecture/residency.md"
+PHYSICAL_SHAPE_DOC = "docs/decisions/0046-gpu-physical-workload-shape-contracts.md"
 SYNTHETIC_DOC = "docs/testing/synthetic-data.md"
 ALLOWED_MATERIALIZATION_METHODS = {"to_pandas", "to_numpy", "values", "__repr__"}
 DATA_FILE_ALLOWED_SUFFIXES = {".py", ".md"}
@@ -248,6 +249,12 @@ def check_kernel_host_transfers(repo_root: Path) -> list[LintError]:
                 name = call_name(descendant)
                 if name not in KERNEL_TRANSFER_APIS:
                     continue
+                if (
+                    name == "get"
+                    and isinstance(descendant.func, ast.Attribute)
+                    and descendant.args
+                ):
+                    continue
                 errors.append(
                     LintError(
                         code="ARCH004",
@@ -458,6 +465,38 @@ def check_dispatch_residency_context(repo_root: Path) -> list[LintError]:
     return errors
 
 
+def check_direct_device_resolution(repo_root: Path) -> list[LintError]:
+    """ARCH009: Keep mutating device resolution inside the owned carrier."""
+    errors: list[LintError] = []
+    root = repo_root / "src" / "vibespatial"
+    owned_path = root / "geometry" / "owned.py"
+    for path in iter_python_files(root):
+        if path == owned_path:
+            continue
+        tree = parse_module(path)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr != "_device_resolve":
+                continue
+            errors.append(
+                LintError(
+                    code="ARCH009",
+                    path=path,
+                    line=node.lineno,
+                    message=(
+                        "Compute paths may not invoke mutating generic device resolution; "
+                        "consume row indirection or use physicalize_device_rows() as an "
+                        "explicit non-mutating layout transition."
+                    ),
+                    doc_path=PHYSICAL_SHAPE_DOC,
+                )
+            )
+    return errors
+
+
 def run_checks(repo_root: Path) -> list[LintError]:
     errors: list[LintError] = []
     errors.extend(check_vendor_imports(repo_root))
@@ -467,6 +506,7 @@ def run_checks(repo_root: Path) -> list[LintError]:
     errors.extend(check_gpu_kernel_tests(repo_root))
     errors.extend(check_test_data_files(repo_root))
     errors.extend(check_dispatch_residency_context(repo_root))
+    errors.extend(check_direct_device_resolution(repo_root))
     return sorted(errors, key=lambda error: (str(error.path), error.line, error.code))
 
 

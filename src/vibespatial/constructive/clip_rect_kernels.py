@@ -18,7 +18,10 @@ _LINE_CLIP_GPU_THRESHOLD = 1_000
 # into a pre-allocated output buffer using per-ring offsets computed via
 # exclusive_scan on a vertex-count pass.
 
-_SUTHERLAND_HODGMAN_KERNEL_SOURCE = STRIP_CLOSURE_DEVICE + SPATIAL_TOLERANCE_PREAMBLE + r"""
+_SUTHERLAND_HODGMAN_KERNEL_SOURCE = (
+    STRIP_CLOSURE_DEVICE
+    + SPATIAL_TOLERANCE_PREAMBLE
+    + r"""
 #define EPSILON VS_SPATIAL_EPSILON
 
 /* Clip a ring against one boundary edge.
@@ -198,155 +201,149 @@ extern "C" __global__ void sh_clip_rings(
   out_y[out_start + count] = src_y[0];
 }
 """
+)
 _SH_KERNEL_NAMES = ("sh_count_vertices", "sh_clip_rings")
 # ---------------------------------------------------------------------------
-# GPU Liang-Barsky line clip kernel (NVRTC)
-# ---------------------------------------------------------------------------
-# Per-segment clip against a rectangle.  Each thread processes one segment.
-
-_LIANG_BARSKY_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
-#define LB_EPSILON VS_SPATIAL_EPSILON
-
-extern "C" __global__ void lb_clip_segments(
-    const double* seg_x0,
-    const double* seg_y0,
-    const double* seg_x1,
-    const double* seg_y1,
-    double* out_x0,
-    double* out_y0,
-    double* out_x1,
-    double* out_y1,
-    unsigned char* out_valid,
-    double xmin, double ymin, double xmax, double ymax,
-    int segment_count
-) {
-  const int seg = blockIdx.x * blockDim.x + threadIdx.x;
-  if (seg >= segment_count) return;
-
-  double x0 = seg_x0[seg], y0 = seg_y0[seg];
-  double x1 = seg_x1[seg], y1 = seg_y1[seg];
-  double dx = x1 - x0, dy = y1 - y0;
-
-  double p[4] = {-dx, dx, -dy, dy};
-  double q[4] = {x0 - xmin, xmax - x0, y0 - ymin, ymax - y0};
-
-  double u1 = 0.0, u2 = 1.0;
-  for (int k = 0; k < 4; k++) {
-    if (fabs(p[k]) <= LB_EPSILON) {
-      if (q[k] < 0.0) { out_valid[seg] = 0; return; }
-      continue;
-    }
-    double t = q[k] / p[k];
-    if (p[k] < 0.0) { if (t > u1) u1 = t; }
-    else             { if (t < u2) u2 = t; }
-    if (u1 > u2) { out_valid[seg] = 0; return; }
-  }
-
-  double cx0 = x0 + u1 * dx, cy0 = y0 + u1 * dy;
-  double cx1 = x0 + u2 * dx, cy1 = y0 + u2 * dy;
-  cx0 = fmin(fmax(cx0, xmin), xmax);
-  cy0 = fmin(fmax(cy0, ymin), ymax);
-  cx1 = fmin(fmax(cx1, xmin), xmax);
-  cy1 = fmin(fmax(cy1, ymin), ymax);
-
-  /* Reject degenerate segments */
-  double ddx = cx0 - cx1, ddy = cy0 - cy1;
-  if (ddx * ddx + ddy * ddy < LB_EPSILON * LB_EPSILON) {
-    out_valid[seg] = 0;
-    return;
-  }
-
-  out_x0[seg] = cx0;
-  out_y0[seg] = cy0;
-  out_x1[seg] = cx1;
-  out_y1[seg] = cy1;
-  out_valid[seg] = 1;
-}
-"""
-_LB_KERNEL_NAMES = ("lb_clip_segments",)
-# ---------------------------------------------------------------------------
-# Segmented arange NVRTC kernel (Tier 1 — geometry-specific gather index)
-# ---------------------------------------------------------------------------
-# Given per-ring (start, length, write_offset), produce a flat array of
-# gather indices: for ring i, write  start[i], start[i]+1, ..., start[i]+len[i]-1
-# at output[write_offset[i] .. write_offset[i]+len[i]).
-# One thread per surviving ring — each thread writes a short range.
-
-_SEGMENTED_ARANGE_KERNEL_SOURCE = r"""
-extern "C" __global__ void __launch_bounds__(256, 4)
-segmented_arange(
-    const long long* __restrict__ starts,
-    const long long* __restrict__ lens,
-    const long long* __restrict__ write_offsets,
-    long long* __restrict__ output,
-    const int n_segments
-) {
-    const int stride = blockDim.x * gridDim.x;
-    for (int seg = blockIdx.x * blockDim.x + threadIdx.x;
-         seg < n_segments;
-         seg += stride) {
-        long long base = starts[seg];
-        long long off  = write_offsets[seg];
-        long long len  = lens[seg];
-        for (long long j = 0; j < len; j++) {
-            output[off + j] = base + j;
-        }
-    }
-}
-"""
-_SEG_ARANGE_KERNEL_NAMES = ("segmented_arange",)
-
-
-# ---------------------------------------------------------------------------
-# LineString-only rectangle clip assembly kernels
+# Line-family rectangle clip assembly kernels
 # ---------------------------------------------------------------------------
 
-_LINE_ROW_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
+_LINE_ROW_KERNEL_SOURCE = (
+    SPATIAL_TOLERANCE_PREAMBLE
+    + r"""
 #define EPSILON VS_SPATIAL_EPSILON
 
+__device__ __forceinline__ int line_rect_clip_segment(
+    const double x0,
+    const double y0,
+    const double x1,
+    const double y1,
+    const double xmin,
+    const double ymin,
+    const double xmax,
+    const double ymax,
+    double* __restrict__ out_x0,
+    double* __restrict__ out_y0,
+    double* __restrict__ out_x1,
+    double* __restrict__ out_y1
+) {
+    const double dx = x1 - x0;
+    const double dy = y1 - y0;
+    const double p[4] = {-dx, dx, -dy, dy};
+    const double q[4] = {x0 - xmin, xmax - x0, y0 - ymin, ymax - y0};
+    double u1 = 0.0;
+    double u2 = 1.0;
+
+    for (int edge = 0; edge < 4; ++edge) {
+        if (fabs(p[edge]) <= EPSILON) {
+            if (q[edge] < 0.0) return 0;
+            continue;
+        }
+        const double t = q[edge] / p[edge];
+        if (p[edge] < 0.0) {
+            if (t > u1) u1 = t;
+        } else if (t < u2) {
+            u2 = t;
+        }
+        if (u1 > u2) return 0;
+    }
+
+    double cx0 = fmin(fmax(x0 + u1 * dx, xmin), xmax);
+    double cy0 = fmin(fmax(y0 + u1 * dy, ymin), ymax);
+    double cx1 = fmin(fmax(x0 + u2 * dx, xmin), xmax);
+    double cy1 = fmin(fmax(y0 + u2 * dy, ymin), ymax);
+    const double ddx = cx0 - cx1;
+    const double ddy = cy0 - cy1;
+    if (ddx * ddx + ddy * ddy < EPSILON * EPSILON) return 0;
+
+    *out_x0 = cx0;
+    *out_y0 = cy0;
+    *out_x1 = cx1;
+    *out_y1 = cy1;
+    return 1;
+}
+
 extern "C" __global__ void __launch_bounds__(256, 4)
-line_single_run_count(
-    const double* __restrict__ seg_x0,
-    const double* __restrict__ seg_y0,
-    const double* __restrict__ seg_x1,
-    const double* __restrict__ seg_y1,
-    const unsigned char* __restrict__ valid,
-    const int* __restrict__ row_segment_offsets,
+line_rect_capacity_count(
+    const unsigned char* __restrict__ validity,
+    const signed char* __restrict__ tags,
+    const int* __restrict__ family_row_offsets,
+    const double* __restrict__ line_x,
+    const double* __restrict__ line_y,
+    const int* __restrict__ line_geometry_offsets,
+    const unsigned char* __restrict__ line_empty,
+    const double* __restrict__ multi_x,
+    const double* __restrict__ multi_y,
+    const int* __restrict__ multi_geometry_offsets,
+    const int* __restrict__ multi_part_offsets,
+    const unsigned char* __restrict__ multi_empty,
     int* __restrict__ out_run_counts,
     int* __restrict__ out_coord_counts,
     unsigned char* __restrict__ out_has_output,
+    const double xmin,
+    const double ymin,
+    const double xmax,
+    const double ymax,
     const int row_count
 ) {
     const int stride = blockDim.x * gridDim.x;
     for (int row = blockIdx.x * blockDim.x + threadIdx.x;
          row < row_count;
          row += stride) {
-        const int start = row_segment_offsets[row];
-        const int end = row_segment_offsets[row + 1];
         int runs = 0;
         int coords = 0;
         int have_prev = 0;
         double prev_x1 = 0.0;
         double prev_y1 = 0.0;
 
-        for (int seg = start; seg < end; ++seg) {
-            if (!valid[seg]) continue;
-            const double sx = seg_x0[seg];
-            const double sy = seg_y0[seg];
-            const double ex = seg_x1[seg];
-            const double ey = seg_y1[seg];
-            if (!have_prev) {
-                runs = 1;
-                coords = 2;
-                have_prev = 1;
-            } else if (fabs(prev_x1 - sx) > EPSILON || fabs(prev_y1 - sy) > EPSILON) {
-                runs += 1;
-                coords += 2;
-            } else {
-                coords += 1;
+        if (validity[row]) {
+            const int family = (int)tags[row];
+            const int family_row = family_row_offsets[row];
+            int part_start = 0;
+            int part_end = 0;
+            if (family == 1 && !line_empty[family_row]) {
+                part_start = family_row;
+                part_end = family_row + 1;
+            } else if (family == 4 && !multi_empty[family_row]) {
+                part_start = multi_geometry_offsets[family_row];
+                part_end = multi_geometry_offsets[family_row + 1];
             }
-            prev_x1 = ex;
-            prev_y1 = ey;
+
+            for (int part = part_start; part < part_end; ++part) {
+                const int coord_start = family == 1
+                    ? line_geometry_offsets[family_row]
+                    : multi_part_offsets[part];
+                const int coord_end = family == 1
+                    ? line_geometry_offsets[family_row + 1]
+                    : multi_part_offsets[part + 1];
+                int part_boundary = have_prev;
+                for (int coord = coord_start; coord < coord_end - 1; ++coord) {
+                    const double* x = family == 1 ? line_x : multi_x;
+                    const double* y = family == 1 ? line_y : multi_y;
+                    double sx, sy, ex, ey;
+                    if (!line_rect_clip_segment(
+                        x[coord], y[coord], x[coord + 1], y[coord + 1],
+                        xmin, ymin, xmax, ymax, &sx, &sy, &ex, &ey
+                    )) continue;
+
+                    if (!have_prev) {
+                        runs = 1;
+                        coords = 2;
+                        have_prev = 1;
+                    } else if (
+                        part_boundary
+                        || fabs(prev_x1 - sx) > EPSILON
+                        || fabs(prev_y1 - sy) > EPSILON
+                    ) {
+                        runs += 1;
+                        coords += 2;
+                    } else {
+                        coords += 1;
+                    }
+                    prev_x1 = ex;
+                    prev_y1 = ey;
+                    part_boundary = 0;
+                }
+            }
         }
 
         out_run_counts[row] = runs;
@@ -356,116 +353,111 @@ line_single_run_count(
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
-line_single_run_scatter(
-    const double* __restrict__ seg_x0,
-    const double* __restrict__ seg_y0,
-    const double* __restrict__ seg_x1,
-    const double* __restrict__ seg_y1,
-    const unsigned char* __restrict__ valid,
-    const int* __restrict__ row_segment_offsets,
-    const int* __restrict__ selected_rows,
-    const int* __restrict__ coord_offsets,
-    double* __restrict__ out_x,
-    double* __restrict__ out_y,
-    const int selected_count
+line_rect_capacity_scatter(
+    const unsigned char* __restrict__ validity,
+    const signed char* __restrict__ tags,
+    const int* __restrict__ family_row_offsets,
+    const double* __restrict__ line_x,
+    const double* __restrict__ line_y,
+    const int* __restrict__ line_geometry_offsets,
+    const unsigned char* __restrict__ line_empty,
+    const double* __restrict__ multi_x,
+    const double* __restrict__ multi_y,
+    const int* __restrict__ multi_geometry_offsets,
+    const int* __restrict__ multi_part_offsets,
+    const unsigned char* __restrict__ multi_empty,
+    const int* __restrict__ run_counts,
+    const int* __restrict__ single_coord_offsets,
+    const int* __restrict__ multi_part_output_offsets,
+    const int* __restrict__ multi_coord_offsets,
+    int* __restrict__ out_multi_part_offsets,
+    double* __restrict__ out_single_x,
+    double* __restrict__ out_single_y,
+    double* __restrict__ out_multi_x,
+    double* __restrict__ out_multi_y,
+    const double xmin,
+    const double ymin,
+    const double xmax,
+    const double ymax,
+    const int row_count
 ) {
     const int stride = blockDim.x * gridDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < selected_count;
-         idx += stride) {
-        const int row = selected_rows[idx];
-        const int start = row_segment_offsets[row];
-        const int end = row_segment_offsets[row + 1];
-        int write = coord_offsets[idx];
-        int started = 0;
+    for (int row = blockIdx.x * blockDim.x + threadIdx.x;
+         row < row_count;
+         row += stride) {
+        const int output_runs = run_counts[row];
+        if (output_runs <= 0 || !validity[row]) continue;
 
-        for (int seg = start; seg < end; ++seg) {
-            if (!valid[seg]) continue;
-            if (!started) {
-                out_x[write] = seg_x0[seg];
-                out_y[write] = seg_y0[seg];
-                write += 1;
-                started = 1;
-            }
-            out_x[write] = seg_x1[seg];
-            out_y[write] = seg_y1[seg];
-            write += 1;
+        const int family = (int)tags[row];
+        const int family_row = family_row_offsets[row];
+        int part_start = 0;
+        int part_end = 0;
+        if (family == 1 && !line_empty[family_row]) {
+            part_start = family_row;
+            part_end = family_row + 1;
+        } else if (family == 4 && !multi_empty[family_row]) {
+            part_start = multi_geometry_offsets[family_row];
+            part_end = multi_geometry_offsets[family_row + 1];
+        } else {
+            continue;
         }
-    }
-}
 
-extern "C" __global__ void __launch_bounds__(256, 4)
-line_multi_run_scatter(
-    const double* __restrict__ seg_x0,
-    const double* __restrict__ seg_y0,
-    const double* __restrict__ seg_x1,
-    const double* __restrict__ seg_y1,
-    const unsigned char* __restrict__ valid,
-    const int* __restrict__ row_segment_offsets,
-    const int* __restrict__ selected_rows,
-    const int* __restrict__ geom_part_offsets,
-    const int* __restrict__ coord_offsets,
-    int* __restrict__ out_part_offsets,
-    double* __restrict__ out_x,
-    double* __restrict__ out_y,
-    const int selected_count
-) {
-    const int stride = blockDim.x * gridDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < selected_count;
-         idx += stride) {
-        const int row = selected_rows[idx];
-        const int start = row_segment_offsets[row];
-        const int end = row_segment_offsets[row + 1];
-        int part_write = geom_part_offsets[idx];
-        int coord_write = coord_offsets[idx];
+        int part_write = multi_part_output_offsets[row];
+        int coord_write = output_runs == 1
+            ? single_coord_offsets[row]
+            : multi_coord_offsets[row];
         int started = 0;
         double prev_x1 = 0.0;
         double prev_y1 = 0.0;
 
-        for (int seg = start; seg < end; ++seg) {
-            if (!valid[seg]) continue;
-            const double sx = seg_x0[seg];
-            const double sy = seg_y0[seg];
-            const double ex = seg_x1[seg];
-            const double ey = seg_y1[seg];
+        for (int part = part_start; part < part_end; ++part) {
+            const int coord_start = family == 1
+                ? line_geometry_offsets[family_row]
+                : multi_part_offsets[part];
+            const int coord_end = family == 1
+                ? line_geometry_offsets[family_row + 1]
+                : multi_part_offsets[part + 1];
+            int part_boundary = started;
+            for (int coord = coord_start; coord < coord_end - 1; ++coord) {
+                const double* x = family == 1 ? line_x : multi_x;
+                const double* y = family == 1 ? line_y : multi_y;
+                double sx, sy, ex, ey;
+                if (!line_rect_clip_segment(
+                    x[coord], y[coord], x[coord + 1], y[coord + 1],
+                    xmin, ymin, xmax, ymax, &sx, &sy, &ex, &ey
+                )) continue;
 
-            if (!started) {
-                out_part_offsets[part_write] = coord_write;
-                out_x[coord_write] = sx;
-                out_y[coord_write] = sy;
-                coord_write += 1;
+                const int new_run = !started || part_boundary
+                    || fabs(prev_x1 - sx) > EPSILON
+                    || fabs(prev_y1 - sy) > EPSILON;
+                double* out_x = output_runs == 1 ? out_single_x : out_multi_x;
+                double* out_y = output_runs == 1 ? out_single_y : out_multi_y;
+                if (new_run) {
+                    if (output_runs > 1) {
+                        if (started) part_write += 1;
+                        out_multi_part_offsets[part_write] = coord_write;
+                    }
+                    out_x[coord_write] = sx;
+                    out_y[coord_write] = sy;
+                    coord_write += 1;
+                    started = 1;
+                }
                 out_x[coord_write] = ex;
                 out_y[coord_write] = ey;
                 coord_write += 1;
-                started = 1;
-            } else if (fabs(prev_x1 - sx) > EPSILON || fabs(prev_y1 - sy) > EPSILON) {
-                part_write += 1;
-                out_part_offsets[part_write] = coord_write;
-                out_x[coord_write] = sx;
-                out_y[coord_write] = sy;
-                coord_write += 1;
-                out_x[coord_write] = ex;
-                out_y[coord_write] = ey;
-                coord_write += 1;
-            } else {
-                out_x[coord_write] = ex;
-                out_y[coord_write] = ey;
-                coord_write += 1;
+                prev_x1 = ex;
+                prev_y1 = ey;
+                part_boundary = 0;
             }
-
-            prev_x1 = ex;
-            prev_y1 = ey;
         }
-
-        if (started) {
-            out_part_offsets[part_write + 1] = coord_write;
+        if (output_runs > 1) {
+            out_multi_part_offsets[multi_part_output_offsets[row] + output_runs] = coord_write;
         }
     }
 }
 """
+)
 _LINE_ROW_KERNEL_NAMES = (
-    "line_single_run_count",
-    "line_single_run_scatter",
-    "line_multi_run_scatter",
+    "line_rect_capacity_count",
+    "line_rect_capacity_scatter",
 )

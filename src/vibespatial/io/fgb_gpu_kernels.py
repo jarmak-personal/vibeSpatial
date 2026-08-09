@@ -375,4 +375,3 @@ _POINT_KERNEL_NAMES = ("fgb_decode_points",)
 _COUNT_KERNEL_NAMES = ("fgb_count_coords",)
 
 _GATHER_KERNEL_NAMES = ("fgb_gather_coords",)
-

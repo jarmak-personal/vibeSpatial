@@ -82,14 +82,18 @@ _GEOARROW_ENCODING_FAMILIES: dict[str, GeometryFamily] = {
 
 _SUPPORTED_DEVICE_GEOARROW_PROMOTIONS = {
     frozenset({GeometryFamily.POINT, GeometryFamily.MULTIPOINT}): GeometryFamily.MULTIPOINT,
-    frozenset({GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING}): GeometryFamily.MULTILINESTRING,
+    frozenset(
+        {GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING}
+    ): GeometryFamily.MULTILINESTRING,
     frozenset({GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}): GeometryFamily.MULTIPOLYGON,
 }
 
 
-_request_nvrtc_warmup([
-    ("wkb-encode", _WKB_ENCODE_KERNEL_SOURCE, _WKB_ENCODE_KERNEL_NAMES),
-])
+_request_nvrtc_warmup(
+    [
+        ("wkb-encode", _WKB_ENCODE_KERNEL_SOURCE, _WKB_ENCODE_KERNEL_NAMES),
+    ]
+)
 
 
 @dataclass(frozen=True)
@@ -103,6 +107,15 @@ class _NativeDeviceWriteStatus:
     written: bool
     fallback_detail: str | None = None
     compatibility_detail: str | None = None
+
+
+@dataclass(frozen=True)
+class _NativeDeviceIndexColumn:
+    field_name: str
+    logical_name: Any
+    column: Any
+    field: Any
+    metadata_index: Any
 
 
 def _pylibcudf_sink(path) -> str | io.IOBase | None:
@@ -131,6 +144,12 @@ def _authoritative_host_metadata(
     owned: OwnedGeometryArray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return host metadata sourced from device state when available."""
+    if (
+        getattr(owned, "_validity", None) is not None
+        and getattr(owned, "_tags", None) is not None
+        and getattr(owned, "_family_row_offsets", None) is not None
+    ):
+        return owned._validity, owned._tags, owned._family_row_offsets
     if owned.device_state is not None:
         runtime = get_cuda_runtime()
         return (
@@ -162,24 +181,36 @@ def _wkb_encode_kernels():
 def _device_family_row_selection(
     owned: OwnedGeometryArray,
     family: GeometryFamily,
-) -> tuple[np.ndarray, np.ndarray]:
-    validity, tags, family_row_offsets = _authoritative_host_metadata(owned)
-    family_mask = (tags == FAMILY_TAGS[family]) & validity
-    row_indexes = np.flatnonzero(family_mask).astype(np.int32, copy=False)
-    family_rows = family_row_offsets[row_indexes].astype(np.int32, copy=False)
+) -> tuple[Any, Any]:
+    import cupy as cp
+
+    state = _terminal_device_state(owned)
+    family_mask = (cp.asarray(state.tags) == np.int8(FAMILY_TAGS[family])) & cp.asarray(
+        state.validity
+    )
+    row_indexes = cp.flatnonzero(family_mask).astype(cp.int32, copy=False)
+    family_rows = cp.asarray(state.family_row_offsets)[
+        row_indexes.astype(cp.int64, copy=False)
+    ].astype(cp.int32, copy=False)
     return row_indexes, family_rows
 
 
-def _device_wkb_lengths_for_family(owned: OwnedGeometryArray, family: GeometryFamily):
+def _terminal_device_state(owned: OwnedGeometryArray):
+    return owned._ensure_device_state(preserve_indexed_view=True)
+
+
+def _device_wkb_lengths_for_family(
+    owned: OwnedGeometryArray,
+    family: GeometryFamily,
+    family_rows,
+):
     import cupy as cp
 
-    state = owned._ensure_device_state()
+    state = _terminal_device_state(owned)
     device_buffer = state.families[family]
-    _row_indexes, family_rows_host = _device_family_row_selection(owned, family)
-    if family_rows_host.size == 0:
-        return cp.zeros(0, dtype=cp.int32), family_rows_host
+    if family_rows.size == 0:
+        return cp.zeros(0, dtype=cp.int32)
 
-    family_rows = cp.asarray(family_rows_host)
     geometry_offsets = device_buffer.geometry_offsets
 
     if family is GeometryFamily.POINT:
@@ -193,7 +224,9 @@ def _device_wkb_lengths_for_family(owned: OwnedGeometryArray, family: GeometryFa
         ring_stop = geometry_offsets[family_rows + 1]
         coord_start = ring_offsets[ring_start]
         coord_stop = ring_offsets[ring_stop]
-        lengths = (9 + 4 * (ring_stop - ring_start) + 16 * (coord_stop - coord_start)).astype(cp.int32, copy=False)
+        lengths = (9 + 4 * (ring_stop - ring_start) + 16 * (coord_stop - coord_start)).astype(
+            cp.int32, copy=False
+        )
     elif family is GeometryFamily.MULTIPOINT:
         counts = geometry_offsets[family_rows + 1] - geometry_offsets[family_rows]
         lengths = (9 + 21 * counts).astype(cp.int32, copy=False)
@@ -203,7 +236,9 @@ def _device_wkb_lengths_for_family(owned: OwnedGeometryArray, family: GeometryFa
         part_stop = geometry_offsets[family_rows + 1]
         coord_start = part_offsets[part_start]
         coord_stop = part_offsets[part_stop]
-        lengths = (9 + 9 * (part_stop - part_start) + 16 * (coord_stop - coord_start)).astype(cp.int32, copy=False)
+        lengths = (9 + 9 * (part_stop - part_start) + 16 * (coord_stop - coord_start)).astype(
+            cp.int32, copy=False
+        )
     elif family is GeometryFamily.MULTIPOLYGON:
         part_offsets = device_buffer.part_offsets
         ring_offsets = device_buffer.ring_offsets
@@ -214,34 +249,37 @@ def _device_wkb_lengths_for_family(owned: OwnedGeometryArray, family: GeometryFa
         coord_start = ring_offsets[ring_start]
         coord_stop = ring_offsets[ring_stop]
         lengths = (
-            9 + 9 * (poly_stop - poly_start) + 4 * (ring_stop - ring_start) + 16 * (coord_stop - coord_start)
+            9
+            + 9 * (poly_stop - poly_start)
+            + 4 * (ring_stop - ring_start)
+            + 16 * (coord_stop - coord_start)
         ).astype(cp.int32, copy=False)
     else:  # pragma: no cover - exhaustive today
         raise ValueError(f"Unsupported geometry family for device WKB encode: {family}")
-    return lengths, family_rows_host
+    return lengths
 
 
 def _launch_device_wkb_write_kernel(
     family: GeometryFamily,
     *,
     owned: OwnedGeometryArray,
-    row_indexes_host: np.ndarray,
-    family_rows_host: np.ndarray,
+    row_indexes,
+    family_rows,
     row_offsets,
     payload,
 ) -> None:
     import cupy as cp
 
-    count = int(row_indexes_host.size)
+    count = int(row_indexes.size)
     if count == 0:
         return
 
     runtime = get_cuda_runtime()
     kernels = _wkb_encode_kernels()
-    state = owned._ensure_device_state()
+    state = _terminal_device_state(owned)
     device_buffer = state.families[family]
-    row_indexes = cp.asarray(row_indexes_host)
-    family_rows = cp.asarray(family_rows_host)
+    row_indexes = cp.asarray(row_indexes, dtype=cp.int32)
+    family_rows = cp.asarray(family_rows, dtype=cp.int32)
     ptr = runtime.pointer
     if family is GeometryFamily.POINT:
         kernel = kernels["write_point_wkb"]
@@ -270,32 +308,130 @@ def _launch_device_wkb_write_kernel(
     elif family is GeometryFamily.LINESTRING:
         kernel = kernels["write_linestring_wkb"]
         params = (
-            (ptr(row_indexes), ptr(family_rows), ptr(device_buffer.geometry_offsets), ptr(device_buffer.x), ptr(device_buffer.y), ptr(row_offsets), ptr(payload), count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(row_indexes),
+                ptr(family_rows),
+                ptr(device_buffer.geometry_offsets),
+                ptr(device_buffer.x),
+                ptr(device_buffer.y),
+                ptr(row_offsets),
+                ptr(payload),
+                count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
     elif family is GeometryFamily.POLYGON:
         kernel = kernels["write_polygon_wkb"]
         params = (
-            (ptr(row_indexes), ptr(family_rows), ptr(device_buffer.geometry_offsets), ptr(device_buffer.ring_offsets), ptr(device_buffer.x), ptr(device_buffer.y), ptr(row_offsets), ptr(payload), count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(row_indexes),
+                ptr(family_rows),
+                ptr(device_buffer.geometry_offsets),
+                ptr(device_buffer.ring_offsets),
+                ptr(device_buffer.x),
+                ptr(device_buffer.y),
+                ptr(row_offsets),
+                ptr(payload),
+                count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
     elif family is GeometryFamily.MULTIPOINT:
         kernel = kernels["write_multipoint_wkb"]
         params = (
-            (ptr(row_indexes), ptr(family_rows), ptr(device_buffer.geometry_offsets), ptr(device_buffer.x), ptr(device_buffer.y), ptr(row_offsets), ptr(payload), count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(row_indexes),
+                ptr(family_rows),
+                ptr(device_buffer.geometry_offsets),
+                ptr(device_buffer.x),
+                ptr(device_buffer.y),
+                ptr(row_offsets),
+                ptr(payload),
+                count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
     elif family is GeometryFamily.MULTILINESTRING:
         kernel = kernels["write_multilinestring_wkb"]
         params = (
-            (ptr(row_indexes), ptr(family_rows), ptr(device_buffer.geometry_offsets), ptr(device_buffer.part_offsets), ptr(device_buffer.x), ptr(device_buffer.y), ptr(row_offsets), ptr(payload), count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(row_indexes),
+                ptr(family_rows),
+                ptr(device_buffer.geometry_offsets),
+                ptr(device_buffer.part_offsets),
+                ptr(device_buffer.x),
+                ptr(device_buffer.y),
+                ptr(row_offsets),
+                ptr(payload),
+                count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
     elif family is GeometryFamily.MULTIPOLYGON:
         kernel = kernels["write_multipolygon_wkb"]
         params = (
-            (ptr(row_indexes), ptr(family_rows), ptr(device_buffer.geometry_offsets), ptr(device_buffer.part_offsets), ptr(device_buffer.ring_offsets), ptr(device_buffer.x), ptr(device_buffer.y), ptr(row_offsets), ptr(payload), count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(row_indexes),
+                ptr(family_rows),
+                ptr(device_buffer.geometry_offsets),
+                ptr(device_buffer.part_offsets),
+                ptr(device_buffer.ring_offsets),
+                ptr(device_buffer.x),
+                ptr(device_buffer.y),
+                ptr(row_offsets),
+                ptr(payload),
+                count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
     else:  # pragma: no cover - exhaustive today
         raise ValueError(f"Unsupported geometry family for device WKB encode: {family}")
@@ -316,8 +452,8 @@ def _wkb_upper_bound_bytes(
     buffer, which is typically zero.
     """
     total = 0
-    for family, (row_indexes_host, _family_rows_host) in family_selections.items():
-        n_rows_family = row_indexes_host.shape[0]
+    for family, (row_indexes, _family_rows) in family_selections.items():
+        n_rows_family = row_indexes.shape[0]
         buf = state.families[family]
         n_coords = buf.x.shape[0]
 
@@ -344,17 +480,19 @@ def _encode_owned_wkb_column_device(owned: OwnedGeometryArray):
     import cupy as cp
     import pylibcudf as plc
 
-    state = owned._ensure_device_state()
+    state = _terminal_device_state(owned)
     row_count = owned.row_count
     lengths = cp.zeros(row_count, dtype=cp.int32)
-    family_selections: dict[GeometryFamily, tuple[np.ndarray, np.ndarray]] = {}
+    family_selections: dict[GeometryFamily, tuple[Any, Any]] = {}
+    valid_row_count = 0
 
     for family in state.families:
-        row_indexes_host, _family_rows_host = _device_family_row_selection(owned, family)
-        family_lengths, family_rows_host = _device_wkb_lengths_for_family(owned, family)
-        if row_indexes_host.size:
-            lengths[cp.asarray(row_indexes_host)] = family_lengths
-            family_selections[family] = (row_indexes_host, family_rows_host)
+        row_indexes, family_rows = _device_family_row_selection(owned, family)
+        family_lengths = _device_wkb_lengths_for_family(owned, family, family_rows)
+        if row_indexes.size:
+            lengths[row_indexes.astype(cp.int64, copy=False)] = family_lengths
+            family_selections[family] = (row_indexes, family_rows)
+            valid_row_count += int(row_indexes.size)
 
     offsets = cp.empty(row_count + 1, dtype=cp.int32)
     if row_count:
@@ -368,12 +506,12 @@ def _encode_owned_wkb_column_device(owned: OwnedGeometryArray):
     total_bytes = _wkb_upper_bound_bytes(state, family_selections) if row_count else 0
     payload = cp.empty(total_bytes, dtype=cp.uint8)
 
-    for family, (row_indexes_host, family_rows_host) in family_selections.items():
+    for family, (row_indexes, family_rows) in family_selections.items():
         _launch_device_wkb_write_kernel(
             family,
             owned=owned,
-            row_indexes_host=row_indexes_host,
-            family_rows_host=family_rows_host,
+            row_indexes=row_indexes,
+            family_rows=family_rows,
             row_offsets=offsets,
             payload=payload,
         )
@@ -392,10 +530,14 @@ def _encode_owned_wkb_column_device(owned: OwnedGeometryArray):
         [offsets_column],
     )
 
-    validity_mask, null_count = _device_validity_gpumask(owned)
+    validity_mask, null_count = _device_validity_gpumask(
+        owned,
+        valid_row_count=valid_row_count,
+    )
     if null_count:
         column = column.with_mask(validity_mask, null_count)
     return column
+
 
 def _geoarrow_family_from_encoding(encoding_name: str) -> GeometryFamily:
     try:
@@ -405,12 +547,27 @@ def _geoarrow_family_from_encoding(encoding_name: str) -> GeometryFamily:
 
 
 def _device_geoarrow_family_set(owned: OwnedGeometryArray) -> frozenset[GeometryFamily]:
+    if getattr(owned, "is_indexed_view", False):
+        state = owned.device_state
+        if state is not None:
+            if state.trusted_homogeneous_family is not None:
+                return frozenset({state.trusted_homogeneous_family})
+            if len(state.families) == 1:
+                return frozenset(state.families)
+        validity = getattr(owned, "_validity", None)
+        tags = getattr(owned, "_tags", None)
+        if validity is not None and tags is not None:
+            valid_tags = np.asarray(tags[np.asarray(validity, dtype=bool)], dtype=np.int8)
+            if valid_tags.size == 0:
+                return frozenset()
+            return frozenset(TAG_FAMILIES[int(tag)] for tag in np.unique(valid_tags))
+        if state is not None:
+            return frozenset(state.families)
+        return frozenset()
     state = owned.device_state
     if state is not None:
         return frozenset(
-            family
-            for family in state.families
-            if _device_family_row_count(owned, family) > 0
+            family for family in state.families if _device_family_row_count(owned, family) > 0
         )
     validity, tags, _family_row_offsets = _authoritative_host_metadata(owned)
     valid_tags = np.asarray(tags[validity], dtype=np.int8)
@@ -447,20 +604,31 @@ def _device_geoarrow_fast_path_reason_owned(owned: OwnedGeometryArray) -> str | 
 
 def _device_full_offsets_from_local(
     owned: OwnedGeometryArray,
+    family: GeometryFamily,
     local_offsets,
     *,
     empty_mask=None,
 ):
     import cupy as cp
 
-    validity = owned._ensure_device_state().validity
+    state = _terminal_device_state(owned)
+    validity = cp.asarray(state.validity)
+    tags = cp.asarray(state.tags)
+    family_rows = cp.asarray(state.family_row_offsets, dtype=cp.int64)
+    family_valid = validity & (tags == np.int8(FAMILY_TAGS[family]))
     row_count = owned.row_count
     counts = cp.zeros(row_count, dtype=cp.int32)
     if row_count:
         local_counts = (local_offsets[1:] - local_offsets[:-1]).astype(cp.int32, copy=False)
+        selected_family_rows = family_rows[family_valid]
+        selected_counts = local_counts[selected_family_rows]
         if empty_mask is not None:
-            local_counts = cp.where(empty_mask, 0, local_counts)
-        counts[validity] = local_counts
+            selected_counts = cp.where(
+                cp.asarray(empty_mask)[selected_family_rows],
+                0,
+                selected_counts,
+            )
+        counts[family_valid] = selected_counts
     full_offsets = cp.empty(row_count + 1, dtype=cp.int32)
     full_offsets[0] = 0
     if row_count:
@@ -478,6 +646,26 @@ def _device_scalar_to_host_int(device_value, *, reason: str) -> int:
 
 
 def _device_family_row_count(owned: OwnedGeometryArray, family: GeometryFamily) -> int:
+    if getattr(owned, "is_indexed_view", False):
+        state = owned.device_state
+        if (
+            state is not None
+            and state.trusted_homogeneous_family is family
+            and state.trusted_all_valid is True
+        ):
+            return int(owned.row_count)
+        if state is not None and len(state.families) == 1 and family in state.families:
+            return int(owned.row_count)
+        validity = getattr(owned, "_validity", None)
+        tags = getattr(owned, "_tags", None)
+        if validity is not None and tags is not None:
+            return int(
+                np.count_nonzero(
+                    np.asarray(validity, dtype=bool)
+                    & (np.asarray(tags, dtype=np.int8) == np.int8(FAMILY_TAGS[family]))
+                )
+            )
+        return 0
     state = owned.device_state
     if state is not None and family in state.families:
         offsets = state.families[family].geometry_offsets
@@ -490,6 +678,17 @@ def _device_family_row_count(owned: OwnedGeometryArray, family: GeometryFamily) 
 def _device_structure_valid_row_count(owned: OwnedGeometryArray) -> int | None:
     state = owned.device_state
     if state is None:
+        return None
+    if state.trusted_all_valid is True:
+        return int(owned.row_count)
+    if len(state.families) == 1:
+        device_buffer = next(iter(state.families.values()))
+        if int(getattr(device_buffer.geometry_offsets, "size", 0)) == int(owned.row_count) + 1:
+            return int(owned.row_count)
+    if getattr(owned, "is_indexed_view", False):
+        validity = getattr(owned, "_validity", None)
+        if validity is not None:
+            return int(np.count_nonzero(np.asarray(validity, dtype=bool)))
         return None
     return sum(_device_family_row_count(owned, family) for family in state.families)
 
@@ -510,7 +709,9 @@ def _device_scatter_xy_offset_slices(
 
     if total_coords == 0 or int(source_rows.size) == 0:
         return
-    counts = (source_offsets[source_rows + 1] - source_offsets[source_rows]).astype(cp.int32, copy=False)
+    counts = (source_offsets[source_rows + 1] - source_offsets[source_rows]).astype(
+        cp.int32, copy=False
+    )
     local_offsets = cp.empty(int(source_rows.size) + 1, dtype=cp.int32)
     local_offsets[0] = 0
     local_offsets[1:] = cp.cumsum(counts, dtype=cp.int32)
@@ -532,7 +733,7 @@ def _promoted_geoarrow_metadata(
 ):
     import cupy as cp
 
-    state = owned._ensure_device_state()
+    state = _terminal_device_state(owned)
     valid_rows = cp.flatnonzero(state.validity).astype(cp.int64, copy=False)
     valid_count = _device_structure_valid_row_count(owned)
     if valid_count is None:
@@ -560,24 +761,23 @@ def _promote_point_multipoint_geoarrow_owned_device(
 
     counts = cp.zeros(valid_count, dtype=cp.int32)
     point_rows_global = cp.flatnonzero(
-        state.validity
-        & (state.tags == np.int8(FAMILY_TAGS[GeometryFamily.POINT]))
+        state.validity & (state.tags == np.int8(FAMILY_TAGS[GeometryFamily.POINT]))
     ).astype(cp.int64, copy=False)
     point_rows = state.family_row_offsets[point_rows_global].astype(cp.int64, copy=False)
     point_target_rows = promoted_family_rows[point_rows_global].astype(cp.int64, copy=False)
     point_counts = (
-        point_buffer.geometry_offsets[point_rows + 1]
-        - point_buffer.geometry_offsets[point_rows]
+        point_buffer.geometry_offsets[point_rows + 1] - point_buffer.geometry_offsets[point_rows]
     ).astype(cp.int32, copy=False)
     if int(point_target_rows.size):
         counts[point_target_rows] = point_counts
 
     multipoint_rows_global = cp.flatnonzero(
-        state.validity
-        & (state.tags == np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOINT]))
+        state.validity & (state.tags == np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOINT]))
     ).astype(cp.int64, copy=False)
     multipoint_rows = state.family_row_offsets[multipoint_rows_global].astype(cp.int64, copy=False)
-    multipoint_target_rows = promoted_family_rows[multipoint_rows_global].astype(cp.int64, copy=False)
+    multipoint_target_rows = promoted_family_rows[multipoint_rows_global].astype(
+        cp.int64, copy=False
+    )
     multipoint_counts = (
         multipoint_buffer.geometry_offsets[multipoint_rows + 1]
         - multipoint_buffer.geometry_offsets[multipoint_rows]
@@ -652,19 +852,23 @@ def _promote_linestring_multilinestring_geoarrow_owned_device(
         raise ValueError("LineString/MultiLineString GeoArrow promotion requires both families")
 
     linestring_rows_global = cp.flatnonzero(
-        state.validity
-        & (state.tags == np.int8(FAMILY_TAGS[GeometryFamily.LINESTRING]))
+        state.validity & (state.tags == np.int8(FAMILY_TAGS[GeometryFamily.LINESTRING]))
     ).astype(cp.int64, copy=False)
     linestring_rows = state.family_row_offsets[linestring_rows_global].astype(cp.int64, copy=False)
-    linestring_target_rows = promoted_family_rows[linestring_rows_global].astype(cp.int64, copy=False)
+    linestring_target_rows = promoted_family_rows[linestring_rows_global].astype(
+        cp.int64, copy=False
+    )
     linestring_part_counts = cp.ones(int(linestring_rows.size), dtype=cp.int32)
 
     multilinestring_rows_global = cp.flatnonzero(
-        state.validity
-        & (state.tags == np.int8(FAMILY_TAGS[GeometryFamily.MULTILINESTRING]))
+        state.validity & (state.tags == np.int8(FAMILY_TAGS[GeometryFamily.MULTILINESTRING]))
     ).astype(cp.int64, copy=False)
-    multilinestring_rows = state.family_row_offsets[multilinestring_rows_global].astype(cp.int64, copy=False)
-    multilinestring_target_rows = promoted_family_rows[multilinestring_rows_global].astype(cp.int64, copy=False)
+    multilinestring_rows = state.family_row_offsets[multilinestring_rows_global].astype(
+        cp.int64, copy=False
+    )
+    multilinestring_target_rows = promoted_family_rows[multilinestring_rows_global].astype(
+        cp.int64, copy=False
+    )
     multilinestring_part_counts = (
         multilinestring_buffer.geometry_offsets[multilinestring_rows + 1]
         - multilinestring_buffer.geometry_offsets[multilinestring_rows]
@@ -696,7 +900,9 @@ def _promote_linestring_multilinestring_geoarrow_owned_device(
     if total_mls_parts:
         source_part_indexes = cp.arange(total_mls_parts, dtype=cp.int64)
         row_ends = multilinestring_buffer.geometry_offsets[multilinestring_rows + 1]
-        groups = cp.searchsorted(row_ends, source_part_indexes, side="right").astype(cp.int64, copy=False)
+        groups = cp.searchsorted(row_ends, source_part_indexes, side="right").astype(
+            cp.int64, copy=False
+        )
         row_starts = multilinestring_buffer.geometry_offsets[multilinestring_rows[groups]]
         within = source_part_indexes - row_starts
         dest_part_indexes = geometry_offsets[multilinestring_target_rows[groups]] + within
@@ -728,7 +934,9 @@ def _promote_linestring_multilinestring_geoarrow_owned_device(
     if total_mls_parts:
         source_part_indexes = cp.arange(total_mls_parts, dtype=cp.int64)
         row_ends = multilinestring_buffer.geometry_offsets[multilinestring_rows + 1]
-        groups = cp.searchsorted(row_ends, source_part_indexes, side="right").astype(cp.int64, copy=False)
+        groups = cp.searchsorted(row_ends, source_part_indexes, side="right").astype(
+            cp.int64, copy=False
+        )
         row_starts = multilinestring_buffer.geometry_offsets[multilinestring_rows[groups]]
         within = source_part_indexes - row_starts
         dest_part_indexes = geometry_offsets[multilinestring_target_rows[groups]] + within
@@ -782,19 +990,21 @@ def _promote_polygon_multipolygon_geoarrow_owned_device(
         raise ValueError("Polygon/MultiPolygon GeoArrow promotion requires both families")
 
     polygon_rows_global = cp.flatnonzero(
-        state.validity
-        & (state.tags == np.int8(FAMILY_TAGS[GeometryFamily.POLYGON]))
+        state.validity & (state.tags == np.int8(FAMILY_TAGS[GeometryFamily.POLYGON]))
     ).astype(cp.int64, copy=False)
     polygon_rows = state.family_row_offsets[polygon_rows_global].astype(cp.int64, copy=False)
     polygon_target_rows = promoted_family_rows[polygon_rows_global].astype(cp.int64, copy=False)
     polygon_counts = cp.ones(int(polygon_rows.size), dtype=cp.int32)
 
     multipolygon_rows_global = cp.flatnonzero(
-        state.validity
-        & (state.tags == np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]))
+        state.validity & (state.tags == np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]))
     ).astype(cp.int64, copy=False)
-    multipolygon_rows = state.family_row_offsets[multipolygon_rows_global].astype(cp.int64, copy=False)
-    multipolygon_target_rows = promoted_family_rows[multipolygon_rows_global].astype(cp.int64, copy=False)
+    multipolygon_rows = state.family_row_offsets[multipolygon_rows_global].astype(
+        cp.int64, copy=False
+    )
+    multipolygon_target_rows = promoted_family_rows[multipolygon_rows_global].astype(
+        cp.int64, copy=False
+    )
     multipolygon_counts = (
         multipolygon_buffer.geometry_offsets[multipolygon_rows + 1]
         - multipolygon_buffer.geometry_offsets[multipolygon_rows]
@@ -826,7 +1036,9 @@ def _promote_polygon_multipolygon_geoarrow_owned_device(
     if total_mpoly_parts:
         source_part_indexes = cp.arange(total_mpoly_parts, dtype=cp.int64)
         row_ends = multipolygon_buffer.geometry_offsets[multipolygon_rows + 1]
-        groups = cp.searchsorted(row_ends, source_part_indexes, side="right").astype(cp.int64, copy=False)
+        groups = cp.searchsorted(row_ends, source_part_indexes, side="right").astype(
+            cp.int64, copy=False
+        )
         row_starts = multipolygon_buffer.geometry_offsets[multipolygon_rows[groups]]
         within = source_part_indexes - row_starts
         dest_part_indexes = geometry_offsets[multipolygon_target_rows[groups]] + within
@@ -849,7 +1061,9 @@ def _promote_polygon_multipolygon_geoarrow_owned_device(
     if total_polygon_rings:
         source_ring_indexes = cp.arange(total_polygon_rings, dtype=cp.int64)
         row_ends = polygon_buffer.geometry_offsets[polygon_rows + 1]
-        groups = cp.searchsorted(row_ends, source_ring_indexes, side="right").astype(cp.int64, copy=False)
+        groups = cp.searchsorted(row_ends, source_ring_indexes, side="right").astype(
+            cp.int64, copy=False
+        )
         row_starts = polygon_buffer.geometry_offsets[polygon_rows[groups]]
         within = source_ring_indexes - row_starts
         dest_ring_indexes = part_offsets[polygon_part_positions[groups]] + within
@@ -861,12 +1075,18 @@ def _promote_polygon_multipolygon_geoarrow_owned_device(
 
     if total_mpoly_rings:
         source_ring_indexes = cp.arange(total_mpoly_rings, dtype=cp.int64)
-        source_part_ends = multipolygon_buffer.part_offsets[cp.arange(total_mpoly_parts, dtype=cp.int64) + 1]
-        part_groups = cp.searchsorted(source_part_ends, source_ring_indexes, side="right").astype(cp.int64, copy=False)
+        source_part_ends = multipolygon_buffer.part_offsets[
+            cp.arange(total_mpoly_parts, dtype=cp.int64) + 1
+        ]
+        part_groups = cp.searchsorted(source_part_ends, source_ring_indexes, side="right").astype(
+            cp.int64, copy=False
+        )
         source_part_starts = multipolygon_buffer.part_offsets[part_groups]
         within_part = source_ring_indexes - source_part_starts
         row_ends = multipolygon_buffer.geometry_offsets[multipolygon_rows + 1]
-        row_groups = cp.searchsorted(row_ends, part_groups, side="right").astype(cp.int64, copy=False)
+        row_groups = cp.searchsorted(row_ends, part_groups, side="right").astype(
+            cp.int64, copy=False
+        )
         row_starts = multipolygon_buffer.geometry_offsets[multipolygon_rows[row_groups]]
         within_row = part_groups - row_starts
         dest_part_indexes = geometry_offsets[multipolygon_target_rows[row_groups]] + within_row
@@ -888,7 +1108,9 @@ def _promote_polygon_multipolygon_geoarrow_owned_device(
     if total_polygon_rings:
         source_ring_indexes = cp.arange(total_polygon_rings, dtype=cp.int64)
         row_ends = polygon_buffer.geometry_offsets[polygon_rows + 1]
-        groups = cp.searchsorted(row_ends, source_ring_indexes, side="right").astype(cp.int64, copy=False)
+        groups = cp.searchsorted(row_ends, source_ring_indexes, side="right").astype(
+            cp.int64, copy=False
+        )
         row_starts = polygon_buffer.geometry_offsets[polygon_rows[groups]]
         within = source_ring_indexes - row_starts
         dest_ring_indexes = part_offsets[polygon_part_positions[groups]] + within
@@ -905,12 +1127,18 @@ def _promote_polygon_multipolygon_geoarrow_owned_device(
         )
     if total_mpoly_rings:
         source_ring_indexes = cp.arange(total_mpoly_rings, dtype=cp.int64)
-        source_part_ends = multipolygon_buffer.part_offsets[cp.arange(total_mpoly_parts, dtype=cp.int64) + 1]
-        part_groups = cp.searchsorted(source_part_ends, source_ring_indexes, side="right").astype(cp.int64, copy=False)
+        source_part_ends = multipolygon_buffer.part_offsets[
+            cp.arange(total_mpoly_parts, dtype=cp.int64) + 1
+        ]
+        part_groups = cp.searchsorted(source_part_ends, source_ring_indexes, side="right").astype(
+            cp.int64, copy=False
+        )
         source_part_starts = multipolygon_buffer.part_offsets[part_groups]
         within_part = source_ring_indexes - source_part_starts
         row_ends = multipolygon_buffer.geometry_offsets[multipolygon_rows + 1]
-        row_groups = cp.searchsorted(row_ends, part_groups, side="right").astype(cp.int64, copy=False)
+        row_groups = cp.searchsorted(row_ends, part_groups, side="right").astype(
+            cp.int64, copy=False
+        )
         row_starts = multipolygon_buffer.geometry_offsets[multipolygon_rows[row_groups]]
         within_row = part_groups - row_starts
         dest_part_indexes = geometry_offsets[multipolygon_target_rows[row_groups]] + within_row
@@ -957,32 +1185,45 @@ def _promote_supported_geoarrow_owned_device(
     export_family: GeometryFamily,
 ) -> OwnedGeometryArray:
     family_set = _device_geoarrow_family_set(owned)
-    if (
-        export_family is GeometryFamily.MULTIPOINT
-        and family_set == frozenset({GeometryFamily.POINT, GeometryFamily.MULTIPOINT})
+    if export_family is GeometryFamily.MULTIPOINT and family_set == frozenset(
+        {GeometryFamily.POINT, GeometryFamily.MULTIPOINT}
     ):
         return _promote_point_multipoint_geoarrow_owned_device(owned)
-    if (
-        export_family is GeometryFamily.MULTILINESTRING
-        and family_set == frozenset({GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING})
+    if export_family is GeometryFamily.MULTILINESTRING and family_set == frozenset(
+        {GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING}
     ):
         return _promote_linestring_multilinestring_geoarrow_owned_device(owned)
-    if (
-        export_family is GeometryFamily.MULTIPOLYGON
-        and family_set == frozenset({GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON})
+    if export_family is GeometryFamily.MULTIPOLYGON and family_set == frozenset(
+        {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
     ):
         return _promote_polygon_multipolygon_geoarrow_owned_device(owned)
     raise ValueError("Native GeoArrow fast path requires a homogeneous geometry family")
 
 
 def _homogeneous_family_from_device_structure(owned: OwnedGeometryArray) -> GeometryFamily:
+    if getattr(owned, "is_indexed_view", False):
+        state = owned.device_state
+        if state is not None:
+            if state.trusted_homogeneous_family is not None:
+                return state.trusted_homogeneous_family
+            if len(state.families) == 1:
+                return next(iter(state.families))
+        validity = getattr(owned, "_validity", None)
+        tags = getattr(owned, "_tags", None)
+        if validity is not None and tags is not None:
+            valid_tags = np.asarray(tags[np.asarray(validity, dtype=bool)], dtype=np.int8)
+            if valid_tags.size == 0:
+                raise ValueError("Cannot encode an all-null geometry array to native GeoArrow")
+            unique_tags = np.unique(valid_tags)
+            if unique_tags.size != 1:
+                raise ValueError("Native GeoArrow fast path requires a homogeneous geometry family")
+            return TAG_FAMILIES[int(unique_tags[0])]
+        raise ValueError("Native GeoArrow fast path requires indexed-view family metadata")
     state = owned.device_state
     if state is None:
         raise ValueError("device structure is unavailable")
     families = tuple(
-        family
-        for family in state.families
-        if _device_family_row_count(owned, family) > 0
+        family for family in state.families if _device_family_row_count(owned, family) > 0
     )
     if not families:
         raise ValueError("Cannot encode an all-null geometry array to native GeoArrow")
@@ -991,12 +1232,17 @@ def _homogeneous_family_from_device_structure(owned: OwnedGeometryArray) -> Geom
     return families[0]
 
 
-def _device_validity_gpumask(owned: OwnedGeometryArray):
+def _device_validity_gpumask(
+    owned: OwnedGeometryArray,
+    *,
+    valid_row_count: int | None = None,
+):
     import cupy as cp
     import pylibcudf as plc
 
-    validity = cp.asarray(owned._ensure_device_state().validity)
-    valid_row_count = _device_structure_valid_row_count(owned)
+    validity = cp.asarray(_terminal_device_state(owned).validity)
+    if valid_row_count is None:
+        valid_row_count = _device_structure_valid_row_count(owned)
     null_count = (
         owned.row_count - valid_row_count
         if valid_row_count is not None
@@ -1047,7 +1293,7 @@ def _encode_owned_geoarrow_column_device(owned: OwnedGeometryArray):
             owned,
             export_family=family,
         )
-    state = owned._ensure_device_state()
+    state = _terminal_device_state(owned)
     device_buffer = state.families[family]
     mask, null_count = _device_validity_gpumask(owned)
 
@@ -1065,10 +1311,13 @@ def _encode_owned_geoarrow_column_device(owned: OwnedGeometryArray):
             return column, "point"
         x_full = cp.full(row_count, cp.nan, dtype=cp.float64)
         y_full = cp.full(row_count, cp.nan, dtype=cp.float64)
-        valid_mask = state.validity
-        valid_rows = cp.flatnonzero(valid_mask)
-        non_empty_mask = ~device_buffer.empty_mask
-        coord_indices = device_buffer.geometry_offsets[:-1][non_empty_mask]
+        family_valid = cp.asarray(state.validity) & (
+            cp.asarray(state.tags) == np.int8(FAMILY_TAGS[GeometryFamily.POINT])
+        )
+        valid_rows = cp.flatnonzero(family_valid)
+        family_rows = cp.asarray(state.family_row_offsets, dtype=cp.int64)[family_valid]
+        non_empty_mask = ~cp.asarray(device_buffer.empty_mask)[family_rows]
+        coord_indices = device_buffer.geometry_offsets[family_rows[non_empty_mask]]
         target_rows = valid_rows[non_empty_mask]
         x_full[target_rows] = device_buffer.x[coord_indices]
         y_full[target_rows] = device_buffer.y[coord_indices]
@@ -1080,6 +1329,7 @@ def _encode_owned_geoarrow_column_device(owned: OwnedGeometryArray):
     if family is GeometryFamily.LINESTRING:
         full_offsets = _device_full_offsets_from_local(
             owned,
+            family,
             device_buffer.geometry_offsets,
             empty_mask=device_buffer.empty_mask,
         )
@@ -1091,6 +1341,7 @@ def _encode_owned_geoarrow_column_device(owned: OwnedGeometryArray):
     if family is GeometryFamily.MULTIPOINT:
         full_offsets = _device_full_offsets_from_local(
             owned,
+            family,
             device_buffer.geometry_offsets,
             empty_mask=device_buffer.empty_mask,
         )
@@ -1100,9 +1351,12 @@ def _encode_owned_geoarrow_column_device(owned: OwnedGeometryArray):
         return column, "multipoint"
 
     if family is GeometryFamily.POLYGON:
-        rings = _device_list_column(device_buffer.ring_offsets, point_values, int(device_buffer.ring_offsets.size - 1))
+        rings = _device_list_column(
+            device_buffer.ring_offsets, point_values, int(device_buffer.ring_offsets.size - 1)
+        )
         full_offsets = _device_full_offsets_from_local(
             owned,
+            family,
             device_buffer.geometry_offsets,
             empty_mask=device_buffer.empty_mask,
         )
@@ -1112,9 +1366,12 @@ def _encode_owned_geoarrow_column_device(owned: OwnedGeometryArray):
         return column, "polygon"
 
     if family is GeometryFamily.MULTILINESTRING:
-        parts = _device_list_column(device_buffer.part_offsets, point_values, int(device_buffer.part_offsets.size - 1))
+        parts = _device_list_column(
+            device_buffer.part_offsets, point_values, int(device_buffer.part_offsets.size - 1)
+        )
         full_offsets = _device_full_offsets_from_local(
             owned,
+            family,
             device_buffer.geometry_offsets,
             empty_mask=device_buffer.empty_mask,
         )
@@ -1124,10 +1381,15 @@ def _encode_owned_geoarrow_column_device(owned: OwnedGeometryArray):
         return column, "multilinestring"
 
     if family is GeometryFamily.MULTIPOLYGON:
-        rings = _device_list_column(device_buffer.ring_offsets, point_values, int(device_buffer.ring_offsets.size - 1))
-        polygons = _device_list_column(device_buffer.part_offsets, rings, int(device_buffer.part_offsets.size - 1))
+        rings = _device_list_column(
+            device_buffer.ring_offsets, point_values, int(device_buffer.ring_offsets.size - 1)
+        )
+        polygons = _device_list_column(
+            device_buffer.part_offsets, rings, int(device_buffer.part_offsets.size - 1)
+        )
         full_offsets = _device_full_offsets_from_local(
             owned,
+            family,
             device_buffer.geometry_offsets,
             empty_mask=device_buffer.empty_mask,
         )
@@ -1160,12 +1422,238 @@ def _apply_geoarrow_child_metadata(column_meta, family: GeometryFamily) -> None:
 def _compression_type_from_name(name: str):
     import pylibcudf as plc
 
-    return getattr(plc.io.types.CompressionType, str(name).upper(), plc.io.types.CompressionType.AUTO)
+    return getattr(
+        plc.io.types.CompressionType, str(name).upper(), plc.io.types.CompressionType.AUTO
+    )
 
 
 def _native_parquet_compression_supported(name: str | None) -> bool:
     normalized = None if name is None else str(name).lower()
     return normalized in {None, "snappy", "lz4", "zstd"}
+
+
+def _pandas_dtype_for_arrow_type(arrow_type):
+    try:
+        return arrow_type.to_pandas_dtype()
+    except (AttributeError, NotImplementedError, TypeError, ValueError):
+        return object
+
+
+def _empty_pandas_series_for_arrow_field(field, *, name):
+    import pandas as pd
+
+    dtype = _pandas_dtype_for_arrow_type(field.type)
+    try:
+        return pd.Series([], dtype=dtype, name=name)
+    except (TypeError, ValueError):
+        return pd.Series([], dtype=object, name=name)
+
+
+def _native_index_field_name(index_name, level: int, column_names) -> str:
+    taken = {str(name) for name in column_names}
+    if index_name is not None:
+        candidate = str(index_name)
+        if candidate not in taken:
+            return candidate
+    base = f"__index_level_{level:d}__"
+    candidate = base
+    suffix = 1
+    while candidate in taken:
+        candidate = f"{base}_{suffix:d}"
+        suffix += 1
+    return candidate
+
+
+def _range_index_for_native_export(index_plan, fallback_index, row_count: int):
+    import pandas as pd
+
+    index = getattr(index_plan, "index", None)
+    if isinstance(index, pd.RangeIndex) and len(index) == int(row_count):
+        return index
+    if index_plan is None and isinstance(fallback_index, pd.RangeIndex):
+        if len(fallback_index) == int(row_count):
+            return fallback_index
+    return None
+
+
+def _native_device_index_columns(
+    *,
+    index_plan,
+    fallback_index,
+    row_count: int,
+    index,
+    attribute_columns,
+    pa,
+    plc,
+) -> tuple[tuple[_NativeDeviceIndexColumn, ...], Any | None] | None:
+    if index is False:
+        return (), None
+
+    range_index = _range_index_for_native_export(
+        index_plan,
+        fallback_index,
+        row_count,
+    )
+    if index is None and range_index is not None:
+        return (), range_index
+
+    if index_plan is not None and getattr(index_plan, "nlevels", 1) != 1:
+        return None
+
+    import cupy as cp
+    import numpy as _np
+    import pandas as pd
+
+    labels = None
+    logical_name = None
+    if range_index is not None:
+        logical_name = range_index.name
+        labels = cp.arange(int(row_count), dtype=cp.int64) * _np.int64(
+            range_index.step
+        ) + _np.int64(range_index.start)
+    elif index_plan is not None and getattr(index_plan, "device_labels", None) is not None:
+        logical_name = getattr(index_plan, "name", None)
+        labels = cp.asarray(index_plan.device_labels)
+    else:
+        return None
+
+    if labels.ndim != 1 or int(labels.size) != int(row_count):
+        return None
+    dtype = _np.dtype(labels.dtype)
+    if not (_np.issubdtype(dtype, _np.number) or _np.issubdtype(dtype, _np.bool_)):
+        return None
+
+    field_name = _native_index_field_name(logical_name, 0, attribute_columns)
+    column = plc.Column.from_cuda_array_interface(labels)
+    field = pa.field(field_name, column.type().to_arrow())
+    metadata_index = pd.Index(
+        [],
+        dtype=_pandas_dtype_for_arrow_type(field.type),
+        name=logical_name,
+    )
+    return (
+        (
+            _NativeDeviceIndexColumn(
+                field_name=field_name,
+                logical_name=logical_name,
+                column=column,
+                field=field,
+                metadata_index=metadata_index,
+            ),
+        ),
+        None,
+    )
+
+
+def _native_pandas_schema_metadata(
+    *,
+    attribute_fields,
+    index_columns: tuple[_NativeDeviceIndexColumn, ...],
+    range_index,
+    preserve_index,
+):
+    import pandas as pd
+    import pyarrow.pandas_compat as pandas_compat
+
+    columns_to_convert = []
+    column_names = []
+    column_field_names = []
+    types = []
+    for field in attribute_fields:
+        columns_to_convert.append(_empty_pandas_series_for_arrow_field(field, name=field.name))
+        column_names.append(field.name)
+        column_field_names.append(field.name)
+        types.append(field.type)
+
+    prototype = pd.DataFrame(index=pd.RangeIndex(0), columns=column_field_names)
+    index_levels = []
+    index_descriptors = []
+    if preserve_index is not False:
+        if range_index is not None:
+            index_levels.append(range_index)
+            index_descriptors.append(pandas_compat._get_range_index_descriptor(range_index))
+        else:
+            for column in index_columns:
+                index_levels.append(column.metadata_index)
+                index_descriptors.append(column.field_name)
+                types.append(column.field.type)
+
+    return pandas_compat.construct_metadata(
+        columns_to_convert,
+        prototype,
+        column_names,
+        index_levels,
+        index_descriptors,
+        preserve_index,
+        types,
+        column_field_names=column_field_names,
+    )
+
+
+def _try_native_device_attribute_export(
+    attribute_frame,
+    non_geometry_columns,
+    *,
+    index,
+    index_plan,
+    pa,
+    plc,
+) -> tuple[dict[Any, Any], Any, tuple[str, ...]] | None:
+    try:
+        from vibespatial.api._native_result_core import NativeAttributeTable
+    except Exception:
+        return None
+
+    if not isinstance(attribute_frame, NativeAttributeTable):
+        return None
+    if getattr(attribute_frame, "device_table", None) is None:
+        return None
+
+    try:
+        columns = attribute_frame.to_pylibcudf_columns(non_geometry_columns)
+        attribute_schema = attribute_frame.arrow_schema_for_columns(non_geometry_columns)
+        index_result = _native_device_index_columns(
+            index_plan=index_plan,
+            fallback_index=attribute_frame.index,
+            row_count=len(attribute_frame),
+            index=index,
+            attribute_columns=non_geometry_columns,
+            pa=pa,
+            plc=plc,
+        )
+    except (
+        AttributeError,
+        KeyError,
+        ModuleNotFoundError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    if index_result is None:
+        return None
+
+    index_columns, range_index = index_result
+    attribute_fields = list(attribute_schema)
+    fields = [*attribute_fields, *(column.field for column in index_columns)]
+    metadata = {
+        key: value for key, value in (attribute_schema.metadata or {}).items() if key != b"pandas"
+    }
+    metadata.update(
+        _native_pandas_schema_metadata(
+            attribute_fields=attribute_fields,
+            index_columns=index_columns,
+            range_index=range_index,
+            preserve_index=index,
+        )
+    )
+    device_columns = dict(zip(non_geometry_columns, columns, strict=True))
+    device_columns.update({column.field_name: column.column for column in index_columns})
+    return (
+        device_columns,
+        pa.schema(fields, metadata=metadata or None),
+        tuple(column.field_name for column in index_columns),
+    )
 
 
 def _attribute_column_to_plc(arrow_column, col_name, *, plc):
@@ -1183,7 +1671,12 @@ def _attribute_column_to_plc(arrow_column, col_name, *, plc):
     # for a CUDA array interface (cudf/cupy-backed pyarrow arrays expose one).
     if len(combined) > 0 and hasattr(combined, "buffers"):
         bufs = combined.buffers()
-        if bufs and len(bufs) > 1 and bufs[1] is not None and hasattr(bufs[1], "__cuda_array_interface__"):
+        if (
+            bufs
+            and len(bufs) > 1
+            and bufs[1] is not None
+            and hasattr(bufs[1], "__cuda_array_interface__")
+        ):
             return plc.Column.from_cuda_array_interface(bufs[1])
     return plc.Column.from_arrow(combined)
 
@@ -1209,11 +1702,14 @@ def _build_native_host_attribute_table_from_frame(attribute_frame, ordered_colum
 
     import pandas as pd
 
+    from vibespatial.api._native_result_core import _arrow_compatible_pandas_frame
+
     df_attr = pd.DataFrame(
         {column_name: attribute_frame[column_name] for column_name in ordered_columns},
         index=attribute_frame.index,
         copy=False,
     )
+    df_attr = _arrow_compatible_pandas_frame(df_attr)
     pandas_metadata = pa.Schema.from_pandas(df_attr, preserve_index=index).metadata
 
     if index not in (None, False):
@@ -1252,6 +1748,61 @@ def _build_native_host_attribute_table(df, non_geometry_columns, *, index, pa):
     )
 
 
+def _write_pylibcudf_parquet_table(
+    plc,
+    plc_table,
+    *,
+    sink,
+    metadata,
+    footer_metadata,
+    compression,
+    writer_kwargs,
+) -> None:
+    """Write a device table while honoring explicit row-group boundaries."""
+    row_group_size = writer_kwargs.get("row_group_size")
+    row_count = plc_table.num_rows()
+    if row_group_size is not None:
+        row_group_size = int(row_group_size)
+        if row_group_size <= 0:
+            raise ValueError("row_group_size must be greater than zero")
+
+    if row_group_size is not None and row_group_size < row_count:
+        builder = plc.io.parquet.ChunkedParquetWriterOptions.builder(
+            plc.io.types.SinkInfo([sink])
+        )
+        builder.metadata(metadata)
+        builder.key_value_metadata([footer_metadata])
+        builder.write_arrow_schema(False)
+        builder.compression(_compression_type_from_name(compression))
+        builder.row_group_size_rows(row_group_size)
+        if "max_page_size" in writer_kwargs:
+            builder.max_page_size_bytes(int(writer_kwargs["max_page_size"]))
+        writer = plc.io.parquet.ChunkedParquetWriter.from_options(builder.build())
+        slice_bounds = [
+            bound
+            for start in range(0, row_count, row_group_size)
+            for bound in (start, min(start + row_group_size, row_count))
+        ]
+        for chunk in plc.copying.slice(plc_table, slice_bounds):
+            writer.write(chunk)
+        writer.close([])
+        return
+
+    builder = plc.io.parquet.ParquetWriterOptions.builder(
+        plc.io.types.SinkInfo([sink]),
+        plc_table,
+    )
+    builder.metadata(metadata)
+    builder.key_value_metadata([footer_metadata])
+    builder.write_arrow_schema(False)
+    builder.compression(_compression_type_from_name(compression))
+    if row_group_size is not None:
+        builder.row_group_size_rows(row_group_size)
+    if "max_page_size" in writer_kwargs:
+        builder.max_page_size_bytes(int(writer_kwargs["max_page_size"]))
+    plc.io.parquet.write_parquet(builder.build())
+
+
 def _write_geoparquet_native_device_payload(
     attribute_frame,
     geometry_owned,
@@ -1266,6 +1817,7 @@ def _write_geoparquet_native_device_payload(
     write_covering_bbox,
     column_order,
     frame_attrs=None,
+    index_plan=None,
     **kwargs,
 ) -> _NativeDeviceWriteStatus:
     import base64
@@ -1331,24 +1883,19 @@ def _write_geoparquet_native_device_payload(
 
     non_geometry_columns = [column for column in column_order if column != geometry_name]
     device_attribute_columns = None
+    device_extra_columns: tuple[str, ...] = ()
     host_table = None
     attribute_schema = None
-    if index is False:
-        try:
-            from vibespatial.api._native_result_core import NativeAttributeTable
-
-            if isinstance(attribute_frame, NativeAttributeTable):
-                device_attribute_columns = dict(
-                    zip(
-                        non_geometry_columns,
-                        attribute_frame.to_pylibcudf_columns(non_geometry_columns),
-                        strict=True,
-                    )
-                )
-                attribute_schema = attribute_frame.arrow_schema_for_columns(non_geometry_columns)
-        except Exception:
-            device_attribute_columns = None
-            attribute_schema = None
+    device_export = _try_native_device_attribute_export(
+        attribute_frame,
+        non_geometry_columns,
+        index=index,
+        index_plan=index_plan,
+        pa=pa,
+        plc=plc,
+    )
+    if device_export is not None:
+        device_attribute_columns, attribute_schema, device_extra_columns = device_export
     if device_attribute_columns is None:
         host_table = _build_native_host_attribute_table_from_frame(
             attribute_frame,
@@ -1359,14 +1906,26 @@ def _write_geoparquet_native_device_payload(
         attribute_schema = host_table.schema
     if index is False and attribute_schema.metadata:
         attribute_schema = attribute_schema.with_metadata(
-            {
-                key: value
-                for key, value in attribute_schema.metadata.items()
-                if key != b"pandas"
-            }
+            {key: value for key, value in attribute_schema.metadata.items() if key != b"pandas"}
             or None
         )
+    if any(pa.types.is_dictionary(field.type) for field in attribute_schema):
+        return _NativeDeviceWriteStatus(
+            written=False,
+            compatibility_detail=(
+                "native device GeoParquet payload writer does not support "
+                "dictionary/categorical attribute schema metadata"
+            ),
+        )
     ordered_column_names = list(column_order)
+    if host_table is not None:
+        for column_name in host_table.column_names:
+            if column_name not in ordered_column_names:
+                ordered_column_names.append(column_name)
+    else:
+        for column_name in device_extra_columns:
+            if column_name not in ordered_column_names:
+                ordered_column_names.append(column_name)
     table_columns = []
     geometry_encoding_dict = {}
 
@@ -1393,7 +1952,9 @@ def _write_geoparquet_native_device_payload(
             if device_attribute_columns is not None:
                 table_columns.append(device_attribute_columns[column_name])
             else:
-                table_columns.append(_attribute_column_to_plc(host_table[column_name], column_name, plc=plc))
+                table_columns.append(
+                    _attribute_column_to_plc(host_table[column_name], column_name, plc=plc)
+                )
 
     bbox_column_names: list[str] = []
     if write_covering_bbox:
@@ -1563,19 +2124,15 @@ def _write_geoparquet_native_device_payload(
         arrow_schema.serialize().to_pybytes()
     ).decode()
 
-    builder = plc.io.parquet.ParquetWriterOptions.builder(
-        plc.io.types.SinkInfo([sink]),
+    _write_pylibcudf_parquet_table(
+        plc,
         plc_table,
+        sink=sink,
+        metadata=metadata,
+        footer_metadata=footer_metadata,
+        compression=compression,
+        writer_kwargs=recognized_kwargs,
     )
-    builder.metadata(metadata)
-    builder.key_value_metadata([footer_metadata])
-    builder.write_arrow_schema(False)
-    builder.compression(_compression_type_from_name(compression))
-    if "row_group_size" in recognized_kwargs:
-        builder.row_group_size_rows(int(recognized_kwargs["row_group_size"]))
-    if "max_page_size" in recognized_kwargs:
-        builder.max_page_size_bytes(int(recognized_kwargs["max_page_size"]))
-    plc.io.parquet.write_parquet(builder.build())
     record_dispatch_event(
         surface="vibespatial.io.geoparquet",
         operation="to_parquet",
@@ -1623,12 +2180,22 @@ def _write_geoparquet_native_device(
     recognized_kwargs = {k: v for k, v in kwargs.items() if k in _RECOGNIZED_KWARGS}
     unrecognized_kwargs = {k: v for k, v in kwargs.items() if k not in _RECOGNIZED_KWARGS}
     geometry_columns = list(geometry_columns)
-    geometry_arrays = [df[col].array for col in geometry_columns]
-    if not geometry_arrays or not all(isinstance(arr, DeviceGeometryArray) for arr in geometry_arrays):
+    if not geometry_columns:
         return _NativeDeviceWriteStatus(written=False)
 
-    owned_by_name = {col: df[col].array.to_owned() for col in geometry_columns}
-    if not all(owned.residency is Residency.DEVICE and owned.device_state is not None for owned in owned_by_name.values()):
+    owned_by_name: dict[Any, OwnedGeometryArray] = {}
+    for col in geometry_columns:
+        arr = df[col].array
+        owned = (
+            arr.to_owned() if isinstance(arr, DeviceGeometryArray) else getattr(arr, "_owned", None)
+        )
+        if owned is None:
+            return _NativeDeviceWriteStatus(written=False)
+        owned_by_name[col] = owned
+    if not all(
+        owned.residency is Residency.DEVICE and owned.device_state is not None
+        for owned in owned_by_name.values()
+    ):
         return _NativeDeviceWriteStatus(written=False)
     if unrecognized_kwargs:
         return _NativeDeviceWriteStatus(
@@ -1642,8 +2209,7 @@ def _write_geoparquet_native_device(
         return _NativeDeviceWriteStatus(
             written=False,
             compatibility_detail=(
-                "native device GeoParquet writer does not support "
-                f"compression={compression!r}"
+                f"native device GeoParquet writer does not support compression={compression!r}"
             ),
         )
     sink = _pylibcudf_sink(path)
@@ -1664,8 +2230,7 @@ def _write_geoparquet_native_device(
 
     geometry_columns_set = set(geometry_columns)
     non_geometry_columns = [
-        column_name for column_name in df.columns
-        if column_name not in geometry_columns_set
+        column_name for column_name in df.columns if column_name not in geometry_columns_set
     ]
     host_table = _build_native_host_attribute_table(
         df,
@@ -1701,7 +2266,9 @@ def _write_geoparquet_native_device(
             table_columns.append(_encode_owned_wkb_column_device(owned))
             geometry_encoding_dict[column_name] = "WKB"
         else:
-            table_columns.append(_attribute_column_to_plc(host_table[column_name], column_name, plc=plc))
+            table_columns.append(
+                _attribute_column_to_plc(host_table[column_name], column_name, plc=plc)
+            )
 
     # If write_covering_bbox, compute per-row bounds on device and add a
     # struct column with xmin/ymin/xmax/ymax children.
@@ -1862,19 +2429,15 @@ def _write_geoparquet_native_device(
         arrow_schema.serialize().to_pybytes()
     ).decode()
 
-    builder = plc.io.parquet.ParquetWriterOptions.builder(
-        plc.io.types.SinkInfo([sink]),
+    _write_pylibcudf_parquet_table(
+        plc,
         plc_table,
+        sink=sink,
+        metadata=metadata,
+        footer_metadata=footer_metadata,
+        compression=compression,
+        writer_kwargs=recognized_kwargs,
     )
-    builder.metadata(metadata)
-    builder.key_value_metadata([footer_metadata])
-    builder.write_arrow_schema(False)
-    builder.compression(_compression_type_from_name(compression))
-    if "row_group_size" in recognized_kwargs:
-        builder.row_group_size_rows(int(recognized_kwargs["row_group_size"]))
-    if "max_page_size" in recognized_kwargs:
-        builder.max_page_size_bytes(int(recognized_kwargs["max_page_size"]))
-    plc.io.parquet.write_parquet(builder.build())
     record_dispatch_event(
         surface="vibespatial.io.geoparquet",
         operation="to_parquet",
@@ -1883,6 +2446,7 @@ def _write_geoparquet_native_device(
         selected=ExecutionMode.GPU,
     )
     return _NativeDeviceWriteStatus(written=True)
+
 
 @dataclass(frozen=True)
 class WKBBridgePlan:
@@ -1919,6 +2483,7 @@ class DeviceWKBHeaderScan:
     fallback_mask: Any
     point_mask: Any
 
+
 def plan_wkb_bridge(operation: IOOperation | str) -> WKBBridgePlan:
     normalized = operation if isinstance(operation, IOOperation) else IOOperation(operation)
     plan = plan_io_support(IOFormat.WKB, normalized)
@@ -1934,6 +2499,7 @@ def plan_wkb_bridge(operation: IOOperation | str) -> WKBBridgePlan:
         ),
     )
 
+
 def _new_wkb_family_state() -> dict[str, Any]:
     return {
         "row_count": 0,
@@ -1946,23 +2512,35 @@ def _new_wkb_family_state() -> dict[str, Any]:
     }
 
 
-def _finalize_wkb_family_buffer(family: GeometryFamily, state: dict[str, Any]) -> FamilyGeometryBuffer:
+def _finalize_wkb_family_buffer(
+    family: GeometryFamily, state: dict[str, Any]
+) -> FamilyGeometryBuffer:
     x = np.asarray(state["x_payload"], dtype=np.float64)
     y = np.asarray(state["y_payload"], dtype=np.float64)
-    geometry_offsets = np.asarray([*state["geometry_offsets"], len(state["x_payload"])], dtype=np.int32)
+    geometry_offsets = np.asarray(
+        [*state["geometry_offsets"], len(state["x_payload"])], dtype=np.int32
+    )
     part_offsets = None
     ring_offsets = None
 
     if family is GeometryFamily.POLYGON:
         ring_offsets = np.asarray([*state["ring_offsets"], len(state["x_payload"])], dtype=np.int32)
-        geometry_offsets = np.asarray([*state["geometry_offsets"], len(state["ring_offsets"])], dtype=np.int32)
+        geometry_offsets = np.asarray(
+            [*state["geometry_offsets"], len(state["ring_offsets"])], dtype=np.int32
+        )
     elif family is GeometryFamily.MULTILINESTRING:
         part_offsets = np.asarray([*state["part_offsets"], len(state["x_payload"])], dtype=np.int32)
-        geometry_offsets = np.asarray([*state["geometry_offsets"], len(state["part_offsets"])], dtype=np.int32)
+        geometry_offsets = np.asarray(
+            [*state["geometry_offsets"], len(state["part_offsets"])], dtype=np.int32
+        )
     elif family is GeometryFamily.MULTIPOLYGON:
-        part_offsets = np.asarray([*state["part_offsets"], len(state["ring_offsets"])], dtype=np.int32)
+        part_offsets = np.asarray(
+            [*state["part_offsets"], len(state["ring_offsets"])], dtype=np.int32
+        )
         ring_offsets = np.asarray([*state["ring_offsets"], len(state["x_payload"])], dtype=np.int32)
-        geometry_offsets = np.asarray([*state["geometry_offsets"], len(state["part_offsets"])], dtype=np.int32)
+        geometry_offsets = np.asarray(
+            [*state["geometry_offsets"], len(state["part_offsets"])], dtype=np.int32
+        )
 
     return FamilyGeometryBuffer(
         family=family,
@@ -2142,9 +2720,7 @@ def _geometry_family_from_shapely_type(geom_type: str) -> GeometryFamily:
         "MultiPolygon": GeometryFamily.MULTIPOLYGON,
     }.get(geom_type)
     if family is None:
-        raise NotImplementedError(
-            f"{geom_type} rows fall outside the 2D owned native result model"
-        )
+        raise NotImplementedError(f"{geom_type} rows fall outside the 2D owned native result model")
     return family
 
 
@@ -2258,7 +2834,9 @@ def _decode_polygon_wkb_payload(value: bytes, state: dict[str, Any]) -> int:
             raise ValueError("Polygon ring coordinates overrun buffer")
         state["ring_offsets"].append(len(state["x_payload"]))
         if point_count:
-            coords = np.frombuffer(value, dtype="<f8", offset=cursor, count=point_count * 2).reshape(point_count, 2)
+            coords = np.frombuffer(
+                value, dtype="<f8", offset=cursor, count=point_count * 2
+            ).reshape(point_count, 2)
             _append_coordinate_range(state, coords)
         cursor += coord_bytes
     if cursor != len(value):
@@ -2306,7 +2884,9 @@ def _decode_multilinestring_wkb_payload(value: bytes, state: dict[str, Any]) -> 
         if cursor + 9 > len(value):
             raise ValueError("MultiLineString part header overruns buffer")
         if value[cursor] != 1 or int.from_bytes(value[cursor + 1 : cursor + 5], "little") != 2:
-            raise ValueError("MultiLineString fast path requires nested little-endian linestring records")
+            raise ValueError(
+                "MultiLineString fast path requires nested little-endian linestring records"
+            )
         point_count = int.from_bytes(value[cursor + 5 : cursor + 9], "little")
         coord_bytes = point_count * 16
         end = cursor + 9 + coord_bytes
@@ -2314,7 +2894,9 @@ def _decode_multilinestring_wkb_payload(value: bytes, state: dict[str, Any]) -> 
             raise ValueError("MultiLineString part coordinates overrun buffer")
         state["part_offsets"].append(len(state["x_payload"]))
         if point_count:
-            coords = np.frombuffer(value, dtype="<f8", offset=cursor + 9, count=point_count * 2).reshape(point_count, 2)
+            coords = np.frombuffer(
+                value, dtype="<f8", offset=cursor + 9, count=point_count * 2
+            ).reshape(point_count, 2)
             _append_coordinate_range(state, coords)
         cursor = end
     if cursor != len(value):
@@ -2349,7 +2931,9 @@ def _decode_multipolygon_wkb_payload(value: bytes, state: dict[str, Any]) -> int
                 raise ValueError("MultiPolygon ring coordinates overrun buffer")
             state["ring_offsets"].append(len(state["x_payload"]))
             if point_count:
-                coords = np.frombuffer(value, dtype="<f8", offset=cursor, count=point_count * 2).reshape(point_count, 2)
+                coords = np.frombuffer(
+                    value, dtype="<f8", offset=cursor, count=point_count * 2
+                ).reshape(point_count, 2)
                 _append_coordinate_range(state, coords)
             cursor += coord_bytes
     if cursor != len(value):
@@ -2458,8 +3042,13 @@ def _decode_native_wkb(
         family_row_offsets=family_row_offsets,
         families=families,
     )
-    array._record(DiagnosticKind.CREATED, "created owned geometry array from staged native WKB decode", visible=True)
+    array._record(
+        DiagnosticKind.CREATED,
+        "created owned geometry array from staged native WKB decode",
+        visible=True,
+    )
     return array, partition_plan
+
 
 def _decode_arrow_wkb_point_fast(array) -> OwnedGeometryArray | None:
     validity = np.asarray(array.is_valid().to_numpy(zero_copy_only=False), dtype=bool)
@@ -2546,7 +3135,9 @@ def _decode_arrow_wkb_linestring_fast(array) -> OwnedGeometryArray | None:
     family_row_offsets = np.full(row_count, -1, dtype=np.int32)
     valid_count = int(validity.sum())
     if valid_count == 0:
-        return OwnedGeometryArray(validity=validity, tags=tags, family_row_offsets=family_row_offsets, families={})
+        return OwnedGeometryArray(
+            validity=validity, tags=tags, family_row_offsets=family_row_offsets, families={}
+        )
 
     offsets = _arrow_binary_offsets(array)
     data_buffer = array.buffers()[2]
@@ -2564,7 +3155,11 @@ def _decode_arrow_wkb_linestring_fast(array) -> OwnedGeometryArray | None:
         end = int(offsets[row_index + 1])
         if end - start < 9:
             return None
-        if data[start] != 1 or int.from_bytes(data[start + 1 : start + 5], "little") != WKB_TYPE_IDS[GeometryFamily.LINESTRING]:
+        if (
+            data[start] != 1
+            or int.from_bytes(data[start + 1 : start + 5], "little")
+            != WKB_TYPE_IDS[GeometryFamily.LINESTRING]
+        ):
             return None
         point_count = int.from_bytes(data[start + 5 : start + 9], "little")
         if end - start != 9 + (point_count * 16):
@@ -2585,7 +3180,9 @@ def _decode_arrow_wkb_linestring_fast(array) -> OwnedGeometryArray | None:
         point_count = int.from_bytes(data[start + 5 : start + 9], "little")
         empty_mask[valid_row] = point_count == 0
         if point_count:
-            coords = np.frombuffer(data[start + 9 : start + 9 + (point_count * 16)], dtype="<f8", count=point_count * 2).reshape(point_count, 2)
+            coords = np.frombuffer(
+                data[start + 9 : start + 9 + (point_count * 16)], dtype="<f8", count=point_count * 2
+            ).reshape(point_count, 2)
             x[coord_cursor : coord_cursor + point_count] = coords[:, 0]
             y[coord_cursor : coord_cursor + point_count] = coords[:, 1]
             coord_cursor += point_count
@@ -2624,7 +3221,9 @@ def _decode_arrow_wkb_linestring_uniform_fast(array) -> OwnedGeometryArray | Non
     family_row_offsets = np.full(row_count, -1, dtype=np.int32)
     valid_count = int(validity.sum())
     if valid_count == 0:
-        return OwnedGeometryArray(validity=validity, tags=tags, family_row_offsets=family_row_offsets, families={})
+        return OwnedGeometryArray(
+            validity=validity, tags=tags, family_row_offsets=family_row_offsets, families={}
+        )
 
     offsets = _arrow_binary_offsets(array)
     valid_lengths = np.diff(offsets)[validity]
@@ -2699,7 +3298,9 @@ def _decode_arrow_wkb_polygon_fast(array) -> OwnedGeometryArray | None:
     family_row_offsets = np.full(row_count, -1, dtype=np.int32)
     valid_count = int(validity.sum())
     if valid_count == 0:
-        return OwnedGeometryArray(validity=validity, tags=tags, family_row_offsets=family_row_offsets, families={})
+        return OwnedGeometryArray(
+            validity=validity, tags=tags, family_row_offsets=family_row_offsets, families={}
+        )
 
     offsets = _arrow_binary_offsets(array)
     data_buffer = array.buffers()[2]
@@ -2719,7 +3320,11 @@ def _decode_arrow_wkb_polygon_fast(array) -> OwnedGeometryArray | None:
         end = int(offsets[row_index + 1])
         if end - start < 9:
             return None
-        if data[start] != 1 or int.from_bytes(data[start + 1 : start + 5], "little") != WKB_TYPE_IDS[GeometryFamily.POLYGON]:
+        if (
+            data[start] != 1
+            or int.from_bytes(data[start + 1 : start + 5], "little")
+            != WKB_TYPE_IDS[GeometryFamily.POLYGON]
+        ):
             return None
         ring_count = int.from_bytes(data[start + 5 : start + 9], "little")
         empty_mask[valid_row] = ring_count == 0
@@ -2755,7 +3360,9 @@ def _decode_arrow_wkb_polygon_fast(array) -> OwnedGeometryArray | None:
             cursor += 4
             ring_offsets[ring_cursor] = coord_cursor
             if point_count:
-                coords = np.frombuffer(data[cursor : cursor + (point_count * 16)], dtype="<f8", count=point_count * 2).reshape(point_count, 2)
+                coords = np.frombuffer(
+                    data[cursor : cursor + (point_count * 16)], dtype="<f8", count=point_count * 2
+                ).reshape(point_count, 2)
                 x[coord_cursor : coord_cursor + point_count] = coords[:, 0]
                 y[coord_cursor : coord_cursor + point_count] = coords[:, 1]
                 coord_cursor += point_count
@@ -2798,7 +3405,9 @@ def _decode_arrow_wkb_polygon_uniform_fast(array) -> OwnedGeometryArray | None:
     family_row_offsets = np.full(row_count, -1, dtype=np.int32)
     valid_count = int(validity.sum())
     if valid_count == 0:
-        return OwnedGeometryArray(validity=validity, tags=tags, family_row_offsets=family_row_offsets, families={})
+        return OwnedGeometryArray(
+            validity=validity, tags=tags, family_row_offsets=family_row_offsets, families={}
+        )
 
     offsets = _arrow_binary_offsets(array)
     valid_lengths = np.diff(offsets)[validity]
@@ -2915,6 +3524,7 @@ def _try_uniform_arrow_wkb_fast_decode(array) -> OwnedGeometryArray | None:
 
     return None
 
+
 def _decode_arrow_wkb_multipolygon_fast(array) -> OwnedGeometryArray | None:
     """Decode a WKB Arrow binary column containing only MultiPolygon geometries.
 
@@ -2930,8 +3540,10 @@ def _decode_arrow_wkb_multipolygon_fast(array) -> OwnedGeometryArray | None:
     valid_count = int(validity.sum())
     if valid_count == 0:
         return OwnedGeometryArray(
-            validity=validity, tags=tags,
-            family_row_offsets=family_row_offsets, families={},
+            validity=validity,
+            tags=tags,
+            family_row_offsets=family_row_offsets,
+            families={},
         )
 
     offsets = _arrow_binary_offsets(array)
@@ -2967,7 +3579,10 @@ def _decode_arrow_wkb_multipolygon_fast(array) -> OwnedGeometryArray | None:
         for _ in range(polygon_count):
             if cursor + 9 > end:
                 return None
-            if data[cursor] != 1 or int.from_bytes(data[cursor + 1 : cursor + 5], "little") != wkb_poly_type:
+            if (
+                data[cursor] != 1
+                or int.from_bytes(data[cursor + 1 : cursor + 5], "little") != wkb_poly_type
+            ):
                 return None
             ring_count = int.from_bytes(data[cursor + 5 : cursor + 9], "little")
             cursor += 9
@@ -3012,7 +3627,8 @@ def _decode_arrow_wkb_multipolygon_fast(array) -> OwnedGeometryArray | None:
                     nbytes = point_count * 16
                     coords = np.frombuffer(
                         data[cursor : cursor + nbytes],
-                        dtype="<f8", count=point_count * 2,
+                        dtype="<f8",
+                        count=point_count * 2,
                     ).reshape(point_count, 2)
                     x[coord_cursor : coord_cursor + point_count] = coords[:, 0]
                     y[coord_cursor : coord_cursor + point_count] = coords[:, 1]
@@ -3051,7 +3667,9 @@ def _decode_arrow_wkb_multipolygon_fast(array) -> OwnedGeometryArray | None:
     return owned
 
 
-def _hexify_if_requested(values: list[bytes | None], *, hex_output: bool) -> list[bytes | str | None]:
+def _hexify_if_requested(
+    values: list[bytes | None], *, hex_output: bool
+) -> list[bytes | str | None]:
     if not hex_output:
         return values
     return [None if value is None else value.hex() for value in values]
@@ -3093,10 +3711,9 @@ def _pack_polygon_wkb(buffer: FamilyGeometryBuffer, row: int) -> bytes:
     def _ring_needs_closure(coord_start: int, coord_end: int) -> bool:
         if coord_end <= coord_start:
             return False
-        return (
-            float(buffer.x[coord_start]) != float(buffer.x[coord_end - 1])
-            or float(buffer.y[coord_start]) != float(buffer.y[coord_end - 1])
-        )
+        return float(buffer.x[coord_start]) != float(buffer.x[coord_end - 1]) or float(
+            buffer.y[coord_start]
+        ) != float(buffer.y[coord_end - 1])
 
     ring_start = int(buffer.geometry_offsets[row])
     ring_end = int(buffer.geometry_offsets[row + 1])
@@ -3117,7 +3734,9 @@ def _pack_polygon_wkb(buffer: FamilyGeometryBuffer, row: int) -> bytes:
         count = (coord_end - coord_start) + int(needs_closure)
         payload[cursor : cursor + 4] = count.to_bytes(4, "little")
         cursor += 4
-        for x, y in zip(buffer.x[coord_start:coord_end], buffer.y[coord_start:coord_end], strict=True):
+        for x, y in zip(
+            buffer.x[coord_start:coord_end], buffer.y[coord_start:coord_end], strict=True
+        ):
             struct.pack_into("<dd", payload, cursor, float(x), float(y))
             cursor += 16
         if needs_closure:
@@ -3167,10 +3786,14 @@ def _pack_multilinestring_wkb(buffer: FamilyGeometryBuffer, row: int) -> bytes:
     for coord_start, coord_end in part_ranges:
         count = coord_end - coord_start
         payload[cursor] = 1
-        payload[cursor + 1 : cursor + 5] = WKB_TYPE_IDS[GeometryFamily.LINESTRING].to_bytes(4, "little")
+        payload[cursor + 1 : cursor + 5] = WKB_TYPE_IDS[GeometryFamily.LINESTRING].to_bytes(
+            4, "little"
+        )
         payload[cursor + 5 : cursor + 9] = count.to_bytes(4, "little")
         cursor += 9
-        for x, y in zip(buffer.x[coord_start:coord_end], buffer.y[coord_start:coord_end], strict=True):
+        for x, y in zip(
+            buffer.x[coord_start:coord_end], buffer.y[coord_start:coord_end], strict=True
+        ):
             struct.pack_into("<dd", payload, cursor, float(x), float(y))
             cursor += 16
     return bytes(payload)
@@ -3180,10 +3803,9 @@ def _pack_multipolygon_wkb(buffer: FamilyGeometryBuffer, row: int) -> bytes:
     def _ring_needs_closure(coord_start: int, coord_end: int) -> bool:
         if coord_end <= coord_start:
             return False
-        return (
-            float(buffer.x[coord_start]) != float(buffer.x[coord_end - 1])
-            or float(buffer.y[coord_start]) != float(buffer.y[coord_end - 1])
-        )
+        return float(buffer.x[coord_start]) != float(buffer.x[coord_end - 1]) or float(
+            buffer.y[coord_start]
+        ) != float(buffer.y[coord_end - 1])
 
     polygon_start = int(buffer.geometry_offsets[row])
     polygon_end = int(buffer.geometry_offsets[row + 1])
@@ -3209,14 +3831,18 @@ def _pack_multipolygon_wkb(buffer: FamilyGeometryBuffer, row: int) -> bytes:
     cursor = 9
     for ring_ranges in polygon_specs:
         payload[cursor] = 1
-        payload[cursor + 1 : cursor + 5] = WKB_TYPE_IDS[GeometryFamily.POLYGON].to_bytes(4, "little")
+        payload[cursor + 1 : cursor + 5] = WKB_TYPE_IDS[GeometryFamily.POLYGON].to_bytes(
+            4, "little"
+        )
         payload[cursor + 5 : cursor + 9] = len(ring_ranges).to_bytes(4, "little")
         cursor += 9
         for coord_start, coord_end, needs_closure in ring_ranges:
             count = (coord_end - coord_start) + int(needs_closure)
             payload[cursor : cursor + 4] = count.to_bytes(4, "little")
             cursor += 4
-            for x, y in zip(buffer.x[coord_start:coord_end], buffer.y[coord_start:coord_end], strict=True):
+            for x, y in zip(
+                buffer.x[coord_start:coord_end], buffer.y[coord_start:coord_end], strict=True
+            ):
                 struct.pack_into("<dd", payload, cursor, float(x), float(y))
                 cursor += 16
             if needs_closure:
@@ -3242,7 +3868,10 @@ def _encode_native_wkb(
         null_rows=int((~array.validity).sum()),
         native_rows=int(array.validity.sum()),
         fallback_rows=0,
-        family_counts={family.value: int((array.tags == FAMILY_TAGS[family]).sum()) for family in GeometryFamily},
+        family_counts={
+            family.value: int((array.tags == FAMILY_TAGS[family]).sum())
+            for family in GeometryFamily
+        },
         fallback_indexes=tuple(),
         fallback_reason_counts={},
         reason="Owned buffers already provide family tags and offsets, so encode can go straight to family-local WKB assembly.",
@@ -3279,6 +3908,7 @@ def _encode_native_wkb(
         family = TAG_FAMILIES[int(array.tags[row_index])]
         outputs[row_index] = encoded_by_family[family][int(array.family_row_offsets[row_index])]
     return _hexify_if_requested(outputs, hex_output=hex_output), partition_plan
+
 
 def decode_wkb_owned(
     values: list[bytes | str | None] | tuple[bytes | str | None, ...],
@@ -3436,8 +4066,7 @@ def _try_gpu_wkb_list_decode(
         return _GpuWkbDecodeAttempt(
             result=None,
             fallback_detail=(
-                f"{detail}; pylibcudf WKB decode bridge unavailable: "
-                f"{type(exc).__name__}: {exc}"
+                f"{detail}; pylibcudf WKB decode bridge unavailable: {type(exc).__name__}: {exc}"
             ),
         )
     except Exception as exc:
@@ -3452,8 +4081,7 @@ def _try_gpu_wkb_list_decode(
         return _GpuWkbDecodeAttempt(
             result=None,
             fallback_detail=(
-                f"{detail}; pylibcudf WKB decode bridge failed: "
-                f"{type(exc).__name__}: {exc}"
+                f"{detail}; pylibcudf WKB decode bridge failed: {type(exc).__name__}: {exc}"
             ),
         )
 
@@ -3523,7 +4151,10 @@ def _try_gpu_wkb_arrow_decode(
         if pa.types.is_binary(array.type) or pa.types.is_large_binary(array.type):
             target = pa.string() if pa.types.is_binary(array.type) else pa.large_string()
             array = pa.Array.from_buffers(
-                target, len(array), array.buffers(), null_count=array.null_count,
+                target,
+                len(array),
+                array.buffers(),
+                null_count=array.null_count,
             )
 
         plc_column = plc.Column.from_arrow(array)
@@ -3537,17 +4168,13 @@ def _try_gpu_wkb_arrow_decode(
         return _GpuWkbDecodeAttempt(
             result=None,
             fallback_detail=(
-                "GPU Arrow WKB decode bridge unavailable: "
-                f"{type(exc).__name__}: {exc}"
+                f"GPU Arrow WKB decode bridge unavailable: {type(exc).__name__}: {exc}"
             ),
         )
     except Exception as exc:
         return _GpuWkbDecodeAttempt(
             result=None,
-            fallback_detail=(
-                "GPU Arrow WKB decode bridge failed: "
-                f"{type(exc).__name__}: {exc}"
-            ),
+            fallback_detail=(f"GPU Arrow WKB decode bridge failed: {type(exc).__name__}: {exc}"),
         )
 
 
@@ -3633,9 +4260,7 @@ def _try_gpu_wkb_encode_arrow(
             if crs_json is not None:
                 import json
 
-                field_metadata[b"ARROW:extension:metadata"] = json.dumps(
-                    {"crs": crs_json}
-                ).encode()
+                field_metadata[b"ARROW:extension:metadata"] = json.dumps({"crs": crs_json}).encode()
         field_metadata[b"ARROW:extension:name"] = b"geoarrow.wkb"
         field = pa.field(field_name, pa.binary(), nullable=True, metadata=field_metadata)
         return field, wkb_arr
@@ -3659,15 +4284,17 @@ def encode_wkb_owned(
             reason="GPU WKB encode via device kernel pipeline",
             selected=ExecutionMode.GPU,
         )
-        record_native_export_boundary(NativeExportBoundary(
-            surface="vibespatial.io.wkb.encode_wkb_owned",
-            operation="owned_geometry_to_wkb",
-            target="wkb",
-            reason="owned geometry exported to host-visible WKB values",
-            detail=f"hex={int(hex)}, implementation=device_wkb_encode",
-            row_count=array.row_count,
-            d2h_transfer=True,
-        ))
+        record_native_export_boundary(
+            NativeExportBoundary(
+                surface="vibespatial.io.wkb.encode_wkb_owned",
+                operation="owned_geometry_to_wkb",
+                target="wkb",
+                reason="owned geometry exported to host-visible WKB values",
+                detail=f"hex={int(hex)}, implementation=device_wkb_encode",
+                row_count=array.row_count,
+                d2h_transfer=True,
+            )
+        )
         return gpu_result
     # Fall through to host path
     record_dispatch_event(
@@ -3678,18 +4305,20 @@ def encode_wkb_owned(
         selected=ExecutionMode.CPU,
     )
     values, partition_plan = _encode_native_wkb(array, hex_output=hex)
-    record_native_export_boundary(NativeExportBoundary(
-        surface="vibespatial.io.wkb.encode_wkb_owned",
-        operation="owned_geometry_to_wkb",
-        target="wkb",
-        reason="owned geometry exported to host-visible WKB values",
-        detail=(
-            f"hex={int(hex)}, implementation=owned_wkb_bridge, "
-            f"fallback_rows={partition_plan.fallback_rows}"
-        ),
-        row_count=array.row_count,
-        d2h_transfer=array.device_state is not None,
-    ))
+    record_native_export_boundary(
+        NativeExportBoundary(
+            surface="vibespatial.io.wkb.encode_wkb_owned",
+            operation="owned_geometry_to_wkb",
+            target="wkb",
+            reason="owned geometry exported to host-visible WKB values",
+            detail=(
+                f"hex={int(hex)}, implementation=owned_wkb_bridge, "
+                f"fallback_rows={partition_plan.fallback_rows}"
+            ),
+            row_count=array.row_count,
+            d2h_transfer=array.device_state is not None,
+        )
+    )
     if partition_plan.fallback_rows:
         record_fallback_event(
             surface="vibespatial.io.wkb",
@@ -3700,6 +4329,7 @@ def encode_wkb_owned(
             d2h_transfer=True,
         )
     return values
+
 
 def _homogeneous_family(array: OwnedGeometryArray):
     if array.device_state is not None:
@@ -3712,6 +4342,7 @@ def _homogeneous_family(array: OwnedGeometryArray):
     if unique_tags.size != 1:
         raise ValueError("Native GeoArrow fast path requires a homogeneous geometry family")
     return TAG_FAMILIES[int(unique_tags[0])]
+
 
 def _encode_owned_wkb_array(
     owned: OwnedGeometryArray,
@@ -3740,12 +4371,10 @@ def _encode_owned_wkb_array(
 
     # Make one final direct device-encode attempt before surfacing a host
     # fallback.  Strict-native writers must not fail just because the generic
-    # helper declined GPU encode on a small batch or because the owned array is
-    # still host-resident at the write boundary; _encode_owned_wkb_column_device
-    # will materialize device state on demand.
-    if force_device or strict_native_mode_enabled() or (
-        owned.residency is Residency.DEVICE and owned.device_state is not None
-    ):
+    # helper declined GPU encode on a small batch.  A cached device_state is
+    # also a valid terminal output-byte source even when public ownership has
+    # restored the logical residency flag to HOST.
+    if force_device or strict_native_mode_enabled() or (owned.device_state is not None):
         try:
             import pyarrow as pa
 
@@ -3778,18 +4407,27 @@ def _encode_owned_wkb_array(
         except Exception:
             pass
 
-    # CPU fallback -- needs host state
-    record_fallback_event(
-        surface="vibespatial.io.wkb",
-        reason="GPU WKB encode unavailable; falling back to host-side row-by-row WKB encode",
-        detail="GPU runtime not available or row count below threshold",
-        selected=ExecutionMode.CPU,
-        pipeline="io/wkb_encode",
-        d2h_transfer=True,
-    )
+    device_source = owned.residency is Residency.DEVICE or owned.device_state is not None
+    if device_source:
+        record_fallback_event(
+            surface="vibespatial.io.wkb",
+            reason="GPU WKB encode unavailable; falling back to host-side row-by-row WKB encode",
+            detail="device WKB encoder declined the owned carrier",
+            selected=ExecutionMode.CPU,
+            pipeline="io/wkb_encode",
+            d2h_transfer=True,
+        )
+    else:
+        record_dispatch_event(
+            surface="vibespatial.io.wkb",
+            operation="encode_to_parquet",
+            implementation="host_owned_wkb_encode",
+            reason="host-owned geometry uses the native typed-buffer WKB terminal encoder",
+            selected=ExecutionMode.CPU,
+        )
     import pyarrow as pa
 
-    owned._ensure_host_state()
+    owned._ensure_host_state(preserve_indexed_view=True)
     wkb_list: list[bytes | None] = []
     for row in range(owned.row_count):
         if not bool(owned.validity[row]):
@@ -3809,9 +4447,7 @@ def _encode_owned_wkb_array(
         if crs_json is not None:
             import json
 
-            field_metadata[b"ARROW:extension:metadata"] = json.dumps(
-                {"crs": crs_json}
-            ).encode()
+            field_metadata[b"ARROW:extension:metadata"] = json.dumps({"crs": crs_json}).encode()
     field_metadata[b"ARROW:extension:name"] = b"geoarrow.wkb"
     field = pa.field(field_name, pa.binary(), nullable=True, metadata=field_metadata)
     result = (field, wkb_arr)
@@ -3840,10 +4476,7 @@ def _encode_family_row_wkb(
         e = int(buf.geometry_offsets[frow + 1])
         npts = e - s
         header = struct.pack("<BII", 1, wkb_type, npts)
-        coords = b"".join(
-            struct.pack("<dd", float(buf.x[i]), float(buf.y[i]))
-            for i in range(s, e)
-        )
+        coords = b"".join(struct.pack("<dd", float(buf.x[i]), float(buf.y[i])) for i in range(s, e))
         return header + coords
 
     if family is GeometryFamily.POLYGON:
@@ -3858,8 +4491,7 @@ def _encode_family_row_wkb(
             npts = ce - cs
             rings += struct.pack("<I", npts)
             rings += b"".join(
-                struct.pack("<dd", float(buf.x[i]), float(buf.y[i]))
-                for i in range(cs, ce)
+                struct.pack("<dd", float(buf.x[i]), float(buf.y[i])) for i in range(cs, ce)
             )
         return header + rings
 
@@ -3869,8 +4501,9 @@ def _encode_family_row_wkb(
         npts = e - s
         header = struct.pack("<BII", 1, wkb_type, npts)
         points = b"".join(
-            struct.pack("<BIdd", 1, WKB_TYPE_IDS[GeometryFamily.POINT],
-                        float(buf.x[i]), float(buf.y[i]))
+            struct.pack(
+                "<BIdd", 1, WKB_TYPE_IDS[GeometryFamily.POINT], float(buf.x[i]), float(buf.y[i])
+            )
             for i in range(s, e)
         )
         return header + points
@@ -3887,8 +4520,7 @@ def _encode_family_row_wkb(
             npts = ce - cs
             lines += struct.pack("<BII", 1, WKB_TYPE_IDS[GeometryFamily.LINESTRING], npts)
             lines += b"".join(
-                struct.pack("<dd", float(buf.x[i]), float(buf.y[i]))
-                for i in range(cs, ce)
+                struct.pack("<dd", float(buf.x[i]), float(buf.y[i])) for i in range(cs, ce)
             )
         return header + lines
 
@@ -3909,8 +4541,7 @@ def _encode_family_row_wkb(
                 npts = ce - cs
                 polygons += struct.pack("<I", npts)
                 polygons += b"".join(
-                    struct.pack("<dd", float(buf.x[i]), float(buf.y[i]))
-                    for i in range(cs, ce)
+                    struct.pack("<dd", float(buf.x[i]), float(buf.y[i])) for i in range(cs, ce)
                 )
         return header + polygons
 

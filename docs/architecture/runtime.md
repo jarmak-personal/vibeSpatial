@@ -175,10 +175,10 @@ available, with CuPy's built-in `MemoryPool` as the fallback.
 - **Tier C** uses CUDA managed memory for datasets exceeding VRAM. Performance
   degrades 2-10× under oversubscription due to PCIe page migration; the SoA
   coordinate layout amplifies page faults.
-- **Deferred initialization**: RMM resources require a CUDA context, so
-  `_configure_rmm_pool()` runs inside `_ensure_context()` after the primary
-  context is retained.  If RMM setup fails, the runtime falls back to the
-  CuPy pool with a warning.
+- **Deferred initialization**: no device allocator is installed merely because
+  CuPy or RMM imports. Pool selection runs inside `_ensure_context()` after the
+  primary context is retained. If RMM setup fails, the runtime falls back to
+  the CuPy pool with a warning.
 - `VIBESPATIAL_GPU_POOL_LIMIT` maps to `maximum_pool_size` (Tiers A/B) and is
   ignored for Tier C (managed memory uses OS overcommit semantics).
 - `_memory_backend` discriminator values: `"cupy"`, `"rmm-pool"`, `"rmm-safe"`,

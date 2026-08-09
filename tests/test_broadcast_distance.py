@@ -373,6 +373,7 @@ def test_hausdorff_dispatch_forwards_precision_plan(monkeypatch) -> None:
     np.testing.assert_allclose(result, [4.0, 4.0])
 
 
+@pytest.mark.gpu
 def test_hausdorff_strict_native_gpu_failure_is_not_swallowed(monkeypatch) -> None:
     import vibespatial.spatial.distance_metrics as distance_metrics
 
@@ -493,6 +494,7 @@ def test_frechet_gpu_densify_matches_shapely() -> None:
     np.testing.assert_allclose(result, expected, rtol=1e-10)
 
 
+@pytest.mark.gpu
 def test_frechet_strict_native_gpu_failure_is_not_swallowed(monkeypatch) -> None:
     import vibespatial.spatial.distance_metrics as distance_metrics
 

@@ -87,14 +87,14 @@ def _median_wkb_bytes(geometries) -> int:
 
 
 def build_payload_model(seed: int = 0, sample_size: int = 512) -> PayloadModel:
-    point_dataset = generate_points(
-        SyntheticSpec("point", "uniform", count=sample_size, seed=seed)
-    )
+    point_dataset = generate_points(SyntheticSpec("point", "uniform", count=sample_size, seed=seed))
     line_dataset = generate_lines(
         SyntheticSpec("line", "random-walk", count=sample_size, seed=seed, vertices=8)
     )
     polygon_dataset = generate_polygons(
-        SyntheticSpec("polygon", "star", count=sample_size, seed=seed, vertices=6, hole_probability=0.2)
+        SyntheticSpec(
+            "polygon", "star", count=sample_size, seed=seed, vertices=6, hole_probability=0.2
+        )
     )
 
     promoted_points = [box(*geometry.bounds) for geometry in point_dataset.geometries]
@@ -256,9 +256,7 @@ def benchmark_matrix(
     results = []
     for dataset_name in DATASET_MIXES:
         for scale in scales:
-            results.append(
-                benchmark_mixed_layout(dataset_name, scale, payload_model, seed=seed)
-            )
+            results.append(benchmark_mixed_layout(dataset_name, scale, payload_model, seed=seed))
     return results
 
 

@@ -8,6 +8,7 @@ call triggers CCCL's JIT compilation (which releases the GIL via Cython
 
 Toggle with VIBESPATIAL_PRECOMPILE env var (default: enabled).
 """
+
 from __future__ import annotations
 
 import logging
@@ -58,6 +59,7 @@ def precompile_enabled() -> bool:
 @dataclass(slots=True)
 class PrecompiledPrimitive:
     """A compiled make_* callable with pre-allocated temp storage."""
+
     name: str
     make_callable: Any
     temp_storage: Any  # CuPy device array
@@ -73,6 +75,7 @@ SPEC_REGISTRY: dict[str, CCCLWarmupSpec] = build_spec_registry()
 # Operator table (lazy — imports from cccl_primitives only when compiling)
 # ---------------------------------------------------------------------------
 
+
 def _get_op(op_name: str, *, algorithms: Any = None, cp_module: Any = None, dtype: Any = None):
     """Return the operator callable for a given op_name."""
     from .cccl_primitives import (
@@ -82,6 +85,7 @@ def _get_op(op_name: str, *, algorithms: Any = None, cp_module: Any = None, dtyp
         _min_op,
         _sum_op,
     )
+
     table = {
         "sum": _sum_op,
         "min": _min_op,
@@ -95,13 +99,15 @@ def _get_op(op_name: str, *, algorithms: Any = None, cp_module: Any = None, dtyp
         return algorithms.SortOrder.ASCENDING
     return None
 
+
 # ---------------------------------------------------------------------------
 # CCCL warning suppression
 # ---------------------------------------------------------------------------
 
 
 _SUPPRESS_CCCL_STDERR = os.environ.get(
-    "VIBESPATIAL_SUPPRESS_CCCL_WARNINGS", "1",
+    "VIBESPATIAL_SUPPRESS_CCCL_WARNINGS",
+    "1",
 ).lower() not in {"0", "false", "off", "no"}
 """Suppress CCCL deprecation warnings on stderr during JIT compilation.
 
@@ -128,7 +134,10 @@ def get_real_stderr():
 
 
 def _suppress_cccl_warnings(
-    compiler: Any, spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
+    compiler: Any,
+    spec: CCCLWarmupSpec,
+    cp_module: Any,
+    algorithms: Any,
 ) -> PrecompiledPrimitive:
     """Run a CCCL make_* compiler with C-level stderr suppressed.
 
@@ -152,7 +161,9 @@ def _suppress_cccl_warnings(
             try:
                 _stderr_saved_fd = os.dup(2)
                 _stderr_saved_file = os.fdopen(
-                    os.dup(_stderr_saved_fd), "w", closefd=True,
+                    os.dup(_stderr_saved_fd),
+                    "w",
+                    closefd=True,
                 )
                 devnull = os.open(os.devnull, os.O_WRONLY)
                 os.dup2(devnull, 2)
@@ -185,7 +196,9 @@ _N = 128  # representative array size for warmup
 
 
 def _compile_exclusive_scan(
-    spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
+    spec: CCCLWarmupSpec,
+    cp_module: Any,
+    algorithms: Any,
 ) -> PrecompiledPrimitive:
     make_fn = algorithms.make_exclusive_scan
     d_in = cp_module.empty(_N, dtype=spec.key_dtype)
@@ -199,14 +212,19 @@ def _compile_exclusive_scan(
     d_temp = cp_module.empty(temp_bytes, dtype=cp_module.uint8)
     elapsed = (perf_counter() - t0) * 1000.0
     return PrecompiledPrimitive(
-        name=spec.name, make_callable=callable_obj,
-        temp_storage=d_temp, temp_storage_bytes=temp_bytes,
-        high_water_n=_N, warmup_ms=elapsed,
+        name=spec.name,
+        make_callable=callable_obj,
+        temp_storage=d_temp,
+        temp_storage_bytes=temp_bytes,
+        high_water_n=_N,
+        warmup_ms=elapsed,
     )
 
 
 def _compile_select(
-    spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
+    spec: CCCLWarmupSpec,
+    cp_module: Any,
+    algorithms: Any,
 ) -> PrecompiledPrimitive:
     make_fn = algorithms.make_select
     d_indices = cp_module.arange(_N, dtype=spec.key_dtype)
@@ -224,14 +242,19 @@ def _compile_select(
     d_temp = cp_module.empty(temp_bytes, dtype=cp_module.uint8)
     elapsed = (perf_counter() - t0) * 1000.0
     return PrecompiledPrimitive(
-        name=spec.name, make_callable=callable_obj,
-        temp_storage=d_temp, temp_storage_bytes=temp_bytes,
-        high_water_n=_N, warmup_ms=elapsed,
+        name=spec.name,
+        make_callable=callable_obj,
+        temp_storage=d_temp,
+        temp_storage_bytes=temp_bytes,
+        high_water_n=_N,
+        warmup_ms=elapsed,
     )
 
 
 def _compile_reduce_into(
-    spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
+    spec: CCCLWarmupSpec,
+    cp_module: Any,
+    algorithms: Any,
 ) -> PrecompiledPrimitive:
     make_fn = algorithms.make_reduce_into
     d_in = cp_module.empty(_N, dtype=spec.key_dtype)
@@ -245,14 +268,19 @@ def _compile_reduce_into(
     d_temp = cp_module.empty(temp_bytes, dtype=cp_module.uint8)
     elapsed = (perf_counter() - t0) * 1000.0
     return PrecompiledPrimitive(
-        name=spec.name, make_callable=callable_obj,
-        temp_storage=d_temp, temp_storage_bytes=temp_bytes,
-        high_water_n=_N, warmup_ms=elapsed,
+        name=spec.name,
+        make_callable=callable_obj,
+        temp_storage=d_temp,
+        temp_storage_bytes=temp_bytes,
+        high_water_n=_N,
+        warmup_ms=elapsed,
     )
 
 
 def _compile_segmented_reduce(
-    spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
+    spec: CCCLWarmupSpec,
+    cp_module: Any,
+    algorithms: Any,
 ) -> PrecompiledPrimitive:
     make_fn = algorithms.make_segmented_reduce
     n_segs = 4
@@ -266,15 +294,25 @@ def _compile_segmented_reduce(
     t0 = perf_counter()
     callable_obj = make_fn(d_values, d_out, d_starts, d_ends, op, h_init)
     temp_bytes = callable_obj(
-        None, d_values, d_out, d_starts, d_ends, op, n_segs, h_init,
+        None,
+        d_values,
+        d_out,
+        d_starts,
+        d_ends,
+        op,
+        n_segs,
+        h_init,
     )
     temp_bytes = max(int(temp_bytes) if temp_bytes else 1, 1)
     d_temp = cp_module.empty(temp_bytes, dtype=cp_module.uint8)
     elapsed = (perf_counter() - t0) * 1000.0
     return PrecompiledPrimitive(
-        name=spec.name, make_callable=callable_obj,
-        temp_storage=d_temp, temp_storage_bytes=temp_bytes,
-        high_water_n=_N, warmup_ms=elapsed,
+        name=spec.name,
+        make_callable=callable_obj,
+        temp_storage=d_temp,
+        temp_storage_bytes=temp_bytes,
+        high_water_n=_N,
+        warmup_ms=elapsed,
     )
 
 
@@ -322,7 +360,9 @@ class _BinarySearchAdapter:
 
 
 def _compile_lower_bound(
-    spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
+    spec: CCCLWarmupSpec,
+    cp_module: Any,
+    algorithms: Any,
 ) -> PrecompiledPrimitive:
     make_fn = algorithms.make_lower_bound
     d_sorted = cp_module.arange(_N, dtype=spec.key_dtype)
@@ -337,14 +377,19 @@ def _compile_lower_bound(
     adapted = _BinarySearchAdapter(raw_callable)
     d_temp = cp_module.empty(1, dtype=cp_module.uint8)
     return PrecompiledPrimitive(
-        name=spec.name, make_callable=adapted,
-        temp_storage=d_temp, temp_storage_bytes=1,
-        high_water_n=_N, warmup_ms=elapsed,
+        name=spec.name,
+        make_callable=adapted,
+        temp_storage=d_temp,
+        temp_storage_bytes=1,
+        high_water_n=_N,
+        warmup_ms=elapsed,
     )
 
 
 def _compile_upper_bound(
-    spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
+    spec: CCCLWarmupSpec,
+    cp_module: Any,
+    algorithms: Any,
 ) -> PrecompiledPrimitive:
     make_fn = algorithms.make_upper_bound
     d_sorted = cp_module.arange(_N, dtype=spec.key_dtype)
@@ -359,14 +404,19 @@ def _compile_upper_bound(
     adapted = _BinarySearchAdapter(raw_callable)
     d_temp = cp_module.empty(1, dtype=cp_module.uint8)
     return PrecompiledPrimitive(
-        name=spec.name, make_callable=adapted,
-        temp_storage=d_temp, temp_storage_bytes=1,
-        high_water_n=_N, warmup_ms=elapsed,
+        name=spec.name,
+        make_callable=adapted,
+        temp_storage=d_temp,
+        temp_storage_bytes=1,
+        high_water_n=_N,
+        warmup_ms=elapsed,
     )
 
 
 def _compile_radix_sort(
-    spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
+    spec: CCCLWarmupSpec,
+    cp_module: Any,
+    algorithms: Any,
 ) -> PrecompiledPrimitive:
     make_fn = algorithms.make_radix_sort
     d_keys = cp_module.empty(_N, dtype=spec.key_dtype)
@@ -377,20 +427,30 @@ def _compile_radix_sort(
     t0 = perf_counter()
     callable_obj = make_fn(d_keys, d_out_keys, d_values, d_out_values, order)
     temp_bytes = callable_obj(
-        None, d_keys, d_out_keys, d_values, d_out_values, _N,
+        None,
+        d_keys,
+        d_out_keys,
+        d_values,
+        d_out_values,
+        _N,
     )
     temp_bytes = max(int(temp_bytes) if temp_bytes else 1, 1)
     d_temp = cp_module.empty(temp_bytes, dtype=cp_module.uint8)
     elapsed = (perf_counter() - t0) * 1000.0
     return PrecompiledPrimitive(
-        name=spec.name, make_callable=callable_obj,
-        temp_storage=d_temp, temp_storage_bytes=temp_bytes,
-        high_water_n=_N, warmup_ms=elapsed,
+        name=spec.name,
+        make_callable=callable_obj,
+        temp_storage=d_temp,
+        temp_storage_bytes=temp_bytes,
+        high_water_n=_N,
+        warmup_ms=elapsed,
     )
 
 
 def _compile_merge_sort(
-    spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
+    spec: CCCLWarmupSpec,
+    cp_module: Any,
+    algorithms: Any,
 ) -> PrecompiledPrimitive:
     make_fn = algorithms.make_merge_sort
     d_keys = cp_module.empty(_N, dtype=spec.key_dtype)
@@ -401,20 +461,31 @@ def _compile_merge_sort(
     t0 = perf_counter()
     callable_obj = make_fn(d_keys, d_values, d_out_keys, d_out_values, op)
     temp_bytes = callable_obj(
-        None, d_keys, d_values, d_out_keys, d_out_values, op, _N,
+        None,
+        d_keys,
+        d_values,
+        d_out_keys,
+        d_out_values,
+        op,
+        _N,
     )
     temp_bytes = max(int(temp_bytes) if temp_bytes else 1, 1)
     d_temp = cp_module.empty(temp_bytes, dtype=cp_module.uint8)
     elapsed = (perf_counter() - t0) * 1000.0
     return PrecompiledPrimitive(
-        name=spec.name, make_callable=callable_obj,
-        temp_storage=d_temp, temp_storage_bytes=temp_bytes,
-        high_water_n=_N, warmup_ms=elapsed,
+        name=spec.name,
+        make_callable=callable_obj,
+        temp_storage=d_temp,
+        temp_storage_bytes=temp_bytes,
+        high_water_n=_N,
+        warmup_ms=elapsed,
     )
 
 
 def _compile_unique_by_key(
-    spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
+    spec: CCCLWarmupSpec,
+    cp_module: Any,
+    algorithms: Any,
 ) -> PrecompiledPrimitive:
     make_fn = algorithms.make_unique_by_key
     d_keys = cp_module.arange(_N, dtype=spec.key_dtype)
@@ -426,20 +497,32 @@ def _compile_unique_by_key(
     t0 = perf_counter()
     callable_obj = make_fn(d_keys, d_values, d_out_keys, d_out_values, d_out_count, op)
     temp_bytes = callable_obj(
-        None, d_keys, d_values, d_out_keys, d_out_values, d_out_count, op, _N,
+        None,
+        d_keys,
+        d_values,
+        d_out_keys,
+        d_out_values,
+        d_out_count,
+        op,
+        _N,
     )
     temp_bytes = max(int(temp_bytes) if temp_bytes else 1, 1)
     d_temp = cp_module.empty(temp_bytes, dtype=cp_module.uint8)
     elapsed = (perf_counter() - t0) * 1000.0
     return PrecompiledPrimitive(
-        name=spec.name, make_callable=callable_obj,
-        temp_storage=d_temp, temp_storage_bytes=temp_bytes,
-        high_water_n=_N, warmup_ms=elapsed,
+        name=spec.name,
+        make_callable=callable_obj,
+        temp_storage=d_temp,
+        temp_storage_bytes=temp_bytes,
+        high_water_n=_N,
+        warmup_ms=elapsed,
     )
 
 
 def _compile_segmented_sort(
-    spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
+    spec: CCCLWarmupSpec,
+    cp_module: Any,
+    algorithms: Any,
 ) -> PrecompiledPrimitive:
     make_fn = algorithms.make_segmented_sort
     n_segs = 4
@@ -447,26 +530,44 @@ def _compile_segmented_sort(
     d_keys = cp_module.empty(_N, dtype=spec.key_dtype)
     d_out_keys = cp_module.empty(_N, dtype=spec.key_dtype)
     d_values = cp_module.empty(_N, dtype=spec.value_dtype) if spec.value_dtype is not None else None
-    d_out_values = cp_module.empty(_N, dtype=spec.value_dtype) if spec.value_dtype is not None else None
+    d_out_values = (
+        cp_module.empty(_N, dtype=spec.value_dtype) if spec.value_dtype is not None else None
+    )
     d_starts = cp_module.arange(0, _N, seg_size, dtype=cp_module.int32)
     d_ends = d_starts + seg_size
     order = algorithms.SortOrder.ASCENDING
     t0 = perf_counter()
     callable_obj = make_fn(
-        d_keys, d_out_keys, d_values, d_out_values,
-        d_starts, d_ends, order,
+        d_keys,
+        d_out_keys,
+        d_values,
+        d_out_values,
+        d_starts,
+        d_ends,
+        order,
     )
     temp_bytes = callable_obj(
-        None, d_keys, d_out_keys, d_values, d_out_values,
-        _N, n_segs, d_starts, d_ends, order,
+        None,
+        d_keys,
+        d_out_keys,
+        d_values,
+        d_out_values,
+        _N,
+        n_segs,
+        d_starts,
+        d_ends,
+        order,
     )
     temp_bytes = max(int(temp_bytes) if temp_bytes else 1, 1)
     d_temp = cp_module.empty(temp_bytes, dtype=cp_module.uint8)
     elapsed = (perf_counter() - t0) * 1000.0
     return PrecompiledPrimitive(
-        name=spec.name, make_callable=callable_obj,
-        temp_storage=d_temp, temp_storage_bytes=temp_bytes,
-        high_water_n=_N, warmup_ms=elapsed,
+        name=spec.name,
+        make_callable=callable_obj,
+        temp_storage=d_temp,
+        temp_storage_bytes=temp_bytes,
+        high_water_n=_N,
+        warmup_ms=elapsed,
     )
 
 
@@ -504,7 +605,10 @@ _FAMILY_MAKE_FN = {
 
 
 def _build_cached_callable(
-    entry: Any, spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
+    entry: Any,
+    spec: CCCLWarmupSpec,
+    cp_module: Any,
+    algorithms: Any,
 ) -> Any:
     """Construct a _Cached* callable from a CacheEntry + spec."""
     from cuda.compute._bindings import Op as CcclOp
@@ -541,6 +645,7 @@ def _build_cached_callable(
         d_out_cccl = to_cccl_output_iter(d_out)
         op_adapter = make_op_adapter(op)
         from cuda.compute._cccl_interop import get_value_type
+
         vt = get_value_type(h_init)
         op_cccl = op_adapter.compile((vt, vt), vt)
         init_cccl = to_cccl_value(h_init)
@@ -551,8 +656,14 @@ def _build_cached_callable(
             else "cccl_device_reduce"
         )
         return _CachedScanReduce(
-            build, spec.name, c_func,
-            d_in_cccl, d_out_cccl, op_cccl, init_cccl, op_adapter,
+            build,
+            spec.name,
+            c_func,
+            d_in_cccl,
+            d_out_cccl,
+            op_cccl,
+            init_cccl,
+            op_adapter,
         )
 
     if family == AlgorithmFamily.SEGMENTED_REDUCE:
@@ -570,13 +681,20 @@ def _build_cached_callable(
         d_ends_cccl = to_cccl_input_iter(d_ends)
         op_adapter = make_op_adapter(op)
         from cuda.compute._cccl_interop import get_value_type
+
         vt = get_value_type(h_init)
         op_cccl = op_adapter.compile((vt, vt), vt)
         init_cccl = to_cccl_value(h_init)
         return _CachedSegmentedReduce(
-            build, spec.name,
-            d_in_cccl, d_out_cccl, d_starts_cccl, d_ends_cccl,
-            op_cccl, init_cccl, op_adapter,
+            build,
+            spec.name,
+            d_in_cccl,
+            d_out_cccl,
+            d_starts_cccl,
+            d_ends_cccl,
+            op_cccl,
+            init_cccl,
+            op_adapter,
         )
 
     if family in (AlgorithmFamily.LOWER_BOUND, AlgorithmFamily.UPPER_BOUND):
@@ -589,15 +707,22 @@ def _build_cached_callable(
         # Binary search uses a compiled lambda comparator (not OpKind.LESS,
         # because well-known ops don't carry type info for JIT)
         import numba
+
         def _default_less(a, b):
             return a < b
+
         from cuda.compute._cccl_interop import get_value_type
+
         comp_adapter = make_op_adapter(_default_less)
         vt = get_value_type(d_sorted)
         op_cccl = comp_adapter.compile((vt, vt), numba.types.uint8)
         return _CachedBinarySearch(
-            build, spec.name,
-            d_data_cccl, d_values_cccl, d_out_cccl, op_cccl,
+            build,
+            spec.name,
+            d_data_cccl,
+            d_values_cccl,
+            d_out_cccl,
+            op_cccl,
         )
 
     if family == AlgorithmFamily.RADIX_SORT:
@@ -611,14 +736,21 @@ def _build_cached_callable(
         d_vals_out_cccl = to_cccl_output_iter(d_out_values)
         # Radix sort uses a dummy (empty) decomposer op
         from cuda.compute._bindings import Op as CcclOp
+
         decomposer_cccl = CcclOp(
-            name="", operator_type=OpKind.STATELESS,
-            ltoir=b"", state_alignment=1, state=None,
+            name="",
+            operator_type=OpKind.STATELESS,
+            ltoir=b"",
+            state_alignment=1,
+            state=None,
         )
         return _CachedRadixSort(
-            build, spec.name,
-            d_keys_in_cccl, d_keys_out_cccl,
-            d_vals_in_cccl, d_vals_out_cccl,
+            build,
+            spec.name,
+            d_keys_in_cccl,
+            d_keys_out_cccl,
+            d_vals_in_cccl,
+            d_vals_out_cccl,
             decomposer_cccl,
         )
 
@@ -634,13 +766,18 @@ def _build_cached_callable(
         d_vals_out_cccl = to_cccl_output_iter(d_out_values)
         op_adapter = make_op_adapter(op)
         from cuda.compute._cccl_interop import get_value_type
+
         vt = get_value_type(d_keys)
         op_cccl = op_adapter.compile((vt, vt), vt)
         return _CachedMergeSort(
-            build, spec.name,
-            d_keys_in_cccl, d_vals_in_cccl,
-            d_keys_out_cccl, d_vals_out_cccl,
-            op_cccl, op_adapter,
+            build,
+            spec.name,
+            d_keys_in_cccl,
+            d_vals_in_cccl,
+            d_keys_out_cccl,
+            d_vals_out_cccl,
+            op_cccl,
+            op_adapter,
         )
 
     if family == AlgorithmFamily.UNIQUE_BY_KEY:
@@ -657,13 +794,19 @@ def _build_cached_callable(
         d_count_cccl = to_cccl_output_iter(d_count)
         op_adapter = make_op_adapter(op)
         from cuda.compute._cccl_interop import get_value_type
+
         vt = get_value_type(d_keys)
         op_cccl = op_adapter.compile((vt, vt), vt)
         return _CachedUniqueByKey(
-            build, spec.name,
-            d_keys_in_cccl, d_vals_in_cccl,
-            d_keys_out_cccl, d_vals_out_cccl, d_count_cccl,
-            op_cccl, op_adapter,
+            build,
+            spec.name,
+            d_keys_in_cccl,
+            d_vals_in_cccl,
+            d_keys_out_cccl,
+            d_vals_out_cccl,
+            d_count_cccl,
+            op_cccl,
+            op_adapter,
         )
 
     # Unsupported family (select, segmented_sort) — fall through to build
@@ -671,7 +814,9 @@ def _build_cached_callable(
 
 
 def _query_cached_temp(
-    cached_callable: Any, spec: CCCLWarmupSpec, cp_module: Any,
+    cached_callable: Any,
+    spec: CCCLWarmupSpec,
+    cp_module: Any,
 ) -> int:
     """Query temp storage size from a cached callable."""
     family = spec.family
@@ -696,7 +841,14 @@ def _query_cached_temp(
         op = _get_op(spec.op_name)
         h_init = get_host_init(spec.op_name, spec.key_dtype)
         return cached_callable(
-            None, d_values, d_out, d_starts, d_ends, op, n_segs, h_init,
+            None,
+            d_values,
+            d_out,
+            d_starts,
+            d_ends,
+            op,
+            n_segs,
+            h_init,
         )
 
     if family in (AlgorithmFamily.LOWER_BOUND, AlgorithmFamily.UPPER_BOUND):
@@ -711,7 +863,12 @@ def _query_cached_temp(
         d_values = cp_module.empty(_N, dtype=spec.value_dtype)
         d_out_values = cp_module.empty(_N, dtype=spec.value_dtype)
         return cached_callable(
-            None, d_keys, d_out_keys, d_values, d_out_values, _N,
+            None,
+            d_keys,
+            d_out_keys,
+            d_values,
+            d_out_values,
+            _N,
         )
 
     if family == AlgorithmFamily.MERGE_SORT:
@@ -721,7 +878,13 @@ def _query_cached_temp(
         d_out_values = cp_module.empty(_N, dtype=spec.value_dtype)
         op = _get_op(spec.op_name)
         return cached_callable(
-            None, d_keys, d_values, d_out_keys, d_out_values, op, _N,
+            None,
+            d_keys,
+            d_values,
+            d_out_keys,
+            d_out_values,
+            op,
+            _N,
         )
 
     if family == AlgorithmFamily.UNIQUE_BY_KEY:
@@ -732,7 +895,14 @@ def _query_cached_temp(
         d_count = cp_module.empty(1, dtype=cp_module.int32)
         op = _get_op(spec.op_name)
         return cached_callable(
-            None, d_keys, d_values, d_out_keys, d_out_values, d_count, op, _N,
+            None,
+            d_keys,
+            d_values,
+            d_out_keys,
+            d_out_values,
+            d_count,
+            op,
+            _N,
         )
 
     return 1  # fallback
@@ -741,6 +911,7 @@ def _query_cached_temp(
 # ---------------------------------------------------------------------------
 # Precompiler singleton
 # ---------------------------------------------------------------------------
+
 
 class CCCLPrecompiler:
     """Demand-driven background pre-compilation of CCCL make_* callables.
@@ -804,6 +975,7 @@ class CCCLPrecompiler:
 
             # Batch probe: which of the new specs are already on disk?
             from .cccl_cubin_cache import _cached_spec_name_set
+
             cached_on_disk = _cached_spec_name_set()
 
             for name in new_specs:
@@ -836,7 +1008,9 @@ class CCCLPrecompiler:
         make_fn_name = _FAMILY_MAKE_FN.get(spec.family)
         if make_fn_name and not hasattr(algorithms, make_fn_name):
             diag = WarmupDiagnostic(
-                spec.name, 0.0, False,
+                spec.name,
+                0.0,
+                False,
                 f"{make_fn_name} not available in this CCCL version",
             )
             self._diagnostics.append(diag)
@@ -889,7 +1063,10 @@ class CCCLPrecompiler:
 
             t0 = perf_counter()
             cached_callable = _build_cached_callable(
-                entry, spec, cp_module, algorithms,
+                entry,
+                spec,
+                cp_module,
+                algorithms,
             )
             if cached_callable is None:
                 return None
@@ -914,32 +1091,43 @@ class CCCLPrecompiler:
             )
             logger.debug(
                 "CCCL warmup: %s loaded from disk cache in %.1fms",
-                spec.name, elapsed,
+                spec.name,
+                elapsed,
             )
             return result
         except (OSError, ValueError, KeyError, RuntimeError) as exc:
             logger.debug(
                 "CCCL cache: hit but load failed for %s, falling back: %s",
-                spec.name, exc,
+                spec.name,
+                exc,
             )
             return None
 
     def _save_to_disk_cache(
-        self, spec: CCCLWarmupSpec, result: PrecompiledPrimitive,
+        self,
+        spec: CCCLWarmupSpec,
+        result: PrecompiledPrimitive,
     ) -> None:
         """Save a freshly built result to disk cache."""
         try:
             from vibespatial.cuda import cccl_cubin_cache
+
             cccl_cubin_cache.save_after_build(
-                spec.name, spec.family, result.make_callable,
+                spec.name,
+                spec.family,
+                result.make_callable,
             )
         except (OSError, ValueError, KeyError, RuntimeError) as exc:
             logger.debug(
-                "CCCL cache: save failed for %s: %s", spec.name, exc,
+                "CCCL cache: save failed for %s: %s",
+                spec.name,
+                exc,
             )
 
     def get_compiled(
-        self, name: str, timeout: float = 5.0,
+        self,
+        name: str,
+        timeout: float | None = 5.0,
     ) -> PrecompiledPrimitive | None:
         """Get a pre-compiled primitive.  Blocks if compilation in progress.
 
@@ -1020,12 +1208,9 @@ class CCCLPrecompiler:
             "deferred": len(self._deferred_disk),
             "pending": sum(1 for f in self._futures.values() if not f.done()),
             "failed": sum(
-                1 for f in self._futures.values()
-                if f.done() and f.exception() is not None
+                1 for f in self._futures.values() if f.done() and f.exception() is not None
             ),
-            "wall_ms": (perf_counter() - self._start_time) * 1000
-            if self._start_time
-            else 0,
+            "wall_ms": (perf_counter() - self._start_time) * 1000 if self._start_time else 0,
             "per_primitive": [
                 {"name": d.name, "ms": round(d.elapsed_ms, 1), "ok": d.success}
                 for d in self._diagnostics
@@ -1056,14 +1241,15 @@ class CCCLPrecompiler:
         return cold
 
     def shutdown(self) -> None:
-        """Shut down the thread pool.  For testing cleanup."""
+        """Quiesce the thread pool before releasing compiler-owned GPU state."""
         if self._executor is not None:
-            self._executor.shutdown(wait=False)
+            self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
 # Module-level convenience functions
 # ---------------------------------------------------------------------------
+
 
 def request_warmup(spec_names: list[str]) -> None:
     """Non-blocking request to pre-compile CCCL specs.
@@ -1080,6 +1266,16 @@ def request_warmup(spec_names: list[str]) -> None:
     if not has_gpu_runtime():
         return
     CCCLPrecompiler.get().request(spec_names)
+
+
+def get_or_request_compiled(name: str) -> PrecompiledPrimitive | None:
+    """Return one typed primitive, compiling it once when warm state was reset."""
+    if name not in SPEC_REGISTRY:
+        return None
+    request_warmup([name])
+    if CCCLPrecompiler._instance is None:
+        return None
+    return CCCLPrecompiler._instance.get_compiled(name, timeout=None)
 
 
 def precompile_status() -> dict[str, Any]:
@@ -1180,7 +1376,6 @@ def _warm_exact_polygon_intersection_route(timeout: float = 60.0) -> None:
                 left,
                 right,
                 dispatch_mode=ExecutionMode.GPU,
-                _prefer_exact_polygon_intersection=True,
             )
         except Exception:
             logger.debug(
@@ -1255,7 +1450,7 @@ def _warm_overlay_difference_segmented_union_route(timeout: float = 60.0) -> Non
     """Warm the overlay-difference segmented-union route used by redevelopment flows.
 
     The strict-native redevelopment and site suitability shootouts hit
-    ``_batched_overlay_difference_owned``. That path unions grouped right-side
+    ``_grouped_overlay_difference_capacity_owned``. That path unions grouped right-side
     polygons via ``segmented_union_all(...)``, which in turn exercises the
     overlay split/candidate pipeline and CCCL ``upper_bound``. If that binary
     search callable is still cold, its first-use build cost lands inside the
@@ -1412,8 +1607,10 @@ def _warm_device_centroid_buffer_route(timeout: float = 60.0) -> None:
 
         _device_centroid_buffer_warm_done = True
 
+
 # Modules whose import triggers request_nvrtc_warmup() at module scope.
 _NVRTC_CONSUMER_MODULES: tuple[str, ...] = (
+    "vibespatial.api._native_rowset",
     "vibespatial.spatial.indexing",
     "vibespatial.io.geojson_gpu",
     "vibespatial.io.wkb",
@@ -1436,8 +1633,10 @@ _NVRTC_CONSUMER_MODULES: tuple[str, ...] = (
     "vibespatial.constructive.measurement",
     "vibespatial.constructive.centroid",
     "vibespatial.constructive.clip_rect",
+    "vibespatial.constructive.grouped_mixed_union",
     "vibespatial.constructive.union_all",
     "vibespatial.kernels.constructive.polygon_rect_intersection",
+    "vibespatial.kernels.constructive.polygon_simple_intersection",
     "vibespatial.constructive.validity",
     "vibespatial.io.gpu_parse.structural",
     "vibespatial.io.gpu_parse.numeric",

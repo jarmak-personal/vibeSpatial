@@ -4,6 +4,7 @@ Operations self-register via the ``@benchmark_operation`` decorator.
 The registry is populated when operation modules under
 ``vibespatial.bench.operations`` are imported.
 """
+
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -15,6 +16,7 @@ from .schema import BenchmarkResult
 # ---------------------------------------------------------------------------
 # Callable protocol
 # ---------------------------------------------------------------------------
+
 
 class BenchmarkCallable(Protocol):
     def __call__(
@@ -35,6 +37,7 @@ class BenchmarkCallable(Protocol):
 # ---------------------------------------------------------------------------
 # Operation parameters
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class OperationParameterSpec:
@@ -103,11 +106,7 @@ def resolve_operation_args(
 ) -> dict[str, Any]:
     """Validate and coerce operation-specific CLI args against the operation schema."""
     params = {param.name: param for param in spec.parameters}
-    resolved = {
-        param.name: param.default
-        for param in spec.parameters
-        if param.default is not None
-    }
+    resolved = {param.name: param.default for param in spec.parameters if param.default is not None}
     if not raw_args:
         return resolved
 
@@ -135,6 +134,7 @@ def resolve_operation_args(
 # ---------------------------------------------------------------------------
 # Operation spec
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class OperationSpec:
@@ -224,10 +224,7 @@ def get_operation(name: str) -> OperationSpec:
     """
     if name not in _OPERATION_REGISTRY:
         available = ", ".join(_OPERATION_REGISTRY) or "(none registered)"
-        raise KeyError(
-            f"Unknown benchmark operation: {name!r}. "
-            f"Available: {available}"
-        )
+        raise KeyError(f"Unknown benchmark operation: {name!r}. Available: {available}")
     return _OPERATION_REGISTRY[name]
 
 

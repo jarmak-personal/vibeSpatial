@@ -48,6 +48,7 @@ Precision (ADR-0002):
     Coordinate parsing delegates to gpu_parse.parse_ascii_floats which
     always produces fp64 -- storage precision is always fp64 per ADR-0002.
 """
+
 from __future__ import annotations
 
 import ctypes
@@ -151,18 +152,21 @@ KML_FAMILY_UNKNOWN: int = -2
 
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    (
-        "kml-assign-geom-type",
-        _KML_ASSIGN_GEOM_TYPE_SOURCE,
-        _KML_ASSIGN_GEOM_TYPE_NAMES,
-    ),
-])
+request_nvrtc_warmup(
+    [
+        (
+            "kml-assign-geom-type",
+            _KML_ASSIGN_GEOM_TYPE_SOURCE,
+            _KML_ASSIGN_GEOM_TYPE_NAMES,
+        ),
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # Kernel compilation helpers
 # ---------------------------------------------------------------------------
+
 
 def _assign_geom_type_kernels() -> dict:
     """Compile (or retrieve cached) KML geometry type assignment kernel."""
@@ -215,6 +219,7 @@ _TAG_COMMENT_CLOSE = b"-->"
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _find_tag_positions(
     d_bytes: cp.ndarray,
@@ -397,6 +402,7 @@ def _pair_open_close_tags(
 # Result dataclass
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True, slots=True)
 class KmlGpuResult:
     """Result of GPU KML reading.
@@ -459,6 +465,7 @@ class KmlStructuralResult:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def kml_structural_analysis(d_bytes: cp.ndarray) -> KmlStructuralResult:
     """Perform structural analysis on a KML document.
@@ -577,7 +584,9 @@ def kml_structural_analysis(d_bytes: cp.ndarray) -> KmlStructuralResult:
     # We handle this by checking the byte at the expected plain offset.
 
     d_paired_opens, d_paired_closes = _pair_open_close_tags(
-        d_coord_open_pos, d_coord_close_pos, close_tag_len=14,
+        d_coord_open_pos,
+        d_coord_close_pos,
+        close_tag_len=14,
     )
     del d_coord_open_pos, d_coord_close_pos
 
@@ -588,7 +597,7 @@ def kml_structural_analysis(d_bytes: cp.ndarray) -> KmlStructuralResult:
     if d_paired_opens.shape[0] > 0:
         # Check second byte to determine tag variant
         d_second_byte = d_bytes[(d_paired_opens + 1).astype(cp.intp)]
-        d_is_ns = (d_second_byte == ord('k'))
+        d_is_ns = d_second_byte == ord("k")
         # Plain tag: content starts at open_pos + len("<coordinates>") = open_pos + 13
         # NS tag: content starts at open_pos + len("<kml:coordinates>") = open_pos + 17
         d_coord_starts = d_paired_opens + cp.where(d_is_ns, 17, 13)
@@ -623,7 +632,9 @@ def kml_structural_analysis(d_bytes: cp.ndarray) -> KmlStructuralResult:
     )
 
     d_placemark_starts, d_placemark_closes = _pair_open_close_tags(
-        d_pm_open_pos, d_pm_close_pos, close_tag_len=13,
+        d_pm_open_pos,
+        d_pm_close_pos,
+        close_tag_len=13,
     )
     del d_pm_open_pos, d_pm_close_pos
 
@@ -631,7 +642,7 @@ def kml_structural_analysis(d_bytes: cp.ndarray) -> KmlStructuralResult:
     # To compute the exact end, check the close tag variant.
     if d_placemark_closes.shape[0] > 0:
         d_close_second = d_bytes[(d_placemark_closes + 2).astype(cp.intp)]
-        d_close_is_ns = (d_close_second == ord('k'))
+        d_close_is_ns = d_close_second == ord("k")
         # </Placemark> = 13 bytes, </kml:Placemark> = 17 bytes
         d_placemark_ends = d_placemark_closes + cp.where(d_close_is_ns, 17, 13)
         del d_close_second, d_close_is_ns
@@ -705,13 +716,15 @@ def kml_structural_analysis(d_bytes: cp.ndarray) -> KmlStructuralResult:
 # ---------------------------------------------------------------------------
 
 # Register for warmup (ADR-0034 Level 2)
-request_nvrtc_warmup([
-    (
-        "kml-count-commas-spaces",
-        _KML_COUNT_COMMAS_SPACES_SOURCE,
-        _KML_COUNT_COMMAS_SPACES_NAMES,
-    ),
-])
+request_nvrtc_warmup(
+    [
+        (
+            "kml-count-commas-spaces",
+            _KML_COUNT_COMMAS_SPACES_SOURCE,
+            _KML_COUNT_COMMAS_SPACES_NAMES,
+        ),
+    ]
+)
 
 
 def _count_commas_spaces_kernels() -> dict:
@@ -734,13 +747,15 @@ def _count_commas_spaces_kernels() -> dict:
 # corresponds to one ring (outer boundary + optional inner boundaries).
 # ---------------------------------------------------------------------------
 
-request_nvrtc_warmup([
-    (
-        "kml-assign-coord-regions",
-        _KML_ASSIGN_COORD_REGIONS_SOURCE,
-        _KML_ASSIGN_COORD_REGIONS_NAMES,
-    ),
-])
+request_nvrtc_warmup(
+    [
+        (
+            "kml-assign-coord-regions",
+            _KML_ASSIGN_COORD_REGIONS_SOURCE,
+            _KML_ASSIGN_COORD_REGIONS_NAMES,
+        ),
+    ]
+)
 
 
 def _assign_coord_regions_kernels() -> dict:
@@ -766,6 +781,7 @@ _KML_TAG_TO_FAMILY = {
 # ---------------------------------------------------------------------------
 # Coordinate extraction pipeline
 # ---------------------------------------------------------------------------
+
 
 def _detect_dimensionality(
     d_bytes: cp.ndarray,
@@ -868,13 +884,17 @@ def _extract_kml_coordinates(
 
     # Step 1: Detect dimensionality (2D or 3D)
     dim = _detect_dimensionality(
-        d_bytes, structural.d_coord_starts, structural.d_coord_ends,
+        d_bytes,
+        structural.d_coord_starts,
+        structural.d_coord_ends,
     )
 
     # Step 2: Build a span mask for all coordinate regions.
     # This marks bytes that are inside <coordinates>...</coordinates> content.
     d_coord_mask = mark_spans(
-        structural.d_coord_starts, structural.d_coord_ends, n,
+        structural.d_coord_starts,
+        structural.d_coord_ends,
+        n,
     )
 
     # Step 3: Find number boundaries using gpu_parse.
@@ -903,9 +923,9 @@ def _extract_kml_coordinates(
     # numeric-initial char, force is_start=1
     d_first_bytes = d_bytes[d_coord_starts_arr.astype(cp.intp)]
     d_is_numeric_initial = (
-        ((d_first_bytes >= ord('0')) & (d_first_bytes <= ord('9')))
-        | (d_first_bytes == ord('-'))
-        | (d_first_bytes == ord('+'))
+        ((d_first_bytes >= ord("0")) & (d_first_bytes <= ord("9")))
+        | (d_first_bytes == ord("-"))
+        | (d_first_bytes == ord("+"))
     )
     d_is_start[d_coord_starts_arr[d_is_numeric_initial].astype(cp.intp)] = 1
 
@@ -916,18 +936,20 @@ def _extract_kml_coordinates(
     if d_last_pos.shape[0] > 0:
         d_last_bytes = d_bytes[d_last_pos]
         d_is_numeric = (
-            ((d_last_bytes >= ord('0')) & (d_last_bytes <= ord('9')))
-            | (d_last_bytes == ord('.'))
-            | (d_last_bytes == ord('e'))
-            | (d_last_bytes == ord('E'))
-            | (d_last_bytes == ord('-'))
-            | (d_last_bytes == ord('+'))
+            ((d_last_bytes >= ord("0")) & (d_last_bytes <= ord("9")))
+            | (d_last_bytes == ord("."))
+            | (d_last_bytes == ord("e"))
+            | (d_last_bytes == ord("E"))
+            | (d_last_bytes == ord("-"))
+            | (d_last_bytes == ord("+"))
         )
         d_is_end[d_last_pos[d_is_numeric]] = 1
 
     # Step 4: Extract number positions within coordinate regions only.
     d_num_starts, d_num_ends = extract_number_positions(
-        d_is_start, d_is_end, d_mask=d_coord_mask,
+        d_is_start,
+        d_is_end,
+        d_mask=d_coord_mask,
     )
     del d_is_start, d_is_end, d_coord_mask
 
@@ -963,7 +985,9 @@ def _extract_kml_coordinates(
     # Assign each coordinate region to its Placemark, then sum up
     # the values per Placemark and convert to pair counts.
     d_placemark_coord_counts = _count_coords_per_placemark(
-        structural, n_coords, dim,
+        structural,
+        n_coords,
+        dim,
         d_bytes,
     )
 
@@ -1159,6 +1183,7 @@ def _count_rings_per_placemark(
 # Offset building helpers (follow wkt_gpu.py patterns)
 # ---------------------------------------------------------------------------
 
+
 def _device_compact_offsets(d_counts: cp.ndarray) -> cp.ndarray:
     """Build (n+1) offset array from per-element counts via exclusive sum.
 
@@ -1177,6 +1202,7 @@ def _device_compact_offsets(d_counts: cp.ndarray) -> cp.ndarray:
 # ---------------------------------------------------------------------------
 # Per-Placemark ring-level coordinate counting for Polygon assembly
 # ---------------------------------------------------------------------------
+
 
 def _count_coords_per_ring(
     structural: KmlStructuralResult,
@@ -1253,6 +1279,7 @@ def _count_coords_per_ring(
 # ---------------------------------------------------------------------------
 # Assembly into OwnedGeometryArray
 # ---------------------------------------------------------------------------
+
 
 def _build_empty_owned() -> OwnedGeometryArray:
     """Build an empty OwnedGeometryArray with zero rows."""
@@ -1335,7 +1362,7 @@ def _assemble_kml_homogeneous(
     """Build OwnedGeometryArray for a homogeneous KML file (single family)."""
     from vibespatial.io.pylibcudf import _build_device_single_family_owned
 
-    d_empty_mask = (d_placemark_coord_counts == 0)
+    d_empty_mask = d_placemark_coord_counts == 0
     d_validity = ~d_empty_mask
 
     if family == GeometryFamily.POINT:
@@ -1369,7 +1396,9 @@ def _assemble_kml_homogeneous(
         # (one per ring).  geometry_offsets = cumulative ring counts.
         # ring_offsets = cumulative coordinate pairs per ring.
         d_ring_counts, d_ring_coord_pair_counts = _count_coords_per_ring(
-            structural, dim, d_bytes,
+            structural,
+            dim,
+            d_bytes,
         )
         d_geom_offsets = _device_compact_offsets(d_ring_counts)
         d_ring_offsets = _device_compact_offsets(d_ring_coord_pair_counts)
@@ -1415,14 +1444,10 @@ def _assemble_kml_mixed(
     d_oga_tags[d_oga_tags < 0] = -1
     d_oga_tags[d_oga_tags == KML_FAMILY_MULTI] = -1
 
-    d_validity = (d_oga_tags >= 0)
+    d_validity = d_oga_tags >= 0
 
     # Pre-compute 2D coordinate array for gather operations
-    coords_2d = (
-        cp.column_stack([d_x, d_y])
-        if d_x.size > 0
-        else cp.empty((0, 2), dtype=cp.float64)
-    )
+    coords_2d = cp.column_stack([d_x, d_y]) if d_x.size > 0 else cp.empty((0, 2), dtype=cp.float64)
 
     family_devices: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
     family_rows: dict[int, cp.ndarray] = {}
@@ -1464,17 +1489,22 @@ def _assemble_kml_mixed(
 
         elif family == GeometryFamily.LINESTRING:
             gathered, ls_geom_offsets = _device_gather_offset_slices(
-                coords_2d, d_coord_offsets, rows,
+                coords_2d,
+                d_coord_offsets,
+                rows,
+                allocation_reason="kml mixed-family coordinate allocation fence",
             )
             family_devices[family] = DeviceFamilyGeometryBuffer(
                 family=family,
                 x=(
                     cp.ascontiguousarray(gathered[:, 0])
-                    if gathered.size else cp.empty(0, dtype=cp.float64)
+                    if gathered.size
+                    else cp.empty(0, dtype=cp.float64)
                 ),
                 y=(
                     cp.ascontiguousarray(gathered[:, 1])
-                    if gathered.size else cp.empty(0, dtype=cp.float64)
+                    if gathered.size
+                    else cp.empty(0, dtype=cp.float64)
                 ),
                 geometry_offsets=ls_geom_offsets,
                 empty_mask=(ls_geom_offsets[1:] == ls_geom_offsets[:-1]),
@@ -1484,26 +1514,35 @@ def _assemble_kml_mixed(
             # For Polygon: gather coordinates per Placemark, then build
             # ring offsets from the per-ring coordinate counts.
             gathered, sub_coord_offsets = _device_gather_offset_slices(
-                coords_2d, d_coord_offsets, rows,
+                coords_2d,
+                d_coord_offsets,
+                rows,
+                allocation_reason="kml mixed-family polygon allocation fence",
             )
             pg_x = (
                 cp.ascontiguousarray(gathered[:, 0])
-                if gathered.size else cp.empty(0, dtype=cp.float64)
+                if gathered.size
+                else cp.empty(0, dtype=cp.float64)
             )
             pg_y = (
                 cp.ascontiguousarray(gathered[:, 1])
-                if gathered.size else cp.empty(0, dtype=cp.float64)
+                if gathered.size
+                else cp.empty(0, dtype=cp.float64)
             )
 
             # Build ring counts and ring-level coord pair counts for the
             # polygon subset.
             sub_ring_counts = _count_rings_per_placemark_subset(
-                structural, rows,
+                structural,
+                rows,
             )
             sub_geom_offsets = _device_compact_offsets(sub_ring_counts)
 
             sub_ring_coord_pair_counts = _count_ring_coords_for_subset(
-                structural, rows, dim, d_bytes,
+                structural,
+                rows,
+                dim,
+                d_bytes,
             )
             sub_ring_offsets = _device_compact_offsets(sub_ring_coord_pair_counts)
 
@@ -1607,7 +1646,7 @@ def _count_ring_coords_for_subset(
     d_row_set[rows] = 1
 
     # Filter to regions that belong to subset Placemarks
-    d_valid = (d_region_pm_idx >= 0)
+    d_valid = d_region_pm_idx >= 0
     d_in_subset = d_valid & (d_row_set[d_region_pm_idx.clip(0)] == 1)
     d_subset_region_indices = cp.flatnonzero(d_in_subset).astype(cp.int32)
     del d_valid, d_in_subset, d_row_set
@@ -1621,6 +1660,7 @@ def _count_ring_coords_for_subset(
 # ---------------------------------------------------------------------------
 # KML attribute extraction (host-side, text data)
 # ---------------------------------------------------------------------------
+
 
 def _extract_tag_text(
     h_bytes: bytes,
@@ -1720,14 +1760,20 @@ def _extract_kml_attributes(
 
     # Tag pairs to search for: plain and namespace-prefixed
     tag_specs: list[tuple[str, list[tuple[bytes, bytes]]]] = [
-        ("name", [
-            (b"<name>", b"</name>"),
-            (b"<kml:name>", b"</kml:name>"),
-        ]),
-        ("description", [
-            (b"<description>", b"</description>"),
-            (b"<kml:description>", b"</kml:description>"),
-        ]),
+        (
+            "name",
+            [
+                (b"<name>", b"</name>"),
+                (b"<kml:name>", b"</kml:name>"),
+            ],
+        ),
+        (
+            "description",
+            [
+                (b"<description>", b"</description>"),
+                (b"<kml:description>", b"</kml:description>"),
+            ],
+        ),
     ]
 
     results: dict[str, list[str | None]] = {}
@@ -1754,6 +1800,7 @@ def _extract_kml_attributes(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def read_kml_gpu(d_bytes: cp.ndarray) -> KmlGpuResult:
     """Parse KML bytes on GPU and return device-resident geometry.
@@ -1816,19 +1863,22 @@ def read_kml_gpu(d_bytes: cp.ndarray) -> KmlGpuResult:
 
     if n_placemarks == 0:
         return KmlGpuResult(
-            geometry=_build_empty_owned(), n_placemarks=0,
+            geometry=_build_empty_owned(),
+            n_placemarks=0,
         )
 
     # ------------------------------------------------------------------
     # Stage 2: Coordinate extraction
     # ------------------------------------------------------------------
     d_x, d_y, dim, d_placemark_coord_counts = _extract_kml_coordinates(
-        d_bytes, structural,
+        d_bytes,
+        structural,
     )
 
     if d_x.shape[0] == 0:
         return KmlGpuResult(
-            geometry=_build_empty_owned(), n_placemarks=0,
+            geometry=_build_empty_owned(),
+            n_placemarks=0,
         )
 
     # ------------------------------------------------------------------
@@ -1850,7 +1900,8 @@ def read_kml_gpu(d_bytes: cp.ndarray) -> KmlGpuResult:
 
     if d_valid_tags.size == 0:
         return KmlGpuResult(
-            geometry=_build_empty_owned(), n_placemarks=0,
+            geometry=_build_empty_owned(),
+            n_placemarks=0,
         )
 
     d_unique_tags = cp.unique(d_valid_tags)
@@ -1867,14 +1918,25 @@ def read_kml_gpu(d_bytes: cp.ndarray) -> KmlGpuResult:
             msg = f"Unsupported KML geometry tag: {h_unique_tags[0]}"
             raise ValueError(msg)
         geometry = _assemble_kml_homogeneous(
-            family, n_placemarks, d_x, d_y,
-            d_placemark_coord_counts, structural, dim, d_bytes,
+            family,
+            n_placemarks,
+            d_x,
+            d_y,
+            d_placemark_coord_counts,
+            structural,
+            dim,
+            d_bytes,
         )
     else:
         # Mixed file
         geometry = _assemble_kml_mixed(
-            n_placemarks, d_x, d_y,
-            d_placemark_coord_counts, structural, dim, d_bytes,
+            n_placemarks,
+            d_x,
+            d_y,
+            d_placemark_coord_counts,
+            structural,
+            dim,
+            d_bytes,
         )
 
     return KmlGpuResult(

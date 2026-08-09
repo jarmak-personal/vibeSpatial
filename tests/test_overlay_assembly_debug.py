@@ -132,7 +132,9 @@ def test_buffered_line_union_gpu_partition_plan_matches_host() -> None:
     expected = shapely.union(buffered[14], buffered[15])
 
     assert actual.is_valid
-    assert shapely.area(shapely.symmetric_difference(actual, expected)) == pytest.approx(0.0, abs=1e-6)
+    assert shapely.area(shapely.symmetric_difference(actual, expected)) == pytest.approx(
+        0.0, abs=1e-6
+    )
 
 
 @pytest.mark.gpu
@@ -171,12 +173,16 @@ def test_buffered_line_union_gpu_repairs_invalid_batched_rows() -> None:
 
 @pytest.mark.gpu
 def test_overlay_execution_plan_materializes_multiple_ops_from_one_topology() -> None:
-    left = from_shapely_geometries([
-        shapely.box(0.0, 0.0, 4.0, 4.0),
-    ])
-    right = from_shapely_geometries([
-        shapely.box(2.0, 1.0, 5.0, 3.0),
-    ])
+    left = from_shapely_geometries(
+        [
+            shapely.box(0.0, 0.0, 4.0, 4.0),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            shapely.box(2.0, 1.0, 5.0, 3.0),
+        ]
+    )
 
     plan = _build_overlay_execution_plan(left, right)
     intersection, intersection_mode = _materialize_overlay_execution_plan(
@@ -222,17 +228,70 @@ def test_overlay_execution_plan_materializes_multiple_ops_from_one_topology() ->
 
 
 @pytest.mark.gpu
+def test_row_isolated_union_preserves_isolated_input_interior_ring() -> None:
+    left_geom = shapely.from_wkt(
+        "MULTIPOLYGON (((760 400, 760 390, 770 390, 770 400, "
+        "770 402.34933765836877, 769.2591269559479 402.4192905377805, "
+        "760 403.1665826929884, 760 400)), ((760 420, "
+        "760 415.4180185219829, 760.6889332337587 420, "
+        "761.2955140267919 424.034268957292, 769.0632999422907 "
+        "427.9901186102625, 764.572987725914 430, 760 432.0468872726247, "
+        "760 430.6359251988752, 760 430, 760 428.3860518879259, "
+        "760 420)), ((767.8200952458151 580, 770 576.2829775332077, "
+        "770 580, 767.8200952458151 580)))"
+    )
+    right_geom = shapely.from_wkt(
+        "POLYGON ((760 590, 760 587.1970902119367, "
+        "762.3450433556148 589.3356789298515, 767.8200952458151 580, "
+        "770 580, 770 590, 770 600, 770 610, 760 610, 760 600, "
+        "760 593.1254694820173, 760 592.5510137807898, "
+        "760 591.7934595572564, 760 590), "
+        "(760.5097004377169 592.4651784398636, "
+        "760.3128597825861 592.205768058526, "
+        "761.3019467765761 591.1142949046449, "
+        "760.5097004377169 592.4651784398636))"
+    )
+    left = from_shapely_geometries([left_geom])
+    right = from_shapely_geometries([right_geom])
+
+    result = _dispatch_overlay_gpu(
+        "union",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+    )
+
+    actual = result.to_shapely()[0]
+    expected = shapely.union(left_geom, right_geom)
+
+    assert actual.is_valid
+    assert shapely.area(shapely.symmetric_difference(actual, expected)) == pytest.approx(
+        0.0,
+        abs=1e-6,
+    )
+    polygon_with_hole = [
+        geom for geom in getattr(actual, "geoms", [actual]) if getattr(geom, "interiors", ())
+    ]
+    assert len(polygon_with_hole) == 1
+
+
+@pytest.mark.gpu
 def test_row_isolated_difference_preserves_sparse_multipolygon_rows() -> None:
-    left = from_shapely_geometries([
-        shapely.box(0.0, 0.0, 10.0, 10.0),
-        shapely.box(20.0, 20.0, 30.0, 30.0),
-        shapely.box(40.0, 40.0, 50.0, 50.0),
-    ])
-    right = from_shapely_geometries([
-        shapely.box(0.0, 0.0, 10.0, 10.0),
-        shapely.box(20.0, 20.0, 30.0, 30.0),
-        shapely.box(44.0, 39.0, 46.0, 51.0),
-    ])
+    left = from_shapely_geometries(
+        [
+            shapely.box(0.0, 0.0, 10.0, 10.0),
+            shapely.box(20.0, 20.0, 30.0, 30.0),
+            shapely.box(40.0, 40.0, 50.0, 50.0),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            shapely.box(0.0, 0.0, 10.0, 10.0),
+            shapely.box(20.0, 20.0, 30.0, 30.0),
+            shapely.box(44.0, 39.0, 46.0, 51.0),
+        ]
+    )
 
     result = _dispatch_overlay_gpu(
         "difference",
@@ -258,10 +317,12 @@ def test_row_isolated_difference_preserves_sparse_multipolygon_rows() -> None:
 
 @pytest.mark.gpu
 def test_multipolygon_polygon_intersection_packs_disjoint_fragments_on_gpu() -> None:
-    left_geom = shapely.MultiPolygon([
-        shapely.box(0.0, 0.0, 2.0, 2.0),
-        shapely.box(4.0, 0.0, 6.0, 2.0),
-    ])
+    left_geom = shapely.MultiPolygon(
+        [
+            shapely.box(0.0, 0.0, 2.0, 2.0),
+            shapely.box(4.0, 0.0, 6.0, 2.0),
+        ]
+    )
     right_geom = shapely.box(1.0, -1.0, 5.0, 3.0)
     left = from_shapely_geometries([left_geom])
     right = from_shapely_geometries([right_geom])
@@ -272,7 +333,6 @@ def test_multipolygon_polygon_intersection_packs_disjoint_fragments_on_gpu() -> 
         left,
         right,
         dispatch_mode=ExecutionMode.GPU,
-        _prefer_exact_polygon_intersection=True,
     )
 
     got = result.to_shapely()[0]
@@ -281,22 +341,26 @@ def test_multipolygon_polygon_intersection_packs_disjoint_fragments_on_gpu() -> 
     assert got is not None
     assert got.geom_type == "MultiPolygon"
     assert got.normalize().equals_exact(expected.normalize(), tolerance=1e-9)
+    events = get_dispatch_events(clear=True)
     assert any(
-        event.implementation == "direct_multipart_intersection_pack_gpu"
-        for event in get_dispatch_events(clear=True)
-    )
+        event.implementation == "polygon_intersection_partitioned_capacity_gpu" for event in events
+    ), [(event.operation, event.implementation) for event in events]
 
 
 @pytest.mark.gpu
 def test_row_isolated_difference_preserves_all_empty_rows() -> None:
-    left = from_shapely_geometries([
-        shapely.box(0.0, 0.0, 2.0, 2.0),
-        shapely.box(4.0, 0.0, 6.0, 2.0),
-    ])
-    right = from_shapely_geometries([
-        shapely.box(0.0, 0.0, 2.0, 2.0),
-        shapely.box(4.0, 0.0, 6.0, 2.0),
-    ])
+    left = from_shapely_geometries(
+        [
+            shapely.box(0.0, 0.0, 2.0, 2.0),
+            shapely.box(4.0, 0.0, 6.0, 2.0),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            shapely.box(0.0, 0.0, 2.0, 2.0),
+            shapely.box(4.0, 0.0, 6.0, 2.0),
+        ]
+    )
 
     result = _dispatch_overlay_gpu(
         "difference",
@@ -312,12 +376,16 @@ def test_row_isolated_difference_preserves_all_empty_rows() -> None:
 
 @pytest.mark.gpu
 def test_gpu_face_assembly_uses_runtime_launch_config(monkeypatch) -> None:
-    left = from_shapely_geometries([
-        shapely.box(0.0, 0.0, 4.0, 4.0),
-    ])
-    right = from_shapely_geometries([
-        shapely.box(2.0, 1.0, 5.0, 3.0),
-    ])
+    left = from_shapely_geometries(
+        [
+            shapely.box(0.0, 0.0, 4.0, 4.0),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            shapely.box(2.0, 1.0, 5.0, 3.0),
+        ]
+    )
 
     split_events = build_gpu_split_events(left, right)
     atomic_edges = build_gpu_atomic_edges(split_events)
@@ -359,7 +427,57 @@ def test_disconnected_overlap_intersection_gpu_matches_host() -> None:
     expected = shapely.intersection(left_geom, right_geom)
 
     assert actual.is_valid
-    assert shapely.area(shapely.symmetric_difference(actual, expected)) == pytest.approx(0.0, abs=1e-6)
+    assert shapely.area(shapely.symmetric_difference(actual, expected)) == pytest.approx(
+        0.0, abs=1e-6
+    )
+
+
+@pytest.mark.gpu
+def test_exact_split_parameters_preserve_projected_coordinate_sliver() -> None:
+    origin_x = 360_000.0
+    origin_y = 3_076_000.0
+    width = float(np.spacing(origin_x))
+    left_geom = shapely.box(origin_x - 10.0, origin_y, origin_x, origin_y + 10.0)
+    right_geom = shapely.Polygon(
+        [
+            (origin_x - width, origin_y + 1.0),
+            (origin_x + 10.0, origin_y + 5.0),
+            (origin_x - width, origin_y + 9.0),
+        ]
+    )
+    left = from_shapely_geometries([left_geom])
+    right = from_shapely_geometries([right_geom])
+
+    split_events = build_gpu_split_events(
+        left,
+        right,
+        require_same_row=True,
+    )
+    source_ids = split_events.source_segment_ids
+    event_t = split_events.t
+    has_subnanoparameter_split = any(
+        np.any(
+            (event_t[source_ids == source_id] > 0.0) & (event_t[source_ids == source_id] < 1.0e-9)
+        )
+        for source_id in np.unique(source_ids)
+    )
+
+    result = _dispatch_overlay_gpu(
+        "intersection",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+    )
+    actual = result.to_shapely()[0]
+    expected = shapely.intersection(left_geom, right_geom)
+
+    assert has_subnanoparameter_split
+    assert expected.geom_type == "Polygon"
+    assert expected.area > 0.0
+    assert actual is not None
+    assert actual.geom_type == "Polygon"
+    assert shapely.equals(actual, expected)
 
 
 @pytest.mark.gpu

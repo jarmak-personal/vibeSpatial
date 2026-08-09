@@ -8,7 +8,9 @@ from vibespatial.cuda.device_functions.strip_closure import STRIP_CLOSURE_DEVICE
 # NVRTC kernel sources (Tier 1)
 # ---------------------------------------------------------------------------
 
-_RING_KERNEL_SOURCE = STRIP_CLOSURE_DEVICE + r"""
+_RING_KERNEL_SOURCE = (
+    STRIP_CLOSURE_DEVICE
+    + r"""
 typedef {compute_type} compute_t;
 
 extern "C" __global__ void normalize_ring_find_min(
@@ -60,6 +62,7 @@ extern "C" __global__ void normalize_ring_rotate(
     double* y_out,
     const int* ring_offsets,
     const int* min_index,
+    const unsigned char* is_exterior,
     int total_rings
 ) {{
     const int ring = blockIdx.x * blockDim.x + threadIdx.x;
@@ -77,9 +80,38 @@ extern "C" __global__ void normalize_ring_rotate(
     const int best = min_index[ring];
     const int offset_in_ring = best - coord_start;
 
-    // Cyclic copy: rotate so that best vertex is first
+    // Choose the lexicographically smaller cyclic direction. This makes the
+    // normalized ring independent of input winding and matches GEOS ring
+    // normalization rather than merely rotating the existing direction.
+    bool reverse = false;
+    for (int i = 1; i < n; i++) {{
+        int forward_local = (offset_in_ring + i) % n;
+        int reverse_local = (offset_in_ring - i) % n;
+        if (reverse_local < 0) reverse_local += n;
+        const int forward_idx = coord_start + forward_local;
+        const int reverse_idx = coord_start + reverse_local;
+        const double forward_x = x_in[forward_idx];
+        const double reverse_x = x_in[reverse_idx];
+        const double forward_y = y_in[forward_idx];
+        const double reverse_y = y_in[reverse_idx];
+        if (reverse_x < forward_x ||
+            (reverse_x == forward_x && reverse_y < forward_y)) {{
+            reverse = true;
+            break;
+        }}
+        if (forward_x < reverse_x ||
+            (forward_x == reverse_x && forward_y < reverse_y)) {{
+            break;
+        }}
+    }}
+    if (is_exterior[ring] == 0u) reverse = !reverse;
+
+    // Cyclic copy: rotate so that best vertex is first and use the canonical
+    // direction selected above.
     for (int i = 0; i < n; i++) {{
-        const int src = coord_start + ((offset_in_ring + i) % n);
+        int local = reverse ? (offset_in_ring - i) % n : (offset_in_ring + i) % n;
+        if (local < 0) local += n;
+        const int src = coord_start + local;
         const int dst = coord_start + i;
         x_out[dst] = x_in[src];
         y_out[dst] = y_in[src];
@@ -92,6 +124,7 @@ extern "C" __global__ void normalize_ring_rotate(
     }}
 }}
 """
+)
 _LINE_KERNEL_SOURCE = r"""
 typedef {compute_type} compute_t;
 

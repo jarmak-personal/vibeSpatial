@@ -22,6 +22,11 @@ _LINESTRING_TYPE_ID = 1
 _POLYGON_TYPE_ID = 3
 
 
+def host_geometry_coordinate_count(geometries: np.ndarray) -> int:
+    """Count host geometry coordinates at the explicit Shapely boundary."""
+    return int(np.sum(shapely.get_num_coordinates(geometries), dtype=np.int64))
+
+
 def empty_index_array() -> np.ndarray:
     return np.empty(0, dtype=np.int32)
 
@@ -77,7 +82,9 @@ def point_buffer_owned_cpu(
 
     if np.any(empty_rows_mask):
         empty_idx = np.flatnonzero(empty_rows_mask)
-        result[empty_idx] = shapely.buffer(geometries[empty_idx], distances[empty_idx], quad_segs=quad_segs)
+        result[empty_idx] = shapely.buffer(
+            geometries[empty_idx], distances[empty_idx], quad_segs=quad_segs
+        )
 
     point_rows = np.flatnonzero(point_mask)
     if point_rows.size > 0:
@@ -159,7 +166,9 @@ def _batch_mitre_offset_uniform(
         safe_denoms = np.where(collinear, 1.0, denoms)
 
         deltas = next_shifts - prev_shifts
-        t = (deltas[:, :, 0] * next_dirs[:, :, 1] - deltas[:, :, 1] * next_dirs[:, :, 0]) / safe_denoms
+        t = (
+            deltas[:, :, 0] * next_dirs[:, :, 1] - deltas[:, :, 1] * next_dirs[:, :, 0]
+        ) / safe_denoms
         intersections = prev_shifts + t[:, :, None] * prev_dirs
 
         miter_dists = np.linalg.norm(intersections - next_shifts, axis=2)
@@ -234,7 +243,9 @@ def _build_linestring_owned_from_chunks(
     )
 
 
-def _offset_from_coords_mitre(coords: np.ndarray, distance: float, *, mitre_limit: float) -> np.ndarray | None:
+def _offset_from_coords_mitre(
+    coords: np.ndarray, distance: float, *, mitre_limit: float
+) -> np.ndarray | None:
     if coords.shape[0] < 2:
         return np.empty((0, 2), dtype=np.float64)
     segments = coords[1:] - coords[:-1]
@@ -354,7 +365,9 @@ def offset_curve_owned_cpu(
         for row_index in empty_idx:
             coord_chunks[int(row_index)] = _empty_coords()
 
-    linestring_mask = non_null_mask & ~empty_mask & (type_ids == _LINESTRING_TYPE_ID) & (join_style != "round")
+    linestring_mask = (
+        non_null_mask & ~empty_mask & (type_ids == _LINESTRING_TYPE_ID) & (join_style != "round")
+    )
     fallback_mask = non_null_mask & ~empty_mask & ~linestring_mask
 
     linestring_rows = np.flatnonzero(linestring_mask)
@@ -370,7 +383,10 @@ def offset_curve_owned_cpu(
 
         if unique_counts.size == 1 and unique_counts[0] >= 2:
             batch_lines, batch_ok, batch_coords = _batch_mitre_offset_uniform(
-                all_coords, line_dists, int(unique_counts[0]), mitre_limit=mitre_limit,
+                all_coords,
+                line_dists,
+                int(unique_counts[0]),
+                mitre_limit=mitre_limit,
             )
             ok_local = np.flatnonzero(batch_ok)
             fail_local = np.flatnonzero(~batch_ok)
@@ -390,7 +406,7 @@ def offset_curve_owned_cpu(
             for local_idx in range(linestring_rows.size):
                 row_index = linestring_rows[local_idx]
                 n_coords = coord_counts[local_idx]
-                coords = all_coords[offset_start:offset_start + n_coords]
+                coords = all_coords[offset_start : offset_start + n_coords]
                 offset_start += n_coords
                 dist = float(line_dists[local_idx])
                 offset_coords = _offset_from_coords_mitre(coords, dist, mitre_limit=mitre_limit)
@@ -587,14 +603,18 @@ def supports_offset_curve_surface(geometries: np.ndarray, *, join_style) -> bool
     return bool(np.all(type_ids == _LINESTRING_TYPE_ID))
 
 
-def benchmark_point_buffer_baseline(geometries: np.ndarray, distance: float, *, quad_segs: int) -> float:
+def benchmark_point_buffer_baseline(
+    geometries: np.ndarray, distance: float, *, quad_segs: int
+) -> float:
     shapely.buffer(geometries, distance, quad_segs=quad_segs)
     started = perf_counter()
     shapely.buffer(geometries, distance, quad_segs=quad_segs)
     return perf_counter() - started
 
 
-def benchmark_offset_curve_baseline(geometries: np.ndarray, distance: float, *, join_style: str) -> float:
+def benchmark_offset_curve_baseline(
+    geometries: np.ndarray, distance: float, *, join_style: str
+) -> float:
     shapely.offset_curve(geometries, distance, join_style=join_style)
     started = perf_counter()
     shapely.offset_curve(geometries, distance, join_style=join_style)

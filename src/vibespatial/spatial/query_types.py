@@ -23,11 +23,19 @@ SUPPORTED_GEOM_TYPES = {
 }
 
 # Predicates that can be evaluated via GPU DE-9IM bitmask for polygon pairs.
-_POLYGON_DE9IM_PREDICATES = frozenset({
-    "intersects", "contains", "within", "touches",
-    "covers", "covered_by", "overlaps", "disjoint",
-    "contains_properly",
-})
+_POLYGON_DE9IM_PREDICATES = frozenset(
+    {
+        "intersects",
+        "contains",
+        "within",
+        "touches",
+        "covers",
+        "covered_by",
+        "overlaps",
+        "disjoint",
+        "contains_properly",
+    }
+)
 
 
 def _device_array_detail(values: Any, *, side: str) -> str:
@@ -77,6 +85,7 @@ class RegularGridPointIndex:
 @dataclass(frozen=True)
 class _DeviceCandidates:
     """Device-resident candidate pair indices from GPU bbox overlap."""
+
     d_left: Any  # CuPy int32 device array
     d_right: Any  # CuPy int32 device array
     total_pairs: int
@@ -121,35 +130,57 @@ class DeviceSpatialJoinResult:
     for pandas attribute assembly or Shapely fallback paths).
     """
 
-    d_left_idx: Any   # CuPy int32 device array
+    d_left_idx: Any  # CuPy int32 device array
     d_right_idx: Any  # CuPy int32 device array
 
-    def to_host(self) -> tuple[np.ndarray, np.ndarray]:
-        """Copy index arrays to host as numpy int32 arrays."""
+    def left_to_host(
+        self,
+        *,
+        reason: str = "device spatial join left-index crossed to host for public index export",
+    ) -> np.ndarray:
+        """Copy left index array to host as a numpy int32 array."""
         runtime = get_cuda_runtime()
         _record_device_join_materialization(
             self.d_left_idx,
             side="left",
-            surface="vibespatial.spatial.query_types.DeviceSpatialJoinResult.to_host",
+            surface="vibespatial.spatial.query_types.DeviceSpatialJoinResult.left_to_host",
             operation="device_spatial_join_indices_to_host",
-            reason="device spatial join pairs crossed to host for public index export",
+            reason=reason,
         )
-        left = runtime.copy_device_to_host(
+        return runtime.copy_device_to_host(
             self.d_left_idx,
             reason="device spatial join left-index host export",
         ).astype(np.int32, copy=False)
+
+    def right_to_host(
+        self,
+        *,
+        reason: str = "device spatial join right-index crossed to host for public index export",
+    ) -> np.ndarray:
+        """Copy right index array to host as a numpy int32 array."""
+        runtime = get_cuda_runtime()
         _record_device_join_materialization(
             self.d_right_idx,
             side="right",
-            surface="vibespatial.spatial.query_types.DeviceSpatialJoinResult.to_host",
+            surface="vibespatial.spatial.query_types.DeviceSpatialJoinResult.right_to_host",
             operation="device_spatial_join_indices_to_host",
-            reason="device spatial join pairs crossed to host for public index export",
+            reason=reason,
         )
-        right = runtime.copy_device_to_host(
+        return runtime.copy_device_to_host(
             self.d_right_idx,
             reason="device spatial join right-index host export",
         ).astype(np.int32, copy=False)
-        return left, right
+
+    def to_host(self) -> tuple[np.ndarray, np.ndarray]:
+        """Copy index arrays to host as numpy int32 arrays."""
+        return (
+            self.left_to_host(
+                reason="device spatial join pairs crossed to host for public index export",
+            ),
+            self.right_to_host(
+                reason="device spatial join pairs crossed to host for public index export",
+            ),
+        )
 
     @property
     def size(self) -> int:
@@ -166,7 +197,7 @@ class SpatialJoinIndices:
     enforces that dtype invariant at construction time.
     """
 
-    left: np.ndarray   # dtype np.intp
+    left: np.ndarray  # dtype np.intp
     right: np.ndarray  # dtype np.intp
 
     def __post_init__(self):

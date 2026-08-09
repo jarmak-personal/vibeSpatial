@@ -20,7 +20,6 @@ from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
     compile_kernel_group,
-    count_scatter_total,
     get_cuda_runtime,
 )
 from vibespatial.cuda.cccl_primitives import exclusive_sum
@@ -32,12 +31,18 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import (
+    PhysicalWorkEstimate,
+    estimate_physical_work_from_owned,
+)
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import Residency, TransferTrigger, combined_residency
 
-request_nvrtc_warmup([
-    ("linestring-buffer", _LINESTRING_BUFFER_KERNEL_SOURCE, _LINESTRING_BUFFER_KERNEL_NAMES),
-])
+request_nvrtc_warmup(
+    [
+        ("linestring-buffer", _LINESTRING_BUFFER_KERNEL_SOURCE, _LINESTRING_BUFFER_KERNEL_NAMES),
+    ]
+)
 
 from vibespatial.cuda.cccl_precompile import request_warmup  # noqa: E402
 
@@ -45,7 +50,9 @@ request_warmup(["exclusive_scan_i32"])
 
 
 def _linestring_buffer_kernels():
-    return compile_kernel_group("linestring-buffer", _LINESTRING_BUFFER_KERNEL_SOURCE, _LINESTRING_BUFFER_KERNEL_NAMES)
+    return compile_kernel_group(
+        "linestring-buffer", _LINESTRING_BUFFER_KERNEL_SOURCE, _LINESTRING_BUFFER_KERNEL_NAMES
+    )
 
 
 def _device_scalar_bool(value, *, reason: str) -> bool:
@@ -56,6 +63,25 @@ def _device_scalar_bool(value, *, reason: str) -> bool:
 
 _CAP_STYLE_MAP = {"round": 0, "flat": 1, "square": 2}
 _JOIN_STYLE_MAP = {"round": 0, "mitre": 1, "bevel": 2}
+
+
+def _has_trusted_two_point_linestring_layout(lines: OwnedGeometryArray) -> bool:
+    """Prove the two-point device layout from persistent owned metadata."""
+    state = lines.device_state
+    if (
+        state is None
+        or state.trusted_all_valid is not True
+        or state.trusted_all_non_empty is not True
+        or state.trusted_homogeneous_family is not GeometryFamily.LINESTRING
+    ):
+        return False
+    device_buffer = state.families.get(GeometryFamily.LINESTRING)
+    fixed_size = None if device_buffer is None else device_buffer.fixed_size
+    return (
+        fixed_size is not None
+        and fixed_size.coord_count_per_row == 2
+        and int(device_buffer.geometry_offsets.size) == int(lines.row_count) + 1
+    )
 
 
 def supports_two_point_linestring_buffer_fast_path(
@@ -93,35 +119,10 @@ def supports_two_point_linestring_buffer_fast_path(
             return False
         offsets = np.asarray(line_buffer.geometry_offsets, dtype=np.int32)
         return bool(
-            offsets.shape == (lines.row_count + 1,)
-            and np.all((offsets[1:] - offsets[:-1]) == 2)
+            offsets.shape == (lines.row_count + 1,) and np.all((offsets[1:] - offsets[:-1]) == 2)
         )
 
-    state = lines.device_state
-    if cp is None or state is None or GeometryFamily.LINESTRING not in state.families:
-        return False
-
-    try:
-        if not _device_scalar_bool(
-            cp.all(cp.asarray(state.validity)),
-            reason="linestring buffer fast-path validity scalar fence",
-        ):
-            return False
-        device_line_buffer = state.families[GeometryFamily.LINESTRING]
-        if _device_scalar_bool(
-            cp.any(device_line_buffer.empty_mask),
-            reason="linestring buffer fast-path empty-mask scalar fence",
-        ):
-            return False
-        offsets = cp.asarray(device_line_buffer.geometry_offsets)
-        if int(offsets.size) != lines.row_count + 1:
-            return False
-        return _device_scalar_bool(
-            cp.all((offsets[1:] - offsets[:-1]) == 2),
-            reason="linestring buffer fast-path two-point scalar fence",
-        )
-    except Exception:
-        return False
+    return _has_trusted_two_point_linestring_layout(lines)
 
 
 def _linestring_device_input_valid(lines: OwnedGeometryArray) -> bool:
@@ -136,6 +137,11 @@ def _linestring_device_input_valid(lines: OwnedGeometryArray) -> bool:
             and np.all(lines.tags == FAMILY_TAGS[GeometryFamily.LINESTRING])
         )
     state = lines._ensure_device_state()
+    if (
+        state.trusted_all_valid is True
+        and state.trusted_homogeneous_family is GeometryFamily.LINESTRING
+    ):
+        return True
     return _device_scalar_bool(
         cp.all(
             cp.asarray(state.validity)
@@ -156,7 +162,9 @@ def linestring_buffer_owned_array(
     dispatch_mode: ExecutionMode = ExecutionMode.AUTO,
 ) -> OwnedGeometryArray:
     if GeometryFamily.LINESTRING not in lines.families or len(lines.families) != 1:
-        raise ValueError("linestring_buffer_owned_array requires a linestring-only OwnedGeometryArray")
+        raise ValueError(
+            "linestring_buffer_owned_array requires a linestring-only OwnedGeometryArray"
+        )
     if not _linestring_device_input_valid(lines):
         raise ValueError("linestring_buffer_owned_array requires non-null rows only")
 
@@ -164,9 +172,14 @@ def linestring_buffer_owned_array(
     if line_buffer.host_materialized:
         has_empty = bool(np.any(line_buffer.empty_mask))
     elif cp is not None and lines.device_state is not None:
-        has_empty = _device_scalar_bool(
-            cp.any(lines._ensure_device_state().families[GeometryFamily.LINESTRING].empty_mask),
-            reason="linestring buffer input empty-mask scalar fence",
+        state = lines._ensure_device_state()
+        has_empty = (
+            False
+            if state.trusted_all_non_empty is True
+            else _device_scalar_bool(
+                cp.any(state.families[GeometryFamily.LINESTRING].empty_mask),
+                reason="linestring buffer input empty-mask scalar fence",
+            )
         )
     else:
         has_empty = bool(np.any(line_buffer.empty_mask))
@@ -181,12 +194,30 @@ def linestring_buffer_owned_array(
     if radii.shape != (lines.row_count,):
         raise ValueError("distance must be a scalar or length-matched vector")
 
+    base_work = estimate_physical_work_from_owned(lines)
+    output_coordinate_capacity = int(base_work.coordinate_count) * (4 * int(quad_segs) + 2)
+    work_estimate = PhysicalWorkEstimate(
+        row_count=lines.row_count,
+        coordinate_count=base_work.coordinate_count,
+        segment_count=base_work.segment_count,
+        ring_count=base_work.ring_count,
+        output_row_count=lines.row_count,
+        output_byte_count=(output_coordinate_capacity * 16 + (int(lines.row_count) + 1) * 8),
+        temporary_byte_count=int(lines.row_count) * 24,
+        primary_unit_count=max(
+            int(lines.row_count),
+            int(base_work.coordinate_count),
+            output_coordinate_capacity,
+        ),
+        primary_unit_name="linestring-buffer-output-coordinate",
+    )
     selected_mode = plan_dispatch_selection(
         kernel_name="linestring_buffer",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=lines.row_count,
         requested_mode=dispatch_mode,
         current_residency=combined_residency(lines),
+        work_estimate=work_estimate,
     ).selected
 
     cap_int = _CAP_STYLE_MAP.get(cap_style, 0)
@@ -194,13 +225,21 @@ def linestring_buffer_owned_array(
 
     if selected_mode is not ExecutionMode.GPU:
         return build_linestring_buffers_cpu(
-            lines, radii, quad_segs=quad_segs,
-            cap_style=cap_style, join_style=join_style, mitre_limit=mitre_limit,
+            lines,
+            radii,
+            quad_segs=quad_segs,
+            cap_style=cap_style,
+            join_style=join_style,
+            mitre_limit=mitre_limit,
         )
 
     return _build_linestring_buffers_gpu(
-        lines, radii, quad_segs=quad_segs,
-        cap_style=cap_int, join_style=join_int, mitre_limit=mitre_limit,
+        lines,
+        radii,
+        quad_segs=quad_segs,
+        cap_style=cap_int,
+        join_style=join_int,
+        mitre_limit=mitre_limit,
     )
 
 
@@ -256,6 +295,8 @@ def _build_linestring_buffers_gpu(
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
         reason="linestring_buffer_owned_array selected GPU execution",
     )
+    if lines.is_indexed_view:
+        lines = lines.physicalize_device_rows(allow_capacity_allocation=True)
     runtime = get_cuda_runtime()
     state = lines._ensure_device_state()
     line_buf = state.families[GeometryFamily.LINESTRING]
@@ -302,36 +343,25 @@ def _build_linestring_buffers_gpu(
                 KERNEL_PARAM_I32,
             ),
         )
-        count_grid, count_block = runtime.launch_config(kernels["linestring_buffer_count"], lines.row_count)
-        runtime.launch(kernels["linestring_buffer_count"],
-                       grid=count_grid, block=count_block, params=count_params)
+        count_grid, count_block = runtime.launch_config(
+            kernels["linestring_buffer_count"], lines.row_count
+        )
+        runtime.launch(
+            kernels["linestring_buffer_count"],
+            grid=count_grid,
+            block=count_block,
+            params=count_params,
+        )
 
         # Compute exclusive prefix sum for scatter offsets
         device_offsets = exclusive_sum(device_counts)
 
-        total_verts = count_scatter_total(
-            runtime,
-            device_counts,
-            device_offsets,
-            reason="linestring buffer vertex allocation fence",
-        )
-
-        if total_verts == 0:
-            device_x = runtime.allocate((0,), np.float64)
-            device_y = runtime.allocate((0,), np.float64)
-            d_geometry_offsets = cp.arange(lines.row_count + 1, dtype=cp.int32)
-            d_ring_offsets = cp.zeros(lines.row_count + 1, dtype=cp.int32)
-            success = True
-            return _build_device_backed_polygon_output_variable(
-                device_x, device_y,
-                row_count=lines.row_count,
-                geometry_offsets=d_geometry_offsets,
-                ring_offsets=d_ring_offsets,
-            )
-
-        # Allocate output coordinate arrays
-        device_x = runtime.allocate((total_verts,), np.float64)
-        device_y = runtime.allocate((total_verts,), np.float64)
+        # A round join contributes at most 2*q steps on each side of an
+        # interior source vertex. Caps and closure fit within the same
+        # per-coordinate bound for every supported cap/join style.
+        vertex_capacity = int(line_buf.x.size) * (4 * quad_segs + 2)
+        device_x = runtime.allocate((vertex_capacity,), np.float64)
+        device_y = runtime.allocate((vertex_capacity,), np.float64)
 
         # Pass 2: scatter vertices
         scatter_params = (
@@ -368,9 +398,15 @@ def _build_linestring_buffers_gpu(
                 KERNEL_PARAM_I32,
             ),
         )
-        scatter_grid, scatter_block = runtime.launch_config(kernels["linestring_buffer_scatter"], lines.row_count)
-        runtime.launch(kernels["linestring_buffer_scatter"],
-                       grid=scatter_grid, block=scatter_block, params=scatter_params)
+        scatter_grid, scatter_block = runtime.launch_config(
+            kernels["linestring_buffer_scatter"], lines.row_count
+        )
+        runtime.launch(
+            kernels["linestring_buffer_scatter"],
+            grid=scatter_grid,
+            block=scatter_block,
+            params=scatter_params,
+        )
 
         d_geometry_offsets = cp.arange(lines.row_count + 1, dtype=cp.int32)
         d_ring_offsets = cp.empty(lines.row_count + 1, dtype=cp.int32)
@@ -382,7 +418,8 @@ def _build_linestring_buffers_gpu(
 
         success = True
         return _build_device_backed_polygon_output_variable(
-            device_x, device_y,
+            device_x,
+            device_y,
             row_count=lines.row_count,
             geometry_offsets=d_geometry_offsets,
             ring_offsets=d_ring_offsets,

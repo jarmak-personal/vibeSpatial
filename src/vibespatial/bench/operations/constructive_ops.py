@@ -1,4 +1,5 @@
 """Constructive operation benchmarks: clip-rect, gpu-constructive, make-valid, gpu-dissolve, stroke-kernels."""
+
 from __future__ import annotations
 
 import math
@@ -100,7 +101,11 @@ def bench_clip_rect(
 
     # Derive clip rectangle from actual data bounds (central 60%) to
     # guarantee overlap regardless of scale or fixture distribution.
-    rect = tuple(kwargs["rect"]) if "rect" in kwargs else _clip_rect_from_bounds(gdf.total_bounds, fraction=0.6)
+    rect = (
+        tuple(kwargs["rect"])
+        if "rect" in kwargs
+        else _clip_rect_from_bounds(gdf.total_bounds, fraction=0.6)
+    )
 
     try:
         gdf.geometry.clip_by_rect(*rect)
@@ -442,10 +447,7 @@ def bench_gpu_dissolve(
         grouped = frame.groupby("group", sort=True, observed=False, dropna=True)[
             frame.geometry.name
         ]
-        group_positions = [
-            positions
-            for _, positions in grouped.indices.items()
-        ]
+        group_positions = [positions for _, positions in grouped.indices.items()]
         shapely_times: list[float] = []
         baseline = None
         baseline_func = {

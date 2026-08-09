@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import shapely
 from shapely.geometry import LineString
 
-from vibespatial.constructive.linestring import linestring_buffer_owned_array
+from vibespatial.constructive.linestring import (
+    linestring_buffer_owned_array,
+    supports_two_point_linestring_buffer_fast_path,
+)
 from vibespatial.geometry.buffers import GeometryFamily
-from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.geometry.owned import (
+    DeviceFixedGeometrySizeMetadata,
+    from_shapely_geometries,
+)
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.residency import Residency
 
@@ -150,9 +159,7 @@ def test_linestring_buffer_gpu_keeps_metadata_lazy(strict_device_guard) -> None:
     with execution_trace("linestring-buffer-metadata-canary") as trace:
         gpu = linestring_buffer_owned_array(lines, 1.0, quad_segs=4, dispatch_mode=ExecutionMode.GPU)
 
-    assert [transfer.reason for transfer in trace.transfers] == [
-        "linestring buffer vertex allocation fence"
-    ]
+    assert trace.transfers == []
     assert gpu.residency is Residency.DEVICE
     assert gpu._validity is None
     assert gpu._tags is None
@@ -162,6 +169,56 @@ def test_linestring_buffer_gpu_keeps_metadata_lazy(strict_device_guard) -> None:
     poly_buf = gpu.device_state.families[GeometryFamily.POLYGON]
     assert isinstance(poly_buf.geometry_offsets, cp.ndarray)
     assert isinstance(poly_buf.ring_offsets, cp.ndarray)
+
+
+def test_linestring_buffer_uses_source_coordinate_capacity() -> None:
+    source = Path(__file__).resolve().parents[1].joinpath(
+        "src/vibespatial/constructive/linestring.py"
+    ).read_text()
+
+    assert "int(line_buf.x.size) * (4 * quad_segs + 2)" in source
+    assert "estimate_physical_work_from_owned(lines)" in source
+    assert 'primary_unit_name="linestring-buffer-output-coordinate"' in source
+    assert "output_coordinate_capacity * 16" in source
+    assert "linestring buffer vertex allocation fence" not in source
+
+
+def test_two_point_device_admission_consumes_trusted_layout_metadata() -> None:
+    device_buffer = SimpleNamespace(
+        fixed_size=DeviceFixedGeometrySizeMetadata(coord_count_per_row=2),
+        geometry_offsets=SimpleNamespace(size=4),
+    )
+    lines = SimpleNamespace(
+        row_count=3,
+        _validity=None,
+        families={
+            GeometryFamily.LINESTRING: SimpleNamespace(host_materialized=False),
+        },
+        device_state=SimpleNamespace(
+            trusted_all_valid=True,
+            trusted_all_non_empty=True,
+            trusted_homogeneous_family=GeometryFamily.LINESTRING,
+            families={GeometryFamily.LINESTRING: device_buffer},
+        ),
+    )
+
+    assert supports_two_point_linestring_buffer_fast_path(
+        lines,
+        quad_segs=8,
+        cap_style="round",
+        join_style="round",
+        single_sided=False,
+    )
+    device_buffer.fixed_size = DeviceFixedGeometrySizeMetadata(
+        coord_count_per_row=3
+    )
+    assert not supports_two_point_linestring_buffer_fast_path(
+        lines,
+        quad_segs=8,
+        cap_style="round",
+        join_style="round",
+        single_sided=False,
+    )
 
 
 @pytest.mark.gpu

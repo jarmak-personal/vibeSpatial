@@ -27,7 +27,10 @@ from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
 # ---------------------------------------------------------------------------
 
 _SHORTEST_LINE_KERNEL_SOURCE = (
-    POINT_ON_SEGMENT_DEVICE + POINT_IN_RING_BOUNDARY_DEVICE + SPATIAL_TOLERANCE_PREAMBLE + r"""
+    POINT_ON_SEGMENT_DEVICE
+    + POINT_IN_RING_BOUNDARY_DEVICE
+    + SPATIAL_TOLERANCE_PREAMBLE
+    + r"""
 #if !defined(INFINITY)
 #define INFINITY __longlong_as_double(0x7FF0000000000000LL)
 #endif
@@ -813,7 +816,8 @@ extern "C" __global__ __launch_bounds__(256, 4) void shortest_line_mpg_mpg(
   out_ax[i] = bax; out_ay[i] = bay;
   out_bx[i] = bbx; out_by[i] = bby;
 }
-""")
+"""
+)
 
 SHORTEST_LINE_KERNEL_NAMES = (
     "shortest_line_pt_pt",

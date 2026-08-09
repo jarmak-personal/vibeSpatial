@@ -17,31 +17,6 @@ def empty_shared_paths_result() -> GeometryCollection:
     return GeometryCollection([MultiLineString(), MultiLineString()])
 
 
-def init_shared_paths_result_array(row_count: int) -> np.ndarray:
-    """Create a result array prefilled with empty shared_paths outputs."""
-    results = np.empty(row_count, dtype=object)
-    for i in range(row_count):
-        results[i] = empty_shared_paths_result()
-    return results
-
-
-def merge_shared_paths_segments(
-    existing: GeometryCollection | None,
-    forward_segs: list[list[tuple[float, float]]],
-    backward_segs: list[list[tuple[float, float]]],
-) -> GeometryCollection:
-    """Merge new shared-path segments into an existing GeometryCollection."""
-    if existing is not None and len(existing.geoms) == 2:
-        if not existing.geoms[0].is_empty:
-            forward_segs = [list(g.coords) for g in existing.geoms[0].geoms] + forward_segs
-        if not existing.geoms[1].is_empty:
-            backward_segs = [list(g.coords) for g in existing.geoms[1].geoms] + backward_segs
-
-    forward = MultiLineString(forward_segs) if forward_segs else MultiLineString()
-    backward = MultiLineString(backward_segs) if backward_segs else MultiLineString()
-    return GeometryCollection([forward, backward])
-
-
 @register_kernel_variant(
     "shared_paths",
     "cpu",
