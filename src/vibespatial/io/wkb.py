@@ -15,6 +15,9 @@ from vibespatial.cuda._runtime import (
     KERNEL_PARAM_PTR,
     get_cuda_runtime,
     make_kernel_cache_key,
+    pylibcudf_column_from_arrow,
+    pylibcudf_column_from_device,
+    pylibcudf_to_arrow,
 )
 from vibespatial.cuda.cccl_precompile import request_warmup
 from vibespatial.cuda.cccl_primitives import exclusive_sum
@@ -519,7 +522,9 @@ def _encode_owned_wkb_column_device(owned: OwnedGeometryArray):
     runtime = get_cuda_runtime()
     runtime.synchronize()
 
-    offsets_column = plc.Column.from_cuda_array_interface(offsets)
+    from vibespatial.cuda._runtime import pylibcudf_column_from_device
+
+    offsets_column = pylibcudf_column_from_device(offsets)
     column = plc.Column(
         plc.types.DataType(plc.types.TypeId.STRING),
         row_count,
@@ -1260,8 +1265,10 @@ def _device_validity_gpumask(
 def _device_point_values_column(x_device, y_device, *, mask=None, null_count: int = 0):
     import pylibcudf as plc
 
-    x_col = plc.Column.from_cuda_array_interface(x_device)
-    y_col = plc.Column.from_cuda_array_interface(y_device)
+    from vibespatial.cuda._runtime import pylibcudf_column_from_device
+
+    x_col = pylibcudf_column_from_device(x_device)
+    y_col = pylibcudf_column_from_device(y_device)
     if mask is not None and null_count:
         x_col = x_col.with_mask(mask, null_count)
         y_col = y_col.with_mask(mask, null_count)
@@ -1272,7 +1279,9 @@ def _device_point_values_column(x_device, y_device, *, mask=None, null_count: in
 def _device_list_column(offsets_device, child_column, size: int):
     import pylibcudf as plc
 
-    offsets_col = plc.Column.from_cuda_array_interface(offsets_device)
+    from vibespatial.cuda._runtime import pylibcudf_column_from_device
+
+    offsets_col = pylibcudf_column_from_device(offsets_device)
     return plc.Column(
         plc.types.DataType(plc.types.TypeId.LIST),
         int(size),
@@ -1524,7 +1533,9 @@ def _native_device_index_columns(
         return None
 
     field_name = _native_index_field_name(logical_name, 0, attribute_columns)
-    column = plc.Column.from_cuda_array_interface(labels)
+    from vibespatial.cuda._runtime import pylibcudf_column_from_device
+
+    column = pylibcudf_column_from_device(labels)
     field = pa.field(field_name, column.type().to_arrow())
     metadata_index = pd.Index(
         [],
@@ -1677,8 +1688,12 @@ def _attribute_column_to_plc(arrow_column, col_name, *, plc):
             and bufs[1] is not None
             and hasattr(bufs[1], "__cuda_array_interface__")
         ):
-            return plc.Column.from_cuda_array_interface(bufs[1])
-    return plc.Column.from_arrow(combined)
+            from vibespatial.cuda._runtime import pylibcudf_column_from_device
+
+            return pylibcudf_column_from_device(bufs[1])
+    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+    return plc.Column.from_arrow(combined, stream=pylibcudf_current_stream())
 
 
 def _native_host_attribute_table_from_pandas(df, non_geometry_columns, *, index, pa):
@@ -1759,6 +1774,9 @@ def _write_pylibcudf_parquet_table(
     writer_kwargs,
 ) -> None:
     """Write a device table while honoring explicit row-group boundaries."""
+    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+    stream = pylibcudf_current_stream(plc_table)
     row_group_size = writer_kwargs.get("row_group_size")
     row_count = plc_table.num_rows()
     if row_group_size is not None:
@@ -1777,13 +1795,16 @@ def _write_pylibcudf_parquet_table(
         builder.row_group_size_rows(row_group_size)
         if "max_page_size" in writer_kwargs:
             builder.max_page_size_bytes(int(writer_kwargs["max_page_size"]))
-        writer = plc.io.parquet.ChunkedParquetWriter.from_options(builder.build())
+        writer = plc.io.parquet.ChunkedParquetWriter.from_options(
+            builder.build(),
+            stream=stream,
+        )
         slice_bounds = [
             bound
             for start in range(0, row_count, row_group_size)
             for bound in (start, min(start + row_group_size, row_count))
         ]
-        for chunk in plc.copying.slice(plc_table, slice_bounds):
+        for chunk in plc.copying.slice(plc_table, slice_bounds, stream=stream):
             writer.write(chunk)
         writer.close([])
         return
@@ -1800,7 +1821,7 @@ def _write_pylibcudf_parquet_table(
         builder.row_group_size_rows(row_group_size)
     if "max_page_size" in writer_kwargs:
         builder.max_page_size_bytes(int(writer_kwargs["max_page_size"]))
-    plc.io.parquet.write_parquet(builder.build())
+    plc.io.parquet.write_parquet(builder.build(), stream=stream)
 
 
 def _write_geoparquet_native_device_payload(
@@ -1977,10 +1998,10 @@ def _write_geoparquet_native_device_payload(
         d_xmax = _cp.ascontiguousarray(bounds[:, 2])
         d_ymax = _cp.ascontiguousarray(bounds[:, 3])
         bbox_children = [
-            plc.Column.from_cuda_array_interface(d_xmin),
-            plc.Column.from_cuda_array_interface(d_ymin),
-            plc.Column.from_cuda_array_interface(d_xmax),
-            plc.Column.from_cuda_array_interface(d_ymax),
+            pylibcudf_column_from_device(d_xmin),
+            pylibcudf_column_from_device(d_ymin),
+            pylibcudf_column_from_device(d_xmax),
+            pylibcudf_column_from_device(d_ymax),
         ]
         bbox_struct = plc.Column.struct_from_children(bbox_children)
         table_columns.append(bbox_struct)
@@ -2297,10 +2318,10 @@ def _write_geoparquet_native_device(
         d_xmax = _cp.ascontiguousarray(bounds[:, 2])
         d_ymax = _cp.ascontiguousarray(bounds[:, 3])
         bbox_children = [
-            plc.Column.from_cuda_array_interface(d_xmin),
-            plc.Column.from_cuda_array_interface(d_ymin),
-            plc.Column.from_cuda_array_interface(d_xmax),
-            plc.Column.from_cuda_array_interface(d_ymax),
+            pylibcudf_column_from_device(d_xmin),
+            pylibcudf_column_from_device(d_ymin),
+            pylibcudf_column_from_device(d_xmax),
+            pylibcudf_column_from_device(d_ymax),
         ]
         bbox_struct = plc.Column.struct_from_children(bbox_children)
         table_columns.append(bbox_struct)
@@ -4032,7 +4053,6 @@ def _try_gpu_wkb_list_decode(
 
     try:
         import pyarrow as pa
-        import pylibcudf as plc
 
         from .pylibcudf import _decode_pylibcudf_wkb_general_column_to_owned
 
@@ -4047,7 +4067,7 @@ def _try_gpu_wkb_list_decode(
             null_count=arrow_array.null_count,
         )
 
-        plc_column = plc.Column.from_arrow(arrow_str)
+        plc_column = pylibcudf_column_from_arrow(arrow_str)
         result = _decode_pylibcudf_wkb_general_column_to_owned(plc_column)
         if on_invalid == "raise":
             _raise_on_invalid_gpu_wkb_decode(result, non_null_mask)
@@ -4141,7 +4161,6 @@ def _try_gpu_wkb_arrow_decode(
     non_null_mask = np.asarray(array.is_valid().to_numpy(zero_copy_only=False), dtype=bool)
     try:
         import pyarrow as pa
-        import pylibcudf as plc
 
         from .pylibcudf import _decode_pylibcudf_wkb_general_column_to_owned
 
@@ -4157,7 +4176,7 @@ def _try_gpu_wkb_arrow_decode(
                 null_count=array.null_count,
             )
 
-        plc_column = plc.Column.from_arrow(array)
+        plc_column = pylibcudf_column_from_arrow(array)
         result = _decode_pylibcudf_wkb_general_column_to_owned(plc_column)
         if on_invalid == "raise":
             _raise_on_invalid_gpu_wkb_decode(result, non_null_mask)
@@ -4206,7 +4225,7 @@ def _try_gpu_wkb_encode(
 
         plc_column = _encode_owned_wkb_column_device(array)
         # Single bulk D2H transfer via Arrow
-        arrow_col = plc_column.to_arrow()
+        arrow_col = pylibcudf_to_arrow(plc_column)
         # The plc column is STRING type; cast to binary so raw WKB bytes
         # survive the Arrow conversion without UTF-8 validation issues.
         arrow_bin = arrow_col.cast(pa.binary())
@@ -4248,7 +4267,7 @@ def _try_gpu_wkb_encode_arrow(
 
         plc_column = _encode_owned_wkb_column_device(owned)
         # Single bulk D->H via Arrow -- no Python list intermediary
-        arrow_col = plc_column.to_arrow()
+        arrow_col = pylibcudf_to_arrow(plc_column)
         wkb_arr = arrow_col.cast(pa.binary())
 
         field_metadata = {}
@@ -4379,7 +4398,7 @@ def _encode_owned_wkb_array(
             import pyarrow as pa
 
             plc_column = _encode_owned_wkb_column_device(owned)
-            arrow_col = plc_column.to_arrow()
+            arrow_col = pylibcudf_to_arrow(plc_column)
             wkb_arr = arrow_col.cast(pa.binary())
 
             field_metadata = {}

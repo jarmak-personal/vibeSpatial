@@ -382,8 +382,10 @@ class NativeGroupedAttributeReduction:
             except ModuleNotFoundError:
                 pass
             else:
+                from vibespatial.cuda._runtime import pylibcudf_column_from_device
+
                 device_columns = [
-                    plc.Column.from_cuda_array_interface(cp.asarray(reduction.values))
+                    pylibcudf_column_from_device(cp.asarray(reduction.values))
                     for reduction in self.columns.values()
                 ]
                 return NativeAttributeTable(

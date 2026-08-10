@@ -2485,7 +2485,9 @@ def _encode_owned_wkb_values(
 
     import pyarrow as pa
 
-    arrow_col = _encode_owned_wkb_column_device(owned).to_arrow()
+    from vibespatial.cuda._runtime import pylibcudf_to_arrow
+
+    arrow_col = pylibcudf_to_arrow(_encode_owned_wkb_column_device(owned))
     if pa.types.is_string(arrow_col.type) or pa.types.is_large_string(arrow_col.type):
         arrow_col = arrow_col.cast(pa.binary())
     values = arrow_col.to_pylist()

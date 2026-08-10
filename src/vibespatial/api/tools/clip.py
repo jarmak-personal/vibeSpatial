@@ -6115,6 +6115,7 @@ def _clip_grouped_polygon_pair_capacity(
     from vibespatial.api._native_grouped import NativeGroupedSelection
     from vibespatial.api._native_rowset import NativeDeviceSelection
     from vibespatial.cuda.cccl_primitives import PairSortStrategy, sort_pairs
+    from vibespatial.geometry.buffers import GeometryFamily
     from vibespatial.geometry.owned import (
         OwnedGeometryArray,
         build_empty_polygon_rows_device,
@@ -6203,10 +6204,14 @@ def _clip_grouped_polygon_pair_capacity(
     all_parts.device_state.trusted_all_valid = True
     all_parts.device_state.trusted_polygonal_only = True
     ordered_parts = all_parts._device_indexed_take(d_order)
-    ordered_parts.device_state.trusted_all_valid = True
-    ordered_parts.device_state.trusted_polygonal_only = True
+    ordered_state = ordered_parts._ensure_device_state(preserve_indexed_view=True)
+    ordered_state.trusted_all_valid = True
+    ordered_state.trusted_polygonal_only = True
+    ordered_state.trusted_family_domain = (
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+    )
     if pair_intersections_axis_rectangles:
-        from vibespatial.geometry.buffers import GeometryFamily
         from vibespatial.geometry.owned import DeviceFixedGeometrySizeMetadata
 
         ordered_polygon_buffer = ordered_parts.device_state.families.get(
@@ -6242,6 +6247,12 @@ def _clip_grouped_polygon_pair_capacity(
     )
     if grouped_result is None or grouped_result.row_count != output_row_count:
         raise RuntimeError("grouped clip topology did not preserve source capacity")
+    grouped_state = grouped_result._ensure_device_state(preserve_indexed_view=True)
+    grouped_state.trusted_polygonal_only = True
+    grouped_state.trusted_family_domain = (
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+    )
     d_keep = _owned_valid_nonempty_device_mask(grouped_result)
     if d_keep is None:
         raise RuntimeError("grouped clip result has no device validity metadata")
@@ -7732,6 +7743,263 @@ def _clip_gdf_with_mask(gdf, mask, sort=False, *, query_geometry=None):
     )
 
 
+def _flatten_geometrycollection_clip_ingress(values):
+    """Flatten GeometryCollection members at the public compatibility ingress."""
+    objects = np.asarray(values, dtype=object)
+    geometries: list[object] = []
+    source_rows: list[int] = []
+
+    def append_geometry(geometry, source_row: int) -> None:
+        if geometry is None or bool(shapely.is_missing(geometry)):
+            return
+        if geometry.geom_type != "GeometryCollection":
+            geometries.append(geometry)
+            source_rows.append(source_row)
+            return
+        for member in geometry.geoms:
+            append_geometry(member, source_row)
+
+    for source_row, geometry in enumerate(objects):
+        append_geometry(geometry, source_row)
+    return (
+        geometries,
+        np.asarray(source_rows, dtype=np.int64),
+    )
+
+
+def _clip_geometrycollection_source_native(
+    source,
+    mask,
+    *,
+    sort: bool,
+) -> NativeTabularResult | NativeTabularSelection | None:
+    """Clip public GeometryCollection rows through native grouped set union."""
+    if not has_gpu_runtime():
+        return None
+    geometry = source.geometry if isinstance(source, GeoDataFrame) else source
+    values = geometry.values
+    # DeviceGeometryArray cannot contain a GeometryCollection: owned geometry
+    # stores its concrete families columnarly.  Reading ``_data`` here would
+    # materialize every device-resident source through Shapely merely to prove
+    # that no collection is present.
+    if isinstance(values, DeviceGeometryArray):
+        return None
+    public_values = getattr(values, "_data", None)
+    if public_values is None:
+        return None
+    type_ids = shapely.get_type_id(np.asarray(public_values, dtype=object))
+    if not bool(np.any(type_ids == 7)):
+        return None
+
+    flat_geometries, flat_source_rows = (
+        _flatten_geometrycollection_clip_ingress(public_values)
+    )
+    clipping_by_rectangle = _mask_is_list_like_rectangle(mask)
+    if not flat_geometries:
+        return _clip_constructive_parts_to_native_tabular_result(
+            source=source,
+            parts=(),
+            ordered_row_positions=np.empty(0, dtype=np.intp),
+            clipping_by_rectangle=clipping_by_rectangle,
+            has_non_point_candidates=False,
+            keep_geom_type=False,
+        )
+
+    from vibespatial.geometry.owned import from_shapely_geometries
+
+    flat_owned = from_shapely_geometries(
+        flat_geometries,
+        residency=Residency.DEVICE if has_gpu_runtime() else Residency.HOST,
+    )
+    flat_values = (
+        DeviceGeometryArray._from_owned(flat_owned, crs=source.crs)
+        if flat_owned.residency is Residency.DEVICE
+        else GeometryArray.from_owned(flat_owned, crs=source.crs)
+    )
+    flat_index = pd.RangeIndex(len(flat_geometries))
+    if isinstance(source, GeoDataFrame):
+        flat_source = source.iloc[flat_source_rows].copy(deep=False)
+        flat_source.index = flat_index
+        flat_source = _replace_geometry_column(flat_source, flat_values)
+    else:
+        flat_source = _geometry_series_from_values(
+            flat_values,
+            index=flat_index,
+            crs=source.crs,
+            name=getattr(source, "name", None),
+        )
+
+    flat_result = evaluate_geopandas_clip_native(
+        flat_source,
+        mask,
+        keep_geom_type=False,
+        sort=sort,
+    )
+    capacity_result = (
+        flat_result.capacity_result
+        if isinstance(flat_result, NativeTabularSelection)
+        else flat_result
+    )
+
+    import cupy as cp
+
+    capacity = capacity_result.geometry.row_count
+    provenance_rows = getattr(capacity_result.provenance, "source_rows", None)
+    d_capacity_source_rows = (
+        cp.arange(capacity, dtype=cp.int64)
+        if provenance_rows is None
+        else cp.asarray(provenance_rows, dtype=cp.int64)
+    )
+    if isinstance(flat_result, NativeTabularSelection):
+        d_active_capacity = flat_result.selection.active_capacity_mask()
+        d_capacity_positions = flat_result.selection.safe_capacity_positions()
+        selected_geometry = capacity_result.geometry.take(d_capacity_positions).mask_capacity(
+            d_active_capacity
+        )
+        d_selected_flat_rows = d_capacity_source_rows[d_capacity_positions]
+    else:
+        d_active_capacity = cp.ones(capacity, dtype=cp.bool_)
+        selected_geometry = capacity_result.geometry
+        d_selected_flat_rows = d_capacity_source_rows
+
+    from vibespatial.api._native_result_core import (
+        NativeGeometryCompositionPart,
+        NativeGeometryProvenance,
+    )
+
+    if selected_geometry.composition is None:
+        concrete_parts = (
+            NativeGeometryCompositionPart(
+                geometry=selected_geometry,
+                output_rows=cp.arange(capacity, dtype=cp.int64),
+                collection_position=0,
+            ),
+        )
+    else:
+        concrete_parts = selected_geometry.composition.parts
+
+    d_flat_source_rows = cp.asarray(flat_source_rows, dtype=cp.int64)
+    source_row_count = len(source)
+    concrete_owned = []
+    concrete_group_rows = []
+    concrete_active = []
+    for child_part in concrete_parts:
+        owned = child_part.geometry.owned
+        if owned is None:
+            raise StrictNativeFallbackError(
+                "GeometryCollection clip reduction lost concrete device storage"
+            )
+        d_child_rows = cp.asarray(child_part.output_rows, dtype=cp.int64)
+        d_child_flat_rows = d_selected_flat_rows[d_child_rows]
+        d_child_valid = child_part.geometry.valid_nonempty_mask_device()
+        if d_child_valid is None:
+            raise StrictNativeFallbackError(
+                "GeometryCollection clip reduction lost device validity metadata"
+            )
+        concrete_owned.append(owned)
+        concrete_group_rows.append(d_flat_source_rows[d_child_flat_rows])
+        concrete_active.append(cp.asarray(d_child_valid, dtype=cp.bool_))
+
+    from vibespatial.geometry.owned import OwnedGeometryArray
+
+    grouped_input = OwnedGeometryArray.concat(concrete_owned)
+    if grouped_input.row_count == 0:
+        return _clip_constructive_parts_to_native_tabular_result(
+            source=source,
+            parts=(),
+            ordered_row_positions=np.empty(0, dtype=np.intp),
+            clipping_by_rectangle=clipping_by_rectangle,
+            has_non_point_candidates=False,
+            keep_geom_type=False,
+        )
+    d_group_rows = cp.concatenate(concrete_group_rows)
+    d_group_active = cp.concatenate(concrete_active)
+    grouped_polygon = _clip_grouped_polygon_pair_capacity(
+        grouped_input,
+        d_group_rows,
+        d_group_active,
+        output_row_count=source_row_count,
+    )
+    if grouped_polygon is None:
+        raise StrictNativeFallbackError(
+            "GeometryCollection clip polygon coverage reduction declined"
+        )
+    polygon_capacity, d_polygon_keep = grouped_polygon
+    from vibespatial.constructive.grouped_mixed_union import (
+        grouped_mixed_union_capacity_device,
+    )
+
+    mixed_capacity = grouped_mixed_union_capacity_device(
+        grouped_input,
+        d_group_rows,
+        d_group_active,
+        polygon_capacity,
+        d_polygon_keep,
+        output_row_count=source_row_count,
+        crs=source.crs,
+    )
+    d_source_active = cp.asarray(mixed_capacity.keep_mask, dtype=cp.bool_)
+
+    geometry_name = (
+        source._geometry_column_name
+        if isinstance(source, GeoDataFrame)
+        else getattr(source, "name", None) or "geometry"
+    )
+    attributes = (
+        source.drop(columns=[geometry_name]).copy(deep=False)
+        if isinstance(source, GeoDataFrame)
+        else pd.DataFrame(index=source.index)
+    )
+    result = NativeTabularResult(
+        attributes=attributes,
+        geometry=mixed_capacity.geometry,
+        geometry_name=geometry_name,
+        column_order=(
+            tuple(source.columns)
+            if isinstance(source, GeoDataFrame)
+            else (geometry_name,)
+        ),
+        attrs=source.attrs.copy() or None,
+        provenance=NativeGeometryProvenance(
+            operation="clip_geometrycollection_grouped_union",
+            row_count=source_row_count,
+            source_rows=cp.arange(source_row_count, dtype=cp.int64),
+        ),
+    )
+    from vibespatial.runtime.dispatch import record_dispatch_event
+
+    record_dispatch_event(
+        surface="clip",
+        operation="clip",
+        implementation="geometrycollection_grouped_union_gpu",
+        reason=(
+            "GeometryCollection members clipped and reduced through native grouped "
+            "mixed union semantics"
+        ),
+        detail=f"rows={source_row_count},parts={len(flat_geometries)}",
+        selected=ExecutionMode.GPU,
+    )
+    selected_result = NativeTabularSelection(
+        capacity_result=result,
+        selection=NativeDeviceSelection.from_mask(d_source_active),
+    )
+    if not sort or source_row_count <= 1:
+        return selected_result
+
+    source_order = np.asarray(
+        pd.Series(
+            np.arange(source_row_count, dtype=np.int64),
+            index=source.index,
+        )
+        .sort_index(kind="stable")
+        .to_numpy(copy=False),
+        dtype=np.int64,
+    )
+    source_sort_rank = np.empty(source_row_count, dtype=np.int64)
+    source_sort_rank[source_order] = np.arange(source_row_count, dtype=np.int64)
+    return selected_result.sort_selected_by_int64(cp.asarray(source_sort_rank))
+
+
 def evaluate_geopandas_clip_native(
     gdf,
     mask,
@@ -7760,6 +8028,14 @@ def evaluate_geopandas_clip_native(
 
     if isinstance(mask, GeoDataFrame | GeoSeries) and not _check_crs(gdf, mask):
         _crs_mismatch_warn(gdf, mask, stacklevel=3)
+
+    geometrycollection_result = _clip_geometrycollection_source_native(
+        gdf,
+        mask,
+        sort=sort,
+    )
+    if geometrycollection_result is not None:
+        return geometrycollection_result
 
     lazy_grouped_mask_owned = (
         _lazy_grouped_union_mask_owned_private(mask)

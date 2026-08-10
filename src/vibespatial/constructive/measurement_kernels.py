@@ -21,6 +21,7 @@ void polygon_area_cooperative(
     const double* __restrict__ y,
     const int* __restrict__ ring_offsets,
     const int* __restrict__ geometry_offsets,
+    const int* __restrict__ source_rows,
     double* __restrict__ out_area,
     double center_x,
     double center_y,
@@ -29,8 +30,9 @@ void polygon_area_cooperative(
     const int row = blockIdx.x;
     if (row >= row_count) return;
 
-    const int first_ring = geometry_offsets[row];
-    const int last_ring = geometry_offsets[row + 1];
+    const int source_row = source_rows == nullptr ? row : source_rows[row];
+    const int first_ring = geometry_offsets[source_row];
+    const int last_ring = geometry_offsets[source_row + 1];
 
     /* Shared memory for inter-warp Kahan reduction (up to 256/32 = 8 warps) */
     __shared__ compute_t warp_sums[8];
@@ -120,6 +122,7 @@ extern "C" __global__ void polygon_area(
     const double* y,
     const int* ring_offsets,
     const int* geometry_offsets,
+    const int* source_rows,
     double* out_area,
     double center_x,
     double center_y,
@@ -128,8 +131,9 @@ extern "C" __global__ void polygon_area(
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= row_count) return;
 
-    const int first_ring = geometry_offsets[row];
-    const int last_ring = geometry_offsets[row + 1];
+    const int source_row = source_rows == nullptr ? row : source_rows[row];
+    const int first_ring = geometry_offsets[source_row];
+    const int last_ring = geometry_offsets[source_row + 1];
 
     compute_t total_area = (compute_t)0.0;
     compute_t c_total = (compute_t)0.0;
@@ -185,6 +189,7 @@ extern "C" __global__ void multipolygon_area(
     const int* ring_offsets,
     const int* part_offsets,
     const int* geometry_offsets,
+    const int* source_rows,
     double* out_area,
     double center_x,
     double center_y,
@@ -193,8 +198,9 @@ extern "C" __global__ void multipolygon_area(
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= row_count) return;
 
-    const int first_part = geometry_offsets[row];
-    const int last_part = geometry_offsets[row + 1];
+    const int source_row = source_rows == nullptr ? row : source_rows[row];
+    const int first_part = geometry_offsets[source_row];
+    const int last_part = geometry_offsets[source_row + 1];
 
     compute_t total_area = (compute_t)0.0;
     compute_t c_total = (compute_t)0.0;
@@ -279,6 +285,7 @@ extern "C" __global__ void polygon_length(
     const double* y,
     const int* ring_offsets,
     const int* geometry_offsets,
+    const int* source_rows,
     double* out_length,
     double center_x,
     double center_y,
@@ -287,8 +294,9 @@ extern "C" __global__ void polygon_length(
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= row_count) return;
 
-    const int first_ring = geometry_offsets[row];
-    const int last_ring = geometry_offsets[row + 1];
+    const int source_row = source_rows == nullptr ? row : source_rows[row];
+    const int first_ring = geometry_offsets[source_row];
+    const int last_ring = geometry_offsets[source_row + 1];
 
     compute_t total_length = (compute_t)0.0;
     compute_t c_total = (compute_t)0.0;
@@ -319,6 +327,7 @@ extern "C" __global__ void multipolygon_length(
     const int* ring_offsets,
     const int* part_offsets,
     const int* geometry_offsets,
+    const int* source_rows,
     double* out_length,
     double center_x,
     double center_y,
@@ -327,8 +336,9 @@ extern "C" __global__ void multipolygon_length(
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= row_count) return;
 
-    const int first_part = geometry_offsets[row];
-    const int last_part = geometry_offsets[row + 1];
+    const int source_row = source_rows == nullptr ? row : source_rows[row];
+    const int first_part = geometry_offsets[source_row];
+    const int last_part = geometry_offsets[source_row + 1];
 
     compute_t total_length = (compute_t)0.0;
     compute_t c_total = (compute_t)0.0;
@@ -361,6 +371,7 @@ extern "C" __global__ void linestring_length(
     const double* x,
     const double* y,
     const int* geometry_offsets,
+    const int* source_rows,
     double* out_length,
     double center_x,
     double center_y,
@@ -369,8 +380,9 @@ extern "C" __global__ void linestring_length(
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= row_count) return;
 
-    const int cs = geometry_offsets[row];
-    const int ce = geometry_offsets[row + 1];
+    const int source_row = source_rows == nullptr ? row : source_rows[row];
+    const int cs = geometry_offsets[source_row];
+    const int ce = geometry_offsets[source_row + 1];
     const int n = ce - cs;
 
     if (n < 2) {{
@@ -399,6 +411,7 @@ extern "C" __global__ void multilinestring_length(
     const double* y,
     const int* part_offsets,
     const int* geometry_offsets,
+    const int* source_rows,
     double* out_length,
     double center_x,
     double center_y,
@@ -407,8 +420,9 @@ extern "C" __global__ void multilinestring_length(
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= row_count) return;
 
-    const int first_part = geometry_offsets[row];
-    const int last_part = geometry_offsets[row + 1];
+    const int source_row = source_rows == nullptr ? row : source_rows[row];
+    const int first_part = geometry_offsets[source_row];
+    const int last_part = geometry_offsets[source_row + 1];
 
     compute_t total_length = (compute_t)0.0;
     compute_t c_total = (compute_t)0.0;

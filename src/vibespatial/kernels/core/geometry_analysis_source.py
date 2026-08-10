@@ -33,6 +33,7 @@ extern "C" __global__ void bounds_simple(
     const double* __restrict__ y,
     const int* __restrict__ geometry_offsets,
     const unsigned char* __restrict__ empty_mask,
+    const int* __restrict__ source_rows,
     double* __restrict__ out,
     int row_count
 ) {{{{
@@ -40,12 +41,13 @@ extern "C" __global__ void bounds_simple(
   if (row >= row_count) {{{{
     return;
   }}}}
-  if (empty_mask[row]) {{{{
+  const int source_row = source_rows == nullptr ? row : source_rows[row];
+  if (empty_mask[source_row]) {{{{
     write_nan_bounds(out, row);
     return;
   }}}}
-  const int coord_start = geometry_offsets[row];
-  const int coord_end = geometry_offsets[row + 1];
+  const int coord_start = geometry_offsets[source_row];
+  const int coord_end = geometry_offsets[source_row + 1];
   if (coord_end <= coord_start) {{{{
     write_nan_bounds(out, row);
     return;
@@ -75,6 +77,7 @@ extern "C" __global__ void bounds_polygon(
     const int* __restrict__ geometry_offsets,
     const int* __restrict__ ring_offsets,
     const unsigned char* __restrict__ empty_mask,
+    const int* __restrict__ source_rows,
     double* __restrict__ out,
     int row_count
 ) {{{{
@@ -82,12 +85,13 @@ extern "C" __global__ void bounds_polygon(
   if (row >= row_count) {{{{
     return;
   }}}}
-  if (empty_mask[row]) {{{{
+  const int source_row = source_rows == nullptr ? row : source_rows[row];
+  if (empty_mask[source_row]) {{{{
     write_nan_bounds(out, row);
     return;
   }}}}
-  const int ring_start = geometry_offsets[row];
-  const int ring_end = geometry_offsets[row + 1];
+  const int ring_start = geometry_offsets[source_row];
+  const int ring_end = geometry_offsets[source_row + 1];
   const int coord_start = ring_offsets[ring_start];
   const int coord_end = ring_offsets[ring_end];
   if (coord_end <= coord_start) {{{{
@@ -119,6 +123,7 @@ extern "C" __global__ void bounds_multilinestring(
     const int* __restrict__ geometry_offsets,
     const int* __restrict__ part_offsets,
     const unsigned char* __restrict__ empty_mask,
+    const int* __restrict__ source_rows,
     double* __restrict__ out,
     int row_count
 ) {{{{
@@ -126,12 +131,13 @@ extern "C" __global__ void bounds_multilinestring(
   if (row >= row_count) {{{{
     return;
   }}}}
-  if (empty_mask[row]) {{{{
+  const int source_row = source_rows == nullptr ? row : source_rows[row];
+  if (empty_mask[source_row]) {{{{
     write_nan_bounds(out, row);
     return;
   }}}}
-  const int part_start = geometry_offsets[row];
-  const int part_end = geometry_offsets[row + 1];
+  const int part_start = geometry_offsets[source_row];
+  const int part_end = geometry_offsets[source_row + 1];
   const int coord_start = part_offsets[part_start];
   const int coord_end = part_offsets[part_end];
   if (coord_end <= coord_start) {{{{
@@ -164,6 +170,7 @@ extern "C" __global__ void bounds_multipolygon(
     const int* __restrict__ part_offsets,
     const int* __restrict__ ring_offsets,
     const unsigned char* __restrict__ empty_mask,
+    const int* __restrict__ source_rows,
     double* __restrict__ out,
     int row_count
 ) {{{{
@@ -171,12 +178,13 @@ extern "C" __global__ void bounds_multipolygon(
   if (row >= row_count) {{{{
     return;
   }}}}
-  if (empty_mask[row]) {{{{
+  const int source_row = source_rows == nullptr ? row : source_rows[row];
+  if (empty_mask[source_row]) {{{{
     write_nan_bounds(out, row);
     return;
   }}}}
-  const int polygon_start = geometry_offsets[row];
-  const int polygon_end = geometry_offsets[row + 1];
+  const int polygon_start = geometry_offsets[source_row];
+  const int polygon_end = geometry_offsets[source_row + 1];
   const int ring_start = part_offsets[polygon_start];
   const int ring_end = part_offsets[polygon_end];
   const int coord_start = ring_offsets[ring_start];
@@ -296,6 +304,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void bounds_polygon_cooperative(
     const int* __restrict__ geometry_offsets,
     const int* __restrict__ ring_offsets,
     const unsigned char* __restrict__ empty_mask,
+    const int* __restrict__ source_rows,
     double* __restrict__ out,
     int row_count
 ) {{{{
@@ -303,14 +312,15 @@ extern "C" __global__ __launch_bounds__(256, 4) void bounds_polygon_cooperative(
   if (row >= row_count) {{{{
     return;
   }}}}
-  if (empty_mask[row]) {{{{
+  const int source_row = source_rows == nullptr ? row : source_rows[row];
+  if (empty_mask[source_row]) {{{{
     if (threadIdx.x == 0) {{{{
       write_nan_bounds_coop(out, row);
     }}}}
     return;
   }}}}
-  const int ring_start = geometry_offsets[row];
-  const int ring_end = geometry_offsets[row + 1];
+  const int ring_start = geometry_offsets[source_row];
+  const int ring_end = geometry_offsets[source_row + 1];
   const int coord_start = ring_offsets[ring_start];
   const int coord_end = ring_offsets[ring_end];
   const int n_coords = coord_end - coord_start;
@@ -392,6 +402,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void bounds_multipolygon_coopera
     const int* __restrict__ part_offsets,
     const int* __restrict__ ring_offsets,
     const unsigned char* __restrict__ empty_mask,
+    const int* __restrict__ source_rows,
     double* __restrict__ out,
     int row_count
 ) {{{{
@@ -399,14 +410,15 @@ extern "C" __global__ __launch_bounds__(256, 4) void bounds_multipolygon_coopera
   if (row >= row_count) {{{{
     return;
   }}}}
-  if (empty_mask[row]) {{{{
+  const int source_row = source_rows == nullptr ? row : source_rows[row];
+  if (empty_mask[source_row]) {{{{
     if (threadIdx.x == 0) {{{{
       write_nan_bounds_coop(out, row);
     }}}}
     return;
   }}}}
-  const int polygon_start = geometry_offsets[row];
-  const int polygon_end = geometry_offsets[row + 1];
+  const int polygon_start = geometry_offsets[source_row];
+  const int polygon_end = geometry_offsets[source_row + 1];
   const int ring_start = part_offsets[polygon_start];
   const int ring_end = part_offsets[polygon_end];
   const int coord_start = ring_offsets[ring_start];

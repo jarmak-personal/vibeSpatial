@@ -575,6 +575,18 @@ def _pylibcudf_numeric_column_view(column):
     return cp.asarray(column.data()).view(dtype)[: int(column.size())]
 
 
+def _pylibcudf_column_from_device(values):
+    from vibespatial.cuda._runtime import pylibcudf_column_from_device
+
+    return pylibcudf_column_from_device(values)
+
+
+def _pylibcudf_table_from_arrow(table):
+    from vibespatial.cuda._runtime import pylibcudf_table_from_arrow
+
+    return pylibcudf_table_from_arrow(table)
+
+
 def _native_expression_device_column(value, *, row_count: int):
     from vibespatial.api._native_expression import NativeExpression
 
@@ -586,15 +598,13 @@ def _native_expression_device_column(value, *, row_count: int):
         return None
 
     import cupy as cp
-    import pylibcudf as plc
-
     values = cp.asarray(value.values)
     if int(values.size) != int(row_count):
         raise ValueError("NativeExpression column row count must match attributes")
     dtype = np.dtype(values.dtype)
     if not (np.issubdtype(dtype, np.number) or np.issubdtype(dtype, np.bool_)):
         return None
-    return plc.Column.from_cuda_array_interface(values)
+    return _pylibcudf_column_from_device(values)
 
 
 def _assigned_device_column(value, *, row_count: int):
@@ -612,15 +622,13 @@ def _assigned_device_column(value, *, row_count: int):
 
     if _is_device_array(value):
         import cupy as cp
-        import pylibcudf as plc
-
         values = cp.asarray(value)
         if values.ndim != 1 or int(values.size) != int(row_count):
             raise ValueError("assigned column row count must match attributes")
         dtype = np.dtype(values.dtype)
         if not (np.issubdtype(dtype, np.number) or np.issubdtype(dtype, np.bool_)):
             return None
-        return plc.Column.from_cuda_array_interface(values)
+        return _pylibcudf_column_from_device(values)
 
     if pd.api.types.is_scalar(value):
         host_values = np.full(int(row_count), value)
@@ -630,14 +638,15 @@ def _assigned_device_column(value, *, row_count: int):
         if not _is_admissible_pandas_numeric_series(value):
             try:
                 import pyarrow as pa
-                import pylibcudf as plc
             except ModuleNotFoundError:
                 return None
             try:
                 arrow_array = pa.array(value)
                 if int(len(arrow_array)) != int(row_count):
                     raise ValueError("assigned column row count must match attributes")
-                return plc.Table.from_arrow(pa.table({"__assigned__": arrow_array})).columns()[0]
+                return _pylibcudf_table_from_arrow(
+                    pa.table({"__assigned__": arrow_array})
+                ).columns()[0]
             except Exception:
                 return None
         host_values = value.to_numpy(copy=False)
@@ -651,21 +660,18 @@ def _assigned_device_column(value, *, row_count: int):
     if not numeric_or_bool or bool(pd.isna(host_values).any()):
         try:
             import pyarrow as pa
-            import pylibcudf as plc
         except ModuleNotFoundError:
             return None
         try:
-            return plc.Table.from_arrow(
+            return _pylibcudf_table_from_arrow(
                 pa.table({"__assigned__": pa.array(host_values)})
             ).columns()[0]
         except Exception:
             return None
 
     import cupy as cp
-    import pylibcudf as plc
-
     if numeric_or_bool:
-        return plc.Column.from_cuda_array_interface(cp.asarray(host_values))
+        return _pylibcudf_column_from_device(cp.asarray(host_values))
 
     return None
 
@@ -835,6 +841,10 @@ class NativeAttributeTable:
         if self.arrow_table is not None and self.schema_override is None:
             object.__setattr__(self, "schema_override", self.arrow_table.schema)
         if self.device_table is not None:
+            if type(self.device_table).__module__.startswith("pylibcudf."):
+                from vibespatial.cuda._runtime import pylibcudf_mark_produced
+
+                pylibcudf_mark_produced(self.device_table)
             row_count = _device_table_row_count(self.device_table)
             if self.index_override is None and self.row_positions is None:
                 object.__setattr__(self, "index_override", pd.RangeIndex(row_count))
@@ -1111,17 +1121,21 @@ class NativeAttributeTable:
         source_columns = self.device_table.columns()
         output_columns = []
         fields = []
+        from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+        stream = pylibcudf_current_stream(self.device_table)
         for column in requested:
             selected_rows = (
                 first_positions if normalized_reducers[column] == "first" else last_positions
             )
-            gather_map = plc.Column.from_cuda_array_interface(
+            gather_map = _pylibcudf_column_from_device(
                 selected_rows.astype(target_dtype, copy=False)
             )
             gathered = plc.copying.gather(
                 plc.Table([source_columns[positions[column]]]),
                 gather_map,
                 plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                stream=stream,
             )
             output_column = gathered.columns()[0]
             output_columns.append(output_column)
@@ -1285,7 +1299,9 @@ class NativeAttributeTable:
                     if all(column in columns_by_name for column in requested_columns):
                         output_columns = [columns_by_name[column] for column in requested_columns]
                         fields = [fields_by_name[column] for column in requested_columns]
-                        table = plc.Table(output_columns).to_arrow()
+                        from vibespatial.cuda._runtime import pylibcudf_to_arrow
+
+                        table = pylibcudf_to_arrow(plc.Table(output_columns))
                         table = _rename_device_arrow_table(
                             table,
                             requested_columns,
@@ -1338,7 +1354,9 @@ class NativeAttributeTable:
                 if self.row_positions is not None
                 else self.device_table
             )
-            table = table.to_arrow()
+            from vibespatial.cuda._runtime import pylibcudf_to_arrow
+
+            table = pylibcudf_to_arrow(table)
             table = _rename_device_arrow_table(
                 table,
                 tuple(requested_columns) if requested_columns is not None else self.column_override,
@@ -1369,12 +1387,14 @@ class NativeAttributeTable:
         )
 
     def to_pylibcudf_columns(self, columns) -> list[Any]:
-        import pylibcudf as plc
-
         requested_columns = list(columns)
         if self.device_table is None:
-            table = plc.Table.from_arrow(self.to_arrow(index=False, columns=requested_columns))
+            table = _pylibcudf_table_from_arrow(
+                self.to_arrow(index=False, columns=requested_columns)
+            )
             return table.columns()
+
+        from vibespatial.cuda._runtime import pylibcudf_current_stream
 
         source_columns = self.device_table.columns()
         by_name = {
@@ -1383,6 +1403,7 @@ class NativeAttributeTable:
         }
         output_columns = [by_name[column] for column in requested_columns]
         if self.row_positions is None:
+            pylibcudf_current_stream(self.device_table)
             return output_columns
         return self._gathered_device_table(requested_columns).columns()
 
@@ -1393,6 +1414,9 @@ class NativeAttributeTable:
         import cupy as cp
         import pylibcudf as plc
 
+        from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+        stream = pylibcudf_current_stream(self.device_table)
         source_columns = self.device_table.columns()
         requested = tuple(self.columns if columns is None else columns)
         positions = _column_position_map(self.columns)
@@ -1407,13 +1431,14 @@ class NativeAttributeTable:
             if _device_table_row_count(self.device_table) <= np.iinfo(np.int32).max
             else cp.int64
         )
-        gather_map = plc.Column.from_cuda_array_interface(
+        gather_map = _pylibcudf_column_from_device(
             row_positions.astype(target_dtype, copy=False)
         )
         return plc.copying.gather(
             plc.Table(output_columns),
             gather_map,
             plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+            stream=stream,
         )
 
     def _physicalize_device_row_view(self, columns=None) -> NativeAttributeTable:
@@ -1470,7 +1495,7 @@ class NativeAttributeTable:
             device_values = cp.asarray(arrays[column])
             if device_values.ndim != 1 or int(device_values.size) != len(self):
                 return None
-            device_column = plc.Column.from_cuda_array_interface(device_values)
+            device_column = _pylibcudf_column_from_device(device_values)
             output_columns.append(device_column)
             fields.append(_field_for_device_column(column, device_column, self.schema_override))
 
@@ -1912,7 +1937,7 @@ class NativeAttributeTable:
                         index_columns = []
                         break
                     values = cp.asarray(series.to_numpy(copy=False))
-                    column = plc.Column.from_cuda_array_interface(values)
+                    column = _pylibcudf_column_from_device(values)
                     index_columns.append(column)
                     index_fields.append(pa.field(str(column_name), column.type().to_arrow()))
                 if index_columns:
@@ -2156,6 +2181,8 @@ class NativeAttributeTable:
         try:
             import cupy as cp
             import pylibcudf as plc
+
+            from vibespatial.cuda._runtime import pylibcudf_current_stream
         except ModuleNotFoundError:
             return None
         if self.dataframe is not None and self.dataframe.shape[1] == 0:
@@ -2166,7 +2193,7 @@ class NativeAttributeTable:
             source = self.device_table
             schema = self.schema_override
         elif self.arrow_table is not None:
-            source = plc.Table.from_arrow(self.to_arrow(index=False))
+            source = _pylibcudf_table_from_arrow(self.to_arrow(index=False))
             schema = self.arrow_table.schema
         else:
             return None
@@ -2175,13 +2202,15 @@ class NativeAttributeTable:
             d_positions = cp.asarray(self.row_positions, dtype=cp.int64)[d_positions]
         source_row_count = _device_table_row_count(source)
         target_dtype = cp.int32 if source_row_count <= np.iinfo(np.int32).max else cp.int64
-        gather_map = plc.Column.from_cuda_array_interface(
+        gather_map = _pylibcudf_column_from_device(
             d_positions.astype(target_dtype, copy=False)
         )
+        stream = pylibcudf_current_stream(source)
         gathered = plc.copying.gather(
             source,
             gather_map,
             plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+            stream=stream,
         )
         return type(self)(
             device_table=gathered,
@@ -2363,8 +2392,12 @@ class NativeAttributeTable:
                 except ModuleNotFoundError:  # pragma: no cover - optional GPU dependency
                     plc = None
                 if plc is not None:
+                    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+                    sources = [table.device_table for table in tables]
                     concatenated = plc.concatenate.concatenate(
-                        [table.device_table for table in tables]
+                        sources,
+                        stream=pylibcudf_current_stream(*sources),
                     )
                     if ignore_index:
                         index_override = pd.RangeIndex(_device_table_row_count(concatenated))
@@ -2916,6 +2949,7 @@ def _composition_part_take_relation(part_rows: Any, selected_rows: Any):
         import pylibcudf as plc
 
         from vibespatial.api._native_relation import NativeRelation
+        from vibespatial.cuda._runtime import pylibcudf_current_stream
 
         rows = cp.asarray(part_rows, dtype=cp.int64)
         selected = cp.asarray(selected_rows, dtype=cp.int64)
@@ -2929,9 +2963,10 @@ def _composition_part_take_relation(part_rows: Any, selected_rows: Any):
             )
 
         concrete_column, selected_column = plc.join.inner_join(
-            plc.Table([plc.Column.from_cuda_array_interface(rows)]),
-            plc.Table([plc.Column.from_cuda_array_interface(selected)]),
+            plc.Table([_pylibcudf_column_from_device(rows)]),
+            plc.Table([_pylibcudf_column_from_device(selected)]),
             plc.types.NullEquality.EQUAL,
+            stream=pylibcudf_current_stream(),
         )
 
         def _join_indices(column):

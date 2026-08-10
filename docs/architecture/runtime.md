@@ -5,7 +5,7 @@ Scope: GPU-first runtime rules, fallback policy, and execution invariants.
 Read If: You are changing runtime selection, GPU execution, fallback visibility, or kernels.
 STOP IF: Your task is docs-only or limited to vendored test maintenance.
 Source Of Truth: Runtime architecture policy for GPU-first execution.
-Body Budget: 166/200 lines
+Body Budget: 185/200 lines
 Document: docs/architecture/runtime.md
 
 Section Map (Body Lines)
@@ -22,8 +22,8 @@ Section Map (Body Lines)
 | 81-94 | Session Execution Mode Override |
 | 95-109 | Provenance Rewrite Override |
 | 110-132 | Device-Native Result Boundary (ADR-0042) |
-| 133-160 | Memory Pool Tiers (ADR-0040) |
-| 161-166 | Compatibility |
+| 133-179 | Memory Pool Tiers (ADR-0040) |
+| 180-185 | Compatibility |
 DOC_HEADER:END -->
 
 `vibeSpatial` is GPU-first, not GPU-optional.
@@ -70,8 +70,8 @@ files to inspect when execution behavior changes.
   Python package imports successfully.
 - CPU execution exists to preserve correctness and debuggability, not to define
   the architecture.
-- Canonical geometry storage should stay `fp64`; compute precision may dispatch
-  separately from storage precision.
+- Canonical geometry storage stays `fp64`; metric precision statistics and
+  centering reduce logical row-indirected bounds before compute dispatch.
 - Null and empty geometries are distinct states and must stay distinct through
   buffer layout and kernel outputs.
 - Predicate and constructive kernels must declare a robustness guarantee, not
@@ -183,6 +183,25 @@ available, with CuPy's built-in `MemoryPool` as the fallback.
   ignored for Tier C (managed memory uses OS overcommit semantics).
 - `_memory_backend` discriminator values: `"cupy"`, `"rmm-pool"`, `"rmm-safe"`,
   `"rmm-managed"`, `"none"` (before context init).
+- Explicit frees and every cached or one-shot CCCL launch use one completion-
+  retirement service. Explicit streams coalesce short windows; PTDS submissions
+  retain a lifetime-unique thread token and record their event in the submitting
+  thread. Arrays, iterator owners, and scratch tokens release when the event
+  completes without requiring a later vibeSpatial call or context sync.
+  Explicit synchronization releases only retirements claimed before its
+  boundary, so concurrent later submissions remain owned. Invocation failures
+  transfer operands to the same service before re-raising. Event-record or
+  event-query failures require a proven event, stream, or context boundary;
+  batches retry with bounded backoff while available boundaries fail.
+- Cached CCCL callables lease scratch per ordering domain. Their mutable
+  iterator binding is serialized only through launch, same-stream scratch
+  follows CUDA ordering, and explicit or per-thread concurrent streams receive
+  independent scratch so they can overlap without corrupting callable state.
+- A pylibcudf stream wrapper is attached to its CuPy stream object rather than
+  retained in a process-global handle cache. Transient wrappers therefore die
+  with their stream. Persistent values publish completion-scoped producer
+  readiness; cross-stream pylibcudf consumers enqueue an event dependency while
+  same-stream pipelines remain event-free.
 
 ## Compatibility
 

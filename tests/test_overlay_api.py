@@ -2944,7 +2944,7 @@ def test_grouped_overlay_difference_cover_owner_keeps_group_capacity() -> None:
     assert "device_select_owned_capacity_partitions(" in function_source
 
 
-def test_grouped_overlay_difference_keeps_indexed_views_for_grouped_topology(
+def test_grouped_overlay_difference_physicalizes_indexed_views_for_mutable_topology(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not vibespatial.has_gpu_runtime():
@@ -3001,7 +3001,7 @@ def test_grouped_overlay_difference_keeps_indexed_views_for_grouped_topology(
     assert result.row_count == 1
     assert shapely.symmetric_difference(actual, expected).area < 1.0e-8
     assert any(
-        event.implementation == "grouped_overlay_difference_row_indirected_topology_gpu"
+        event.implementation == "grouped_overlay_difference_topology_physicalization_gpu"
         for event in events
     )
     assert not any(
@@ -3015,7 +3015,7 @@ def test_grouped_overlay_difference_keeps_indexed_views_for_grouped_topology(
     )
 
 
-def test_grouped_overlay_difference_row_indirected_duplicate_indexed_rows(
+def test_grouped_overlay_difference_physicalized_duplicate_indexed_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not vibespatial.has_gpu_runtime():
@@ -3073,7 +3073,7 @@ def test_grouped_overlay_difference_row_indirected_duplicate_indexed_rows(
     for actual_geom, expected_geom in zip(actual, expected, strict=True):
         assert shapely.symmetric_difference(actual_geom, expected_geom).area < 1.0e-8
     assert any(
-        event.implementation == "grouped_overlay_difference_row_indirected_topology_gpu"
+        event.implementation == "grouped_overlay_difference_topology_physicalization_gpu"
         for event in events
     )
     assert not any(
@@ -3083,7 +3083,7 @@ def test_grouped_overlay_difference_row_indirected_duplicate_indexed_rows(
     assert any(event.implementation == "grouped_overlay_difference_gpu" for event in events)
 
 
-def test_grouped_overlay_difference_row_indirected_duplicate_multipolygon_rows(
+def test_grouped_overlay_difference_physicalized_duplicate_multipolygon_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not vibespatial.has_gpu_runtime():
@@ -3140,7 +3140,7 @@ def test_grouped_overlay_difference_row_indirected_duplicate_multipolygon_rows(
     for actual_geom, expected_geom in zip(actual, expected, strict=True):
         assert shapely.symmetric_difference(actual_geom, expected_geom).area < 1.0e-8
     assert any(
-        event.implementation == "grouped_overlay_difference_row_indirected_topology_gpu"
+        event.implementation == "grouped_overlay_difference_topology_physicalization_gpu"
         for event in events
     )
     assert not any(
@@ -10415,11 +10415,11 @@ def test_overlay_intersection_few_right_skips_non_polygon_inputs(
     def _fake_binary(op, left_arg, right_arg, **kwargs):
         assert op == "intersection"
         binary_calls.append(left_arg.row_count)
-        return left_arg
+        return GeometryNativeResult.from_owned(left_arg, crs=None)
 
     monkeypatch.setattr(
         constructive_module,
-        "binary_constructive_owned",
+        "binary_constructive_native",
         _fake_binary,
     )
 
@@ -11614,16 +11614,19 @@ def test_overlay_intersection_general_device_pairs_construct_before_host_export(
     def _fake_binary_constructive(*_args, **_kwargs):
         nonlocal constructive_started
         constructive_started = True
-        return from_shapely_geometries(
-            [box(1.0, 1.0, 2.0, 2.0), box(11.0, 1.0, 12.0, 2.0)],
-            residency=Residency.DEVICE,
+        return GeometryNativeResult.from_owned(
+            from_shapely_geometries(
+                [box(1.0, 1.0, 2.0, 2.0), box(11.0, 1.0, 12.0, 2.0)],
+                residency=Residency.DEVICE,
+            ),
+            crs=None,
         )
 
     monkeypatch.setattr(DeviceSpatialJoinResult, "left_to_host", _fail_device_pair_export)
     monkeypatch.setattr(DeviceSpatialJoinResult, "right_to_host", _fail_device_pair_export)
     monkeypatch.setattr(
         constructive_module,
-        "binary_constructive_owned",
+        "binary_constructive_native",
         _fake_binary_constructive,
     )
 
@@ -11640,6 +11643,83 @@ def test_overlay_intersection_general_device_pairs_construct_before_host_export(
     assert used_owned is True
     assert result["col1"].tolist() == [1, 2]
     assert result["col2"].tolist() == [10, 20]
+
+
+def test_overlay_intersection_general_pairs_preserve_mixed_native_composition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    import cupy as cp
+
+    from vibespatial.api._native_result_core import (
+        NativeGeometryComposition,
+        NativeGeometryCompositionPart,
+    )
+    from vibespatial.constructive import binary_constructive as constructive_module
+    from vibespatial.spatial.query_types import DeviceSpatialJoinResult
+
+    left = GeoDataFrame(
+        {"left_value": [1, 2]},
+        geometry=GeoSeries([box(0, 0, 3, 3), box(10, 0, 13, 3)]),
+    )
+    right = GeoDataFrame(
+        {"right_value": [10, 20]},
+        geometry=GeoSeries([box(1, 1, 2, 2), box(11, 1, 12, 2)]),
+    )
+    left_owned = from_shapely_geometries(list(left.geometry), residency=Residency.DEVICE)
+    right_owned = from_shapely_geometries(list(right.geometry), residency=Residency.DEVICE)
+    point_part = GeometryNativeResult.from_owned(
+        from_shapely_geometries([Point(1.0, 1.0)], residency=Residency.DEVICE),
+        crs=None,
+    )
+    polygon_part = GeometryNativeResult.from_owned(
+        from_shapely_geometries([box(11.0, 1.0, 12.0, 2.0)], residency=Residency.DEVICE),
+        crs=None,
+    )
+    native_composition = GeometryNativeResult.from_composition(
+        NativeGeometryComposition(
+            parts=(
+                NativeGeometryCompositionPart(
+                    geometry=point_part,
+                    output_rows=cp.asarray([0], dtype=cp.int64),
+                ),
+                NativeGeometryCompositionPart(
+                    geometry=polygon_part,
+                    output_rows=cp.asarray([1], dtype=cp.int64),
+                ),
+            ),
+            row_count=2,
+            crs=None,
+        ),
+        crs=None,
+    )
+
+    monkeypatch.setattr(
+        constructive_module,
+        "binary_constructive_native",
+        lambda *_args, **_kwargs: native_composition,
+    )
+    native_result, used_owned = overlay_module._overlay_intersection_native(
+        left,
+        right,
+        left_owned=left_owned,
+        right_owned=right_owned,
+        _prefer_exact_polygon_gpu=True,
+        _index_result=DeviceSpatialJoinResult(
+            cp.asarray([0, 1], dtype=cp.int32),
+            cp.asarray([0, 1], dtype=cp.int32),
+        ),
+    )
+
+    assert used_owned is True
+    assert isinstance(native_result, NativeTabularSelection)
+    assert native_result.capacity_result.geometry.composition is not None
+    exported = native_result.to_geodataframe()
+    assert exported["left_value"].tolist() == [1, 2]
+    assert exported["right_value"].tolist() == [10, 20]
+    assert exported.geometry.geom_type.tolist() == ["Point", "Polygon"]
 
 
 def test_overlay_intersection_few_right_device_pairs_stay_native(
@@ -11952,11 +12032,11 @@ def test_overlay_intersection_warning_path_prefers_pair_owned_gpu_boundary_for_s
             residency=Residency.DEVICE,
         )
         result._polygon_rect_boundary_overlap = cp.zeros(2, dtype=cp.bool_)
-        return result
+        return GeometryNativeResult.from_owned(result, crs=None)
 
     monkeypatch.setattr(
         constructive_module,
-        "binary_constructive_owned",
+        "binary_constructive_native",
         _fake_binary,
     )
     monkeypatch.setattr(
@@ -12382,6 +12462,99 @@ def test_overlay_difference_survives_strict_native_mode_for_small_overlap_polygo
     assert result.geometry.notna().all()
 
 
+def test_grouped_overlay_difference_does_not_mutate_source_validity() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    polygons = GeoDataFrame(
+        {"col1": [1, 2]},
+        geometry=GeoSeries(
+            [
+                Polygon([(1, 1), (3, 1), (3, 3), (1, 3)]),
+                Polygon([(3, 3), (5, 3), (5, 5), (3, 5)]),
+            ]
+        ),
+    )
+    lines = GeoDataFrame(
+        {"col3": [1, 2]},
+        geometry=GeoSeries(
+            [
+                LineString([(2, 0), (2, 4), (6, 4)]),
+                LineString([(0, 3), (6, 3)]),
+            ]
+        ),
+    )
+
+    with strict_native_environment():
+        polygon_owned, line_owned = overlay_module._coerce_owned_pair_for_strict_overlay(
+            polygons,
+            lines,
+            None,
+            None,
+        )
+        polygon_validity = cp.asarray(
+            polygon_owned._ensure_device_state(preserve_indexed_view=True).validity,
+            dtype=cp.bool_,
+        ).copy()
+        line_validity = cp.asarray(
+            line_owned._ensure_device_state(preserve_indexed_view=True).validity,
+            dtype=cp.bool_,
+        ).copy()
+        result, used_owned = overlay_module._overlay_symmetric_diff_native(
+            polygons,
+            lines,
+            polygon_owned,
+            line_owned,
+        )
+
+    assert used_owned is True
+    assert bool(cp.array_equal(polygon_owned.device_state.validity, polygon_validity))
+    assert bool(cp.array_equal(line_owned.device_state.validity, line_validity))
+    exported = result.to_geodataframe()
+    line_results = exported.loc[exported["col1"].isna(), "geometry"]
+    assert len(line_results) == 2
+    assert all(geometry.geom_type == "MultiLineString" for geometry in line_results)
+
+
+@pytest.mark.gpu
+def test_mixed_overlay_union_normalizes_assembled_polygons_like_geos() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    left = GeoDataFrame(
+        {"col1": [1, 2]},
+        geometry=GeoSeries(
+            [
+                Polygon([(1, 1), (3, 1), (3, 3), (1, 3)]),
+                Polygon([(3, 3), (5, 3), (5, 5), (3, 5)]),
+            ]
+        ),
+    )
+    right = GeoDataFrame(
+        {"col4": [1, 2]},
+        geometry=GeoSeries([Point(2, 2), Point(3, 3)]),
+    )
+
+    with strict_native_environment():
+        result = overlay(left, right, how="union", keep_geom_type=False)
+        expected_frame = read_file(
+            Path(
+                "tests/upstream/geopandas/tests/data/overlay/strict/"
+                "poly_point_union_False.geojson"
+            )
+        )
+        sort_columns = list(set(result.columns) - {"geometry"})
+        result = result.sort_values(sort_columns).reset_index(drop=True)
+        expected_frame = expected_frame.sort_values(sort_columns).reset_index(drop=True)
+        normalized_array = result.geometry.array.normalize()
+        expected_array = expected_frame.geometry.array.normalize()
+        normalized = np.asarray(normalized_array, dtype=object)
+        expected = np.asarray(expected_array, dtype=object)
+
+    assert shapely.equals_exact(normalized, expected, tolerance=0.0).all()
+
+
 def test_overlay_difference_preserves_left_geometry_name() -> None:
     left = (
         GeoDataFrame(
@@ -12474,3 +12647,22 @@ def test_overlay_touching_polygon_groups_do_not_merge_owned_difference_rows(
         polygon_only.iloc[0],
         Polygon([(-1, 1), (1, 1), (1, 3), (-1, 3)]),
     )
+@pytest.mark.gpu
+def test_reverse_device_relation_gather_is_sorted_and_independent() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    import cupy as cp
+
+    from vibespatial.spatial.query_types import DeviceSpatialJoinResult
+
+    forward_left = cp.asarray([1, 0, 1], dtype=cp.int32)
+    forward_right = cp.asarray([2, 3, 1], dtype=cp.int32)
+    reverse = overlay_module._reverse_intersecting_index_pairs(
+        DeviceSpatialJoinResult(forward_left, forward_right)
+    )
+
+    np.testing.assert_array_equal(reverse.d_left_idx.get(), np.asarray([1, 2, 3]))
+    np.testing.assert_array_equal(reverse.d_right_idx.get(), np.asarray([1, 1, 0]))
+    assert reverse.d_left_idx.data.ptr != forward_right.data.ptr
+    assert reverse.d_right_idx.data.ptr != forward_left.data.ptr

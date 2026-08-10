@@ -573,8 +573,10 @@ def _native_attribute_table_from_projected_frames(
         except ModuleNotFoundError:
             pass
         else:
+            from vibespatial.cuda._runtime import pylibcudf_table_from_arrow
+
             return NativeAttributeTable(
-                device_table=plc.Table.from_arrow(arrow_table),
+                device_table=pylibcudf_table_from_arrow(arrow_table),
                 index_override=index_override,
                 column_override=tuple(declared_names),
                 schema_override=arrow_table.schema,
@@ -1465,6 +1467,7 @@ def _device_attribute_table_from_column(
         import cupy as cp
         import pyarrow as pa
         import pylibcudf as plc
+        from vibespatial.cuda._runtime import pylibcudf_column_from_device
     except ModuleNotFoundError:
         return None
 
@@ -1477,7 +1480,7 @@ def _device_attribute_table_from_column(
         or np.issubdtype(dtype, np.bool_)
     ):
         return None
-    column = plc.Column.from_cuda_array_interface(d_values)
+    column = pylibcudf_column_from_device(d_values)
     return NativeAttributeTable(
         device_table=plc.Table([column]),
         index_override=index_override,

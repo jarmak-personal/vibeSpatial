@@ -32,6 +32,10 @@ except ImportError:
     _HAS_SIMDJSON = False
 
 
+from vibespatial.cuda._runtime import (
+    pylibcudf_column_from_arrow,
+    pylibcudf_scalar_from_py,
+)
 from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -447,15 +451,20 @@ def _require_pylibcudf_geojson_support() -> None:
 
 def _geojson_records_column(records: list[str]):
     import pyarrow as pa
-    import pylibcudf as plc
 
-    return plc.Column.from_arrow(pa.array(records))
+    return pylibcudf_column_from_arrow(pa.array(records))
 
 
 def _geojson_json_path_column(records_column, path: str):
     import pylibcudf as plc
 
-    return plc.json.get_json_object(records_column, plc.Scalar.from_py(path))
+    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+    return plc.json.get_json_object(
+        records_column,
+        pylibcudf_scalar_from_py(path),
+        stream=pylibcudf_current_stream(),
+    )
 
 
 def _decode_geojson_property_json_values(values: list[str | None]) -> list[dict[str, object]]:
@@ -470,7 +479,12 @@ def _decode_geojson_property_json_values(values: list[str | None]) -> list[dict[
 
 
 def _decode_geojson_properties_column(properties_column) -> list[dict[str, object]]:
-    return _decode_geojson_property_json_values(properties_column.to_arrow().to_pylist())
+    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+    stream = pylibcudf_current_stream()
+    return _decode_geojson_property_json_values(
+        properties_column.to_arrow(stream=stream).to_pylist()
+    )
 
 
 def _load_geojson_properties_from_text(text: str) -> list[dict[str, object]]:
@@ -699,11 +713,15 @@ def _decode_geojson_gpu_coordinates_view(
 ) -> GeoArrowBufferView:
     import pylibcudf as plc
 
+    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+    stream = pylibcudf_current_stream()
     geometry_table = plc.io.json.read_json_from_string_column(
         coordinates_column,
-        plc.Scalar.from_py("\n"),
-        plc.Scalar.from_py("null"),
-    ).tbl.to_arrow()
+        pylibcudf_scalar_from_py("\n"),
+        pylibcudf_scalar_from_py("null"),
+        stream=stream,
+    ).tbl.to_arrow(stream=stream)
     x_array = geometry_table.column(0).combine_chunks()
     y_array = geometry_table.column(1).combine_chunks()
     if family is GeometryFamily.POINT:
@@ -724,11 +742,15 @@ def _decode_geojson_gpu_geometry_view(
 ) -> GeoArrowBufferView:
     import pylibcudf as plc
 
+    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+    stream = pylibcudf_current_stream()
     geometry_table = plc.io.json.read_json_from_string_column(
         geometry_column,
-        plc.Scalar.from_py("\n"),
-        plc.Scalar.from_py("null"),
-    ).tbl.to_arrow()
+        pylibcudf_scalar_from_py("\n"),
+        pylibcudf_scalar_from_py("null"),
+        stream=stream,
+    ).tbl.to_arrow(stream=stream)
     coords_array = geometry_table.column(1).combine_chunks()
     if family is GeometryFamily.POLYGON:
         return _decode_geojson_polygon_geometry_view(coords_array, family)
@@ -757,17 +779,25 @@ def _read_geojson_owned_pylibcudf_arrays(text: str) -> GeoJSONOwnedBatch | None:
     import pyarrow as pa
     import pylibcudf as plc
 
-    feature_collection = plc.Column.from_arrow(pa.array([text]))
+    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+    stream = pylibcudf_current_stream()
+    feature_collection = pylibcudf_column_from_arrow(pa.array([text]))
     type_array_json = plc.json.get_json_object(
         feature_collection,
-        plc.Scalar.from_py("$.features[*].geometry.type"),
+        pylibcudf_scalar_from_py("$.features[*].geometry.type"),
+        stream=stream,
     )
     type_table = plc.io.json.read_json_from_string_column(
         type_array_json,
-        plc.Scalar.from_py("\n"),
-        plc.Scalar.from_py("null"),
+        pylibcudf_scalar_from_py("\n"),
+        pylibcudf_scalar_from_py("null"),
+        stream=stream,
     ).tbl
-    geometry_type_array = plc.concatenate.concatenate(type_table.columns()).to_arrow()
+    geometry_type_array = plc.concatenate.concatenate(
+        type_table.columns(),
+        stream=stream,
+    ).to_arrow(stream=stream)
     geometry_types = geometry_type_array.to_pylist()
     families = {
         _geometry_family_from_geojson_name(name) for name in geometry_types if name is not None
@@ -779,14 +809,19 @@ def _read_geojson_owned_pylibcudf_arrays(text: str) -> GeoJSONOwnedBatch | None:
 
     coordinates_array_json = plc.json.get_json_object(
         feature_collection,
-        plc.Scalar.from_py("$.features[*].geometry.coordinates"),
+        pylibcudf_scalar_from_py("$.features[*].geometry.coordinates"),
+        stream=stream,
     )
     coordinate_table = plc.io.json.read_json_from_string_column(
         coordinates_array_json,
-        plc.Scalar.from_py("\n"),
-        plc.Scalar.from_py("null"),
+        pylibcudf_scalar_from_py("\n"),
+        pylibcudf_scalar_from_py("null"),
+        stream=stream,
     ).tbl
-    coordinate_array = plc.concatenate.concatenate(coordinate_table.columns()).to_arrow()
+    coordinate_array = plc.concatenate.concatenate(
+        coordinate_table.columns(),
+        stream=stream,
+    ).to_arrow(stream=stream)
     validity = np.asarray(geometry_type_array.is_valid().to_numpy(zero_copy_only=False), dtype=bool)
     tags = np.full(len(geometry_types), -1, dtype=np.int8)
     family_row_offsets = np.full(len(geometry_types), -1, dtype=np.int32)
@@ -848,15 +883,25 @@ def _read_geojson_owned_pylibcudf_rowized(text: str) -> GeoJSONOwnedBatch | None
     import pyarrow as pa
     import pylibcudf as plc
 
-    feature_collection = plc.Column.from_arrow(pa.array([text]))
-    features_array = plc.json.get_json_object(feature_collection, plc.Scalar.from_py("$.features"))
+    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+    stream = pylibcudf_current_stream()
+    feature_collection = pylibcudf_column_from_arrow(pa.array([text]))
+    features_array = plc.json.get_json_object(
+        feature_collection,
+        pylibcudf_scalar_from_py("$.features"),
+        stream=stream,
+    )
     try:
         parsed = plc.io.json.read_json_from_string_column(
             features_array,
-            plc.Scalar.from_py("\n"),
-            plc.Scalar.from_py("null"),
+            pylibcudf_scalar_from_py("\n"),
+            pylibcudf_scalar_from_py("null"),
+            stream=stream,
         ).tbl
-        rowized = plc.reshape.interleave_columns(parsed).to_arrow()
+        rowized = plc.reshape.interleave_columns(parsed, stream=stream).to_arrow(
+            stream=stream
+        )
     except RuntimeError:
         return None
 
@@ -902,8 +947,11 @@ def _read_geojson_owned_pylibcudf(text: str) -> GeoJSONOwnedBatch:
     records_column = _geojson_records_column(records)
     geometry_type_column = _geojson_json_path_column(records_column, "$.geometry.type")
     properties_column = _geojson_json_path_column(records_column, "$.properties")
-    geometry_types = geometry_type_column.to_arrow().to_pylist()
-    properties_json = properties_column.to_arrow().to_pylist()
+    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+    stream = pylibcudf_current_stream()
+    geometry_types = geometry_type_column.to_arrow(stream=stream).to_pylist()
+    properties_json = properties_column.to_arrow(stream=stream).to_pylist()
 
     row_count = len(records)
     validity = np.zeros(row_count, dtype=bool)

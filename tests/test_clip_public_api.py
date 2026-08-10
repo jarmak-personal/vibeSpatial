@@ -1220,6 +1220,204 @@ def test_clip_polygon_area_and_boundary_remnants_use_native_composition() -> Non
     assert shapely.equals(exported.geometry.iloc[0], expected)
 
 
+@pytest.mark.gpu
+def test_clip_geometrycollection_ingress_uses_native_grouped_union() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    from vibespatial.api._native_result_core import NativeTabularSelection
+    from vibespatial.api.tools.clip import evaluate_geopandas_clip_native
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.runtime.residency import Residency
+
+    source_geometry = GeometryCollection(
+        [
+            Point(2.0, 3.0),
+            Polygon(
+                [
+                    (3.0, 4.0),
+                    (5.0, 2.0),
+                    (12.0, 2.0),
+                    (10.0, 5.0),
+                    (9.0, 7.5),
+                    (3.0, 4.0),
+                ]
+            ),
+        ]
+    )
+    source = vibespatial.GeoDataFrame(
+        {"value": [7], "geometry": [source_geometry]},
+        crs="EPSG:3857",
+    )
+    mask = box(0.0, 0.0, 10.0, 10.0)
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    native_result = evaluate_geopandas_clip_native(source, mask)
+
+    assert isinstance(native_result, NativeTabularSelection)
+    composition = native_result.capacity_result.geometry.composition
+    assert composition is not None
+    assert composition.residency is Residency.DEVICE
+    assert all(part.collection_position is None for part in composition.parts)
+    assert get_d2h_transfer_events(clear=True) == []
+
+    with pytest.warns(UserWarning, match="GeometryCollection"):
+        result = clip(source, mask, keep_geom_type=True)
+    expected = shapely.intersection(source_geometry, mask)
+    assert result["value"].tolist() == [7]
+    assert result.geometry.iloc[0].geom_type == "GeometryCollection"
+    assert shapely.equals(result.geometry.iloc[0], expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "source_geometry",
+    [
+        GeometryCollection(
+            [
+                Point(1.0, 1.0),
+                box(0.0, 0.0, 2.0, 2.0),
+                GeometryCollection([Point(4.0, 4.0)]),
+            ]
+        ),
+        GeometryCollection(
+            [
+                box(0.0, 0.0, 2.0, 2.0),
+                box(1.0, 0.0, 3.0, 2.0),
+            ]
+        ),
+    ],
+    ids=["covered-point-and-nested-member", "overlapping-polygons"],
+)
+def test_clip_geometrycollection_grouped_union_matches_geos(source_geometry) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    source = vibespatial.GeoDataFrame(
+        {"value": [11], "geometry": [source_geometry]},
+        crs="EPSG:3857",
+    )
+    mask = box(-1.0, -1.0, 5.0, 5.0)
+
+    result = clip(source, mask)
+    expected = shapely.intersection(source_geometry, mask)
+
+    assert result["value"].tolist() == [11]
+    assert shapely.equals_exact(
+        shapely.normalize(result.geometry.iloc[0]),
+        shapely.normalize(expected),
+        tolerance=1e-12,
+    )
+
+
+@pytest.mark.gpu
+def test_clip_geometrycollection_drops_fully_covered_point_members() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    source_geometry = GeometryCollection(
+        [
+            box(0.0, 0.0, 2.0, 2.0),
+            Point(1.0, 1.0),
+        ]
+    )
+    source = vibespatial.GeoDataFrame(
+        {"value": [11], "geometry": [source_geometry]},
+        crs="EPSG:3857",
+    )
+    mask = box(-1.0, -1.0, 3.0, 3.0)
+
+    result = clip(source, mask)
+    expected = shapely.intersection(source_geometry, mask)
+
+    assert result["value"].tolist() == [11]
+    assert shapely.equals_exact(
+        shapely.normalize(result.geometry.iloc[0]),
+        shapely.normalize(expected),
+        tolerance=1e-12,
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "source_geometry",
+    [
+        GeometryCollection([Point(9.0, 9.0)]),
+        GeometryCollection([Point()]),
+    ],
+    ids=["fully-excluded", "empty-member"],
+)
+def test_clip_geometrycollection_zero_output_skips_grouped_reduction(
+    source_geometry,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    source = vibespatial.GeoDataFrame(
+        {"value": [11], "geometry": [source_geometry]},
+        crs="EPSG:3857",
+    )
+
+    result = clip(source, box(0.0, 0.0, 1.0, 1.0))
+
+    assert result.empty
+    assert result.columns.tolist() == ["value", "geometry"]
+
+
+@pytest.mark.gpu
+def test_clip_geometrycollection_grouped_union_honors_public_index_sort() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    source = vibespatial.GeoDataFrame(
+        {
+            "value": [20, 10],
+            "geometry": [
+                GeometryCollection([box(4.0, 0.0, 5.0, 1.0), Point(6.0, 0.5)]),
+                GeometryCollection([box(0.0, 0.0, 1.0, 1.0), Point(2.0, 0.5)]),
+            ],
+        },
+        index=[20, 10],
+        crs="EPSG:3857",
+    )
+
+    result = clip(source, box(-1.0, -1.0, 7.0, 2.0), sort=True)
+
+    assert result.index.tolist() == [10, 20]
+    assert result["value"].tolist() == [10, 20]
+
+
+@pytest.mark.gpu
+def test_clip_geometrycollection_probe_does_not_materialize_device_source() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.geometry.owned import from_shapely_geometries
+    from vibespatial.runtime.residency import Residency
+
+    owned = from_shapely_geometries(
+        [box(-1.0, -1.0, 2.0, 2.0)],
+        residency=Residency.DEVICE,
+    )
+    source = vibespatial.GeoDataFrame(
+        {
+            "value": [1],
+            "geometry": DeviceGeometryArray._from_owned(owned, crs="EPSG:3857"),
+        },
+        crs="EPSG:3857",
+    )
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    result = clip(source, box(0.0, 0.0, 1.0, 1.0))
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert result["value"].tolist() == [1]
+    assert not any(reason.startswith("owned geometry") for reason in reasons)
+
+
 def test_clip_rectangle_keep_geom_type_device_candidates_use_native_rowsets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

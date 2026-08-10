@@ -25,9 +25,11 @@ from vibespatial.geometry.geometry_analysis_host import (
     compute_geometry_bounds_cpu_vectorized as _compute_geometry_bounds_cpu_vectorized_host,
 )
 from vibespatial.geometry.owned import (
+    FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
+    device_family_coordinate_counts,
 )
 from vibespatial.kernels.core.geometry_analysis_source import (
     _BOUNDS_COOPERATIVE_KERNEL_NAMES,
@@ -146,12 +148,17 @@ def _launch_family_bounds_kernel(
     device_buffer: DeviceFamilyGeometryBuffer,
     *,
     row_count: int,
+    source_rows=None,
+    out_bounds=None,
     compute_type: str = "double",
 ) -> None:
     if row_count == 0:
         return
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
+    target = device_buffer.bounds if out_bounds is None else out_bounds
+    if target is None:
+        raise RuntimeError("family bounds launch requires an output carrier")
     kernel = _bounds_kernels(compute_type)[_family_kernel_name(family)]
     if family in {GeometryFamily.POINT, GeometryFamily.LINESTRING, GeometryFamily.MULTIPOINT}:
         params = (
@@ -160,10 +167,12 @@ def _launch_family_bounds_kernel(
                 ptr(device_buffer.y),
                 ptr(device_buffer.geometry_offsets),
                 ptr(device_buffer.empty_mask),
-                ptr(device_buffer.bounds),
+                0 if source_rows is None else ptr(source_rows),
+                ptr(target),
                 row_count,
             ),
             (
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
@@ -180,10 +189,12 @@ def _launch_family_bounds_kernel(
                 ptr(device_buffer.geometry_offsets),
                 ptr(device_buffer.ring_offsets),
                 ptr(device_buffer.empty_mask),
-                ptr(device_buffer.bounds),
+                0 if source_rows is None else ptr(source_rows),
+                ptr(target),
                 row_count,
             ),
             (
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
@@ -201,10 +212,12 @@ def _launch_family_bounds_kernel(
                 ptr(device_buffer.geometry_offsets),
                 ptr(device_buffer.part_offsets),
                 ptr(device_buffer.empty_mask),
-                ptr(device_buffer.bounds),
+                0 if source_rows is None else ptr(source_rows),
+                ptr(target),
                 row_count,
             ),
             (
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
@@ -223,10 +236,12 @@ def _launch_family_bounds_kernel(
                 ptr(device_buffer.part_offsets),
                 ptr(device_buffer.ring_offsets),
                 ptr(device_buffer.empty_mask),
-                ptr(device_buffer.bounds),
+                0 if source_rows is None else ptr(source_rows),
+                ptr(target),
                 row_count,
             ),
             (
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
@@ -270,6 +285,8 @@ def _launch_family_bounds_cooperative(
     device_buffer: DeviceFamilyGeometryBuffer,
     *,
     row_count: int,
+    source_rows=None,
+    out_bounds=None,
     compute_type: str = "double",
 ) -> None:
     """Launch cooperative (block-per-geometry) bounds kernel for polygon/multipolygon."""
@@ -277,6 +294,9 @@ def _launch_family_bounds_cooperative(
         return
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
+    target = device_buffer.bounds if out_bounds is None else out_bounds
+    if target is None:
+        raise RuntimeError("cooperative family bounds launch requires an output carrier")
     cooperative_kernels = _bounds_cooperative_kernels(compute_type)
     if family is GeometryFamily.POLYGON:
         kernel = cooperative_kernels["bounds_polygon_cooperative"]
@@ -287,10 +307,12 @@ def _launch_family_bounds_cooperative(
                 ptr(device_buffer.geometry_offsets),
                 ptr(device_buffer.ring_offsets),
                 ptr(device_buffer.empty_mask),
-                ptr(device_buffer.bounds),
+                0 if source_rows is None else ptr(source_rows),
+                ptr(target),
                 row_count,
             ),
             (
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
@@ -310,10 +332,12 @@ def _launch_family_bounds_cooperative(
                 ptr(device_buffer.part_offsets),
                 ptr(device_buffer.ring_offsets),
                 ptr(device_buffer.empty_mask),
-                ptr(device_buffer.bounds),
+                0 if source_rows is None else ptr(source_rows),
+                ptr(target),
                 row_count,
             ),
             (
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
@@ -339,6 +363,58 @@ def _launch_family_bounds_cooperative(
     )
 
 
+def _launch_selected_family_bounds(
+    family: GeometryFamily,
+    device_buffer: DeviceFamilyGeometryBuffer,
+    source_rows,
+    out_bounds,
+    *,
+    compute_type: str,
+) -> None:
+    """Bin selected rows by their own coordinate spans before launching."""
+    row_count = int(source_rows.size)
+    if family not in {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}:
+        _launch_family_bounds_kernel(
+            family,
+            device_buffer,
+            row_count=row_count,
+            source_rows=source_rows,
+            out_bounds=out_bounds,
+            compute_type=compute_type,
+        )
+        return
+    coordinate_counts = device_family_coordinate_counts(device_buffer, source_rows)
+    cooperative_positions = cp.flatnonzero(
+        coordinate_counts >= _COOPERATIVE_BOUNDS_THRESHOLD
+    ).astype(cp.int32, copy=False)
+    serial_positions = cp.flatnonzero(coordinate_counts < _COOPERATIVE_BOUNDS_THRESHOLD).astype(
+        cp.int32, copy=False
+    )
+    for positions, launch in (
+        (serial_positions, _launch_family_bounds_kernel),
+        (cooperative_positions, _launch_family_bounds_cooperative),
+    ):
+        selected_count = int(positions.size)
+        if selected_count == 0:
+            continue
+        selected_source_rows = source_rows[positions]
+        selected_out = (
+            out_bounds
+            if selected_count == row_count
+            else cp.empty((selected_count, 4), dtype=cp.float64)
+        )
+        launch(
+            family,
+            device_buffer,
+            row_count=selected_count,
+            source_rows=selected_source_rows,
+            out_bounds=selected_out,
+            compute_type=compute_type,
+        )
+        if selected_out is not out_bounds:
+            out_bounds[positions] = selected_out
+
+
 def _compute_geometry_bounds_gpu_impl(
     geometry_array: OwnedGeometryArray,
     compute_type: str = "double",
@@ -356,6 +432,7 @@ def _compute_geometry_bounds_gpu_impl(
     preserving_indexed_view = preserve_indexed_view and getattr(
         geometry_array, "is_indexed_view", False
     )
+    cooperative_families = frozenset({GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON})
     if state.row_bounds is not None:
         if materialize_host:
             if _has_host_routing_metadata(geometry_array):
@@ -370,8 +447,49 @@ def _compute_geometry_bounds_gpu_impl(
                 geometry_array.cache_bounds(bounds)
             return bounds
         return cp.asarray(state.row_bounds)
+    if preserving_indexed_view:
+        d_validity = cp.asarray(state.validity, dtype=cp.bool_)
+        d_tags = cp.asarray(state.tags, dtype=cp.int8)
+        d_family_rows = cp.asarray(state.family_row_offsets, dtype=cp.int32)
+        out_bounds = cp.full(
+            (geometry_array.row_count, 4),
+            cp.nan,
+            dtype=cp.float64,
+        )
+        for family, device_buffer in state.families.items():
+            d_global_rows = cp.flatnonzero(
+                d_validity & (d_tags == cp.int8(FAMILY_TAGS[family]))
+            ).astype(cp.int64, copy=False)
+            if int(d_global_rows.size) == 0:
+                continue
+            d_selected_rows, d_inverse = cp.unique(
+                d_family_rows[d_global_rows],
+                return_inverse=True,
+            )
+            d_selected_rows = d_selected_rows.astype(cp.int32, copy=False)
+            work_count = int(d_selected_rows.size)
+            d_selected_bounds = cp.empty((work_count, 4), dtype=cp.float64)
+            _launch_selected_family_bounds(
+                family,
+                device_buffer,
+                d_selected_rows,
+                d_selected_bounds,
+                compute_type=compute_type,
+            )
+            if work_count == _device_buffer_row_count(device_buffer):
+                device_buffer.bounds = d_selected_bounds
+            out_bounds[d_global_rows] = d_selected_bounds[d_inverse]
+        state.row_bounds = out_bounds
+        if materialize_host:
+            bounds = runtime.copy_device_to_host(
+                out_bounds,
+                reason="geometry analysis indexed row-bounds host export",
+            )
+            if _has_host_routing_metadata(geometry_array):
+                geometry_array.cache_bounds(bounds)
+            return bounds
+        return out_bounds
     temp_bounds: list[tuple[GeometryFamily, DeviceFamilyGeometryBuffer, object]] = []
-    _cooperative_families = frozenset({GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON})
     try:
         for family, device_buffer in state.families.items():
             if device_buffer.bounds is None:
@@ -388,7 +506,7 @@ def _compute_geometry_bounds_gpu_impl(
                 # Use cooperative (block-per-geometry) kernel when family supports it
                 # and geometries are complex enough to benefit from warp-level reduction.
                 use_cooperative = (
-                    family in _cooperative_families
+                    family in cooperative_families
                     and (
                         _avg_coords_per_geometry(host_buffer)
                         if host_buffer is not None

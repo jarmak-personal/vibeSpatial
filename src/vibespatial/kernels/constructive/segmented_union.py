@@ -2186,7 +2186,10 @@ def segmented_union_all_device_grouped(
                 active_group_mask=d_direct_groups,
                 assume_active_groups_disjoint=True,
             )
-            if direct is None or direct.row_count != output_row_count:
+            if direct is None:
+                direct = empty_output
+                d_direct_groups = cp.zeros_like(d_direct_groups, dtype=cp.bool_)
+            if direct.row_count != output_row_count:
                 raise RuntimeError("grouped disjoint partition assembly failed")
             d_positions = cp.arange(geometries.row_count, dtype=cp.int64)
             d_group_local = cp.searchsorted(

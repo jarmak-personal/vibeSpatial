@@ -24,7 +24,7 @@ Section Map (Body Lines)
 | 170-203 | Next Autonomous Push Queue |
 | 204-221 | Acceptance |
 | 222-233 | Tracking |
-| 234-313 | Fresh Session Handoff |
+| 234-314 | Fresh Session Handoff |
 | ... | (1 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -300,9 +300,9 @@ And it must satisfy all of:
   Identity, planar union, and symmetric difference compose those native components. The old pairwise-union semantics, no-candidate early return, per-group stream executor, boundary exports, centroid rescue, and Shapely fallback are deleted; the explicit CPU oracle is isolated in `overlay.host_fallback`.
   Grouped rectangle-strip/exact and positive-area/degenerate routing are complementary capacity partitions with no two-flag packet. Grouped-union residual closure retains one initial logical-count admission to avoid an empty regroup/merge; the duplicate post-repair difference/area pass and scalar are deleted because exact closure is `C union (I difference C)`.
   Compact `NativeRowSet` conversion occurs only at the explicit `NativeTabularSelection` consumer/export boundary; structural constructive failures remain atomic.
-- P6: every planner call carries physical shape, prefers authoritative device
-  families, and scales indexed logical rows. Compute uses row indirection or named
-  physicalization; `ARCH009` confines `_device_resolve` to owned internals.
+- P6: every planner call carries physical shape and authoritative device families.
+  Indexed metrics compact unique rows, bin selected coordinate spans on device, and scatter by inverse;
+  other compute uses named row indirection/physicalization, and `ARCH009` confines `_device_resolve` to owned internals.
 - Unary stroke admission physicalizes resident indexed logical rows before family dispatch; unreferenced ancestral buffers cannot trigger mixed fallback, and admitted kernel failures are atomic.
 - P4: polygon clip predicates carry indexed source rows and candidate-local outputs
   through device-counted capacity selections; rectangle specialization does not compact or scalar-probe tags.
@@ -315,34 +315,34 @@ And it must satisfy all of:
   proofs avoid ordinary semantic probes. Clip cleanup combines nonempty, area,
   and keep-type filters in one capacity selection. Degenerate line parts use
   segmented exact deduplication and compensated fp64 Point-capacity reduction.
-- Current instrumented 10K repeat-3 checkpoint (August 7, 2026): 14/14 exact,
-  GeoPandas 3527.5ms versus vibeSpatial 2826.2ms (1.248x), zero fallbacks,
-  219 total materializations, and 467 runtime D2H transfers. The 211
-  stage-attributed materializations are 154 public exports and 57 explicit
-  public-operation compatibility conversions; 24 of the latter are eight-byte
-  dynamic row-count reads required to construct exact-length pandas results.
-  These totals are boundary diagnostics, not native-compute work. Site
-  suitability is 3.78x, retail screening 2.29x, redevelopment 2.04x, and
-  vegetation 1.19x faster than GeoPandas.
-- Full 1M sparkline (August 7, 2026): maximum active stage 70.50ms; grouped
-  disjoint setup 65.88ms, mixed union 50.64ms, grouped union 33.91ms, grouped
-  difference 10.86ms, and relation intersection 1.84ms. Native compute reports
-  zero materializations and zero D2H; terminal output reports one
-  materialization and zero runtime D2H at 1M. Two raster cases remain expected
+- Runtime ordering is explicit across driver, pylibcudf, and CCCL on CuPy's current
+  stream. One service retires frees and all CCCL operands; PTDS retains lifetime-unique
+  identity and submitter-recorded events. Cached calls lease ordered scratch;
+  invocation failures transfer ownership before re-raising, and explicit sync claims only prior work.
+  Event API failures require a proven boundary and bounded retry. Pylibcudf wrappers, producers,
+  and value-aware consumers follow stream completion.
+  This keeps habitat at 218.6ms in final repeat-3 while preserving asynchronous overlap.
+- GeometryCollection clip ingress lowers members to concrete device parts and performs
+  source-row grouped mixed union: polygon coverage is unioned,
+  lines are noded outside area, covered points are removed, and nested members plus overlapping polygons match normalized GEOS constructive
+  output; ordinary device-owned sources still bypass the host type probe.
+- Final 10K repeat-3 (August 7, 2026): 14/14 exact, GeoPandas 3328.6ms versus
+  vibeSpatial 2771.8ms (1.201x), zero failures. Site suitability is 3.53x,
+  retail 2.19x, redevelopment 2.00x, and vegetation 1.16x faster than
+  GeoPandas.
+- Final full 1M sparkline: maximum active stage 69.82ms; grouped disjoint setup
+  63.91ms, mixed union 50.90ms, grouped union 34.25ms, grouped difference
+  10.59ms, and relation intersection 1.78ms. Every active pipeline reports zero
+  compute materialization and zero compute D2H. Two raster cases remain expected
   feature deferrals.
-- Correctness hardening now covers equal-cardinality reordered indexed metrics,
-  copy-on-write native attribute mutation, detached native-expression assignment,
-  canonical MultiLineString/MultiPoint normalization, strict-interior polygon
-  representative points, and GEOS-compatible lineal/polygonal topological
-  equality. The complete upstream overlay gate passes 128 tests and the
-  remaining upstream tail passes 419 tests. The final uninterrupted local and
-  vendored-upstream suite passes 6,979 tests with 434 optional-dependency skips,
-  7 expected xfails, and zero failures.
+- Correctness gates pass: strict-native upstream is 1,971 passed / 423 skipped /
+  5 xfailed; contract health passes every surface; the focused carrier suite is
+  612 passed; and the uninterrupted local plus vendored-upstream suite is 7,028
+  passed / 434 skipped / 7 xfailed with zero failures.
 
 ## Completion State
 
-The PRD is complete when deterministic gates and the uninterrupted full suite
-remain green at landing. The measured acceptance evidence above already proves
-the physical-shape conditions: no native compute materialization or D2H, no
-fallbacks in the 10K or full profile, no active 1M stage above 100ms, exact 10K
-fingerprints, and only explicit public compatibility/export boundaries.
+The PRD is complete. Deterministic, contract, strict-native, focused, benchmark,
+and uninterrupted full-suite gates are green. Native compute has no measured
+materialization or D2H, every active 1M stage is below 100ms, all 10K fingerprints
+are exact, and remaining public compatibility/export boundaries are explicit.

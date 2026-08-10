@@ -302,7 +302,6 @@ def _normalize_polygon_family_gpu(
     d_y_out = runtime.allocate((total_coords,), np.float64)
     hierarchy_inputs_to_free = []
     hierarchy_outputs_to_free = []
-    d_is_exterior = None
 
     try:
         if needs_free:
@@ -324,13 +323,22 @@ def _normalize_polygon_family_gpu(
                 )
                 hierarchy_inputs_to_free.append(d_part_offsets_input)
 
-        import cupy as cp
-
-        d_is_exterior = cp.zeros(total_rings, dtype=cp.uint8)
         d_shell_offsets = (
             d_geometry_offsets_input if family is GeometryFamily.POLYGON else d_part_offsets_input
         )
-        d_is_exterior[cp.asarray(d_shell_offsets, dtype=cp.int64)[:-1]] = 1
+        shell_count = (
+            active_geometry_count
+            if family is GeometryFamily.POLYGON and device_buffer is not None
+            else (
+                int(buf.row_count)
+                if family is GeometryFamily.POLYGON
+                else (
+                    active_part_count
+                    if device_buffer is not None
+                    else int(buf.part_offsets.size) - 1
+                )
+            )
+        )
         ptr = runtime.pointer
 
         params = (
@@ -340,7 +348,8 @@ def _normalize_polygon_family_gpu(
                 ptr(d_x_out),
                 ptr(d_y_out),
                 ptr(d_ring_offsets),
-                ptr(d_is_exterior),
+                ptr(d_shell_offsets),
+                shell_count,
                 center_x,
                 center_y,
                 total_rings,
@@ -352,6 +361,7 @@ def _normalize_polygon_family_gpu(
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
                 KERNEL_PARAM_F64,
                 KERNEL_PARAM_F64,
                 KERNEL_PARAM_I32,
@@ -362,6 +372,14 @@ def _normalize_polygon_family_gpu(
 
         d_rotated_x = d_x_out
         d_rotated_y = d_y_out
+        polygon_rows_have_at_most_one_ring = (
+            family is GeometryFamily.POLYGON
+            and bool(
+                np.all(
+                    np.diff(buf.geometry_offsets[: int(buf.row_count) + 1]) <= 1
+                )
+            )
+        )
         (
             d_canonical_x,
             d_canonical_y,
@@ -376,11 +394,12 @@ def _normalize_polygon_family_gpu(
             d_geometry_offsets_input,
             d_part_offsets_input,
             total_coords=total_coords,
+            polygon_rows_have_at_most_one_ring=polygon_rows_have_at_most_one_ring,
         )
         if d_canonical_x is not d_rotated_x:
-            runtime.free(d_rotated_x)
+            hierarchy_outputs_to_free.append(d_rotated_x)
         if d_canonical_y is not d_rotated_y:
-            runtime.free(d_rotated_y)
+            hierarchy_outputs_to_free.append(d_rotated_y)
         d_x_out = d_canonical_x
         d_y_out = d_canonical_y
         for output, source in (
@@ -423,7 +442,6 @@ def _normalize_polygon_family_gpu(
             runtime.free(d)
         for d in hierarchy_outputs_to_free:
             runtime.free(d)
-        runtime.free(d_is_exterior)
         for d in (d_x_out, d_y_out):
             runtime.free(d)
 
@@ -449,6 +467,7 @@ def _canonicalize_polygon_hierarchy_device(
     d_part_offsets,
     *,
     total_coords: int,
+    polygon_rows_have_at_most_one_ring: bool = False,
 ):
     """Order polygon rings and parts in GEOS canonical descending order.
 
@@ -466,6 +485,8 @@ def _canonicalize_polygon_hierarchy_device(
     ring_count = int(d_ring_offsets.size) - 1
     if ring_count <= 1:
         return d_x, d_y, d_geometry_offsets, d_part_offsets, d_ring_offsets.astype(cp.int32)
+    if family is GeometryFamily.POLYGON and polygon_rows_have_at_most_one_ring:
+        return d_x, d_y, d_geometry_offsets, None, d_ring_offsets.astype(cp.int32)
 
     d_ring_ids = cp.arange(ring_count, dtype=cp.int32)
     d_ring_starts = d_ring_offsets[:-1]
@@ -678,10 +699,10 @@ def _normalize_linestring_family_gpu(
                 )
             )
             if d_x_out is not d_x:
-                runtime.free(d_x)
+                hierarchy_outputs_to_free.append(d_x)
                 d_x = d_x_out
             if d_y_out is not d_y:
-                runtime.free(d_y)
+                hierarchy_outputs_to_free.append(d_y)
                 d_y = d_y_out
             if d_part_offsets_out is not d_part_offsets:
                 hierarchy_outputs_to_free.append(d_part_offsets_out)

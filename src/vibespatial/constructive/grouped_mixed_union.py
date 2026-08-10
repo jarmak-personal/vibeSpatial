@@ -221,8 +221,22 @@ def pack_point_part_capacity_device(
     )
     d_point_offsets = cp.asarray(point_buffer.geometry_offsets, dtype=cp.int64)
     d_coord_rows = d_point_offsets[d_family_rows]
-    d_point_x = cp.asarray(point_buffer.x, dtype=cp.float64)[d_coord_rows].copy()
-    d_point_y = cp.asarray(point_buffer.y, dtype=cp.float64)[d_coord_rows].copy()
+    d_source_x = cp.asarray(point_buffer.x, dtype=cp.float64)
+    d_source_y = cp.asarray(point_buffer.y, dtype=cp.float64)
+    source_coord_capacity = int(d_source_x.size)
+    d_safe_coord_rows = cp.where(
+        d_sorted_active,
+        d_coord_rows,
+        cp.int64(source_coord_capacity),
+    )
+    d_padded_x = cp.empty(source_coord_capacity + 1, dtype=cp.float64)
+    d_padded_y = cp.empty(source_coord_capacity + 1, dtype=cp.float64)
+    d_padded_x[:source_coord_capacity] = d_source_x
+    d_padded_y[:source_coord_capacity] = d_source_y
+    d_padded_x[source_coord_capacity] = 0.0
+    d_padded_y[source_coord_capacity] = 0.0
+    d_point_x = d_padded_x[d_safe_coord_rows]
+    d_point_y = d_padded_y[d_safe_coord_rows]
     gathered_point_buffer = DeviceFamilyGeometryBuffer(
         family=GeometryFamily.POINT,
         x=d_point_x,

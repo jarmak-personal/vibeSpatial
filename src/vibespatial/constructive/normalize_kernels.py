@@ -19,7 +19,8 @@ extern "C" __global__ void normalize_ring_rotate(
     double* __restrict__ x_out,
     double* __restrict__ y_out,
     const int* __restrict__ ring_offsets,
-    const unsigned char* __restrict__ is_exterior,
+    const int* __restrict__ shell_offsets,
+    int shell_count,
     double center_x,
     double center_y,
     int total_rings
@@ -78,7 +79,15 @@ extern "C" __global__ void normalize_ring_rotate(
             break;
         }}
     }}
-    if (is_exterior[ring] == 0u) reverse = !reverse;
+    int shell_low = 0;
+    int shell_high = shell_count;
+    while (shell_low < shell_high) {{
+        const int middle = shell_low + (shell_high - shell_low) / 2;
+        if (shell_offsets[middle] < ring) shell_low = middle + 1;
+        else shell_high = middle;
+    }}
+    const bool is_exterior = shell_low < shell_count && shell_offsets[shell_low] == ring;
+    if (!is_exterior) reverse = !reverse;
 
     // Cyclic copy: rotate so that best vertex is first and use the canonical
     // direction selected above.

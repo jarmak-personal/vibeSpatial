@@ -1099,7 +1099,7 @@ def _build_device_resident_polygon_output(
     d_valid_empty = (
         cp.zeros(output_row_count, dtype=cp.bool_)
         if d_valid_empty_rows is None
-        else cp.asarray(d_valid_empty_rows, dtype=cp.bool_)
+        else cp.asarray(d_valid_empty_rows, dtype=cp.bool_).copy()
     )
     if int(d_valid_empty.size) != output_row_count:
         raise ValueError("valid-empty row mask must match polygon output rows")

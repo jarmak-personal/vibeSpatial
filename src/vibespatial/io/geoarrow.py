@@ -1254,6 +1254,8 @@ def _device_interleaved_point_child(plc_column, *, family: GeometryFamily):
     import pyarrow as pa
     import pylibcudf as plc
 
+    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
     if family is GeometryFamily.POINT:
         point_column = plc_column
     elif family in {GeometryFamily.LINESTRING, GeometryFamily.MULTIPOINT}:
@@ -1267,7 +1269,11 @@ def _device_interleaved_point_child(plc_column, *, family: GeometryFamily):
 
     x_column = point_column.child(0)
     y_column = point_column.child(1)
-    values = plc.reshape.interleave_columns(plc.Table([x_column, y_column])).to_arrow()
+    stream = pylibcudf_current_stream()
+    values = plc.reshape.interleave_columns(
+        plc.Table([x_column, y_column]),
+        stream=stream,
+    ).to_arrow(stream=stream)
     return pa.Array.from_buffers(
         pa.float64(),
         len(values),
@@ -1287,8 +1293,11 @@ def _encode_owned_geoarrow_array_device(
 ):
     import pyarrow as pa
 
+    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
     plc_column, encoding_name = _encode_owned_geoarrow_column_device(owned)
-    source_array = plc_column.to_arrow()
+    stream = pylibcudf_current_stream()
+    source_array = plc_column.to_arrow(stream=stream)
     target_type = _geoarrow_target_type(family, interleaved=interleaved)
     interleaved_point_child = None
     if interleaved:

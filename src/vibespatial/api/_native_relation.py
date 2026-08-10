@@ -135,12 +135,13 @@ def _device_gather_map(indices: Any, *, source_row_count: int | None):
     if not _is_device_array(indices):
         raise ValueError("device column equality requires device relation indices")
     import cupy as cp
-    import pylibcudf as plc
+
+    from vibespatial.cuda._runtime import pylibcudf_column_from_device
 
     dtype = cp.int32
     if source_row_count is None or int(source_row_count) > np.iinfo(np.int32).max:
         dtype = cp.int64
-    return plc.Column.from_cuda_array_interface(cp.asarray(indices, dtype=dtype))
+    return pylibcudf_column_from_device(cp.asarray(indices, dtype=dtype))
 
 
 def _dtype_name(values: Any) -> str | None:
@@ -579,9 +580,15 @@ class NativeRelation:
             raise ValueError("device relation equality requires all-valid columns")
         try:
             import pylibcudf as plc
+
+            from vibespatial.cuda._runtime import pylibcudf_current_stream
         except ModuleNotFoundError as exc:  # pragma: no cover - optional GPU dependency
             raise ValueError("pylibcudf is required for device column equality") from exc
 
+        stream = pylibcudf_current_stream(
+            *left_columns.values(),
+            *right_columns.values(),
+        )
         left_map = _device_gather_map(
             self.left_indices,
             source_row_count=self.left_row_count,
@@ -598,17 +605,20 @@ class NativeRelation:
                 plc.Table([left_column]),
                 left_map,
                 plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                stream=stream,
             ).columns()[0]
             right_gathered = plc.copying.gather(
                 plc.Table([right_column]),
                 right_map,
                 plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                stream=stream,
             ).columns()[0]
             equal = plc.binaryop.binary_operation(
                 left_gathered,
                 right_gathered,
                 plc.binaryop.BinaryOperator.EQUAL,
                 bool_type,
+                stream=stream,
             )
             keep_column = (
                 equal
@@ -618,6 +628,7 @@ class NativeRelation:
                     equal,
                     plc.binaryop.BinaryOperator.LOGICAL_AND,
                     bool_type,
+                    stream=stream,
                 )
             )
 

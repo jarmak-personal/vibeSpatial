@@ -7,15 +7,18 @@ import os
 import pathlib
 import threading
 from collections import deque
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any, TypeAlias
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+_PYLIBCUDF_STREAM_ATTRIBUTE = "_vibespatial_pylibcudf_stream"
+_PYLIBCUDF_STREAM_LOCK = threading.Lock()
 
 try:
     import cupy as cp
@@ -113,6 +116,110 @@ def has_cuda_device() -> bool:
 
 def has_nvrtc_support() -> bool:
     return nvrtc is not None
+
+
+def pylibcudf_current_stream(*consumer_values):
+    """Return pylibcudf's active stream after ordering source producers."""
+    _require_gpu_arrays()
+    from rmm.pylibrmm.stream import Stream
+
+    cupy_stream = cp.cuda.get_current_stream()
+    for value in consumer_values:
+        _wait_for_pylibcudf_producers(value, cupy_stream)
+    return _pylibcudf_stream_for_cupy(cupy_stream, Stream)
+
+
+def _pylibcudf_stream_for_cupy(cupy_stream, stream_type=None):
+    """Return a collectible pylibcudf wrapper for one CuPy stream."""
+    if stream_type is None:
+        from rmm.pylibrmm.stream import Stream
+
+        stream_type = Stream
+    with _PYLIBCUDF_STREAM_LOCK:
+        cached = getattr(cupy_stream, _PYLIBCUDF_STREAM_ATTRIBUTE, None)
+        if cached is None:
+            cached = stream_type(cupy_stream)
+            try:
+                setattr(cupy_stream, _PYLIBCUDF_STREAM_ATTRIBUTE, cached)
+            except (AttributeError, TypeError):
+                pass
+        return cached
+
+
+def pylibcudf_to_arrow(value, *, stream=None):
+    """Convert a pylibcudf value after all producers on its stream."""
+    if stream is None:
+        cupy_stream = cp.cuda.get_current_stream()
+        pylibcudf_stream = _pylibcudf_stream_for_cupy(cupy_stream)
+    else:
+        cupy_stream = CudaDriverRuntime._cupy_stream(stream)
+        pylibcudf_stream = (
+            _pylibcudf_stream_for_cupy(cupy_stream)
+            if isinstance(stream, cp.cuda.Stream)
+            else stream
+        )
+    _wait_for_pylibcudf_producers(value, cupy_stream)
+    return value.to_arrow(stream=pylibcudf_stream)
+
+
+def pylibcudf_column_from_device(values):
+    """Build a pylibcudf column on CuPy's active stream."""
+    import pylibcudf as plc
+
+    stream = cp.cuda.get_current_stream()
+    result = plc.Column.from_cuda_array_interface(
+        values,
+        stream=_pylibcudf_stream_for_cupy(stream),
+    )
+    return pylibcudf_mark_produced(result, stream=stream)
+
+
+def pylibcudf_column_from_arrow(values):
+    """Build a pylibcudf column from Arrow on CuPy's active stream."""
+    import pylibcudf as plc
+
+    stream = cp.cuda.get_current_stream()
+    result = plc.Column.from_arrow(
+        values,
+        stream=_pylibcudf_stream_for_cupy(stream),
+    )
+    return pylibcudf_mark_produced(result, stream=stream)
+
+
+def pylibcudf_scalar_from_arrow(value):
+    """Build a pylibcudf scalar from Arrow on CuPy's active stream."""
+    import pylibcudf as plc
+
+    stream = cp.cuda.get_current_stream()
+    result = plc.Scalar.from_arrow(
+        value,
+        stream=_pylibcudf_stream_for_cupy(stream),
+    )
+    return pylibcudf_mark_produced(result, stream=stream)
+
+
+def pylibcudf_scalar_from_py(value):
+    """Build a pylibcudf scalar from Python on CuPy's active stream."""
+    import pylibcudf as plc
+
+    stream = cp.cuda.get_current_stream()
+    result = plc.Scalar.from_py(
+        value,
+        stream=_pylibcudf_stream_for_cupy(stream),
+    )
+    return pylibcudf_mark_produced(result, stream=stream)
+
+
+def pylibcudf_table_from_arrow(table):
+    """Build a pylibcudf table on CuPy's active stream."""
+    import pylibcudf as plc
+
+    stream = cp.cuda.get_current_stream()
+    result = plc.Table.from_arrow(
+        table,
+        stream=_pylibcudf_stream_for_cupy(stream),
+    )
+    return pylibcudf_mark_produced(result, stream=stream)
 
 
 DeviceArray: TypeAlias = Any
@@ -517,6 +624,400 @@ class CompiledKernel:
     function: Any
 
 
+@dataclass(frozen=True, slots=True)
+class CudaStreamIdentity:
+    """Process-local identity for one CUDA stream ordering domain."""
+
+    handle: int
+    owner_thread: threading.Thread | None = None
+
+    @property
+    def is_per_thread_default(self) -> bool:
+        return self.owner_thread is not None
+
+
+def cuda_stream_identity(stream: Any) -> CudaStreamIdentity:
+    """Distinguish PTDS ordering domains that share CUDA's sentinel handle."""
+    handle = int(_normalize_stream_handle(stream))
+    owner_thread = threading.current_thread() if handle == 2 else None
+    return CudaStreamIdentity(handle=handle, owner_thread=owner_thread)
+
+
+@dataclass(slots=True)
+class _CompletionRetirementBatch:
+    event: Any
+    stream: Any
+    stream_key: CudaStreamIdentity
+    retirements: tuple[tuple[Any, Callable[[Any], None]], ...]
+    retry_after: float = 0.0
+    failure_count: int = 0
+
+
+class CudaCompletionRetainer:
+    """Retire Python-owned CUDA resources after their stream completes.
+
+    Producers append retirements to a short per-stream coalescing window.  A
+    daemon records one CUDA event for the window and releases its payloads once
+    that event completes.  This keeps asynchronous external launches alive
+    without requiring a later vibeSpatial call to reap their references.
+    """
+
+    def __init__(self, *, flush_interval_seconds: float = 0.001) -> None:
+        self._flush_interval_seconds = float(flush_interval_seconds)
+        self._condition = threading.Condition()
+        self._open: dict[
+            CudaStreamIdentity,
+            tuple[Any, float, list[tuple[Any, Callable[[Any], None]]]],
+        ] = {}
+        self._pending: list[_CompletionRetirementBatch] = []
+        self._worker: threading.Thread | None = None
+
+    @staticmethod
+    def _stream_key(stream: Any) -> CudaStreamIdentity:
+        return cuda_stream_identity(stream)
+
+    def _ensure_worker_locked(self) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._worker = threading.Thread(
+            target=self._run,
+            name="vibespatial-cuda-retirement",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def defer(
+        self,
+        stream: Any,
+        payload: Any,
+        release: Callable[[Any], None],
+    ) -> None:
+        """Retain one payload until all prior work on ``stream`` completes."""
+        stream_key = self._stream_key(stream)
+        if stream_key.is_per_thread_default:
+            try:
+                event = cp.cuda.Event(disable_timing=True)
+                event.record(CudaDriverRuntime._cupy_stream(stream))
+            except Exception:
+                logger.exception("failed to record PTDS completion retirement event")
+                event = None
+            batch = _CompletionRetirementBatch(
+                event=event,
+                stream=stream,
+                stream_key=stream_key,
+                retirements=((payload, release),),
+            )
+            if event is None and self._synchronize_failed_batch(batch):
+                self._apply_retirements(batch.retirements)
+                return
+            with self._condition:
+                self._pending.append(batch)
+                self._ensure_worker_locked()
+                self._condition.notify()
+            return
+        with self._condition:
+            bucket = self._open.get(stream_key)
+            if bucket is None:
+                bucket = (
+                    stream,
+                    monotonic() + self._flush_interval_seconds,
+                    [],
+                )
+                self._open[stream_key] = bucket
+            bucket[2].append((payload, release))
+            self._ensure_worker_locked()
+            self._condition.notify()
+
+    @staticmethod
+    def _apply_retirements(
+        retirements: tuple[tuple[Any, Callable[[Any], None]], ...]
+        | list[tuple[Any, Callable[[Any], None]]],
+    ) -> None:
+        for payload, release in retirements:
+            try:
+                release(payload)
+            except Exception:
+                logger.exception("CUDA completion retirement failed")
+
+    def claim_stream_retirements(
+        self,
+        stream: Any,
+    ) -> list[tuple[Any, Callable[[Any], None]]]:
+        """Claim work registered before a caller enters a stream sync."""
+        stream_key = self._stream_key(stream)
+        with self._condition:
+            retirements = list(self._open.pop(stream_key, (None, 0.0, []))[2])
+            pending = []
+            for batch in self._pending:
+                if batch.stream_key == stream_key:
+                    retirements.extend(batch.retirements)
+                else:
+                    pending.append(batch)
+            self._pending = pending
+        return retirements
+
+    def claim_all_retirements(
+        self,
+    ) -> list[tuple[Any, list[tuple[Any, Callable[[Any], None]]]]]:
+        """Claim all work registered before a caller enters a context sync."""
+        with self._condition:
+            claimed = [(stream, list(bucket)) for stream, _deadline, bucket in self._open.values()]
+            claimed.extend((batch.stream, list(batch.retirements)) for batch in self._pending)
+            self._open.clear()
+            self._pending.clear()
+        return claimed
+
+    def restore_stream_retirements(
+        self,
+        stream: Any,
+        retirements: list[tuple[Any, Callable[[Any], None]]],
+    ) -> None:
+        """Return a failed synchronization claim to event retirement."""
+        if not retirements:
+            return
+        stream_key = self._stream_key(stream)
+        with self._condition:
+            bucket = self._open.get(stream_key)
+            if bucket is None:
+                bucket = (
+                    stream,
+                    monotonic() + self._flush_interval_seconds,
+                    [],
+                )
+                self._open[stream_key] = bucket
+            bucket[2].extend(retirements)
+            self._ensure_worker_locked()
+            self._condition.notify()
+
+    def restore_claimed_retirements(
+        self,
+        claimed: list[tuple[Any, list[tuple[Any, Callable[[Any], None]]]]],
+    ) -> None:
+        for stream, retirements in claimed:
+            self.restore_stream_retirements(stream, retirements)
+
+    def release_claimed_retirements(
+        self,
+        retirements: list[tuple[Any, Callable[[Any], None]]],
+    ) -> None:
+        self._apply_retirements(retirements)
+
+    def release_all_claimed_retirements(
+        self,
+        claimed: list[tuple[Any, list[tuple[Any, Callable[[Any], None]]]]],
+    ) -> None:
+        for _stream, retirements in claimed:
+            self._apply_retirements(retirements)
+
+    def _record_due_batches_locked(self, now: float) -> None:
+        due_keys = [
+            stream_key
+            for stream_key, (_stream, deadline, _retirements) in self._open.items()
+            if deadline <= now
+        ]
+        for stream_key in due_keys:
+            stream, _deadline, retirements = self._open.pop(stream_key)
+            try:
+                event = cp.cuda.Event(disable_timing=True)
+                event.record(CudaDriverRuntime._cupy_stream(stream))
+            except Exception:
+                logger.exception("failed to record CUDA completion retirement event")
+                event = None
+            self._pending.append(
+                _CompletionRetirementBatch(
+                    event=event,
+                    stream=stream,
+                    stream_key=stream_key,
+                    retirements=tuple(retirements),
+                )
+            )
+
+    @staticmethod
+    def _synchronize_failed_batch(batch: _CompletionRetirementBatch) -> bool:
+        """Establish a terminal completion boundary after event API failure."""
+        if batch.event is not None:
+            try:
+                batch.event.synchronize()
+                return True
+            except Exception:
+                logger.exception("failed to synchronize CUDA retirement event")
+        if (
+            not batch.stream_key.is_per_thread_default
+            or batch.stream_key.owner_thread is threading.current_thread()
+        ):
+            try:
+                CudaDriverRuntime._cupy_stream(batch.stream).synchronize()
+                return True
+            except Exception:
+                logger.exception("failed to synchronize CUDA retirement stream")
+        try:
+            cp.cuda.runtime.deviceSynchronize()
+            return True
+        except Exception:
+            logger.exception("failed to synchronize CUDA retirement context")
+            return False
+
+    @staticmethod
+    def _defer_failed_batch(batch: _CompletionRetirementBatch) -> None:
+        batch.failure_count += 1
+        retry_delay = min(0.01 * (2 ** min(batch.failure_count - 1, 7)), 1.0)
+        batch.retry_after = monotonic() + retry_delay
+
+    @classmethod
+    def _batch_completed(cls, batch: _CompletionRetirementBatch) -> bool:
+        if batch.retry_after > monotonic():
+            return False
+        if batch.event is None:
+            if cls._synchronize_failed_batch(batch):
+                return True
+            cls._defer_failed_batch(batch)
+            return False
+        try:
+            return bool(batch.event.done)
+        except Exception:
+            logger.exception("failed to query CUDA completion retirement event")
+            if cls._synchronize_failed_batch(batch):
+                return True
+            cls._defer_failed_batch(batch)
+            return False
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while not self._open and not self._pending:
+                    self._condition.wait()
+                now = monotonic()
+                if self._open:
+                    next_deadline = min(bucket[1] for bucket in self._open.values())
+                    if next_deadline > now:
+                        self._condition.wait(timeout=next_deadline - now)
+                        continue
+                    self._record_due_batches_locked(now)
+                pending_snapshot = tuple(self._pending)
+
+            completed_ids = set()
+            for batch in pending_snapshot:
+                if self._batch_completed(batch):
+                    completed_ids.add(id(batch))
+
+            completed: list[_CompletionRetirementBatch] = []
+            with self._condition:
+                if completed_ids:
+                    still_pending = []
+                    for batch in self._pending:
+                        if id(batch) in completed_ids:
+                            completed.append(batch)
+                        else:
+                            still_pending.append(batch)
+                    self._pending = still_pending
+                if self._pending and not self._open:
+                    self._condition.wait(timeout=self._flush_interval_seconds)
+            for batch in completed:
+                self._apply_retirements(batch.retirements)
+            # A daemon blocked in ``Condition.wait`` retains its frame locals.
+            # Clear completed payload owners before the next idle wait.
+            pending_snapshot = ()
+            completed.clear()
+            completed_ids.clear()
+            batch = None
+
+
+_CUDA_COMPLETION_RETAINER = CudaCompletionRetainer()
+
+
+def get_cuda_completion_retainer() -> CudaCompletionRetainer:
+    return _CUDA_COMPLETION_RETAINER
+
+
+@dataclass(frozen=True, slots=True)
+class _PylibcudfProducerReadiness:
+    value: Any
+    stream: Any
+    stream_key: CudaStreamIdentity
+    event: Any | None
+    token: object
+
+
+_PYLIBCUDF_READINESS_LOCK = threading.Lock()
+_PYLIBCUDF_READINESS: dict[int, _PylibcudfProducerReadiness] = {}
+
+
+def _release_pylibcudf_producer(readiness: _PylibcudfProducerReadiness) -> None:
+    value_id = id(readiness.value)
+    with _PYLIBCUDF_READINESS_LOCK:
+        current = _PYLIBCUDF_READINESS.get(value_id)
+        if current is not None and current.token is readiness.token:
+            del _PYLIBCUDF_READINESS[value_id]
+
+
+def _register_pylibcudf_producer(value, stream):
+    """Publish readiness while one pylibcudf producer remains in flight."""
+    cupy_stream = CudaDriverRuntime._cupy_stream(stream)
+    try:
+        event = cp.cuda.Event(disable_timing=True)
+        event.record(cupy_stream)
+    except Exception:
+        logger.exception("failed to record pylibcudf producer readiness event")
+        cupy_stream.synchronize()
+        event = None
+    readiness = _PylibcudfProducerReadiness(
+        value=value,
+        stream=stream,
+        stream_key=cuda_stream_identity(stream),
+        event=event,
+        token=object(),
+    )
+    with _PYLIBCUDF_READINESS_LOCK:
+        _PYLIBCUDF_READINESS[id(value)] = readiness
+    get_cuda_completion_retainer().defer(
+        stream,
+        readiness,
+        _release_pylibcudf_producer,
+    )
+    return value
+
+
+def pylibcudf_mark_produced(value, *, stream=None):
+    """Attach completion-scoped producer readiness to a persistent value."""
+    producer_stream = cp.cuda.get_current_stream() if stream is None else stream
+    cupy_stream = CudaDriverRuntime._cupy_stream(producer_stream)
+    _wait_for_pylibcudf_producers(value, cupy_stream)
+    return _register_pylibcudf_producer(value, producer_stream)
+
+
+def _pylibcudf_readiness_members(value):
+    """Yield a table and its columns without materializing device data."""
+    yield value
+    columns = getattr(value, "columns", None)
+    if callable(columns):
+        yield from columns()
+
+
+def _wait_for_pylibcudf_producers(value, consumer_stream) -> None:
+    """Order a consumer stream after every registered producer of ``value``."""
+    with _PYLIBCUDF_READINESS_LOCK:
+        readiness = tuple(
+            producer
+            for member in _pylibcudf_readiness_members(value)
+            if (producer := _PYLIBCUDF_READINESS.get(id(member))) is not None
+        )
+    consumer_key = cuda_stream_identity(consumer_stream)
+    for producer in readiness:
+        if producer.stream_key != consumer_key and producer.event is not None:
+            consumer_stream.wait_event(producer.event)
+            get_cuda_completion_retainer().defer(
+                consumer_stream,
+                producer.event,
+                lambda _event: None,
+            )
+
+
+def _active_pylibcudf_readiness_count() -> int:
+    """Return in-flight pylibcudf registrations for tests and diagnostics."""
+    with _PYLIBCUDF_READINESS_LOCK:
+        return len(_PYLIBCUDF_READINESS)
+
+
 class CudaDriverRuntime:
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -532,6 +1033,32 @@ class CudaDriverRuntime:
         self._memory_backend: str = "none"
         self._rmm_mr = None
         self._memory_pool_configured: bool = False
+
+    @staticmethod
+    def _free_now(device_array: DeviceArray) -> None:
+        memory = getattr(getattr(device_array, "data", None), "mem", None)
+        if memory is None:
+            return
+        try:
+            memory.free()
+        except Exception:
+            return
+
+    def _defer_free(
+        self,
+        stream: Any,
+        device_array: DeviceArray,
+    ) -> None:
+        """Retire an explicit free after active-stream work completes."""
+        get_cuda_completion_retainer().defer(stream, device_array, self._free_now)
+
+    @staticmethod
+    def _cupy_stream(stream: Any) -> Any:
+        if isinstance(stream, cp.cuda.Stream):
+            return stream
+        if callable(getattr(stream, "__cuda_stream__", None)):
+            return cp.cuda.Stream.from_external(stream)
+        return cp.cuda.ExternalStream(int(_normalize_stream_handle(stream)))
 
     def _configure_cupy_pool(self) -> None:
         """Install the CuPy fallback pool after a CUDA context is active."""
@@ -821,7 +1348,15 @@ class CudaDriverRuntime:
         _require_gpu_arrays()
         started = perf_counter()
         with self.activate():
-            host = cp.asnumpy(device_array)
+            stream = cp.cuda.get_current_stream()
+            retainer = get_cuda_completion_retainer()
+            claimed = retainer.claim_stream_retirements(stream)
+            try:
+                host = cp.asnumpy(device_array)
+            except BaseException:
+                retainer.restore_stream_retirements(stream, claimed)
+                raise
+            retainer.release_claimed_retirements(claimed)
         elapsed = perf_counter() - started
         _notify_runtime_d2h_transfer(
             device_array,
@@ -844,16 +1379,19 @@ class CudaDriverRuntime:
     def free(self, device_array: DeviceArray | None) -> None:
         if device_array is None:
             return
-        memory = getattr(getattr(device_array, "data", None), "mem", None)
-        if memory is not None:
-            try:
-                memory.free()
-            except Exception:
-                return
+        with self.activate():
+            self._defer_free(cp.cuda.get_current_stream(), device_array)
 
     def synchronize(self) -> None:
         with self.activate():
-            _check_driver(cu.cuCtxSynchronize())
+            retainer = get_cuda_completion_retainer()
+            claimed = retainer.claim_all_retirements()
+            try:
+                _check_driver(cu.cuCtxSynchronize())
+            except BaseException:
+                retainer.restore_claimed_retirements(claimed)
+                raise
+            retainer.release_all_claimed_retirements(claimed)
 
     # ------------------------------------------------------------------
     # Stream management
@@ -877,7 +1415,14 @@ class CudaDriverRuntime:
         completed before calling this method.
         """
         with self.activate():
-            _check_driver(cu.cuStreamDestroy(stream.handle))
+            retainer = get_cuda_completion_retainer()
+            claimed = retainer.claim_stream_retirements(stream)
+            try:
+                _check_driver(cu.cuStreamDestroy(stream.handle))
+            except BaseException:
+                retainer.restore_stream_retirements(stream, claimed)
+                raise
+            retainer.release_claimed_retirements(claimed)
 
     @contextmanager
     def stream_context(self):

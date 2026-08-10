@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import sys
+import time
 import types
 from io import BytesIO
 from pathlib import Path
@@ -79,6 +80,135 @@ from vibespatial.io.wkb import encode_owned_wkb_device
 from vibespatial.runtime.residency import Residency, TransferTrigger
 
 
+@pytest.mark.gpu
+def test_pylibcudf_to_arrow_uses_active_nondefault_stream() -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("pylibcudf and a GPU runtime are required")
+
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import (
+        pylibcudf_current_stream,
+        pylibcudf_to_arrow,
+    )
+
+    received_streams = []
+
+    class _ArrowConvertible:
+        def to_arrow(self, *, stream=None):
+            received_streams.append(stream)
+            return "arrow"
+
+    stream = cp.cuda.Stream(non_blocking=True)
+    with stream:
+        expected_stream = pylibcudf_current_stream()
+        assert pylibcudf_to_arrow(_ArrowConvertible()) == "arrow"
+    stream.synchronize()
+
+    assert received_streams == [expected_stream]
+
+
+@pytest.mark.gpu
+def test_pylibcudf_to_arrow_waits_for_cross_stream_producer() -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("pylibcudf and a GPU runtime are required")
+
+    import cupy as cp
+    import pylibcudf as plc
+
+    from vibespatial.cuda._runtime import (
+        _active_pylibcudf_readiness_count,
+        pylibcudf_column_from_device,
+        pylibcudf_to_arrow,
+    )
+
+    delay = cp.RawKernel(
+        r'''
+        extern "C" __global__ void delay(unsigned long long ticks) {
+            unsigned long long start = clock64();
+            while (clock64() - start < ticks) {}
+        }
+        ''',
+        "delay",
+    )
+    blocker = cp.cuda.Stream(non_blocking=True)
+    producer = cp.cuda.Stream(non_blocking=True)
+    consumer = cp.cuda.Stream(non_blocking=True)
+    ready = cp.cuda.Event(disable_timing=True)
+    values = cp.zeros(1, dtype=cp.int32)
+    with blocker:
+        delay((1,), (1,), (100_000_000,))
+        ready.record(blocker)
+    with producer:
+        producer.wait_event(ready)
+        values.fill(123)
+        column = pylibcudf_column_from_device(values)
+        table = plc.Table([column])
+    with consumer:
+        arrow = pylibcudf_to_arrow(table)
+
+    assert arrow.column(0).to_pylist() == [123]
+    producer.synchronize()
+    deadline = time.monotonic() + 2.0
+    while _active_pylibcudf_readiness_count() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert _active_pylibcudf_readiness_count() == 0
+
+
+@pytest.mark.gpu
+def test_native_attribute_gather_waits_for_cross_stream_producer() -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("pylibcudf and a GPU runtime are required")
+
+    import cupy as cp
+    import pylibcudf as plc
+
+    from vibespatial.cuda._runtime import (
+        pylibcudf_column_from_device,
+        pylibcudf_to_arrow,
+    )
+
+    delay = cp.RawKernel(
+        r'''
+        extern "C" __global__ void delay(unsigned long long ticks) {
+            unsigned long long start = clock64();
+            while (clock64() - start < ticks) {}
+        }
+        ''',
+        "delay",
+    )
+    blocker = cp.cuda.Stream(non_blocking=True)
+    producer = cp.cuda.Stream(non_blocking=True)
+    consumer = cp.cuda.Stream(non_blocking=True)
+    ready = cp.cuda.Event(disable_timing=True)
+    values = cp.zeros(1, dtype=cp.int32)
+    with blocker:
+        delay((1,), (1,), (100_000_000,))
+        ready.record(blocker)
+    with producer:
+        producer.wait_event(ready)
+        values.fill(123)
+        column = pylibcudf_column_from_device(values)
+        source = NativeAttributeTable(
+            device_table=plc.Table([column]),
+            index_override=pd.RangeIndex(1),
+            column_override=("value",),
+            schema_override=pa.schema([pa.field("value", pa.int32())]),
+        )
+
+    gathered = []
+    with consumer:
+        for _ in range(5):
+            result = source._device_take(
+                cp.asarray([0], dtype=cp.int64),
+                preserve_index=False,
+            )
+            assert result is not None
+            gathered.append(pylibcudf_to_arrow(result.device_table))
+
+    assert [table.column(0).to_pylist() for table in gathered] == [[123]] * 5
+
+
 def test_geoarrow_wkb_osm_d2h_exports_are_runtime_accounted() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     paths = (
@@ -102,6 +232,35 @@ def test_geoarrow_wkb_osm_d2h_exports_are_runtime_accounted() -> None:
             ):
                 offenders.append(f"{path.relative_to(repo_root)}:{node.lineno}")
     assert offenders == []
+
+
+def test_pylibcudf_csv_attribute_export_uses_parse_stream() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    tree = ast.parse(
+        (repo_root / "src" / "vibespatial" / "io" / "file.py").read_text()
+    )
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_try_csv_pylibcudf_read_native"
+    )
+    exports = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "to_arrow"
+    ]
+
+    assert len(exports) == 1
+    stream_keyword = next(
+        (keyword for keyword in exports[0].keywords if keyword.arg == "stream"),
+        None,
+    )
+    assert stream_keyword is not None
+    assert isinstance(stream_keyword.value, ast.Name)
+    assert stream_keyword.value.id == "stream"
 
 
 def _diagnostic_totals(*values) -> tuple[int, int]:
@@ -1603,7 +1762,7 @@ def test_read_geoparquet_gpu_path_returns_dga_without_geometry_to_arrow(monkeypa
         def columns(self):
             return self._columns
 
-        def to_arrow(self):
+        def to_arrow(self, *, stream=None):
             raise AssertionError("geometry GPU path must not call to_arrow()")
 
     fake_table = FakeGpuTable()
@@ -1695,7 +1854,8 @@ def test_decode_geoparquet_table_to_owned_gpu_decode_miss_falls_back_to_arrow(mo
             self._arrow_table = arrow_table
             self._columns = [object()]
 
-        def to_arrow(self):
+        def to_arrow(self, *, stream=None):
+            assert stream is not None
             return self._arrow_table
 
         def columns(self):
@@ -1743,7 +1903,8 @@ def test_read_geoparquet_gpu_decode_miss_falls_back_to_arrow_geometry_decode(mon
         def columns(self):
             return self._columns
 
-        def to_arrow(self):
+        def to_arrow(self, *, stream=None):
+            assert stream is not None
             return self._arrow_table
 
     arrow_table = pa.table({"geometry": [Point(0, 0).wkb, Point(1, 2).wkb]})
@@ -1843,7 +2004,7 @@ def test_read_geoparquet_gpu_filter_projection_includes_filter_columns_without_l
         def columns(self):
             return self._columns
 
-        def to_arrow(self):
+        def to_arrow(self, *, stream=None):
             raise AssertionError("geometry GPU path must not call to_arrow()")
 
     fake_table = FakeGpuTable()
@@ -1944,7 +2105,7 @@ def test_read_geoparquet_gpu_geometry_only_skips_non_geometry_sidecar_read(monke
         def num_rows(self):
             return 3
 
-        def to_arrow(self):
+        def to_arrow(self, *, stream=None):
             raise AssertionError("geometry-only GPU path must not materialize Arrow geometry")
 
     fake_table = FakeGpuTable()
@@ -3082,7 +3243,7 @@ def test_read_geoparquet_table_with_pylibcudf_disables_unneeded_schema_metadata(
             types=types.SimpleNamespace(SourceInfo=FakeSourceInfo),
             parquet=types.SimpleNamespace(
                 ParquetReaderOptions=types.SimpleNamespace(builder=lambda source: FakeBuilder(source)),
-                read_parquet=lambda options: fake_result,
+                    read_parquet=lambda options, stream=None: fake_result,
             ),
         )
     )

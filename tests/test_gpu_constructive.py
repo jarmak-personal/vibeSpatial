@@ -420,6 +420,166 @@ def test_normalize_owned_orders_polygon_hierarchy_like_geos() -> None:
 
 
 @pytest.mark.gpu
+def test_normalize_owned_orders_multiple_single_ring_polygons_like_geos() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.runtime.residency import Residency
+
+    source = [
+        Polygon([(1, 1), (3, 1), (3, 3), (1, 3), (1, 1)]),
+        Polygon([(3, 3), (5, 3), (5, 5), (3, 5), (3, 3)]),
+    ]
+    owned = from_shapely_geometries(source, residency=Residency.DEVICE)
+
+    actual = normalize_owned(
+        owned,
+        dispatch_mode=ExecutionMode.GPU,
+    ).to_shapely()
+
+    assert all(
+        shapely.equals_exact(got, shapely.normalize(expected), tolerance=0.0)
+        for got, expected in zip(actual, source, strict=True)
+    )
+
+
+@pytest.mark.gpu
+def test_normalize_owned_orders_holes_when_empty_rows_balance_ring_count() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.runtime.residency import Residency
+
+    polygon = Polygon(
+        [(0, 0), (9, 0), (9, 9), (0, 9), (0, 0)],
+        holes=[
+            [(1, 1), (2, 1), (2, 2), (1, 2), (1, 1)],
+            [(5, 5), (8, 5), (8, 8), (5, 8), (5, 5)],
+        ],
+    )
+    source = [Polygon(), polygon, Polygon()]
+    owned = from_shapely_geometries(source, residency=Residency.DEVICE)
+
+    actual = normalize_owned(owned, dispatch_mode=ExecutionMode.GPU).to_shapely()
+
+    assert all(
+        shapely.equals_exact(got, shapely.normalize(expected), tolerance=0.0)
+        for got, expected in zip(actual, source, strict=True)
+    )
+
+
+@pytest.mark.gpu
+def test_coordinate_stats_ignore_uninitialized_device_capacity_lanes() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    from vibespatial.constructive.measurement import _coord_stats_from_owned
+    from vibespatial.runtime.residency import Residency
+
+    source = [
+        Polygon([(1, 1), (3, 1), (3, 3), (1, 3), (1, 1)]),
+        Polygon([(3, 3), (5, 3), (5, 5), (3, 5), (3, 3)]),
+    ]
+    owned = from_shapely_geometries(source, residency=Residency.DEVICE)
+    device_buffer = owned.device_state.families[GeometryFamily.POLYGON]
+    active_coordinate_count = int(device_buffer.x.size)
+    device_buffer.x = cp.concatenate(
+        (device_buffer.x, cp.full(32, cp.inf, dtype=cp.float64))
+    )
+    device_buffer.y = cp.concatenate(
+        (device_buffer.y, cp.full(32, -cp.inf, dtype=cp.float64))
+    )
+    device_buffer.ring_offsets = cp.concatenate(
+        (
+            device_buffer.ring_offsets,
+            cp.full(8, active_coordinate_count, dtype=cp.int32),
+        )
+    )
+
+    assert _coord_stats_from_owned(owned) == (5.0, 1.0, 5.0)
+    normalized = normalize_owned(owned, dispatch_mode=ExecutionMode.GPU).to_shapely()
+    assert all(
+        shapely.equals_exact(got, shapely.normalize(expected), tolerance=0.0)
+        for got, expected in zip(normalized, source, strict=True)
+    )
+
+
+@pytest.mark.gpu
+def test_normalize_owned_orders_mixed_points_and_polygons_like_geos() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.runtime.residency import Residency
+
+    source = [
+        Point(2, 2),
+        Point(3, 3),
+        Point(3, 3),
+        Polygon([(1, 1), (3, 1), (3, 3), (1, 3), (1, 1)]),
+        Polygon([(3, 3), (5, 3), (5, 5), (3, 5), (3, 3)]),
+    ]
+    owned = from_shapely_geometries(source, residency=Residency.DEVICE)
+
+    actual = normalize_owned(
+        owned,
+        dispatch_mode=ExecutionMode.GPU,
+    ).to_shapely()
+
+    assert all(
+        shapely.equals_exact(got, shapely.normalize(expected), tolerance=0.0)
+        for got, expected in zip(actual, source, strict=True)
+    )
+
+
+@pytest.mark.gpu
+def test_normalize_defers_async_gather_sources_until_terminal_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.runtime.residency import Residency
+
+    source = Polygon(
+        [(0, 0), (8, 0), (8, 8), (0, 8), (0, 0)],
+        holes=[
+            [(1, 1), (2, 1), (2, 2), (1, 2), (1, 1)],
+            [(5, 5), (7, 5), (7, 7), (5, 7), (5, 5)],
+        ],
+    )
+    owned = from_shapely_geometries([source], residency=Residency.DEVICE)
+    runtime = get_cuda_runtime()
+    original_copy = runtime.copy_device_to_host
+    original_free = runtime.free
+    events: list[str] = []
+
+    def tracked_copy(*args, **kwargs):
+        events.append("copy")
+        return original_copy(*args, **kwargs)
+
+    def tracked_free(*args, **kwargs):
+        events.append("free")
+        return original_free(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "copy_device_to_host", tracked_copy)
+    monkeypatch.setattr(runtime, "free", tracked_free)
+
+    actual = normalize_owned(
+        owned,
+        dispatch_mode=ExecutionMode.GPU,
+    ).to_shapely()[0]
+
+    assert events.count("copy") >= 4
+    assert events.index("free") > max(
+        position for position, event in enumerate(events) if event == "copy"
+    )
+    assert shapely.equals_exact(actual, shapely.normalize(source), tolerance=0.0)
+
+
+@pytest.mark.gpu
 def test_normalize_owned_orders_lineal_and_point_multi_hierarchies_like_geos() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")

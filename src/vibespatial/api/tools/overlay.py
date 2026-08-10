@@ -2243,12 +2243,39 @@ def _native_grouped_union_difference_owned(
     )
     from vibespatial.overlay.dissolve import DissolveUnionMethod, execute_native_grouped_union
 
+    grouped_union_input = right_batch
+    if getattr(right_batch, "is_indexed_view", False):
+        grouped_union_input = right_batch.physicalize_device_rows(
+            allow_capacity_allocation=True,
+        )
+        record_dispatch_event(
+            surface="geopandas.array.difference",
+            operation="difference",
+            implementation="grouped_union_input_physicalization_gpu",
+            reason=(
+                "the grouped union reducer requires contiguous family buffers, "
+                "so indexed right rows were physicalized entirely on device"
+            ),
+            detail=(
+                f"groups={left_batch.row_count}, pairs={right_batch.row_count}, "
+                f"stage={stage}"
+            ),
+            requested=dispatch_mode,
+            selected=ExecutionMode.GPU,
+        )
     grouped_union = execute_native_grouped_union(
         grouped,
         _geometries=(),
         method=DissolveUnionMethod.UNARY,
-        owned=right_batch,
+        owned=grouped_union_input,
     )
+    if grouped_union is None:
+        grouped_union = execute_native_grouped_union(
+            grouped,
+            _geometries=(),
+            method=DissolveUnionMethod.DISJOINT_SUBSET,
+            owned=grouped_union_input,
+        )
     if grouped_union is None or grouped_union.owned is None:
         return None
     unioned_right = grouped_union.owned
@@ -3890,26 +3917,27 @@ def _grouped_overlay_difference_owned(
         return result
 
     def _row_indirected_grouped_topology_inputs():
-        """Admit indexed gathered rows into grouped topology without resolving.
-
-        Segment extraction reads logical row metadata with
-        ``preserve_indexed_view=True`` and keeps physical family-row offsets as
-        the coordinate indirection. Split and face-label stages then remap
-        source rows to grouped logical rows. That is the row-indirected exact
-        topology carrier; device physicalization is reserved for kernels that
-        still lack those source-row maps.
-        """
+        """Give mutable grouped topology independently owned device buffers."""
         left_was_indexed = bool(getattr(left_batch, "is_indexed_view", False))
         right_was_indexed = bool(getattr(right_batch, "is_indexed_view", False))
         if left_was_indexed or right_was_indexed:
+            topology_left = (
+                left_batch.physicalize_device_rows(allow_capacity_allocation=True)
+                if left_was_indexed
+                else left_batch
+            )
+            topology_right = (
+                right_batch.physicalize_device_rows(allow_capacity_allocation=True)
+                if right_was_indexed
+                else right_batch
+            )
             record_dispatch_event(
                 surface="geopandas.array.difference",
                 operation="difference",
-                implementation="grouped_overlay_difference_row_indirected_topology_gpu",
+                implementation="grouped_overlay_difference_topology_physicalization_gpu",
                 reason=(
-                    "grouped exact overlay difference kept indexed owned views "
-                    "as row-indirected topology inputs instead of resolving "
-                    "physical family rows"
+                    "grouped topology canonicalization uses mutable coordinate "
+                    "workspaces, so indexed gathers received independent device buffers"
                 ),
                 detail=(
                     f"groups={left_batch.row_count}, "
@@ -3920,6 +3948,7 @@ def _grouped_overlay_difference_owned(
                 requested=dispatch_mode,
                 selected=ExecutionMode.GPU,
             )
+            return topology_left, topology_right
         return left_batch, right_batch
 
     def _left_covered_group_mask():
@@ -4680,9 +4709,11 @@ def _reverse_intersecting_index_pairs(index_result):
     if isinstance(index_result, DeviceSpatialJoinResult):
         import cupy as cp
 
-        d_left = index_result.d_right_idx.astype(cp.int32, copy=False)
-        d_right = index_result.d_left_idx.astype(cp.int32, copy=False)
+        d_left = cp.asarray(index_result.d_right_idx, dtype=cp.int32)
+        d_right = cp.asarray(index_result.d_left_idx, dtype=cp.int32)
         if d_left.size > 0:
+            # Fancy indexing below creates the independent reverse carriers;
+            # copying the unsorted inputs first only doubles relation traffic.
             order = _device_pair_lexicographic_order(d_left, d_right)
             d_left = d_left[order]
             d_right = d_right[order]
@@ -9037,6 +9068,7 @@ def _overlay_intersection_native(
             and intersections is None
         ):
             from vibespatial.constructive.binary_constructive import (
+                binary_constructive_native,
                 binary_constructive_owned,
             )
 
@@ -9187,21 +9219,66 @@ def _overlay_intersection_native(
 
             if intersections is None and not (_is_many_vs_one or _is_few_right):
                 # Standard element-wise path for N-vs-M patterns.
-                result_owned = _attach_aligned_pair_sources(
-                    binary_constructive_owned(
-                        "intersection",
-                        left_sub,
-                        right_sub,
-                        dispatch_mode=_pairwise_mode,
-                    ),
+                native_intersections = binary_constructive_native(
+                    "intersection",
                     left_sub,
                     right_sub,
+                    dispatch_mode=_pairwise_mode,
                 )
+                result_owned = native_intersections.owned
                 if result_owned is not None:
+                    result_owned = _attach_aligned_pair_sources(
+                        result_owned,
+                        left_sub,
+                        right_sub,
+                    )
                     intersections = GeoSeries(
                         GeometryArray.from_owned(result_owned, crs=df1.crs),
                     )
                     used_owned = True
+                elif native_intersections.composition is not None:
+                    d_nonempty = native_intersections.valid_nonempty_mask_device()
+                    if d_nonempty is None:
+                        raise RuntimeError(
+                            "native overlay intersection composition lost its "
+                            "valid/nonempty row metadata"
+                        )
+                    _apply_intersection_pair_keep_mask(d_nonempty)
+                    use_device_relation = _has_device_indices and (
+                        pair_selection is not None or idx1 is None
+                    )
+                    capacity_result = _pairwise_constructive_to_native_tabular_result(
+                        geometry=native_intersections.with_crs(df1.crs),
+                        relation=RelationIndexResult(
+                            d_idx1 if use_device_relation else idx1,
+                            d_idx2 if use_device_relation else idx2,
+                        ),
+                        keep_geom_type_applied=False,
+                        left_df=df1,
+                        right_df=df2,
+                    )
+                    record_dispatch_event(
+                        surface="geopandas.overlay",
+                        operation="intersection",
+                        implementation="mixed_pair_composition_gpu",
+                        reason=(
+                            "mixed-family constructive output remained in its "
+                            "row-aligned native composition"
+                        ),
+                        detail=(
+                            f"pair_capacity={pair_count}; "
+                            "physical_shape=relation_pair_capacity_composition"
+                        ),
+                        requested=_pairwise_mode,
+                        selected=ExecutionMode.GPU,
+                    )
+                    return (
+                        NativeTabularSelection(
+                            capacity_result=capacity_result,
+                            selection=pair_selection,
+                        ),
+                        True,
+                    )
 
             if intersections is None and _is_few_right:
                 if _has_device_indices:
@@ -9969,6 +10046,12 @@ def _overlay_identity_native(
     _warn_on_dropped_lower_dim_polygon_results: bool = False,
 ):
     """Build the native identity result before the explicit GeoPandas export."""
+    left_owned, right_owned = _coerce_owned_pair_for_strict_overlay(
+        df1,
+        df2,
+        left_owned,
+        right_owned,
+    )
     forward_index_result = _intersecting_index_pairs(
         df1,
         df2,
@@ -10050,6 +10133,12 @@ def _overlay_symmetric_diff_native(
     _reverse_index_result=None,
 ):
     """Build the native symmetric-difference result before explicit export."""
+    left_owned, right_owned = _coerce_owned_pair_for_strict_overlay(
+        df1,
+        df2,
+        left_owned,
+        right_owned,
+    )
     if _forward_index_result is None:
         _forward_index_result = _intersecting_index_pairs(
             df1,
@@ -10129,6 +10218,12 @@ def _overlay_union_native(
     _warn_on_dropped_lower_dim_polygon_results: bool = False,
 ):
     """Build the native union result before the explicit GeoPandas export."""
+    left_owned, right_owned = _coerce_owned_pair_for_strict_overlay(
+        df1,
+        df2,
+        left_owned,
+        right_owned,
+    )
     forward_index_result = _intersecting_index_pairs(
         df1,
         df2,

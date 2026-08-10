@@ -16,7 +16,7 @@ import os
 import sys
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any
 
@@ -66,6 +66,8 @@ class PrecompiledPrimitive:
     temp_storage_bytes: int
     high_water_n: int
     warmup_ms: float
+    invocation_lock: Any = field(default_factory=threading.RLock, repr=False)
+    scratch_slots: list[Any] = field(default_factory=list, repr=False)
 
 
 SPEC_REGISTRY: dict[str, CCCLWarmupSpec] = build_spec_registry()

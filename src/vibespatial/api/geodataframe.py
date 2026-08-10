@@ -1138,6 +1138,8 @@ def _native_sort_values_rowset(
         return None
 
     try:
+        from vibespatial.cuda._runtime import pylibcudf_current_stream
+
         key_table = plc.Table(attributes.to_pylibcudf_columns(sort_columns))
         column_order = [
             Order.ASCENDING if is_ascending else Order.DESCENDING
@@ -1152,7 +1154,12 @@ def _native_sort_values_rowset(
             if kind in {"stable", "mergesort"} or len(sort_columns) > 1
             else sorting.sorted_order
         )
-        order_column = sort_fn(key_table, column_order, null_precedence)
+        order_column = sort_fn(
+            key_table,
+            column_order,
+            null_precedence,
+            stream=pylibcudf_current_stream(),
+        )
         sorted_positions = _pylibcudf_numeric_column_view(order_column)
     except Exception:
         return None
@@ -2347,30 +2354,38 @@ def _native_drop_duplicates_rowset(owner, subset, keep):
         False: stream_compaction.DuplicateKeepOption.KEEP_NONE,
     }[keep]
     try:
+        from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+        stream = pylibcudf_current_stream()
         key_table = plc.Table(attributes.to_pylibcudf_columns(labels))
         sorted_column = sorting.stable_sorted_order(
             key_table,
             [Order.ASCENDING] * len(labels),
             [NullOrder.AFTER] * len(labels),
+            stream=stream,
         )
         sorted_positions = _pylibcudf_numeric_column_view(sorted_column)
         if sorted_positions is None:
             return None
         sorted_positions = cp.asarray(sorted_positions, dtype=cp.int64)
         target_dtype = cp.int32 if state.row_count <= np.iinfo(np.int32).max else cp.int64
-        gather_map = plc.Column.from_cuda_array_interface(
+        from vibespatial.cuda._runtime import pylibcudf_column_from_device
+
+        gather_map = pylibcudf_column_from_device(
             sorted_positions.astype(target_dtype, copy=False)
         )
         sorted_keys = plc.copying.gather(
             key_table,
             gather_map,
             plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+            stream=stream,
         )
         unique_local_column = stream_compaction.distinct_indices(
             sorted_keys,
             keep_option,
             NullEquality.EQUAL,
             NanEquality.ALL_EQUAL,
+            stream=stream,
         )
         unique_local = _pylibcudf_numeric_column_view(unique_local_column)
     except Exception:

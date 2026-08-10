@@ -939,7 +939,9 @@ def _extract_wkb_and_parse(
     runtime.synchronize()
 
     # --- Build pylibcudf column on device ---
-    offsets_column = plc.Column.from_cuda_array_interface(d_offsets)
+    from vibespatial.cuda._runtime import pylibcudf_column_from_device
+
+    offsets_column = pylibcudf_column_from_device(d_offsets)
     column = plc.Column(
         plc.types.DataType(plc.types.TypeId.STRING),
         n_rows,

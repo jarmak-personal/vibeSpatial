@@ -47,14 +47,9 @@ TAG_FAMILIES = {value: key for key, value in FAMILY_TAGS.items()}
 
 def _propagate_row_segment_capacity_bound(result, arrays) -> None:
     """Preserve a proven per-logical-row segment bound across composition."""
-    bounds = [
-        getattr(array, "_active_family_row_segment_capacity_bound", None)
-        for array in arrays
-    ]
+    bounds = [getattr(array, "_active_family_row_segment_capacity_bound", None) for array in arrays]
     if bounds and all(bound is not None for bound in bounds):
-        result._active_family_row_segment_capacity_bound = max(
-            int(bound) for bound in bounds
-        )
+        result._active_family_row_segment_capacity_bound = max(int(bound) for bound in bounds)
 
 
 def _owned_take_kernels():
@@ -360,6 +355,40 @@ class DeviceFamilyGeometryBuffer:
     axis_aligned_rectangles: bool = False
     regular_grid_rect: DeviceRegularGridRectMetadata | None = None
     fixed_size: DeviceFixedGeometrySizeMetadata | None = None
+
+
+def device_family_coordinate_counts(
+    buffer: DeviceFamilyGeometryBuffer,
+    source_rows: DeviceArray | None = None,
+) -> DeviceArray:
+    """Return device-resident coordinate spans for selected physical rows."""
+    if cp is None:  # pragma: no cover - GPU-only helper
+        raise RuntimeError("CuPy is required for device coordinate counts")
+    rows = (
+        cp.arange(_device_family_row_count(buffer), dtype=cp.int32)
+        if source_rows is None
+        else cp.asarray(source_rows, dtype=cp.int32)
+    )
+    starts = buffer.geometry_offsets[rows]
+    ends = buffer.geometry_offsets[rows + 1]
+    if buffer.family in {
+        GeometryFamily.POINT,
+        GeometryFamily.LINESTRING,
+        GeometryFamily.MULTIPOINT,
+    }:
+        return ends - starts
+    if buffer.family in {GeometryFamily.POLYGON, GeometryFamily.MULTILINESTRING}:
+        child_offsets = (
+            buffer.ring_offsets if buffer.family is GeometryFamily.POLYGON else buffer.part_offsets
+        )
+        if child_offsets is None:
+            raise RuntimeError(f"{buffer.family.value} device buffer is missing child offsets")
+        return child_offsets[ends] - child_offsets[starts]
+    if buffer.part_offsets is None or buffer.ring_offsets is None:
+        raise RuntimeError("multipolygon device buffer is missing nested offsets")
+    ring_starts = buffer.part_offsets[starts]
+    ring_ends = buffer.part_offsets[ends]
+    return buffer.ring_offsets[ring_ends] - buffer.ring_offsets[ring_starts]
 
 
 def build_updated_device_family_buffer(
@@ -1676,9 +1705,7 @@ class OwnedGeometryArray:
                 total_bytes += geometry_offsets.nbytes
             if not buffer.empty_mask.size:
                 total_bytes += empty_mask.nbytes
-            first_level_count = (
-                0 if int(geometry_offsets.size) == 0 else int(geometry_offsets[-1])
-            )
+            first_level_count = 0 if int(geometry_offsets.size) == 0 else int(geometry_offsets[-1])
             part_offsets = buffer.part_offsets
             if part_offsets is None and device_buffer.part_offsets is not None:
                 part_offset_count = first_level_count + 1
@@ -4065,11 +4092,7 @@ def _flatten_exact_device_row_selection(
     while current.is_indexed_view:
         base = current._base
         index_map = current._index_map
-        if (
-            base is None
-            or index_map is None
-            or not hasattr(index_map, "__cuda_array_interface__")
-        ):
+        if base is None or index_map is None or not hasattr(index_map, "__cuda_array_interface__"):
             raise RuntimeError("exact device physicalization requires device row maps")
         d_indices = cp.asarray(index_map, dtype=cp.int64)[d_indices]
         current = base
@@ -4187,10 +4210,7 @@ def device_physicalize_owned_row_selections_exact(
     """
     if cp is None:  # pragma: no cover - exercised only on CPU-only installs
         raise RuntimeError("CuPy is required for exact device row physicalization")
-    prepared = [
-        _flatten_exact_device_row_selection(owned, active)
-        for owned, active in selections
-    ]
+    prepared = [_flatten_exact_device_row_selection(owned, active) for owned, active in selections]
     work_keys = [
         (selection_index, family)
         for selection_index, selection in enumerate(prepared)
@@ -4206,10 +4226,7 @@ def device_physicalize_owned_row_selections_exact(
         ).reshape(len(work_keys), 7)
     else:
         h_packet = np.empty((0, 7), dtype=np.int64)
-    host_stats = {
-        key: h_packet[position]
-        for position, key in enumerate(work_keys)
-    }
+    host_stats = {key: h_packet[position] for position, key in enumerate(work_keys)}
 
     results: list[OwnedGeometryArray | None] = []
     for selection_index, selection in enumerate(prepared):

@@ -48,6 +48,7 @@ from vibespatial.constructive.point import (
 )
 from vibespatial.constructive.polygon import polygon_centroids_owned
 from vibespatial.constructive.union_all import union_all_gpu_owned
+from vibespatial.cuda._runtime import pylibcudf_table_from_arrow
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import (
@@ -773,10 +774,9 @@ def _attach_private_native_state_from_public_frame(
         arrow_table = pa.Table.from_pandas(attribute_frame, preserve_index=False)
         if has_gpu_runtime() and has_pylibcudf_support():
             try:
-                import pylibcudf as plc
 
                 attributes = NativeAttributeTable(
-                    device_table=plc.Table.from_arrow(arrow_table),
+                    device_table=pylibcudf_table_from_arrow(arrow_table),
                     index_override=frame.index,
                     column_override=tuple(attribute_frame.columns),
                     schema_override=arrow_table.schema,
@@ -822,7 +822,6 @@ def _native_box_frame_from_owned(
 ) -> tuple[geopandas.GeoDataFrame, NativeFrameState]:
     """Build a public frame with attached private native state from owned boxes."""
     import pyarrow as pa
-    import pylibcudf as plc
 
     row_count = int(owned.row_count)
     geometry_name = "geometry"
@@ -842,7 +841,7 @@ def _native_box_frame_from_owned(
     )
     arrow_table = pa.table(columns)
     attributes = NativeAttributeTable(
-        device_table=plc.Table.from_arrow(arrow_table),
+        device_table=pylibcudf_table_from_arrow(arrow_table),
         index_override=index,
         column_override=tuple(arrow_table.column_names),
         schema_override=arrow_table.schema,
@@ -4099,7 +4098,6 @@ def _profile_native_area_expression_pipeline(
 
     import cupy as cp
     import pyarrow as pa
-    import pylibcudf as plc
 
     from vibespatial.runtime.materialization import (
         MaterializationBoundary,
@@ -4152,7 +4150,7 @@ def _profile_native_area_expression_pipeline(
             }
         )
         attributes = NativeAttributeTable(
-            device_table=plc.Table.from_arrow(attribute_arrow),
+            device_table=pylibcudf_table_from_arrow(attribute_arrow),
             column_override=tuple(attribute_arrow.column_names),
             schema_override=attribute_arrow.schema,
         )
@@ -4728,7 +4726,6 @@ def _profile_constructive_output_native_pipeline(
 
     import cupy as cp
     import pyarrow as pa
-    import pylibcudf as plc
 
     from vibespatial.constructive.binary_constructive import binary_constructive_owned
     from vibespatial.runtime.materialization import clear_materialization_events
@@ -4796,7 +4793,7 @@ def _profile_constructive_output_native_pipeline(
         constructive_elapsed = perf_counter() - started
         attribute_arrow = pa.table({"group": pa.array(group_codes_host, type=pa.int32())})
         attributes = NativeAttributeTable(
-            device_table=plc.Table.from_arrow(attribute_arrow),
+            device_table=pylibcudf_table_from_arrow(attribute_arrow),
             column_override=tuple(attribute_arrow.column_names),
             schema_override=attribute_arrow.schema,
         )

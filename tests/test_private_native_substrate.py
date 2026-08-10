@@ -65,6 +65,7 @@ from vibespatial.api._native_state import (
 )
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.tools.sjoin import (
+    _device_columns_from_native_attributes,
     _sjoin_export_result,
     _sjoin_nearest_relation_result,
     sjoin,
@@ -6083,6 +6084,65 @@ def test_sjoin_native_on_attribute_filters_device_relation_pairs() -> None:
         )
     ) == [(0, 0), (1, 0), (2, 1)]
     reset_d2h_transfer_count()
+
+
+def test_sjoin_on_attribute_waits_for_cross_stream_device_columns() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native sjoin attribute stream ordering")
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+
+    from vibespatial.cuda._runtime import pylibcudf_column_from_device
+
+    delay = cp.RawKernel(
+        r'''
+        extern "C" __global__ void delay(unsigned long long ticks) {
+            unsigned long long start = clock64();
+            while (clock64() - start < ticks) {}
+        }
+        ''',
+        "delay",
+    )
+    blocker = cp.cuda.Stream(non_blocking=True)
+    producer = cp.cuda.Stream(non_blocking=True)
+    consumer = cp.cuda.Stream(non_blocking=True)
+    ready = cp.cuda.Event(disable_timing=True)
+    left_values = cp.zeros(1, dtype=cp.int32)
+    right_values = cp.zeros(1, dtype=cp.int32)
+    right_attributes = NativeAttributeTable(
+        device_table=plc.Table([pylibcudf_column_from_device(right_values)]),
+        index_override=pd.RangeIndex(1),
+        column_override=("zone",),
+        schema_override=pa.schema([pa.field("zone", pa.int32())]),
+    )
+    with blocker:
+        delay((1,), (1,), (100_000_000,))
+        ready.record(blocker)
+    with producer:
+        producer.wait_event(ready)
+        left_values.fill(123)
+        left_attributes = NativeAttributeTable(
+            device_table=plc.Table([pylibcudf_column_from_device(left_values)]),
+            index_override=pd.RangeIndex(1),
+            column_override=("zone",),
+            schema_override=pa.schema([pa.field("zone", pa.int32())]),
+        )
+
+    relation = NativeRelation(
+        left_indices=cp.asarray([0], dtype=cp.int32),
+        right_indices=cp.asarray([0], dtype=cp.int32),
+        left_row_count=1,
+        right_row_count=1,
+    )
+    with consumer:
+        left_columns = _device_columns_from_native_attributes(left_attributes, ("zone",))
+        right_columns = _device_columns_from_native_attributes(right_attributes, ("zone",))
+        assert left_columns is not None
+        assert right_columns is not None
+        filtered = relation.filter_by_equal_columns(left_columns, right_columns)
+
+    assert int(filtered.left_indices.size) == 0
+    assert int(filtered.right_indices.size) == 0
 
 
 def test_sjoin_public_string_on_attribute_filters_device_relation_in_strict_native(

@@ -1934,7 +1934,11 @@ def _try_csv_pylibcudf_read_native(filename, *, target_crs: str | None = None):
     import cupy as cp
     import pyarrow as pa
     import pylibcudf as plc
-    from pylibcudf.scalar import Scalar
+
+    from vibespatial.cuda._runtime import (
+        pylibcudf_current_stream,
+        pylibcudf_scalar_from_arrow,
+    )
 
     from .csv_gpu import _decode_hex_string_column_to_owned
     from .wkt_gpu import read_wkt_gpu
@@ -1950,7 +1954,8 @@ def _try_csv_pylibcudf_read_native(filename, *, target_crs: str | None = None):
 
     options = plc.io.csv.CsvReaderOptions.builder(plc.io.types.SourceInfo([str(file_path)])).build()
     options.set_header(0)
-    csv_table = plc.io.csv.read_csv(options)
+    stream = pylibcudf_current_stream()
+    csv_table = plc.io.csv.read_csv(options, stream=stream)
     column_names = csv_table.column_names()
     if geom_idx >= len(column_names):
         return None
@@ -1960,9 +1965,14 @@ def _try_csv_pylibcudf_read_native(filename, *, target_crs: str | None = None):
         return None
 
     if layout.geometry_format == "wkt":
-        newline = Scalar.from_arrow(pa.scalar("\n"))
-        empty = Scalar.from_arrow(pa.scalar(""))
-        joined = plc.strings.combine.join_strings(geom_column, newline, empty)
+        newline = pylibcudf_scalar_from_arrow(pa.scalar("\n"))
+        empty = pylibcudf_scalar_from_arrow(pa.scalar(""))
+        joined = plc.strings.combine.join_strings(
+            geom_column,
+            newline,
+            empty,
+            stream=stream,
+        )
         offsets = cp.asarray(joined.child(0).data()).view(cp.int32)
         total_bytes = int(offsets[1]) if int(joined.size()) else 0
         payload = cp.asarray(joined.data()).view(cp.uint8)[:total_bytes]
@@ -1973,7 +1983,10 @@ def _try_csv_pylibcudf_read_native(filename, *, target_crs: str | None = None):
     attribute_names = [name for idx, name in enumerate(column_names) if idx != geom_idx]
     attributes = None
     if attribute_names:
-        attributes = csv_table.tbl.to_arrow(metadata=column_names).select(attribute_names)
+        attributes = csv_table.tbl.to_arrow(
+            metadata=column_names,
+            stream=stream,
+        ).select(attribute_names)
 
     crs = target_crs if target_crs is not None else None
     return _native_file_result_from_owned(

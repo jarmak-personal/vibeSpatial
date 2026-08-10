@@ -494,6 +494,8 @@ def _decode_pylibcudf_geoparquet_column_with_arrow_fallback(
 ) -> OwnedGeometryArray:
     import pyarrow as pa
 
+    from vibespatial.cuda._runtime import pylibcudf_to_arrow
+
     try:
         decoder = _decode_pylibcudf_geoparquet_column_to_owned
         if "column_meta" in inspect.signature(decoder).parameters:
@@ -514,7 +516,7 @@ def _decode_pylibcudf_geoparquet_column_with_arrow_fallback(
             pipeline="io/read_parquet",
             d2h_transfer=True,
         )
-        arrow_table = table.to_arrow()
+        arrow_table = pylibcudf_to_arrow(table)
         arrow_column_index = arrow_table.schema.get_field_index(column_name)
         if arrow_column_index == -1:
             arrow_column_index = int(column_index)
@@ -570,8 +572,9 @@ def _decode_arrow_geoparquet_column_to_host_geoseries(
 
     from vibespatial.api.geometry_array import from_wkb
     from vibespatial.api.geoseries import GeoSeries
+    from vibespatial.cuda._runtime import pylibcudf_to_arrow
 
-    arrow_table = table.to_arrow() if _is_pylibcudf_table(table) else table
+    arrow_table = pylibcudf_to_arrow(table) if _is_pylibcudf_table(table) else table
     arrow_column_index = arrow_table.schema.get_field_index(column_name)
     if arrow_column_index == -1:
         arrow_column_index = int(column_index)
@@ -1693,7 +1696,12 @@ def _geoparquet_table_to_native_tabular_result(
                 pipeline="io/read_parquet",
                 d2h_transfer=True,
             )
-            host_decode_table = table.to_arrow() if scanned_with_pylibcudf else table
+            if scanned_with_pylibcudf:
+                from vibespatial.cuda._runtime import pylibcudf_to_arrow
+
+                host_decode_table = pylibcudf_to_arrow(table)
+            else:
+                host_decode_table = table
             host_series = _decode_arrow_geoparquet_column_to_host_geoseries(
                 host_decode_table,
                 column_name=column_name,
@@ -1948,6 +1956,8 @@ def _read_geoparquet_table_with_pylibcudf(
 ):
     import pylibcudf as plc
 
+    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
     scan_sources = list(sources or [path])
     source = plc.io.types.SourceInfo(scan_sources)
     builder = plc.io.parquet.ParquetReaderOptions.builder(source)
@@ -1972,7 +1982,10 @@ def _read_geoparquet_table_with_pylibcudf(
                 available_columns=tuple(available_columns or ()),
             )
         )
-    table_with_metadata = plc.io.parquet.read_parquet(options)
+    table_with_metadata = plc.io.parquet.read_parquet(
+        options,
+        stream=pylibcudf_current_stream(),
+    )
     return table_with_metadata.tbl
 
 
@@ -2335,7 +2348,9 @@ def _decode_geoparquet_table_to_owned(
                 pipeline="io/read_parquet",
                 d2h_transfer=True,
             )
-            table = table.to_arrow()
+            from vibespatial.cuda._runtime import pylibcudf_to_arrow
+
+            table = pylibcudf_to_arrow(table)
         else:
             primary = geo_metadata["primary_column"]
             decode_index = 0 if column_index is None else int(column_index)

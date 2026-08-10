@@ -39,6 +39,8 @@ def _has_gpu():
 
 
 requires_gpu = pytest.mark.skipif(not _has_gpu(), reason="GPU not available")
+
+
 def _shapely_area(geometries: list) -> np.ndarray:
     return shapely.area(np.array(geometries, dtype=object))
 
@@ -156,10 +158,12 @@ class TestLengthCPU:
         np.testing.assert_allclose(result, expected, rtol=1e-10)
 
     def test_multilinestring(self):
-        mls = MultiLineString([
-            [(0, 0), (1, 0)],
-            [(-1, 0), (1, 0)],
-        ])
+        mls = MultiLineString(
+            [
+                [(0, 0), (1, 0)],
+                [(-1, 0), (1, 0)],
+            ]
+        )
         owned = _make_owned([mls])
         result = length_owned(owned, dispatch_mode=ExecutionMode.CPU)
         np.testing.assert_allclose(result, [1.0 + 2.0], atol=1e-12)
@@ -265,10 +269,12 @@ class TestAreaGPU:
             Point(0, 0),
             LineString([(0, 0), (1, 1)]),
             Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
-            MultiPolygon([
-                Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
-                Polygon([(5, 5), (6, 5), (6, 6), (5, 6)]),
-            ]),
+            MultiPolygon(
+                [
+                    Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
+                    Polygon([(5, 5), (6, 5), (6, 6), (5, 6)]),
+                ]
+            ),
         ]
         owned = _make_owned(geoms)
         result = area_owned(owned, dispatch_mode=ExecutionMode.GPU)
@@ -356,6 +362,129 @@ class TestLengthGPU:
         expected = _shapely_length(geoms)
         # fp32 Kahan on consumer GPUs gives ~1e-4 precision (ADR-0002)
         np.testing.assert_allclose(result, expected, rtol=5e-3)
+
+    def test_fp32_center_skips_overallocated_zero_active_family(self):
+        import cupy as cp
+
+        from vibespatial.geometry.buffers import GeometryFamily
+        from vibespatial.geometry.owned import from_shapely_geometries
+        from vibespatial.runtime.residency import Residency
+
+        owned = from_shapely_geometries(
+            [Point(), LineString([(1.0, 1.0), (3.0, 3.0)])],
+            residency=Residency.DEVICE,
+        )
+        point_buffer = owned.device_state.families[GeometryFamily.POINT]
+        point_buffer.x = cp.full(16, cp.nan, dtype=cp.float64)
+        point_buffer.y = cp.full(16, cp.nan, dtype=cp.float64)
+
+        result = length_owned(
+            owned,
+            dispatch_mode=ExecutionMode.GPU,
+            precision="fp32",
+        )
+
+        np.testing.assert_allclose(result, [0.0, math.sqrt(8.0)], rtol=5e-6)
+
+    def test_indexed_fp32_metrics_only_scan_selected_family_rows(self, monkeypatch):
+        import cupy as cp
+
+        from vibespatial.constructive import measurement as measurement_module
+        from vibespatial.constructive.measurement import (
+            _coord_stats_from_owned,
+            _fp32_center_coords,
+        )
+        from vibespatial.geometry.buffers import GeometryFamily
+        from vibespatial.geometry.owned import (
+            OwnedGeometryArray,
+            from_shapely_geometries,
+        )
+        from vibespatial.runtime.residency import Residency
+
+        dense_far_polygon = Polygon(
+            [
+                (
+                    1e12 + 100.0 * math.cos(2.0 * math.pi * index / 512),
+                    1e12 + 100.0 * math.sin(2.0 * math.pi * index / 512),
+                )
+                for index in range(512)
+            ]
+        )
+
+        base = from_shapely_geometries(
+            [
+                LineString([(0.0, 0.0), (3.0, 4.0)]),
+                LineString([(1e12, 1e12), (1e12 + 3.0, 1e12 + 4.0)]),
+                Polygon([(0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (0.0, 1.0)]),
+                Polygon(
+                    [
+                        (1e12, 1e12),
+                        (1e12 + 2.0, 1e12),
+                        (1e12 + 2.0, 1e12 + 1.0),
+                        (1e12, 1e12 + 1.0),
+                    ]
+                ),
+                dense_far_polygon,
+            ],
+            residency=Residency.DEVICE,
+        )
+        view = OwnedGeometryArray._indexed_view(
+            base,
+            cp.asarray([0, 2, 0, 2], dtype=cp.int64),
+        )
+
+        from vibespatial.kernels.core import geometry_analysis as bounds_module
+
+        bounds_launches: list[tuple[str, list[int]]] = []
+        original_serial_bounds = bounds_module._launch_family_bounds_kernel
+        original_cooperative_bounds = bounds_module._launch_family_bounds_cooperative
+
+        def _record_serial_bounds(family, *args, **kwargs):
+            if family is GeometryFamily.POLYGON:
+                bounds_launches.append(("serial", kwargs["source_rows"].get().tolist()))
+            return original_serial_bounds(family, *args, **kwargs)
+
+        def _record_cooperative_bounds(family, *args, **kwargs):
+            if family is GeometryFamily.POLYGON:
+                bounds_launches.append(("cooperative", kwargs["source_rows"].get().tolist()))
+            return original_cooperative_bounds(family, *args, **kwargs)
+
+        monkeypatch.setattr(bounds_module, "_launch_family_bounds_kernel", _record_serial_bounds)
+        monkeypatch.setattr(
+            bounds_module,
+            "_launch_family_bounds_cooperative",
+            _record_cooperative_bounds,
+        )
+
+        assert view.is_indexed_view
+        assert _coord_stats_from_owned(view) == (4.0, 0.0, 4.0)
+        assert _fp32_center_coords(view) == (1.5, 2.0)
+        assert bounds_launches == [("serial", [0])]
+        np.testing.assert_allclose(
+            length_owned(view, dispatch_mode=ExecutionMode.GPU, precision="fp32"),
+            [5.0, 6.0, 5.0, 6.0],
+            rtol=5e-6,
+        )
+        area_launches: list[tuple[bool, list[int]]] = []
+        original_area_launch = measurement_module._launch_polygon_area_rows
+
+        def _record_area_launch(runtime, device_buffer, source_rows, out, **kwargs):
+            area_launches.append((kwargs["cooperative"], source_rows.get().tolist()))
+            return original_area_launch(runtime, device_buffer, source_rows, out, **kwargs)
+
+        monkeypatch.setattr(
+            measurement_module,
+            "_launch_polygon_area_rows",
+            _record_area_launch,
+        )
+        np.testing.assert_allclose(
+            area_owned(view, dispatch_mode=ExecutionMode.GPU, precision="fp32"),
+            [0.0, 2.0, 0.0, 2.0],
+            rtol=5e-6,
+        )
+        assert area_launches == [(False, [0])]
+        assert base.device_state.families[GeometryFamily.LINESTRING].bounds is None
+        assert base.device_state.families[GeometryFamily.POLYGON].bounds is None
 
 
 # =====================================================================

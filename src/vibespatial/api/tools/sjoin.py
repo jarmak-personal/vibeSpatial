@@ -672,11 +672,8 @@ def _device_columns_from_native_attributes(attributes, on_attribute):
     ):
         return None
 
-    source_columns = table.device_table.columns()
-    return {
-        column: source_columns[column_positions[column]]
-        for column in requested
-    }
+    source_columns = table.to_pylibcudf_columns(requested)
+    return dict(zip(requested, source_columns, strict=True))
 
 
 def _device_columns_from_public_frame(frame, on_attribute):
@@ -685,7 +682,6 @@ def _device_columns_from_public_frame(frame, on_attribute):
     requested = tuple(dict.fromkeys(on_attribute))
     try:
         import pyarrow as pa
-        import pylibcudf as plc
     except ModuleNotFoundError:
         return None
 
@@ -710,10 +706,12 @@ def _device_columns_from_public_frame(frame, on_attribute):
 
     physical_names = [f"__vibespatial_on_attribute_{index}" for index in range(len(arrays))]
     try:
-        device_table = plc.Table.from_arrow(
-            pa.Table.from_arrays(arrays, names=physical_names)
+        from vibespatial.cuda._runtime import pylibcudf_table_from_arrow
+
+        device_table = pylibcudf_table_from_arrow(
+            pa.Table.from_arrays(arrays, names=physical_names),
         )
-    except (TypeError, ValueError):
+    except (ModuleNotFoundError, TypeError, ValueError):
         return None
     source_columns = device_table.columns()
     return {
