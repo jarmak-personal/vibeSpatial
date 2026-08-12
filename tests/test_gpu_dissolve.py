@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import shapely
-from shapely.geometry import LineString, Polygon, box
+from shapely.geometry import LineString, MultiPolygon, Polygon, box
 
 import vibespatial.api as geopandas
 from vibespatial import DissolveUnionMethod, has_gpu_runtime
@@ -330,6 +330,167 @@ def test_large_buffered_line_collective_union_uses_exact_tiled_topology() -> Non
         event.surface == "vibespatial.constructive.collective_union"
         and event.implementation == "gpu_single_group_tiled_collective_topology"
         for event in events
+    )
+
+
+@pytest.mark.gpu
+def test_dense_buffered_line_collective_union_renodes_refined_crossings(
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.constructive.linestring import linestring_buffer_owned_array
+    from vibespatial.constructive.tiled_union import _single_group_collective_union_gpu
+    from vibespatial.overlay import split as split_module
+    from vibespatial.runtime import ExecutionMode
+
+    lines = from_shapely_geometries(
+        _river_lines(500, seed=10),
+        residency=Residency.DEVICE,
+    )
+    buffered = linestring_buffer_owned_array(
+        lines,
+        35.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    expected = shapely.union_all(np.asarray(buffered.to_shapely(), dtype=object))
+    renode_calls = []
+    original_renode = split_module.renode_gpu_atomic_edges
+
+    def _record_renode(*args, **kwargs):
+        renode_calls.append(True)
+        return original_renode(*args, **kwargs)
+
+    monkeypatch.setattr(split_module, "renode_gpu_atomic_edges", _record_renode)
+
+    actual = _single_group_collective_union_gpu(buffered).to_shapely()[0]
+
+    assert renode_calls
+    assert bool(shapely.is_valid(actual))
+    assert shapely.area(shapely.symmetric_difference(actual, expected)) == pytest.approx(
+        0.0,
+        abs=1.0e-8,
+    )
+
+
+@pytest.mark.gpu
+def test_collective_topology_tile_relation_is_sparse_and_tile_sorted() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    from vibespatial.constructive.tiled_union import (
+        _build_topology_tile_candidate_relation,
+        _device_topology_tile_bounds,
+    )
+    from vibespatial.spatial.segment_primitives import _extract_segments_gpu
+
+    source = np.asarray(
+        [box(0.0, 0.0, 1.0, 1.0), box(10.0, 0.0, 11.0, 1.0)],
+        dtype=object,
+    )
+    owned = from_shapely_geometries(source, residency=Residency.DEVICE)
+    d_tile_bounds, _, metadata = _device_topology_tile_bounds(
+        owned,
+        tile_count=8,
+    )
+    segments = _extract_segments_gpu(owned)
+
+    relation, host_offsets, d_full_tile_mask, max_pressure = (
+        _build_topology_tile_candidate_relation(
+            owned,
+            segments,
+            d_tile_bounds,
+            metadata,
+        )
+    )
+    cp.cuda.get_current_stream().synchronize()
+    segments.free()
+
+    relation_pairs = set(
+        zip(
+            cp.asnumpy(relation.left_indices).tolist(),
+            cp.asnumpy(relation.right_indices).tolist(),
+            strict=True,
+        )
+    )
+    full_tiles = cp.asnumpy(cp.flatnonzero(d_full_tile_mask)).tolist()
+    tile_bounds = cp.asnumpy(d_tile_bounds)
+    for tile_id, bounds in enumerate(tile_bounds):
+        tile = box(*bounds)
+        for source_row, geometry in enumerate(source):
+            if shapely.intersects(tile, geometry):
+                assert tile_id in full_tiles or (tile_id, source_row) in relation_pairs
+
+    assert relation.sorted_by_left
+    assert relation.left_row_count == 8
+    assert relation.right_row_count == 2
+    assert host_offsets.shape == (9,)
+    assert np.all(np.diff(host_offsets) >= 0)
+    assert max_pressure >= 0
+
+
+@pytest.mark.gpu
+def test_collective_topology_supports_empty_interior_tiles() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.constructive.tiled_union import (
+        single_group_polygon_collective_union_gpu,
+    )
+
+    geometries = np.asarray(
+        [box(0.0, 0.0, 1.0, 1.0), box(10.0, 0.0, 11.0, 1.0)],
+        dtype=object,
+    )
+    owned = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+
+    actual = single_group_polygon_collective_union_gpu(
+        owned,
+        force_tile_count=8,
+    ).to_shapely()[0]
+    expected = shapely.union_all(geometries)
+
+    assert bool(shapely.equals(actual, expected))
+
+
+@pytest.mark.gpu
+def test_collective_topology_scanline_proof_preserves_holes_and_multipart_parts() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.constructive.tiled_union import (
+        single_group_polygon_collective_union_gpu,
+    )
+
+    shell_with_hole = Polygon(
+        [(0.0, 0.0), (12.0, 0.0), (12.0, 12.0), (0.0, 12.0)],
+        holes=[[(3.0, 3.0), (9.0, 3.0), (9.0, 9.0), (3.0, 9.0)]],
+    )
+    multipart = MultiPolygon(
+        [
+            box(4.0, 4.0, 5.0, 5.0),
+            box(7.0, 7.0, 8.0, 8.0),
+        ]
+    )
+    geometries = np.asarray([shell_with_hole, multipart], dtype=object)
+    owned = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+    state = owned._ensure_device_state(preserve_indexed_view=True)
+    state.trusted_all_valid = True
+    state.trusted_all_non_empty = True
+
+    actual = single_group_polygon_collective_union_gpu(
+        owned,
+        force_tile_count=32,
+    ).to_shapely()[0]
+    expected = shapely.union_all(geometries)
+
+    assert bool(shapely.is_valid(actual))
+    assert shapely.area(shapely.symmetric_difference(actual, expected)) == pytest.approx(
+        0.0,
+        abs=1.0e-10,
     )
 
 

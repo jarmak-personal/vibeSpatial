@@ -81,6 +81,7 @@ def test_row_isolated_face_output_stays_capacity_backed() -> None:
     )
     assert containment_position < branch_start
     assert 'kernels["locate_boundary_ring_group_spans"]' in assemble_source
+    assert "count_boundary_ring_containment_depth" in kernel_source
     assert "d_explicit_polygon_output_rows" in capacity_branch
     assert "d_explicit_polygon_active" in capacity_branch
     assert "excluded_rings" not in assemble_source

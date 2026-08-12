@@ -695,13 +695,8 @@ def _clip_collective_grouped_mask_prefers_relation(
         positive_area_pair_count=positive_area_pair_count,
         mask_rectangle_strip_admissible=mask_rectangle_strip_admissible,
     )
-    relation_memory_admissible = (
-        available_device_bytes is None
-        or relation_estimate.is_device_memory_admissible(available_device_bytes)
-    )
     return (
-        relation_memory_admissible
-        and relation_estimate.dispatch_unit_count() <= union_estimate.dispatch_unit_count(),
+        relation_estimate.dispatch_unit_count() <= union_estimate.dispatch_unit_count(),
         relation_estimate,
         union_estimate,
     )
@@ -6766,114 +6761,168 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
         )
 
     from vibespatial.constructive.binary_constructive import _binary_constructive_gpu
+    from vibespatial.cuda.cccl_primitives import PairSortStrategy, sort_pairs
+    from vibespatial.overlay.gpu import _compact_bounded_device_work_spans
 
-    d_pair_capacity_active = relation_pair_selection.active_capacity_mask()
-    d_pair_source_rows = relation_pair_selection.gather_capacity(
-        d_source_rows,
-        fill_value=0,
+    d_unresolved_pair_positions = cp.flatnonzero(d_unresolved_pair_active).astype(
+        cp.int64,
+        copy=False,
+    )
+    compact_pair_count = int(d_unresolved_pair_positions.size)
+    d_compact_source_rows = d_source_rows[d_unresolved_pair_positions]
+    d_compact_mask_rows = d_mask_rows[d_unresolved_pair_positions]
+    d_sort_keys = (
+        d_compact_source_rows.astype(cp.uint64, copy=False) << cp.uint64(32)
+    ) | cp.arange(compact_pair_count, dtype=cp.uint64)
+    d_pair_order = sort_pairs(
+        d_sort_keys,
+        cp.arange(compact_pair_count, dtype=cp.int32),
+        strategy=PairSortStrategy.RADIX,
+        synchronize=False,
+    ).values.astype(cp.int64, copy=False)
+    d_sorted_source_rows = d_compact_source_rows[d_pair_order]
+    d_sorted_mask_rows = d_compact_mask_rows[d_pair_order]
+    d_source_pair_counts = cp.bincount(
+        d_sorted_source_rows,
+        minlength=source_state.row_count,
     ).astype(cp.int64, copy=False)
-    d_pair_mask_rows = relation_pair_selection.gather_capacity(
-        d_mask_rows,
-        fill_value=0,
-    ).astype(cp.int64, copy=False)
-    source_pairs = owned.device_take_capacity(
-        d_pair_source_rows,
-        d_pair_capacity_active,
+    relation_live_bytes = max(int(relation_estimate.live_device_byte_count()), 1)
+    estimated_bytes_per_pair = max(
+        (relation_live_bytes + max(compact_pair_count, 1) - 1)
+        // max(compact_pair_count, 1),
+        256,
     )
-    mask_pairs = mask_source_owned.device_take_capacity(
-        d_pair_mask_rows,
-        d_pair_capacity_active,
+    page_available_bytes = max(int(available_device_bytes or relation_live_bytes) // 5, 1)
+    page_pair_budget = max(
+        64 * 1024,
+        page_available_bytes // estimated_bytes_per_pair,
     )
-    pair_intersections = _binary_constructive_gpu(
-        "intersection",
-        source_pairs,
-        mask_pairs,
-        dispatch_mode=ExecutionMode.GPU,
+    source_spans = _compact_bounded_device_work_spans(
+        d_source_pair_counts,
+        live_event_budget=page_pair_budget,
     )
-    if pair_intersections is None or pair_intersections.residency is not Residency.DEVICE:
-        raise RuntimeError("grouped-mask relation intersection declined after GPU plan admission")
-    d_pair_polygon_active = _owned_nonempty_polygon_device_mask(pair_intersections)
-    if d_pair_polygon_active is None:
-        raise RuntimeError("grouped-mask relation intersection lost polygon activity metadata")
-    d_pair_polygon_active = cp.asarray(d_pair_polygon_active, dtype=cp.bool_)
-    from vibespatial.kernels.constructive.polygon_rect_intersection import (
-        device_trusted_rectangle_bounds_matrix,
+    d_pair_offsets = cp.empty(source_state.row_count + 1, dtype=cp.int64)
+    d_pair_offsets[0] = 0
+    d_pair_offsets[1:] = cp.cumsum(d_source_pair_counts, dtype=cp.int64)
+    d_span_boundaries = cp.asarray(
+        [source_spans[0][0], *(end for _start, end in source_spans)],
+        dtype=cp.int64,
+    )
+    host_pair_boundaries = np.asarray(
+        get_cuda_runtime().copy_device_to_host(
+            d_pair_offsets[d_span_boundaries],
+            reason="clip grouped-mask complete-source page-offset planning packet",
+        ),
+        dtype=np.int64,
     )
 
-    pair_intersections_axis_rectangles = bool(
-        device_trusted_rectangle_bounds_matrix(source_pairs) is not None
-        and device_trusted_rectangle_bounds_matrix(mask_pairs) is not None
-    )
-    pair_boundary_parts = ()
-    if not keep_geom_type:
-        from vibespatial.constructive.grouped_mixed_union import (
-            polygon_pair_boundary_capacity_parts_device,
+    for page_index, (source_start, source_end) in enumerate(source_spans):
+        pair_start = int(host_pair_boundaries[page_index])
+        pair_end = int(host_pair_boundaries[page_index + 1])
+        if pair_end <= pair_start:
+            continue
+        page_source_count = source_end - source_start
+        d_page_source_rows = d_sorted_source_rows[pair_start:pair_end]
+        d_page_mask_rows = d_sorted_mask_rows[pair_start:pair_end]
+        d_page_group_rows = (d_page_source_rows - np.int64(source_start)).astype(
+            cp.int64,
+            copy=False,
         )
-
-        pair_boundary_parts = polygon_pair_boundary_capacity_parts_device(
+        d_page_active = cp.ones(pair_end - pair_start, dtype=cp.bool_)
+        source_pairs = owned.device_take(d_page_source_rows)
+        mask_pairs = mask_source_owned.device_take(d_page_mask_rows)
+        pair_intersections = _binary_constructive_gpu(
+            "intersection",
             source_pairs,
             mask_pairs,
-            pair_active=(d_pair_capacity_active & ~d_pair_polygon_active),
+            dispatch_mode=ExecutionMode.GPU,
         )
-        if pair_boundary_parts is None:
-            raise RuntimeError("grouped-mask relation boundary capacity declined")
-
-    grouped_capacity = _clip_grouped_polygon_pair_capacity(
-        pair_intersections,
-        d_pair_source_rows,
-        d_pair_capacity_active,
-        output_row_count=source_state.row_count,
-        pair_intersections_axis_rectangles=pair_intersections_axis_rectangles,
-    )
-    if grouped_capacity is None:
-        return None
-    polygon_capacity, d_polygon_keep = grouped_capacity
-    if keep_geom_type:
-        capacity_geometry = GeometryNativeResult.from_owned(
-            polygon_capacity,
-            crs=geometry.crs,
-        )
-        d_output_keep = d_polygon_keep
-    else:
-        from vibespatial.constructive.grouped_mixed_union import (
-            grouped_mixed_union_capacity_device,
+        if pair_intersections is None or pair_intersections.residency is not Residency.DEVICE:
+            raise RuntimeError(
+                "grouped-mask relation page intersection declined after GPU plan admission"
+            )
+        d_pair_polygon_active = _owned_nonempty_polygon_device_mask(pair_intersections)
+        if d_pair_polygon_active is None:
+            raise RuntimeError("grouped-mask relation page lost polygon activity metadata")
+        d_pair_polygon_active = cp.asarray(d_pair_polygon_active, dtype=cp.bool_)
+        from vibespatial.kernels.constructive.polygon_rect_intersection import (
+            device_trusted_rectangle_bounds_matrix,
         )
 
-        mixed_capacity = grouped_mixed_union_capacity_device(
+        pair_intersections_axis_rectangles = bool(
+            device_trusted_rectangle_bounds_matrix(source_pairs) is not None
+            and device_trusted_rectangle_bounds_matrix(mask_pairs) is not None
+        )
+        pair_boundary_parts = ()
+        if not keep_geom_type:
+            from vibespatial.constructive.grouped_mixed_union import (
+                polygon_pair_boundary_capacity_parts_device,
+            )
+
+            pair_boundary_parts = polygon_pair_boundary_capacity_parts_device(
+                source_pairs,
+                mask_pairs,
+                pair_active=(d_page_active & ~d_pair_polygon_active),
+            )
+            if pair_boundary_parts is None:
+                raise RuntimeError("grouped-mask relation page boundary capacity declined")
+
+        grouped_capacity = _clip_grouped_polygon_pair_capacity(
             pair_intersections,
-            d_pair_source_rows,
-            d_pair_capacity_active,
-            polygon_capacity,
-            d_polygon_keep,
-            output_row_count=source_state.row_count,
-            crs=geometry.crs,
-            pair_boundary_parts=pair_boundary_parts,
+            d_page_group_rows,
+            d_page_active,
+            output_row_count=page_source_count,
+            pair_intersections_axis_rectangles=pair_intersections_axis_rectangles,
         )
-        capacity_geometry = mixed_capacity.geometry
-        d_output_keep = mixed_capacity.keep_mask
-    source_rowset = NativeRowSet.from_positions(
-        cp.arange(source_state.row_count, dtype=cp.int64),
-        source_token=source_state.lineage_token,
-        source_row_count=source_state.row_count,
-        ordered=True,
-        unique=True,
-        identity=True,
-    )
-    capacity_result = _clip_native_tabular_result_from_rowset(
-        gdf,
-        geometry_name=geometry_name,
-        geometry=capacity_geometry,
-        rowset=source_rowset,
-        keep_geom_type=keep_geom_type,
-    )
-    if capacity_result is None:
-        return None
-    result_partitions.append(
-        NativeTabularSelection(
-            capacity_result=capacity_result,
-            selection=NativeDeviceSelection.from_mask(d_output_keep),
+        if grouped_capacity is None:
+            return None
+        polygon_capacity, d_polygon_keep = grouped_capacity
+        if keep_geom_type:
+            capacity_geometry = GeometryNativeResult.from_owned(
+                polygon_capacity,
+                crs=geometry.crs,
+            )
+            d_output_keep = d_polygon_keep
+        else:
+            from vibespatial.constructive.grouped_mixed_union import (
+                grouped_mixed_union_capacity_device,
+            )
+
+            mixed_capacity = grouped_mixed_union_capacity_device(
+                pair_intersections,
+                d_page_group_rows,
+                d_page_active,
+                polygon_capacity,
+                d_polygon_keep,
+                output_row_count=page_source_count,
+                crs=geometry.crs,
+                pair_boundary_parts=pair_boundary_parts,
+            )
+            capacity_geometry = mixed_capacity.geometry
+            d_output_keep = mixed_capacity.keep_mask
+        source_rowset = NativeRowSet.from_positions(
+            cp.arange(source_start, source_end, dtype=cp.int64),
+            source_token=source_state.lineage_token,
+            source_row_count=source_state.row_count,
+            ordered=True,
+            unique=True,
+            identity=(source_start == 0 and source_end == source_state.row_count),
         )
-    )
+        capacity_result = _clip_native_tabular_result_from_rowset(
+            gdf,
+            geometry_name=geometry_name,
+            geometry=capacity_geometry,
+            rowset=source_rowset,
+            keep_geom_type=keep_geom_type,
+        )
+        if capacity_result is None:
+            return None
+        result_partitions.append(
+            NativeTabularSelection(
+                capacity_result=capacity_result,
+                selection=NativeDeviceSelection.from_mask(d_output_keep),
+            )
+        )
 
     record_dispatch_event(
         surface="geopandas.clip",
@@ -6885,7 +6934,8 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
         ),
         detail=(
             f"source_rows={owned.row_count}, mask_rows={mask_source_owned.row_count}, "
-            f"pairs={pair_count}, output_rows=device-resident"
+            f"pairs={compact_pair_count}, pages={len(source_spans)}, "
+            f"pair_budget={page_pair_budget}, output_rows=device-resident"
         ),
         requested=ExecutionMode.AUTO,
         selected=ExecutionMode.GPU,

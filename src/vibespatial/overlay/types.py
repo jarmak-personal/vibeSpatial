@@ -36,6 +36,9 @@ class SplitEventDeviceState:
     part_indices: DeviceArray | None = None
     ring_indices: DeviceArray | None = None
     geometry_indices: DeviceArray | None = None
+    # Endpoint incidences touched by a paired event. Descendant atomic edges
+    # form the native rowset requiring fixed-point planarity refinement.
+    planarity_risk: DeviceArray | None = None
 
 
 @dataclass
@@ -53,6 +56,7 @@ class SplitEventTable:
     right_segment_count: int
     runtime_selection: RuntimeSelection
     device_state: SplitEventDeviceState
+    requires_renoding: bool = False
     _count: int = 0
     # Host arrays — lazily materialized from device_state on first access.
     _source_segment_ids: np.ndarray | None = None
@@ -214,6 +218,9 @@ class AtomicEdgeDeviceState:
     # are summed independently for the two overlay operands.
     left_coverage_delta: DeviceArray | None = None
     right_coverage_delta: DeviceArray | None = None
+    # Per-directed-edge lineage from risky split-event endpoint incidences.
+    # Forward/reverse twins carry the same bit.
+    planarity_risk: DeviceArray | None = None
 
 
 @dataclass

@@ -85,6 +85,7 @@ def build_spec_registry() -> dict[str, CCCLWarmupSpec]:
         "radix_sort_i32_i32": S("radix_sort_i32_i32", F.RADIX_SORT, i32, i32, "ascending"),
         "radix_sort_i64_i32": S("radix_sort_i64_i32", F.RADIX_SORT, i64, i32, "ascending"),
         "radix_sort_u64_i32": S("radix_sort_u64_i32", F.RADIX_SORT, u64, i32, "ascending"),
+        "radix_sort_f64_i32": S("radix_sort_f64_i32", F.RADIX_SORT, f64, i32, "ascending"),
         "merge_sort_u64_i32": S("merge_sort_u64_i32", F.MERGE_SORT, u64, i32, "less_than"),
         "unique_by_key_i32_i32": S("unique_by_key_i32_i32", F.UNIQUE_BY_KEY, i32, i32, "equal_to"),
         "unique_by_key_u64_i32": S("unique_by_key_u64_i32", F.UNIQUE_BY_KEY, u64, i32, "equal_to"),

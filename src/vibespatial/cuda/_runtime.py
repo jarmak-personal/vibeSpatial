@@ -1393,6 +1393,20 @@ class CudaDriverRuntime:
                 raise
             retainer.release_all_claimed_retirements(claimed)
 
+    def synchronize_stream(self, stream: Any | None = None) -> None:
+        """Complete one stream and retire only its submitted resource owners."""
+        with self.activate():
+            target = cp.cuda.get_current_stream() if stream is None else stream
+            cupy_stream = self._cupy_stream(target)
+            retainer = get_cuda_completion_retainer()
+            claimed = retainer.claim_stream_retirements(target)
+            try:
+                cupy_stream.synchronize()
+            except BaseException:
+                retainer.restore_stream_retirements(target, claimed)
+                raise
+            retainer.release_claimed_retirements(claimed)
+
     # ------------------------------------------------------------------
     # Stream management
     # ------------------------------------------------------------------

@@ -7459,7 +7459,7 @@ def test_collective_grouped_mask_shape_estimate_prefers_sparse_relation() -> Non
     assert relation.dispatch_unit_count() < union.dispatch_unit_count()
 
 
-def test_collective_grouped_mask_shape_rejects_relation_over_memory_budget() -> None:
+def test_collective_grouped_mask_shape_pages_relation_over_memory_budget() -> None:
     source_owned = from_shapely_geometries(
         [box(float(i), 0.0, float(i) + 3.0, 1.0) for i in range(10)],
         residency=Residency.HOST,
@@ -7479,7 +7479,7 @@ def test_collective_grouped_mask_shape_rejects_relation_over_memory_budget() -> 
 
     assert relation.dispatch_unit_count() < union.dispatch_unit_count()
     assert not relation.is_device_memory_admissible(1)
-    assert not prefers_relation
+    assert prefers_relation
 
 
 def test_collective_grouped_mask_shape_estimate_prefers_dense_union() -> None:

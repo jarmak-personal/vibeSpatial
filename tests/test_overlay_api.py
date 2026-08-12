@@ -840,6 +840,8 @@ def test_overlay_gpu_face_selection_stays_capacity_backed() -> None:
     assert "1 - d_face_selected" not in face_assembly_source
     assert "classify_hole_faces" not in face_assembly_source
     assert "count_boundary_ring_containment_depth" in face_assembly_source
+    assert "(d_containment_depth & np.int32(1)) == 0" in face_assembly_source
+    assert "(d_containment_depth & np.int32(1)) != 0" in face_assembly_source
 
     helper_start = assemble_source.index("def _extract_face_boundary_rings_gpu(")
     helper_end = assemble_source.index("\ndef ", helper_start + 1)
@@ -873,15 +875,17 @@ def test_overlay_gpu_face_selection_stays_capacity_backed() -> None:
     assert "d_containment_group_end" in nesting_section
     assert "cp.flatnonzero" not in nesting_section
 
-    for kernel_name in (
-        "count_boundary_ring_containment_depth(",
-        "assign_holes_to_exteriors(",
-    ):
-        kernel_start = kernel_source.index(kernel_name)
-        kernel_end = kernel_source.index("\n}", kernel_start) + 2
-        kernel_body = kernel_source[kernel_start:kernel_end]
-        assert "group_start" in kernel_body
-        assert "group_end" in kernel_body
+    kernel_start = kernel_source.index("assign_holes_to_exteriors(")
+    kernel_end = kernel_source.index("\n}", kernel_start) + 2
+    kernel_body = kernel_source[kernel_start:kernel_end]
+    assert "group_start" in kernel_body
+    assert "group_end" in kernel_body
+
+    metrics_start = kernel_source.index("compute_centered_boundary_ring_areas(")
+    metrics_end = kernel_source.index("\n}", metrics_start) + 2
+    metrics_body = kernel_source[metrics_start:metrics_end]
+    assert "origin_x" in metrics_body
+    assert "out_area" in metrics_body
 
 
 def test_overlay_face_assembly_prefers_device_path_without_selected_face_export(

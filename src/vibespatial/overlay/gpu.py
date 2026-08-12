@@ -14,6 +14,7 @@ request_warmup(
         "radix_sort_i32_i32",
         "radix_sort_i64_i32",
         "radix_sort_u64_i32",
+        "radix_sort_f64_i32",
         "unique_by_key_i32_i32",
         "unique_by_key_u64_i32",
         "segmented_reduce_sum_f64",
@@ -1582,6 +1583,13 @@ def _materialize_overlay_execution_plan(
                     else cp.asarray(valid_empty_rows, dtype=cp.bool_)[row_start:row_end]
                 ),
             )
+            page_result = _physicalize_paged_overlay_output(page_result)
+            with hotpath_stage("overlay.plan.page_retirement", category="setup"):
+                # A page result is compact and self-contained after
+                # physicalization. Complete its stream before planning the
+                # next page so graph and CCCL scratch ownership is bounded by
+                # one physical topology page rather than Python launch depth.
+                get_cuda_runtime().synchronize_stream()
             page_results.append(page_result)
             if page_selected is ExecutionMode.CPU:
                 selected = ExecutionMode.CPU
@@ -1651,6 +1659,52 @@ def _materialize_overlay_execution_plan(
     finally:
         del selected_faces
         maybe_trim_pool_memory()
+
+
+def _physicalize_paged_overlay_output(
+    result: OwnedGeometryArray,
+) -> OwnedGeometryArray:
+    """Compact one completed topology page before retaining later pages."""
+    from vibespatial.geometry.owned import (
+        build_null_owned_array,
+        device_physicalize_owned_row_selections_exact,
+    )
+    from vibespatial.runtime.residency import Residency
+
+    remnant_mask = getattr(
+        result,
+        "_polygon_intersection_lower_dimensional_remnant",
+        None,
+    )
+    remnant_parts = getattr(
+        result,
+        "_polygon_intersection_lower_dimensional_parts",
+        None,
+    )
+    arrays = [result, *(remnant_parts or ())]
+    physicalized = device_physicalize_owned_row_selections_exact(
+        [
+            (owned, cp.ones(owned.row_count, dtype=cp.bool_))
+            for owned in arrays
+        ],
+        reason="paged overlay output exact-allocation packet",
+    )
+    resolved = [
+        (
+            build_null_owned_array(source.row_count, residency=Residency.DEVICE)
+            if physical is None
+            else physical
+        )
+        for source, physical in zip(arrays, physicalized, strict=True)
+    ]
+    primary = resolved[0]
+    if primary.row_count != result.row_count:
+        raise RuntimeError("paged overlay output physicalization changed row count")
+    if remnant_mask is not None:
+        primary._polygon_intersection_lower_dimensional_remnant = remnant_mask
+    if remnant_parts is not None:
+        primary._polygon_intersection_lower_dimensional_parts = tuple(resolved[1:])
+    return primary
 
 
 def _expand_group_pair_positions(group_starts, group_ends, *, total_count: int | None = None):

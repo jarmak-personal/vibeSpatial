@@ -1169,8 +1169,11 @@ reduce_indexed_component_containment(
   __shared__ int sh_right[256];
   __shared__ int sh_depth[256];
   const int root_edge = face_edge_ids[face_offsets[root_face]];
-  const double px = src_x[root_edge];
-  const double py = src_y[root_edge];
+  const int root_twin = root_edge ^ 1;
+  const double root_x = src_x[root_edge];
+  const double root_y = src_y[root_edge];
+  const double px = root_x + (src_x[root_twin] - root_x) * 0.5;
+  const double py = root_y + (src_y[root_twin] - root_y) * 0.5;
   if (tid == 0) {
     sh_upper = face_bounds_prefix_upper_bound(
         px, candidate_faces, face_bounds, face_capacity);
@@ -1262,8 +1265,11 @@ select_indexed_component_containment_parent(
   __shared__ int sh_upper;
   __shared__ int sh_parent[256];
   const int root_edge = face_edge_ids[face_offsets[root_face]];
-  const double px = src_x[root_edge];
-  const double py = src_y[root_edge];
+  const int root_twin = root_edge ^ 1;
+  const double root_x = src_x[root_edge];
+  const double root_y = src_y[root_edge];
+  const double px = root_x + (src_x[root_twin] - root_x) * 0.5;
+  const double py = root_y + (src_y[root_twin] - root_y) * 0.5;
   if (tid == 0) {
     sh_upper = face_bounds_prefix_upper_bound(
         px, candidate_faces, face_bounds, face_capacity);
@@ -1525,7 +1531,7 @@ scatter_boundary_ring_coordinates(
 // One block owns one boundary cycle. The cycle membership is sorted but does
 // not need traversal order because boundary_next supplies each directed edge's
 // successor. Centering at the first edge prevents translated slivers from
-// cancelling before exact positive-area admission.
+// cancelling in the area metric.
 extern "C" __global__ void __launch_bounds__(256, 4)
 compute_centered_boundary_ring_areas(
     const double* __restrict__ src_x,
@@ -1579,9 +1585,10 @@ compute_centered_boundary_ring_areas(
   if (tid == 0) out_area[ring] = sh_cross[0] * 0.5;
 }
 
-// Preserve one existing boundary vertex and exact fp64 bounds per ring. The
-// historical entry-point name is retained as an internal ABI for the assembly
-// launcher; no synthetic interior coordinate is constructed.
+// Use the interior of one boundary edge as the containment reference and
+// compute exact fp64 bounds per ring. A vertex probe is ambiguous after an
+// articulation boundary is split into point-touching simple cycles; an edge
+// midpoint is off every sibling that shares only the articulation node.
 extern "C" __global__ void __launch_bounds__(256, 4)
 compute_ring_sample_points(
     const int* __restrict__ ring_coord_offsets,
@@ -1635,8 +1642,12 @@ compute_ring_sample_points(
   out_bounds[r * 4 + 2] = max_x;
   out_bounds[r * 4 + 3] = max_y;
 
-  out_reference_x[r] = all_x[start];
-  out_reference_y[r] = all_y[start];
+  const double x0 = all_x[start];
+  const double y0 = all_y[start];
+  const double x1 = all_x[start + 1];
+  const double y1 = all_y[start + 1];
+  out_reference_x[r] = x0 + (x1 - x0) * 0.5;
+  out_reference_y[r] = y0 + (y1 - y0) * 0.5;
 }
 
 // Locate the equal-key source-row span for each sorted ring lane. Inactive
@@ -1678,9 +1689,9 @@ locate_boundary_ring_group_spans(
   out_group_end[pos] = lo;
 }
 
-// Classify all boundary cycles by containment parity.  sorted_ring_ids and
-// group_start/end keep each thread's search within one source-row span, so a
-// million independent one-ring rows remain O(R), not O(R^2).
+// Classify boundary cycles by exact same-row containment parity. The grouped
+// spans keep independent public rows linear while nested rings retain polygon
+// shell/hole semantics regardless of their face-cycle winding.
 extern "C" __global__ void __launch_bounds__(256, 4)
 count_boundary_ring_containment_depth(
     const double* __restrict__ ring_reference_x,

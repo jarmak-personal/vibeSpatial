@@ -93,6 +93,42 @@ def test_live_split_event_budget_tracks_free_memory_and_safety_ceiling(
     assert gpu._compute_live_split_event_budget() == gpu._MAX_LIVE_SPLIT_EVENT_BUDGET
 
 
+def test_split_event_consumer_bounds_candidate_pages_by_event_amplification() -> None:
+    from vibespatial.overlay import split
+    from vibespatial.spatial import segment_primitives
+
+    split_source = Path(split.__file__).read_text()
+    segment_source = Path(segment_primitives.__file__).read_text()
+
+    assert "_compute_live_split_event_budget() // 4" in split_source
+    assert "_candidate_page_budget=candidate_page_budget" in split_source
+    assert "candidate_page_budget=_candidate_page_budget" in segment_source
+    assert "accumulator.contiguous_pair_budget" in segment_source
+
+
+@pytest.mark.gpu
+def test_planarity_risk_marks_only_ulp_inconsistent_shared_pair_nodes() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    from vibespatial.overlay.split import _paired_event_planarity_risk
+
+    x = cp.asarray(
+        [1.0, 1.0, 2.0, np.nextafter(2.0, np.inf), 3.0, np.nextafter(3.0, np.inf)],
+        dtype=cp.float64,
+    )
+    risk = _paired_event_planarity_risk(
+        cp.arange(6, dtype=cp.int32),
+        cp.asarray([0, 0, 0, 0, 0, 1], dtype=cp.int32),
+        x,
+        cp.zeros(6, dtype=cp.float64),
+        cp.ones(6, dtype=cp.int8),
+    )
+
+    assert cp.asnumpy(risk).tolist() == [False, False, True, True, False, False]
+
+
 def test_paged_overlay_plan_keeps_page_boundaries_algebraic() -> None:
     plan = PagedOverlayExecutionPlan(
         left=object(),
@@ -141,6 +177,8 @@ def test_split_consumes_classified_candidate_pages_without_relation_concat() -> 
     assert "concatenate_paged_segment_intersections_device" not in split_source
     assert "_emit_pair_split_event_batch" in split_source
     assert "_merge_sorted_split_event_runs" in split_source
+    assert "_SplitEventRunAccumulator" in split_source
+    assert "pair_event_runs.append" not in split_source
     assert "overlay.split.external_merge_events" in split_source
     assert "overlay.split.concat_events" not in split_source
     assert "_stable_radix_order_pass" in split_source
@@ -148,6 +186,31 @@ def test_split_consumes_classified_candidate_pages_without_relation_concat() -> 
     assert "cp.stack" not in split_source
     assert "bool(cp.any(should_update))" not in split_source
     assert "_classified_page_consumer(classified)" in primitive_source
+
+
+def test_split_event_run_accumulator_retains_one_run_per_binary_level(
+    monkeypatch,
+) -> None:
+    from vibespatial.overlay import split
+
+    monkeypatch.setattr(
+        split._SplitEventRunAccumulator,
+        "_merge",
+        staticmethod(lambda left, right: (left, right)),
+    )
+    accumulator = split._SplitEventRunAccumulator()
+    for page in range(13):
+        accumulator.append(page)
+        assert len(accumulator.retained_runs()) == (page + 1).bit_count()
+
+    assert accumulator.finish() == (
+        (
+            (((0, 1), (2, 3)), ((4, 5), (6, 7))),
+            ((8, 9), (10, 11)),
+        ),
+        12,
+    )
+    assert accumulator.retained_runs() == ()
 
 
 def test_oversized_single_row_plan_uses_strict_interval_components() -> None:
@@ -226,6 +289,27 @@ def test_gpu_row_isolated_topology_pages_preserve_complete_rows(
     )
 
     monkeypatch.setattr(overlay_gpu, "_compute_live_split_event_budget", lambda: 80)
+    original_physicalize = overlay_gpu._physicalize_paged_overlay_output
+    physicalized_page_rows = []
+    runtime = overlay_gpu.get_cuda_runtime()
+    original_synchronize_stream = runtime.synchronize_stream
+    synchronized_pages = []
+
+    def _record_physicalization(result):
+        physicalized_page_rows.append(result.row_count)
+        return original_physicalize(result)
+
+    monkeypatch.setattr(
+        overlay_gpu,
+        "_physicalize_paged_overlay_output",
+        _record_physicalization,
+    )
+
+    def _record_page_retirement():
+        synchronized_pages.append(True)
+        original_synchronize_stream()
+
+    monkeypatch.setattr(runtime, "synchronize_stream", _record_page_retirement)
     left = from_shapely_geometries([box(0, 0, 4, 4), box(10, 0, 14, 4), box(20, 0, 24, 4)])
     right = from_shapely_geometries([box(2, 2, 6, 6), box(12, 2, 16, 6), box(22, 2, 26, 6)])
 
@@ -275,6 +359,8 @@ def test_gpu_row_isolated_topology_pages_preserve_complete_rows(
     ]
     assert selected is ExecutionMode.GPU
     assert result.row_count == 3
+    assert physicalized_page_rows == [1, 1, 1]
+    assert synchronized_pages == [True, True, True]
     assert all(
         actual.normalize().equals_exact(wanted.normalize(), tolerance=1.0e-9)
         for actual, wanted in zip(result.to_shapely(), expected, strict=True)

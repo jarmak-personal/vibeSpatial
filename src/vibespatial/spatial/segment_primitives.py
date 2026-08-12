@@ -1780,12 +1780,19 @@ def _compute_max_batch_pairs() -> int:
     return min(max(max_pairs, _MIN_BATCH_PAIRS), _MAX_BATCH_PAIRS_CAP)
 
 
-def _candidate_capacity_plan(right_capacity: int) -> _SegmentCandidateCapacityPlan | None:
+def _candidate_capacity_plan(
+    right_capacity: int,
+    *,
+    max_batch_pairs: int | None = None,
+) -> _SegmentCandidateCapacityPlan | None:
     """Plan fixed-capacity candidate batches from host-known table shape."""
     right_capacity = int(right_capacity)
     if right_capacity <= 0:
         return None
-    max_batch_pairs = _compute_max_batch_pairs()
+    max_batch_pairs = min(
+        _compute_max_batch_pairs(),
+        int(max_batch_pairs) if max_batch_pairs is not None else _MAX_BATCH_PAIRS_CAP,
+    )
     if right_capacity > max_batch_pairs:
         return None
     return _SegmentCandidateCapacityPlan(
@@ -1904,6 +1911,7 @@ def _same_row_capacity_scatter_candidates(
     d_right_row_starts,
     d_right_row_ends,
     max_right_span: int,
+    max_batch_pairs: int | None = None,
     page_consumer=None,
     upper_left_rows=None,
     upper_right_rows=None,
@@ -1912,7 +1920,10 @@ def _same_row_capacity_scatter_candidates(
     import cupy as cp
 
     max_right_span = int(max_right_span)
-    plan = _candidate_capacity_plan(max_right_span)
+    plan = _candidate_capacity_plan(
+        max_right_span,
+        max_batch_pairs=max_batch_pairs,
+    )
     if plan is None:
         return _empty_device_segment_candidates(runtime)
 
@@ -2014,6 +2025,7 @@ def _generate_candidates_gpu_same_row_warp(
     _allow_swap: bool = True,
     span_summary: tuple[int, int, int] | None = None,
     strict_upper_source_rows: tuple[DeviceArray, DeviceArray] | None = None,
+    max_batch_pairs: int | None = None,
     page_consumer=None,
 ) -> DeviceSegmentIntersectionCandidates | DeviceSegmentIntersectionCandidatePages | None:
     import cupy as cp
@@ -2056,6 +2068,7 @@ def _generate_candidates_gpu_same_row_warp(
                 left,
                 _allow_swap=False,
                 span_summary=(max_right_span, max_left_span, max_row_id),
+                max_batch_pairs=max_batch_pairs,
                 page_consumer=(_consume_swapped_page if page_consumer is not None else None),
             )
             if swapped is None:
@@ -2098,6 +2111,7 @@ def _generate_candidates_gpu_same_row_warp(
         d_right_row_starts=d_right_row_starts,
         d_right_row_ends=d_right_row_ends,
         max_right_span=max_right_span,
+        max_batch_pairs=max_batch_pairs,
         page_consumer=page_consumer,
         upper_left_rows=d_upper_left_rows if use_upper_rows else None,
         upper_right_rows=d_upper_right_rows if use_upper_rows else None,
@@ -2136,7 +2150,10 @@ def _device_counted_sweep_candidates(
         return
 
     runtime = get_cuda_runtime()
-    max_batch_pairs = _compute_max_batch_pairs()
+    max_batch_pairs = min(
+        _compute_max_batch_pairs(),
+        accumulator.contiguous_pair_budget,
+    )
     per_left_chunk = min(range_capacity, max_batch_pairs)
     d_range_start = cp.asarray(range_start, dtype=cp.int64)
     d_range_end = cp.asarray(range_end, dtype=cp.int64)
@@ -2324,6 +2341,7 @@ def _generate_candidates_gpu(
     use_same_row_fast_path: bool = True,
     strict_upper_source_rows: tuple[DeviceArray, DeviceArray] | None = None,
     same_row_span_summary: tuple[int, int, int] | None = None,
+    candidate_page_budget: int | None = None,
     page_consumer=None,
 ) -> DeviceSegmentIntersectionCandidates | DeviceSegmentIntersectionCandidatePages:
     """GPU-native O(n log n) candidate generation via sort-sweep."""
@@ -2350,6 +2368,7 @@ def _generate_candidates_gpu(
                 right,
                 span_summary=same_row_span_summary,
                 strict_upper_source_rows=strict_upper_source_rows,
+                max_batch_pairs=candidate_page_budget,
                 page_consumer=page_consumer,
             )
         if same_row_candidates is not None:
@@ -2395,10 +2414,18 @@ def _generate_candidates_gpu(
     )
     d_use_y_sweep = (right_half_w_y / d_extent_y) < (right_half_w_x / d_extent_x)
 
+    contiguous_pair_budget = min(
+        _compute_max_batch_pairs(),
+        (
+            int(candidate_page_budget)
+            if candidate_page_budget is not None
+            else _MAX_BATCH_PAIRS_CAP
+        ),
+    )
     candidate_accumulator = _DeviceCandidatePageAccumulator(
         left=left,
         right=right,
-        contiguous_pair_budget=_compute_max_batch_pairs(),
+        contiguous_pair_budget=contiguous_pair_budget,
         page_consumer=page_consumer,
     )
 
@@ -3149,6 +3176,7 @@ def _classify_segment_intersections_gpu(
     _same_row_single_group: bool = False,
     _same_row_span_summary: tuple[int, int, int] | None = None,
     _compact_paged_non_disjoint: bool = False,
+    _candidate_page_budget: int | None = None,
     _classified_page_consumer: Callable[[SegmentIntersectionResult], None] | None = None,
 ) -> SegmentIntersectionResult | PagedSegmentIntersectionResult:
     """Full GPU-native segment intersection pipeline.
@@ -3290,6 +3318,7 @@ def _classify_segment_intersections_gpu(
                     use_same_row_fast_path=_use_same_row_fast_path,
                     strict_upper_source_rows=_strict_upper_source_rows,
                     same_row_span_summary=same_row_span_summary,
+                    candidate_page_budget=_candidate_page_budget,
                     page_consumer=_classify_candidate_page,
                 )
         except Exception as exc:
@@ -3687,6 +3716,7 @@ def classify_segment_intersections(
     _same_row_single_group: bool = False,
     _same_row_span_summary: tuple[int, int, int] | None = None,
     _compact_paged_non_disjoint: bool = False,
+    _candidate_page_budget: int | None = None,
     _classified_page_consumer: Callable[[SegmentIntersectionResult], None] | None = None,
 ) -> SegmentIntersectionResult | PagedSegmentIntersectionResult:
     """Classify all segment-segment intersections between two geometry arrays.
@@ -3790,6 +3820,7 @@ def classify_segment_intersections(
                 _same_row_single_group=_same_row_single_group,
                 _same_row_span_summary=_same_row_span_summary,
                 _compact_paged_non_disjoint=_compact_paged_non_disjoint,
+                _candidate_page_budget=_candidate_page_budget,
                 _classified_page_consumer=_classified_page_consumer,
             )
 

@@ -376,7 +376,6 @@ def _extract_face_boundary_rings_gpu(
             d_boundary_inverse[d_boundary_next_full],
             cp.arange(boundary_capacity, dtype=cp.int32),
         ).astype(cp.int32, copy=False)
-
         cycle_label = cp.arange(boundary_capacity, dtype=cp.int32)
         jump = compact_next.copy()
         max_iter = max(1, int(np.ceil(np.log2(max(1, boundary_capacity)))))
@@ -740,6 +739,9 @@ def _build_polygon_output_from_faces_gpu(
         d_exterior_mask_full = d_all_ring_active & (
             (d_containment_depth & np.int32(1)) == 0
         )
+        d_hole_mask_full = d_all_ring_active & (
+            (d_containment_depth & np.int32(1)) != 0
+        )
         d_face_to_ring = cp.full(face_count, -1, dtype=cp.int32)
         d_ring_ids = cp.arange(total_ring_count, dtype=cp.int32)
         d_face_to_ring[d_cycle_face_ids[d_all_ring_active]] = d_ring_ids[
@@ -852,6 +854,9 @@ def _build_polygon_output_from_faces_gpu(
         d_exterior_mask_full = d_all_ring_active & (
             (d_containment_depth & np.int32(1)) == 0
         )
+        d_hole_mask_full = d_all_ring_active & (
+            (d_containment_depth & np.int32(1)) != 0
+        )
         with hotpath_stage("overlay.assemble.hole_assignment", category="refine"):
             d_exterior_id = cp.full(total_ring_count, -1, dtype=cp.int32)
             ring_grid_all, ring_block_all = runtime.launch_config(
@@ -891,12 +896,10 @@ def _build_polygon_output_from_faces_gpu(
         copy=False,
     )
 
-    # Odd-depth rings are holes. Even-depth islands were admitted as exteriors
-    # above and remain concrete polygons in the same output row.
     d_is_hole = (
         d_all_ring_active
         & (d_exterior_id >= 0)
-        & ((d_containment_depth % 2) != 0)
+        & d_hole_mask_full
     )
 
     with hotpath_stage("overlay.assemble.output_grouping", category="sort"):

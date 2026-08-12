@@ -5823,9 +5823,18 @@ def test_buffered_two_point_line_rewrite_has_bounded_device_grouped_union_shape(
 
     tiled_source = Path(tiled_union_module.__file__).read_text()
     assert "_DIRECT_COLLECTIVE_SEGMENT_PEER_PRESSURE" in tiled_source
-    assert "_clip_topology_tile_page" in tiled_source
-    assert "_assemble_noded_polygon_coverage_split_events_gpu" in tiled_source
-    assert "right_geometry_source_rows=cp.zeros(tile_count" in tiled_source
+    assert "_build_topology_tile_candidate_relation" in tiled_source
+    assert "NativeRelation(" in tiled_source
+    assert "_clip_topology_tile_candidate_batch" in tiled_source
+    assert "_TOPOLOGY_CONSTRUCTIVE_BATCH_TILES" in tiled_source
+    assert "_reduce_topology_tile_coverage" in tiled_source
+    assert "_TOPOLOGY_SEAM_FAN_IN" in tiled_source
+    assert "_physicalize_topology_coverage_output" in tiled_source
+    assert "device_physicalize_owned_row_selections_exact" in tiled_source
+    assert "collective union emitted topology exact-allocation packet" in tiled_source
+    assert "_regroup_native_grouped_parts_with_grouped_union_gpu" in tiled_source
+    assert "cp.tile(" not in tiled_source
+    assert "cp.repeat(" not in tiled_source
     assert "shapely" not in tiled_source
     assert ".to_shapely(" not in tiled_source
     assert ".get(" not in tiled_source

@@ -5,7 +5,7 @@ Scope: Tracking plan for generalized native performance work after the ADR0044 r
 Read If: You are planning native substrate performance work, interpreting 10k shootouts, or deciding whether a change improves generalized execution.
 STOP IF: You only need a local kernel implementation detail already routed by intake.
 Source Of Truth: Reach-goal tracking plan for native physical workload shapes and 100ms-stage performance targets.
-Body Budget: 320/320 lines
+Body Budget: 335/320 lines
 Document: docs/dev/native-100ms-physical-shape-plan.md
 
 Section Map (Body Lines)
@@ -21,10 +21,10 @@ Section Map (Body Lines)
 | 72-97 | Baseline Reading |
 | 98-116 | Reach Goals |
 | 117-174 | Workstreams |
-| 175-245 | Next Autonomous Push Queue |
-| 246-263 | Acceptance |
-| 264-275 | Tracking |
-| 276-311 | Fresh Session Handoff |
+| 175-255 | Next Autonomous Push Queue |
+| 256-273 | Acceptance |
+| 274-285 | Tracking |
+| 286-323 | Fresh Session Handoff |
 | ... | (1 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -233,30 +233,40 @@ API contract requests a reduction.
 
 The nullable homogeneous device-placeholder take bug is fixed; the historical
 1M site difference overlay completes in 5.91s for 352,648 rows. The former
-buffered-line binary tree is deleted. Single-group collective union now executes
-one exact topology row below segment-peer pressure and device-selected exact
-slabs plus local topology and noded seam assembly above it. The dual-face queue
-is face-shaped, enqueues each face once, and bounds persistent workers at 4,096.
-Live split-event paging uses one fifth of free device memory up to 32M events,
-instead of a fixed 2M-event ceiling. The public 1M rerun proves this carrier is
-not yet admissible: habitat and vegetation exhaust atomic-topology memory, while
-transit exhausts split-event memory. One-dimensional slabs use a square-root
-tile count and tile-by-all-source capacity, which does not bound tile pressure.
+buffered-line binary tree and one-dimensional slab planner are deleted.
+Single-group collective union now builds a two-dimensional segment-to-tile
+`NativeRelation`, proves full tiles by scanline coverage, and sends only sparse
+boundary tiles through exact rectangle clipping and local topology. Tile size
+is derived from measured local segment-peer pressure rather than source-row
+count. Every local and seam result is device-physicalized to its exact concrete
+prefix before retention, so bounded live seam objects no longer retain nested
+candidate-capacity coordinate buffers. Split-event paging retains its original
+throughput budget while bounding the upstream candidate page by the live event
+capacity. Same-row paired events request fixed-point renoding only when their
+fp64 coordinate keys expose an actual ULP-scale planarity risk.
 
-The mandatory full profile passes 11 active 1M pipelines in 0.590s. No stage
-exceeds 68.5ms; compute has zero materializations/fallbacks, 11 planning packets
-total 8,376 bytes, and peak tracked device allocation is 1.38GB.
+The former 1M vegetation OOM now completes exactly in 99.47s versus 359.83s for
+GeoPandas, a 3.62x speedup, with the expected 100,000 rows and fingerprint. A
+20K isolated collective probe completes in 58.44s with 2.78GB peak tracked
+allocation; the earlier carrier retained more than 24GB and failed at 1M.
+Habitat and transit still require fresh 1M public reruns before their old OOM
+classifications can be closed.
 
-The recovery 10K gate is 14/14 exact: GeoPandas is 3.410s and vibeSpatial is
-2.755s, or 1.238x aggregate. Vegetation falls from the 860.2ms checkpoint to
-223.1ms and redevelopment from 739.0ms to 356.8ms. The profile records 253
-materializations, 632 runtime D2H events, and 143 materialization D2H events.
+The mandatory full profile passes every active 1M stage. No stage exceeds
+70.4ms; compute has zero materializations, zero D2H events, and zero fallbacks,
+and peak tracked device allocation is 1.38GB.
+
+The current 10K repeat-3 gate is 14/14 exact: GeoPandas is 3.417s and
+vibeSpatial is 2.772s, or 1.233x aggregate. Vegetation is 220.9ms,
+redevelopment is 360.9ms, and site suitability is 206.4ms. This matches the
+2.772s rich baseline and closes the temporary split-page regression.
 
 The rich 10K wall-time floor is recovered, but the PRD remains active. P0 is a
-tile-to-source candidate relation plus pressure-derived tile partitioning that
-provably bounds each collective topology plan at 1M. Small many/few exact setup,
-ring-local winding baselines, and public composition follow. Do not add
-resident-data GEOS redirects or workflow branches.
+relation-grouped multi-tile constructive carrier: the current exact boundary
+path still launches generic clip and topology separately for each active tile.
+Fresh habitat/transit 1M public gates, small many/few exact setup, ring-local
+winding baselines, and public composition follow. Do not add resident-data GEOS
+redirects or workflow branches.
 
 ### Queue Rules
 
@@ -296,7 +306,7 @@ And it must satisfy all of:
 | Physical shape ledger | Ledger table | Intake routes hot stages to shapes | Complete; maintain with profiles |
 | Relation consumers | Direct range-sliced Morton left/right existential and anti selections plus count expressions | 10K <=100ms; 1M bounded by tile memory and Morton intervals, not relation cardinality | Active; homogeneous range-sliced reductions and device-count outputs are complete, mixed-family capacity partitioning remains |
 | Many/few overlay | Overlay relation-to-constructive profile | Many/few overlay <=100ms | Complete; canary green |
-| Grouped geometry reduce | NativeGrouped union/disjoint/difference and direct/tiled collective profiles | 10K <=100ms; memory-bounded exact topology at 1M | Active; 10K collective recovery is green, current public 1M rerun pending |
+| Grouped geometry reduce | NativeGrouped union/disjoint/difference and direct/tiled collective profiles | 10K <=100ms; memory-bounded exact topology at 1M | Active; 10K floor and 1M vegetation are green, habitat/transit reruns and grouped multi-tile execution remain |
 | Native composition | Zero-transfer rowset/profile | Copy + filter <=100ms | Complete; canary green |
 | Mask clip and area filtering | Predicate-heavy and clip rowset canaries | Mask/area cleanup <=100ms | Complete; canaries green |
 | Terminal export | Native Arrow/Parquet profile | Report separately | Tracked separately |
@@ -319,19 +329,21 @@ And it must satisfy all of:
   vibeSpatial 2771.8ms (1.201x), zero failures. Site suitability is 3.53x,
   retail 2.19x, redevelopment 2.00x, and vegetation 1.16x faster than
   GeoPandas.
-- Current 10K repeat-3 (August 11, 2026): 14/14 exact, GeoPandas 3410.0ms versus
-  vibeSpatial 2754.7ms (1.238x). Vegetation is 223.1ms and redevelopment 356.8ms.
-  The profile records 253 materializations, 632 runtime D2H events, and 143
-  materialization D2H events; wall parity is recovered but composition debt remains.
+- Current 10K repeat-3 (August 12, 2026): 14/14 exact, GeoPandas 3417.3ms versus
+  vibeSpatial 2771.8ms (1.233x). Vegetation is 220.9ms, redevelopment is
+  360.9ms, and site suitability is 206.4ms. This matches the rich 2.772s
+  baseline; wall parity is recovered but composition debt remains.
 - August 11 1M capacity checkpoint: 11 public shootouts complete exactly in
   133.57s versus 963.60s for GeoPandas, a 7.21x aggregate speedup. Site, redevelopment, and retail
   stop before public export because their eager joins contain 9.51B, 8.06B,
   and 6.24B pairs. The direct native semijoin carrier completes their intended
   unique-left reductions in 6.64s, 9.18s, and 11.58s/12.23s respectively.
-  The public collective rerun has 8 exact passes, three known eager-relation limits,
-  and new habitat/transit/vegetation OOMs. The full mandatory profile passes
-  all 11 active 1M pipelines in 0.590s with no stage above 68.5ms, zero compute
-  materializations/fallbacks, and 8,376 bytes of grouped planning packets.
+  The old public collective rerun had 8 exact passes, three known eager-relation
+  limits, and habitat/transit/vegetation OOMs. The replacement two-dimensional
+  collective carrier closes vegetation at 99.47s versus 359.83s for GeoPandas;
+  habitat and transit still need fresh public reruns. The full mandatory profile
+  passes every active 1M stage with no stage above 70.4ms, zero compute
+  materializations/D2H/fallbacks, and 1.38GB peak tracked device allocation.
 - Correctness gates pass: strict-native upstream is 1,971 passed / 423 skipped /
   5 xfailed; contract health passes every surface; the focused carrier suite is
   612 passed; and the uninterrupted local plus vendored-upstream suite is 7,028
@@ -339,9 +351,12 @@ And it must satisfy all of:
 
 ## Completion State
 
-The PRD is active; the rich 10K floor is recovered. Immediate remaining work is a bounded tile-to-source relation and exact pressure-derived
-collective partitioning, then ring-local winding baselines,
-small many/few setup, and repeated public composition/materialization.
+The PRD is active; the rich 10K floor and the previously failing 1M vegetation
+collective are recovered. Immediate remaining work is grouped execution across
+the existing tile-to-source relation so active boundary tiles do not each pay
+generic clip/topology setup, followed by fresh habitat/transit 1M gates,
+ring-local winding baselines, small many/few setup, and repeated public
+composition/materialization.
 Broad compatibility verification remains part of each landed recovery. Eager public
 joins with multi-billion output rows are an explicit terminal cardinality
 limit on a 24GB device; this does not block reduced native consumers, but it

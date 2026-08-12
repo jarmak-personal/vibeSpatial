@@ -58,6 +58,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
     cp = None
 
+_MIN_SPLIT_EVENT_CANDIDATE_PAGE_PAIRS = 64 * 1024
+_PLANARITY_NODE_ULP_WINDOW = np.uint64(8)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -92,6 +95,7 @@ def _free_split_event_device_state(split_events: SplitEventTable) -> None:
         ds.part_indices,
         ds.ring_indices,
         ds.geometry_indices,
+        ds.planarity_risk,
     ):
         if arr is not None:
             runtime.free(arr)
@@ -121,6 +125,77 @@ def _sync_hotpath(runtime) -> None:
         cp.cuda.get_current_stream().synchronize()
 
 
+def _paired_event_planarity_risk(
+    source_segment_ids,
+    row_indices,
+    x_values,
+    y_values,
+    event_priority,
+):
+    """Mark fp64-inconsistent reconstructions of one shared exact node.
+
+    The mask controls exact re-noding only; it never merges coordinates.
+    Exact-equal pair events already share one graph node. Distinct pair events
+    are reconsidered only when their ordered fp64 payloads differ inside the
+    predicate-refinement uncertainty window.
+    """
+    d_priority = cp.asarray(event_priority, dtype=cp.int8)
+    event_count = int(d_priority.size)
+    d_risk_u32 = cp.zeros(event_count, dtype=cp.uint32)
+    d_pair_indices = compact_indices((d_priority > 0).astype(cp.uint8)).values
+    pair_count = int(d_pair_indices.size)
+    if pair_count <= 1:
+        return d_risk_u32.astype(cp.bool_, copy=False)
+
+    d_sources = cp.asarray(source_segment_ids, dtype=cp.int32)[d_pair_indices]
+    d_rows = cp.asarray(row_indices, dtype=cp.int32)[d_pair_indices]
+    d_x_keys = _fp64_radix_keys(
+        cp.asarray(x_values, dtype=cp.float64)[d_pair_indices]
+    )
+    d_y_keys = _fp64_radix_keys(
+        cp.asarray(y_values, dtype=cp.float64)[d_pair_indices]
+    )
+    d_order = cp.arange(pair_count, dtype=cp.int32)
+    for key in (d_sources, d_y_keys, d_x_keys, d_rows):
+        d_order = _stable_radix_order_pass(d_order, key)
+    d_sorted_indices = d_pair_indices[d_order]
+    d_sorted_sources = d_sources[d_order]
+    d_sorted_rows = d_rows[d_order]
+    d_sorted_x = d_x_keys[d_order]
+    d_sorted_y = d_y_keys[d_order]
+    d_near = (
+        (d_sorted_rows[:-1] == d_sorted_rows[1:])
+        & (d_sorted_sources[:-1] != d_sorted_sources[1:])
+        & (
+            (cp.maximum(d_sorted_x[1:], d_sorted_x[:-1])
+             - cp.minimum(d_sorted_x[1:], d_sorted_x[:-1]))
+            <= _PLANARITY_NODE_ULP_WINDOW
+        )
+        & (
+            (cp.maximum(d_sorted_y[1:], d_sorted_y[:-1])
+             - cp.minimum(d_sorted_y[1:], d_sorted_y[:-1]))
+            <= _PLANARITY_NODE_ULP_WINDOW
+        )
+        & (
+            (d_sorted_x[:-1] != d_sorted_x[1:])
+            | (d_sorted_y[:-1] != d_sorted_y[1:])
+        )
+    )
+    d_near_positions = compact_indices(d_near.astype(cp.uint8)).values
+    d_risky_events = cp.concatenate(
+        (
+            d_sorted_indices[d_near_positions],
+            d_sorted_indices[d_near_positions + 1],
+        )
+    )
+    cp.bitwise_or.at(
+        d_risk_u32,
+        d_risky_events,
+        cp.ones(d_risky_events.size, dtype=cp.uint32),
+    )
+    return d_risk_u32.astype(cp.bool_, copy=False)
+
+
 def _canonicalize_source_endpoint_coordinates(
     source_segment_ids,
     t_values,
@@ -148,7 +223,7 @@ def _canonicalize_source_endpoint_coordinates(
     """
     event_count = int(source_segment_ids.size)
     if event_count == 0:
-        return x_values, y_values, event_priority
+        return x_values, y_values, event_priority, None
 
     d_t = cp.asarray(t_values, dtype=cp.float64)
     endpoint_mask = ((d_t == 0.0) | (d_t == 1.0)).astype(
@@ -158,7 +233,7 @@ def _canonicalize_source_endpoint_coordinates(
     endpoint_indices = compact_indices(endpoint_mask).values
     endpoint_count = int(endpoint_indices.size)
     if endpoint_count <= 1:
-        return x_values, y_values, event_priority
+        return x_values, y_values, event_priority, None
 
     d_source_ids = cp.asarray(source_segment_ids, dtype=cp.int32)
     endpoint_source_ids = d_source_ids[endpoint_indices]
@@ -295,7 +370,19 @@ def _canonicalize_source_endpoint_coordinates(
         representative_priority,
         sorted_priority,
     )
-    return out_x, out_y, out_priority
+    out_planarity_risk = _paired_event_planarity_risk(
+        source_segment_ids,
+        row_indices,
+        out_x,
+        out_y,
+        out_priority,
+    )
+    return (
+        out_x,
+        out_y,
+        out_priority,
+        out_planarity_risk,
+    )
 
 
 def _deduplicate_atomic_edge_geometry(
@@ -309,6 +396,7 @@ def _deduplicate_atomic_edge_geometry(
     occurrence_membership=None,
     occurrence_left_delta,
     occurrence_right_delta,
+    occurrence_planarity_risk=None,
     row_indices=None,
     left_segment_count: int,
     preserve_source_orientation: bool = False,
@@ -349,6 +437,7 @@ def _deduplicate_atomic_edge_geometry(
             cp.empty(0, dtype=cp.uint8),
             cp.empty(0, dtype=cp.int32),
             cp.empty(0, dtype=cp.int32),
+            cp.empty(0, dtype=cp.bool_),
         )
 
     d_src_x = all_src_x[forward_indices]
@@ -423,11 +512,22 @@ def _deduplicate_atomic_edge_geometry(
     )
     representative_left_delta = cp.zeros(unique_count, dtype=cp.int32)
     representative_right_delta = cp.zeros(unique_count, dtype=cp.int32)
+    representative_planarity_risk_u32 = cp.zeros(unique_count, dtype=cp.uint32)
     cp.add.at(
         representative_left_delta,
         group_ids,
         cp.asarray(occurrence_left_delta, dtype=cp.int32)[sorted_forward]
         * sorted_orientation_multiplier,
+    )
+    if occurrence_planarity_risk is not None:
+        cp.bitwise_or.at(
+            representative_planarity_risk_u32,
+            group_ids,
+            cp.asarray(occurrence_planarity_risk, dtype=cp.uint32)[sorted_forward],
+        )
+    representative_planarity_risk = representative_planarity_risk_u32.astype(
+        cp.bool_,
+        copy=False,
     )
     cp.add.at(
         representative_right_delta,
@@ -473,6 +573,7 @@ def _deduplicate_atomic_edge_geometry(
     dedup_source_membership = cp.empty(out_size, dtype=cp.uint8)
     dedup_left_delta = cp.empty(out_size, dtype=cp.int32)
     dedup_right_delta = cp.empty(out_size, dtype=cp.int32)
+    dedup_planarity_risk = cp.empty(out_size, dtype=cp.bool_)
 
     dedup_source_ids[0::2] = rep_source_ids
     dedup_source_ids[1::2] = rep_source_ids
@@ -492,6 +593,8 @@ def _deduplicate_atomic_edge_geometry(
     dedup_left_delta[1::2] = -dedup_left_delta[0::2]
     dedup_right_delta[0::2] = representative_right_delta * orientation_multiplier
     dedup_right_delta[1::2] = -dedup_right_delta[0::2]
+    dedup_planarity_risk[0::2] = representative_planarity_risk
+    dedup_planarity_risk[1::2] = representative_planarity_risk
     return (
         dedup_source_ids,
         dedup_direction,
@@ -502,6 +605,7 @@ def _deduplicate_atomic_edge_geometry(
         dedup_source_membership,
         dedup_left_delta,
         dedup_right_delta,
+        dedup_planarity_risk,
     )
 
 
@@ -976,6 +1080,50 @@ def _merge_split_event_runs_balanced(runs):
     return None if not live else live[0]
 
 
+class _SplitEventRunAccumulator:
+    """Online exact merge tree with one retained run per binary level."""
+
+    def __init__(self) -> None:
+        self._levels = []
+
+    @staticmethod
+    def _merge(left_run, right_run):
+        merged = _merge_sorted_split_event_runs(left_run, right_run)
+        get_cuda_completion_retainer().defer(
+            cp.cuda.get_current_stream(),
+            (left_run, right_run),
+            lambda _owners: None,
+        )
+        return merged
+
+    def append(self, run) -> None:
+        if run is None:
+            return
+        carry = run
+        level = 0
+        while level < len(self._levels) and self._levels[level] is not None:
+            older = self._levels[level]
+            self._levels[level] = None
+            carry = self._merge(older, carry)
+            level += 1
+        if level == len(self._levels):
+            self._levels.append(carry)
+        else:
+            self._levels[level] = carry
+
+    def finish(self):
+        merged = None
+        for run in reversed(self._levels):
+            if run is None:
+                continue
+            merged = run if merged is None else self._merge(merged, run)
+        self._levels.clear()
+        return merged
+
+    def retained_runs(self) -> tuple:
+        return tuple(run for run in self._levels if run is not None)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1008,7 +1156,18 @@ def build_gpu_split_events(
 
     # Lazy import to avoid circular dependency — kernel compile functions
     # live in gpu.py which imports from this module.
-    from vibespatial.overlay.gpu import _overlay_split_kernels
+    from vibespatial.overlay.gpu import (
+        _compute_live_split_event_budget,
+        _overlay_split_kernels,
+    )
+
+    # One classified candidate can emit four exact split events. Bound the
+    # producer page by the downstream classify/emit/sort phase, not by the
+    # narrower raw-pair carrier alone.
+    candidate_page_budget = max(
+        _MIN_SPLIT_EVENT_CANDIDATE_PAGE_PAIRS,
+        _compute_live_split_event_budget() // 4,
+    )
 
     # GPU-native segment extraction -- no CPU loop, no host round-trip.
     # lyy.15: reuse pre-extracted right-side segments when provided
@@ -1087,8 +1246,8 @@ def build_gpu_split_events(
         else right_physical_count
     )
     segment_total = left_count + right_count
-    pair_event_runs = []
-    right_right_event_runs = []
+    pair_event_accumulator = _SplitEventRunAccumulator()
+    right_right_event_accumulator = _SplitEventRunAccumulator()
 
     def _release_classified_page(page: SegmentIntersectionResult) -> None:
         state = page.device_state
@@ -1131,7 +1290,7 @@ def build_gpu_split_events(
                 batch[3],
                 (batch[4] + cp.int8(4)).astype(cp.int8, copy=False),
             )
-            pair_event_runs.append(_sort_deduplicate_split_event_run(batch))
+            pair_event_accumulator.append(_sort_deduplicate_split_event_run(batch))
 
     def _consume_classified_page(page: SegmentIntersectionResult) -> None:
         try:
@@ -1150,7 +1309,7 @@ def build_gpu_split_events(
         side_count = int(side_segments.count)
         if not require_same_row or side_count < 2:
             return None
-        side_event_runs = []
+        side_event_accumulator = _SplitEventRunAccumulator()
 
         def _consume_side_page(page: SegmentIntersectionResult) -> None:
             try:
@@ -1172,7 +1331,7 @@ def build_gpu_split_events(
                     batch[3],
                     batch[4],
                 )
-                side_event_runs.append(
+                side_event_accumulator.append(
                     _sort_deduplicate_split_event_run(normalized)
                 )
             finally:
@@ -1206,6 +1365,7 @@ def build_gpu_split_events(
                     _collect_ambiguous_rows=False,
                     _strict_upper_source_rows=(source_order, source_order),
                     _compact_paged_non_disjoint=False,
+                    _candidate_page_budget=candidate_page_budget,
                     _classified_page_consumer=_consume_side_page,
                 )
             if side_result.runtime_selection.selected is not ExecutionMode.GPU:
@@ -1218,11 +1378,11 @@ def build_gpu_split_events(
             else:
                 _consume_side_page(side_result)
                 side_result = None
-            return _merge_split_event_runs_balanced(side_event_runs)
+            return side_event_accumulator.finish()
         finally:
             get_cuda_completion_retainer().defer(
                 cp.cuda.get_current_stream(),
-                tuple(side_event_runs),
+                side_event_accumulator.retained_runs(),
                 lambda _owners: None,
             )
 
@@ -1294,7 +1454,7 @@ def build_gpu_split_events(
                 batch[3],
                 batch[4],
             )
-            right_right_event_runs.append(
+            right_right_event_accumulator.append(
                 _sort_deduplicate_split_event_run(normalized)
             )
         finally:
@@ -1322,6 +1482,7 @@ def build_gpu_split_events(
                 # Overlay applies a constructive-only ULP near-touch pass to
                 # exact-disjoint candidates before event emission.
                 _compact_paged_non_disjoint=False,
+                _candidate_page_budget=candidate_page_budget,
                 _classified_page_consumer=_consume_classified_page,
             )
     except Exception as exc:
@@ -1498,6 +1659,7 @@ def build_gpu_split_events(
                                 original_right_segment_rows,
                             ),
                             _compact_paged_non_disjoint=False,
+                            _candidate_page_budget=candidate_page_budget,
                             _classified_page_consumer=_consume_right_right_page,
                         )
                     if right_right.runtime_selection.selected is not ExecutionMode.GPU:
@@ -1546,13 +1708,11 @@ def build_gpu_split_events(
                     event_run = _merge_split_event_runs_balanced(
                         [
                             endpoint_event_run,
-                            *pair_event_runs,
-                            *right_right_event_runs,
+                            pair_event_accumulator.finish(),
+                            right_right_event_accumulator.finish(),
                             *same_side_event_batches,
                         ]
                     )
-                    pair_event_runs.clear()
-                    right_right_event_runs.clear()
                     same_side_event_batches.clear()
                     (
                         unique_source_ids,
@@ -1593,6 +1753,7 @@ def build_gpu_split_events(
                         unique_x,
                         unique_y,
                         unique_priority,
+                        d_planarity_risk,
                     ) = _canonicalize_source_endpoint_coordinates(
                         unique_source_ids,
                         unique_t,
@@ -1614,11 +1775,17 @@ def build_gpu_split_events(
                     f"overlay split event assembly failed: {type(exc).__name__}: {exc}"
                 ) from exc
             event_count = int(unique_source_ids.size)
+            # Two endpoints per source segment are the irreducible event
+            # carrier. Only an interior paired event can create second-order
+            # support requiring atomic re-noding; endpoint-only contacts are
+            # canonicalized back to their exact source coordinates above.
+            requires_renoding = event_count > base_event_count
 
             return SplitEventTable(
                 left_segment_count=left_count,
                 right_segment_count=right_count,
                 runtime_selection=result.runtime_selection,
+                requires_renoding=requires_renoding,
                 device_state=SplitEventDeviceState(
                     source_segment_ids=unique_source_ids,
                     t=unique_t,
@@ -1629,6 +1796,7 @@ def build_gpu_split_events(
                     part_indices=d_part_indices,
                     ring_indices=d_ring_indices,
                     geometry_indices=d_geometry_indices,
+                    planarity_risk=d_planarity_risk,
                 ),
                 _count=event_count,
             )
@@ -1636,8 +1804,8 @@ def build_gpu_split_events(
             get_cuda_completion_retainer().defer(
                 cp.cuda.get_current_stream(),
                 (
-                    tuple(pair_event_runs),
-                    tuple(right_right_event_runs),
+                    pair_event_accumulator.retained_runs(),
+                    right_right_event_accumulator.retained_runs(),
                     tuple(locals().get("same_side_event_batches", ())),
                 ),
                 lambda _owners: None,
@@ -1789,7 +1957,7 @@ def _source_ring_transition_state(split_events, kernels):
     )
 
 
-def build_gpu_atomic_edges(
+def _build_gpu_atomic_edges_once(
     split_events: SplitEventTable,
     *,
     isolate_rows: bool = False,
@@ -1969,6 +2137,7 @@ def build_gpu_atomic_edges(
             dedup_source_membership,
             dedup_left_delta,
             dedup_right_delta,
+            dedup_planarity_risk,
         ) = _deduplicate_atomic_edge_geometry(
             out_source_ids,
             out_direction,
@@ -1979,6 +2148,21 @@ def build_gpu_atomic_edges(
             occurrence_membership=raw_membership,
             occurrence_left_delta=raw_left_delta,
             occurrence_right_delta=raw_right_delta,
+            occurrence_planarity_risk=(
+                None
+                if device.planarity_risk is None
+                else cp.repeat(
+                    (
+                        cp.asarray(device.planarity_risk, dtype=cp.bool_)[
+                            d_adjacent_positions
+                        ]
+                        | cp.asarray(device.planarity_risk, dtype=cp.bool_)[
+                            d_adjacent_positions + 1
+                        ]
+                    ),
+                    2,
+                )
+            ),
             row_indices=raw_edge_rows,
             left_segment_count=split_events.left_segment_count,
             preserve_source_orientation=preserve_source_orientation,
@@ -2067,6 +2251,7 @@ def build_gpu_atomic_edges(
                 tangent_y=d_tangent_y,
                 left_coverage_delta=dedup_left_delta,
                 right_coverage_delta=dedup_right_delta,
+                planarity_risk=dedup_planarity_risk,
             ),
             _count=int(dedup_source_ids.size),
         )
@@ -2079,6 +2264,7 @@ def renode_gpu_atomic_edges(
     atomic_edges: AtomicEdgeTable,
     *,
     isolate_rows: bool,
+    preserve_source_orientation: bool = False,
 ) -> AtomicEdgeTable:
     """Split second-order crossings until the atomic relation is planar.
 
@@ -2103,6 +2289,7 @@ def renode_gpu_atomic_edges(
     runtime = get_cuda_runtime()
     kernels = _overlay_split_kernels()
     current = atomic_edges
+    refine_all = False
 
     while True:
         state = current.device_state
@@ -2136,6 +2323,26 @@ def renode_gpu_atomic_edges(
             count=segment_count,
             part_indices=d_parts,
             ring_indices=d_rings,
+        )
+        if refine_all or state.planarity_risk is None:
+            d_refine_segment_ids = d_segment_ids
+        else:
+            d_refine_segment_ids = cp.flatnonzero(
+                cp.asarray(state.planarity_risk, dtype=cp.bool_)[d_forward]
+            ).astype(cp.int32, copy=False)
+        refine_segment_count = int(d_refine_segment_ids.size)
+        if refine_segment_count == 0:
+            return current
+        refine_segments = DeviceSegmentTable(
+            row_indices=d_rows[d_refine_segment_ids],
+            segment_indices=d_refine_segment_ids,
+            x0=d_segment_x0[d_refine_segment_ids],
+            y0=d_segment_y0[d_refine_segment_ids],
+            x1=d_segment_x1[d_refine_segment_ids],
+            y1=d_segment_y1[d_refine_segment_ids],
+            count=refine_segment_count,
+            part_indices=d_parts[d_refine_segment_ids],
+            ring_indices=d_rings[d_refine_segment_ids],
         )
         line_owned = build_device_resident_owned(
             device_families={
@@ -2189,13 +2396,15 @@ def renode_gpu_atomic_edges(
             page: SegmentIntersectionResult,
             *,
             _segments=segments,
+            _refine_segments=refine_segments,
+            _refine_segment_ids=d_refine_segment_ids,
             _pair_runs=pair_runs,
             _segment_count=segment_count,
         ) -> None:
             try:
                 batch = _emit_pair_split_event_batch(
                     page,
-                    left_segments=_segments,
+                    left_segments=_refine_segments,
                     right_segments=_segments,
                     kernels=kernels,
                 )
@@ -2204,9 +2413,17 @@ def renode_gpu_atomic_edges(
                 _pair_runs.append(
                     _sort_deduplicate_split_event_run(
                         (
-                            (cp.asarray(batch[0], dtype=cp.int32) % _segment_count).astype(
-                                cp.int32,
-                                copy=False,
+                            cp.where(
+                                cp.asarray(batch[0], dtype=cp.int32)
+                                < np.int32(_refine_segments.count),
+                                _refine_segment_ids[
+                                    cp.minimum(
+                                        cp.asarray(batch[0], dtype=cp.int32),
+                                        np.int32(_refine_segments.count - 1),
+                                    )
+                                ],
+                                cp.asarray(batch[0], dtype=cp.int32)
+                                - np.int32(_refine_segments.count),
                             ),
                             batch[1],
                             batch[2],
@@ -2222,13 +2439,15 @@ def renode_gpu_atomic_edges(
             line_owned,
             line_owned,
             dispatch_mode=ExecutionMode.GPU,
-            _cached_left_device_segments=segments,
+            _cached_left_device_segments=refine_segments,
             _cached_right_device_segments=segments,
             _require_same_row=isolate_rows,
-            _use_same_row_fast_path=isolate_rows,
+            # Re-noding is an atomic-segment relation refinement, not a
+            # public grouped-row matrix. The counted sweep preserves row
+            # isolation without inheriting caller-specific warp shape.
+            _use_same_row_fast_path=False,
             _same_row_single_group=False,
             _collect_ambiguous_rows=False,
-            _strict_upper_source_rows=(d_segment_ids, d_segment_ids),
             _compact_paged_non_disjoint=False,
             _classified_page_consumer=_consume_page,
         )
@@ -2276,9 +2495,10 @@ def renode_gpu_atomic_edges(
             ),
             _count=d_event_source.size,
         )
-        rebuilt = build_gpu_atomic_edges(
+        rebuilt = _build_gpu_atomic_edges_once(
             split_events,
             isolate_rows=isolate_rows,
+            preserve_source_orientation=preserve_source_orientation,
             _parent_atomic_state=state,
         )
         rebuilt = replace(
@@ -2297,12 +2517,47 @@ def renode_gpu_atomic_edges(
         # explicitly freeing an underlying allocation through one view.
         get_cuda_completion_retainer().defer(
             cp.cuda.get_current_stream(),
-            (state, segments, line_owned),
+            (
+                state,
+                segments,
+                refine_segments,
+                d_refine_segment_ids,
+                line_owned,
+            ),
             lambda _owners: None,
         )
         current = rebuilt
         if reached_fixed_point:
             return current
+        refine_all = True
+
+
+def build_gpu_atomic_edges(
+    split_events: SplitEventTable,
+    *,
+    isolate_rows: bool = False,
+    preserve_source_orientation: bool = False,
+) -> AtomicEdgeTable:
+    """Build a planar exact atomic-edge carrier from source split events.
+
+    Pairwise refined intersection coordinates can introduce second-order
+    crossings after the first source-segment split. Atomic topology therefore
+    includes fixed-point re-noding as part of its contract; consumers never
+    receive a merely once-split graph and do not need operation-specific
+    planarity repair.
+    """
+    initial = _build_gpu_atomic_edges_once(
+        split_events,
+        isolate_rows=isolate_rows,
+        preserve_source_orientation=preserve_source_orientation,
+    )
+    if not split_events.requires_renoding:
+        return initial
+    return renode_gpu_atomic_edges(
+        initial,
+        isolate_rows=isolate_rows,
+        preserve_source_orientation=preserve_source_orientation,
+    )
 
 
 def noded_boundary_segments_from_split_events_gpu(
