@@ -6,7 +6,7 @@ Public API
 ----------
 - ``build_gpu_half_edge_graph`` — constructs half-edge graph from atomic edges
 - ``_gpu_face_walk`` — walks faces in the half-edge graph, computes shoelace
-  contributions + face sample points
+  contributions and edge-to-face identity
 - ``_empty_half_edge_graph`` — creates an empty graph structure
 - ``_quantize_coordinate`` — coordinate quantization helper
 """
@@ -16,9 +16,9 @@ from __future__ import annotations
 import numpy as np
 
 from vibespatial.cuda._runtime import (
-    KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
+    get_cuda_completion_retainer,
     get_cuda_runtime,
 )
 from vibespatial.cuda.cccl_primitives import (
@@ -30,6 +30,8 @@ from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabl
 
 from .types import (
     AtomicEdgeTable,
+    EndpointIncidenceDeviceState,
+    GpuFaceWalkResult,
     HalfEdgeGraph,
     HalfEdgeGraphDeviceState,
 )
@@ -172,33 +174,38 @@ def _empty_half_edge_graph(
             part_indices=empty_device_i32,
             ring_indices=empty_device_i32,
             direction=empty_device_i8,
+            left_coverage_delta=empty_device_i32,
+            right_coverage_delta=empty_device_i32,
         ),
     )
 
 
-def build_gpu_half_edge_graph(
+def build_endpoint_incidence_device_state(
     atomic_edges: AtomicEdgeTable,
     *,
     isolate_rows: bool = False,
-) -> HalfEdgeGraph:
+) -> EndpointIncidenceDeviceState:
+    """Group exact source endpoints into a reusable node-incidence CSR."""
     _require_gpu_arrays()
     runtime = get_cuda_runtime()
-    if atomic_edges.count == 0:
-        return _empty_half_edge_graph(atomic_edges)
-
     device = atomic_edges.device_state
     edge_count = int(atomic_edges.count)
+    if edge_count == 0:
+        return EndpointIncidenceDeviceState(
+            incidence_edge_ids=runtime.allocate((0,), np.int32),
+            node_offsets=runtime.allocate((1,), np.int32, zero=True),
+            src_node_ids=runtime.allocate((0,), np.int32),
+            node_count=runtime.allocate((1,), np.int32, zero=True),
+            edge_count=0,
+            isolate_rows=isolate_rows,
+        )
+
     source_x = cp.asarray(device.src_x)
     source_y = cp.asarray(device.src_y)
     source_rows = None
     if isolate_rows and device.row_indices is not None:
         source_rows = cp.asarray(device.row_indices)
 
-    # Atomic edges are emitted as adjacent forward/reverse twins and the
-    # successor construction below already relies on edge_id ^ 1. Every target
-    # endpoint is therefore represented by its twin's source endpoint. Build
-    # the node relation from source endpoints once instead of concatenating and
-    # sorting a duplicated 2*edge_count point relation.
     point_order = cp.arange(edge_count, dtype=cp.int32)
     source_y_keys = _fp64_radix_keys(source_y)
     point_order = _stable_radix_order_pass(point_order, source_y_keys)
@@ -209,14 +216,11 @@ def build_gpu_half_edge_graph(
     if source_rows is not None:
         point_order = _stable_radix_order_pass(point_order, source_rows)
 
-    # Mark the end of each exact endpoint group in sorted position space. An
-    # exclusive sum of those markers is the node id for the current position:
-    # [0, 1, 0] -> [0, 0, 1]. This avoids materializing sorted x/y/row columns.
     from vibespatial.overlay.gpu import _overlay_face_walk_kernels
 
     kernels = _overlay_face_walk_kernels()
     ptr = runtime.pointer
-    point_group_ends = cp.empty((edge_count,), dtype=cp.int32)
+    point_group_ends = cp.empty(edge_count, dtype=cp.int32)
     endpoint_grid, endpoint_block = runtime.launch_config(
         kernels["mark_endpoint_group_ends"],
         edge_count,
@@ -235,34 +239,141 @@ def build_gpu_half_edge_graph(
                 np.int32(source_rows is not None),
                 edge_count,
             ),
-            (
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_I32,
-                KERNEL_PARAM_I32,
-            ),
+            (KERNEL_PARAM_PTR,) * 5 + (KERNEL_PARAM_I32, KERNEL_PARAM_I32),
         ),
     )
-    point_node_ids_sorted = exclusive_sum(point_group_ends)
-    del point_group_ends, source_rows
-    src_node_ids = cp.empty((edge_count,), dtype=cp.int32)
+    point_node_ids_sorted = exclusive_sum(point_group_ends, synchronize=False)
+    node_offsets = cp.empty(edge_count + 1, dtype=cp.int32)
+    node_count = cp.empty(1, dtype=cp.int32)
+    node_offset_grid, node_offset_block = runtime.launch_config(
+        kernels["scatter_node_offsets"],
+        edge_count,
+    )
+    runtime.launch(
+        kernels["scatter_node_offsets"],
+        grid=node_offset_grid,
+        block=node_offset_block,
+        params=(
+            (
+                ptr(point_group_ends),
+                ptr(point_node_ids_sorted),
+                ptr(node_offsets),
+                ptr(node_count),
+                edge_count,
+            ),
+            (KERNEL_PARAM_PTR,) * 4 + (KERNEL_PARAM_I32,),
+        ),
+    )
+    src_node_ids = cp.empty(edge_count, dtype=cp.int32)
     src_node_ids[point_order] = point_node_ids_sorted
-    del point_node_ids_sorted, point_order, source_x, source_y
+    return EndpointIncidenceDeviceState(
+        incidence_edge_ids=point_order,
+        node_offsets=node_offsets,
+        src_node_ids=src_node_ids,
+        node_count=node_count,
+        edge_count=edge_count,
+        isolate_rows=isolate_rows,
+    )
 
-    angle = cp.arctan2(device.dst_y - device.src_y, device.dst_x - device.src_x)
-    # Use the full fp64 angle for radial ordering at each node. Quantizing
-    # the turn angle can collapse near-collinear but distinct rays onto the
-    # same key, which breaks the half-edge successor relation on dense
-    # polygon/circle intersections even when the split-event payload is exact.
-    angle_keys = _fp64_radix_keys(angle)
-    del angle
-    sorted_edge_ids = cp.arange(edge_count, dtype=cp.int32)
-    sorted_edge_ids = _stable_radix_order_pass(sorted_edge_ids, angle_keys)
-    del angle_keys
-    sorted_edge_ids = _stable_radix_order_pass(sorted_edge_ids, src_node_ids)
+
+def build_gpu_half_edge_graph(
+    atomic_edges: AtomicEdgeTable,
+    *,
+    isolate_rows: bool = False,
+) -> HalfEdgeGraph:
+    _require_gpu_arrays()
+    runtime = get_cuda_runtime()
+    if atomic_edges.count == 0:
+        return _empty_half_edge_graph(atomic_edges)
+
+    device = atomic_edges.device_state
+    edge_count = int(atomic_edges.count)
+    # Atomic edges are adjacent forward/reverse twins, so every segment
+    # endpoint appears exactly once as an outgoing incidence. Reuse the same
+    # exact endpoint CSR that boundary topology consumes before graph build.
+    from vibespatial.overlay.gpu import _overlay_face_walk_kernels
+
+    kernels = _overlay_face_walk_kernels()
+    ptr = runtime.pointer
+    incidence = build_endpoint_incidence_device_state(
+        atomic_edges,
+        isolate_rows=isolate_rows,
+    )
+    point_order = cp.asarray(incidence.incidence_edge_ids)
+    src_node_ids = cp.asarray(incidence.src_node_ids)
+    d_node_offsets = cp.asarray(incidence.node_offsets)
+
+    # ``point_order`` groups outgoing edges by exact endpoint. Group ids and
+    # sparse node offsets form a native segmented carrier for exact merge
+    # passes. Each pass is edge-shaped and uses the adaptive orientation
+    # comparator; node degree never becomes serial quadratic work.
+    d_radial_group_ids = src_node_ids[point_order]
+
+    radial_input = point_order
+    radial_output = cp.empty_like(point_order)
+    source_tangent_x = (
+        cp.asarray(device.tangent_x, dtype=cp.float64)
+        if device.tangent_x is not None
+        else cp.asarray(device.dst_x) - cp.asarray(device.src_x)
+    )
+    source_tangent_y = (
+        cp.asarray(device.tangent_y, dtype=cp.float64)
+        if device.tangent_y is not None
+        else cp.asarray(device.dst_y) - cp.asarray(device.src_y)
+    )
+    atomic_tangent_x = cp.asarray(device.dst_x) - cp.asarray(device.src_x)
+    atomic_tangent_y = cp.asarray(device.dst_y) - cp.asarray(device.src_y)
+    # Use source support only when fp64 endpoint reconstruction collapsed a
+    # nonzero direction component. Otherwise the atom's own coordinates are
+    # the canonical embedding and avoid changing ordinary radial order.
+    collapsed_direction = (
+        ((atomic_tangent_x == 0.0) & (source_tangent_x != 0.0))
+        | ((atomic_tangent_y == 0.0) & (source_tangent_y != 0.0))
+    )
+    minimal_representable_extent = (
+        ((atomic_tangent_x != 0.0) & (cp.nextafter(device.src_x, device.dst_x) == device.dst_x))
+        | ((atomic_tangent_y != 0.0) & (cp.nextafter(device.src_y, device.dst_y) == device.dst_y))
+    )
+    use_source_tangent = collapsed_direction & minimal_representable_extent
+    radial_tangent_x = cp.where(
+        use_source_tangent,
+        source_tangent_x,
+        atomic_tangent_x,
+    )
+    radial_tangent_y = cp.where(
+        use_source_tangent,
+        source_tangent_y,
+        atomic_tangent_y,
+    )
+    radial_grid, radial_block = runtime.launch_config(
+        kernels["merge_node_edges_robust_pass"],
+        edge_count,
+    )
+    merge_width = 1
+    while merge_width < edge_count:
+        runtime.launch(
+            kernels["merge_node_edges_robust_pass"],
+            grid=radial_grid,
+            block=radial_block,
+            params=(
+                (
+                    ptr(radial_tangent_x),
+                    ptr(radial_tangent_y),
+                    ptr(radial_input),
+                    ptr(radial_output),
+                    ptr(d_radial_group_ids),
+                    ptr(d_node_offsets),
+                    merge_width,
+                    edge_count,
+                ),
+                (KERNEL_PARAM_PTR,) * 6
+                + (KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+            ),
+        )
+        radial_input, radial_output = radial_output, radial_input
+        merge_width *= 2
+    sorted_edge_ids = radial_input
+    del d_radial_group_ids, d_node_offsets
 
     # For each outgoing edge in radial order, write its clockwise predecessor
     # as the successor of its incoming twin. Group starts locate the wraparound
@@ -324,29 +435,19 @@ def build_gpu_half_edge_graph(
             part_indices=ae_ds.part_indices,
             ring_indices=ae_ds.ring_indices,
             direction=ae_ds.direction,
+            left_coverage_delta=ae_ds.left_coverage_delta,
+            right_coverage_delta=ae_ds.right_coverage_delta,
         ),
     )
 
 
 def _gpu_face_walk(
     half_edge_graph: HalfEdgeGraph,
-    *,
-    area_epsilon: float = 0.0,
-) -> tuple[
-    cp.ndarray,
-    cp.ndarray,
-    cp.ndarray,
-    cp.ndarray,
-    cp.ndarray,
-    cp.ndarray,
-    cp.ndarray,
-    cp.ndarray,
-    int,
-]:
+) -> GpuFaceWalkResult:
     """GPU face walk via pointer jumping + shoelace aggregation.
 
-    Returns (face_offsets, face_edge_ids, bounded_mask, signed_area,
-             centroid_x, centroid_y, label_x, label_y, face_count)
+    Returns (face_offsets, face_edge_ids, edge_face_ids, bounded_mask,
+             signed_area, centroid_x, centroid_y, face_count)
     as CuPy device arrays (except face_count which is int).
     """
     from vibespatial.overlay.gpu import _overlay_face_walk_kernels
@@ -360,9 +461,9 @@ def _gpu_face_walk(
     with hotpath_stage("overlay.graph.face_id_pointer_jump", category="refine"):
         face_id = cp.arange(edge_count, dtype=cp.int32)
         jump = cp.asarray(device.next_edge_ids).copy()
-        max_iterations = max(1, int(np.ceil(np.log2(edge_count))))
+        pointer_jump_rounds = max(1, (edge_count - 1).bit_length())
 
-        for _ in range(max_iterations):
+        for _ in range(pointer_jump_rounds):
             face_id = cp.minimum(face_id, face_id[jump])
             jump = jump[jump]
         _sync_hotpath(runtime)
@@ -401,16 +502,16 @@ def _gpu_face_walk(
         empty_i32 = cp.asarray([0], dtype=cp.int32)
         empty_f64 = cp.empty(0, dtype=cp.float64)
         empty_i8 = cp.empty(0, dtype=cp.int8)
-        return (
-            empty_i32,
-            cp.empty(0, dtype=cp.int32),
-            empty_i8,
-            empty_f64,
-            empty_f64,
-            empty_f64,
-            empty_f64,
-            empty_f64,
-            0,
+        return GpuFaceWalkResult(
+            face_offsets=empty_i32,
+            face_edge_ids=cp.empty(0, dtype=cp.int32),
+            edge_face_ids=cp.empty(0, dtype=cp.int32),
+            bounded_mask=empty_i8,
+            signed_area=empty_f64,
+            centroid_x=empty_f64,
+            centroid_y=empty_f64,
+            face_count=0,
+            cycle_orientation=empty_i8,
         )
 
     valid_starts = starts[valid_face_indices]
@@ -468,6 +569,7 @@ def _gpu_face_walk(
             params=metrics_params,
         )
         _sync_hotpath(runtime)
+    face_walk_kernel_owners = (sorted_edge_ids, valid_starts, valid_ends)
 
     # Every downstream GPU consumer uses face spans as unordered membership and
     # follows next_edge_ids whenever traversal order matters. Keep the first
@@ -480,7 +582,10 @@ def _gpu_face_walk(
     # a proper CSR offset array with face_count+1 entries so that
     # face_offsets[face_count] gives the total edge count.
     with hotpath_stage("overlay.graph.face_offsets", category="sort"):
-        _prefix = exclusive_sum(valid_lengths.astype(cp.int32, copy=False))
+        _prefix = exclusive_sum(
+            valid_lengths.astype(cp.int32, copy=False),
+            synchronize=False,
+        )
         _total = valid_lengths.sum().reshape(1).astype(cp.int32)
         face_offsets = cp.concatenate((_prefix, _total))
         _sync_hotpath(runtime)
@@ -510,64 +615,69 @@ def _gpu_face_walk(
         del sorted_edge_ids, valid_starts, valid_ends, valid_lengths
         _sync_hotpath(runtime)
 
-    # --- Step 4: Face sample points via kernel ---
-    label_x = cp.empty(face_count, dtype=cp.float64)
-    label_y = cp.empty(face_count, dtype=cp.float64)
-    bounded_mask = cp.empty(face_count, dtype=cp.int8)
-    sample_params = (
-        (
-            ptr(device.src_x),
-            ptr(device.src_y),
-            ptr(device.next_edge_ids),
-            ptr(face_offsets),
-            ptr(face_edge_ids),
-            ptr(signed_area),
-            ptr(centroid_x),
-            ptr(centroid_y),
-            ptr(label_x),
-            ptr(label_y),
-            ptr(bounded_mask),
-            area_epsilon,
-            face_count,
-            edge_count,
-        ),
-        (
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_F64,
-            KERNEL_PARAM_I32,
-            KERNEL_PARAM_I32,
+    edge_face_ids = cp.full(edge_count, -1, dtype=cp.int32)
+    runtime.launch(
+        kernels["scatter_edge_face_ids"],
+        grid=(face_count, 1, 1),
+        block=(min(256, runtime.optimal_block_size(kernels["scatter_edge_face_ids"])), 1, 1),
+        params=((ptr(face_offsets), ptr(face_edge_ids), ptr(edge_face_ids), face_count),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32)),
+    )
+    previous_edge_ids = cp.full(edge_count, -1, dtype=cp.int32)
+    previous_grid, previous_block = runtime.launch_config(
+        kernels["scatter_previous_edge_ids"],
+        edge_count,
+    )
+    runtime.launch(
+        kernels["scatter_previous_edge_ids"],
+        grid=previous_grid,
+        block=previous_block,
+        params=(
+            (ptr(device.next_edge_ids), ptr(previous_edge_ids), edge_count),
+            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
         ),
     )
-    sample_grid, sample_block = runtime.launch_config(
-        kernels["compute_face_sample_points"], face_count
-    )
-    with hotpath_stage("overlay.graph.sample_points", category="refine"):
-        runtime.launch(
-            kernels["compute_face_sample_points"],
-            grid=sample_grid,
-            block=sample_block,
-            params=sample_params,
+    cycle_orientation = cp.empty(face_count, dtype=cp.int8)
+    orientation_block_size = _largest_power_of_two_block_size(
+        min(
+            runtime.optimal_block_size(kernels["compute_face_exact_orientation"]),
+            256,
         )
-        _sync_hotpath(runtime)
+    )
+    runtime.launch(
+        kernels["compute_face_exact_orientation"],
+        grid=(face_count, 1, 1),
+        block=(orientation_block_size, 1, 1),
+        params=(
+            (
+                ptr(face_offsets),
+                ptr(face_edge_ids),
+                ptr(previous_edge_ids),
+                ptr(device.next_edge_ids),
+                ptr(device.src_x),
+                ptr(device.src_y),
+                ptr(cycle_orientation),
+                face_count,
+                edge_count,
+            ),
+            (KERNEL_PARAM_PTR,) * 7 + (KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+        ),
+    )
+    bounded_mask = (cycle_orientation > 0).astype(cp.int8, copy=False)
+    get_cuda_completion_retainer().defer(
+        cp.cuda.get_current_stream(),
+        (*face_walk_kernel_owners, previous_edge_ids),
+        lambda _owners: None,
+    )
 
-    return (
-        face_offsets,
-        face_edge_ids,
-        bounded_mask,
-        signed_area,
-        centroid_x,
-        centroid_y,
-        label_x,
-        label_y,
-        face_count,
+    return GpuFaceWalkResult(
+        face_offsets=face_offsets,
+        face_edge_ids=face_edge_ids,
+        edge_face_ids=edge_face_ids,
+        bounded_mask=bounded_mask,
+        signed_area=signed_area,
+        centroid_x=centroid_x,
+        centroid_y=centroid_y,
+        face_count=face_count,
+        cycle_orientation=cycle_orientation,
     )

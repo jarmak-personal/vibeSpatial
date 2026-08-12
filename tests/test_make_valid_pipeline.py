@@ -121,7 +121,7 @@ def test_make_valid_repair_mapping_stays_device_rowset_shaped() -> None:
     assert "NativeGroupedSelection" in multipart_repair
     assert "sentinel_group" not in multipart_repair
     assert "d_group_sizes[0] +=" in multipart_repair
-    assert "allow_capacity_allocation=True" in multipart_repair
+    assert "physicalize_device_rows" not in multipart_repair
     assert "_explode_polygonal_rows_to_polygons_gpu" not in multipart_repair
     assert "cp.unique" not in multipart_repair
     assert "cp.argsort" not in multipart_repair

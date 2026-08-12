@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 
 from vibespatial.cuda._runtime import (
@@ -17,6 +19,16 @@ from vibespatial.predicates.point_relations_kernels import (
     _POINT_BINARY_RELATIONS_KERNEL_NAMES,
     _POINT_BINARY_RELATIONS_KERNEL_SOURCE,
 )
+from vibespatial.runtime import ExecutionMode, RuntimeSelection
+from vibespatial.runtime.precision import (
+    CompensationMode,
+    KernelClass,
+    PrecisionMode,
+    PrecisionPlan,
+    RefinementMode,
+    normalize_precision_mode,
+    select_precision_plan,
+)
 
 POINT_LOCATION_OUTSIDE = np.uint8(0)
 POINT_LOCATION_BOUNDARY = np.uint8(1)
@@ -25,12 +37,12 @@ POINT_LOCATION_INTERIOR = np.uint8(2)
 request_nvrtc_warmup(
     [
         (
-            "point-binary-relations",
+            "point-binary-relations-fp64",
             _POINT_BINARY_RELATIONS_KERNEL_SOURCE,
             _POINT_BINARY_RELATIONS_KERNEL_NAMES,
         ),
         (
-            "multipoint-binary-relations",
+            "multipoint-binary-relations-fp64",
             _MULTIPOINT_BINARY_RELATIONS_KERNEL_SOURCE,
             _MULTIPOINT_KERNEL_NAMES,
         ),
@@ -40,7 +52,7 @@ request_nvrtc_warmup(
 
 def _point_binary_relation_kernels():
     return compile_kernel_group(
-        "point-binary-relations",
+        "point-binary-relations-fp64",
         _POINT_BINARY_RELATIONS_KERNEL_SOURCE,
         _POINT_BINARY_RELATIONS_KERNEL_NAMES,
     )
@@ -48,7 +60,7 @@ def _point_binary_relation_kernels():
 
 def _multipoint_relation_kernels():
     return compile_kernel_group(
-        "multipoint-binary-relations",
+        "multipoint-binary-relations-fp64",
         _MULTIPOINT_BINARY_RELATIONS_KERNEL_SOURCE,
         _MULTIPOINT_KERNEL_NAMES,
     )
@@ -149,6 +161,8 @@ def _launch_kernel(
     *,
     extra_device_allocs: list | None = None,
     return_device: bool = False,
+    logical_count=None,
+    precision_plan: PrecisionPlan | None = None,
 ) -> np.ndarray:
     """Launch a point or multipoint binary-relation kernel.
 
@@ -169,6 +183,8 @@ def _launch_kernel(
         mapped FRO arrays).  With ``return_device=True``, ownership of
         ``device_out`` transfers to the caller as a CuPy array.
     """
+    if precision_plan is not None:
+        _require_indexed_point_fp64_plan(precision_plan)
     n_items = int(candidate_rows.size)
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
@@ -188,15 +204,27 @@ def _launch_kernel(
     try:
         kernel = kernel_dict_fn()[kernel_name]
         params = (
-            (ptr(device_rows), *args, ptr(device_out), n_items),
-            (KERNEL_PARAM_PTR, *arg_types, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(device_rows),
+                *args,
+                ptr(device_out),
+                ptr(logical_count),
+                n_items,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                *arg_types,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
         grid, block = runtime.launch_config(kernel, n_items)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        runtime.synchronize()
         if return_device:
             returning_device = True
             return device_out
+        runtime.synchronize()
         out = np.empty(n_items, dtype=np.uint8)
         runtime.copy_device_to_host(
             device_out,
@@ -379,6 +407,89 @@ _LINE_TAGS_INDEXED = tuple(FAMILY_TAGS[f] for f in _LINE_FAMILIES_INDEXED)
 _REGION_TAGS_INDEXED = tuple(FAMILY_TAGS[f] for f in _REGION_FAMILIES_INDEXED)
 
 
+def _plan_indexed_point_precision(
+    requested: PrecisionMode | str = PrecisionMode.AUTO,
+    *,
+    runtime_selection: RuntimeSelection | None = None,
+) -> PrecisionPlan:
+    """Resolve requested precision against the indexed point variant set.
+
+    AUTO selects the sole implemented exact-refine variant, native fp64.
+    Forced fp32 remains a forced request and is rejected by the variant guard
+    instead of being silently promoted to fp64.
+    """
+    requested_mode = normalize_precision_mode(requested)
+    selection = runtime_selection or RuntimeSelection(
+        requested=ExecutionMode.GPU,
+        selected=ExecutionMode.GPU,
+        reason="indexed point-family predicate kernels require authoritative fp64",
+    )
+    precision_plan = select_precision_plan(
+        runtime_selection=selection,
+        kernel_class=KernelClass.PREDICATE,
+        requested=(
+            PrecisionMode.FP64
+            if requested_mode is PrecisionMode.AUTO
+            else requested_mode
+        ),
+    )
+    if requested_mode is PrecisionMode.AUTO:
+        precision_plan = replace(
+            precision_plan,
+            reason=(
+                "auto precision resolved to native fp64 because indexed "
+                "point-family exact refinement has no centered fp32 plus "
+                "selective-fp64 refinement variant"
+            ),
+        )
+    return _require_indexed_point_fp64_plan(precision_plan)
+
+
+def _default_indexed_point_fp64_plan() -> PrecisionPlan:
+    """Return the AUTO plan for the indexed point predicate shape."""
+    return _plan_indexed_point_precision(PrecisionMode.AUTO)
+
+
+def _require_indexed_point_fp64_plan(precision_plan: PrecisionPlan) -> PrecisionPlan:
+    """Enforce the implemented ADR-0002 variant for indexed point predicates.
+
+    These exact candidate-refine kernels currently execute directly in fp64.
+    An fp32 predicate plan is not admissible until the shape has centered
+    coarse computation and selective fp64 refinement for ambiguous pairs.
+    """
+    if not isinstance(precision_plan, PrecisionPlan):
+        raise TypeError("indexed point predicates require a PrecisionPlan")
+    if precision_plan.kernel_class is not KernelClass.PREDICATE:
+        raise ValueError("indexed point predicates require a PREDICATE PrecisionPlan")
+    if (
+        precision_plan.storage_precision is not PrecisionMode.FP64
+        or precision_plan.compute_precision is not PrecisionMode.FP64
+    ):
+        raise NotImplementedError(
+            "indexed point predicates currently require authoritative fp64; "
+            "fp32 is unsupported until centered coarse evaluation and selective "
+            "fp64 refinement are implemented"
+        )
+    if (
+        precision_plan.compensation is not CompensationMode.NONE
+        or precision_plan.refinement is not RefinementMode.NONE
+        or precision_plan.center_coordinates
+    ):
+        raise ValueError(
+            "indexed point predicate fp64 plans must be uncentered and require "
+            "neither compensation nor refinement"
+        )
+    return precision_plan
+
+
+def _resolve_indexed_point_precision_plan(
+    precision_plan: PrecisionPlan | None,
+) -> PrecisionPlan:
+    if precision_plan is None:
+        precision_plan = _default_indexed_point_fp64_plan()
+    return _require_indexed_point_fp64_plan(precision_plan)
+
+
 def _prepare_indexed_fro(owned, indices, runtime):
     """Map indices through family_row_offsets and return a device array."""
     if _is_device_array(indices):
@@ -396,7 +507,9 @@ def _classify_indexed_point_equals(
     left_indices: np.ndarray,
     right_indices: np.ndarray,
     *,
+    precision_plan: PrecisionPlan,
     return_device: bool = False,
+    logical_count=None,
 ) -> np.ndarray:
     n = int(left_indices.size)
     if n == 0:
@@ -434,6 +547,8 @@ def _classify_indexed_point_equals(
         (KERNEL_PARAM_PTR,) * 10,
         extra_device_allocs=[device_left_fro, device_right_fro],
         return_device=return_device,
+        logical_count=logical_count,
+        precision_plan=precision_plan,
     )
 
 
@@ -444,7 +559,9 @@ def _classify_indexed_point_line(
     line_indices: np.ndarray,
     *,
     line_family: GeometryFamily,
+    precision_plan: PrecisionPlan,
     return_device: bool = False,
+    logical_count=None,
 ) -> np.ndarray:
     n = int(point_indices.size)
     if n == 0:
@@ -494,6 +611,8 @@ def _classify_indexed_point_line(
         (KERNEL_PARAM_PTR,) * len(args),
         extra_device_allocs=[device_point_fro, device_line_fro],
         return_device=return_device,
+        logical_count=logical_count,
+        precision_plan=precision_plan,
     )
 
 
@@ -504,7 +623,9 @@ def _classify_indexed_point_region(
     region_indices: np.ndarray,
     *,
     region_family: GeometryFamily,
+    precision_plan: PrecisionPlan,
     return_device: bool = False,
+    logical_count=None,
 ) -> np.ndarray:
     n = int(point_indices.size)
     if n == 0:
@@ -555,6 +676,8 @@ def _classify_indexed_point_region(
         (KERNEL_PARAM_PTR,) * len(args),
         extra_device_allocs=[device_point_fro, device_region_fro],
         return_device=return_device,
+        logical_count=logical_count,
+        precision_plan=precision_plan,
     )
 
 
@@ -564,6 +687,8 @@ def classify_point_predicates_indexed(
     right_owned: OwnedGeometryArray,
     left_indices: np.ndarray,
     right_indices: np.ndarray,
+    *,
+    precision_plan: PrecisionPlan | None = None,
 ) -> np.ndarray:
     """Evaluate point-family predicates using indexed access into original owned arrays.
 
@@ -578,6 +703,7 @@ def classify_point_predicates_indexed(
         _point_relation_to_predicate,
     )
 
+    precision_plan = _resolve_indexed_point_precision_plan(precision_plan)
     n = left_indices.size
     if n == 0:
         return np.empty(0, dtype=bool)
@@ -595,6 +721,7 @@ def classify_point_predicates_indexed(
             right_owned,
             left_indices[idx],
             right_indices[idx],
+            precision_plan=precision_plan,
         )
         _apply_relation_rows(out, idx, _point_equals_to_predicate(predicate, relation))
 
@@ -609,6 +736,7 @@ def classify_point_predicates_indexed(
                 left_indices[idx],
                 right_indices[idx],
                 line_family=line_family,
+                precision_plan=precision_plan,
             )
             _apply_relation_rows(
                 out, idx, _point_relation_to_predicate(predicate, relation, point_on_left=True)
@@ -623,6 +751,7 @@ def classify_point_predicates_indexed(
                 right_indices[idx],
                 left_indices[idx],
                 line_family=line_family,
+                precision_plan=precision_plan,
             )
             _apply_relation_rows(
                 out, idx, _point_relation_to_predicate(predicate, relation, point_on_left=False)
@@ -641,6 +770,7 @@ def classify_point_predicates_indexed(
                 left_indices[idx],
                 right_indices[idx],
                 region_family=region_family,
+                precision_plan=precision_plan,
             )
             _apply_relation_rows(
                 out, idx, _point_relation_to_predicate(predicate, relation, point_on_left=True)
@@ -655,6 +785,7 @@ def classify_point_predicates_indexed(
                 right_indices[idx],
                 left_indices[idx],
                 region_family=region_family,
+                precision_plan=precision_plan,
             )
             _apply_relation_rows(
                 out, idx, _point_relation_to_predicate(predicate, relation, point_on_left=False)
@@ -678,6 +809,7 @@ def classify_point_predicates_indexed(
             mp_left_mask,
             mp_right_mask,
             _apply_relation_rows,
+            precision_plan,
         )
 
     return out
@@ -692,6 +824,7 @@ def classify_point_predicates_indexed_device(
     *,
     left_tags=None,
     right_tags=None,
+    precision_plan: PrecisionPlan | None = None,
 ):
     """Evaluate point-family indexed predicates on device.
 
@@ -700,6 +833,8 @@ def classify_point_predicates_indexed_device(
     lineal, and polygonal relation-pair rows without exporting branch masks to
     host.
     """
+    precision_plan = _resolve_indexed_point_precision_plan(precision_plan)
+
     import cupy as cp
 
     left_indices = cp.asarray(left_indices, dtype=cp.int32)
@@ -731,6 +866,7 @@ def classify_point_predicates_indexed_device(
             right_owned,
             left_indices[idx],
             right_indices[idx],
+            precision_plan=precision_plan,
             return_device=True,
         )
         out[idx] = _point_equals_to_predicate_array(predicate, relation)
@@ -745,6 +881,7 @@ def classify_point_predicates_indexed_device(
                 left_indices[idx],
                 right_indices[idx],
                 line_family=line_family,
+                precision_plan=precision_plan,
                 return_device=True,
             )
             out[idx] = _point_relation_to_predicate_array(
@@ -762,6 +899,7 @@ def classify_point_predicates_indexed_device(
                 right_indices[idx],
                 left_indices[idx],
                 line_family=line_family,
+                precision_plan=precision_plan,
                 return_device=True,
             )
             out[idx] = _point_relation_to_predicate_array(
@@ -782,6 +920,7 @@ def classify_point_predicates_indexed_device(
                 left_indices[idx],
                 right_indices[idx],
                 region_family=region_family,
+                precision_plan=precision_plan,
                 return_device=True,
             )
             out[idx] = _point_relation_to_predicate_array(
@@ -799,6 +938,7 @@ def classify_point_predicates_indexed_device(
                 right_indices[idx],
                 left_indices[idx],
                 region_family=region_family,
+                precision_plan=precision_plan,
                 return_device=True,
             )
             out[idx] = _point_relation_to_predicate_array(
@@ -823,9 +963,240 @@ def classify_point_predicates_indexed_device(
             right_tags,
             left_tags == mp_tag,
             right_tags == mp_tag,
+            precision_plan,
         )
 
     return out
+
+
+def classify_homogeneous_point_predicates_indexed_device(
+    predicate: str,
+    left_owned: OwnedGeometryArray,
+    right_owned: OwnedGeometryArray,
+    left_indices,
+    right_indices,
+    *,
+    left_family: GeometryFamily,
+    right_family: GeometryFamily,
+    precision_plan: PrecisionPlan,
+    logical_count=None,
+):
+    """Evaluate one point-family pair without relation-row compaction."""
+    precision_plan = _require_indexed_point_fp64_plan(precision_plan)
+
+    import cupy as cp
+
+    left_indices = cp.asarray(left_indices, dtype=cp.int32)
+    right_indices = cp.asarray(right_indices, dtype=cp.int32)
+    if left_indices.size != right_indices.size:
+        raise ValueError("homogeneous point predicate indices must be aligned")
+
+    if left_family is GeometryFamily.POINT:
+        if right_family is GeometryFamily.POINT:
+            relation = _classify_indexed_point_equals(
+                left_owned,
+                right_owned,
+                left_indices,
+                right_indices,
+                precision_plan=precision_plan,
+                return_device=True,
+                logical_count=logical_count,
+            )
+            return _point_equals_to_predicate_array(predicate, relation)
+        if right_family in _LINE_FAMILIES_INDEXED:
+            relation = _classify_indexed_point_line(
+                left_owned,
+                right_owned,
+                left_indices,
+                right_indices,
+                line_family=right_family,
+                precision_plan=precision_plan,
+                return_device=True,
+                logical_count=logical_count,
+            )
+            return _point_relation_to_predicate_array(
+                predicate,
+                relation,
+                point_on_left=True,
+            )
+        if right_family in _REGION_FAMILIES_INDEXED:
+            relation = _classify_indexed_point_region(
+                left_owned,
+                right_owned,
+                left_indices,
+                right_indices,
+                region_family=right_family,
+                precision_plan=precision_plan,
+                return_device=True,
+                logical_count=logical_count,
+            )
+            return _point_relation_to_predicate_array(
+                predicate,
+                relation,
+                point_on_left=True,
+            )
+        if right_family is GeometryFamily.MULTIPOINT:
+            bits = _classify_indexed_mp_point(
+                right_owned,
+                left_owned,
+                right_indices,
+                left_indices,
+                precision_plan=precision_plan,
+                return_device=True,
+                logical_count=logical_count,
+            )
+            return _multipoint_bits_to_predicate(
+                predicate,
+                bits,
+                mp_on_left=False,
+                target_family=GeometryFamily.POINT,
+            )
+
+    if right_family is GeometryFamily.POINT:
+        if left_family in _LINE_FAMILIES_INDEXED:
+            relation = _classify_indexed_point_line(
+                right_owned,
+                left_owned,
+                right_indices,
+                left_indices,
+                line_family=left_family,
+                precision_plan=precision_plan,
+                return_device=True,
+                logical_count=logical_count,
+            )
+            return _point_relation_to_predicate_array(
+                predicate,
+                relation,
+                point_on_left=False,
+            )
+        if left_family in _REGION_FAMILIES_INDEXED:
+            relation = _classify_indexed_point_region(
+                right_owned,
+                left_owned,
+                right_indices,
+                left_indices,
+                region_family=left_family,
+                precision_plan=precision_plan,
+                return_device=True,
+                logical_count=logical_count,
+            )
+            return _point_relation_to_predicate_array(
+                predicate,
+                relation,
+                point_on_left=False,
+            )
+        if left_family is GeometryFamily.MULTIPOINT:
+            bits = _classify_indexed_mp_point(
+                left_owned,
+                right_owned,
+                left_indices,
+                right_indices,
+                precision_plan=precision_plan,
+                return_device=True,
+                logical_count=logical_count,
+            )
+            return _multipoint_bits_to_predicate(
+                predicate,
+                bits,
+                mp_on_left=True,
+                target_family=GeometryFamily.POINT,
+            )
+
+    if left_family is GeometryFamily.MULTIPOINT:
+        if right_family in _LINE_FAMILIES_INDEXED:
+            bits = _classify_indexed_mp_line(
+                left_owned,
+                right_owned,
+                left_indices,
+                right_indices,
+                line_family=right_family,
+                precision_plan=precision_plan,
+                return_device=True,
+                logical_count=logical_count,
+            )
+        elif right_family in _REGION_FAMILIES_INDEXED:
+            bits = _classify_indexed_mp_region(
+                left_owned,
+                right_owned,
+                left_indices,
+                right_indices,
+                region_family=right_family,
+                precision_plan=precision_plan,
+                return_device=True,
+                logical_count=logical_count,
+            )
+        elif right_family is GeometryFamily.MULTIPOINT:
+            bits = _classify_indexed_mp_mp(
+                left_owned,
+                right_owned,
+                left_indices,
+                right_indices,
+                precision_plan=precision_plan,
+                return_device=True,
+                logical_count=logical_count,
+            )
+            if predicate in {"contains", "covers", "contains_properly"}:
+                bits = _classify_indexed_mp_mp(
+                    right_owned,
+                    left_owned,
+                    right_indices,
+                    left_indices,
+                    precision_plan=precision_plan,
+                    return_device=True,
+                    logical_count=logical_count,
+                )
+                return _multipoint_bits_to_predicate(
+                    predicate,
+                    bits,
+                    mp_on_left=False,
+                    target_family=GeometryFamily.MULTIPOINT,
+                )
+        else:
+            bits = None
+        if bits is not None:
+            return _multipoint_bits_to_predicate(
+                predicate,
+                bits,
+                mp_on_left=True,
+                target_family=right_family,
+            )
+
+    if right_family is GeometryFamily.MULTIPOINT:
+        if left_family in _LINE_FAMILIES_INDEXED:
+            bits = _classify_indexed_mp_line(
+                right_owned,
+                left_owned,
+                right_indices,
+                left_indices,
+                line_family=left_family,
+                precision_plan=precision_plan,
+                return_device=True,
+                logical_count=logical_count,
+            )
+        elif left_family in _REGION_FAMILIES_INDEXED:
+            bits = _classify_indexed_mp_region(
+                right_owned,
+                left_owned,
+                right_indices,
+                left_indices,
+                region_family=left_family,
+                precision_plan=precision_plan,
+                return_device=True,
+                logical_count=logical_count,
+            )
+        else:
+            bits = None
+        if bits is not None:
+            return _multipoint_bits_to_predicate(
+                predicate,
+                bits,
+                mp_on_left=False,
+                target_family=left_family,
+            )
+
+    raise ValueError(
+        "homogeneous point predicate requires at least one point-family input"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -925,7 +1296,9 @@ def _classify_indexed_mp_point(
     mp_indices: np.ndarray,
     pt_indices: np.ndarray,
     *,
+    precision_plan: PrecisionPlan,
     return_device: bool = False,
+    logical_count=None,
 ) -> np.ndarray:
     """MULTIPOINT x POINT relation bits."""
     n = int(mp_indices.size)
@@ -964,6 +1337,8 @@ def _classify_indexed_mp_point(
         (KERNEL_PARAM_PTR,) * 10,
         extra_device_allocs=[device_mp_fro, device_pt_fro],
         return_device=return_device,
+        logical_count=logical_count,
+        precision_plan=precision_plan,
     )
 
 
@@ -974,7 +1349,9 @@ def _classify_indexed_mp_line(
     line_indices: np.ndarray,
     *,
     line_family: GeometryFamily,
+    precision_plan: PrecisionPlan,
     return_device: bool = False,
+    logical_count=None,
 ) -> np.ndarray:
     """MULTIPOINT x LINESTRING/MULTILINESTRING relation bits."""
     n = int(mp_indices.size)
@@ -1025,6 +1402,8 @@ def _classify_indexed_mp_line(
         (KERNEL_PARAM_PTR,) * len(args),
         extra_device_allocs=[device_mp_fro, device_line_fro],
         return_device=return_device,
+        logical_count=logical_count,
+        precision_plan=precision_plan,
     )
 
 
@@ -1035,7 +1414,9 @@ def _classify_indexed_mp_region(
     region_indices: np.ndarray,
     *,
     region_family: GeometryFamily,
+    precision_plan: PrecisionPlan,
     return_device: bool = False,
+    logical_count=None,
 ) -> np.ndarray:
     """MULTIPOINT x POLYGON/MULTIPOLYGON relation bits."""
     n = int(mp_indices.size)
@@ -1087,6 +1468,8 @@ def _classify_indexed_mp_region(
         (KERNEL_PARAM_PTR,) * len(args),
         extra_device_allocs=[device_mp_fro, device_region_fro],
         return_device=return_device,
+        logical_count=logical_count,
+        precision_plan=precision_plan,
     )
 
 
@@ -1096,7 +1479,9 @@ def _classify_indexed_mp_mp(
     left_indices: np.ndarray,
     right_indices: np.ndarray,
     *,
+    precision_plan: PrecisionPlan,
     return_device: bool = False,
+    logical_count=None,
 ) -> np.ndarray:
     """MULTIPOINT x MULTIPOINT relation bits (left MP vs right MP)."""
     n = int(left_indices.size)
@@ -1135,6 +1520,8 @@ def _classify_indexed_mp_mp(
         (KERNEL_PARAM_PTR,) * 10,
         extra_device_allocs=[device_left_fro, device_right_fro],
         return_device=return_device,
+        logical_count=logical_count,
+        precision_plan=precision_plan,
     )
 
 
@@ -1150,6 +1537,7 @@ def _dispatch_multipoint_pairs(
     mp_left_mask: np.ndarray,
     mp_right_mask: np.ndarray,
     _apply_relation_rows,
+    precision_plan: PrecisionPlan,
 ) -> None:
     """Dispatch multipoint pairs to the appropriate GPU kernel and convert results."""
     pt_tag = _POINT_TAG_INDEXED
@@ -1165,6 +1553,7 @@ def _dispatch_multipoint_pairs(
             right_owned,
             left_indices[idx],
             right_indices[idx],
+            precision_plan=precision_plan,
         )
         _apply_relation_rows(
             out,
@@ -1188,6 +1577,7 @@ def _dispatch_multipoint_pairs(
                 left_indices[idx],
                 right_indices[idx],
                 line_family=lf,
+                precision_plan=precision_plan,
             )
             _apply_relation_rows(
                 out,
@@ -1212,6 +1602,7 @@ def _dispatch_multipoint_pairs_device(
     right_tags,
     mp_left_mask,
     mp_right_mask,
+    precision_plan: PrecisionPlan,
 ) -> None:
     """Dispatch multipoint relation-pair rows without exporting masks to host."""
     import cupy as cp
@@ -1233,6 +1624,7 @@ def _dispatch_multipoint_pairs_device(
             right_owned,
             left_indices[idx],
             right_indices[idx],
+            precision_plan=precision_plan,
             return_device=True,
         )
         out[idx] = _multipoint_bits_to_predicate(
@@ -1254,6 +1646,7 @@ def _dispatch_multipoint_pairs_device(
                 left_indices[idx],
                 right_indices[idx],
                 line_family=line_family,
+                precision_plan=precision_plan,
                 return_device=True,
             )
             out[idx] = _multipoint_bits_to_predicate(
@@ -1280,6 +1673,7 @@ def _dispatch_multipoint_pairs_device(
                 left_indices[idx],
                 right_indices[idx],
                 region_family=region_family,
+                precision_plan=precision_plan,
                 return_device=True,
             )
             out[idx] = _multipoint_bits_to_predicate(
@@ -1301,6 +1695,7 @@ def _dispatch_multipoint_pairs_device(
             right_owned,
             left_mp_indices,
             right_mp_indices,
+            precision_plan=precision_plan,
             return_device=True,
         )
         if predicate in {"contains", "covers", "contains_properly"}:
@@ -1309,6 +1704,7 @@ def _dispatch_multipoint_pairs_device(
                 left_owned,
                 right_mp_indices,
                 left_mp_indices,
+                precision_plan=precision_plan,
                 return_device=True,
             )
             result = _multipoint_bits_to_predicate(
@@ -1346,6 +1742,7 @@ def _dispatch_multipoint_pairs_device(
             left_owned,
             right_indices[idx],
             left_indices[idx],
+            precision_plan=precision_plan,
             return_device=True,
         )
         out[idx] = _multipoint_bits_to_predicate(
@@ -1367,6 +1764,7 @@ def _dispatch_multipoint_pairs_device(
                 right_indices[idx],
                 left_indices[idx],
                 line_family=line_family,
+                precision_plan=precision_plan,
                 return_device=True,
             )
             out[idx] = _multipoint_bits_to_predicate(
@@ -1393,6 +1791,7 @@ def _dispatch_multipoint_pairs_device(
                 right_indices[idx],
                 left_indices[idx],
                 region_family=region_family,
+                precision_plan=precision_plan,
                 return_device=True,
             )
             out[idx] = _multipoint_bits_to_predicate(

@@ -10,6 +10,8 @@ Validates that the unified device spatial index query function:
 
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 import pytest
 from shapely.geometry import Point, box
@@ -20,6 +22,7 @@ from vibespatial.kernels.core.geometry_analysis import (
     compute_geometry_bounds_device,
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
+from vibespatial.runtime.precision import PrecisionMode
 from vibespatial.runtime.residency import Residency
 from vibespatial.spatial.indexing import build_flat_spatial_index
 from vibespatial.spatial.query import (
@@ -27,8 +30,186 @@ from vibespatial.spatial.query import (
     query_spatial_index,
     spatial_index_device_query,
 )
+from vibespatial.spatial.query_types import (
+    CandidateRelationCapacityError,
+    available_device_memory_bytes,
+    require_device_candidate_pair_capacity,
+)
+from vibespatial.spatial.spatial_index_device import (
+    _MORTON_SPAN_BUCKET_UPPER_BOUNDS,
+    _classify_homogeneous_reduction_tile,
+    _morton_range_query,
+    _morton_reduction_span_schedule,
+    _spatial_index_device_relation_reduction,
+    _spatial_reduction_tile_lane_capacity,
+)
 
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+
+
+def test_point_reduction_tile_propagates_explicit_precision_plan(monkeypatch) -> None:
+    pytest.importorskip("cupy")
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.predicates import point_relations
+
+    precision_plan = point_relations._plan_indexed_point_precision(
+        PrecisionMode.AUTO,
+    )
+    sentinel = object()
+    observed = []
+
+    def classify(*args, precision_plan, **kwargs):
+        observed.append(precision_plan)
+        return sentinel
+
+    monkeypatch.setattr(
+        point_relations,
+        "classify_homogeneous_point_predicates_indexed_device",
+        classify,
+    )
+
+    with pytest.raises(TypeError, match="explicit PrecisionPlan"):
+        _classify_homogeneous_reduction_tile(
+            "intersects",
+            object(),
+            object(),
+            np.asarray([0], dtype=np.int32),
+            np.asarray([0], dtype=np.int32),
+            query_family=GeometryFamily.POINT,
+            tree_family=GeometryFamily.POINT,
+        )
+
+    result = _classify_homogeneous_reduction_tile(
+        "intersects",
+        object(),
+        object(),
+        np.asarray([0], dtype=np.int32),
+        np.asarray([0], dtype=np.int32),
+        query_family=GeometryFamily.POINT,
+        tree_family=GeometryFamily.POINT,
+        precision_plan=precision_plan,
+    )
+
+    assert result is sentinel
+    assert observed == [precision_plan]
+
+
+def test_candidate_relation_capacity_reports_inherent_device_limit() -> None:
+    device_capacity = 24 * 1024**3
+    pair_count = 6_241_973_507
+
+    with pytest.raises(CandidateRelationCapacityError, match=r"46\.51 GiB"):
+        require_device_candidate_pair_capacity(
+            pair_count,
+            relation_name="test Morton relation",
+            device_capacity_bytes=device_capacity,
+        )
+
+    assert require_device_candidate_pair_capacity(
+        1_000_000,
+        relation_name="test relation",
+        device_capacity_bytes=device_capacity,
+    ) == 8_000_000
+
+    with pytest.raises(CandidateRelationCapacityError, match="reserved allocation budget"):
+        require_device_candidate_pair_capacity(
+            1_000_000,
+            relation_name="live-memory relation",
+            device_capacity_bytes=12_000_000,
+        )
+
+    with pytest.raises(CandidateRelationCapacityError, match="scratch"):
+        require_device_candidate_pair_capacity(
+            500_000,
+            relation_name="refinement relation",
+            device_capacity_bytes=16_000_000,
+            temporary_bytes=6_000_000,
+        )
+
+
+def test_spatial_reduction_tile_capacity_tracks_live_memory(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "vibespatial.spatial.spatial_index_device.available_device_memory_bytes",
+        lambda: 64 * 400 * 4,
+    )
+
+    assert _spatial_reduction_tile_lane_capacity(
+        object(),
+        object(),
+        predicate="intersects",
+        family_admission=(True, False, False),
+    ) == 400
+
+
+def test_spatial_reduction_tile_capacity_tracks_segment_pair_shape(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "vibespatial.spatial.spatial_index_device.available_device_memory_bytes",
+        lambda: 8 * 1024**3,
+    )
+    spans = iter((100, 200))
+    monkeypatch.setattr(
+        "vibespatial.geometry.owned.ensure_device_geometry_size_bounds",
+        lambda *args, **kwargs: next(spans),
+    )
+
+    assert _spatial_reduction_tile_lane_capacity(
+        object(),
+        object(),
+        predicate="intersects",
+        family_admission=(False, False, True),
+    ) == (8 * 1024 * 1024) // (100 * 200)
+
+
+def test_spatial_reduction_uses_structural_tiles_without_active_row_rounds() -> None:
+    source = inspect.getsource(_spatial_index_device_relation_reduction)
+
+    assert "while " not in source
+    assert "_filter_predicate_pairs_owned" not in source
+    assert "range(0, tree_count" not in source
+    assert "_morton_reduction_span_schedule" in source
+    assert "for bucket_index" in source
+    assert "for query_order_start in range" in source
+    assert "for position_start in range" in source
+    assert "cp.broadcast_to" not in source
+    assert 'kernels["morton_range_tile_count"]' in source
+    assert 'kernels["morton_range_tile_scatter"]' in source
+    assert "logical_count=d_candidate_count_i64" in source
+    assert "logical_count=d_candidate_count_i32" in source
+    assert "candidate_selection.active_capacity_mask()" in source
+    assert "NativeDeviceSelection.from_mask(d_reduced != 0)" in source
+
+
+@requires_gpu
+def test_morton_reduction_span_schedule_bounds_total_capacity() -> None:
+    cp = pytest.importorskip("cupy")
+    spans = cp.asarray([0, 1, 2, 3, 4, 5, 31, 32, 33, 1_000], dtype=cp.uint64)
+    starts = cp.zeros_like(spans)
+
+    order, bucket_counts = _morton_reduction_span_schedule(starts, spans)
+
+    scheduled_lanes = sum(
+        int(count) * int(upper)
+        for count, upper in zip(
+            bucket_counts,
+            _MORTON_SPAN_BUCKET_UPPER_BOUNDS,
+            strict=True,
+        )
+    )
+    actual_lanes = int(cp.asnumpy(cp.sum(spans)))
+    assert scheduled_lanes < 2 * actual_lanes
+    ordered_spans = cp.asnumpy(spans[order]).tolist()
+    assert ordered_spans == sorted(ordered_spans)
+
+
+def test_device_memory_probe_propagates_runtime_failure(monkeypatch) -> None:
+    cp = pytest.importorskip("cupy")
+
+    def fail_device():
+        raise RuntimeError("driver memory query failed")
+
+    monkeypatch.setattr(cp.cuda, "Device", fail_device)
+    with pytest.raises(RuntimeError, match="driver memory query failed"):
+        available_device_memory_bytes()
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +466,152 @@ def test_device_query_uses_morton_range_for_large_input():
     )
     # Verify execution reason mentions Morton range.
     assert "Morton" in execution.reason or "brute" in execution.reason
+
+
+@requires_gpu
+def test_empty_morton_query_cleanup_does_not_context_synchronize(monkeypatch):
+    """Morton temporaries retire on-stream when no candidate pairs are emitted."""
+    from unittest.mock import Mock
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    tree_geoms = np.asarray(
+        [
+            box(0.0, 0.0, 1.0, 1.0),
+            box(2.0, 2.0, 3.0, 3.0),
+            box(4.0, 4.0, 5.0, 5.0),
+        ],
+        dtype=object,
+    )
+    tree_owned = from_shapely_geometries(tree_geoms, residency=Residency.DEVICE)
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="test Morton cleanup deferred-free ownership",
+        ),
+    )
+    query_bounds = np.asarray([[100.0, 100.0, 101.0, 101.0]], dtype=np.float64)
+
+    runtime = get_cuda_runtime()
+    guarded_runtime = Mock(wraps=runtime)
+    guarded_runtime.synchronize.side_effect = AssertionError(
+        "Morton cleanup must use stream-ordered deferred frees"
+    )
+
+    with monkeypatch.context() as sync_guard:
+        sync_guard.setattr(
+            "vibespatial.spatial.spatial_index_device.get_cuda_runtime",
+            lambda: guarded_runtime,
+        )
+        candidates = _morton_range_query(flat_index, query_bounds, query_bounds)
+
+    assert candidates is not None
+    assert candidates.total_pairs == 0
+    guarded_runtime.synchronize.assert_not_called()
+
+
+@requires_gpu
+def test_native_spatial_index_reductions_do_not_context_synchronize(monkeypatch):
+    """Semijoin, antijoin, and counts keep exact semantics without a context fence."""
+    from unittest.mock import Mock
+
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.spatial import spatial_index_device as spatial_index_device_module
+
+    tree_owned = from_shapely_geometries(
+        [
+            box(0.0, 0.0, 2.0, 2.0),
+            box(0.0, 0.0, 1.0, 1.0),
+            box(10.0, 10.0, 11.0, 11.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="test native reduction deferred-free ownership",
+        ),
+    )
+    query_owned = from_shapely_geometries(
+        [
+            Point(0.5, 0.5),
+            Point(1.5, 1.5),
+            Point(5.0, 5.0),
+            Point(10.5, 10.5),
+        ],
+        residency=Residency.DEVICE,
+    )
+    query_bounds = compute_geometry_bounds_device(query_owned)
+    native_index = flat_index.to_native_spatial_index(source_token="tree")
+    runtime = get_cuda_runtime()
+    guarded_runtime = Mock(wraps=runtime)
+    guarded_runtime.synchronize.side_effect = AssertionError(
+        "native spatial reductions must not context-synchronize"
+    )
+    observed_precision_plans = []
+    classify_tile = spatial_index_device_module._classify_homogeneous_reduction_tile
+
+    def classify_tile_with_precision(*args, **kwargs):
+        observed_precision_plans.append(kwargs["precision_plan"])
+        return classify_tile(*args, **kwargs)
+
+    query_kwargs = {
+        "predicate": "intersects",
+        "query_token": "query",
+        "precomputed_query_bounds": query_bounds,
+        "return_metadata": True,
+    }
+    with monkeypatch.context() as sync_guard:
+        sync_guard.setattr(
+            "vibespatial.spatial.spatial_index_device.get_cuda_runtime",
+            lambda: guarded_runtime,
+        )
+        sync_guard.setattr(
+            spatial_index_device_module,
+            "_classify_homogeneous_reduction_tile",
+            classify_tile_with_precision,
+        )
+        semijoin, semijoin_execution = native_index.query_left_semijoin(
+            query_owned,
+            **query_kwargs,
+        )
+        antijoin, antijoin_execution = native_index.query_left_antijoin(
+            query_owned,
+            **query_kwargs,
+        )
+        counts, count_execution = native_index.query_left_match_count_expression(
+            query_owned,
+            **query_kwargs,
+        )
+        right_semijoin, right_execution = native_index.query_right_semijoin(
+            query_owned,
+            predicate="intersects",
+            precomputed_query_bounds=query_bounds,
+            return_metadata=True,
+        )
+
+    assert semijoin_execution.implementation == "owned_gpu_spatial_semijoin"
+    assert antijoin_execution.implementation == "owned_gpu_spatial_semijoin"
+    assert count_execution.implementation == "owned_gpu_spatial_match_count"
+    assert right_execution.implementation == "owned_gpu_spatial_right_semijoin"
+    semijoin_count = int(cp.asnumpy(semijoin.logical_count)[0])
+    antijoin_count = int(cp.asnumpy(antijoin.logical_count)[0])
+    right_count = int(cp.asnumpy(right_semijoin.logical_count)[0])
+    assert cp.asnumpy(semijoin.positions[:semijoin_count]).tolist() == [0, 1, 3]
+    assert cp.asnumpy(antijoin.positions[:antijoin_count]).tolist() == [2]
+    assert cp.asnumpy(counts.values).tolist() == [2, 1, 0, 1]
+    assert cp.asnumpy(right_semijoin.positions[:right_count]).tolist() == [0, 1, 2]
+    assert observed_precision_plans
+    assert all(
+        plan.compute_precision is PrecisionMode.FP64
+        for plan in observed_precision_plans
+    )
+    guarded_runtime.synchronize.assert_not_called()
 
 
 @requires_gpu

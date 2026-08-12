@@ -200,6 +200,7 @@ class NativeRelation:
             distances=distances,
             left_row_count=left_row_count,
             right_row_count=right_row_count,
+            sorted_by_left=bool(getattr(result, "sorted_by_left", False)),
         )
 
     def __len__(self) -> int:
@@ -1039,11 +1040,6 @@ class NativeRelationGeometrySelection:
             )
         owned = result.owned
         if owned is not None:
-            if owned.is_indexed_view:
-                owned = owned.physicalize_device_rows(
-                    allow_capacity_allocation=True,
-                )
-                result = type(result).from_owned(owned, crs=result.crs)
             active = self.selection.active_capacity_mask()
             state = owned._ensure_device_state(preserve_indexed_view=True)
             state.validity = cp.asarray(state.validity, dtype=cp.bool_) & active

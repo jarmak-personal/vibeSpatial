@@ -84,6 +84,30 @@ def _unique_first(values: Any):
     return host_values[first_indices], first_indices
 
 
+def _unique_grouped_first(values: Any):
+    """Deduplicate a grouped vector without allocating a global sort."""
+    if _is_device_array(values):
+        import cupy as cp
+
+        d_values = cp.asarray(values)
+        if int(d_values.size) == 0:
+            return d_values, cp.asarray([], dtype=cp.int64)
+        first = cp.empty(d_values.size, dtype=cp.bool_)
+        first[0] = True
+        first[1:] = d_values[1:] != d_values[:-1]
+        first_indices = cp.flatnonzero(first).astype(cp.int64, copy=False)
+        return d_values[first_indices], first_indices
+
+    host_values = np.asarray(values)
+    if host_values.size == 0:
+        return host_values, np.asarray([], dtype=np.int64)
+    first = np.empty(host_values.size, dtype=bool)
+    first[0] = True
+    first[1:] = host_values[1:] != host_values[:-1]
+    first_indices = np.flatnonzero(first).astype(np.int64, copy=False)
+    return host_values[first_indices], first_indices
+
+
 def _take_optional(values: Any | None, indices: Any) -> Any | None:
     if values is None:
         return None
@@ -888,20 +912,23 @@ class NativeIndexLabelsArray(ExtensionArray):
         plan = self.index_plan
         selection_positions = getattr(plan, "selection_positions", None)
         if selection_positions is not None:
-            unique_selection, first_indices = _unique_first(selection_positions)
+            unique_fn = (
+                _unique_grouped_first
+                if getattr(plan, "selection_grouped", False)
+                else _unique_first
+            )
+            unique_selection, first_indices = unique_fn(selection_positions)
+            label_plan = plan.take(
+                first_indices,
+                preserve_index=True,
+                unique=True,
+            )
             new_plan = replace(
-                plan,
-                length=_array_size(unique_selection),
-                index=None,
-                device_labels=_take_optional(
-                    getattr(plan, "device_labels", None),
-                    first_indices,
-                ),
-                take_positions=_take_optional(
-                    getattr(plan, "take_positions", None),
-                    first_indices,
-                ),
+                label_plan,
+                selection_source_token=plan.selection_source_token,
+                selection_source_row_count=plan.selection_source_row_count,
                 selection_positions=unique_selection,
+                selection_grouped=True,
                 has_duplicates=False,
             )
             return type(self)(
@@ -1153,9 +1180,10 @@ def native_public_index_from_plan(index_plan) -> pd.Index | None:
         if getattr(index_plan, "index", None) is not None:
             return index_plan.index
         return None
-    if getattr(index_plan, "index", None) is not None:
+    has_selection_lineage = getattr(index_plan, "selection_positions", None) is not None
+    if getattr(index_plan, "index", None) is not None and not has_selection_lineage:
         return index_plan.index
-    if getattr(index_plan, "device_labels", None) is not None or (
+    if has_selection_lineage or getattr(index_plan, "device_labels", None) is not None or (
         getattr(index_plan, "source_index", None) is not None
         and getattr(index_plan, "take_positions", None) is not None
     ):

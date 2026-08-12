@@ -54,6 +54,10 @@ from vibespatial import (
     write_geoparquet,
 )
 from vibespatial.api._native_metadata import NativeGeometryMetadata
+from vibespatial.api._native_result_core import (
+    NativeGeometryComposition,
+    NativeGeometryCompositionPart,
+)
 from vibespatial.api._native_results import (
     GeometryNativeResult,
     NativeAttributeTable,
@@ -1136,6 +1140,55 @@ def test_geoparquet_scan_plan_uses_metadata_summary_for_row_group_selection() ->
     assert plan.selected_row_groups == (1, 2)
     assert plan.available_row_groups == 4
     assert plan.decoded_row_fraction_estimate == 0.5
+
+
+def test_geoparquet_scan_plan_keeps_row_group_layout_without_spatial_bounds() -> None:
+    summary = build_geoparquet_metadata_summary(
+        source="row_group_metadata",
+        row_group_rows=[100, 200, 300],
+    )
+
+    plan = plan_geoparquet_scan(
+        bbox=(0.0, 0.0, 1.0, 1.0),
+        geo_metadata={
+            "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB"}},
+        },
+        metadata_summary=summary,
+    )
+
+    assert summary.has_spatial_bounds is False
+    assert summary.total_rows == 600
+    assert plan.metadata_summary_available is True
+    assert plan.available_row_groups == 3
+    assert plan.selected_row_groups is None
+    assert plan.row_group_pushdown is False
+
+
+def test_wkb_geoparquet_footer_builds_nonspatial_row_group_layout(tmp_path) -> None:
+    gdf = geopandas.GeoDataFrame(
+        geometry=[box(float(index), 0.0, float(index + 1), 1.0) for index in range(5)],
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "wkb-row-groups.parquet"
+    gdf.to_parquet(path, geometry_encoding="WKB", row_group_size=2)
+
+    filesystem, normalized_path, _, geo_metadata = io_geoparquet._load_geoparquet_metadata(
+        path,
+        filesystem=None,
+        storage_options=None,
+    )
+    assert geo_metadata is not None
+    summary = io_geoparquet._build_geoparquet_metadata_summary_from_pyarrow(
+        normalized_path,
+        filesystem=filesystem,
+        geo_metadata=geo_metadata,
+    )
+
+    assert summary is not None
+    assert summary.source == "row_group_metadata"
+    assert summary.row_group_rows.tolist() == [2, 2, 1]
+    assert summary.has_spatial_bounds is False
 
 
 def test_geoparquet_prune_strategies_return_same_selection() -> None:
@@ -3805,6 +3858,321 @@ def test_native_tabular_to_parquet_device_payload_preserves_named_index_only(
     assert result.index.name == "group"
     assert list(result.columns) == ["geometry"]
     assert result.geometry.iloc[0].equals(box(0, 0, 1, 1))
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU GeoParquet writer unavailable",
+)
+def test_native_device_wkb_writer_encodes_bounded_row_groups(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    geometries = [box(float(index), 0.0, float(index + 1), 1.0) for index in range(5)]
+    owned = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+    attributes = NativeAttributeTable(
+        dataframe=pd.DataFrame({"parcel_id": np.arange(5, dtype=np.int64)})
+    )
+    path = tmp_path / "native-bounded-wkb.parquet"
+    monkeypatch.setattr(io_wkb, "_NATIVE_DEVICE_PARQUET_CHUNK_ROWS", 2)
+    deferred_chunk_owners = []
+    completion_retainer = io_wkb.get_cuda_completion_retainer()
+
+    class _RecordingCompletionRetainer:
+        def defer(self, stream, payload, release) -> None:
+            deferred_chunk_owners.append(payload)
+            completion_retainer.defer(stream, payload, release)
+
+    monkeypatch.setattr(
+        io_wkb,
+        "get_cuda_completion_retainer",
+        lambda: _RecordingCompletionRetainer(),
+    )
+
+    status = io_wkb._write_geoparquet_native_device_payload(
+        attributes,
+        owned,
+        path,
+        geometry_name="geometry",
+        geometry_crs="EPSG:4326",
+        index=False,
+        compression="snappy",
+        geometry_encoding="WKB",
+        schema_version=None,
+        write_covering_bbox=False,
+        column_order=("parcel_id", "geometry"),
+    )
+
+    assert status.written
+    assert [owners[2].row_count for owners in deferred_chunk_owners] == [2, 2, 1]
+    monkeypatch.setattr(io_geoparquet, "_DEFAULT_GPU_GEOPARQUET_CHUNK_ROWS", 2)
+    native = read_geoparquet_native(path, backend="gpu")
+    assert native.geometry.composition is not None
+    assert native.geometry.composition.trusted_singular_rows
+    assert native.geometry.composition.contiguous_row_partitions
+    assert all(
+        part.geometry.owned is not None
+        and part.geometry.owned.device_state is not None
+        and part.geometry.owned.device_state.trusted_all_valid is True
+        for part in native.geometry.composition.parts
+    )
+    assert native.provenance is not None
+    assert native.provenance.selected_row_groups == (0, 1, 2)
+
+    result = geopandas.read_parquet(path)
+    assert result["parcel_id"].tolist() == [0, 1, 2, 3, 4]
+    assert result.crs.to_epsg() == 4326
+    assert all(
+        actual.equals(expected)
+        for actual, expected in zip(result.geometry, geometries, strict=True)
+    )
+
+
+def test_native_device_wkb_chunk_writer_has_no_context_wide_sync() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "src" / "vibespatial" / "io" / "wkb.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_write_geoparquet_native_device_wkb_chunks"
+    )
+
+    synchronizations = [
+        node.lineno
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "synchronize"
+    ]
+    deferred_releases = [
+        node.lineno
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "defer"
+    ]
+
+    assert synchronizations == []
+    assert len(deferred_releases) == 1
+
+
+def test_native_wkb_capacity_splits_small_huge_structural_shape(monkeypatch) -> None:
+    metadata = NativeGeometryMetadata(
+        row_count=3,
+        residency=Residency.DEVICE,
+        shape_summary={
+            "physical_shape": "terminal-native-wkb-export",
+            "coordinate_count": 6_000_000,
+            "max_wkb_output_bytes_per_row": 32_000_013,
+            "max_owned_bytes_per_row": 32_000_011,
+            "metadata_bytes_per_row": 6,
+        },
+    )
+    plan = io_wkb._native_wkb_capacity_plan_from_metadata(
+        metadata,
+        max_chunk_rows=1_000_000,
+        composition=True,
+        write_covering_bbox=False,
+    )
+    monkeypatch.setattr(
+        io_wkb,
+        "_available_native_wkb_device_bytes",
+        lambda: 270_000_000,
+    )
+
+    assert list(io_wkb._iter_native_wkb_capacity_spans(3, plan)) == [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+    ]
+    assert plan.estimate(1).composition_bytes == 64_000_022
+
+
+def test_native_wkb_capacity_rechecks_live_memory_pressure(monkeypatch) -> None:
+    metadata = NativeGeometryMetadata(
+        row_count=10,
+        residency=Residency.DEVICE,
+        shape_summary={
+            "physical_shape": "terminal-native-wkb-export",
+            "coordinate_count": 625_000,
+            "max_wkb_output_bytes_per_row": 1_000_000,
+            "max_owned_bytes_per_row": 1_000_000,
+            "metadata_bytes_per_row": 6,
+        },
+    )
+    plan = io_wkb._native_wkb_capacity_plan_from_metadata(
+        metadata,
+        max_chunk_rows=1_000_000,
+        composition=False,
+        write_covering_bbox=False,
+    )
+    pressure = {"available_bytes": 40_000_000}
+    monkeypatch.setattr(
+        io_wkb,
+        "_available_native_wkb_device_bytes",
+        lambda: pressure["available_bytes"],
+    )
+
+    assert plan.admitted_rows(10) == 9
+    pressure["available_bytes"] = 10_000_000
+    assert plan.admitted_rows(10) == 2
+
+
+def test_native_wkb_memory_probe_propagates_runtime_failure(monkeypatch) -> None:
+    cp = pytest.importorskip("cupy")
+
+    def fail_device():
+        raise RuntimeError("driver memory query failed")
+
+    monkeypatch.setattr(cp.cuda, "Device", fail_device)
+    with pytest.raises(RuntimeError, match="driver memory query failed"):
+        io_wkb._available_native_wkb_device_bytes()
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU GeoParquet writer unavailable",
+)
+def test_partitioned_native_device_wkb_writer_batches_ordered_owned_parts(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import cupy as cp
+
+    geometries = [box(float(index), 0.0, float(index + 1), 1.0) for index in range(7)]
+    first = from_shapely_geometries(geometries[:3], residency=Residency.DEVICE)
+    second = from_shapely_geometries(geometries[3:], residency=Residency.DEVICE)
+    composition = NativeGeometryComposition(
+        parts=(
+            NativeGeometryCompositionPart(
+                GeometryNativeResult.from_owned(first, crs="EPSG:4326"),
+                cp.arange(3, dtype=cp.int64),
+            ),
+            NativeGeometryCompositionPart(
+                GeometryNativeResult.from_owned(second, crs="EPSG:4326"),
+                cp.arange(3, 7, dtype=cp.int64),
+            ),
+        ),
+        row_count=7,
+        crs="EPSG:4326",
+        trusted_singular_rows=True,
+        trusted_family_domain=(GeometryFamily.POLYGON,),
+    )
+    attributes = NativeAttributeTable(
+        dataframe=pd.DataFrame({"parcel_id": np.arange(7, dtype=np.int64)})
+    )
+    path = tmp_path / "partitioned-native-bounded-wkb.parquet"
+    monkeypatch.setattr(io_wkb, "_NATIVE_DEVICE_PARQUET_CHUNK_ROWS", 4)
+
+    status = io_wkb._write_geoparquet_native_device_payload(
+        attributes,
+        None,
+        path,
+        geometry_composition=composition,
+        geometry_name="geometry",
+        geometry_crs="EPSG:4326",
+        index=False,
+        compression="snappy",
+        geometry_encoding="WKB",
+        schema_version=None,
+        write_covering_bbox=False,
+        column_order=("parcel_id", "geometry"),
+    )
+
+    assert status.written
+    assert composition.contiguous_row_partitions
+    result = geopandas.read_parquet(path)
+    assert result["parcel_id"].tolist() == list(range(7))
+    assert all(
+        actual.equals(expected)
+        for actual, expected in zip(result.geometry, geometries, strict=True)
+    )
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU GeoParquet writer unavailable",
+)
+def test_interleaved_native_wkb_composition_uses_one_allocation_packet(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    geometries = [box(float(index), 0.0, float(index + 1), 1.0) for index in range(4)]
+    even = from_shapely_geometries(
+        [geometries[0], geometries[2]],
+        residency=Residency.DEVICE,
+    )
+    odd = from_shapely_geometries(
+        [geometries[1], geometries[3]],
+        residency=Residency.DEVICE,
+    )
+    composition = NativeGeometryComposition(
+        parts=(
+            NativeGeometryCompositionPart(
+                GeometryNativeResult.from_owned(even, crs="EPSG:4326"),
+                cp.asarray([0, 2], dtype=cp.int64),
+            ),
+            NativeGeometryCompositionPart(
+                GeometryNativeResult.from_owned(odd, crs="EPSG:4326"),
+                cp.asarray([1, 3], dtype=cp.int64),
+            ),
+        ),
+        row_count=4,
+        crs="EPSG:4326",
+        trusted_singular_rows=True,
+        trusted_family_domain=(GeometryFamily.POLYGON,),
+    )
+    attributes = NativeAttributeTable(
+        dataframe=pd.DataFrame({"parcel_id": np.arange(4, dtype=np.int64)})
+    )
+    path = tmp_path / "interleaved-native-capacity-wkb.parquet"
+    monkeypatch.setattr(io_wkb, "_NATIVE_DEVICE_PARQUET_CHUNK_ROWS", 2)
+
+    allocation_packet_reasons = []
+    runtime = get_cuda_runtime()
+    copy_device_to_host = runtime.copy_device_to_host
+
+    def _record_copy(device_array, host_array=None, *, reason, terminal_export=False):
+        if "allocation packet" in reason:
+            allocation_packet_reasons.append(reason)
+        return copy_device_to_host(
+            device_array,
+            host_array,
+            reason=reason,
+            terminal_export=terminal_export,
+        )
+
+    monkeypatch.setattr(runtime, "copy_device_to_host", _record_copy)
+
+    status = io_wkb._write_geoparquet_native_device_payload(
+        attributes,
+        None,
+        path,
+        geometry_composition=composition,
+        geometry_name="geometry",
+        geometry_crs="EPSG:4326",
+        index=False,
+        compression="snappy",
+        geometry_encoding="WKB",
+        schema_version=None,
+        write_covering_bbox=False,
+        column_order=("parcel_id", "geometry"),
+    )
+
+    assert status.written
+    assert len(allocation_packet_reasons) == 1
+    result = geopandas.read_parquet(path)
+    assert result["parcel_id"].tolist() == list(range(4))
+    assert all(
+        actual.equals(expected)
+        for actual, expected in zip(result.geometry, geometries, strict=True)
+    )
 
 
 def test_native_tabular_geometry_only_to_parquet_populates_schema_metadata(tmp_path) -> None:

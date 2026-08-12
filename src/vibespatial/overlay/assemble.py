@@ -35,6 +35,7 @@ from vibespatial.runtime.residency import Residency
 from .graph import _stable_radix_order_pass
 from .types import (
     HalfEdgeGraph,
+    IndexedComponentContainmentDeviceState,
     OverlayFaceTable,
 )
 
@@ -57,6 +58,8 @@ class _FaceBoundaryRings:
     y: DeviceArray
     active: DeviceArray
     source_rows: DeviceArray
+    face_ids: DeviceArray | None
+    component_ids: DeviceArray | None
     ring_count: int
     coord_capacity: int
 
@@ -262,6 +265,8 @@ def _extract_face_boundary_rings_gpu(
     d_face_offsets,
     d_face_edge_ids,
     d_face_selected,
+    edge_face_ids=None,
+    d_face_component=None,
     kernels,
     runtime,
     area_epsilon: float,
@@ -484,6 +489,23 @@ def _extract_face_boundary_rings_gpu(
         d_row_indices[boundary_edge_indices[d_ring_edge_starts]],
         cp.int32(-1),
     ).astype(cp.int32, copy=False)
+    d_cycle_face_ids = None
+    d_cycle_component_ids = None
+    if edge_face_ids is not None and d_face_component is not None:
+        d_cycle_face_ids = cp.where(
+            d_ring_active,
+            cp.asarray(edge_face_ids, dtype=cp.int32)[
+                boundary_edge_indices[d_ring_edge_starts]
+            ],
+            cp.int32(-1),
+        ).astype(cp.int32, copy=False)
+        d_cycle_component_ids = cp.where(
+            d_ring_active,
+            cp.asarray(d_face_component, dtype=cp.int32)[
+                d_cycle_face_ids.clip(0, face_count - 1)
+            ],
+            cp.int32(-1),
+        ).astype(cp.int32, copy=False)
 
     with hotpath_stage(f"{stage}.boundary_scatter", category="emit"):
         ring_coord_counts = cp.where(
@@ -550,6 +572,16 @@ def _extract_face_boundary_rings_gpu(
         y=d_out_y,
         active=d_nondegenerate,
         source_rows=cp.where(d_nondegenerate, d_cycle_source_rows, cp.int32(-1)),
+        face_ids=(
+            None
+            if d_cycle_face_ids is None
+            else cp.where(d_nondegenerate, d_cycle_face_ids, cp.int32(-1))
+        ),
+        component_ids=(
+            None
+            if d_cycle_component_ids is None
+            else cp.where(d_nondegenerate, d_cycle_component_ids, cp.int32(-1))
+        ),
         ring_count=ring_count,
         coord_capacity=coord_capacity,
     )
@@ -563,6 +595,7 @@ def _build_polygon_output_from_faces_gpu(
     preserve_row_count: int | None = None,
     d_valid_empty_rows=None,
     area_epsilon: float = 0.0,
+    component_nesting: IndexedComponentContainmentDeviceState | None = None,
 ) -> OwnedGeometryArray | None:
     """GPU face-to-polygon assembly (Phase 11: GPU boundary cycle detection).
 
@@ -638,6 +671,14 @@ def _build_polygon_output_from_faces_gpu(
         d_face_offsets=d_face_offsets,
         d_face_edge_ids=d_face_edge_ids,
         d_face_selected=d_face_selected,
+        edge_face_ids=(
+            face_device.edge_face_ids if component_nesting is not None else None
+        ),
+        d_face_component=(
+            component_nesting.face_component
+            if component_nesting is not None
+            else None
+        ),
         kernels=kernels,
         runtime=runtime,
         area_epsilon=area_epsilon,
@@ -653,6 +694,8 @@ def _build_polygon_output_from_faces_gpu(
     d_out_y = selected_rings.y
     d_ring_active = selected_rings.active
     d_cycle_source_rows = selected_rings.source_rows
+    d_cycle_face_ids = selected_rings.face_ids
+    d_cycle_component_ids = selected_rings.component_ids
     ring_count = selected_rings.ring_count
 
     # Selected-region cycles already carry every selected/excluded interface:
@@ -668,45 +711,6 @@ def _build_polygon_output_from_faces_gpu(
     d_all_edge_counts = d_ring_edge_counts
     d_all_ring_active = d_ring_active
 
-    with hotpath_stage("overlay.assemble.sample_points", category="refine"):
-        # Compute one in-ring sample point per assembled ring. Unlike centroids,
-        # these sample points stay inside concave rings and match the host
-        # assembly logic used for ring containment and hole assignment.
-        d_ring_sample_x = cp.empty(total_ring_count, dtype=cp.float64)
-        d_ring_sample_y = cp.empty(total_ring_count, dtype=cp.float64)
-        sample_grid, sample_block = runtime.launch_config(
-            kernels["compute_ring_sample_points"],
-            total_ring_count,
-        )
-        runtime.launch(
-            kernels["compute_ring_sample_points"],
-            grid=sample_grid,
-            block=sample_block,
-            params=(
-                (
-                    ptr(d_all_coord_offsets),
-                    ptr(d_all_edge_counts),
-                    ptr(d_all_ring_active),
-                    ptr(d_all_x),
-                    ptr(d_all_y),
-                    ptr(d_ring_sample_x),
-                    ptr(d_ring_sample_y),
-                    total_ring_count,
-                ),
-                (
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_I32,
-                ),
-            ),
-        )
-        _sync_hotpath(runtime)
-
     # Boundary rings get their source row from the selected face. Holes inherit
     # the exterior row after assignment below.
     d_all_source_rows = cp.where(
@@ -715,10 +719,171 @@ def _build_polygon_output_from_faces_gpu(
         cp.int32(-1),
     )
 
-    # --- Step 8: Classify selected-side boundary orientation. ---
-    # The half-edge boundary walk keeps the selected region on the left:
-    # positive cycles are exteriors and negative cycles are holes.
-    d_exterior_mask_full = d_ring_active & (d_all_area > 0.0)
+    d_ring_active_i8 = d_all_ring_active.astype(cp.int8, copy=False)
+    if component_nesting is not None:
+        # Boundary-only topology already classified disconnected components
+        # through the indexed exact relation used by face propagation. Consume
+        # those structural hints directly instead of repeating ring F² PIP.
+        if (
+            component_nesting.component_depth is None
+            or component_nesting.component_parent is None
+            or d_cycle_face_ids is None
+            or d_cycle_component_ids is None
+        ):
+            raise ValueError("boundary component nesting hints are incomplete")
+        d_safe_components = d_cycle_component_ids.clip(0, face_count - 1)
+        d_containment_depth = cp.where(
+            d_all_ring_active,
+            cp.asarray(component_nesting.component_depth)[d_safe_components],
+            cp.int32(0),
+        ).astype(cp.int32, copy=False)
+        d_exterior_mask_full = d_all_ring_active & (
+            (d_containment_depth & np.int32(1)) == 0
+        )
+        d_face_to_ring = cp.full(face_count, -1, dtype=cp.int32)
+        d_ring_ids = cp.arange(total_ring_count, dtype=cp.int32)
+        d_face_to_ring[d_cycle_face_ids[d_all_ring_active]] = d_ring_ids[
+            d_all_ring_active
+        ]
+        d_parent_faces = cp.asarray(component_nesting.component_parent)[
+            d_safe_components
+        ]
+        d_parent_rings = d_face_to_ring[d_parent_faces.clip(0, face_count - 1)]
+        d_exterior_id = cp.where(
+            d_exterior_mask_full,
+            d_ring_ids,
+            cp.where(d_all_ring_active, d_parent_rings, cp.int32(-1)),
+        ).astype(cp.int32, copy=False)
+    else:
+        # Generic overlay assembly retains source-row ring semantics. It has no
+        # component carrier, so classify and assign its output rings locally.
+        with hotpath_stage("overlay.assemble.sample_points", category="refine"):
+            d_ring_sample_x = cp.empty(total_ring_count, dtype=cp.float64)
+            d_ring_sample_y = cp.empty(total_ring_count, dtype=cp.float64)
+            d_ring_bounds = cp.empty((total_ring_count, 4), dtype=cp.float64)
+            sample_grid, sample_block = runtime.launch_config(
+                kernels["compute_ring_sample_points"],
+                total_ring_count,
+            )
+            runtime.launch(
+                kernels["compute_ring_sample_points"],
+                grid=sample_grid,
+                block=sample_block,
+                params=(
+                    (
+                        ptr(d_all_coord_offsets),
+                        ptr(d_all_edge_counts),
+                        ptr(d_all_ring_active),
+                        ptr(d_all_x),
+                        ptr(d_all_y),
+                        ptr(d_ring_sample_x),
+                        ptr(d_ring_sample_y),
+                        ptr(d_ring_bounds),
+                        total_ring_count,
+                    ),
+                    (KERNEL_PARAM_PTR,) * 8 + (KERNEL_PARAM_I32,),
+                ),
+            )
+            _sync_hotpath(runtime)
+
+        d_containment_order = cp.arange(total_ring_count, dtype=cp.int32)
+        d_containment_group_key = cp.where(
+            d_all_ring_active,
+            d_all_source_rows,
+            cp.int32(np.iinfo(np.int32).max),
+        ).astype(cp.int32, copy=False)
+        d_containment_order = _stable_radix_order_pass(
+            d_containment_order,
+            d_containment_group_key,
+        )
+        d_sorted_group_keys = d_containment_group_key[d_containment_order]
+        d_containment_group_start = cp.empty(total_ring_count, dtype=cp.int32)
+        d_containment_group_end = cp.empty(total_ring_count, dtype=cp.int32)
+        group_span_grid, group_span_block = runtime.launch_config(
+            kernels["locate_boundary_ring_group_spans"],
+            total_ring_count,
+        )
+        runtime.launch(
+            kernels["locate_boundary_ring_group_spans"],
+            grid=group_span_grid,
+            block=group_span_block,
+            params=(
+                (
+                    ptr(d_sorted_group_keys),
+                    ptr(d_containment_order),
+                    ptr(d_ring_active_i8),
+                    ptr(d_containment_group_start),
+                    ptr(d_containment_group_end),
+                    total_ring_count,
+                ),
+                (KERNEL_PARAM_PTR,) * 5 + (KERNEL_PARAM_I32,),
+            ),
+        )
+        d_containment_depth = cp.zeros(total_ring_count, dtype=cp.int32)
+        containment_grid, containment_block = runtime.launch_config(
+            kernels["count_boundary_ring_containment_depth"],
+            total_ring_count,
+        )
+        runtime.launch(
+            kernels["count_boundary_ring_containment_depth"],
+            grid=containment_grid,
+            block=containment_block,
+            params=(
+                (
+                    ptr(d_ring_sample_x),
+                    ptr(d_ring_sample_y),
+                    ptr(d_all_area),
+                    ptr(d_ring_active_i8),
+                    ptr(d_containment_order),
+                    ptr(d_containment_group_start),
+                    ptr(d_containment_group_end),
+                    ptr(d_all_coord_offsets),
+                    ptr(d_all_edge_counts),
+                    ptr(d_all_x),
+                    ptr(d_all_y),
+                    ptr(d_ring_bounds),
+                    ptr(d_containment_depth),
+                    total_ring_count,
+                ),
+                (KERNEL_PARAM_PTR,) * 13 + (KERNEL_PARAM_I32,),
+            ),
+        )
+        _sync_hotpath(runtime)
+        d_exterior_mask_full = d_all_ring_active & (
+            (d_containment_depth & np.int32(1)) == 0
+        )
+        with hotpath_stage("overlay.assemble.hole_assignment", category="refine"):
+            d_exterior_id = cp.full(total_ring_count, -1, dtype=cp.int32)
+            ring_grid_all, ring_block_all = runtime.launch_config(
+                kernels["assign_holes_to_exteriors"],
+                total_ring_count,
+            )
+            runtime.launch(
+                kernels["assign_holes_to_exteriors"],
+                grid=ring_grid_all,
+                block=ring_block_all,
+                params=(
+                    (
+                        ptr(d_ring_sample_x),
+                        ptr(d_ring_sample_y),
+                        ptr(d_all_area),
+                        ptr(d_exterior_mask_full.astype(cp.int8, copy=False)),
+                        ptr(d_ring_active_i8),
+                        ptr(d_containment_order),
+                        ptr(d_containment_group_start),
+                        ptr(d_containment_group_end),
+                        ptr(d_all_coord_offsets),
+                        ptr(d_all_edge_counts),
+                        ptr(d_all_x),
+                        ptr(d_all_y),
+                        ptr(d_ring_bounds),
+                        ptr(d_exterior_id),
+                        total_ring_count,
+                    ),
+                    (KERNEL_PARAM_PTR,) * 14 + (KERNEL_PARAM_I32,),
+                ),
+            )
+            _sync_hotpath(runtime)
 
     exterior_selection = NativeDeviceSelection.from_mask(d_exterior_mask_full)
     d_exterior_indices = exterior_selection.partition_capacity_positions().astype(
@@ -726,123 +891,18 @@ def _build_polygon_output_from_faces_gpu(
         copy=False,
     )
 
-    with hotpath_stage("overlay.assemble.hole_assignment", category="refine"):
-        # --- Step 9: Assign holes to exteriors via GPU kernel ---
-        d_exterior_id = cp.full(total_ring_count, -1, dtype=cp.int32)
-        ring_grid_all, ring_block_all = runtime.launch_config(
-            kernels["assign_holes_to_exteriors"],
-            total_ring_count,
-        )
-        runtime.launch(
-            kernels["assign_holes_to_exteriors"],
-            grid=ring_grid_all,
-            block=ring_block_all,
-            params=(
-                (
-                    ptr(d_ring_sample_x),
-                    ptr(d_ring_sample_y),
-                    ptr(d_all_area),
-                    ptr(d_exterior_mask_full.astype(cp.int8, copy=False)),
-                    ptr(d_all_source_rows),
-                    ptr(d_all_coord_offsets),
-                    ptr(d_all_edge_counts),
-                    ptr(d_all_x),
-                    ptr(d_all_y),
-                    ptr(d_exterior_indices),
-                    ptr(exterior_selection.logical_count),
-                    ptr(d_exterior_id),
-                    total_ring_count,
-                ),
-                (
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_I32,
-                ),
-            ),
-        )
-        _sync_hotpath(runtime)
-
-    # --- Step 9b: GPU sibling hole nesting depth ---
-    # For each hole assigned to an exterior, count how many sibling holes
-    # (same exterior, larger |area|) contain its centroid. Even local
-    # depth -> valid direct hole; odd -> nested inside another hole (skip).
-    d_sibling_depth = cp.zeros(total_ring_count, dtype=cp.int32)
-
-    # Check if there are any holes assigned
+    # Odd-depth rings are holes. Even-depth islands were admitted as exteriors
+    # above and remain concrete polygons in the same output row.
     d_is_hole = (
         d_all_ring_active
         & (d_exterior_id >= 0)
-        & (d_exterior_id != cp.arange(total_ring_count, dtype=cp.int32))
+        & ((d_containment_depth % 2) != 0)
     )
-    d_can_be_hole = (
-        d_ring_active & (d_all_area <= 0.0)
-    ).astype(cp.int8, copy=False)
-    d_hole_candidates = d_is_hole & (d_can_be_hole != 0)
-    assigned_hole_selection = NativeDeviceSelection.from_mask(
-        d_hole_candidates,
-    )
-    d_assigned_hole_ids = assigned_hole_selection.partition_capacity_positions().astype(
-        cp.int32,
-        copy=False,
-    )
-    sibling_depth_grid, sibling_depth_block = runtime.launch_config(
-        kernels["count_sibling_hole_depth"],
-        total_ring_count,
-    )
-    runtime.launch(
-        kernels["count_sibling_hole_depth"],
-        grid=sibling_depth_grid,
-        block=sibling_depth_block,
-        params=(
-            (
-                ptr(d_ring_sample_x),
-                ptr(d_ring_sample_y),
-                ptr(d_all_area),
-                ptr(d_exterior_id),
-                ptr(d_can_be_hole),
-                ptr(d_all_coord_offsets),
-                ptr(d_all_edge_counts),
-                ptr(d_all_x),
-                ptr(d_all_y),
-                ptr(d_assigned_hole_ids),
-                ptr(assigned_hole_selection.logical_count),
-                ptr(d_sibling_depth),
-                total_ring_count,
-            ),
-            (
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_I32,
-            ),
-        ),
-    )
-    _sync_hotpath(runtime)
 
     with hotpath_stage("overlay.assemble.output_grouping", category="sort"):
         # --- Step 10: Device-resident output assembly ---
         # Build GeoArrow-format polygon output entirely on device.
-        # Valid holes: assigned to an exterior AND even sibling depth.
-        d_valid_hole_mask = d_is_hole & (d_can_be_hole != 0) & ((d_sibling_depth % 2) == 0)
+        d_valid_hole_mask = d_is_hole
 
         # Also filter: only keep holes whose assigned exterior is a true exterior
         d_ext_is_valid = d_exterior_mask_full[d_exterior_id.clip(0, total_ring_count - 1)]
@@ -1055,7 +1115,7 @@ def _build_device_resident_polygon_output(
     d_all_x: cp.ndarray,
     d_all_y: cp.ndarray,
     d_all_coord_offsets: cp.ndarray,
-    d_all_edge_counts: cp.ndarray,
+    d_all_edge_counts: cp.ndarray | None,
     d_sorted_output_ids: cp.ndarray,
     d_rings_per_poly: cp.ndarray,
     d_polys_per_row: cp.ndarray,
@@ -1068,6 +1128,7 @@ def _build_device_resident_polygon_output(
     coord_capacity: int | None = None,
     d_explicit_polygon_output_rows: cp.ndarray | None = None,
     d_explicit_polygon_active: cp.ndarray | None = None,
+    d_sorted_output_edge_counts: cp.ndarray | None = None,
 ) -> OwnedGeometryArray:
     """Build row-capacity Polygon/MultiPolygon buffers without compaction.
 
@@ -1196,11 +1257,23 @@ def _build_device_resident_polygon_output(
         dtype=cp.int32,
     )[d_ring_lookup]
     d_all_ring_order = cp.where(d_active_rings, d_all_ring_order, cp.int32(0))
-    d_all_ring_coord_counts = cp.where(
-        d_active_rings,
-        cp.asarray(d_all_edge_counts, dtype=cp.int32)[d_all_ring_order] + 1,
-        cp.int32(0),
-    )
+    if d_sorted_output_edge_counts is None:
+        if d_all_edge_counts is None:
+            raise ValueError("polygon output requires source- or rowset-aligned edge counts")
+        d_all_ring_coord_counts = cp.where(
+            d_active_rings,
+            cp.asarray(d_all_edge_counts, dtype=cp.int32)[d_all_ring_order] + 1,
+            cp.int32(0),
+        )
+    else:
+        d_rowset_edge_counts = cp.asarray(d_sorted_output_edge_counts, dtype=cp.int32)
+        if int(d_rowset_edge_counts.size) != ring_capacity:
+            raise ValueError("rowset-aligned edge counts must match ring capacity")
+        d_all_ring_coord_counts = cp.where(
+            d_active_rings,
+            d_rowset_edge_counts[d_ring_lookup] + 1,
+            cp.int32(0),
+        )
 
     d_rings_per_output_row = cp.zeros(output_row_count, dtype=cp.int32)
     cp.add.at(

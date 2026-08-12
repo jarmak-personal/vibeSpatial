@@ -13,8 +13,12 @@ from vibespatial.constructive.binary_constructive import (
     binary_constructive_owned,
 )
 from vibespatial.cuda._runtime import get_cuda_runtime
-from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.geometry.owned import (
+    build_empty_polygon_rows_device,
+    from_shapely_geometries,
+)
 from vibespatial.overlay.assemble import _build_polygon_output_from_faces_gpu
+from vibespatial.overlay.boundary_graph import build_polygon_output_from_boundary_segments_gpu
 from vibespatial.overlay.faces import _select_overlay_face_indices_gpu, build_gpu_overlay_faces
 from vibespatial.overlay.gpu import (
     _build_overlay_execution_plan,
@@ -22,9 +26,16 @@ from vibespatial.overlay.gpu import (
 )
 from vibespatial.overlay.graph import build_gpu_half_edge_graph
 from vibespatial.overlay.host_fallback import _build_polygon_output_from_faces
-from vibespatial.overlay.split import build_gpu_atomic_edges, build_gpu_split_events
+from vibespatial.overlay.split import (
+    build_gpu_atomic_edges,
+    build_gpu_split_events,
+    renode_grouped_boundary_segments_gpu,
+)
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.residency import Residency
 
 
 def _river_lines(count: int, *, seed: int, vertices: int = 12) -> list[LineString]:
@@ -82,6 +93,40 @@ def _buffered_line_reduction_pair(
     raise AssertionError(
         f"failed to locate reduction pair round={round_index} pair={pair_index}",
     )
+
+
+@pytest.mark.gpu
+def test_polygonize_classifies_nested_positive_face_as_hole_on_device() -> None:
+    source_geometry = shapely.Polygon(
+        [(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)],
+        holes=[[(2, 2), (2, 8), (8, 8), (8, 2), (2, 2)]],
+    )
+    source = from_shapely_geometries([source_geometry])
+    empty = build_empty_polygon_rows_device(1)
+    split_events = build_gpu_split_events(
+        source,
+        empty,
+        require_same_row=True,
+        use_same_row_fast_path=True,
+        same_row_single_group=True,
+        same_row_span_summary=(8, 0, 0),
+        include_same_side_splits=True,
+    )
+    atomic_edges = build_gpu_atomic_edges(split_events, isolate_rows=True)
+    graph = build_gpu_half_edge_graph(atomic_edges)
+    faces = build_gpu_overlay_faces(
+        source,
+        empty,
+        half_edge_graph=graph,
+        row_isolated=True,
+    )
+    selected = _select_overlay_face_indices_gpu(faces, operation="polygonize")
+
+    actual = _build_polygon_output_from_faces_gpu(graph, faces, selected).to_shapely()[0]
+
+    assert actual.is_valid
+    assert len(actual.interiors) == 1
+    assert shapely.area(shapely.symmetric_difference(actual, source_geometry)) == 0.0
 
 
 @pytest.mark.gpu
@@ -478,6 +523,474 @@ def test_exact_split_parameters_preserve_projected_coordinate_sliver() -> None:
     assert actual is not None
     assert actual.geom_type == "Polygon"
     assert shapely.equals(actual, expected)
+
+
+@pytest.mark.gpu
+def test_constructive_events_do_not_snap_distinct_nearby_coordinates() -> None:
+    left_geom = shapely.from_wkt(
+        "POLYGON ((-10.08426784565221 -33.51578049243587, "
+        "-10.121566987362815 -33.502529627435585, "
+        "-10.121566987362844 -33.50252962743558, "
+        "-10.159963703906177 -33.492911750627314, "
+        "-10.1715587322087 -33.48876298316187, "
+        "-10.183502471459713 -33.48576230898401, "
+        "-10.2432442975097 -33.46433896306574, "
+        "-10.2432442975097 -33.39709974391177, "
+        "-10.0432442975097 -33.39709974391177, "
+        "-10.0432442975097 -33.52595791268441, "
+        "-10.08426784565221 -33.51578049243587))"
+    )
+    right_geom = shapely.from_wkt(
+        "POLYGON ((-10.127010190354717 -33.50289039179234, "
+        "-10.143244297509707 -33.49709974391177, "
+        "-10.14324429750973 -33.49709974391176, "
+        "-10.159963703906177 -33.492911750627314, "
+        "-10.2432442975097 -33.4631134777615, "
+        "-10.2432442975097 -33.39709974391177, "
+        "-10.0432442975097 -33.39709974391177, "
+        "-10.0432442975097 -33.52378510226201, "
+        "-10.127010190354717 -33.50289039179234))"
+    )
+    left = from_shapely_geometries([left_geom])
+    right = from_shapely_geometries([right_geom])
+
+    split_events = build_gpu_split_events(left, right)
+    near_x = -10.1432442975097
+    near_y = -33.49709974391177
+    near = np.isclose(split_events.x, near_x, rtol=0.0, atol=1e-10) & np.isclose(
+        split_events.y,
+        near_y,
+        rtol=0.0,
+        atol=1e-10,
+    )
+    assert near.sum() >= 4
+    assert np.unique(
+        np.column_stack((split_events.x[near], split_events.y[near])),
+        axis=0,
+    ).shape[0] == 3
+
+    result = binary_constructive_owned(
+        "union",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    ).to_shapely()[0]
+    expected = shapely.union(left_geom, right_geom)
+    assert result.is_valid
+    assert shapely.area(shapely.symmetric_difference(result, expected)) == pytest.approx(
+        0.0,
+        abs=1e-12,
+    )
+
+
+@pytest.mark.gpu
+def test_grouped_boundary_renoding_splits_residual_constructed_node_crossing() -> None:
+    import cupy as cp
+
+    start_x = cp.asarray([1034.8518449359565, 1034.831465433527])
+    start_y = cp.asarray([996.9842343903816, 996.5694000884654])
+    end_x = cp.asarray([1034.90302686536, 1034.8552737057707])
+    end_y = cp.asarray([997.396403326943, 997.0540286033288])
+    rows = cp.zeros(2, dtype=cp.int32)
+    placeholder = build_empty_polygon_rows_device(1)
+
+    noded = renode_grouped_boundary_segments_gpu(
+        start_x,
+        start_y,
+        end_x,
+        end_y,
+        rows,
+        placeholder_owned=placeholder,
+    )
+
+    noded_start_x, noded_start_y, noded_end_x, noded_end_y, noded_rows = noded
+    assert int(noded_start_x.size) == 4
+    assert cp.asnumpy(noded_rows).tolist() == [0, 0, 0, 0]
+    lines = np.asarray(
+        [
+            LineString(pair)
+            for pair in zip(
+                zip(cp.asnumpy(noded_start_x), cp.asnumpy(noded_start_y), strict=True),
+                zip(cp.asnumpy(noded_end_x), cp.asnumpy(noded_end_y), strict=True),
+                strict=True,
+            )
+        ],
+        dtype=object,
+    )
+    pairs = shapely.STRtree(lines).query(lines, predicate="crosses")
+    assert not np.any(pairs[0] < pairs[1])
+
+
+@pytest.mark.gpu
+def test_grouped_boundary_renoding_preserves_unmatched_fp64_crossing() -> None:
+    import cupy as cp
+
+    source_lines = [
+        LineString([(0.0, 0.0), (1.0, 1.0)]),
+        LineString([(0.0, 0.3), (1.0, 0.0)]),
+    ]
+    expected_node = shapely.intersection(*source_lines)
+    decimal_grid = 1.0e-12
+    quantized_x = round(expected_node.x / decimal_grid) * decimal_grid
+    assert quantized_x != expected_node.x
+
+    noded = renode_grouped_boundary_segments_gpu(
+        cp.asarray([line.coords[0][0] for line in source_lines]),
+        cp.asarray([line.coords[0][1] for line in source_lines]),
+        cp.asarray([line.coords[1][0] for line in source_lines]),
+        cp.asarray([line.coords[1][1] for line in source_lines]),
+        cp.zeros(2, dtype=cp.int32),
+        placeholder_owned=build_empty_polygon_rows_device(1),
+    )
+
+    start_x, start_y, end_x, end_y, _rows = noded
+    all_x = cp.asnumpy(cp.concatenate((start_x, end_x)))
+    all_y = cp.asnumpy(cp.concatenate((start_y, end_y)))
+    internal = (
+        (all_x != 0.0)
+        & (all_x != 1.0)
+        & (all_y != 0.0)
+        & (all_y != 0.3)
+        & (all_y != 1.0)
+    )
+    nodes = np.unique(np.column_stack((all_x[internal], all_y[internal])), axis=0)
+
+    assert nodes.shape == (1, 2)
+    assert nodes[0, 0] == pytest.approx(
+        expected_node.x,
+        rel=0.0,
+        abs=np.spacing(expected_node.x),
+    )
+    assert nodes[0, 1] == pytest.approx(
+        expected_node.y,
+        rel=0.0,
+        abs=np.spacing(expected_node.y),
+    )
+    assert nodes[0, 0] != quantized_x
+
+
+@pytest.mark.gpu
+def test_boundary_graph_peels_dangle_chain_deeper_than_64_edges() -> None:
+    import cupy as cp
+
+    square_segments = [
+        ((0.0, 0.0), (1.0, 0.0)),
+        ((1.0, 0.0), (1.0, 1.0)),
+        ((1.0, 1.0), (0.0, 1.0)),
+        ((0.0, 1.0), (0.0, 0.0)),
+    ]
+    chain_segments = [
+        ((float(index), 0.0), (float(index + 1), 0.0))
+        for index in range(1, 66)
+    ]
+    segments = [*square_segments, *chain_segments]
+    runtime_selection = plan_dispatch_selection(
+        kernel_name="overlay_faces",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=len(segments),
+        requested_mode=ExecutionMode.GPU,
+        current_residency=Residency.DEVICE,
+    )
+
+    actual = build_polygon_output_from_boundary_segments_gpu(
+        cp.asarray([start[0] for start, _ in segments]),
+        cp.asarray([start[1] for start, _ in segments]),
+        cp.asarray([end[0] for _, end in segments]),
+        cp.asarray([end[1] for _, end in segments]),
+        row_indices=cp.zeros(len(segments), dtype=cp.int32),
+        row_count=1,
+        runtime_selection=runtime_selection,
+    ).to_shapely()[0]
+
+    assert shapely.equals(actual, shapely.box(0.0, 0.0, 1.0, 1.0))
+
+
+def _assemble_boundary_segments(
+    segments,
+    *,
+    rows=None,
+    row_count: int = 1,
+    valid_empty_rows: bool = False,
+):
+    import cupy as cp
+
+    if rows is None:
+        rows = [0] * len(segments)
+    runtime_selection = plan_dispatch_selection(
+        kernel_name="overlay_faces",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=len(segments),
+        requested_mode=ExecutionMode.GPU,
+        current_residency=Residency.DEVICE,
+    )
+    return build_polygon_output_from_boundary_segments_gpu(
+        cp.asarray([start[0] for start, _ in segments]),
+        cp.asarray([start[1] for start, _ in segments]),
+        cp.asarray([end[0] for _, end in segments]),
+        cp.asarray([end[1] for _, end in segments]),
+        row_indices=cp.asarray(rows, dtype=cp.int32),
+        row_count=row_count,
+        runtime_selection=runtime_selection,
+        d_valid_empty_rows=(
+            cp.ones(row_count, dtype=cp.bool_) if valid_empty_rows else None
+        ),
+    )
+
+
+def _closed_ring_segments(coordinates):
+    return list(zip(coordinates[:-1], coordinates[1:], strict=True))
+
+
+@pytest.mark.gpu
+def test_boundary_graph_pure_tree_returns_valid_empty_rows() -> None:
+    segments = [
+        ((0.0, 0.0), (1.0, 0.0)),
+        ((1.0, 0.0), (2.0, 1.0)),
+        ((1.0, 0.0), (2.0, -1.0)),
+        ((2.0, 1.0), (3.0, 1.0)),
+    ]
+
+    actual = _assemble_boundary_segments(
+        segments,
+        valid_empty_rows=True,
+    ).to_shapely()[0]
+
+    assert actual.is_empty
+
+
+@pytest.mark.gpu
+def test_boundary_graph_leaf_frontier_handles_branched_race() -> None:
+    square = _closed_ring_segments(
+        [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)],
+    )
+    branches = [
+        ((1.0, 0.0), (2.0, 0.0)),
+        ((2.0, 0.0), (3.0, 1.0)),
+        ((2.0, 0.0), (3.0, 0.0)),
+        ((2.0, 0.0), (3.0, -1.0)),
+    ]
+
+    actual = _assemble_boundary_segments([*square, *branches]).to_shapely()[0]
+
+    assert shapely.equals(actual, shapely.box(0.0, 0.0, 1.0, 1.0))
+
+
+@pytest.mark.gpu
+def test_boundary_graph_degree_core_isolates_equal_endpoints_by_row() -> None:
+    segments = [
+        ((0.0, 0.0), (1.0, 0.0)),
+        ((1.0, 0.0), (1.0, 1.0)),
+        ((1.0, 1.0), (0.0, 1.0)),
+        ((0.0, 1.0), (0.0, 0.0)),
+    ]
+
+    actual = _assemble_boundary_segments(
+        segments,
+        rows=[0, 0, 0, 1],
+        row_count=2,
+        valid_empty_rows=True,
+    ).to_shapely()
+
+    assert all(geometry.is_empty for geometry in actual)
+
+
+@pytest.mark.gpu
+def test_boundary_graph_cycle_with_multiple_tendrils_keeps_only_cycle() -> None:
+    square = _closed_ring_segments(
+        [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)],
+    )
+    tendrils = [
+        ((0.0, 0.0), (-1.0, 0.0)),
+        ((-1.0, 0.0), (-2.0, 1.0)),
+        ((2.0, 2.0), (3.0, 2.0)),
+        ((3.0, 2.0), (4.0, 3.0)),
+    ]
+
+    actual = _assemble_boundary_segments([*square, *tendrils]).to_shapely()[0]
+
+    assert shapely.equals(actual, shapely.box(0.0, 0.0, 2.0, 2.0))
+
+
+@pytest.mark.gpu
+def test_boundary_graph_two_cycles_joined_by_bridge_preserves_both_cycles() -> None:
+    left = _closed_ring_segments(
+        [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 0.5),
+            (1.0, 1.0),
+            (0.0, 1.0),
+            (0.0, 0.0),
+        ],
+    )
+    right = _closed_ring_segments(
+        [
+            (3.0, 0.0),
+            (4.0, 0.0),
+            (4.0, 1.0),
+            (3.0, 1.0),
+            (3.0, 0.5),
+            (3.0, 0.0),
+        ],
+    )
+    bridge = [((1.0, 0.5), (3.0, 0.5))]
+
+    actual = _assemble_boundary_segments([*left, *right, *bridge]).to_shapely()[0]
+    expected = shapely.multipolygons(
+        [shapely.box(0.0, 0.0, 1.0, 1.0), shapely.box(3.0, 0.0, 4.0, 1.0)],
+    )
+
+    assert shapely.equals(actual, expected)
+
+
+@pytest.mark.gpu
+def test_boundary_graph_component_hints_preserve_shell_hole_island() -> None:
+    shell = _closed_ring_segments(
+        [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0), (0.0, 0.0)],
+    )
+    hole = _closed_ring_segments(
+        [(4.0, 4.0), (4.0, 16.0), (16.0, 16.0), (16.0, 4.0), (4.0, 4.0)],
+    )
+    island = _closed_ring_segments(
+        [(8.0, 8.0), (12.0, 8.0), (12.0, 12.0), (8.0, 12.0), (8.0, 8.0)],
+    )
+    expected = shapely.multipolygons(
+        [
+            shapely.Polygon(
+                [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)],
+                holes=[[(4.0, 4.0), (4.0, 16.0), (16.0, 16.0), (16.0, 4.0)]],
+            ),
+            shapely.box(8.0, 8.0, 12.0, 12.0),
+        ],
+    )
+
+    actual = _assemble_boundary_segments([*shell, *hole, *island]).to_shapely()[0]
+
+    assert shapely.equals(actual, expected)
+
+
+@pytest.mark.gpu
+def test_boundary_graph_indexed_containment_preserves_long_nesting_chain() -> None:
+    ring_coordinates = []
+    segments = []
+    for depth in range(17):
+        lower = float(depth)
+        upper = 40.0 - float(depth)
+        coordinates = [
+            (lower, lower),
+            (upper, lower),
+            (upper, upper),
+            (lower, upper),
+            (lower, lower),
+        ]
+        ring_coordinates.append(coordinates)
+        segments.extend(_closed_ring_segments(coordinates))
+
+    expected_parts = []
+    for depth in range(0, len(ring_coordinates), 2):
+        holes = (
+            [ring_coordinates[depth + 1]]
+            if depth + 1 < len(ring_coordinates)
+            else None
+        )
+        expected_parts.append(shapely.Polygon(ring_coordinates[depth], holes=holes))
+    expected = shapely.multipolygons(expected_parts)
+
+    actual = _assemble_boundary_segments(segments).to_shapely()[0]
+
+    assert actual.is_valid
+    assert shapely.equals(actual, expected)
+
+
+@pytest.mark.gpu
+def test_boundary_graph_builds_half_edge_graph_once(monkeypatch) -> None:
+    import importlib
+
+    graph_module = importlib.import_module("vibespatial.overlay.graph")
+
+    original = graph_module.build_gpu_half_edge_graph
+    calls = 0
+
+    def _counted_build(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(graph_module, "build_gpu_half_edge_graph", _counted_build)
+    square = _closed_ring_segments(
+        [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)],
+    )
+    _assemble_boundary_segments(square)
+
+    assert calls == 1
+
+
+def test_boundary_graph_uses_device_core_and_indexed_nesting_only() -> None:
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    boundary_source = (root / "src/vibespatial/overlay/boundary_graph.py").read_text()
+    kernels_source = (root / "src/vibespatial/overlay/gpu_kernels.py").read_text()
+    assemble_source = (root / "src/vibespatial/overlay/assemble.py").read_text()
+    function_start = boundary_source.index(
+        "def build_polygon_output_from_boundary_segments_gpu(",
+    )
+    function_source = boundary_source[function_start:]
+
+    assert "while True" not in function_source
+    assert function_source.count("build_gpu_half_edge_graph(") == 1
+    assert "initialize_degree_two_core_frontier" in function_source
+    assert "peel_degree_two_core_frontier" in function_source
+    assert "_build_indexed_component_containment_device_state" in function_source
+    assert "component_nesting=nesting" in function_source
+    assert "accumulate_component_containment_baseline" not in kernels_source
+    assert "relation_" not in function_source
+    assert "reduce_component_containment_nesting" not in kernels_source
+    assert "select_indexed_component_containment_parent" in kernels_source
+    assert "grid=((face_count" not in function_source
+    assert "if component_nesting is not None:" in assemble_source
+
+
+@pytest.mark.gpu
+def test_boundary_graph_uses_exact_radial_order_for_near_collinear_rays() -> None:
+    import cupy as cp
+
+    origin = (0.0, 0.0)
+    outer_left = (-0.1523828637565714, -0.6083464929280353)
+    inner_left = (-0.09064249771765276, -0.3618651352087454)
+    inner_right = (-0.09064249771762434, -0.3618651352086317)
+    outer_right = (0.03311138804998137, 0.09254013023701191)
+    segments = [
+        (origin, outer_left),
+        (outer_left, outer_right),
+        (outer_right, origin),
+        (origin, inner_left),
+        (inner_left, inner_right),
+        (inner_right, origin),
+    ]
+    runtime_selection = plan_dispatch_selection(
+        kernel_name="overlay_faces",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=len(segments),
+        requested_mode=ExecutionMode.GPU,
+        current_residency=Residency.DEVICE,
+    )
+    actual = build_polygon_output_from_boundary_segments_gpu(
+        cp.asarray([start[0] for start, _ in segments]),
+        cp.asarray([start[1] for start, _ in segments]),
+        cp.asarray([end[0] for _, end in segments]),
+        cp.asarray([end[1] for _, end in segments]),
+        row_indices=cp.zeros(len(segments), dtype=cp.int32),
+        row_count=1,
+        runtime_selection=runtime_selection,
+    ).to_shapely()[0]
+    expected = shapely.union(
+        shapely.Polygon([origin, outer_left, outer_right, origin]),
+        shapely.Polygon([origin, inner_left, inner_right, origin]),
+    )
+
+    assert actual.is_valid
+    assert shapely.area(shapely.symmetric_difference(actual, expected)) == 0.0
 
 
 @pytest.mark.gpu

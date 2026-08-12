@@ -519,7 +519,7 @@ extern "C" __global__ void bbox_overlap_multi_scatter(
     const double* tree_bounds,
     int query_count,
     int tree_count,
-    const int* offsets,
+    const long long* offsets,
     int* out_left,
     int* out_right
 ) {
@@ -535,7 +535,7 @@ extern "C" __global__ void bbox_overlap_multi_scatter(
   if (isnan(qminx) || isnan(qminy) || isnan(qmaxx) || isnan(qmaxy)) {
     return;
   }
-  int write_pos = offsets[q];
+  long long write_pos = offsets[q];
   for (int t = 0; t < tree_count; t++) {
     const int tbase = t * 4;
     const double tminx = tree_bounds[tbase + 0];
@@ -1219,7 +1219,7 @@ extern "C" __global__ void morton_range_scatter(
     const int* order,
     const double* sorted_tree_bounds,
     const double* query_bounds,
-    const int* offsets,
+    const long long* offsets,
     int* out_left,
     int* out_right,
     int query_count
@@ -1235,9 +1235,101 @@ extern "C" __global__ void morton_range_scatter(
   const double qx1 = query_bounds[qbase + 2];
   const double qy1 = query_bounds[qbase + 3];
 
-  int write_pos = offsets[q];
+  long long write_pos = offsets[q];
   if (!isnan(qx0)) {
     for (unsigned long long i = start; i < end; i++) {
+      const int tbase = (int)i * 4;
+      const double tx0 = sorted_tree_bounds[tbase];
+      const double ty0 = sorted_tree_bounds[tbase + 1];
+      const double tx1 = sorted_tree_bounds[tbase + 2];
+      const double ty1 = sorted_tree_bounds[tbase + 3];
+      if (!isnan(tx0) && qx0 <= tx1 && qx1 >= tx0 && qy0 <= ty1 && qy1 >= ty0) {
+        out_left[write_pos] = q;
+        out_right[write_pos] = order[(int)i];
+        write_pos++;
+      }
+    }
+  }
+}
+
+extern "C" __global__ void morton_range_tile_count(
+    const unsigned long long* starts,
+    const unsigned long long* ends,
+    const int* query_order,
+    const double* sorted_tree_bounds,
+    const double* query_bounds,
+    int* out_counts,
+    int query_order_start,
+    int query_batch_count,
+    long long position_offset,
+    int tile_width
+) {
+  const int local_q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (local_q >= query_batch_count) return;
+
+  const int q = query_order[query_order_start + local_q];
+  const unsigned long long range_start =
+      starts[q] + (unsigned long long)position_offset;
+  const unsigned long long range_end = min(
+      ends[q],
+      range_start + (unsigned long long)tile_width
+  );
+  const int qbase = q * 4;
+  const double qx0 = query_bounds[qbase];
+  const double qy0 = query_bounds[qbase + 1];
+  const double qx1 = query_bounds[qbase + 2];
+  const double qy1 = query_bounds[qbase + 3];
+
+  int count = 0;
+  if (range_start < ends[q] && !isnan(qx0)) {
+    for (unsigned long long i = range_start; i < range_end; i++) {
+      const int tbase = (int)i * 4;
+      const double tx0 = sorted_tree_bounds[tbase];
+      const double ty0 = sorted_tree_bounds[tbase + 1];
+      const double tx1 = sorted_tree_bounds[tbase + 2];
+      const double ty1 = sorted_tree_bounds[tbase + 3];
+      if (!isnan(tx0) && qx0 <= tx1 && qx1 >= tx0 && qy0 <= ty1 && qy1 >= ty0) {
+        count++;
+      }
+    }
+  }
+  out_counts[local_q] = count;
+}
+
+extern "C" __global__ void morton_range_tile_scatter(
+    const unsigned long long* starts,
+    const unsigned long long* ends,
+    const int* query_order,
+    const int* order,
+    const double* sorted_tree_bounds,
+    const double* query_bounds,
+    const long long* offsets,
+    int* out_left,
+    int* out_right,
+    int query_order_start,
+    int query_batch_count,
+    long long position_offset,
+    int tile_width
+) {
+  const int local_q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (local_q >= query_batch_count) return;
+
+  const int q = query_order[query_order_start + local_q];
+  const unsigned long long range_start =
+      starts[q] + (unsigned long long)position_offset;
+  const unsigned long long range_end = min(
+      ends[q],
+      range_start + (unsigned long long)tile_width
+  );
+  const int qbase = q * 4;
+  const double qx0 = query_bounds[qbase];
+  const double qy0 = query_bounds[qbase + 1];
+  const double qx1 = query_bounds[qbase + 2];
+  const double qy1 = query_bounds[qbase + 3];
+
+  long long write_pos = offsets[local_q];
+  if (range_start < ends[q] && !isnan(qx0)) {
+    for (unsigned long long i = range_start; i < range_end; i++) {
       const int tbase = (int)i * 4;
       const double tx0 = sorted_tree_bounds[tbase];
       const double ty0 = sorted_tree_bounds[tbase + 1];
@@ -1258,6 +1350,8 @@ _MORTON_RANGE_KERNEL_NAMES = (
     "morton_range_from_bounds",
     "morton_range_count",
     "morton_range_scatter",
+    "morton_range_tile_count",
+    "morton_range_tile_scatter",
 )
 
 _GRID_NEAREST_KERNEL_SOURCE = """

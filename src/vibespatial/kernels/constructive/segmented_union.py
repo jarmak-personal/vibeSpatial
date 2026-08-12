@@ -62,7 +62,6 @@ except ModuleNotFoundError:  # pragma: no cover
 _get_empty_owned = _segmented_union_cpu_module.get_empty_owned
 _segmented_union_cpu = _segmented_union_cpu_module.segmented_union_cpu
 
-
 @dataclass(frozen=True)
 class _GroupedUnionCoverageFailure:
     failed_selection: Any
@@ -1121,6 +1120,7 @@ def _segmented_union_device_grouped_pairwise_tree(
     )
     from vibespatial.geometry.owned import (
         concat_owned_scatter,
+        device_select_owned_capacity_partitions,
         device_take_owned_capacity_selection,
     )
 
@@ -1133,6 +1133,7 @@ def _segmented_union_device_grouped_pairwise_tree(
     if capacity == 0 or live_group_count == 0:
         return empty_output
     d_span_sizes = d_current_offsets[1:] - d_current_offsets[:-1]
+    d_group_has_values = d_span_sizes > 0
     if (
         allow_singleton_identity
         and all_groups_observed is True
@@ -1199,6 +1200,14 @@ def _segmented_union_device_grouped_pairwise_tree(
         )
         if pair_rows.row_count != capacity:
             return None
+        # Odd members are algebraic carries, not union(null) operations. The
+        # inactive right lane is intentionally null, so binary public null
+        # semantics must not be asked to preserve it as though it were a valid
+        # empty geometry.
+        pair_rows = device_select_owned_capacity_partitions(
+            pair_rows,
+            [(left_rows, d_carry_active)],
+        )
 
         full_selection = NativeDeviceSelection.from_mask(
             d_union_active,
@@ -1231,10 +1240,10 @@ def _segmented_union_device_grouped_pairwise_tree(
         capacity = next_capacity
 
     compact = current.device_take(
-        d_current_offsets[:-1],
+        cp.where(d_group_has_values, d_current_offsets[:-1], cp.int64(0)),
         allow_capacity_allocation=True,
         assume_unique_indices=True,
-    )
+    )._apply_row_activity(d_group_has_values)
     if compact.row_count != live_group_count:
         return None
     if all_groups_observed is True and live_group_count == output_row_count:
@@ -1979,6 +1988,26 @@ def _repair_grouped_union_uncovered_rows_device(
     return repaired
 
 
+def _grouped_subresolution_area_rows(
+    d_row_area,
+    d_row_nonempty,
+    d_row_group_local,
+    group_count: int,
+):
+    """Identify members whose area cannot survive their grouped fp64 sum."""
+    d_effective_area = cp.where(
+        d_row_nonempty,
+        cp.nan_to_num(d_row_area, nan=0.0, posinf=cp.inf, neginf=cp.inf),
+        cp.float64(0.0),
+    )
+    d_group_area = cp.zeros(group_count, dtype=cp.float64)
+    cp.add.at(d_group_area, d_row_group_local, d_effective_area)
+    d_group_ulp = cp.nextafter(d_group_area, cp.inf) - d_group_area
+    d_resolution = d_group_ulp[d_row_group_local] * cp.float64(4.0)
+    d_subresolution = d_row_nonempty & (d_effective_area <= d_resolution)
+    return d_subresolution, d_group_area
+
+
 def segmented_union_all_device_grouped(
     geometries: OwnedGeometryArray,
     group_offsets: Any,
@@ -2047,6 +2076,7 @@ def segmented_union_all_device_grouped(
         from vibespatial.geometry.owned import (
             build_empty_polygon_rows_device,
             device_select_owned_capacity_partitions,
+            device_valid_nonempty_mask,
         )
 
         d_group_offsets = cp.asarray(group_offsets, dtype=cp.int64)
@@ -2075,8 +2105,25 @@ def segmented_union_all_device_grouped(
                 posinf=cp.inf,
                 neginf=cp.inf,
             )
-            d_group_source_area = cp.zeros(compact_group_count, dtype=cp.float64)
-            cp.add.at(d_group_source_area, d_group_local, d_source_area)
+            d_source_nonempty = device_valid_nonempty_mask(geometries)
+            d_subresolution_rows, d_group_source_area = _grouped_subresolution_area_rows(
+                d_source_area,
+                d_source_nonempty,
+                d_group_local,
+                compact_group_count,
+            )
+            d_group_subresolution_count = cp.zeros(compact_group_count, dtype=cp.int32)
+            cp.add.at(
+                d_group_subresolution_count,
+                d_group_local,
+                d_subresolution_rows.astype(cp.int32, copy=False),
+            )
+            d_group_min_source_area = cp.full(compact_group_count, cp.inf, dtype=cp.float64)
+            cp.minimum.at(
+                d_group_min_source_area,
+                d_group_local,
+                cp.where(d_source_nonempty, d_source_area, cp.inf),
+            )
             d_coverage_area = cp.abs(cp.asarray(_area_gpu_device_fp64(coverage), dtype=cp.float64))[
                 d_group_ids
             ]
@@ -2084,9 +2131,20 @@ def segmented_union_all_device_grouped(
                 cp.maximum(d_group_source_area, d_coverage_area),
                 1.0,
             )
-            d_coverage_groups = cp.isfinite(d_coverage_area) & (
+            d_default_area_tolerance = (
+                d_area_scale * cp.float64(1.0e-12) + cp.float64(1.0e-9)
+            )
+            d_area_tolerance = cp.minimum(
+                d_default_area_tolerance,
+                d_group_min_source_area * cp.float64(0.25),
+            )
+            d_coverage_groups = (
+                (d_group_subresolution_count == 0)
+                & cp.isfinite(d_coverage_area)
+                & (
                 cp.abs(d_group_source_area - d_coverage_area)
-                <= (d_area_scale * cp.float64(1.0e-12) + cp.float64(1.0e-9))
+                <= d_area_tolerance
+                )
             )
             d_remainder_rows = ~d_coverage_groups[d_group_local]
             remainder_geometries = _device_row_activity_view(
@@ -2410,10 +2468,12 @@ def segmented_union_all_device_grouped(
     else:
         d_nonempty = device_valid_nonempty_mask(current)
         d_abs_area = cp.abs(cp.asarray(_area_gpu_device_fp64(current), dtype=cp.float64))
-        # Degeneracy is topological, not scale-relative. An absolute epsilon
-        # classifies valid small polygons in geographic CRSs as remnants and
-        # diverts them from the collective grouped topology plan.
-        d_degenerate_row_mask = d_nonempty & (d_abs_area == 0.0)
+        d_degenerate_row_mask, _ = _grouped_subresolution_area_rows(
+            d_abs_area,
+            d_nonempty,
+            d_group_local_by_row,
+            compact_group_count,
+        )
 
     safe_parts = device_select_owned_capacity_partitions(
         build_empty_polygon_rows_device(current.row_count),
@@ -2450,18 +2510,31 @@ def segmented_union_all_device_grouped(
         safe_overlay._native_grouped_union_implementation = "native_grouped_overlay_union_plan"
         return _apply_group_validity(safe_overlay)
 
-    degenerate_parts = device_select_owned_capacity_partitions(
-        build_empty_polygon_rows_device(current.row_count),
-        [(current, d_degenerate_row_mask)],
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+    from vibespatial.geometry.owned import device_take_owned_capacity_selection
+
+    degenerate_selection = NativeDeviceSelection.from_mask(d_degenerate_row_mask)
+    degenerate_parts = device_take_owned_capacity_selection(
+        current,
+        degenerate_selection,
     )
+    d_degenerate_counts = cp.zeros(compact_group_count, dtype=cp.int32)
+    cp.add.at(
+        d_degenerate_counts,
+        d_group_local_by_row,
+        d_degenerate_row_mask.astype(cp.int32, copy=False),
+    )
+    d_degenerate_offsets = cp.empty(compact_group_count + 1, dtype=cp.int64)
+    d_degenerate_offsets[0] = 0
+    cp.cumsum(d_degenerate_counts, out=d_degenerate_offsets[1:])
     degenerate_tree = _segmented_union_device_grouped_pairwise_tree(
         degenerate_parts,
-        d_current_offsets,
+        d_degenerate_offsets,
         d_group_ids,
         output_row_count=output_row_count,
         precision_plan=precision_plan,
         empty_output=empty_output,
-        all_groups_observed=all_groups_observed,
+        all_groups_observed=False,
         allow_singleton_identity=False,
         group_size_max=group_size_max,
     )
@@ -2477,6 +2550,7 @@ def segmented_union_all_device_grouped(
             safe_overlay,
             degenerate_tree,
             dispatch_mode=ExecutionMode.GPU,
+            _partition_disjoint=True,
             _active_rows=d_safe_contributes & d_degenerate_contributes,
         )
         if mixed is None or mixed.row_count != output_row_count:

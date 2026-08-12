@@ -277,16 +277,17 @@ def test_small_grouped_constructive_reduce_pipeline_smoke() -> None:
     assert stage_by_name["native_grouped_union"]["metadata"]["used_native_grouped_carrier"] is True
     assert stage_by_name["native_grouped_union"]["metadata"]["sorted_order_identity"] is True
     assert stage_by_name["native_grouped_union"]["metadata"]["materialization_count_delta"] == 0
-    assert (
-        stage_by_name["native_grouped_union"]["metadata"]["runtime_d2h_transfer_count_delta"] == 0
-    )
-    assert (
-        stage_by_name["native_grouped_union"]["metadata"]["runtime_d2h_transfer_bytes_delta"] == 0
-    )
     native_grouped_events = stage_by_name["native_grouped_union"]["metadata"].get(
         "runtime_d2h_transfer_events",
         (),
     )
+    assert len(native_grouped_events) == 3
+    assert sum(event["bytes_transferred"] for event in native_grouped_events) <= 2040
+    assert {event["reason"] for event in native_grouped_events} == {
+        "constructive indexed polygon-part size planning packet",
+        "overlay compact topology page-weight planning packet",
+        "overlay compact topology work-summary planning packet",
+    }
     removed_overlay_fences = {
         "overlay assemble boundary total-coords allocation fence",
         "overlay assemble compact-hole total-coords allocation fence",
@@ -485,14 +486,16 @@ def test_grouped_difference_constructive_pipeline_smoke() -> None:
     assert (
         stage_by_name["native_grouped_difference"]["metadata"]["materialization_count_delta"] == 0
     )
-    assert (
-        stage_by_name["native_grouped_difference"]["metadata"]["runtime_d2h_transfer_count_delta"]
-        == 0
-    )
     native_events = stage_by_name["native_grouped_difference"]["metadata"].get(
         "runtime_d2h_transfer_events",
         (),
     )
+    assert len(native_events) == 2
+    assert sum(event["bytes_transferred"] for event in native_events) <= 2016
+    assert {event["reason"] for event in native_events} == {
+        "overlay compact topology page-weight planning packet",
+        "overlay compact topology work-summary planning packet",
+    }
     assert not any(event["reason"] in _GENERIC_RUNTIME_D2H_REASONS for event in native_events)
     assert not any("grouped difference" in event["reason"] for event in native_events)
     assert stage_by_name["native_reference_check"]["metadata"]["results_match"] is True

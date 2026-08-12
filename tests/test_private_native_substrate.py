@@ -134,6 +134,21 @@ class _FakeDeviceTable:
     shape = (2, 2)
 
 
+def test_composed_nonempty_mask_uses_capacity_scatter() -> None:
+    source = Path(native_result_core_module.__file__).read_text()
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "valid_nonempty_mask_device"
+    )
+    method_source = ast.unparse(method)
+
+    assert "output_rows[d_active]" not in method_source
+    assert "maximum.at" in method_source
+
+
 def test_source_device_to_host_boundaries_are_named() -> None:
     root = Path("src/vibespatial")
     raw_asnumpy: dict[str, list[int]] = {}
@@ -538,6 +553,19 @@ def test_native_device_selection_contract_has_no_implicit_count_fence() -> None:
     assert "cp.flatnonzero" not in source_mask
 
 
+def test_composed_family_selection_masks_capacity_without_part_compaction() -> None:
+    source = Path(native_result_core_module.__file__).read_text()
+    method_source = source.split(
+        "    def select_family_domain_device(self, families):",
+        1,
+    )[1].split("\n    def mask_capacity", 1)[0]
+
+    assert "cp.maximum.at(" in method_source
+    assert "part.geometry.mask_capacity(d_part_keep)" in method_source
+    assert "cp.flatnonzero" not in method_source
+    assert "_device_indexed_take" not in method_source
+
+
 def test_native_tabular_selection_contract_preserves_exact_result_invariant() -> None:
     rowset_source = Path(
         importlib.import_module("vibespatial.api._native_rowset").__file__
@@ -618,6 +646,11 @@ def test_native_relation_selection_consumes_capacity_without_compaction() -> Non
     assert "def physicalize_geometries(" in relation_selection_source
     assert ".device_take_capacity(" in relation_selection_source
     assert "def constructive_native(" in relation_selection_source
+    constructive_source = relation_selection_source.split(
+        "    def constructive_native(",
+        1,
+    )[1].split("\n\n@dataclass(frozen=True)\nclass NativeRelationConstructiveSelection", 1)[0]
+    assert ".physicalize_device_rows(" not in constructive_source
     assert "selection.gather_capacity(" in grouped_selection_source
     assert "selection.active_capacity_mask()" in grouped_selection_source
     assert "compact_rowset(" not in grouped_selection_source
@@ -718,6 +751,32 @@ def test_native_device_selection_identity_requires_stable_full_partition() -> No
     assert stable_rows.geometry_family_domain == (GeometryFamily.POLYGON,)
     assert stable_rows.trusted_all_valid_rows is True
     assert reordered_rows.identity is False
+
+
+@pytest.mark.gpu
+def test_native_device_selection_remaps_full_capacity_partition_without_d2h() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for capacity-backed selection")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+
+    selection = NativeDeviceSelection.from_mask(
+        cp.asarray([False, True, True, False]),
+        source_token="candidate",
+        source_row_count=4,
+    )
+
+    with assert_zero_d2h_transfers():
+        remapped = selection.remap_source_positions(
+            cp.asarray([8, 3, 6, 1], dtype=cp.int64),
+            source_token="source",
+            source_row_count=10,
+        )
+
+    assert remapped.source_token == "source"
+    assert remapped.source_row_count == 10
+    assert cp.asnumpy(remapped.logical_count).tolist() == [2]
+    assert cp.asnumpy(remapped.partition_capacity_positions()).tolist() == [3, 6, 8, 1]
 
 
 @pytest.mark.gpu
@@ -912,10 +971,12 @@ def test_native_rowset_set_algebra_preserves_source_contract() -> None:
     intersection = left.intersection(right)
     union = left.union(right)
     difference = left.difference(right)
+    complement = left.complement()
 
     assert intersection.positions.tolist() == [1]
     assert union.positions.tolist() == [1, 3, 4]
     assert difference.positions.tolist() == [3]
+    assert complement.positions.tolist() == [0, 2, 4]
     assert intersection.source_token == "frame"
     assert intersection.source_row_count == 5
     assert intersection.ordered is True
@@ -951,6 +1012,8 @@ def test_native_rowset_set_algebra_preserves_source_contract() -> None:
             ordered=True,
             unique=True,
         ).intersection(out_of_bounds)
+    with pytest.raises(ValueError, match="requires source_row_count"):
+        NativeRowSet.from_positions(np.asarray([1], dtype=np.int64)).complement()
 
 
 def test_native_rowset_identity_to_host_positions_skips_device_copy() -> None:
@@ -1033,6 +1096,9 @@ def test_native_rowset_identity_set_algebra_shortcuts_preserve_device_carriers()
         still_members = members.difference(empty)
         still_identity = identity.difference(empty)
         empty_intersection = empty.intersection(identity)
+        complement = members.complement()
+        identity_complement = identity.complement()
+        empty_complement = empty.complement()
 
     assert full_union.positions is identity_positions
     assert full_union.identity is True
@@ -1045,6 +1111,10 @@ def test_native_rowset_identity_set_algebra_shortcuts_preserve_device_carriers()
     assert no_remaining.is_device
     assert len(no_remaining) == 0
     assert empty_intersection.positions is empty_positions
+    assert cp.asnumpy(complement.positions).tolist() == [0, 2, 4]
+    assert len(identity_complement) == 0
+    assert empty_complement.identity is True
+    assert cp.asnumpy(empty_complement.positions).tolist() == [0, 1, 2, 3, 4]
     assert get_materialization_events(clear=True) == []
 
 
@@ -4947,6 +5017,29 @@ def test_public_spatial_index_query_relation_reuses_native_index_cache() -> None
         query_token=query_state.lineage_token,
         return_device=False,
     )
+    semijoin, _semijoin_execution = sindex.query_left_semijoin(
+        query_state,
+        predicate="intersects",
+        source_token=tree_state.lineage_token,
+        query_token=query_state.lineage_token,
+    )
+    antijoin, _antijoin_execution = sindex.query_left_antijoin(
+        query_state,
+        predicate="intersects",
+        source_token=tree_state.lineage_token,
+        query_token=query_state.lineage_token,
+    )
+    counts, _count_execution = sindex.query_left_match_count_expression(
+        query_state,
+        predicate="intersects",
+        source_token=tree_state.lineage_token,
+        query_token=query_state.lineage_token,
+    )
+    right_semijoin, _right_semijoin_execution = sindex.query_right_semijoin(
+        query_state,
+        predicate="intersects",
+        source_token=tree_state.lineage_token,
+    )
 
     assert isinstance(relation, NativeRelation)
     assert execution.implementation in {
@@ -4960,6 +5053,22 @@ def test_public_spatial_index_query_relation_reuses_native_index_cache() -> None
     np.testing.assert_array_equal(relation.right_indices, np.asarray([0, 1], dtype=np.int32))
     np.testing.assert_array_equal(relation_again.left_indices, relation.left_indices)
     np.testing.assert_array_equal(relation_again.right_indices, relation.right_indices)
+    np.testing.assert_array_equal(
+        _host_array(semijoin.positions, dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(
+        _host_array(antijoin.positions, dtype=np.int64),
+        np.asarray([1], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(
+        _host_array(counts.values, dtype=np.int64),
+        np.asarray([1, 0, 1], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(
+        _host_array(right_semijoin.positions, dtype=np.int64),
+        np.asarray([0, 1], dtype=np.int64),
+    )
 
 
 def test_public_sindex_query_exports_indices_from_native_relation() -> None:
@@ -5282,6 +5391,107 @@ def test_native_spatial_index_query_relation_uses_bounded_scalar_fence() -> None
     assert cp.asnumpy(relation.left_indices).tolist() == [0, 1]
     assert cp.asnumpy(relation.right_indices).tolist() == [0, 1]
     assert cp.asnumpy(rowset.positions).tolist() == [0, 1]
+    reset_d2h_transfer_count()
+
+
+def test_native_spatial_index_left_reductions_bypass_dense_relation_on_device() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device native spatial semijoin probe")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_stats,
+        reset_d2h_transfer_count,
+    )
+
+    tree = from_shapely_geometries([box(0.0, 0.0, 10.0, 10.0)] * 128)
+    tree.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test dense native semijoin tree",
+    )
+    flat_index = build_flat_spatial_index(
+        tree,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="unit test dense native semijoin index",
+        ),
+    )
+    query = from_shapely_geometries(
+        [Point(5.0, 5.0) if row % 2 == 0 else Point(20.0, 20.0) for row in range(256)]
+    )
+    query.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test dense native semijoin query",
+    )
+    native_index = flat_index.to_native_spatial_index(source_token="tree")
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    rowset, execution = native_index.query_left_semijoin(
+        query,
+        predicate="intersects",
+        query_token="query",
+        return_metadata=True,
+    )
+    semijoin_d2h_count, semijoin_d2h_bytes = get_d2h_transfer_stats()
+    reset_d2h_transfer_count()
+    anti_rowset, anti_execution = native_index.query_left_antijoin(
+        query,
+        predicate="intersects",
+        query_token="query",
+        return_metadata=True,
+    )
+    antijoin_d2h_count, antijoin_d2h_bytes = get_d2h_transfer_stats()
+    reset_d2h_transfer_count()
+    count_expression, count_execution = native_index.query_left_match_count_expression(
+        query,
+        predicate="intersects",
+        query_token="query",
+        return_metadata=True,
+    )
+    count_d2h_count, count_d2h_bytes = get_d2h_transfer_stats()
+    reset_d2h_transfer_count()
+    right_rowset, right_execution = native_index.query_right_semijoin(
+        query,
+        predicate="intersects",
+        return_metadata=True,
+    )
+    right_d2h_count, right_d2h_bytes = get_d2h_transfer_stats()
+
+    assert execution.implementation == "owned_gpu_spatial_semijoin"
+    assert semijoin_d2h_count <= 2
+    assert semijoin_d2h_bytes <= 288
+    assert rowset.is_device
+    assert rowset.source_token == "query"
+    rowset_count = int(cp.asnumpy(rowset.logical_count)[0])
+    anti_rowset_count = int(cp.asnumpy(anti_rowset.logical_count)[0])
+    right_rowset_count = int(cp.asnumpy(right_rowset.logical_count)[0])
+    assert cp.asnumpy(rowset.positions[:rowset_count]).tolist() == list(range(0, 256, 2))
+    assert anti_execution.implementation == "owned_gpu_spatial_semijoin"
+    assert anti_rowset.is_device
+    assert cp.asnumpy(anti_rowset.positions[:anti_rowset_count]).tolist() == list(
+        range(1, 256, 2)
+    )
+    assert antijoin_d2h_count <= 2
+    assert antijoin_d2h_bytes <= 288
+    assert count_execution.implementation == "owned_gpu_spatial_match_count"
+    assert count_expression.is_device
+    assert cp.asnumpy(count_expression.values).tolist() == [
+        128 if row % 2 == 0 else 0 for row in range(256)
+    ]
+    assert right_execution.implementation == "owned_gpu_spatial_right_semijoin"
+    assert right_rowset.is_device
+    assert cp.asnumpy(right_rowset.positions[:right_rowset_count]).tolist() == list(range(128))
+    assert flat_index._host_bounds is None
+    assert flat_index._host_order is None
+    assert flat_index._host_morton_keys is None
+    assert count_d2h_count <= 2
+    assert count_d2h_bytes <= 288
+    assert right_d2h_count <= 2
+    assert right_d2h_bytes <= 288
+    assert get_materialization_events(clear=True) == []
     reset_d2h_transfer_count()
 
 
@@ -5811,7 +6021,7 @@ def test_relation_selection_preserves_singular_right_constructive_carrier() -> N
         pytest.skip("GPU runtime required for singular-right constructive carrier")
     cp = pytest.importorskip("cupy")
     from vibespatial.cuda._runtime import (
-        assert_zero_d2h_transfers,
+        get_d2h_transfer_events,
         reset_d2h_transfer_count,
     )
 
@@ -5850,15 +6060,18 @@ def test_relation_selection_preserves_singular_right_constructive_carrier() -> N
     reset_d2h_transfer_count()
     clear_dispatch_events()
 
-    with assert_zero_d2h_transfers():
-        pair_geometry = selected.physicalize_geometries(
-            left_geometry,
-            right_geometry,
-        )
-        result = pair_geometry.constructive_native("intersection")
+    pair_geometry = selected.physicalize_geometries(
+        left_geometry,
+        right_geometry,
+    )
+    result = pair_geometry.constructive_native("intersection")
 
     assert pair_geometry.broadcast_right_geometry is right_geometry
     assert result.geometry.owned is not None
+    d2h_events = get_d2h_transfer_events(clear=True)
+    assert len(d2h_events) == 1
+    assert d2h_events[0].reason == "fused multi-root capacity scatter exact allocation packet"
+    assert d2h_events[0].bytes_transferred <= 448
     right_value = right_geometry.to_shapely()[0]
     expected = [
         left.intersection(right_value) for left in left_geometry.to_shapely()
@@ -7340,6 +7553,46 @@ def test_public_sjoin_keeps_candidate_refinement_device_resident(monkeypatch) ->
     assert joined["score"].tolist() == [10.0, 5.0]
 
 
+def test_sjoin_builds_large_query_index_from_resident_geometry_on_device() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for resident sjoin index probe")
+
+    from vibespatial.api.tools.sjoin import _native_spatial_index_for_sjoin_right
+
+    right = GeoDataFrame(
+        {
+            "geometry": GeoSeries.from_wkt(
+                [
+                    "POLYGON ((0 0, 2 0, 1 1, 0 0))",
+                    "POLYGON ((4 0, 7 0, 6 2, 4 0))",
+                    "POLYGON ((9 1, 12 0, 11 3, 9 1))",
+                ],
+                name="geometry",
+            ),
+        }
+    )
+    right_state = _attach_owned_native_tabular_state(right)
+    right_owned = right_state.geometry.owned
+    right_owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test resident sjoin index build",
+    )
+
+    native_index = _native_spatial_index_for_sjoin_right(
+        right,
+        right_state,
+        right_owned,
+        query_row_count=1_000_000,
+    )
+
+    assert native_index.metadata is not None
+    assert hasattr(native_index.metadata.bounds, "__cuda_array_interface__")
+    assert hasattr(native_index.morton_keys, "__cuda_array_interface__")
+    assert hasattr(native_index.order, "__cuda_array_interface__")
+    assert np.isfinite(np.asarray(native_index.total_bounds)).all()
+
+
 def test_public_sjoin_lowers_nonempty_relation_without_internal_pair_export(
     monkeypatch,
 ) -> None:
@@ -7590,7 +7843,9 @@ def test_public_sjoin_device_relation_preserves_host_label_indexes(
     assert index_events == []
 
 
-def test_public_sjoin_unique_index_loc_bridge_preserves_device_rowflow() -> None:
+def test_public_sjoin_unique_index_loc_bridge_preserves_device_rowflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device sjoin unique-index loc bridge")
     pytest.importorskip("pylibcudf")
@@ -7634,6 +7889,16 @@ def test_public_sjoin_unique_index_loc_bridge_preserves_device_rowflow() -> None
         reason="unit test public sjoin unique loc bridge right geometry",
     )
     joined = sjoin(left, right, predicate="intersects")
+    joined_state = get_native_state(joined)
+    assert joined_state is not None
+    assert joined_state.index_plan.selection_grouped is True
+
+    import cupy as cp
+
+    def _reject_global_unique(*_args, **_kwargs):
+        raise AssertionError("grouped relation labels must use adjacent unique")
+
+    monkeypatch.setattr(cp, "unique", _reject_global_unique)
     clear_materialization_events()
     reset_d2h_transfer_count()
 
@@ -7647,6 +7912,35 @@ def test_public_sjoin_unique_index_loc_bridge_preserves_device_rowflow() -> None
     assert NativeAttributeTable.from_value(selected_state.attributes).device_table is not None
     assert get_materialization_events(clear=True) == []
     assert selected["left_value"].tolist() == [1, 3]
+
+
+def test_native_index_plan_roundtrip_preserves_selection_lineage() -> None:
+    from vibespatial.api._native_public_arrays import native_public_index_from_plan
+    from vibespatial.api._native_rowset import NativeIndexPlan
+
+    source = NativeIndexPlan.from_index(pd.Index([10, 20, 30])).with_selection(
+        np.asarray([0, 2], dtype=np.int64),
+        source_token="source-token",
+        source_row_count=3,
+        unique=True,
+    )
+    selected = source.take(
+        np.asarray([0, 2], dtype=np.int64),
+        preserve_index=True,
+        unique=True,
+    ).with_selection(
+        np.asarray([0, 2], dtype=np.int64),
+        source_token="source-token",
+        source_row_count=3,
+        unique=True,
+    )
+    public = native_public_index_from_plan(selected)
+
+    roundtrip = NativeIndexPlan.from_index(public)
+
+    assert roundtrip.selection_source_token == "source-token"
+    assert roundtrip.selection_source_row_count == 3
+    assert np.array_equal(roundtrip.selection_positions, np.asarray([0, 2]))
 
 
 def test_public_sjoin_empty_device_candidates_stay_device_resident(monkeypatch) -> None:
@@ -8208,6 +8502,83 @@ def test_native_geometry_composition_exports_concrete_and_collection_rows() -> N
     ]
 
 
+@pytest.mark.gpu
+def test_native_geometry_composition_measurements_stay_device_resident() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native composition measurements")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+
+    polygons = GeometryNativeResult.from_owned(
+        from_shapely_geometries([box(0, 0, 1, 1), box(2, 0, 3, 1)]).move_to(
+            Residency.DEVICE,
+            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+            reason="unit test native composition polygon measurements",
+        ),
+        crs=None,
+    )
+    remnants = GeometryNativeResult.from_owned(
+        from_shapely_geometries(
+            [LineString([(0, 0), (1, 0)]), Point(4, 4)],
+        ).move_to(
+            Residency.DEVICE,
+            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+            reason="unit test native composition remnant measurements",
+        ),
+        crs=None,
+    )
+    geometry = GeometryNativeResult.from_composition(
+        NativeGeometryComposition(
+            parts=(
+                NativeGeometryCompositionPart(
+                    polygons,
+                    cp.asarray([0, 1], dtype=cp.int64),
+                ),
+                NativeGeometryCompositionPart(
+                    remnants,
+                    cp.asarray([0, 2], dtype=cp.int64),
+                ),
+            ),
+            row_count=4,
+            crs=None,
+        ),
+        crs=None,
+    )
+    metadata = NativeGeometryMetadata.from_native_geometry(geometry)
+    state = NativeTabularResult(
+        attributes=NativeAttributeTable.from_value(
+            pd.DataFrame({"value": [1, 2, 3, 4]})
+        ),
+        geometry=geometry,
+        geometry_name="geometry",
+        column_order=("value", "geometry"),
+        geometry_metadata=metadata,
+    ).to_native_frame_state()
+
+    with assert_zero_d2h_transfers():
+        area = state.geometry_area_expression()
+        length = state.geometry_length_expression()
+        selected_metadata = metadata.take(cp.asarray([0, 2], dtype=cp.int64))
+        physicalized_metadata = selected_metadata.physicalize_logical_rows()
+
+    assert metadata.bounds is None
+    assert len(metadata.composition_parts) == 2
+    assert selected_metadata.bounds is None
+    assert selected_metadata.row_count == 2
+    assert len(selected_metadata.composition_parts) == 2
+    assert physicalized_metadata.composition_parts == ()
+    np.testing.assert_allclose(
+        cp.asnumpy(physicalized_metadata.bounds),
+        [[0.0, 0.0, 1.0, 1.0], [4.0, 4.0, 4.0, 4.0]],
+    )
+    assert area.is_device
+    assert length.is_device
+    np.testing.assert_allclose(cp.asnumpy(area.values[:3]), [1.0, 1.0, 0.0])
+    np.testing.assert_allclose(cp.asnumpy(length.values[:3]), [5.0, 4.0, 0.0])
+    assert bool(cp.asnumpy(cp.isnan(area.values[3])))
+    assert bool(cp.asnumpy(cp.isnan(length.values[3])))
+
+
 def test_native_geometry_composition_preserves_typed_empty_fallback() -> None:
     empty_lines = GeometryNativeResult.from_owned(
         from_shapely_geometries([LineString(), LineString(), None]),
@@ -8462,6 +8833,106 @@ def test_native_geometry_composition_device_take_uses_relation_pairs() -> None:
     assert part.geometry.owned is not None
     assert part.geometry.owned.is_indexed_view
     assert cp.asarray(part.geometry.owned._index_map).tolist() == [2, 0, 1, 0, 1]
+
+
+@pytest.mark.gpu
+def test_singular_device_composition_certifies_ordered_contiguous_parts_once() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device composition certification")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+
+    first = from_shapely_geometries(
+        [box(0, 0, 1, 1), box(2, 0, 3, 1)],
+        residency=Residency.DEVICE,
+    )
+    second = from_shapely_geometries(
+        [box(4, 0, 5, 1)],
+        residency=Residency.DEVICE,
+    )
+    composition = NativeGeometryComposition(
+        parts=(
+            NativeGeometryCompositionPart(
+                GeometryNativeResult.from_owned(first, crs=None),
+                cp.asarray([0, 1], dtype=cp.int64),
+            ),
+            NativeGeometryCompositionPart(
+                GeometryNativeResult.from_owned(second, crs=None),
+                cp.asarray([2], dtype=cp.int64),
+            ),
+        ),
+        row_count=3,
+        crs=None,
+        trusted_singular_rows=True,
+    )
+
+    reset_d2h_transfer_count()
+    spans = composition.ordered_contiguous_device_parts()
+    events = get_d2h_transfer_events(clear=True)
+
+    assert spans is not None
+    assert [(start, stop, owned.row_count) for start, stop, owned in spans] == [
+        (0, 2, 2),
+        (2, 3, 1),
+    ]
+    assert composition.contiguous_row_partitions
+    assert [event.reason for event in events] == [
+        "vibespatial.api.NativeGeometryComposition::ordered_contiguous_partition_certification"
+    ]
+
+    reset_d2h_transfer_count()
+    assert composition.ordered_contiguous_device_parts() == spans
+    assert get_d2h_transfer_events(clear=True) == []
+
+
+@pytest.mark.gpu
+def test_contiguous_device_composition_unique_take_keeps_one_row_indirected_root() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device composition take")
+    cp = pytest.importorskip("cupy")
+
+    first = GeometryNativeResult.from_owned(
+        from_shapely_geometries(
+            [box(0, 0, 1, 1), box(2, 0, 3, 1)],
+            residency=Residency.DEVICE,
+        ),
+        crs=None,
+    )
+    second = GeometryNativeResult.from_owned(
+        from_shapely_geometries(
+            [box(4, 0, 5, 1), box(6, 0, 7, 1)],
+            residency=Residency.DEVICE,
+        ),
+        crs=None,
+    )
+    geometry = GeometryNativeResult.from_composition(
+        NativeGeometryComposition.concat([first, second], crs=None),
+        crs=None,
+    )
+
+    taken = geometry.take(
+        cp.asarray([3, 1], dtype=cp.int32),
+        unique=True,
+    )
+
+    assert taken.composition is not None
+    assert taken.composition.trusted_singular_rows
+    assert taken.owned is None
+    assert all(
+        part.geometry.owned is not None
+        and part.geometry.owned.row_count == 2
+        and (
+            part.geometry.owned._base is None
+            or part.geometry.owned._base.row_count == 2
+        )
+        for part in taken.composition.parts
+    )
+    actual = np.asarray(
+        taken.to_geoseries(index=pd.RangeIndex(2), name="geometry"),
+        dtype=object,
+    )
+    assert actual[0].equals(box(6, 0, 7, 1))
+    assert actual[1].equals(box(2, 0, 3, 1))
 
 
 @pytest.mark.gpu
@@ -13895,8 +14366,9 @@ def test_geodataframe_concat_preserves_device_private_native_state() -> None:
     assert concatenated["score"].tolist() == [1.5, 2.5, 3.5]
     assert state is not None
     assert state.attributes.device_table is not None
-    assert state.geometry.owned is not None
-    assert state.geometry.owned.residency is Residency.DEVICE
+    assert state.geometry.composition is not None
+    assert state.geometry.composition.residency is Residency.DEVICE
+    assert state.geometry.composition.trusted_singular_rows is True
     assert arrays is not None
     assert cp.asnumpy(arrays["score"]).tolist() == [1.5, 2.5, 3.5]
     assert get_materialization_events(clear=True) == []

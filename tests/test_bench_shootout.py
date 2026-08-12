@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -162,6 +163,42 @@ def test_strict_native_transit_service_gap_matches_baseline() -> None:
 
 
 @pytest.mark.gpu
+def test_transit_semijoin_unique_preserves_clipped_left_index_labels() -> None:
+    """The transit anti-semijoin must compare public labels, not row positions."""
+    if not has_gpu_runtime():
+        pytest.skip("GPU required")
+
+    from shapely.geometry import box
+
+    import geopandas as gpd
+
+    source = gpd.GeoDataFrame(
+        {"building_id": [0, 1, 2]},
+        geometry=[box(index, 0.0, index + 0.5, 0.5) for index in range(3)],
+        index=[3000, 3010, 3020],
+    )
+    admin = gpd.GeoDataFrame(
+        {"admin_id": [0]},
+        geometry=[box(-1.0, -1.0, 4.0, 2.0)],
+    )
+    transit = gpd.GeoDataFrame(
+        {"station_id": [0, 1]},
+        geometry=[box(-1.0, -1.0, 4.0, 2.0)] * 2,
+        index=[900, 901],
+    )
+
+    with strict_native_environment():
+        clipped = gpd.clip(source, admin)
+        served = gpd.sjoin(clipped, transit, predicate="intersects")
+        served_labels = served.index.unique()
+        unserved = clipped.loc[~clipped.index.isin(served_labels)]
+
+    assert served.index.tolist() == [3000, 3000, 3010, 3010, 3020, 3020]
+    assert served_labels.tolist() == [3000, 3010, 3020]
+    assert unserved.empty
+
+
+@pytest.mark.gpu
 def test_strict_native_shootout_handles_nested_launcher_gpu_visibility() -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU required")
@@ -231,6 +268,48 @@ def test_shootout_postamble_runs_without_strict_native_env(tmp_path: Path) -> No
 
     assert run.error is None
     assert "TIMED=1;POST=None" in run.stdout
+
+
+def test_shootout_timeout_reaps_harness_descendants(tmp_path: Path) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    script = tmp_path / "timeout_descendant.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import os",
+                "import subprocess",
+                "import sys",
+                "import time",
+                "from pathlib import Path",
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])",
+                "Path(os.environ['VSBENCH_CHILD_PID_PATH']).write_text(str(child.pid))",
+                "# --- timed work starts here ---",
+                "time.sleep(60)",
+                "# --- timed work ends here ---",
+                "print('SHOOTOUT_FINGERPRINT: rows=1')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    run = _run_harness(
+        label="probe",
+        python_cmd=[sys.executable],
+        script=script,
+        repeat=1,
+        warmup=False,
+        env={**os.environ, "VSBENCH_CHILD_PID_PATH": str(child_pid_path)},
+        timeout=2,
+        quiet=True,
+    )
+
+    assert run.error is not None
+    assert "timeout" in run.error
+    child_pid = int(child_pid_path.read_text())
+    deadline = time.monotonic() + 2.0
+    while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not Path(f"/proc/{child_pid}").exists()
 
 
 def test_vibespatial_shootout_profile_reports_physical_plan_evidence(tmp_path: Path) -> None:

@@ -42,7 +42,10 @@ from vibespatial.runtime import has_gpu_runtime  # noqa: E402
 from vibespatial.runtime.crossover import PhysicalWorkEstimate  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
 
-from .query_types import _DeviceCandidates  # noqa: E402
+from .query_types import (  # noqa: E402
+    _DeviceCandidates,
+    require_device_candidate_pair_capacity,
+)
 from .query_utils import _expand_bounds  # noqa: E402
 
 
@@ -180,6 +183,8 @@ def _generate_candidates_gpu_multi(
     tree_count: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """GPU candidate gen for Q>1: count + exclusive_scan + scatter."""
+    import cupy as cp
+
     runtime = get_cuda_runtime()
     device_query_bounds = runtime.from_host(
         np.ascontiguousarray(query_bounds, dtype=np.float64).ravel()
@@ -188,6 +193,7 @@ def _generate_candidates_gpu_multi(
         np.ascontiguousarray(tree_bounds, dtype=np.float64).ravel()
     )
     device_counts = runtime.allocate((query_count,), np.int32)
+    device_counts_i64 = None
     device_offsets = None
     device_left = None
     device_right = None
@@ -222,12 +228,13 @@ def _generate_candidates_gpu_multi(
         )
 
         # Exclusive scan for output offsets (CCCL Tier 3a)
-        device_offsets = exclusive_sum(device_counts)
+        device_counts_i64 = cp.asarray(device_counts).astype(cp.int64, copy=False)
+        device_offsets = exclusive_sum(device_counts_i64)
 
         total_pairs = (
             count_scatter_total(
                 runtime,
-                device_counts,
+                device_counts_i64,
                 device_offsets,
                 reason="spatial query candidate-pair allocation fence",
             )
@@ -238,6 +245,11 @@ def _generate_candidates_gpu_multi(
         if total_pairs == 0:
             empty = np.empty(0, dtype=np.int32)
             return empty, empty
+
+        require_device_candidate_pair_capacity(
+            total_pairs,
+            relation_name="spatial query candidate relation",
+        )
 
         # Scatter pass
         device_left = runtime.allocate((total_pairs,), np.int32)
@@ -285,6 +297,7 @@ def _generate_candidates_gpu_multi(
         runtime.free(device_query_bounds)
         runtime.free(device_tree_bounds)
         runtime.free(device_counts)
+        runtime.free(device_counts_i64)
         runtime.free(device_offsets)
         runtime.free(device_left)
         runtime.free(device_right)
@@ -307,6 +320,7 @@ def _generate_candidates_gpu_multi_device(
     device_query_bounds, free_query_bounds = _candidate_bounds_device_view(runtime, query_bounds)
     device_tree_bounds, free_tree_bounds = _candidate_bounds_device_view(runtime, tree_bounds)
     device_counts = runtime.allocate((query_count,), np.int32)
+    device_counts_i64 = None
     device_offsets = None
     try:
         kernels = _spatial_query_kernels()
@@ -339,12 +353,13 @@ def _generate_candidates_gpu_multi_device(
         )
 
         # Exclusive scan for output offsets (CCCL Tier 3a)
-        device_offsets = exclusive_sum(device_counts)
+        device_counts_i64 = cp.asarray(device_counts).astype(cp.int64, copy=False)
+        device_offsets = exclusive_sum(device_counts_i64)
 
         total_pairs = (
             count_scatter_total(
                 runtime,
-                device_counts,
+                device_counts_i64,
                 device_offsets,
                 reason="spatial query device candidate-pair allocation fence",
             )
@@ -354,6 +369,11 @@ def _generate_candidates_gpu_multi_device(
 
         if total_pairs == 0:
             return None
+
+        require_device_candidate_pair_capacity(
+            total_pairs,
+            relation_name="spatial query device candidate relation",
+        )
 
         # Scatter pass
         device_left = cp.empty(total_pairs, dtype=cp.int32)
@@ -402,6 +422,7 @@ def _generate_candidates_gpu_multi_device(
         if free_tree_bounds:
             runtime.free(device_tree_bounds)
         runtime.free(device_counts)
+        runtime.free(device_counts_i64)
         runtime.free(device_offsets)
 
 
@@ -683,6 +704,7 @@ def _generate_candidates_morton_range_gpu(
     d_range_low = runtime.allocate((query_count,), np.uint64)
     d_range_high = runtime.allocate((query_count,), np.uint64)
     d_counts = runtime.allocate((query_count,), np.int32)
+    d_counts_i64 = None
     d_starts = None
     d_ends = None
     d_offsets = None
@@ -758,12 +780,13 @@ def _generate_candidates_morton_range_gpu(
         )
 
         # Step 4: Exclusive scan for output offsets (Tier 3a CCCL).
-        d_offsets = exclusive_sum(d_counts)
+        d_counts_i64 = cp.asarray(d_counts).astype(cp.int64, copy=False)
+        d_offsets = exclusive_sum(d_counts_i64)
 
         total_pairs = (
             count_scatter_total(
                 runtime,
-                d_counts,
+                d_counts_i64,
                 d_offsets,
                 reason="spatial query tree candidate-pair allocation fence",
             )
@@ -773,6 +796,11 @@ def _generate_candidates_morton_range_gpu(
 
         if total_pairs == 0:
             return None
+
+        require_device_candidate_pair_capacity(
+            total_pairs,
+            relation_name="Morton candidate relation",
+        )
 
         # Step 5: Scatter matching pairs (Tier 1 NVRTC).
         d_left = cp.empty(total_pairs, dtype=np.int32)
@@ -831,6 +859,7 @@ def _generate_candidates_morton_range_gpu(
         runtime.free(d_range_low)
         runtime.free(d_range_high)
         runtime.free(d_counts)
+        runtime.free(d_counts_i64)
         runtime.free(d_starts)
         runtime.free(d_ends)
         runtime.free(d_offsets)

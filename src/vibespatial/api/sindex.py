@@ -570,6 +570,112 @@ class SpatialIndex:
             precomputed_query_bounds=precomputed_query_bounds,
         )
 
+    def query_left_semijoin(
+        self,
+        geometry,
+        *,
+        predicate=None,
+        distance=None,
+        source_token: str | None = None,
+        query_token: str | None = None,
+        query_row_count: int | None = None,
+        precomputed_query_bounds=None,
+    ):
+        """Query this index directly into private matched-left row flow."""
+        native_index = self._native_spatial_index_for_query(
+            source_token=source_token,
+        )
+        if query_row_count is None:
+            query_row_count, _scalar = self._query_cardinality(geometry)
+        return native_index.query_left_semijoin(
+            geometry,
+            predicate=predicate,
+            distance=distance,
+            query_token=query_token,
+            query_row_count=query_row_count,
+            return_metadata=True,
+            precomputed_query_bounds=precomputed_query_bounds,
+        )
+
+    def query_left_antijoin(
+        self,
+        geometry,
+        *,
+        predicate=None,
+        distance=None,
+        source_token: str | None = None,
+        query_token: str | None = None,
+        query_row_count: int | None = None,
+        precomputed_query_bounds=None,
+    ):
+        """Query this index directly into private unmatched-left row flow."""
+        native_index = self._native_spatial_index_for_query(
+            source_token=source_token,
+        )
+        if query_row_count is None:
+            query_row_count, _scalar = self._query_cardinality(geometry)
+        return native_index.query_left_antijoin(
+            geometry,
+            predicate=predicate,
+            distance=distance,
+            query_token=query_token,
+            query_row_count=query_row_count,
+            return_metadata=True,
+            precomputed_query_bounds=precomputed_query_bounds,
+        )
+
+    def query_left_match_count_expression(
+        self,
+        geometry,
+        *,
+        predicate=None,
+        distance=None,
+        source_token: str | None = None,
+        query_token: str | None = None,
+        query_row_count: int | None = None,
+        precomputed_query_bounds=None,
+    ):
+        """Query this index directly into private per-left match counts."""
+        native_index = self._native_spatial_index_for_query(
+            source_token=source_token,
+        )
+        if query_row_count is None:
+            query_row_count, _scalar = self._query_cardinality(geometry)
+        return native_index.query_left_match_count_expression(
+            geometry,
+            predicate=predicate,
+            distance=distance,
+            query_token=query_token,
+            query_row_count=query_row_count,
+            return_metadata=True,
+            precomputed_query_bounds=precomputed_query_bounds,
+        )
+
+    def query_right_semijoin(
+        self,
+        geometry,
+        *,
+        predicate=None,
+        distance=None,
+        source_token: str | None = None,
+        query_row_count: int | None = None,
+        precomputed_query_bounds=None,
+    ):
+        """Query this index directly into private matched-index row flow."""
+        native_index = self._native_spatial_index_for_query(
+            source_token=source_token,
+        )
+        if query_row_count is None:
+            query_row_count, _scalar = self._query_cardinality(geometry)
+        return native_index.query_right_semijoin(
+            geometry,
+            predicate=predicate,
+            distance=distance,
+            query_row_count=query_row_count,
+            return_metadata=True,
+            precomputed_query_bounds=precomputed_query_bounds,
+        )
+
     def _query_native_relation_for_public_output(
         self,
         raw_geometry,
@@ -758,6 +864,9 @@ class SpatialIndex:
             return len(geometry), False
         if isinstance(geometry, OwnedGeometryArray):
             return int(geometry.row_count), False
+        row_count = getattr(geometry, "row_count", None)
+        if row_count is not None:
+            return int(row_count), False
         owned = getattr(geometry, "owned", None)
         if owned is not None:
             return int(owned.row_count), False

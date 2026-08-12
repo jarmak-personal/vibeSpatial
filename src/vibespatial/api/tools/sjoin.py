@@ -210,7 +210,7 @@ def _sjoin_relation_result(
     return_device: bool = False,
 ):
     """Build the native relation result before any DataFrame materialization."""
-    indices, query_implementation, query_execution = _geom_predicate_query(
+    relation, query_implementation, query_execution = _geom_predicate_query(
         left_df,
         right_df,
         predicate,
@@ -218,7 +218,7 @@ def _sjoin_relation_result(
         on_attribute=on_attribute,
         return_device=return_device,
     )
-    return RelationJoinResult(RelationIndexResult(*indices)), query_implementation, query_execution
+    return RelationJoinResult(relation), query_implementation, query_execution
 
 
 def _sjoin_export_result(
@@ -385,7 +385,7 @@ def _query_with_native_spatial_index(
         return_device=return_device,
         return_metadata=True,
     )
-    return (relation.left_indices, relation.right_indices), execution
+    return relation, execution
 
 
 def _native_spatial_index_for_sjoin_right(
@@ -423,12 +423,14 @@ def _native_spatial_index_for_sjoin_right(
             source_token=right_state.lineage_token,
         )
 
-    if (
-        query_row_count is not None
-        and right_owned.residency is Residency.DEVICE
-        and has_gpu_runtime()
-        and prefers_pair_mask_spatial_index_query(query_row_count, right_state.row_count)
-    ):
+    if right_owned.residency is Residency.DEVICE and has_gpu_runtime():
+        bounded_pair_mask = (
+            query_row_count is not None
+            and prefers_pair_mask_spatial_index_query(
+                query_row_count,
+                right_state.row_count,
+            )
+        )
         selection = plan_dispatch_selection(
             kernel_name="flat_index_build",
             kernel_class=KernelClass.COARSE,
@@ -441,7 +443,7 @@ def _native_spatial_index_for_sjoin_right(
         flat_index = build_flat_spatial_index(
             right_owned,
             runtime_selection=selection.runtime_selection,
-            device_bounds_only=True,
+            device_bounds_only=bounded_pair_mask,
         )
         return flat_index.to_native_spatial_index(
             source_token=right_state.lineage_token,
@@ -531,7 +533,7 @@ def _query_with_owned_spatial_index(
                 implementation="owned_empty_geometry_filter",
                 reason="empty geometries were filtered before owned spatial query",
             )
-            return (empty, empty), execution
+            return RelationIndexResult(empty, empty), execution
         if tree_positions.size != len(tree_geometry):
             tree_geometry = tree_geometry.iloc[tree_positions]
         else:
@@ -602,20 +604,27 @@ def _query_with_owned_spatial_index(
                 left_idx = cp.asarray(query_positions, dtype=left_idx.dtype)[left_idx]
             if tree_positions is not None:
                 right_idx = cp.asarray(tree_positions, dtype=right_idx.dtype)[right_idx]
-        return (left_idx, right_idx), execution
+        return (
+            RelationIndexResult(
+                left_idx,
+                right_idx,
+                sorted_by_left=bool(getattr(indices, "sorted_by_left", False)),
+            ),
+            execution,
+        )
     if indices.ndim == 1:
         empty = np.asarray([], dtype=np.intp)
         right_idx = indices.astype(np.intp, copy=False)
         if tree_positions is not None:
             right_idx = tree_positions[right_idx]
-        return (empty, right_idx), execution
+        return RelationIndexResult(empty, right_idx), execution
     left_idx = indices[0].astype(np.intp, copy=False)
     right_idx = indices[1].astype(np.intp, copy=False)
     if query_positions is not None:
         left_idx = query_positions[left_idx]
     if tree_positions is not None:
         right_idx = tree_positions[right_idx]
-    return (left_idx, right_idx), execution
+    return RelationIndexResult(left_idx, right_idx), execution
 
 
 def _is_device_array(values) -> bool:
@@ -958,7 +967,10 @@ def _geom_predicate_query(
         return_device=query_return_device,
     )
     if native_result is not None:
-        (l_idx, r_idx), native_execution = native_result
+        native_relation, native_execution = native_result
+        l_idx = native_relation.left_indices
+        r_idx = native_relation.right_indices
+        sorted_by_left = native_relation.sorted_by_left
         query_implementation = "native_spatial_index"
         query_execution = native_execution
     else:
@@ -973,10 +985,14 @@ def _geom_predicate_query(
             return_device=query_return_device,
         )
         if owned_result is not None:
-            (l_idx, r_idx), owned_execution = owned_result
+            owned_relation, owned_execution = owned_result
+            l_idx = owned_relation.left_indices
+            r_idx = owned_relation.right_indices
+            sorted_by_left = owned_relation.sorted_by_left
             query_implementation = "owned_spatial_query"
             query_execution = owned_execution
         else:
+            sorted_by_left = False
             query_execution = None
             # Owned path unavailable – fall back to sindex.query.
             if predicate == "within":
@@ -1009,6 +1025,7 @@ def _geom_predicate_query(
                 indexer = np.lexsort((r_idx, l_idx))
                 l_idx = l_idx[indexer]
                 r_idx = r_idx[indexer]
+                sorted_by_left = True
 
     if on_attribute:
         filtered_indices = None
@@ -1039,7 +1056,15 @@ def _geom_predicate_query(
                     left_df, right_df, l_idx, r_idx, attr
                 )
 
-    return (l_idx, r_idx), query_implementation, query_execution
+    return (
+        RelationIndexResult(
+            l_idx,
+            r_idx,
+            sorted_by_left=sorted_by_left,
+        ),
+        query_implementation,
+        query_execution,
+    )
 
 
 def _frame_join_from_relation_result(

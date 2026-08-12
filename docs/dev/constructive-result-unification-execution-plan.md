@@ -5,7 +5,7 @@ Scope: Execution plan for unifying constructive results across overlay, clip, di
 Read If: You are planning or executing the constructive-result refactor, overlay architecture rewrite, or planner-driven fusion work.
 STOP IF: You already have the active milestone open and only need local implementation detail.
 Source Of Truth: Program plan for making NativeTabularResult the canonical constructive boundary and using planner-selected workload families for acceleration.
-Body Budget: 884/900 lines
+Body Budget: 887/900 lines
 Document: docs/dev/constructive-result-unification-execution-plan.md
 
 Section Map (Body Lines)
@@ -18,13 +18,13 @@ Section Map (Body Lines)
 | 46-56 | Verify |
 | 57-75 | Risks |
 | 76-107 | Mission |
-| 108-156 | Target Shape |
-| 157-175 | Non-Goals |
-| 176-192 | Working Principles |
-| 193-204 | Tracking |
-| 205-320 | Milestone M0: Baseline, Contract Freeze, And Deletion Inventory |
-| 321-376 | Milestone M1: Shared Result Core And Canonical Contract Extraction |
-| 377-454 | Milestone M2: Explicit Export Boundary Rewrite |
+| 108-155 | Target Shape |
+| 156-174 | Non-Goals |
+| 175-191 | Working Principles |
+| 192-203 | Tracking |
+| 204-319 | Milestone M0: Baseline, Contract Freeze, And Deletion Inventory |
+| 320-375 | Milestone M1: Shared Result Core And Canonical Contract Extraction |
+| 376-453 | Milestone M2: Explicit Export Boundary Rewrite |
 | ... | (6 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -145,7 +145,6 @@ The target architecture is:
 
 The planner should select among workload families such as:
 
-- `clip_rewrite`
 - `broadcast_right_intersection`
 - `broadcast_right_difference`
 - `containment_bypass + batched_sh_clip + remainder_overlay`
@@ -731,7 +730,7 @@ surface name.
   operation, workload shape, topology class, semantics flags, result shape,
   execution family, and fusion opportunities.
 - [x] Teach overlay planning to distinguish at least:
-  `clip_rewrite`, `broadcast_right_intersection`,
+  `broadcast_right_intersection`,
   `broadcast_right_difference`, `coverage_union`, `grouped_union`, and
   `generic_reconstruction`.
 - [x] Record selected execution family in dispatch telemetry.
@@ -748,9 +747,13 @@ surface name.
   `semantics_flags`, `result_shape`, `execution_family`, and a staged
   `fusion_plan`.
 - The overlay planner now distinguishes the target workload families
-  explicitly: `clip_rewrite`, `broadcast_right_intersection`,
+  explicitly: `broadcast_right_intersection`,
   `broadcast_right_difference`, `coverage_union`, `grouped_union`, and
   `generic_reconstruction`.
+- Single-mask overlay intersections use the broadcast-right constructive
+  carrier directly. The former cross-surface `clip_rewrite` family was removed
+  after sparse prepared-mask classification made the native overlay shape both
+  exact and substantially faster for high-coverage masks.
 - `src/vibespatial/overlay/gpu.py` and
   `src/vibespatial/api/tools/overlay.py` both record the same
   planner-selected telemetry detail, including `execution_family`,

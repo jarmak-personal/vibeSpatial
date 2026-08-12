@@ -18,13 +18,13 @@ Section Map (Body Lines)
 | 36-41 | Verify |
 | 42-52 | Risks |
 | 53-71 | Principles |
-| 72-94 | Baseline Reading |
-| 95-113 | Reach Goals |
-| 114-169 | Workstreams |
-| 170-203 | Next Autonomous Push Queue |
-| 204-221 | Acceptance |
-| 222-233 | Tracking |
-| 234-314 | Fresh Session Handoff |
+| 72-97 | Baseline Reading |
+| 98-116 | Reach Goals |
+| 117-174 | Workstreams |
+| 175-241 | Next Autonomous Push Queue |
+| 242-259 | Acceptance |
+| 260-271 | Tracking |
+| 272-310 | Fresh Session Handoff |
 | ... | (1 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -99,9 +99,9 @@ physical shape with explicit export boundaries.
 
 ## Baseline Reading
 
-The ADR0044 rich baseline remains the floor for public workflow performance.
-The current native branch is already faster in aggregate on the 10k shootouts,
-but it achieves that while exposing more explicit materialization surfaces.
+The ADR0044 rich baseline remains the floor. The August 11 branch is exact
+across all 14 10k shootouts but runs at 0.826x parity versus the August 7 rich
+checkpoint's 1.201x, with more explicit materialization surfaces.
 
 The interpretation is:
 
@@ -111,14 +111,17 @@ The interpretation is:
 - changes that improve counters but lose wall time are rejected unless they
   remove a proven structural blocker
 
-The high-value signal from current 10k and 1M profiles is that the first
-reusable shapes are now active: relation consumers, many/few overlay,
-grouped geometry reduce, native composition, and mask clip all have green
-canaries. The remaining frontier is expanding those shapes beyond the current
-admitted paths while keeping public-object assembly terminal. Runtime dispatch
-now has a reusable `PhysicalWorkEstimate` carrier, so new native paths should
-feed coordinates, segments, pairs, groups, rows, or byte estimates into the
-shared planner instead of adding operation-local row thresholds.
+The high-value signal from current 10k and 1M profiles is that relation,
+many/few overlay, grouped geometry, composition, and clip carriers are active,
+but 1M capacity is not complete. Three shootouts request eager public joins of
+6.24B, 8.06B, and 9.51B rows; their two int32 pair columns alone require
+46.51GiB, 60.08GiB, and 70.84GiB. Reducible consumers must bypass those
+relations. `NativeSpatialIndex.query_left_semijoin()` launches one thread per
+query over its Morton-range slice, then count/scan/scatters bbox hits into a
+capacity-backed prefix. Exact kernels consume its device logical count and
+return `NativeDeviceSelection` without dynamic compaction. Antijoin complements
+the selection on device, and clip consumes its capacity partition plus active
+mask. Public joined-row export remains an explicit terminal cardinality limit.
 
 ## Reach Goals
 
@@ -159,9 +162,11 @@ The working ledger lives in `docs/dev/native-physical-shape-ledger.md`.
 
 ### 2. Relation Consumers
 
-Make `NativeRelation` the default internal currency for spatial join consumers:
-semijoin, anti-join, grouped counts, relation projection, and relation-backed
-attribute reduction. Public joined rows should be terminal/export behavior.
+Use `NativeRelation` when downstream semantics require pair flow. Use direct
+`NativeRowSet`/`NativeExpression` reduction when the consumer needs only
+existence, anti-existence, counts, or another reduction. Building a relation
+that the next operation immediately deduplicates is wrong physical shape.
+Public joined rows remain terminal/export behavior.
 
 Do not force small public sjoins through a slower device export path just to
 improve counters. The native win is downstream relation consumption, not public
@@ -202,19 +207,52 @@ proves a lower item is the blocker, and finish each changed carrier family.
 
 | Priority | Remaining work | Correct shape | First acceptance gate |
 |---|---|---|---|
-| P0 | Keep the ledger and handoff rebased after each autonomous push. Classify every >100ms total as native compute, setup, reference/oracle, or terminal export. | Profile rows mapped to ledger stage families, not benchmark names. | Updated ledger/handoff with stage names, times, fallback counts, and terminal-export classification. |
+| P0 | Active. Homogeneous direct left/right existential, anti-existence, and count consumers select range-sliced Morton reductions before relation construction. Query threads scan only their own interval slice; count/scan/scatter emits a fixed-capacity prefix, and exact kernels guard geometry work by its device logical count. Existential outputs remain `NativeDeviceSelection` through antijoin and clip consumers. Pair-preserving consumers retain relations. Mixed-family direct reduction still needs one capacity-backed family partition carrier. Eager public pair flow remains only when the API requests joined rows, with capacity failure explicit. | `NativeSpatialIndex` Morton ranges -> range-sliced candidate count/scan/scatter -> logical-count exact refine -> `NativeDeviceSelection`/`NativeExpression`; capacity-backed family partitions for mixed inputs. | Site, redevelopment, and retail homogeneous reductions complete on 24GB without a full relation and match 10K relation semantics; AST guards reject dense query-by-tree tiles and dynamic output compaction; mixed-family reduction must avoid full relation allocation. |
 | P1 | Completed: fixed nested takes size from structural metadata; boundary line/point families now pack directly from part capacity, and mixed rows remain `NativeGeometryComposition` until terminal export. The old dynamic compact/regroup helpers are deleted. Continue only if a new variable nested rowset path exposes a non-terminal sizing fence. | `OwnedGeometryArray` rowset view or gathered-buffer carrier with public row order, family-local row indirection, logical coordinate sizes, and explicit terminal materialization. | Clip boundary line/point/mixed canaries assert no non-terminal boundary allocation or offset-slice fences; mixed polygon/multipolygon row-indirected GeoDataFrame/Parquet canary remains green. |
 | P2 | Completed. Cover/exact-cache probes, many/few candidate relations, grouped polygon difference, collective line/polygon constructive, polygon-part explosion, boundary remnants, keep-type refinement, and public-row assembly all retain relation, grouped, rowset, part, or composition capacity. Indexed exact topology is row-indirected; named physicalization is used only where a contiguous family buffer is physically required. Host group offsets, per-row constructive loops, compact retry paths, exception-driven algorithm switches, post-hoc Shapely repair, and sparse metadata reconstruction are deleted. Exact topological equality now resolves structurally unresolved lineal and polygonal rows through bidirectional native constructive difference after bounded device physicalization, so redundant vertices and reordered multipart components remain GEOS-compatible without host topology. | `NativeSpatialIndex`/metadata -> `NativeRelation` -> predicate/refine relation -> constructive provenance -> native geometry composition/projection. | Grouped complement, collective line/polygon, pair-cache, boundary-composition, indexed-view, exception-atomicity, and full upstream overlay gates pass on the accelerator. |
 | P3 | The grouped polygonal-complement output-byte carrier is implemented: exact union rows explode to polygon parts, group-local ring parents preserve nested islands, and the output builder restores Polygon/MultiPolygon rows. Mixed complement/exact, rectangle-strip/exact, bounded strip-difference fragments, and sparse touching failures assemble natively. Known-coverage union and segment extraction size from structure/capacity; the grouped reducer derives pair/carry/next-round counts algebraically and uses sparse validity/degenerate rowsets. Grouped-union validity repair passes sparse invalid-row positions directly to atomic `GPURepairResult`; the original carrier is scattered once, and incomplete repair fails the admitted native plan instead of invoking host recomputation. Grouped-union coverage failure metadata is now input-row and output-group `NativeDeviceSelection` capacity, while residual geometry remains source-row aligned, reduces through one `NativeGroupedSelection` carrier, and merges through one valid-empty coverage union. Global polygon and coverage union now lower directly to one all-observed `NativeGrouped` sorted-offset carrier; fixed observed offsets bypass dynamic group compaction, public reduction wrappers do not retry Shapely after native admission, and the duplicate dissolve tree reducer, host bbox/color decomposition, spatial sorting, pairwise retry, and empty substitution paths are deleted. Make-valid validity-expression positions, invalid family/global mappings, valid-repair filtering, and duplicate indexed-row repair remain aligned device rowsets; invalid MultiPolygon parts remain at physical capacity through repair, real groups reduce through grouped fp64 topology, and inactive lanes occupy one sentinel group whose result is discarded by a static device take. `GPURepairResult` is complete-result-only: any unrepaired requested row causes an atomic native decline, recorded before host materialization. Residual-row export, Shapely patching, reupload, and mixed scatter assembly are deleted. GPU repair establishes device state once; the dead host coordinate/offset builder and Python ring reconstruction branch are deleted. Ring closure allocates one extra coordinate per ring, duplicate removal scan/scatters within retained capacity, and ring offsets carry the logical active prefix. Invalid normalized rows polygonize through shared overlay topology rather than the old quadratic make-valid split/rebuild engine. Linework mode composes repaired polygonal area with collapsed/internal source-boundary remnants through `NativeGeometryComposition`, so GeometryCollection construction is terminal. General, outlier, bounded same-row, grouped right-right, and same-side segment sweeps classify candidate pages, emit compact event runs, release each classified page immediately, and externally merge sorted unique runs with device lower/upper bounds instead of rebuilding one classified relation or globally sorting one concatenated event array. Nonpaged classification uses the same emitter and now has explicit device-state ownership. Row-isolated topology exceeding the memory-derived live-event target returns `PagedOverlayExecutionPlan`, derives page boundaries algebraically, and builds/releases one complete-row graph at a time. Half-edge nodes use the source/twin invariant once, and exact stable radix passes replace stacked fp64 lexsort keys throughout split, graph, face assembly, candidate-pair ordering, and grouped dissolve ordering. Oversized aligned and grouped single rows with strictly separated combined polygon-part x intervals return `ComponentOverlayExecutionPlan`; part grouping and disjoint result packing retain physical capacity, while one explicit component-count admission scalar selects the Python plan variant. Each interval becomes an independent synthetic row, grouped right parts retain same-side topology, and disjoint results pack back without another union. A connected oversized aligned row now returns `MicrocellOverlayExecutionPlan`: complete x intervals page at a fixed segment-membership budget, selected trapezoids emit exact slanted atoms, vertical interfaces atomize by signed `(row, x, y)` endpoint scans, duplicate atoms cancel by streamed radix keys, and disconnected contours classify nesting before canonical half-edge polygon assembly. Aligned multirow contraction now lowers segment endpoints and exact intersection events into one device-indirected `(row, interval, segment)` relation, compacts active memberships, and computes segmented left/right parity without row-span exports or a Python row loop. Exact positive-area semantics preserve nonzero slivers. The obsolete host union-find and grouped cell-union reconstruction were deleted. Buffered two-point line dissolve deduplicates source endpoints as a device rowset, buffers once, and executes one grouped topology reduction; host bounds coloring, partial unions, tree retry, and exception-driven execution switches are deleted. Device owned concat compacts active coordinate and nested-offset prefixes into retained capacity without terminal-offset scalar exports. `NativeDeviceSelection` represents dynamic ordered positions at source capacity plus a device logical count and can rebase gathered results onto their compact active prefix without reading that count. `NativeRelationSelection` and `NativeGroupedSelection` consume that capacity directly; relation selections now physicalize pair geometry, construct, gather attributes/provenance, and return `NativeTabularSelection` at capacity. `NativeTabularSelection` preserves the exact `NativeTabularResult` invariant while carrying dynamic logical rows over a capacity result; partition concat, rename, symmetric-difference assembly, and selected source ordering remain device-only, and compact `NativeRowSet` conversion is an explicit consumer/export boundary. Generic constructive adapters preserve the capacity result instead of forcing producer-specific compaction. Shared paths now reuse same-row fp64 segment classification, orient overlap capacity by the left source, reduce forward/backward atomic lines separately, and retain two ordered MultiLineString slots in native composition until terminal GeometryCollection export; the bespoke kernels, count fence, seven intermediate exports, and Python segment loops are deleted. Segmentize now counts one lane per physical input coordinate, scans int64 contribution capacity, gathers output span offsets directly, and scatters one lane per output coordinate. Mixed-family totals cross once in a compact exact-allocation packet because contiguous owned coordinate buffers require host-sized allocation; no geometry or row metadata crosses that boundary. Legacy multi-group public reduction lowers host CSR metadata once to the same native executor. | `NativeGrouped` offsets/codes, `NativeDeviceSelection`, `NativeRelationSelection`, `NativeTabularSelection`, row-indirected polygon parts, sparse rowsets, capacity-backed ring/segment/concat buffers, streamed candidate classification, externally merged split-event runs, complete-row, interval-component, and connected or segmented-multirow microcell topology, exact boundary atoms, segmented output-byte assembly, and logical-row or ordered-collection geometry composition. | Grouped topology/reducer/global-union guards, capacity-selection CPU/static guards, relation-selection constructive and dynamic-tabular no-compaction guards, CPU-safe page/component/microcell/concat/source-contract tests, duplicate-indexed repair/static rowset guards, buffered-line single-carrier/no-switch guards, shared-path capacity and ordered-composition guards, segmentize coordinate-capacity guards, multipart linework composition canaries, residual-capacity guards, and forced-budget, hole, nested-island, and sliver GPU canaries cover the shape; accelerator execution passes across broad grouped topology and full-profile gates. |
-| P4 | Completed. Polygon device candidates retain inside, exact-area, positive-area, boundary, source-lineage, and relation-coverage partitions as `NativeDeviceSelection` capacity. Rectangle and general polygon masks share native point/line/polygon assembly; degenerate line repair is line-part shaped; area plus lower-dimensional remnants stay in `NativeGeometryComposition`; semantic cleanup returns `NativeTabularSelection`; and grouped masks use one aggregate admission packet that never sizes geometry. Host correction probes, boundary-row export/reupload, compact regroup, repeated semantic takes, and terminal exact rebuild are deleted. Dynamic public results perform only the exact count read required by pandas, while possible GeometryCollection rows perform a terminal multiplicity certification before owned-device physicalization; neither is compute-path assembly. | `NativeGeometryMetadata`/`NativeExpression` -> `NativeRelation`/`NativeDeviceSelection` -> exact or dynamic native tabular, owned, or composition assembly, with GEOS typing only at public export. | Polygon/point/line/mixed, semantic cleanup, degenerate repair, area-plus-boundary, rectangle split, grouped-mask, and no-scalar-admission canaries pass; broad clip and upstream gates pass on the accelerator. |
+| P4 | Completed. Polygon candidates retain inside, exact-area, boundary, lineage, and relation-coverage selections at device capacity. One-mask classification now queries a reusable segment index for boundary MBR and exact ray candidates; Morton span buckets bound scheduled lanes, count/scan/scatter keeps candidate counts on device, an explicit fp64 predicate `PrecisionPlan` governs exact orientation, and exact topology crosses one aggregate allocation packet into a compact concrete prefix before device scatter-back. Rectangle/general masks share native point/line/polygon assembly; degenerate repair is line-part shaped; lower-dimensional remnants stay in `NativeGeometryComposition`; cleanup returns `NativeTabularSelection`. Host correction probes, boundary export/reupload, logical-count admission, compact regroup, repeated semantic takes, and terminal exact rebuild are deleted. | `NativeGeometryMetadata`/`NativeExpression` -> indexed candidate relation/`NativeDeviceSelection` -> exact physicalized prefix -> native tabular, owned, or composition assembly, with GEOS typing only at public export. | Indexed-mask lane-bound/exact-ray/precision-plan, polygon/point/line/mixed, cleanup, degenerate repair, area-plus-boundary, rectangle split, grouped-mask, and no-scalar-admission canaries pass; broad clip and upstream gates pass on the accelerator. |
 | P5 | Completed for the admitted composition contract. Device indexed views propagate all-valid caches without host row reads; multi-partition owned scatter fuses replacements into one row-indirected carrier; public `assign`, `__setitem__`, `insert`, concat, exact/duplicate label selection, object-backed loader deferral, numeric rowset takes, arithmetic/filter, geom-type, area, scalar-dwithin, and public Series-mask sidecars preserve exact native state. Broad `query`, `eval`, `merge`, `join`, and other unknown pandas operations intentionally drop state. Reopen only for a stale-state failure or a newly admitted exact operation. | `NativeFrameState` + `NativeRowSet`/projection transitions with exact invalidation. | Zero-transfer assignment/concat, loader deferral, duplicate-label selection, device-take scatter, and fused multi-scatter canaries stay green; stale or unknown pandas operations conservatively drop native state. |
 | P6 | Every `plan_dispatch_selection` caller now supplies a physical estimate or an explicit host/bootstrap estimate. Shared carriers cover coordinates, coordinate pairs, segments, segment pairs, parts, part pairs, rings, candidate/relation pairs, groups, output rows, output bytes, and temporary bytes; authoritative device families and logical indexed expansion are used without metadata export. Buffer, validity, repair, metric, linear-reference, spatial-index, predicate, overlay, and polygon constructive wrappers report their actual scan, quadratic, relation, or bounded-output shape. Polygon buffer remains stream ordered. Grouped-difference polygon explosion and every production compute caller now use row indirection or the named non-mutating device-row physicalization boundary. Direct mutating `_device_resolve` calls are restricted to owned-carrier internals by `ARCH009`. | Shared estimates plus named native-carrier physicalization. | Runtime policy tests prove scan, quadratic pair, grouped, indexed, output, and scratch pressure can dominate without host scans or local row gates; AST audit reports zero planner calls without `work_estimate`. |
 | P7 | Current checkpoint split compute, terminal, and reference counters and moved default-profile terminal geometry writes onto native device export rails. Continue here only for user-visible export breadth, not compute-path accounting. | Explicit terminal export from native carriers, measured separately from compute. | Export benchmark/canary reports wall time separately and does not hide compute-stage host work. |
 
 ### Reconciled Gate Status
 
-The physical-shape queue is complete. Broad compatibility, 10K repeat-3, and full
-1M gates are green. Reopen only for measured host-shaped compute or a >100ms stage.
+The queue is active. The August 11 1M shootout has 11 successful exact
+workflows and three eager joined-row capacity failures. Direct native semijoin
+reductions now complete those logical selections on 24GB: site suitability is
+6.64s for 350,223 rows, redevelopment is 9.18s for 414,447 rows, and retail is
+11.58s for transit plus 12.23s for competitor exclusion. At 10K, the site
+rowset exactly matches the 3,302 unique left rows from the 778,271-pair public
+relation. The anti-join API complements the exact matched rowset on device and
+the count API scans every bounded tile into one int64 value per left row. A
+1M-row/32-tree-row probe evaluates 32M exact predicates and 16M matches in
+59.85ms with one 24-byte planning packet and no pair carrier. Public scripts that explicitly
+request billions of joined rows remain expected terminal failures until their
+API contract requests a reduction.
+
+The nullable homogeneous device-placeholder take bug is fixed; the 1M site
+difference overlay now completes in 5.91s for 352,648 rows. Buffered-line
+dissolve now uses bounded binary aggregate levels and improves the 1M exact
+corridor materialization from 65.40s to 34.32s with the same valid native shape.
+Fresh public vegetation is 34.64s and habitat is 55.95s. Across 11 exact public 1M workflows, vibeSpatial is 133.57s
+versus 963.60s for the unchanged GeoPandas baseline, a 7.21x aggregate speedup.
+The fresh mandatory full profile passes 11 active 1M pipelines in 0.623s
+combined. No stage exceeds 73.3ms; compute has zero materializations and zero
+fallbacks. Grouped topology emits 11 bounded planning packets totaling 8,376
+bytes, and peak tracked device allocation is 1.38GB.
+
+The fresh post-review 10K gate is 14/14 exact: GeoPandas is 3.553s and vibeSpatial
+is 4.301s. Site is 2.47x, retail 2.18x, nearby buildings 1.74x, flood exposure
+1.50x, and transit 1.20x faster. Vegetation is 860.2ms versus 294.9ms;
+redevelopment is 739.0ms versus 731.0ms. The profile records 253 materializations,
+705 runtime D2H events, and 143 materialization D2H events. Both totals moved
+upward during storage activity; unchanged physical counters are the reliable comparison.
+
+Regression recovery remains active: corridor/network grouped construction,
+vegetation exact overlay, and repeated public composition are the largest
+losses. The 0.826x result fails the rich floor; fix carrier roots without
+workflow special cases or resident-data GEOS redirects.
 
 ### Queue Rules
 
@@ -252,9 +290,9 @@ And it must satisfy all of:
 | Workstream | Shape canary | Primary guard | Status |
 |---|---|---|---|
 | Physical shape ledger | Ledger table | Intake routes hot stages to shapes | Complete; maintain with profiles |
-| Relation consumers | Native relation semijoin/reduce profiles | Spatial join stage <=100ms | Complete; canary green |
+| Relation consumers | Direct range-sliced Morton left/right existential and anti selections plus count expressions | 10K <=100ms; 1M bounded by tile memory and Morton intervals, not relation cardinality | Active; homogeneous range-sliced reductions and device-count outputs are complete, mixed-family capacity partitioning remains |
 | Many/few overlay | Overlay relation-to-constructive profile | Many/few overlay <=100ms | Complete; canary green |
-| Grouped geometry reduce | NativeGrouped union/disjoint/difference profiles | Grouped reduce <=100ms | Complete; canaries green |
+| Grouped geometry reduce | NativeGrouped union/disjoint/difference and buffered-line binary reduction profiles | 10K <=100ms; bounded fan-in at 1M | Active; general canaries green, 1M buffered corridor 34.32s |
 | Native composition | Zero-transfer rowset/profile | Copy + filter <=100ms | Complete; canary green |
 | Mask clip and area filtering | Predicate-heavy and clip rowset canaries | Mask/area cleanup <=100ms | Complete; canaries green |
 | Terminal export | Native Arrow/Parquet profile | Report separately | Tracked separately |
@@ -263,78 +301,36 @@ And it must satisfy all of:
 
 - Core shape: overlay consumes relations, clip consumes rowsets, grouped reduce
   consumes `NativeGrouped`, and GeometryCollection/GEOS typing is terminal.
-- P2: grouped polygon difference treats containment and collective coverage as
-  topology. Rectangle-hole, polygon-hole, and polygon-donut builders now return
-  public-row-capacity results plus device support masks. Exact topology consumes
-  the complementary metadata-masked groups once, and one device index map fuses
-  all direct/exact partitions without scalar admission, group compaction, or the
-  former two-int group-size export. Device pairs radix-sort once into dense
-  source-row `NativeGrouped` offsets; zero spans preserve no-neighbor rows, and
-  external unique-left batching, pool trims, concatenation, and scatter are
-  deleted because grouped topology owns paging. The aligned polygon router uses
-  five device-counted capacity partitions, including non-rectangle and
-  `keep_geom_type=False` batches, before native boundary composition. Pairwise
-  line/polygon work shares split-event capacity with row-indirected null lanes.
-- P3: paged split events, exact radix half-edge assembly, component plans, and
-  connected microcell boundary reconstruction are implemented. Multirow
-  contraction uses a segmented device relation instead of exporting row spans
-  and iterating rows on the host. Buffered-line dissolve and invalid grouped
-  output repair are one-shot grouped/atomic carriers with no execution retry.
-  Device concat/gather and physical take, polygon boundary/interiors, bounded
-  SH/rectangle/contained-hole and buffer assembly, line merge, point-pair and
-  point/line part expansion, and make-valid retain capacity/logical lengths
-  without scalar-sized allocation. Generic capacity offset-slice gathering now
-  uses guarded row-range kernels, so inactive allocation lanes never feed
-  search/gather indices. Its lower-level slice planner requires structure or
-  capacity; unknown-size generic value gathers require a caller-owned reason,
-  and only mixed WKT/KML/GeoJSON input-family assembly uses that boundary.
-  Line/polygon construction now uses shared split-event capacity across all
-  rings and parts; its first-ring count/scatter kernel and allocation fences are
-  deleted. Segmentize now counts and scans physical coordinate lanes, batches
-  all family totals into one exact-allocation packet, and scatters output lanes
-  directly; the packet controls contiguous device allocation and carries no
-  geometry or row metadata.
-  Aligned line-line intersection consumes the shared same-row segment classifier page-by-page and carries mixed results through ordered native composition. Repeated-right variable-width polygon, point, and line consumers use fixed/max structural metadata or conservative row-indirected bounds; explode no longer physicalizes and retries.
-  Segmentize uses constructive precision policy; make-valid output stays native. Row-isolated face output extracts one selected-side boundary-cycle carrier: positive cycles are shells and negative cycles are holes. The inverse excluded-face carrier, full-capacity ring merge, collapsed-excluded repair, and duplicate-hole signature kernels are deleted.
-  Face assembly is device-only after native admission; the selected-face host bridge is explicit debug/export. Geometry-only spatial overlay lowers device candidate columns atomically into canonical `NativeRelation`, rejects host-backed pair carriers, radix-orders that relation, executes pair intersections collectively, and runs each difference side through one full-source grouped topology plan.
-  Identity, planar union, and symmetric difference compose those native components. The old pairwise-union semantics, no-candidate early return, per-group stream executor, boundary exports, centroid rescue, and Shapely fallback are deleted; the explicit CPU oracle is isolated in `overlay.host_fallback`.
-  Grouped rectangle-strip/exact and positive-area/degenerate routing are complementary capacity partitions with no two-flag packet. Grouped-union residual closure retains one initial logical-count admission to avoid an empty regroup/merge; the duplicate post-repair difference/area pass and scalar are deleted because exact closure is `C union (I difference C)`.
-  Compact `NativeRowSet` conversion occurs only at the explicit `NativeTabularSelection` consumer/export boundary; structural constructive failures remain atomic.
-- P6: every planner call carries physical shape and authoritative device families.
-  Indexed metrics compact unique rows, bin selected coordinate spans on device, and scatter by inverse;
-  other compute uses named row indirection/physicalization, and `ARCH009` confines `_device_resolve` to owned internals.
-- Unary stroke admission physicalizes resident indexed logical rows before family dispatch; unreferenced ancestral buffers cannot trigger mixed fallback, and admitted kernel failures are atomic.
-- P4: polygon clip predicates carry indexed source rows and candidate-local outputs
-  through device-counted capacity selections; rectangle specialization does not compact or scalar-probe tags.
-  Grouped-mask clip keeps covered/unresolved source and predicate-pair capacities; one
-  two-int plan packet never sizes geometry. Pair intersections reduce by source:
-  valid-empty grouped polygon identities, area-subtracted/noded atomic line edges,
-  deduplicated points with area/line suppression, and terminal native composition.
-  Mixed-family constructive physicalizes family-pair rows at public capacity
-  and fuses one row-indirected result; trusted family-domain and unique-row
-  proofs avoid ordinary semantic probes. Clip cleanup combines nonempty, area,
-  and keep-type filters in one capacity selection. Degenerate line parts use
-  segmented exact deduplication and compensated fp64 Point-capacity reduction.
-- Runtime ordering is explicit across driver, pylibcudf, and CCCL on CuPy's current
-  stream. One service retires frees and all CCCL operands; PTDS retains lifetime-unique
-  identity and submitter-recorded events. Cached calls lease ordered scratch;
-  invocation failures transfer ownership before re-raising, and explicit sync claims only prior work.
-  Event API failures require a proven boundary and bounded retry. Pylibcudf wrappers, producers,
-  and value-aware consumers follow stream completion.
-  This keeps habitat at 218.6ms in final repeat-3 while preserving asynchronous overlap.
-- GeometryCollection clip ingress lowers members to concrete device parts and performs
-  source-row grouped mixed union: polygon coverage is unioned,
-  lines are noded outside area, covered points are removed, and nested members plus overlapping polygons match normalized GEOS constructive
-  output; ordinary device-owned sources still bypass the host type probe.
-- Final 10K repeat-3 (August 7, 2026): 14/14 exact, GeoPandas 3328.6ms versus
+- Completed topology uses relation/group/segment/ring capacity, row indirection,
+  paged exact events, segmented radial merges, and atomic decline after admission.
+  Signed source winding deltas survive partial-overlap renoding; exact cycle
+  orientation labels bounded faces; fixed-capacity indexed containment and an
+  O(E) boundary peel replace face-pair probes and host convergence. Exact
+  construction preserves every positive fp64 sliver. Do not restore tolerances,
+  host regroup, retry, semantic repair, or Shapely repair paths.
+- Runtime ordering is explicit across driver, pylibcudf, and CCCL on the active
+  CuPy stream. Planner calls carry authoritative physical estimates, and
+  `ARCH009` confines mutating device resolution to owned internals.
+- Rich 10K repeat-3 (August 7, 2026): 14/14 exact, GeoPandas 3328.6ms versus
   vibeSpatial 2771.8ms (1.201x), zero failures. Site suitability is 3.53x,
   retail 2.19x, redevelopment 2.00x, and vegetation 1.16x faster than
   GeoPandas.
-- Final full 1M sparkline: maximum active stage 69.82ms; grouped disjoint setup
-  63.91ms, mixed union 50.90ms, grouped union 34.25ms, grouped difference
-  10.59ms, and relation intersection 1.78ms. Every active pipeline reports zero
-  compute materialization and zero compute D2H. Two raster cases remain expected
-  feature deferrals.
+- Current 10K repeat-3 (August 11, 2026): 14/14 exact, GeoPandas 3552.8ms versus
+  vibeSpatial 4301.4ms (0.826x). Site is 2.47x, retail 2.18x, nearby 1.74x, flood
+  1.50x, and transit 1.20x faster. Exact-prefix physicalization lowers vegetation
+  from 1169.0ms to 860.2ms. The profile records 253 materializations, 705 runtime
+  D2H events, and 143 materialization D2H events.
+- August 11 1M capacity checkpoint: 11 public shootouts complete exactly in
+  133.57s versus 963.60s for GeoPandas, a 7.21x aggregate speedup. Site, redevelopment, and retail
+  stop before public export because their eager joins contain 9.51B, 8.06B,
+  and 6.24B pairs. The direct native semijoin carrier completes their intended
+  unique-left reductions in 6.64s, 9.18s, and 11.58s/12.23s respectively.
+  Vegetation corridor is no longer a `make_valid` issue: deferred exact union
+  dominates, and bounded binary aggregate reduction lowers it from 65.40s to
+  34.32s; the fresh public workflow is 34.64s. The full mandatory profile
+  passes all 11 active 1M pipelines with no stage above 73.3ms, zero compute
+  materializations/fallbacks, and 8,376 bytes of bounded grouped planning
+  packets.
 - Correctness gates pass: strict-native upstream is 1,971 passed / 423 skipped /
   5 xfailed; contract health passes every surface; the focused carrier suite is
   612 passed; and the uninterrupted local plus vendored-upstream suite is 7,028
@@ -342,7 +338,11 @@ And it must satisfy all of:
 
 ## Completion State
 
-The PRD is complete. Deterministic, contract, strict-native, focused, benchmark,
-and uninterrupted full-suite gates are green. Native compute has no measured
-materialization or D2H, every active 1M stage is below 100ms, all 10K fingerprints
-are exact, and remaining public compatibility/export boundaries are explicit.
+The PRD is active. Immediate remaining work is root-cause recovery to at least
+the 1.201x rich 10K floor, beginning with corridor/network grouped constructive
+reduction, vegetation exact overlay, and repeated public
+composition/materialization. Broad compatibility verification remains part of
+each landed recovery. Eager public
+joins with multi-billion output rows are an explicit terminal cardinality
+limit on a 24GB device; this does not block reduced native consumers, but it
+cannot be described as a successful public 1M export.

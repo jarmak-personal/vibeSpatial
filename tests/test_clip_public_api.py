@@ -39,6 +39,38 @@ from vibespatial.testing import strict_native_environment
 clip_module = importlib.import_module("vibespatial.api.tools.clip")
 
 
+def _assert_native_geometry_device_resident(values: DeviceGeometryArray) -> None:
+    """Accept either contiguous owned storage or a device-native composition."""
+    owned = values.cached_owned()
+    if owned is not None:
+        assert owned.residency is Residency.DEVICE
+        assert owned.device_state is not None
+        return
+    composition = values.native_composition
+    assert composition is not None
+    assert composition.residency is Residency.DEVICE
+
+
+def _assert_native_geometry_trusted_valid(values) -> None:
+    """Require an all-valid proof without imposing a contiguous layout."""
+    if isinstance(values, DeviceGeometryArray):
+        owned = values.cached_owned()
+        if owned is None:
+            composition = values.native_composition
+            assert composition is not None
+            assert composition.trusted_all_ogc_valid is True
+            return
+    else:
+        owned = getattr(values, "_owned", None)
+    assert owned is not None
+    cached = owned._cached_is_valid_mask
+    if cached is not None:
+        np.testing.assert_array_equal(cached, np.ones(len(values), dtype=bool))
+        return
+    assert owned.device_state is not None
+    assert owned.device_state.trusted_all_ogc_valid is True
+
+
 def _clip_partition_objects(result) -> np.ndarray:
     if isinstance(result, GeometryNativeResult):
         return np.asarray(
@@ -106,6 +138,7 @@ def test_clip_relation_admission_uses_device_rowsets() -> None:
         "clip invalid polygon candidate scalar fence",
         "clip rectangle source positive-span scalar fence",
         "clip rectangle polygonal mixed-family row collision scalar fence",
+        "clip exact-topology admission count packet",
     }
 
     assert all(fence not in source for fence in retired_fences)
@@ -1212,7 +1245,10 @@ def test_clip_polygon_area_and_boundary_remnants_use_native_composition() -> Non
         part.geometry.owned is not None and part.geometry.owned.residency is Residency.DEVICE
         for part in capacity_result.geometry.composition.parts
     )
-    assert get_d2h_transfer_events(clear=True) == []
+    d2h_events = get_d2h_transfer_events(clear=True)
+    assert len(d2h_events) == 1
+    assert d2h_events[0].reason == "constructive device geometry row-size planning packet"
+    assert d2h_events[0].bytes_transferred <= 24
 
     exported = native_result.to_geodataframe()
     expected = shapely.intersection(source_geometry, mask)
@@ -1260,7 +1296,12 @@ def test_clip_geometrycollection_ingress_uses_native_grouped_union() -> None:
     assert composition is not None
     assert composition.residency is Residency.DEVICE
     assert all(part.collection_position is None for part in composition.parts)
-    assert get_d2h_transfer_events(clear=True) == []
+    d2h_events = get_d2h_transfer_events(clear=True)
+    assert [event.reason for event in d2h_events] == [
+        "fused multi-root capacity scatter exact allocation packet",
+        "constructive indexed polygon-part size planning packet",
+    ]
+    assert sum(event.bytes_transferred for event in d2h_events) <= 440
 
     with pytest.warns(UserWarning, match="GeometryCollection"):
         result = clip(source, mask, keep_geom_type=True)
@@ -2338,7 +2379,7 @@ def test_clip_scalar_rectangle_polygon_mask_auto_preserves_device_cleanup_path()
     result = clip(gdf, mask, keep_geom_type=True, sort=False)
 
     assert isinstance(result.geometry.values, DeviceGeometryArray)
-    assert result.geometry.values._owned.residency is Residency.DEVICE
+    _assert_native_geometry_device_resident(result.geometry.values)
     actual = np.asarray(result.geometry.values, dtype=object)
     expected = np.asarray(
         [
@@ -2395,7 +2436,7 @@ def test_clip_scalar_rectangle_device_multipolygon_keep_geom_type_stays_off_host
     assert len(result) == 1
     assert result.geom_type.iloc[0] in POLYGON_GEOM_TYPES
     assert isinstance(result.geometry.values, DeviceGeometryArray)
-    assert result.geometry.values._owned.residency is Residency.DEVICE
+    _assert_native_geometry_device_resident(result.geometry.values)
     assert shapely.equals(result.geometry.iloc[0], shapely.intersection(source_geom, mask))
     assert not any(
         event.surface == "geopandas.clip"
@@ -2647,7 +2688,7 @@ def test_clip_scalar_rectangle_device_multipolygon_uses_canonical_device_path(
     assert len(result) == 1
     assert result.geom_type.iloc[0] in POLYGON_GEOM_TYPES
     assert isinstance(result.geometry.values, DeviceGeometryArray)
-    assert result.geometry.values._owned.residency is Residency.DEVICE
+    _assert_native_geometry_device_resident(result.geometry.values)
     assert shapely.equals(result.geometry.iloc[0], expected)
 
 
@@ -3638,6 +3679,8 @@ def test_multipolygon_rectangle_keep_type_uses_part_capacity_pack() -> None:
     assert "preserve_indexed_view=True" in assembler_source
     assert "d_part_family_rows" in assembler_source
     assert "d_sorted_output_ids" in assembler_source
+    assert "d_sorted_output_edge_counts=d_sorted_output_edge_counts" in assembler_source
+    assert "d_ring_offsets[1:] - d_ring_offsets[:-1]" not in assembler_source
     assert "cp.flatnonzero" not in pack_source
     assert "physicalize_device_rows" not in pack_source
 
@@ -5027,7 +5070,7 @@ def test_clip_declines_host_line_make_valid_cleanup(
         result = native_result.to_spatial()
 
     assert isinstance(result.geometry.values, DeviceGeometryArray)
-    assert result.geometry.values._owned.residency is Residency.DEVICE
+    _assert_native_geometry_device_resident(result.geometry.values)
     assert shapely.equals(result.geometry.iloc[0], Point(0.0, 0.0))
     assert not any(
         event.surface == "geopandas.clip" and event.pipeline == "clip.to_spatial"
@@ -5197,8 +5240,7 @@ def test_clip_polygon_mask_preserves_device_backing_for_polygon_workloads() -> N
     events = vibespatial.get_dispatch_events(clear=True)
 
     assert isinstance(result.geometry.values, DeviceGeometryArray)
-    assert result.geometry.values._owned.residency is Residency.DEVICE
-    assert result.geometry.values._owned.device_state is not None
+    _assert_native_geometry_device_resident(result.geometry.values)
     assert any(
         event.operation == "intersection"
         and event.implementation == "broadcast_right_virtual_segment_topology_gpu"
@@ -5260,7 +5302,7 @@ def test_clip_declines_host_semantic_cleanup(monkeypatch: pytest.MonkeyPatch) ->
         result = native_result.to_spatial()
 
     assert isinstance(result.geometry.values, DeviceGeometryArray)
-    assert result.geometry.values._owned.residency is Residency.DEVICE
+    _assert_native_geometry_device_resident(result.geometry.values)
     assert shapely.equals(result.geometry.iloc[0], box(0.5, 0.5, 1.5, 1.5))
     assert not any(
         event.surface == "geopandas.clip" and event.pipeline == "clip.to_spatial"
@@ -6454,13 +6496,7 @@ def test_clip_polygon_result_seeds_validity_cache_on_owned_output() -> None:
     )
     result = _materialize_native_clip_result(native_result, source=gdf)
 
-    result_owned = getattr(result.geometry.values, "_owned", None)
-    assert result_owned is not None
-    assert result_owned._cached_is_valid_mask is not None
-    np.testing.assert_array_equal(
-        result_owned._cached_is_valid_mask,
-        np.ones(len(result), dtype=bool),
-    )
+    _assert_native_geometry_trusted_valid(result.geometry.values)
     assert result["value"].tolist() == [1]
     assert result.geometry.iloc[0].normalize().equals(box(1.0, 1.0, 3.0, 3.0))
 
@@ -6492,13 +6528,7 @@ def test_clip_polygon_result_preserves_validity_cache_through_public_filter_copy
     result = _materialize_native_clip_result(native_result, source=gdf)
     filtered = result[result.geometry.geom_type.isin(POLYGON_GEOM_TYPES)].copy()
 
-    filtered_owned = getattr(filtered.geometry.values, "_owned", None)
-    assert filtered_owned is not None
-    assert filtered_owned._cached_is_valid_mask is not None
-    np.testing.assert_array_equal(
-        filtered_owned._cached_is_valid_mask,
-        np.ones(len(filtered), dtype=bool),
-    )
+    _assert_native_geometry_trusted_valid(filtered.geometry.values)
     assert filtered["value"].tolist() == [1]
 
 
@@ -6799,7 +6829,8 @@ def test_clip_device_candidate_ordering_uses_soa_radix_keys() -> None:
     assert "cp.lexsort" not in function_source
     assert "cp.stack" not in function_source
     assert "d_rows.astype(cp.float64" not in function_source
-    assert source.count("_clip_spatially_order_device_rows(d_rows,") == 2
+    assert source.count("_clip_spatially_order_device_rows(") == 3
+    assert "active_mask=d_active" in source
 
 
 def test_clip_device_bbox_candidate_uses_device_mask_bounds_without_total_bounds_d2h() -> None:
@@ -7129,7 +7160,7 @@ def test_clip_consumes_lazy_grouped_union_mask_without_materializing_union() -> 
     dissolved_mask = mask_frame.dissolve(by="group", aggfunc="first", method="unary")
     dissolved_mask = dissolved_mask.reset_index()
     assert getattr(
-        dissolved_mask.geometry.values._owned,
+        dissolved_mask.geometry.values.cached_owned(),
         "_is_lazy_grouped_union_owned",
         False,
     )
@@ -7206,7 +7237,7 @@ def test_clip_lazy_grouped_union_covered_source_rows_passthrough() -> None:
     dissolved_mask = mask_frame.dissolve(by="group", aggfunc="first", method="unary")
     dissolved_mask = dissolved_mask.reset_index()
     assert getattr(
-        dissolved_mask.geometry.values._owned,
+        dissolved_mask.geometry.values.cached_owned(),
         "_is_lazy_grouped_union_owned",
         False,
     )
@@ -7251,7 +7282,72 @@ def test_clip_lazy_grouped_union_covered_source_rows_passthrough() -> None:
     assert not any("LazyGroupedUnionOwned" in surface for surface in materialization_surfaces)
 
 
-def test_clip_collective_lazy_grouped_union_mask_physicalizes_once() -> None:
+def test_clip_device_covered_partition_uses_inactive_exact_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    source_geoms = [box(float(i), 0.0, float(i) + 0.5, 0.5) for i in range(40)]
+    source = vibespatial.GeoDataFrame(
+        {
+            "value": np.arange(len(source_geoms), dtype=np.int32),
+            "geometry": DeviceGeometryArray._from_owned(
+                from_shapely_geometries(source_geoms, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+        },
+        crs="EPSG:3857",
+    )
+    mask_geom = Polygon(
+        [(-2.0, -1.0), (41.0, -1.0), (42.0, 1.0), (41.0, 2.0), (-2.0, 2.0)]
+    )
+    mask = vibespatial.GeoDataFrame(
+        {
+            "geometry": DeviceGeometryArray._from_owned(
+                from_shapely_geometries([mask_geom], residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            )
+        },
+        crs="EPSG:3857",
+    )
+
+    original_exact = clip_module._clip_polygon_area_intersection_owned
+    exact_inputs = []
+
+    def _capture_exact(candidate_owned, *args, **kwargs):
+        exact_inputs.append(candidate_owned)
+        return original_exact(candidate_owned, *args, **kwargs)
+
+    monkeypatch.setattr(
+        clip_module,
+        "_clip_polygon_area_intersection_owned",
+        _capture_exact,
+    )
+    vibespatial.clear_dispatch_events()
+    reset_d2h_transfer_count()
+
+    result = clip(source, mask, sort=False)
+    events = vibespatial.get_dispatch_events(clear=True)
+    transfer_reasons = [event.reason for event in get_d2h_transfer_events()]
+
+    assert result["value"].tolist() == list(range(len(source_geoms)))
+    assert [geom.wkb for geom in result.geometry] == [geom.wkb for geom in source.geometry]
+    assert len(exact_inputs) == 1
+    assert not bool(cp.any(cp.asarray(exact_inputs[0].device_state.validity)).get())
+    assert "clip exact-topology admission count packet" not in transfer_reasons
+    assert not any(
+        event.implementation == "polygon_device_covered_rowset_passthrough_gpu"
+        for event in events
+    )
+
+
+def test_clip_collective_lazy_grouped_union_mask_physicalizes_once(monkeypatch) -> None:
     if not vibespatial.has_gpu_runtime():
         pytest.skip("GPU runtime not available")
     pytest.importorskip("cupy")
@@ -7286,10 +7382,20 @@ def test_clip_collective_lazy_grouped_union_mask_physicalizes_once() -> None:
     dissolved_mask = mask_frame.dissolve(by="group", aggfunc="first", method="unary")
     dissolved_mask = dissolved_mask.reset_index()
     assert getattr(
-        dissolved_mask.geometry.values._owned,
+        dissolved_mask.geometry.values.cached_owned(),
         "_is_lazy_grouped_union_owned",
         False,
     )
+
+    def _fail_pair_coverage(**_kwargs):
+        raise AssertionError("union-first admission must precede exact pair coverage")
+
+    monkeypatch.setattr(
+        clip_module,
+        "_clip_lazy_grouped_union_coverage_rows_device",
+        _fail_pair_coverage,
+    )
+    monkeypatch.setattr(clip_module, "_clip_available_device_bytes", lambda: 1)
 
     vibespatial.clear_dispatch_events()
     reset_d2h_transfer_count()
@@ -7302,7 +7408,7 @@ def test_clip_collective_lazy_grouped_union_mask_physicalizes_once() -> None:
     assert result["value"].tolist() == [10, 20]
     assert any(
         event.implementation == "lazy_grouped_union_mask_union_plan_gpu"
-        and "source_rows=2" in event.detail
+        and "semantic_pair_refinement=skipped" in event.detail
         for event in dispatch_events
     )
     assert any(
@@ -7351,6 +7457,29 @@ def test_collective_grouped_mask_shape_estimate_prefers_sparse_relation() -> Non
     assert relation.relation_pair_count == 20
     assert relation.group_count == 10
     assert relation.dispatch_unit_count() < union.dispatch_unit_count()
+
+
+def test_collective_grouped_mask_shape_rejects_relation_over_memory_budget() -> None:
+    source_owned = from_shapely_geometries(
+        [box(float(i), 0.0, float(i) + 3.0, 1.0) for i in range(10)],
+        residency=Residency.HOST,
+    )
+    mask_owned = from_shapely_geometries(
+        [box(float(i) * 10.0, 0.0, float(i) * 10.0 + 1.0, 1.0) for i in range(100)],
+        residency=Residency.HOST,
+    )
+
+    prefers_relation, relation, union = clip_module._clip_collective_grouped_mask_prefers_relation(
+        source_owned,
+        mask_owned,
+        relation_pair_count=20,
+        collective_source_count=10,
+        available_device_bytes=1,
+    )
+
+    assert relation.dispatch_unit_count() < union.dispatch_unit_count()
+    assert not relation.is_device_memory_admissible(1)
+    assert not prefers_relation
 
 
 def test_collective_grouped_mask_shape_estimate_prefers_dense_union() -> None:
@@ -7435,21 +7564,26 @@ def test_clip_sparse_collective_lazy_grouped_union_uses_relation_shape() -> None
 def test_clip_lazy_grouped_union_partitions_covered_and_collective_rows() -> None:
     if not vibespatial.has_gpu_runtime():
         pytest.skip("GPU runtime not available")
-    pytest.importorskip("cupy")
+    cp = pytest.importorskip("cupy")
 
     source_geoms = [
         box(0.1, -0.5, 0.5, 0.5),
         box(0.0, 0.0, 5.0, 2.0),
         box(20.0, 0.0, 21.0, 1.0),
     ]
+    source_base_owned = from_shapely_geometries(
+        [box(-100.0, -100.0, -90.0, -90.0), *source_geoms],
+        residency=Residency.DEVICE,
+    )
+    source_owned = source_base_owned._device_indexed_take(
+        cp.asarray([1, 2, 3], dtype=cp.int64),
+        assume_unique_indices=True,
+    )
     source = vibespatial.GeoDataFrame(
         {
             "value": [10, 20, 30],
             "geometry": DeviceGeometryArray._from_owned(
-                from_shapely_geometries(
-                    source_geoms,
-                    residency=Residency.DEVICE,
-                ),
+                source_owned,
                 crs="EPSG:3857",
             ),
         },
@@ -7489,6 +7623,10 @@ def test_clip_lazy_grouped_union_partitions_covered_and_collective_rows() -> Non
     )
     mask_union = shapely.union_all(np.asarray(mask_geoms, dtype=object))
     expected = shapely.intersection(np.asarray(source_geoms[:2], dtype=object), mask_union)
+    assert tuple(result.geometry.total_bounds) == pytest.approx(
+        tuple(shapely.total_bounds(expected))
+    )
+    assert np.asarray(result.geometry.area) == pytest.approx(shapely.area(expected))
     assert all(
         shapely.equals(got, want) for got, want in zip(result.geometry, expected, strict=True)
     )
@@ -7530,7 +7668,7 @@ def test_clip_lazy_buffered_line_mask_uses_grouped_relation_without_fanout_probe
     dissolved_mask = mask_frame.dissolve(by="group", aggfunc="first", method="unary")
     dissolved_mask = dissolved_mask.reset_index()
     assert getattr(
-        dissolved_mask.geometry.values._owned,
+        dissolved_mask.geometry.values.cached_owned(),
         "_is_lazy_grouped_union_owned",
         False,
     )
@@ -7622,7 +7760,7 @@ def test_grouped_mixed_clip_reduces_area_line_and_point_without_mask_physicaliza
     )
     dissolved = mask_frame.dissolve(by="group", aggfunc="first", method="unary")
     dissolved = dissolved.reset_index()
-    assert getattr(dissolved.geometry.values._owned, "_is_lazy_grouped_union_owned", False)
+    assert getattr(dissolved.geometry.values.cached_owned(), "_is_lazy_grouped_union_owned", False)
 
     vibespatial.clear_dispatch_events()
     reset_d2h_transfer_count()
@@ -7675,7 +7813,7 @@ def test_grouped_mixed_clip_nodes_duplicate_line_contacts_once() -> None:
     )
     dissolved = mask_frame.dissolve(by="group", aggfunc="first", method="unary")
     dissolved = dissolved.reset_index()
-    assert getattr(dissolved.geometry.values._owned, "_is_lazy_grouped_union_owned", False)
+    assert getattr(dissolved.geometry.values.cached_owned(), "_is_lazy_grouped_union_owned", False)
 
     result = clip(source, dissolved, sort=False, keep_geom_type=False)
     actual = result.geometry.iloc[0]
@@ -7915,7 +8053,7 @@ def test_take_spatial_rows_preserves_device_backing_after_row_filter() -> None:
 
     assert result["value"].tolist() == [1]
     assert isinstance(result.geometry.values, DeviceGeometryArray)
-    assert result.geometry.values._owned.residency is Residency.DEVICE
+    _assert_native_geometry_device_resident(result.geometry.values)
 
 
 def test_clip_polygon_area_intersection_declines_atomically_when_capacity_carrier_declines(

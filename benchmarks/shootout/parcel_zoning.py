@@ -20,7 +20,8 @@ from shapely.geometry import box
 
 import geopandas as gpd
 
-tmpdir = Path(tempfile.mkdtemp(prefix="shootout_parcel_"))
+_tmpdir = tempfile.TemporaryDirectory(prefix="shootout_parcel_")
+tmpdir = Path(_tmpdir.name)
 fixtures = setup_fixtures(tmpdir)
 
 # --- timed work starts here ---

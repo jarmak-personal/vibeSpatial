@@ -118,9 +118,17 @@ def _get_geometry_types(series):
             GeometryFamily.MULTIPOLYGON: "MultiPolygon",
         }
 
+        family_domain = arr.native_family_domain
+        if family_domain is None:
+            cached_owned = arr.cached_owned()
+            if cached_owned is None:
+                raise RuntimeError(
+                    "partitioned geometry metadata requires a proven family domain"
+                )
+            family_domain = tuple(cached_owned.families)
         return sorted(
             family_names[family]
-            for family in arr.owned.families
+            for family in family_domain
             if family in family_names
         )
 
@@ -185,7 +193,12 @@ def _regular_grid_rect_shape_proof_metadata(series, geometry_types) -> dict | No
     from vibespatial.geometry.owned import OwnedGeometryArray
 
     arr = series.array
-    owned = arr.to_owned() if isinstance(arr, DeviceGeometryArray) else getattr(arr, "_owned", None)
+    if isinstance(arr, DeviceGeometryArray):
+        owned = arr.cached_owned()
+        if owned is None:
+            return None
+    else:
+        owned = getattr(arr, "_owned", None)
     if isinstance(owned, OwnedGeometryArray):
         metadata = _shape_proof_metadata_from_device_owned(owned)
         if metadata is not None:

@@ -5,7 +5,7 @@ Scope: Overlay reconstruction staging, face-labeling plan, and CCCL-oriented out
 Read If: You are changing union, difference, symmetric difference, or overlay output reconstruction.
 STOP IF: You already have the reconstruction planner open and only need local implementation detail.
 Source Of Truth: Phase-5 reconstruction plan from segment primitives to public overlay outputs.
-Body Budget: 150/220 lines
+Body Budget: 149/220 lines
 Document: docs/architecture/overlay-reconstruction.md
 
 Section Map (Body Lines)
@@ -20,7 +20,7 @@ Section Map (Body Lines)
 | 40-49 | Options Considered |
 | 50-63 | Decision |
 | 64-77 | CCCL Mapping |
-| 78-150 | Consequences |
+| 78-149 | Consequences |
 DOC_HEADER:END -->
 
 `o17.5.3` fixes the constructive assembly shape before full overlay kernels land.
@@ -101,7 +101,7 @@ overlay operations.
 ## Consequences
 
 - public `overlay()` now chooses an execution family before heavy work starts
-  (`clip_rewrite`, `broadcast_right_intersection`,
+  (`broadcast_right_intersection`,
   `broadcast_right_difference`, `coverage_union`, `grouped_union`, or
   `generic_reconstruction`) and records that family in dispatch telemetry
 - every constructive family still lowers through one canonical
@@ -121,14 +121,16 @@ overlay operations.
   instead of forking new topology assembly code
 - current GPU overlay output support remains polygon-only at the input seam;
   mixed-family constructive overlay stays explicitly unsupported until a later
-  a later change widens the kernel contract
+  change widens the kernel contract
 - later GPU overlay work has an explicit CCCL-friendly assembly seam
 - half-edge node construction sorts source endpoints once and derives target
   node ids from adjacent twins; node and radial orders use exact stable radix
   passes instead of duplicated endpoint relations or stacked fp64 key matrices;
   coordinate keys stream one pass at a time, endpoint grouping reads the sorted
-  permutation directly, and one radial-successor kernel replaces edge-position,
-  span, group, and twin-position work arrays
+  permutation directly, and an edge-parallel segmented merge derives radial
+  successors from sparse node offsets without quadratic per-node insertion
+  sorting; source tangents participate only when endpoint subtraction collapses
+  a nonzero component on an atom with exactly one representable fp64 step
 - successor ids are an `int32` graph contract through face walk and assembly;
   face tables retain unordered membership from the first face-id sort and use
   successors for traversal, production graphs omit diagnostic node/radial
@@ -151,20 +153,17 @@ overlay operations.
   surviving boundary atoms feed the canonical half-edge graph, and contour
   nesting restores holes and islands without host union-find or grouped cell
   union; grouped-right indirection remains on its existing exact topology path
-- **Memory-Safe Difference Batching:** overlay difference splits large
-  workloads into VRAM-safe batches to prevent OOM at scale. The strategy:
-  1. Estimate per-pair byte cost from right-side coordinate density.
-  2. Query free VRAM via `cupy.cuda.Device().mem_info`.
-  3. Budget = `free_bytes * _VRAM_BUDGET_FRACTION` (0.3, conservative
-     because segmented_union and binary_constructive each allocate
-     comparable working memory).
-  4. Compute groups per batch from budget / (avg_pairs * bytes_per_pair),
-     clamped to `[_MIN_GROUPS_PER_BATCH=64, _MAX_GROUPS_PER_BATCH=10K]`.
-  5. Below `_PAIR_THRESHOLD` (200K total pairs), skip batching entirely
-     and process in a single dispatch (lower overhead).
-  6. Each batch gathers its left/right slices, runs the GPU overlay
-     difference kernel, and appends results. Final assembly concatenates
-     batch outputs with consistent index tracking.
+- grouped topology carries signed left/right winding deltas through atomic
+  segment deduplication and partial-overlap renoding; exact source-ring signs
+  ignore duplicate, zero-length, and collinear extreme runs
+- exact cycle orientation labels bounded faces without a shoelace-area epsilon;
+  multi-block incidence propagation removes the former single-block face limit
+- component nesting uses fixed-capacity interval-tree traversal with one block
+  per root, exact orient2d containment, and no quadratic face-pair relation
+- boundary extraction peels leaves and the two-core with one O(E) CAS graph
+  pass, then reuses component nesting hints during ring assembly
+- split-event execution has no host synchronization in its admitted path;
+  structural allocation and named physicalization own all sizing boundaries
 - many-vs-one (N-vs-1) overlay uses a three-tier strategy that bypasses the
   full reconstruction graph for the common broadcast_right workload shape:
   (1) containment bypass identifies polygons fully inside the clip polygon

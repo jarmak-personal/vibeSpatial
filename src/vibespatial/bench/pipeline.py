@@ -57,7 +57,6 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     from_shapely_geometries,
     seed_all_validity_cache,
-    seed_homogeneous_host_metadata,
 )
 from vibespatial.io.arrow import (
     geoseries_from_owned,
@@ -4727,7 +4726,7 @@ def _profile_constructive_output_native_pipeline(
     import cupy as cp
     import pyarrow as pa
 
-    from vibespatial.constructive.binary_constructive import binary_constructive_owned
+    from vibespatial.constructive.binary_constructive import binary_constructive_native
     from vibespatial.runtime.materialization import clear_materialization_events
 
     clear_materialization_events()
@@ -4782,14 +4781,12 @@ def _profile_constructive_output_native_pipeline(
         ),
     ) as stage:
         started = perf_counter()
-        constructive_owned = binary_constructive_owned(
+        constructive_geometry = binary_constructive_native(
             "intersection",
             left_owned,
             right_owned,
             dispatch_mode=ExecutionMode.GPU,
-        )
-        seed_homogeneous_host_metadata(constructive_owned, GeometryFamily.POLYGON)
-        seed_all_validity_cache(constructive_owned)
+        ).with_crs("EPSG:4326")
         constructive_elapsed = perf_counter() - started
         attribute_arrow = pa.table({"group": pa.array(group_codes_host, type=pa.int32())})
         attributes = NativeAttributeTable(
@@ -4797,23 +4794,21 @@ def _profile_constructive_output_native_pipeline(
             column_override=tuple(attribute_arrow.column_names),
             schema_override=attribute_arrow.schema,
         )
+        constructive_metadata = NativeGeometryMetadata.from_native_geometry(
+            constructive_geometry,
+        )
         constructive_result = NativeTabularResult(
             attributes=attributes,
-            geometry=GeometryNativeResult.from_owned(
-                constructive_owned,
-                crs="EPSG:4326",
-            ),
+            geometry=constructive_geometry,
             geometry_name="geometry",
             column_order=("group", "geometry"),
             provenance=NativeGeometryProvenance(
                 operation="pairwise_constructive",
-                row_count=int(constructive_owned.row_count),
+                row_count=int(constructive_geometry.row_count),
                 left_rows=cp.arange(effective_rows, dtype=cp.int32),
                 right_rows=cp.arange(effective_rows, dtype=cp.int32),
             ),
-            geometry_metadata=NativeGeometryMetadata.from_cached_owned(
-                constructive_owned,
-            ),
+            geometry_metadata=constructive_metadata,
         )
         constructive_state = constructive_result.to_native_frame_state()
         constructive_grouped = NativeGrouped.from_dense_codes(
@@ -4827,7 +4822,7 @@ def _profile_constructive_output_native_pipeline(
         stage.metadata["constructive_output_carrier"] = "NativeTabularResult"
         stage.metadata["downstream_carrier"] = "NativeFrameState"
         stage.metadata["geometry_storage"] = (
-            "device" if constructive_owned.residency is Residency.DEVICE else "host"
+            "device" if constructive_geometry.residency is Residency.DEVICE else "host"
         )
         stage.metadata["attribute_storage"] = "device"
         stage.metadata["provenance_carrier"] = type(
@@ -4843,7 +4838,7 @@ def _profile_constructive_output_native_pipeline(
             stage,
             audit,
             memory,
-            constructive_owned,
+            constructive_geometry,
             constructive_result,
             constructive_state,
             constructive_grouped,
@@ -5007,7 +5002,7 @@ def _profile_overlay_relation_constructive_pipeline(
 
     from time import perf_counter
 
-    from vibespatial.constructive.binary_constructive import binary_constructive_owned
+    from vibespatial.constructive.binary_constructive import binary_constructive_native
     from vibespatial.runtime.materialization import clear_materialization_events
 
     clear_materialization_events()
@@ -5197,23 +5192,17 @@ def _profile_overlay_relation_constructive_pipeline(
         started = perf_counter()
         left_pairs = left_state.geometry.owned.take(refined_relation.left_indices)
         right_pairs = right_state.geometry.owned.take(refined_relation.right_indices)
-        constructed_owned = binary_constructive_owned(
+        geometry = binary_constructive_native(
             "intersection",
             left_pairs,
             right_pairs,
             dispatch_mode=ExecutionMode.GPU,
-        )
-        seed_homogeneous_host_metadata(constructed_owned, GeometryFamily.POLYGON)
-        seed_all_validity_cache(constructed_owned)
+        ).with_crs("EPSG:4326")
         constructive_elapsed = perf_counter() - started
-        geometry = GeometryNativeResult.from_owned(
-            constructed_owned,
-            crs="EPSG:4326",
-        )
-        stage.rows_out = int(constructed_owned.row_count)
+        stage.rows_out = int(geometry.row_count)
         stage.metadata["input_carriers"] = "NativeRelation,NativeFrameState"
         stage.metadata["geometry_storage"] = (
-            "device" if constructed_owned.residency is Residency.DEVICE else "host"
+            "device" if geometry.residency is Residency.DEVICE else "host"
         )
         stage.metadata["constructive_seconds"] = constructive_elapsed
         stage.metadata["output_carrier"] = "GeometryNativeResult"
@@ -5223,7 +5212,6 @@ def _profile_overlay_relation_constructive_pipeline(
             memory,
             left_pairs,
             right_pairs,
-            constructed_owned,
             geometry,
         )
 
@@ -5231,7 +5219,7 @@ def _profile_overlay_relation_constructive_pipeline(
         "native_tabular_projection",
         category="project",
         device=ExecutionMode.GPU,
-        rows_in=int(constructed_owned.row_count),
+        rows_in=int(geometry.row_count),
         detail=(
             "project relation-aligned attributes and constructive geometry into "
             "NativeTabularResult for native downstream consumers"
@@ -5284,7 +5272,7 @@ def _profile_overlay_relation_constructive_pipeline(
             int(len(refined_relation)) == int(projected_state.row_count) == effective_rows
         )
         candidate_superset_match = int(len(candidate_relation)) >= int(len(refined_relation))
-        geometry_storage_match = constructed_owned.residency is Residency.DEVICE
+        geometry_storage_match = geometry.residency is Residency.DEVICE
         tabular_carrier_match = isinstance(native_result, NativeTabularResult)
         expected_area_shape = float(expected_area_value) > 0.0
         results_match = (

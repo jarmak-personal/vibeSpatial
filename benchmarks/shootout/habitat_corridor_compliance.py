@@ -23,7 +23,8 @@ import geopandas as gpd
 POLYGONAL_TYPES = ["Polygon", "MultiPolygon"]
 RIPARIAN_SETBACK_DISTANCE = 35.0
 
-tmpdir = Path(tempfile.mkdtemp(prefix="shootout_habitat_corridor_"))
+_tmpdir = tempfile.TemporaryDirectory(prefix="shootout_habitat_corridor_")
+tmpdir = Path(_tmpdir.name)
 fixtures = setup_fixtures(tmpdir)
 
 # --- timed work starts here ---

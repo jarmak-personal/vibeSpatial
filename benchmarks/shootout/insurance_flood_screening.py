@@ -24,7 +24,8 @@ import geopandas as gpd
 POLYGONAL_TYPES = ["Polygon", "MultiPolygon"]
 FLOOD_RATIO_THRESHOLD = 0.15
 
-tmpdir = Path(tempfile.mkdtemp(prefix="shootout_insurance_flood_"))
+_tmpdir = tempfile.TemporaryDirectory(prefix="shootout_insurance_flood_")
+tmpdir = Path(_tmpdir.name)
 fixtures = setup_fixtures(tmpdir)
 
 # --- timed work starts here ---

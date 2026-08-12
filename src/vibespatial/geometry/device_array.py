@@ -261,11 +261,15 @@ class DeviceGeometryArray(ExtensionArray):
 
     def __init__(
         self,
-        owned: OwnedGeometryArray,
+        owned: OwnedGeometryArray | None,
         *,
         crs: Any | None = None,
+        composition: Any | None = None,
     ) -> None:
-        self._owned = owned
+        if (owned is None) == (composition is None):
+            raise ValueError("exactly one device geometry carrier is required")
+        self.__owned = owned
+        self._composition = composition
         self._crs = crs
         self._shapely_cache: np.ndarray | None = None
         self._owned_flat_sindex_cache = None
@@ -282,6 +286,21 @@ class DeviceGeometryArray(ExtensionArray):
     ) -> DeviceGeometryArray:
         """Construct directly from an OwnedGeometryArray (zero-copy)."""
         result = cls(owned, crs=crs)
+        result._provenance = provenance
+        return result
+
+    @classmethod
+    def _from_composition(
+        cls,
+        composition: Any,
+        *,
+        crs: Any | None = None,
+        provenance=None,
+    ) -> DeviceGeometryArray:
+        """Wrap trusted singular native partitions without physicalizing them."""
+        if not bool(getattr(composition, "trusted_singular_rows", False)):
+            raise ValueError("partitioned public geometry requires singular-row proof")
+        result = cls(None, crs=crs, composition=composition)
         result._provenance = provenance
         return result
 
@@ -315,8 +334,52 @@ class DeviceGeometryArray(ExtensionArray):
 
     @property
     def owned(self) -> OwnedGeometryArray:
-        """The underlying OwnedGeometryArray (source of truth)."""
-        return self._owned
+        """Cross the explicit contiguous-owned boundary when required."""
+        return self.to_owned()
+
+    def cached_owned(self) -> OwnedGeometryArray | None:
+        """Return a contiguous carrier only when one already exists."""
+        return self.__owned
+
+    @property
+    def native_composition(self):
+        """Return the partitioned native carrier without physicalizing it."""
+        return self._composition
+
+    @property
+    def native_family_domain(self):
+        """Return proven concrete families without probing contiguous storage."""
+        if self._composition is None:
+            return None
+        return self._composition.trusted_family_domain
+
+    @property
+    def _owned(self) -> OwnedGeometryArray:
+        owned = self.__owned
+        if owned is None:
+            raise AttributeError(
+                "partitioned device geometry has no contiguous owned carrier; "
+                "inspect native_composition or call physicalize_owned() explicitly"
+            )
+        return owned
+
+    @_owned.setter
+    def _owned(self, owned: OwnedGeometryArray) -> None:
+        self.__owned = owned
+        self._composition = None
+
+    def physicalize_owned(self) -> OwnedGeometryArray:
+        """Explicitly join a trusted singular composition into owned storage."""
+        owned = self.__owned
+        if owned is not None:
+            return owned
+        composition = self._composition
+        owned = composition._singular_owned_device()
+        if owned is None:
+            raise RuntimeError("singular geometry partitions could not be physicalized")
+        self.__owned = owned
+        self._composition = None
+        return owned
 
     @property
     def crs(self) -> Any | None:
@@ -335,20 +398,33 @@ class DeviceGeometryArray(ExtensionArray):
             self._crs = None
 
     def __len__(self) -> int:
-        return self._owned.row_count
+        if self._composition is not None:
+            return int(self._composition.row_count)
+        return self.__owned.row_count
 
     @property
     def nbytes(self) -> int:
+        if self._composition is not None:
+            return sum(
+                int(
+                    DeviceGeometryArray._from_owned(
+                        part.geometry.owned,
+                        crs=self._crs,
+                    ).nbytes
+                )
+                for part in self._composition.parts
+                if part.geometry.owned is not None
+            )
         if (
-            self._owned.residency is Residency.DEVICE
-            and self._owned.device_state is not None
+            self.to_owned().residency is Residency.DEVICE
+            and self.to_owned().device_state is not None
             and (
-                self._owned._validity is None
-                or self._owned._tags is None
-                or self._owned._family_row_offsets is None
+                self.to_owned()._validity is None
+                or self.to_owned()._tags is None
+                or self.to_owned()._family_row_offsets is None
             )
         ):
-            state = self._owned._ensure_device_state(preserve_indexed_view=True)
+            state = self.to_owned()._ensure_device_state(preserve_indexed_view=True)
             total = state.validity.nbytes + state.tags.nbytes
             total += state.family_row_offsets.nbytes
             for buffer in state.families.values():
@@ -364,10 +440,10 @@ class DeviceGeometryArray(ExtensionArray):
             return total
 
         total = 0
-        total += self._owned.validity.nbytes
-        total += self._owned.tags.nbytes
-        total += self._owned.family_row_offsets.nbytes
-        for buffer in self._owned.families.values():
+        total += self.to_owned().validity.nbytes
+        total += self.to_owned().tags.nbytes
+        total += self.to_owned().family_row_offsets.nbytes
+        for buffer in self.to_owned().families.values():
             total += buffer.x.nbytes + buffer.y.nbytes
             total += buffer.geometry_offsets.nbytes
             total += buffer.empty_mask.nbytes
@@ -380,20 +456,30 @@ class DeviceGeometryArray(ExtensionArray):
         return total
 
     def isna(self) -> np.ndarray:
-        if getattr(self._owned, "_validity", None) is not None:
-            return ~np.asarray(self._owned._validity, dtype=bool)
-        state = getattr(self._owned, "device_state", None)
+        if self._composition is not None:
+            result = np.ones(len(self), dtype=bool)
+            for part in self._composition.parts:
+                rows = self._composition_part_rows_host(part)
+                values = DeviceGeometryArray._from_owned(
+                    part.geometry.owned,
+                    crs=self._crs,
+                ).isna()
+                result[rows] = values
+            return result
+        if getattr(self.to_owned(), "_validity", None) is not None:
+            return ~np.asarray(self.to_owned()._validity, dtype=bool)
+        state = getattr(self.to_owned(), "device_state", None)
         if state is not None:
             if state.trusted_all_valid is True:
-                return np.zeros(int(self._owned.row_count), dtype=bool)
-            device_state = self._owned._ensure_device_state(preserve_indexed_view=True)
+                return np.zeros(int(self.to_owned().row_count), dtype=bool)
+            device_state = self.to_owned()._ensure_device_state(preserve_indexed_view=True)
             host_validity = get_cuda_runtime().copy_device_to_host(
                 device_state.validity,
                 reason="DeviceGeometryArray isna validity terminal export",
                 terminal_export=True,
             )
             return ~np.asarray(host_validity, dtype=bool)
-        return ~self._owned.validity
+        return ~self.to_owned().validity
 
     @property
     def _data(self) -> np.ndarray:
@@ -412,15 +498,25 @@ class DeviceGeometryArray(ExtensionArray):
         Uses vectorized numpy indexing instead of per-element Python loop
         (VPAT001 compliance).
         """
-        single_type = _single_family_geom_type_if_no_nulls(self._owned)
+        if self._composition is not None:
+            result = np.empty(len(self), dtype=object)
+            result[:] = None
+            for part in self._composition.parts:
+                rows = self._composition_part_rows_host(part)
+                result[rows] = DeviceGeometryArray._from_owned(
+                    part.geometry.owned,
+                    crs=self._crs,
+                ).geom_type
+            return result
+        single_type = _single_family_geom_type_if_no_nulls(self.to_owned())
         if single_type is not None:
             return np.full(len(self), single_type, dtype=object)
-        if self._owned._tags is None and self._owned.device_state is not None:
-            self._owned._tags = get_cuda_runtime().copy_device_to_host(
-                self._owned.device_state.tags,
+        if self.to_owned()._tags is None and self.to_owned().device_state is not None:
+            self.to_owned()._tags = get_cuda_runtime().copy_device_to_host(
+                self.to_owned().device_state.tags,
                 reason="device geometry array geom-type tag host export",
             )
-        tags = self._owned.tags
+        tags = self.to_owned().tags
         result = np.empty(len(tags), dtype=object)
         for tag_value, name in _TAG_TO_GEOM_TYPE_NAME.items():
             result[tags == tag_value] = name
@@ -434,13 +530,22 @@ class DeviceGeometryArray(ExtensionArray):
         Uses vectorized numpy indexing per family instead of per-element
         Python loop (VPAT001 compliance).
         """
-        tags = self._owned.tags
-        offsets = self._owned.family_row_offsets
+        if self._composition is not None:
+            result = np.zeros(len(self), dtype=bool)
+            for part in self._composition.parts:
+                rows = self._composition_part_rows_host(part)
+                result[rows] = DeviceGeometryArray._from_owned(
+                    part.geometry.owned,
+                    crs=self._crs,
+                ).is_empty
+            return result
+        tags = self.to_owned().tags
+        offsets = self.to_owned().family_row_offsets
         result = np.zeros(len(tags), dtype=bool)
         for tag_value, family in TAG_FAMILIES.items():
-            if family not in self._owned.families:
+            if family not in self.to_owned().families:
                 continue
-            buf = self._owned.families[family]
+            buf = self.to_owned().families[family]
             mask = tags == tag_value
             if not mask.any():
                 continue
@@ -458,24 +563,49 @@ class DeviceGeometryArray(ExtensionArray):
 
         Returns (N, 4) float64 array of [minx, miny, maxx, maxy].
         """
-        return _compute_bounds_from_owned(self._owned)
+        if self._composition is not None:
+            result = np.full((len(self), 4), np.nan, dtype=np.float64)
+            for part in self._composition.parts:
+                rows = self._composition_part_rows_host(part)
+                result[rows] = _compute_bounds_from_owned(part.geometry.owned)
+            return result
+        return _compute_bounds_from_owned(self.to_owned())
 
     @property
     def total_bounds(self) -> np.ndarray:
         """Aggregate bounds — no Shapely materialization."""
         if len(self) == 0:
             return np.array([np.nan, np.nan, np.nan, np.nan])
-        return _compute_total_bounds_from_owned(self._owned)
+        if self._composition is not None:
+            part_bounds = np.asarray(
+                [
+                    _compute_total_bounds_from_owned(part.geometry.owned)
+                    for part in self._composition.parts
+                    if part.geometry.owned is not None and part.geometry.row_count > 0
+                ],
+                dtype=np.float64,
+            )
+            if part_bounds.size == 0:
+                return np.array([np.nan, np.nan, np.nan, np.nan])
+            return np.array(
+                [
+                    np.nanmin(part_bounds[:, 0]),
+                    np.nanmin(part_bounds[:, 1]),
+                    np.nanmax(part_bounds[:, 2]),
+                    np.nanmax(part_bounds[:, 3]),
+                ]
+            )
+        return _compute_total_bounds_from_owned(self.to_owned())
 
     @property
     def x(self) -> np.ndarray:
         """Return point x coordinates without materializing Shapely objects."""
         from vibespatial.constructive.properties import get_x_owned
 
-        non_null = self._owned.validity
+        non_null = self.to_owned().validity
         point_tag = FAMILY_TAGS[GeometryFamily.POINT]
-        if np.all(self._owned.tags[non_null] == point_tag):
-            return get_x_owned(self._owned)
+        if np.all(self.to_owned().tags[non_null] == point_tag):
+            return get_x_owned(self.to_owned())
         raise ValueError("x attribute access only provided for Point geometries")
 
     @property
@@ -483,10 +613,10 @@ class DeviceGeometryArray(ExtensionArray):
         """Return point y coordinates without materializing Shapely objects."""
         from vibespatial.constructive.properties import get_y_owned
 
-        non_null = self._owned.validity
+        non_null = self.to_owned().validity
         point_tag = FAMILY_TAGS[GeometryFamily.POINT]
-        if np.all(self._owned.tags[non_null] == point_tag):
-            return get_y_owned(self._owned)
+        if np.all(self.to_owned().tags[non_null] == point_tag):
+            return get_y_owned(self.to_owned())
         raise ValueError("y attribute access only provided for Point geometries")
 
     # ------------------------------------------------------------------
@@ -560,7 +690,7 @@ class DeviceGeometryArray(ExtensionArray):
             new_owned = from_shapely_geometries(new_data)
             return DeviceGeometryArray._from_owned(new_owned, crs=crs)
 
-        return _to_crs_owned(self._owned, self._crs, crs)
+        return _to_crs_owned(self.to_owned(), self._crs, crs)
 
     # ------------------------------------------------------------------
     # Shapely-delegated properties (materialization with diagnostics)
@@ -585,7 +715,7 @@ class DeviceGeometryArray(ExtensionArray):
         from vibespatial.constructive.measurement import area_owned
 
         self.check_geographic_crs(stacklevel=5, operation="area")
-        return area_owned(self._owned)
+        return area_owned(self.to_owned())
 
     @property
     def length(self) -> np.ndarray:
@@ -593,7 +723,7 @@ class DeviceGeometryArray(ExtensionArray):
         from vibespatial.constructive.measurement import length_owned
 
         self.check_geographic_crs(stacklevel=5, operation="length")
-        return length_owned(self._owned)
+        return length_owned(self.to_owned())
 
     @property
     def is_valid(self) -> np.ndarray:
@@ -607,14 +737,14 @@ class DeviceGeometryArray(ExtensionArray):
         from vibespatial.constructive.validity import is_valid_owned
 
         result = np.asarray(
-            is_valid_owned(self._owned, _exact_collinearity=True),
+            is_valid_owned(self.to_owned(), _exact_collinearity=True),
             dtype=bool,
         )
-        if not bool(np.all(self._owned.validity)):
+        if not bool(np.all(self.to_owned().validity)):
             # GeoPandas-facing is_valid treats missing rows as False even though
             # the owned structural-validity helper treats null slots as valid.
             result = result.copy()
-            result[~self._owned.validity] = False
+            result[~self.to_owned().validity] = False
         return result
 
     @property
@@ -622,14 +752,14 @@ class DeviceGeometryArray(ExtensionArray):
         """Simplicity — GPU-accelerated from owned coordinate buffers, no Shapely."""
         from vibespatial.constructive.validity import is_simple_owned
 
-        return is_simple_owned(self._owned)
+        return is_simple_owned(self.to_owned())
 
     @property
     def is_ring(self) -> np.ndarray:
         """Ring test — GPU-accelerated from owned coordinate buffers, no Shapely."""
         from vibespatial.constructive.properties import is_ring_owned
 
-        return is_ring_owned(self._owned)
+        return is_ring_owned(self.to_owned())
 
     @property
     def is_closed(self) -> np.ndarray:
@@ -638,11 +768,11 @@ class DeviceGeometryArray(ExtensionArray):
         _record_shapely_fallback_event(
             surface="DeviceGeometryArray.is_closed",
             reason="Shapely materialization required",
-            owned=self._owned,
+            owned=self.to_owned(),
             detail=f"rows={len(self)}",
             pipeline="materialization",
         )
-        self._owned._record(
+        self.to_owned()._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.is_closed: Shapely materialization required",
             visible=True,
@@ -665,11 +795,11 @@ class DeviceGeometryArray(ExtensionArray):
         _record_shapely_fallback_event(
             surface="DeviceGeometryArray.is_valid_reason",
             reason="Shapely materialization required",
-            owned=self._owned,
+            owned=self.to_owned(),
             detail=f"rows={len(self)}",
             pipeline="materialization",
         )
-        self._owned._record(
+        self.to_owned()._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.is_valid_reason: Shapely materialization required",
             visible=True,
@@ -682,7 +812,7 @@ class DeviceGeometryArray(ExtensionArray):
         """Boundary — GPU-accelerated via owned path, no Shapely."""
         from vibespatial.constructive.boundary import boundary_owned
 
-        result_owned = boundary_owned(self._owned)
+        result_owned = boundary_owned(self.to_owned())
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     @property
@@ -690,7 +820,7 @@ class DeviceGeometryArray(ExtensionArray):
         from vibespatial.constructive.centroid import centroid_owned
 
         self.check_geographic_crs(stacklevel=5, operation="centroid")
-        result_owned = centroid_owned(self._owned)
+        result_owned = centroid_owned(self.to_owned())
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     @property
@@ -698,21 +828,21 @@ class DeviceGeometryArray(ExtensionArray):
         """Convex hull — GPU-accelerated via owned path, no Shapely."""
         from vibespatial.constructive.convex_hull import convex_hull_owned
 
-        result_owned = convex_hull_owned(self._owned)
+        result_owned = convex_hull_owned(self.to_owned())
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     @property
     def envelope(self):
         from vibespatial.constructive.envelope import envelope_owned
 
-        result_owned = envelope_owned(self._owned)
+        result_owned = envelope_owned(self.to_owned())
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     @property
     def exterior(self):
         from vibespatial.constructive.exterior import exterior_owned
 
-        result_owned = exterior_owned(self._owned)
+        result_owned = exterior_owned(self.to_owned())
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     @property
@@ -722,11 +852,11 @@ class DeviceGeometryArray(ExtensionArray):
         _record_shapely_fallback_event(
             surface="DeviceGeometryArray.unary_union",
             reason="Shapely materialization required",
-            owned=self._owned,
+            owned=self.to_owned(),
             detail=f"rows={len(self)}",
             pipeline="constructive/unary_union",
         )
-        self._owned._record(
+        self.to_owned()._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.unary_union: Shapely materialization required",
             visible=True,
@@ -746,28 +876,28 @@ class DeviceGeometryArray(ExtensionArray):
             raise ValueError(f"grid_size is not supported for method '{method}'.")
 
         if method == "unary":
-            result_owned = union_all_gpu_owned(self._owned, grid_size=grid_size)
+            result_owned = union_all_gpu_owned(self.to_owned(), grid_size=grid_size)
             result_geoms = result_owned.to_shapely()
             return result_geoms[0] if len(result_geoms) else shapely.GeometryCollection()
 
         if method == "coverage":
-            result_owned = coverage_union_all_gpu_owned(self._owned)
+            result_owned = coverage_union_all_gpu_owned(self.to_owned())
             result_geoms = result_owned.to_shapely()
             return result_geoms[0] if len(result_geoms) else shapely.GeometryCollection()
 
         if method == "disjoint_subset":
-            result_owned = disjoint_subset_union_all_owned(self._owned)
+            result_owned = disjoint_subset_union_all_owned(self.to_owned())
             if result_owned is not None:
                 result_geoms = result_owned.to_shapely()
                 return result_geoms[0] if len(result_geoms) else shapely.GeometryCollection()
             _record_shapely_fallback_event(
                 surface="DeviceGeometryArray.union_all",
                 reason="mixed families require Shapely materialization",
-                owned=self._owned,
+                owned=self.to_owned(),
                 detail=f"rows={len(self)}, method={method}",
                 pipeline="constructive/union_all",
             )
-            self._owned._record(
+            self.to_owned()._record(
                 DiagnosticKind.MATERIALIZATION,
                 "DeviceGeometryArray.union_all: mixed-family disjoint_subset fallback",
                 visible=True,
@@ -821,7 +951,7 @@ class DeviceGeometryArray(ExtensionArray):
         )
 
         # Route via owned metadata -- no Shapely materialization for classification
-        owned = self._owned
+        owned = self.to_owned()
         if (
             owned.residency is Residency.DEVICE
             and owned.device_state is not None
@@ -998,7 +1128,7 @@ class DeviceGeometryArray(ExtensionArray):
         _record_shapely_fallback_event(
             surface="DeviceGeometryArray.buffer",
             reason="mixed families, nulls, empties, or unsupported params",
-            owned=self._owned,
+            owned=self.to_owned(),
             detail=f"rows={len(self)}",
             requested=get_requested_mode(),
             pipeline="constructive/buffer",
@@ -1008,7 +1138,7 @@ class DeviceGeometryArray(ExtensionArray):
             "DeviceGeometryArray.buffer: Shapely fallback",
             visible=True,
         )
-        shapely_geoms = owned_to_shapely(self._owned)
+        shapely_geoms = owned_to_shapely(self.to_owned())
         result = shapely.buffer(
             shapely_geoms,
             distance,
@@ -1037,7 +1167,7 @@ class DeviceGeometryArray(ExtensionArray):
     def simplify(self, tolerance, preserve_topology=True):
         from vibespatial.constructive.simplify import simplify_owned
 
-        result_owned = simplify_owned(self._owned, tolerance, preserve_topology=preserve_topology)
+        result_owned = simplify_owned(self.to_owned(), tolerance, preserve_topology=preserve_topology)
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     def remove_repeated_points(self, tolerance=0.0):
@@ -1045,20 +1175,20 @@ class DeviceGeometryArray(ExtensionArray):
             remove_repeated_points_owned,
         )
 
-        result_owned = remove_repeated_points_owned(self._owned, tolerance)
+        result_owned = remove_repeated_points_owned(self.to_owned(), tolerance)
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     def normalize(self, precision="auto"):
         from vibespatial.constructive.normalize import normalize_owned
 
-        result = normalize_owned(self._owned, precision=precision)
+        result = normalize_owned(self.to_owned(), precision=precision)
         return DeviceGeometryArray._from_owned(result, crs=self._crs)
 
     def offset_curve(self, distance, quad_segs=8, join_style="round", mitre_limit=5.0):
         from vibespatial.runtime import ExecutionMode, get_requested_mode
         from vibespatial.runtime.dispatch import record_dispatch_event
 
-        owned = self._owned
+        owned = self.to_owned()
 
         # Check eligibility from owned metadata: linestring-only + non-round join
         families = set(owned.families.keys())
@@ -1157,7 +1287,7 @@ class DeviceGeometryArray(ExtensionArray):
         # ring-structure checks first and only materialize Shapely objects
         # if invalid rows need repair (lazy materialization).
         result = make_valid_owned(
-            owned=self._owned,
+            owned=self.to_owned(),
             method=method,
             keep_collapsed=keep_collapsed,
         )
@@ -1176,68 +1306,68 @@ class DeviceGeometryArray(ExtensionArray):
     def representative_point(self):
         from vibespatial.constructive.representative_point import representative_point_owned
 
-        result = representative_point_owned(self._owned)
+        result = representative_point_owned(self.to_owned())
         return DeviceGeometryArray._from_owned(result, crs=self._crs)
 
     def affine_transform(self, matrix):
         from vibespatial.constructive.affine_transform import affine_transform_owned
 
-        result_owned = affine_transform_owned(self._owned, matrix)
+        result_owned = affine_transform_owned(self.to_owned(), matrix)
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     def translate(self, xoff=0.0, yoff=0.0, zoff=0.0):
         from vibespatial.constructive.affine_transform import translate_owned
 
-        result_owned = translate_owned(self._owned, xoff, yoff, zoff)
+        result_owned = translate_owned(self.to_owned(), xoff, yoff, zoff)
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     def rotate(self, angle, origin="center", use_radians=False):
         from vibespatial.constructive.affine_transform import rotate_owned
 
-        result_owned = rotate_owned(self._owned, angle, origin=origin, use_radians=use_radians)
+        result_owned = rotate_owned(self.to_owned(), angle, origin=origin, use_radians=use_radians)
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     def scale(self, xfact=1.0, yfact=1.0, zfact=1.0, origin="center"):
         from vibespatial.constructive.affine_transform import scale_owned
 
-        result_owned = scale_owned(self._owned, xfact, yfact, zfact, origin=origin)
+        result_owned = scale_owned(self.to_owned(), xfact, yfact, zfact, origin=origin)
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     def skew(self, xs=0.0, ys=0.0, origin="center", use_radians=False):
         from vibespatial.constructive.affine_transform import skew_owned
 
-        result_owned = skew_owned(self._owned, xs, ys, origin=origin, use_radians=use_radians)
+        result_owned = skew_owned(self.to_owned(), xs, ys, origin=origin, use_radians=use_radians)
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     def count_coordinates(self):
         from vibespatial.constructive.properties import num_coordinates_owned
 
-        return num_coordinates_owned(self._owned)
+        return num_coordinates_owned(self.to_owned())
 
     def count_geometries(self):
         from vibespatial.constructive.properties import num_geometries_owned
 
-        return num_geometries_owned(self._owned)
+        return num_geometries_owned(self.to_owned())
 
     def count_interior_rings(self):
         from vibespatial.constructive.properties import num_interior_rings_owned
 
-        return num_interior_rings_owned(self._owned)
+        return num_interior_rings_owned(self.to_owned())
 
     def to_wkb(self, **kwargs):
         hex_output = bool(kwargs.pop("hex", False))
         if kwargs:
             raise TypeError(f"Unsupported to_wkb kwargs: {', '.join(sorted(kwargs))}")
         return np.asarray(
-            _encode_owned_wkb_values(self._owned, hex_output=hex_output), dtype=object
+            _encode_owned_wkb_values(self.to_owned(), hex_output=hex_output), dtype=object
         )
 
     def to_wkt(self, **kwargs):
-        return np.asarray(_encode_owned_wkt_values(self._owned, **kwargs), dtype=object)
+        return np.asarray(_encode_owned_wkt_values(self.to_owned(), **kwargs), dtype=object)
 
     def to_owned(self) -> OwnedGeometryArray:
-        """Return the underlying OwnedGeometryArray — no materialization."""
-        return self._owned
+        """Cross the explicit contiguous-owned boundary when required."""
+        return self.physicalize_owned()
 
     # ------------------------------------------------------------------
     # Spatial index support
@@ -1254,7 +1384,7 @@ class DeviceGeometryArray(ExtensionArray):
         coordinate buffers and cached for reuse.
         """
         if self._owned_flat_sindex_cache is not None:
-            return self._owned, self._owned_flat_sindex_cache
+            return self.to_owned(), self._owned_flat_sindex_cache
 
         from vibespatial.runtime.adaptive import plan_dispatch_selection
         from vibespatial.runtime.crossover import estimate_spatial_index_work_from_owned
@@ -1264,15 +1394,15 @@ class DeviceGeometryArray(ExtensionArray):
         selection = plan_dispatch_selection(
             kernel_name="flat_index_build",
             kernel_class=KernelClass.COARSE,
-            row_count=self._owned.row_count,
-            work_estimate=estimate_spatial_index_work_from_owned(self._owned),
-            current_residency=self._owned.residency,
+            row_count=self.to_owned().row_count,
+            work_estimate=estimate_spatial_index_work_from_owned(self.to_owned()),
+            current_residency=self.to_owned().residency,
         )
         self._owned_flat_sindex_cache = build_flat_spatial_index(
-            self._owned,
+            self.to_owned(),
             runtime_selection=selection.runtime_selection,
         )
-        return self._owned, self._owned_flat_sindex_cache
+        return self.to_owned(), self._owned_flat_sindex_cache
 
     @property
     def sindex(self):
@@ -1325,7 +1455,7 @@ class DeviceGeometryArray(ExtensionArray):
             box_bounds = _extract_box_query_bounds(predicate, np.asarray([other], dtype=object))
             if box_bounds is not None:
                 point_box_pairs = _query_point_tree_box_index(
-                    self._owned,
+                    self.to_owned(),
                     predicate=predicate,
                     query_row_count=1,
                     box_bounds=box_bounds,
@@ -1346,9 +1476,9 @@ class DeviceGeometryArray(ExtensionArray):
                     return mask
 
         if supports_binary_predicate(predicate):
-            left_owned = self._owned
+            left_owned = self.to_owned()
             if isinstance(other, DeviceGeometryArray):
-                right_input = other._owned
+                right_input = other.to_owned()
             elif isinstance(other, np.ndarray):
                 right_input = other
             else:
@@ -1385,12 +1515,12 @@ class DeviceGeometryArray(ExtensionArray):
         _record_shapely_fallback_event(
             surface=f"DeviceGeometryArray.{predicate}",
             reason="predicate is unsupported by the owned predicate engine",
-            owned=self._owned,
+            owned=self.to_owned(),
             detail=f"rows={len(self)}, predicate={predicate}",
             requested=get_requested_mode(),
             pipeline="predicate",
         )
-        self._owned._record(
+        self.to_owned()._record(
             DiagnosticKind.MATERIALIZATION,
             f"DeviceGeometryArray.{predicate}: Shapely materialization required (unsupported predicate)",
             visible=True,
@@ -1434,7 +1564,7 @@ class DeviceGeometryArray(ExtensionArray):
         if other_owned is not None and other_owned.row_count == len(self):
             from .equality import geom_equals_owned
 
-            return geom_equals_owned(self._owned, other_owned)
+            return geom_equals_owned(self.to_owned(), other_owned)
 
         import shapely
 
@@ -1443,12 +1573,12 @@ class DeviceGeometryArray(ExtensionArray):
         _record_shapely_fallback_event(
             surface="DeviceGeometryArray.equals",
             reason="Shapely materialization required",
-            owned=self._owned,
+            owned=self.to_owned(),
             detail=f"rows={len(self)}",
             requested=get_requested_mode(),
             pipeline="predicate",
         )
-        self._owned._record(
+        self.to_owned()._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.equals: Shapely materialization required",
             visible=True,
@@ -1462,7 +1592,7 @@ class DeviceGeometryArray(ExtensionArray):
         if other_owned is not None and other_owned.row_count == len(self):
             from .equality import geom_equals_owned
 
-            return geom_equals_owned(self._owned, other_owned)
+            return geom_equals_owned(self.to_owned(), other_owned)
         return self.equals(other)
 
     def geom_equals_exact(self, other, tolerance):
@@ -1470,7 +1600,7 @@ class DeviceGeometryArray(ExtensionArray):
         if other_owned is not None and other_owned.row_count == len(self):
             from .equality import geom_equals_exact_owned
 
-            return geom_equals_exact_owned(self._owned, other_owned, tolerance)
+            return geom_equals_exact_owned(self.to_owned(), other_owned, tolerance)
         import shapely
 
         from vibespatial.runtime import get_requested_mode
@@ -1478,12 +1608,12 @@ class DeviceGeometryArray(ExtensionArray):
         _record_shapely_fallback_event(
             surface="DeviceGeometryArray.geom_equals_exact",
             reason="Shapely fallback for non-DGA other",
-            owned=self._owned,
+            owned=self.to_owned(),
             detail=f"rows={len(self)}, tolerance={tolerance}",
             requested=get_requested_mode(),
             pipeline="predicate",
         )
-        self._owned._record(
+        self.to_owned()._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.geom_equals_exact: Shapely fallback for non-DGA other",
             visible=True,
@@ -1495,7 +1625,7 @@ class DeviceGeometryArray(ExtensionArray):
         if other_owned is not None and other_owned.row_count == len(self):
             from .equality import geom_equals_identical_owned
 
-            return geom_equals_identical_owned(self._owned, other_owned)
+            return geom_equals_identical_owned(self.to_owned(), other_owned)
         import shapely
 
         from vibespatial.runtime import get_requested_mode
@@ -1503,12 +1633,12 @@ class DeviceGeometryArray(ExtensionArray):
         _record_shapely_fallback_event(
             surface="DeviceGeometryArray.geom_equals_identical",
             reason="Shapely fallback for non-DGA other",
-            owned=self._owned,
+            owned=self.to_owned(),
             detail=f"rows={len(self)}",
             requested=get_requested_mode(),
             pipeline="predicate",
         )
-        self._owned._record(
+        self.to_owned()._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.geom_equals_identical: Shapely fallback for non-DGA other",
             visible=True,
@@ -1524,12 +1654,12 @@ class DeviceGeometryArray(ExtensionArray):
         if isinstance(other, DeviceGeometryArray):
             if len(other) != len(self):
                 raise ValueError(f"Lengths do not match: {len(self)} vs {len(other)}")
-            return other._owned
+            return other.to_owned()
         other_values = getattr(other, "values", other)
         if isinstance(other_values, DeviceGeometryArray):
             if len(other_values) != len(self):
                 raise ValueError(f"Lengths do not match: {len(self)} vs {len(other_values)}")
-            return other_values._owned
+            return other_values.to_owned()
         other_owned = getattr(other_values, "_owned", None)
         if isinstance(other_owned, OwnedGeometryArray):
             if len(other_values) != len(self):
@@ -1573,7 +1703,7 @@ class DeviceGeometryArray(ExtensionArray):
         if other_owned is not None:
             from vibespatial.spatial.distance_owned import distance_owned
 
-            return distance_owned(self._owned, other_owned)
+            return distance_owned(self.to_owned(), other_owned)
 
         # Shapely fallback for unsupported 'other' types.
         import shapely
@@ -1583,12 +1713,12 @@ class DeviceGeometryArray(ExtensionArray):
         _record_shapely_fallback_event(
             surface="DeviceGeometryArray.distance",
             reason="unsupported other type for owned distance path",
-            owned=self._owned,
+            owned=self.to_owned(),
             detail=f"rows={len(self)}",
             requested=get_requested_mode(),
             pipeline="measurement/distance",
         )
-        self._owned._record(
+        self.to_owned()._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.distance: Shapely fallback (unsupported other type)",
             visible=True,
@@ -1605,7 +1735,7 @@ class DeviceGeometryArray(ExtensionArray):
         if other_owned is not None:
             from vibespatial.spatial.distance_owned import dwithin_owned
 
-            return dwithin_owned(self._owned, other_owned, distance)
+            return dwithin_owned(self.to_owned(), other_owned, distance)
         # Shapely fallback for unsupported 'other' types.
         from vibespatial.runtime import ExecutionMode
         from vibespatial.runtime.dispatch import record_dispatch_event
@@ -1646,7 +1776,7 @@ class DeviceGeometryArray(ExtensionArray):
         if other_owned is not None:
             from vibespatial.spatial.distance_metrics import hausdorff_distance_owned
 
-            return hausdorff_distance_owned(self._owned, other_owned, densify=densify)
+            return hausdorff_distance_owned(self.to_owned(), other_owned, densify=densify)
 
         import shapely
 
@@ -1655,13 +1785,13 @@ class DeviceGeometryArray(ExtensionArray):
         _record_shapely_fallback_event(
             surface="DeviceGeometryArray.hausdorff_distance",
             reason="unsupported other type for owned distance path",
-            owned=self._owned,
+            owned=self.to_owned(),
             detail=f"rows={len(self)}, densify={densify}",
             requested=get_requested_mode(),
             pipeline="measurement/distance",
         )
 
-        self._owned._record(
+        self.to_owned()._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.hausdorff_distance: Shapely fallback (unsupported other type)",
             visible=True,
@@ -1675,7 +1805,7 @@ class DeviceGeometryArray(ExtensionArray):
         if other_owned is not None:
             from vibespatial.spatial.distance_metrics import frechet_distance_owned
 
-            return frechet_distance_owned(self._owned, other_owned, densify=densify)
+            return frechet_distance_owned(self.to_owned(), other_owned, densify=densify)
 
         import shapely
 
@@ -1684,13 +1814,13 @@ class DeviceGeometryArray(ExtensionArray):
         _record_shapely_fallback_event(
             surface="DeviceGeometryArray.frechet_distance",
             reason="unsupported other type for owned distance path",
-            owned=self._owned,
+            owned=self.to_owned(),
             detail=f"rows={len(self)}, densify={densify}",
             requested=get_requested_mode(),
             pipeline="measurement/distance",
         )
 
-        self._owned._record(
+        self.to_owned()._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.frechet_distance: Shapely fallback (unsupported other type)",
             visible=True,
@@ -1708,7 +1838,7 @@ class DeviceGeometryArray(ExtensionArray):
         from vibespatial.runtime.residency import Residency
 
         requested_mode = get_requested_mode()
-        families = set(self._owned.families)
+        families = set(self.to_owned().families)
         gpu_family_supported = (
             (GeometryFamily.POINT in families and len(families) == 1)
             or GeometryFamily.LINESTRING in families
@@ -1721,7 +1851,7 @@ class DeviceGeometryArray(ExtensionArray):
             if (
                 requested_mode is ExecutionMode.AUTO
                 and gpu_family_supported
-                and self._owned.residency is Residency.DEVICE
+                and self.to_owned().residency is Residency.DEVICE
             )
             else (
                 ExecutionMode.CPU
@@ -1731,7 +1861,7 @@ class DeviceGeometryArray(ExtensionArray):
         )
 
         result = clip_by_rect_owned(
-            self._owned,
+            self.to_owned(),
             xmin,
             ymin,
             xmax,
@@ -1751,15 +1881,15 @@ class DeviceGeometryArray(ExtensionArray):
             owned_result = result.owned_result
             row_map = np.asarray(result.owned_result_rows, dtype=np.int64)
             if (
-                owned_result.row_count != self._owned.row_count
-                or row_map.size != self._owned.row_count
+                owned_result.row_count != self.to_owned().row_count
+                or row_map.size != self.to_owned().row_count
                 or not np.array_equal(
                     row_map,
-                    np.arange(self._owned.row_count, dtype=np.int64),
+                    np.arange(self.to_owned().row_count, dtype=np.int64),
                 )
             ):
                 base = build_null_owned_array(
-                    self._owned.row_count,
+                    self.to_owned().row_count,
                     residency=owned_result.residency,
                 )
                 owned_result = concat_owned_scatter(
@@ -1780,7 +1910,7 @@ class DeviceGeometryArray(ExtensionArray):
             geoms[empty] = None
         new_owned = from_shapely_geometries(
             geoms.tolist(),
-            residency=self._owned.residency,
+            residency=self.to_owned().residency,
         )
         return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
 
@@ -1801,7 +1931,7 @@ class DeviceGeometryArray(ExtensionArray):
                 workload_shape = WorkloadShape.SCALAR_RIGHT
             result_geometry = binary_constructive_native(
                 op,
-                self._owned,
+                self.to_owned(),
                 other_owned,
                 grid_size=grid_size,
                 workload_shape=workload_shape,
@@ -1825,12 +1955,12 @@ class DeviceGeometryArray(ExtensionArray):
         _record_shapely_fallback_event(
             surface=f"DeviceGeometryArray.{op}",
             reason="unsupported other type for owned constructive path",
-            owned=self._owned,
+            owned=self.to_owned(),
             detail=f"rows={len(self)}, op={op}",
             requested=get_requested_mode(),
             pipeline="constructive/binary",
         )
-        self._owned._record(
+        self.to_owned()._record(
             DiagnosticKind.MATERIALIZATION,
             f"DeviceGeometryArray.{op}: Shapely fallback (unsupported other type)",
             visible=True,
@@ -1866,53 +1996,77 @@ class DeviceGeometryArray(ExtensionArray):
         """Populate the full Shapely cache if not already present."""
         if self._shapely_cache is not None:
             return self._shapely_cache
-        self._owned._record(
+        if self._composition is not None:
+            cache = np.empty(len(self), dtype=object)
+            cache[:] = None
+            for part in self._composition.parts:
+                rows = self._composition_part_rows_host(part)
+                cache[rows] = owned_to_shapely(
+                    part.geometry.owned,
+                    record_event=True,
+                )
+            self._shapely_cache = cache
+            return cache
+        self.to_owned()._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray: full Shapely cache materialized",
             visible=True,
         )
-        cache = owned_to_shapely(self._owned, record_event=False)
+        cache = owned_to_shapely(self.to_owned(), record_event=False)
         self._shapely_cache = cache
         return cache
+
+    @staticmethod
+    def _composition_part_rows_host(part: Any) -> np.ndarray:
+        rows = part.output_rows
+        if hasattr(rows, "__cuda_array_interface__"):
+            rows = get_cuda_runtime().copy_device_to_host(
+                rows,
+                reason="partitioned geometry row indirection terminal export",
+                terminal_export=True,
+            )
+        return np.asarray(rows, dtype=np.int64)
 
     def _materialize_row(self, row_index: int) -> BaseGeometry | None:
         """Materialize a single row without populating the full cache."""
         if self._shapely_cache is not None:
             return self._shapely_cache[row_index]
-        if self._owned.is_indexed_view:
-            self._owned._ensure_host_state()
-            if not bool(self._owned.validity[row_index]):
+        if self._composition is not None:
+            return self._ensure_shapely_cache()[row_index]
+        if self.to_owned().is_indexed_view:
+            self.to_owned()._ensure_host_state()
+            if not bool(self.to_owned().validity[row_index]):
                 return None
-            family_tag = int(self._owned.tags[row_index])
-            family_row = int(self._owned.family_row_offsets[row_index])
+            family_tag = int(self.to_owned().tags[row_index])
+            family_row = int(self.to_owned().family_row_offsets[row_index])
             family = TAG_FAMILIES[family_tag]
-            family_buffer = self._owned.families[family]
+            family_buffer = self.to_owned().families[family]
             return materialize_family_row(family_buffer, family_row)
 
         row_metadata = None
         if (
-            getattr(self._owned, "_validity", None) is None
-            or getattr(self._owned, "_tags", None) is None
-            or getattr(self._owned, "_family_row_offsets", None) is None
+            getattr(self.to_owned(), "_validity", None) is None
+            or getattr(self.to_owned(), "_tags", None) is None
+            or getattr(self.to_owned(), "_family_row_offsets", None) is None
         ):
             row_metadata = _device_row_metadata(
-                self._owned,
+                self.to_owned(),
                 row_index,
                 reason="DeviceGeometryArray scalar row metadata device export",
             )
         if row_metadata is None:
-            if not bool(self._owned.validity[row_index]):
+            if not bool(self.to_owned().validity[row_index]):
                 return None
-            family_tag = int(self._owned.tags[row_index])
-            family_row = int(self._owned.family_row_offsets[row_index])
+            family_tag = int(self.to_owned().tags[row_index])
+            family_row = int(self.to_owned().family_row_offsets[row_index])
         else:
             valid, family_tag, family_row = row_metadata
             if not valid:
                 return None
         # Ensure host state for the specific family
-        self._owned._ensure_host_state()
+        self.to_owned()._ensure_host_state()
         family = TAG_FAMILIES[family_tag]
-        family_buffer = self._owned.families[family]
+        family_buffer = self.to_owned().families[family]
         return materialize_family_row(family_buffer, family_row)
 
     # ------------------------------------------------------------------
@@ -1926,11 +2080,18 @@ class DeviceGeometryArray(ExtensionArray):
         full ``take``; override to share the backing OwnedGeometryArray
         directly (semantically identical for immutable-in-practice DGA).
         """
-        result = DeviceGeometryArray._from_owned(
-            self._owned,
-            crs=self._crs,
-            provenance=getattr(self, "_provenance", None),
-        )
+        if self._composition is not None:
+            result = DeviceGeometryArray._from_composition(
+                self._composition,
+                crs=self._crs,
+                provenance=getattr(self, "_provenance", None),
+            )
+        else:
+            result = DeviceGeometryArray._from_owned(
+                self.__owned,
+                crs=self._crs,
+                provenance=getattr(self, "_provenance", None),
+            )
         if self._shapely_cache is not None:
             result._shapely_cache = self._shapely_cache
         return result
@@ -1954,12 +2115,7 @@ class DeviceGeometryArray(ExtensionArray):
             if indices.dtype == bool:
                 indices = np.flatnonzero(indices)
 
-        new_owned = self._owned.take(indices)
-        result = DeviceGeometryArray._from_owned(
-            new_owned,
-            crs=self._crs,
-            provenance=getattr(self, "_provenance", None),
-        )
+        result = self.take(indices)
         # Propagate shapely cache subset if available
         if self._shapely_cache is not None:
             result._shapely_cache = self._shapely_cache[indices]
@@ -1973,18 +2129,18 @@ class DeviceGeometryArray(ExtensionArray):
         if isinstance(value, DeviceGeometryArray):
             indices = self._resolve_setitem_indices(key, len(value))
             if indices is not None:
-                if len(indices) == len(self) and len(indices) == value._owned.row_count:
+                if len(indices) == len(self) and len(indices) == value.to_owned().row_count:
                     # Full replacement: just swap the owned array.
-                    self._owned = value._owned
+                    self._owned = value.to_owned()
                     self._shapely_cache = None
                     self._provenance = getattr(value, "_provenance", None)
                     return
-                if len(indices) == value._owned.row_count:
+                if len(indices) == value.to_owned().row_count:
                     from vibespatial.geometry.owned import concat_owned_scatter
 
                     self._owned = concat_owned_scatter(
-                        self._owned,
-                        value._owned,
+                        self.to_owned(),
+                        value.to_owned(),
                         indices,
                     )
                     self._shapely_cache = None
@@ -2036,7 +2192,7 @@ class DeviceGeometryArray(ExtensionArray):
         left = self._ensure_shapely_cache()
         right = other._ensure_shapely_cache()
         result = np.zeros(len(self), dtype=bool)
-        both_valid = self._owned.validity & other._owned.validity
+        both_valid = self.to_owned().validity & other.to_owned().validity
         if both_valid.any():
             result[both_valid] = shapely.equals(left[both_valid], right[both_valid])
         return result
@@ -2068,7 +2224,7 @@ class DeviceGeometryArray(ExtensionArray):
                 # Use only valid indices for the take, then patch fill positions
                 safe_indices = indices.copy()
                 safe_indices[mask] = 0
-                new_owned = self._owned.take(safe_indices)
+                new_owned = self.to_owned().take(safe_indices)
                 new_owned._apply_row_activity(~mask)
                 return DeviceGeometryArray._from_owned(
                     new_owned,
@@ -2076,7 +2232,17 @@ class DeviceGeometryArray(ExtensionArray):
                     provenance=getattr(self, "_provenance", None),
                 )
 
-        new_owned = self._owned.take(indices)
+        if self._composition is not None:
+            result = DeviceGeometryArray._from_composition(
+                self._composition.take(indices),
+                crs=self._crs,
+                provenance=getattr(self, "_provenance", None),
+            )
+            if self._shapely_cache is not None:
+                result._shapely_cache = self._shapely_cache[indices]
+            return result
+
+        new_owned = self.to_owned().take(indices)
         result = DeviceGeometryArray._from_owned(
             new_owned,
             crs=self._crs,
@@ -2088,7 +2254,16 @@ class DeviceGeometryArray(ExtensionArray):
         return result
 
     def copy(self) -> DeviceGeometryArray:
-        new_owned = _copy_owned_array(self._owned)
+        if self._composition is not None:
+            result = DeviceGeometryArray._from_composition(
+                self._composition,
+                crs=self._crs,
+                provenance=getattr(self, "_provenance", None),
+            )
+            if self._shapely_cache is not None:
+                result._shapely_cache = self._shapely_cache.copy()
+            return result
+        new_owned = _copy_owned_array(self.to_owned())
         new_owned._record(DiagnosticKind.CREATED, "DeviceGeometryArray: copy", visible=False)
         result = DeviceGeometryArray._from_owned(
             new_owned,
@@ -2109,6 +2284,32 @@ class DeviceGeometryArray(ExtensionArray):
                 families={},
             )
             return cls._from_owned(empty_owned)
+
+        if any(arr._composition is not None for arr in to_concat):
+            from vibespatial.api._native_result_core import (
+                GeometryNativeResult,
+                NativeGeometryComposition,
+            )
+
+            geometries = [
+                GeometryNativeResult.from_composition(arr._composition, crs=arr._crs)
+                if arr._composition is not None
+                else GeometryNativeResult.from_owned(arr.__owned, crs=arr._crs)
+                for arr in to_concat
+            ]
+            crs = next((arr._crs for arr in to_concat if arr._crs is not None), None)
+            composition = NativeGeometryComposition.concat(geometries, crs=crs)
+            provenance = getattr(to_concat[0], "_provenance", None)
+            if any(
+                getattr(arr, "_provenance", None) != provenance
+                for arr in to_concat[1:]
+            ):
+                provenance = None
+            return cls._from_composition(
+                composition,
+                crs=crs,
+                provenance=provenance,
+            )
 
         target_residency = next(
             (
@@ -2164,8 +2365,8 @@ class DeviceGeometryArray(ExtensionArray):
     # ------------------------------------------------------------------
 
     def __getstate__(self) -> tuple[list[bytes | None], Any, str]:
-        wkb = _serialize_owned_wkb(self._owned)
-        return (wkb, self._crs, self._owned.residency.value)
+        wkb = _serialize_owned_wkb(self.to_owned())
+        return (wkb, self._crs, self.to_owned().residency.value)
 
     def __setstate__(
         self, state: tuple[list[bytes | None], Any] | tuple[list[bytes | None], Any, str]
@@ -2180,7 +2381,7 @@ class DeviceGeometryArray(ExtensionArray):
             residency = Residency(residency_value)
         self._owned = decode_wkb_owned(wkb_list)
         if residency is Residency.DEVICE:
-            self._owned.move_to(
+            self.to_owned().move_to(
                 Residency.DEVICE,
                 trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
                 reason="restored device-resident DeviceGeometryArray from pickle",
@@ -2229,10 +2430,15 @@ class DeviceGeometryArray(ExtensionArray):
                 reason="device geometry array exported through NumPy array protocol",
                 detail=(
                     "residency="
-                    f"{getattr(getattr(self._owned, 'residency', None), 'value', 'unknown')}"
+                    f"{getattr(getattr(self._composition, 'residency', None), 'value', 'unknown')}"
+                    if self._composition is not None
+                    else f"{getattr(getattr(self.__owned, 'residency', None), 'value', 'unknown')}"
                 ),
-                row_count=self._owned.row_count,
-                d2h_transfer=self._owned.device_state is not None,
+                row_count=len(self),
+                d2h_transfer=(
+                    self._composition is not None
+                    or self.__owned.device_state is not None
+                ),
             )
         )
         cache = self._ensure_shapely_cache()
@@ -2242,7 +2448,13 @@ class DeviceGeometryArray(ExtensionArray):
 
     @property
     def diagnostics(self) -> list[DiagnosticEvent]:
-        return self._owned.diagnostics
+        if self._composition is not None:
+            return [
+                event
+                for part in self._composition.parts
+                for event in part.geometry.owned.diagnostics
+            ]
+        return self.__owned.diagnostics
 
 
 def _concat_family_buffers(

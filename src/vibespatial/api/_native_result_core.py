@@ -71,6 +71,8 @@ def _normalize_row_selection(row_positions):
         d_positions = cp.asarray(row_positions)
         if d_positions.dtype == cp.bool_ or d_positions.dtype == bool:
             return cp.flatnonzero(d_positions).astype(cp.int64, copy=False)
+        if d_positions.dtype.kind == "i":
+            return d_positions
         return d_positions.astype(cp.int64, copy=False)
 
     positions = np.asarray(row_positions)
@@ -2056,10 +2058,10 @@ class NativeAttributeTable:
             import cupy as cp
 
             if self.row_positions is None:
-                selected_positions = cp.asarray(normalized, dtype=cp.int64)
+                selected_positions = cp.asarray(normalized)
             else:
-                selected_positions = cp.asarray(self.row_positions, dtype=cp.int64)[
-                    cp.asarray(normalized, dtype=cp.int64)
+                selected_positions = cp.asarray(self.row_positions)[
+                    cp.asarray(normalized)
                 ]
             return type(self)(
                 device_table=self.device_table,
@@ -2197,9 +2199,9 @@ class NativeAttributeTable:
             schema = self.arrow_table.schema
         else:
             return None
-        d_positions = cp.asarray(row_positions, dtype=cp.int64)
+        d_positions = cp.asarray(row_positions)
         if self.row_positions is not None:
-            d_positions = cp.asarray(self.row_positions, dtype=cp.int64)[d_positions]
+            d_positions = cp.asarray(self.row_positions)[d_positions]
         source_row_count = _device_table_row_count(source)
         target_dtype = cp.int32 if source_row_count <= np.iinfo(np.int32).max else cp.int64
         gather_map = _pylibcudf_column_from_device(
@@ -2715,9 +2717,14 @@ class GeometryNativeResult:
 
     @classmethod
     def from_geoseries(cls, series: GeoSeries) -> GeometryNativeResult:
-        owned = getattr(series.values, "_owned", None)
+        values = series.values
+        cached_owned = getattr(values, "cached_owned", None)
+        owned = cached_owned() if callable(cached_owned) else getattr(values, "_owned", None)
         if owned is not None:
             return cls.from_owned(owned, crs=series.crs)
+        composition = getattr(values, "native_composition", None)
+        if composition is not None:
+            return cls.from_composition(composition, crs=series.crs)
         return cls(crs=series.crs, series=series)
 
     @classmethod
@@ -2731,9 +2738,13 @@ class GeometryNativeResult:
     ) -> GeometryNativeResult:
         from vibespatial.api.geometry_array import GeometryArray
 
-        owned = getattr(values, "_owned", None)
-        if "DeviceGeometryArray" in type(values).__name__ and owned is not None:
+        cached_owned = getattr(values, "cached_owned", None)
+        owned = cached_owned() if callable(cached_owned) else getattr(values, "_owned", None)
+        if callable(cached_owned) and owned is not None:
             return cls.from_owned(owned, crs=crs)
+        composition = getattr(values, "native_composition", None)
+        if composition is not None:
+            return cls.from_composition(composition, crs=crs)
 
         from vibespatial.api.geoseries import GeoSeries
 
@@ -2785,24 +2796,105 @@ class GeometryNativeResult:
             import cupy as cp
 
             result = cp.zeros(self.row_count, dtype=cp.bool_)
+            if self.composition.contiguous_row_partitions:
+                for part in self.composition.parts:
+                    part_mask = part.geometry.valid_nonempty_mask_device()
+                    if part_mask is None:
+                        return None
+                    result[cp.asarray(part.output_rows, dtype=cp.int64)] = cp.asarray(
+                        part_mask,
+                        dtype=cp.bool_,
+                    )
+                return result
+            scatter_result = cp.zeros(self.row_count, dtype=cp.uint32)
             for part in self.composition.parts:
                 part_mask = part.geometry.valid_nonempty_mask_device()
                 if part_mask is None:
                     return None
                 output_rows = cp.asarray(part.output_rows, dtype=cp.int64)
-                part_count = int(output_rows.size)
-                d_lanes = cp.arange(part_count, dtype=cp.int64)
                 d_active = cp.asarray(part_mask, dtype=cp.bool_)
-                d_destinations = cp.where(
-                    d_active,
+                cp.maximum.at(
+                    scatter_result,
                     output_rows,
-                    cp.int64(self.row_count) + d_lanes,
+                    d_active.astype(cp.uint32),
                 )
-                d_scatter = cp.zeros(self.row_count + part_count, dtype=cp.bool_)
-                d_scatter[d_destinations] = d_active
-                result |= d_scatter[: self.row_count]
-            return result
+            return scatter_result != 0
         return None
+
+    def select_family_domain_device(self, families):
+        """Mask non-target concrete parts and return logical keep/drop metadata."""
+        import cupy as cp
+
+        from vibespatial.geometry.owned import FAMILY_TAGS
+
+        target_tags = tuple(FAMILY_TAGS[family] for family in families)
+
+        def _owned_selection(owned):
+            state = owned._ensure_device_state(preserve_indexed_view=True)
+            d_valid_nonempty = type(self).from_owned(
+                owned,
+                crs=self.crs,
+            ).valid_nonempty_mask_device()
+            if d_valid_nonempty is None:
+                return None
+            d_target = cp.zeros(owned.row_count, dtype=cp.bool_)
+            d_tags = cp.asarray(state.tags, dtype=cp.int8)
+            for tag in target_tags:
+                d_target |= d_tags == cp.int8(tag)
+            d_keep = cp.asarray(d_valid_nonempty, dtype=cp.bool_) & d_target
+            d_drop = cp.asarray(d_valid_nonempty, dtype=cp.bool_) & ~d_target
+            return d_keep, d_drop
+
+        if self.owned is not None:
+            selection = _owned_selection(self.owned)
+            if selection is None:
+                return None
+            d_keep, d_drop = selection
+            return self.mask_capacity(d_keep), d_keep, cp.sum(d_drop, dtype=cp.int64)
+
+        if self.composition is None:
+            return None
+
+        d_logical_keep_bits = cp.zeros(self.row_count, dtype=cp.uint32)
+        d_drop_count = cp.zeros(1, dtype=cp.int64)
+        selected_parts = []
+        for part in self.composition.parts:
+            owned = part.geometry.owned
+            if owned is None:
+                return None
+            selection = _owned_selection(owned)
+            if selection is None:
+                return None
+            d_part_keep, d_part_drop = selection
+            d_rows = cp.asarray(part.output_rows, dtype=cp.int64)
+            cp.maximum.at(
+                d_logical_keep_bits,
+                d_rows,
+                d_part_keep.astype(cp.uint32),
+            )
+            d_drop_count += cp.sum(d_part_drop, dtype=cp.int64).reshape(1)
+            selected_parts.append(
+                NativeGeometryCompositionPart(
+                    geometry=part.geometry.mask_capacity(d_part_keep),
+                    output_rows=part.output_rows,
+                    collection_position=part.collection_position,
+                )
+            )
+
+        selected = type(self).from_composition(
+            NativeGeometryComposition(
+                parts=tuple(selected_parts),
+                row_count=self.row_count,
+                crs=self.crs,
+                trusted_all_ogc_valid=self.composition.trusted_all_ogc_valid,
+                contiguous_row_partitions=False,
+                trusted_singular_rows=self.composition.trusted_singular_rows,
+                trusted_family_domain=tuple(families),
+            ),
+            crs=self.crs,
+        )
+        d_logical_keep = d_logical_keep_bits != 0
+        return selected, d_logical_keep, d_drop_count[0]
 
     def mask_capacity(self, active_mask) -> GeometryNativeResult:
         """Mask logical capacity lanes without compacting native geometry."""
@@ -2835,6 +2927,11 @@ class GeometryNativeResult:
                     row_count=self.row_count,
                     crs=self.crs,
                     trusted_all_ogc_valid=self.composition.trusted_all_ogc_valid,
+                    contiguous_row_partitions=(
+                        self.composition.contiguous_row_partitions
+                    ),
+                    trusted_singular_rows=self.composition.trusted_singular_rows,
+                    trusted_family_domain=self.composition.trusted_family_domain,
                 ),
                 crs=self.crs,
             )
@@ -2871,27 +2968,52 @@ class GeometryNativeResult:
                     row_count=self.row_count,
                     crs=self.crs,
                     trusted_all_ogc_valid=self.composition.trusted_all_ogc_valid,
+                    contiguous_row_partitions=False,
+                    trusted_singular_rows=self.composition.trusted_singular_rows,
+                    trusted_family_domain=self.composition.trusted_family_domain,
                 ),
                 crs=self.crs,
             )
         raise TypeError("host geometry series cannot use a device capacity permutation")
 
-    def take(self, row_positions, *, unique: bool = False) -> GeometryNativeResult:
-        normalized = _normalize_row_selection(row_positions)
+    def take(
+        self,
+        row_positions,
+        *,
+        unique: bool = False,
+        defer_device_metadata: bool = False,
+    ) -> GeometryNativeResult:
+        normalized = (
+            row_positions
+            if (
+                defer_device_metadata
+                and _is_device_array(row_positions)
+                and getattr(getattr(row_positions, "dtype", None), "kind", None)
+                in {"i", "u"}
+            )
+            else _normalize_row_selection(row_positions)
+        )
         if self.composition is not None:
             return type(self).from_composition(
                 self.composition.take(normalized, unique=unique),
                 crs=self.crs,
             )
         if self.owned is not None:
-            taken = (
-                self.owned.device_take(
+            if _is_device_array(normalized) and defer_device_metadata:
+                taken = self.owned._device_indexed_take(
                     normalized,
                     assume_unique_indices=unique,
+                    defer_device_metadata=True,
                 )
-                if _is_device_array(normalized)
-                else self.owned.take(normalized)
-            )
+            else:
+                taken = (
+                    self.owned.device_take(
+                        normalized,
+                        assume_unique_indices=unique,
+                    )
+                    if _is_device_array(normalized)
+                    else self.owned.take(normalized)
+                )
             return type(self).from_owned(taken, crs=self.crs)
         host_positions = _host_row_positions(normalized)
         return type(self).from_geoseries(self.series.take(host_positions))
@@ -3108,7 +3230,16 @@ class NativeGeometryComposition:
     row_count: int
     crs: Any
     trusted_all_ogc_valid: bool | None = None
+    contiguous_row_partitions: bool = False
+    trusted_singular_rows: bool = False
+    trusted_family_domain: tuple[Any, ...] | None = None
     _singular_owned_cache: Any = dataclass_field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _singular_partitioned_cache: Any = dataclass_field(
         default=None,
         init=False,
         repr=False,
@@ -3139,9 +3270,83 @@ class NativeGeometryComposition:
             row_count=self.row_count,
             crs=crs,
             trusted_all_ogc_valid=self.trusted_all_ogc_valid,
+            contiguous_row_partitions=self.contiguous_row_partitions,
+            trusted_singular_rows=self.trusted_singular_rows,
+            trusted_family_domain=self.trusted_family_domain,
+        )
+
+    def ordered_contiguous_device_parts(self):
+        """Return exact ordered output spans without joining part row arrays.
+
+        This is the terminal-export view of a singular composition.  Each
+        returned owned array covers one contiguous logical output interval and
+        the intervals cover the full result in order.  Certification reduces
+        only compact part-layout metadata to host; geometry rows and
+        coordinates remain device-resident.
+        """
+        if (
+            not self.trusted_singular_rows
+            or self.residency is not Residency.DEVICE
+            or any(part.collection_position is not None for part in self.parts)
+        ):
+            return None
+
+        owned_parts = []
+        total_rows = 0
+        for part in self.parts:
+            owned = part.geometry.owned
+            if owned is None:
+                return None
+            part_rows = int(owned.row_count)
+            if part_rows != _row_aligned_size(part.output_rows):
+                return None
+            if part_rows:
+                owned_parts.append((total_rows, total_rows + part_rows, owned, part.output_rows))
+            total_rows += part_rows
+        if total_rows != int(self.row_count):
+            return None
+
+        if not self.contiguous_row_partitions and owned_parts:
+            import cupy as cp
+
+            checks = []
+            for start, stop, _owned, output_rows in owned_parts:
+                rows = cp.asarray(output_rows, dtype=cp.int64)
+                internally_contiguous = (
+                    cp.asarray(True)
+                    if int(rows.size) == 1
+                    else cp.all(rows[1:] == rows[:-1] + cp.int64(1))
+                )
+                checks.append(
+                    internally_contiguous
+                    & (rows[0] == cp.int64(start))
+                    & (rows[-1] == cp.int64(stop - 1))
+                )
+            certified = _host_array(
+                cp.stack(checks),
+                dtype=np.bool_,
+                strict_disallowed=False,
+                surface="vibespatial.api.NativeGeometryComposition",
+                operation="ordered_contiguous_partition_certification",
+                reason=(
+                    "terminal native export certified compact geometry-part "
+                    "layout metadata"
+                ),
+                detail=f"rows={self.row_count}, parts={len(owned_parts)}",
+            )
+            if not bool(np.all(certified)):
+                return None
+            object.__setattr__(self, "contiguous_row_partitions", True)
+
+        return tuple(
+            (start, stop, owned)
+            for start, stop, owned, _output_rows in owned_parts
         )
 
     def take(self, row_positions, *, unique: bool = False) -> NativeGeometryComposition:
+        singular_partitioned = self._singular_partitioned_cache
+        if singular_partitioned is not None:
+            return singular_partitioned.take(row_positions, unique=unique)
         selected = _normalize_row_selection(row_positions)
         if _row_aligned_size(selected) == 0:
             return type(self)(
@@ -3149,6 +3354,8 @@ class NativeGeometryComposition:
                 row_count=0,
                 crs=self.crs,
                 trusted_all_ogc_valid=self.trusted_all_ogc_valid,
+                trusted_singular_rows=self.trusted_singular_rows,
+                trusted_family_domain=self.trusted_family_domain,
             )
         taken_parts = []
         for part in self.parts:
@@ -3182,6 +3389,8 @@ class NativeGeometryComposition:
             row_count=_row_aligned_size(selected),
             crs=self.crs,
             trusted_all_ogc_valid=self.trusted_all_ogc_valid,
+            trusted_singular_rows=self.trusted_singular_rows,
+            trusted_family_domain=self.trusted_family_domain,
         )
         cached = self._singular_owned_cache
         if cached is not None:
@@ -3198,6 +3407,119 @@ class NativeGeometryComposition:
                     assume_unique_indices=unique,
                 )
             object.__setattr__(result, "_singular_owned_cache", taken_cache)
+        return result
+
+    def _singular_partitioned_device(self):
+        """Select one concrete device part per row without joining buffers."""
+        cached = self._singular_partitioned_cache
+        if cached is not None:
+            return cached
+        if self.residency is not Residency.DEVICE:
+            return None
+        if any(part.collection_position is not None for part in self.parts):
+            return None
+        if self.row_count == 0:
+            result = type(self)(
+                parts=(),
+                row_count=0,
+                crs=self.crs,
+                trusted_all_ogc_valid=self.trusted_all_ogc_valid,
+                trusted_singular_rows=True,
+                trusted_family_domain=self.trusted_family_domain,
+            )
+            object.__setattr__(self, "_singular_partitioned_cache", result)
+            return result
+
+        import cupy as cp
+
+        concrete = []
+        d_counts = cp.zeros(self.row_count, dtype=cp.int32)
+        for part in self.parts:
+            owned = part.geometry.owned
+            if owned is None:
+                return None
+            state = owned._ensure_device_state(preserve_indexed_view=True)
+            d_valid = cp.asarray(state.validity, dtype=cp.bool_)
+            d_nonempty = part.geometry.valid_nonempty_mask_device()
+            if d_nonempty is None:
+                return None
+            d_nonempty = cp.asarray(d_nonempty, dtype=cp.bool_) & d_valid
+            d_rows = cp.asarray(part.output_rows, dtype=cp.int64)
+            if int(d_valid.size) != int(d_rows.size):
+                raise ValueError("composition concrete validity must align with output rows")
+            part_count = int(d_rows.size)
+            cp.add.at(
+                d_counts,
+                d_rows[d_nonempty],
+                cp.ones_like(d_rows[d_nonempty], dtype=cp.int32),
+            )
+            concrete.append((owned, d_rows, d_valid, d_nonempty))
+
+        if not self.trusted_singular_rows:
+            singular = _host_array(
+                cp.stack((cp.all(d_counts <= 1),)),
+                dtype=np.bool_,
+                strict_disallowed=False,
+                surface="vibespatial.api.NativeGeometryComposition.to_geoseries",
+                operation="singular_partitioned_certification",
+                reason=(
+                    "terminal geometry composition multiplicity certified before "
+                    "partitioned public export"
+                ),
+                detail=f"rows={self.row_count}, parts={len(self.parts)}",
+            )
+            if not bool(singular[0]):
+                return None
+
+        selected_codes = cp.zeros(self.row_count, dtype=cp.uint64)
+        part_codes = []
+        high_bit = cp.uint64(1) << cp.uint64(63)
+        for part_index, (owned, d_rows, d_valid, d_nonempty) in enumerate(concrete):
+            part_count = int(owned.row_count)
+            d_lanes = cp.arange(part_count, dtype=cp.uint64)
+            d_codes = (cp.uint64(part_index + 1) << cp.uint64(32)) | (
+                d_lanes + cp.uint64(1)
+            )
+            d_codes = cp.where(d_nonempty, d_codes | high_bit, d_codes)
+            cp.maximum.at(
+                selected_codes,
+                d_rows[d_valid],
+                d_codes[d_valid],
+            )
+            part_codes.append(d_codes)
+
+        selected_parts = []
+        for (owned, d_rows, d_valid, _d_nonempty), d_codes in zip(
+            concrete,
+            part_codes,
+            strict=True,
+        ):
+            d_selected = d_valid & (selected_codes[d_rows] == d_codes)
+            d_lanes = cp.flatnonzero(d_selected).astype(cp.int64, copy=False)
+            if int(d_lanes.size) == 0:
+                continue
+            selected_parts.append(
+                NativeGeometryCompositionPart(
+                    geometry=GeometryNativeResult.from_owned(
+                        owned._device_indexed_take(
+                            d_lanes,
+                            assume_unique_indices=True,
+                        ),
+                        crs=self.crs,
+                    ),
+                    output_rows=d_rows[d_lanes],
+                )
+            )
+
+        result = type(self)(
+            parts=tuple(selected_parts),
+            row_count=self.row_count,
+            crs=self.crs,
+            trusted_all_ogc_valid=self.trusted_all_ogc_valid,
+            trusted_singular_rows=True,
+            trusted_family_domain=self.trusted_family_domain,
+        )
+        object.__setattr__(self, "_singular_partitioned_cache", result)
         return result
 
     def _singular_owned_device(self):
@@ -3220,6 +3542,33 @@ class NativeGeometryComposition:
         if self.row_count == 0:
             return build_null_owned_array(0, residency=Residency.DEVICE)
 
+        if self.contiguous_row_partitions:
+            owned_parts = [part.geometry.owned for part in self.parts]
+            if any(owned is None for owned in owned_parts):
+                return None
+            result = OwnedGeometryArray.concat(owned_parts)
+            if int(result.row_count) != int(self.row_count):
+                raise ValueError("contiguous geometry partitions lost logical rows")
+            if self.trusted_all_ogc_valid is True:
+                result._ensure_device_state(
+                    preserve_indexed_view=True,
+                ).trusted_all_ogc_valid = True
+            object.__setattr__(self, "_singular_owned_cache", result)
+            object.__setattr__(
+                self,
+                "parts",
+                (
+                    NativeGeometryCompositionPart(
+                        geometry=GeometryNativeResult.from_owned(
+                            result,
+                            crs=self.crs,
+                        ),
+                        output_rows=cp.arange(self.row_count, dtype=cp.int64),
+                    ),
+                ),
+            )
+            return result
+
         concrete = []
         d_counts = cp.zeros(self.row_count, dtype=cp.int32)
         d_valid_counts = cp.zeros(self.row_count, dtype=cp.int32)
@@ -3236,35 +3585,16 @@ class NativeGeometryComposition:
             d_rows = cp.asarray(part.output_rows, dtype=cp.int64)
             if int(d_valid.size) != int(d_rows.size):
                 raise ValueError("composition concrete validity must align with output rows")
-            part_count = int(d_rows.size)
-            d_lanes = cp.arange(part_count, dtype=cp.int64)
-            d_destinations = cp.where(
-                d_nonempty,
-                d_rows,
-                cp.int64(self.row_count) + d_lanes,
-            )
-            d_part_counts = cp.zeros(self.row_count + part_count, dtype=cp.int32)
             cp.add.at(
-                d_part_counts,
-                d_destinations,
-                cp.ones(part_count, dtype=cp.int32),
-            )
-            d_counts += d_part_counts[: self.row_count]
-            d_valid_destinations = cp.where(
-                d_valid,
-                d_rows,
-                cp.int64(self.row_count) + d_lanes,
-            )
-            d_part_valid_counts = cp.zeros(
-                self.row_count + part_count,
-                dtype=cp.int32,
+                d_counts,
+                d_rows[d_nonempty],
+                cp.ones_like(d_rows[d_nonempty], dtype=cp.int32),
             )
             cp.add.at(
-                d_part_valid_counts,
-                d_valid_destinations,
-                cp.ones(part_count, dtype=cp.int32),
+                d_valid_counts,
+                d_rows[d_valid],
+                cp.ones_like(d_rows[d_valid], dtype=cp.int32),
             )
-            d_valid_counts += d_part_valid_counts[: self.row_count]
             concrete.append((owned, d_rows, d_valid, d_nonempty))
 
         admission = _host_array(
@@ -3291,14 +3621,11 @@ class NativeGeometryComposition:
             d_lanes = cp.arange(part_count, dtype=cp.uint64)
             d_codes = (cp.uint64(part_index + 1) << cp.uint64(32)) | (d_lanes + cp.uint64(1))
             d_codes = cp.where(d_nonempty, d_codes | high_bit, d_codes)
-            d_destinations = cp.where(
-                d_valid,
-                d_rows,
-                cp.int64(self.row_count) + d_lanes.astype(cp.int64, copy=False),
+            cp.maximum.at(
+                selected_codes,
+                d_rows[d_valid],
+                d_codes[d_valid],
             )
-            d_extended = cp.concatenate((selected_codes, cp.zeros(part_count, dtype=cp.uint64)))
-            cp.maximum.at(d_extended, d_destinations, d_codes)
-            selected_codes = d_extended[: self.row_count]
             part_codes.append(d_codes)
 
         selected_masks = [
@@ -3324,6 +3651,44 @@ class NativeGeometryComposition:
             ],
             reason="native geometry composition exact physicalization allocation packet",
         )
+
+        partitioned_parts = []
+        for (
+            (_owned, d_rows, _d_valid, _d_nonempty),
+            d_selected,
+            physical,
+        ) in zip(
+            concrete,
+            selected_masks,
+            physical_parts,
+            strict=True,
+        ):
+            if physical is None:
+                continue
+            d_lanes = cp.flatnonzero(d_selected).astype(cp.int64, copy=False)
+            if int(d_lanes.size) == 0:
+                continue
+            partitioned_parts.append(
+                NativeGeometryCompositionPart(
+                    geometry=GeometryNativeResult.from_owned(
+                        physical._device_indexed_take(
+                            d_lanes,
+                            assume_unique_indices=True,
+                        ),
+                        crs=self.crs,
+                    ),
+                    output_rows=d_rows[d_lanes],
+                )
+            )
+        singular_partitioned = type(self)(
+            parts=tuple(partitioned_parts),
+            row_count=self.row_count,
+            crs=self.crs,
+            trusted_all_ogc_valid=self.trusted_all_ogc_valid,
+            trusted_singular_rows=True,
+            trusted_family_domain=self.trusted_family_domain,
+        )
+        object.__setattr__(self, "_singular_partitioned_cache", singular_partitioned)
 
         if full_valid_coverage:
             arrays = []
@@ -3380,6 +3745,7 @@ class NativeGeometryComposition:
         crs,
     ) -> NativeGeometryComposition:
         parts: list[NativeGeometryCompositionPart] = []
+        contiguous_row_partitions = True
         row_offset = 0
         for geometry in geometries:
             normalized = geometry.with_crs(crs)
@@ -3399,6 +3765,7 @@ class NativeGeometryComposition:
                     )
                 )
             else:
+                contiguous_row_partitions &= normalized.composition.contiguous_row_partitions
                 for part in normalized.composition.parts:
                     if _is_device_array(part.output_rows):
                         import cupy as xp
@@ -3416,6 +3783,35 @@ class NativeGeometryComposition:
                         )
                     )
             row_offset += normalized.row_count
+        family_domains = []
+        for geometry in geometries:
+            if geometry.composition is not None:
+                domain = geometry.composition.trusted_family_domain
+            elif geometry.owned is not None:
+                state = geometry.owned._ensure_device_state(
+                    preserve_indexed_view=True,
+                ) if geometry.residency is Residency.DEVICE else None
+                domain = (
+                    getattr(state, "trusted_family_domain", None)
+                    if state is not None
+                    else tuple(geometry.owned.families)
+                )
+                if domain is None and state is not None:
+                    domain = tuple(state.families)
+            else:
+                domain = None
+            family_domains.append(domain)
+        trusted_family_domain = (
+            tuple(
+                dict.fromkeys(
+                    family
+                    for domain in family_domains
+                    for family in domain
+                )
+            )
+            if all(domain is not None for domain in family_domains)
+            else None
+        )
         return cls(
             parts=tuple(parts),
             row_count=row_offset,
@@ -3429,10 +3825,32 @@ class NativeGeometryComposition:
                 )
                 else None
             ),
+            contiguous_row_partitions=contiguous_row_partitions,
+            trusted_singular_rows=all(
+                geometry.composition is None
+                or geometry.composition.trusted_singular_rows
+                for geometry in geometries
+            ),
+            trusted_family_domain=trusted_family_domain,
         )
 
     def to_geoseries(self, *, index, name: str) -> GeoSeries:
         """Materialize concrete parts and assemble public rows at export."""
+        singular_partitioned = self._singular_partitioned_device()
+        if singular_partitioned is not None:
+            from vibespatial.api.geoseries import GeoSeries
+            from vibespatial.geometry.device_array import DeviceGeometryArray
+
+            return GeoSeries(
+                DeviceGeometryArray._from_composition(
+                    singular_partitioned,
+                    crs=self.crs,
+                ),
+                index=index,
+                name=name,
+                crs=self.crs,
+                copy=False,
+            )
         singular_owned = self._singular_owned_device()
         if singular_owned is not None:
             from vibespatial.io.geoarrow import geoseries_from_owned

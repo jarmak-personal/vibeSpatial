@@ -24,7 +24,8 @@ POLYGONAL_TYPES = ["Polygon", "MultiPolygon"]
 MAX_STATIONS = 48
 CATCHMENT_DISTANCE = 110.0
 
-tmpdir = Path(tempfile.mkdtemp(prefix="shootout_emergency_response_"))
+_tmpdir = tempfile.TemporaryDirectory(prefix="shootout_emergency_response_")
+tmpdir = Path(_tmpdir.name)
 fixtures = setup_fixtures(tmpdir)
 
 # --- timed work starts here ---

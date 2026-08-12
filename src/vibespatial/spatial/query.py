@@ -113,7 +113,11 @@ def _device_candidates_to_result(
         )
         d_left = d_left[order]
         d_right = d_right[order]
-    result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
+    result = DeviceSpatialJoinResult(
+        d_left_idx=d_left,
+        d_right_idx=d_right,
+        sorted_by_left=True,
+    )
     return (result, execution) if return_metadata else result
 
 
@@ -124,6 +128,7 @@ def _indices_to_device_result(
     sort: bool,
     execution: SpatialQueryExecution,
     return_metadata: bool,
+    grouped_by_left: bool = False,
 ) -> Any:
     """Build a DeviceSpatialJoinResult from host or device index arrays."""
     import cupy as _cp
@@ -146,7 +151,11 @@ def _indices_to_device_result(
         )
         d_left = d_left[order]
         d_right = d_right[order]
-    result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
+    result = DeviceSpatialJoinResult(
+        d_left_idx=d_left,
+        d_right_idx=d_right,
+        sorted_by_left=bool(sort or grouped_by_left),
+    )
     return (result, execution) if return_metadata else result
 
 
@@ -680,7 +689,11 @@ def query_spatial_index(
                     )
                     d_left = d_left[order]
                     d_right = d_right[order]
-                device_result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
+                device_result = DeviceSpatialJoinResult(
+                    d_left_idx=d_left,
+                    d_right_idx=d_right,
+                    sorted_by_left=True,
+                )
                 return (device_result, execution) if return_metadata else device_result
         else:
             if gpu_candidate_gen:
@@ -874,6 +887,7 @@ def query_spatial_index(
             sort=sort,
             execution=execution,
             return_metadata=return_metadata,
+            grouped_by_left=gpu_candidate_gen,
         )
 
     if scalar:

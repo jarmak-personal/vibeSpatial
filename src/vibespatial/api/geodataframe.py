@@ -1274,18 +1274,28 @@ def _copy_geometry_series_preserving_owned_backing(
 ) -> GeoSeries:
     """Return an independent geometry Series wrapper without cloning owned buffers."""
     values = series.values
-    owned = getattr(values, "_owned", None)
-    if owned is None:
+    cached_owned = getattr(values, "cached_owned", None)
+    owned = cached_owned() if callable(cached_owned) else getattr(values, "_owned", None)
+    composition = getattr(values, "native_composition", None)
+    if owned is None and composition is None:
         return series.copy(deep=deep)
 
     crs = getattr(series, "crs", getattr(values, "crs", None))
     if values.__class__.__name__ == "DeviceGeometryArray":
         from vibespatial.geometry.device_array import DeviceGeometryArray
 
-        copied_values = DeviceGeometryArray._from_owned(
-            owned,
-            crs=crs,
-            provenance=getattr(values, "_provenance", None),
+        copied_values = (
+            DeviceGeometryArray._from_owned(
+                owned,
+                crs=crs,
+                provenance=getattr(values, "_provenance", None),
+            )
+            if owned is not None
+            else DeviceGeometryArray._from_composition(
+                composition,
+                crs=crs,
+                provenance=getattr(values, "_provenance", None),
+            )
         )
         shapely_cache = getattr(values, "_shapely_cache", None)
         if shapely_cache is not None:
@@ -1952,11 +1962,10 @@ def _attach_native_state_after_geometry_column_assign(
     from vibespatial.api._native_result_core import GeometryNativeResult
     from vibespatial.api._native_state import attach_native_state
 
-    owned = getattr(getattr(result.geometry, "values", None), "_owned", None)
-    if owned is None:
+    geometry = GeometryNativeResult.from_geoseries(result.geometry)
+    if geometry.owned is None and geometry.composition is None:
         return False
 
-    geometry = GeometryNativeResult.from_owned(owned, crs=result.geometry.crs)
     attach_native_state(result, source_state.with_geometry_result(geometry))
     return True
 
@@ -1980,10 +1989,33 @@ def _attach_native_state_after_attribute_only_result(owner, result) -> bool:
 
     source_values = owner[geometry_name].values
     result_values = result[geometry_name].values
-    source_owned = getattr(source_values, "_owned", None)
-    result_owned = getattr(result_values, "_owned", None)
-    if source_owned is not None or result_owned is not None:
-        if result_owned is not source_owned:
+    source_cached_owned = getattr(source_values, "cached_owned", None)
+    result_cached_owned = getattr(result_values, "cached_owned", None)
+    source_owned = (
+        source_cached_owned()
+        if callable(source_cached_owned)
+        else getattr(source_values, "_owned", None)
+    )
+    result_owned = (
+        result_cached_owned()
+        if callable(result_cached_owned)
+        else getattr(result_values, "_owned", None)
+    )
+    source_composition = getattr(source_values, "native_composition", None)
+    result_composition = getattr(result_values, "native_composition", None)
+    if any(
+        carrier is not None
+        for carrier in (
+            source_owned,
+            result_owned,
+            source_composition,
+            result_composition,
+        )
+    ):
+        if (
+            result_owned is not source_owned
+            or result_composition is not source_composition
+        ):
             return False
     else:
         try:

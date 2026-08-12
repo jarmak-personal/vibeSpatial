@@ -332,7 +332,12 @@ class _ClipDeviceCandidateRows:
     spatially_ordered: bool = False
 
 
-def _clip_spatially_order_device_rows(device_rows, device_bounds):
+def _clip_spatially_order_device_rows(
+    device_rows,
+    device_bounds,
+    *,
+    active_mask=None,
+):
     """Order candidate rows by exact SoA bounds without a stacked key matrix."""
     import cupy as cp
 
@@ -351,6 +356,14 @@ def _clip_spatially_order_device_rows(device_rows, device_bounds):
         order = _stable_radix_order_pass(
             order,
             _fp64_radix_keys(candidate_bounds[:, coordinate_column]),
+        )
+    if active_mask is not None:
+        d_active = cp.asarray(active_mask, dtype=cp.bool_)
+        if d_active.ndim != 1 or int(d_active.size) != int(d_rows.size):
+            raise ValueError("clip candidate active mask must match row capacity")
+        order = _stable_radix_order_pass(
+            order,
+            (~d_active).astype(cp.int32, copy=False),
         )
     return d_rows[order]
 
@@ -672,6 +685,7 @@ def _clip_collective_grouped_mask_prefers_relation(
     collective_source_count: int,
     positive_area_pair_count: int | None = None,
     mask_rectangle_strip_admissible: bool = False,
+    available_device_bytes: int | None = None,
 ) -> tuple[bool, PhysicalWorkEstimate, PhysicalWorkEstimate]:
     relation_estimate, union_estimate = _clip_collective_grouped_mask_work_estimates(
         source_owned,
@@ -681,11 +695,28 @@ def _clip_collective_grouped_mask_prefers_relation(
         positive_area_pair_count=positive_area_pair_count,
         mask_rectangle_strip_admissible=mask_rectangle_strip_admissible,
     )
+    relation_memory_admissible = (
+        available_device_bytes is None
+        or relation_estimate.is_device_memory_admissible(available_device_bytes)
+    )
     return (
-        relation_estimate.dispatch_unit_count() <= union_estimate.dispatch_unit_count(),
+        relation_memory_admissible
+        and relation_estimate.dispatch_unit_count() <= union_estimate.dispatch_unit_count(),
         relation_estimate,
         union_estimate,
     )
+
+
+def _clip_available_device_bytes() -> int | None:
+    """Return bytes available to the active device allocator without a sync."""
+    if not has_gpu_runtime():
+        return None
+    import cupy as cp
+
+    runtime = get_cuda_runtime()
+    cuda_free_bytes = int(cp.cuda.Device().mem_info[0])
+    pool_free_bytes = int(runtime.memory_pool_stats().get("free_bytes", 0))
+    return cuda_free_bytes + pool_free_bytes
 
 
 def _clip_bounds_filter_selects_device(row_count: int, owned=None) -> bool:
@@ -715,7 +746,7 @@ def _clip_source_nonmissing_rowset(
     prefer_device: bool,
 ):
     """Return valid, non-empty source rows without crossing the device boundary."""
-    from vibespatial.api._native_rowset import NativeRowSet
+    from vibespatial.api._native_rowset import NativeDeviceSelection, NativeRowSet
 
     owned = getattr(source_values, "_owned", None) or getattr(source_values, "owned", None)
     row_count = int(getattr(owned, "row_count", len(source_values)))
@@ -1386,20 +1417,24 @@ def _clip_device_candidate_rows_from_native_relation_result(
     )
     source_state = _clip_native_state_for_source(gdf, geometry_name)
     source_token = None if source_state is None else source_state.lineage_token
-    relation, _execution = gdf.sindex.query_relation(
+    rowset, _execution = gdf.sindex.query_right_semijoin(
         query_relation_input,
         predicate="intersects",
-        sort=False,
         source_token=source_token,
         query_row_count=query_row_count,
-        return_device=True,
     )
-
-    rowset = relation.right_semijoin_rowset(order="first")
     if not rowset.is_device:
         return None
 
-    d_rows = cp.asarray(rowset.positions, dtype=cp.int64)
+    if isinstance(rowset, NativeDeviceSelection):
+        d_rows = cp.asarray(
+            rowset.partition_capacity_positions(),
+            dtype=cp.int64,
+        )
+        d_active = rowset.active_capacity_mask()
+    else:
+        d_rows = cp.asarray(rowset.positions, dtype=cp.int64)
+        d_active = None
     if int(d_rows.size) > 1:
         source_bounds = cp.asarray(
             compute_geometry_bounds_device(
@@ -1408,7 +1443,20 @@ def _clip_device_candidate_rows_from_native_relation_result(
             ),
             dtype=cp.float64,
         ).reshape(owned.row_count, 4)
-        d_rows = _clip_spatially_order_device_rows(d_rows, source_bounds)
+        d_rows = _clip_spatially_order_device_rows(
+            d_rows,
+            source_bounds,
+            active_mask=d_active,
+        )
+
+    if isinstance(rowset, NativeDeviceSelection):
+        rowset = replace(
+            rowset,
+            positions=d_rows,
+            ordered=True,
+            full_selection_implies_identity=False,
+        )
+        return _ClipDeviceCandidateRows(rowset, spatially_ordered=True)
 
     return _ClipDeviceCandidateRows(d_rows, spatially_ordered=True)
 
@@ -4846,7 +4894,22 @@ def _clip_homogeneous_point_device_candidates_native(
     except ModuleNotFoundError:  # pragma: no cover - guarded by GPU runtime
         return None
 
-    d_rows = cp.asarray(candidate_device_rows, dtype=cp.int64)
+    candidate_selection = (
+        candidate_device_rows
+        if isinstance(candidate_device_rows, NativeDeviceSelection)
+        else None
+    )
+    if candidate_selection is not None:
+        if candidate_selection.source_row_count != source_state.row_count:
+            return None
+        d_rows = cp.asarray(
+            candidate_selection.partition_capacity_positions(),
+            dtype=cp.int64,
+        )
+        d_candidate_active = candidate_selection.active_capacity_mask()
+    else:
+        d_rows = cp.asarray(candidate_device_rows, dtype=cp.int64)
+        d_candidate_active = cp.ones(int(d_rows.size), dtype=cp.bool_)
     if int(d_rows.size) == 0:
         from vibespatial.geometry.owned import build_null_owned_array
 
@@ -4867,7 +4930,15 @@ def _clip_homogeneous_point_device_candidates_native(
             keep_geom_type=keep_geom_type,
         )
 
-    candidate_owned = owned.device_take(d_rows)
+    if candidate_selection is not None:
+        from vibespatial.geometry.owned import device_take_owned_capacity_selection
+
+        candidate_owned = device_take_owned_capacity_selection(
+            owned,
+            candidate_selection,
+        )
+    else:
+        candidate_owned = owned.device_take(d_rows)
     from vibespatial.geometry.buffers import GeometryFamily
 
     if not _owned_active_family_subset(
@@ -4888,22 +4959,27 @@ def _clip_homogeneous_point_device_candidates_native(
             unique=True,
             identity=False,
         )
-        return _clip_native_tabular_result_from_rowset(
+        capacity_result = _clip_native_tabular_result_from_rowset(
             source,
             geometry_name=geometry_name,
             geometry=geometry_result,
             rowset=source_rowset,
             keep_geom_type=keep_geom_type,
         )
+        if capacity_result is None or candidate_selection is None:
+            return capacity_result
+        return NativeTabularSelection(
+            capacity_result=capacity_result,
+            selection=NativeDeviceSelection.from_mask(d_candidate_active),
+        )
 
     expression = _clip_point_polygon_mask_expression(candidate_owned, mask)
     if expression is None:
         return None
-    from vibespatial.api._native_rowset import NativeDeviceSelection
-
     selection = expression.equal_to_selection(True)
     if not isinstance(selection, NativeDeviceSelection):
         return None
+    d_output_active = d_candidate_active & selection.source_mask()
     source_rowset = NativeRowSet.from_positions(
         d_rows,
         source_token=source_state.lineage_token,
@@ -4923,7 +4999,7 @@ def _clip_homogeneous_point_device_candidates_native(
         return None
     return NativeTabularSelection(
         capacity_result=capacity_result,
-        selection=selection,
+        selection=NativeDeviceSelection.from_mask(d_output_active),
     )
 
 
@@ -4979,11 +5055,34 @@ def _clip_homogeneous_line_rectangle_device_candidates_native(
     from vibespatial.constructive.clip_rect import clip_by_rect_owned
     from vibespatial.runtime.dispatch import record_dispatch_event
 
-    d_rows = cp.asarray(candidate_device_rows, dtype=cp.int64)
+    candidate_selection = (
+        candidate_device_rows
+        if isinstance(candidate_device_rows, NativeDeviceSelection)
+        else None
+    )
+    if candidate_selection is not None:
+        if candidate_selection.source_row_count != source_state.row_count:
+            return None
+        d_rows = cp.asarray(
+            candidate_selection.partition_capacity_positions(),
+            dtype=cp.int64,
+        )
+        d_candidate_active = candidate_selection.active_capacity_mask()
+    else:
+        d_rows = cp.asarray(candidate_device_rows, dtype=cp.int64)
+        d_candidate_active = cp.ones(int(d_rows.size), dtype=cp.bool_)
     if int(d_rows.size) == 0:
         return None
 
-    candidate_owned = owned.device_take(d_rows)
+    if candidate_selection is not None:
+        from vibespatial.geometry.owned import device_take_owned_capacity_selection
+
+        candidate_owned = device_take_owned_capacity_selection(
+            owned,
+            candidate_selection,
+        )
+    else:
+        candidate_owned = owned.device_take(d_rows)
     from vibespatial.geometry.buffers import GeometryFamily
 
     if not _owned_active_family_subset(
@@ -5024,14 +5123,12 @@ def _clip_homogeneous_line_rectangle_device_candidates_native(
         device_state = clipped_owned.device_state
         if device_state is None:
             return None
-        from vibespatial.api._native_rowset import NativeDeviceSelection
-
         d_fast_keep = cp.asarray(device_state.validity, dtype=cp.bool_)
         geometry_result = GeometryNativeResult.from_owned(
             clipped_owned,
             crs=geometry.crs,
         )
-        d_output_keep = d_fast_keep
+        d_output_keep = d_fast_keep & d_candidate_active
         if not clipping_by_rectangle and not keep_geom_type:
             from vibespatial.api._native_results import (
                 NativeGeometryComposition,
@@ -5042,7 +5139,7 @@ def _clip_homogeneous_line_rectangle_device_candidates_native(
             )
             from vibespatial.geometry.owned import tile_single_row
 
-            d_unresolved = ~d_fast_keep
+            d_unresolved = d_candidate_active & ~d_fast_keep
             unresolved_owned = candidate_owned._apply_row_activity(d_unresolved)
             rectangle_owned = _device_rectangle_owned_from_bounds(
                 rectangle_bounds,
@@ -5068,7 +5165,9 @@ def _clip_homogeneous_line_rectangle_device_candidates_native(
             d_exact_keep = exact_geometry.valid_nonempty_mask_device()
             if d_exact_keep is None:
                 return None
-            d_output_keep = d_fast_keep | cp.asarray(d_exact_keep, dtype=cp.bool_)
+            d_output_keep = d_output_keep | (
+                d_candidate_active & cp.asarray(d_exact_keep, dtype=cp.bool_)
+            )
             d_capacity_rows = cp.arange(int(d_rows.size), dtype=cp.int64)
             composition_parts = [
                 NativeGeometryCompositionPart(
@@ -5128,12 +5227,20 @@ def _clip_homogeneous_line_rectangle_device_candidates_native(
         unique=True,
         identity=_clip_source_rows_identity_hint(d_source_rows, source_state.row_count),
     )
-    return _clip_native_tabular_result_from_rowset(
+    capacity_result = _clip_native_tabular_result_from_rowset(
         source,
         geometry_name=geometry_name,
         geometry=geometry_result,
         rowset=source_rowset,
         keep_geom_type=keep_geom_type,
+    )
+    if capacity_result is None or candidate_selection is None:
+        return capacity_result
+    return NativeTabularSelection(
+        capacity_result=capacity_result,
+        selection=NativeDeviceSelection.from_mask(
+            d_candidate_active[d_local_rows],
+        ),
     )
 
 
@@ -5869,7 +5976,22 @@ def _clip_mixed_device_candidates_native(
     except ModuleNotFoundError:  # pragma: no cover - guarded by runtime
         return None
 
-    d_rows = cp.asarray(candidate_device_rows, dtype=cp.int64)
+    candidate_selection = (
+        candidate_device_rows
+        if isinstance(candidate_device_rows, NativeDeviceSelection)
+        else None
+    )
+    if candidate_selection is not None:
+        if candidate_selection.source_row_count != source_state.row_count:
+            return None
+        d_rows = cp.asarray(
+            candidate_selection.partition_capacity_positions(),
+            dtype=cp.int64,
+        )
+        d_candidate_active = candidate_selection.active_capacity_mask()
+    else:
+        d_rows = cp.asarray(candidate_device_rows, dtype=cp.int64)
+        d_candidate_active = cp.ones(int(d_rows.size), dtype=cp.bool_)
     candidate_count = int(d_rows.size)
     if candidate_count == 0:
         from vibespatial.api._native_rowset import NativeRowSet
@@ -5892,7 +6014,15 @@ def _clip_mixed_device_candidates_native(
             keep_geom_type=keep_geom_type,
         )
 
-    candidate_owned = owned.device_take(d_rows)
+    if candidate_selection is not None:
+        from vibespatial.geometry.owned import device_take_owned_capacity_selection
+
+        candidate_owned = device_take_owned_capacity_selection(
+            owned,
+            candidate_selection,
+        )
+    else:
+        candidate_owned = owned.device_take(d_rows)
     if keep_geom_type and rectangle_bounds is not None and _clip_family_masks(source).all_polygonal:
         return None
 
@@ -5948,16 +6078,19 @@ def _clip_mixed_device_candidates_native(
                 requested=ExecutionMode.AUTO,
                 selected=ExecutionMode.GPU,
             )
-        if native_result is None or not dynamic:
+        if native_result is None or (not dynamic and candidate_selection is None):
             return native_result
         geometry_result = (
             result_geometry
             if isinstance(result_geometry, GeometryNativeResult)
             else GeometryNativeResult.from_owned(result_geometry, crs=source.crs)
         )
-        d_keep = geometry_result.valid_nonempty_mask_device()
-        if d_keep is None:
-            return None
+        d_keep = d_candidate_active[d_local_output_rows]
+        if dynamic:
+            d_geometry_keep = geometry_result.valid_nonempty_mask_device()
+            if d_geometry_keep is None:
+                return None
+            d_keep &= cp.asarray(d_geometry_keep, dtype=cp.bool_)
         return NativeTabularSelection(
             capacity_result=native_result,
             selection=NativeDeviceSelection.from_mask(
@@ -6054,6 +6187,17 @@ def _clip_concat_source_ordered_native_results(
     from vibespatial.api._native_results import _concat_native_tabular_results
 
     if any(isinstance(result, NativeTabularSelection) for result in results):
+        results = [
+            replace(
+                result,
+                public_index_source_plan=None,
+                public_index_source_rows=None,
+            )
+            if isinstance(result, NativeTabularSelection)
+            and result.public_index_source_plan is not None
+            else result
+            for result in results
+        ]
         combined_selection = _concat_native_tabular_selections(
             results,
             geometry_name=geometry_name,
@@ -6361,6 +6505,119 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
             keep_geom_type=keep_geom_type,
         )
 
+    result_partitions = []
+    materialized_mask_owned = None
+
+    def _materialized_mask_owned_once():
+        nonlocal materialized_mask_owned
+        if materialized_mask_owned is not None:
+            return materialized_mask_owned
+        materialize_owned = getattr(lazy_mask_owned, "_materialize_owned", None)
+        if not callable(materialize_owned):
+            return None
+        candidate = materialize_owned()
+        if (
+            candidate is None
+            or candidate.residency is not Residency.DEVICE
+            or int(getattr(candidate, "row_count", -1)) != 1
+        ):
+            return None
+        materialized_mask_owned = candidate
+        return materialized_mask_owned
+
+    def _append_physicalized_source_rows(selection, *, implementation: str) -> bool:
+        materialized = _materialized_mask_owned_once()
+        if materialized is None:
+            return False
+        partition = _clip_homogeneous_polygon_device_candidates_native(
+            gdf,
+            mask,
+            selection,
+            mask_owned=materialized,
+            clipping_by_rectangle=False,
+            rectangle_bounds=None,
+            keep_geom_type=keep_geom_type,
+        )
+        if partition is None:
+            return False
+        result_partitions.append(partition)
+        record_dispatch_event(
+            surface="geopandas.clip",
+            operation="clip",
+            implementation=implementation,
+            reason=(
+                "lazy grouped-union mask was device-physicalized once and "
+                "consumed only by the selected source rowset"
+            ),
+            detail=(
+                f"source_rows={owned.row_count}, mask_rows={mask_source_owned.row_count}, "
+                f"selected_capacity={selection.capacity}, "
+                "selected_rows=device-resident"
+            ),
+            requested=ExecutionMode.AUTO,
+            selected=ExecutionMode.GPU,
+        )
+        return True
+
+    # Shape admission must precede semantic pair refinement. Dense relations
+    # can make exact pairwise coverage itself the dominant operation even when
+    # the only feasible constructive carrier is one reduced mask. Build the
+    # candidate source rowset directly from the resident relation and use
+    # conservative host-known capacities for this first decision.
+    d_candidate_source_mask = cp.zeros(owned.row_count, dtype=cp.bool_)
+    d_candidate_source_mask[d_source_rows] = True
+    candidate_source_selection = NativeDeviceSelection.from_mask(
+        d_candidate_source_mask,
+        source_token=source_state.lineage_token,
+        source_row_count=source_state.row_count,
+        geometry_family_domain=tuple(polygonal),
+        trusted_all_valid_rows=None,
+    )
+    available_device_bytes = _clip_available_device_bytes()
+    coarse_source_count = min(int(owned.row_count), pair_count)
+    (
+        coarse_relation_selected,
+        coarse_relation_estimate,
+        coarse_union_estimate,
+    ) = _clip_collective_grouped_mask_prefers_relation(
+        owned,
+        mask_source_owned,
+        relation_pair_count=pair_count,
+        collective_source_count=coarse_source_count,
+        available_device_bytes=available_device_bytes,
+    )
+    if not coarse_relation_selected:
+        record_dispatch_event(
+            surface="geopandas.clip",
+            operation="clip",
+            implementation="lazy_grouped_union_mask_union_plan_gpu",
+            reason=(
+                "grouped-mask clip selected union-first execution before exact "
+                "pair refinement from resident relation shape and memory admission"
+            ),
+            detail=(
+                f"source_rows<={coarse_source_count}, pair_rows={pair_count}, "
+                f"relation_units={coarse_relation_estimate.dispatch_unit_count()}, "
+                f"union_units={coarse_union_estimate.dispatch_unit_count()}, "
+                f"relation_live_bytes={coarse_relation_estimate.live_device_byte_count()}, "
+                f"available_device_bytes={available_device_bytes}, "
+                "semantic_pair_refinement=skipped"
+            ),
+            requested=ExecutionMode.AUTO,
+            selected=ExecutionMode.GPU,
+        )
+        if not _append_physicalized_source_rows(
+            candidate_source_selection,
+            implementation="lazy_grouped_union_mask_union_physicalized_gpu",
+        ):
+            return None
+        return _clip_concat_source_ordered_native_results(
+            result_partitions,
+            source_state=source_state,
+            geometry_name=geometry_name,
+            crs=geometry.crs,
+        )
+
     coverage = _clip_lazy_grouped_union_coverage_rows_device(
         owned=owned,
         mask_source_owned=mask_source_owned,
@@ -6375,7 +6632,7 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
     covered_result = _native_state_passthrough_take(gdf, covered_selection)
     if covered_result is None:
         return None
-    result_partitions = [covered_result]
+    result_partitions.append(covered_result)
     d_unresolved_source_mask = unresolved_selection.source_mask()
     d_unresolved_pair_active = d_unresolved_source_mask[d_source_rows]
     relation_pair_selection = NativeDeviceSelection.from_mask(
@@ -6456,59 +6713,6 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
             geometry_name=geometry_name,
             crs=geometry.crs,
         )
-    materialized_mask_owned = None
-
-    def _materialized_mask_owned_once():
-        nonlocal materialized_mask_owned
-        if materialized_mask_owned is not None:
-            return materialized_mask_owned
-        materialize_owned = getattr(lazy_mask_owned, "_materialize_owned", None)
-        if not callable(materialize_owned):
-            return None
-        candidate = materialize_owned()
-        if (
-            candidate is None
-            or candidate.residency is not Residency.DEVICE
-            or int(getattr(candidate, "row_count", -1)) != 1
-        ):
-            return None
-        materialized_mask_owned = candidate
-        return materialized_mask_owned
-
-    def _append_physicalized_source_rows(selection, *, implementation: str) -> bool:
-        materialized = _materialized_mask_owned_once()
-        if materialized is None:
-            return False
-        partition = _clip_homogeneous_polygon_device_candidates_native(
-            gdf,
-            mask,
-            selection,
-            mask_owned=materialized,
-            clipping_by_rectangle=False,
-            rectangle_bounds=None,
-            keep_geom_type=keep_geom_type,
-        )
-        if partition is None:
-            return False
-        result_partitions.append(partition)
-        record_dispatch_event(
-            surface="geopandas.clip",
-            operation="clip",
-            implementation=implementation,
-            reason=(
-                "lazy grouped-union mask was device-physicalized once and "
-                "consumed only by the unresolved source rowset"
-            ),
-            detail=(
-                f"source_rows={owned.row_count}, mask_rows={mask_source_owned.row_count}, "
-                f"selected_capacity={selection.capacity}, "
-                "selected_rows=device-resident"
-            ),
-            requested=ExecutionMode.AUTO,
-            selected=ExecutionMode.GPU,
-        )
-        return True
-
     (
         relation_selected,
         relation_estimate,
@@ -6520,6 +6724,7 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
         collective_source_count=unresolved_source_count,
         positive_area_pair_count=positive_area_pair_count,
         mask_rectangle_strip_admissible=bool(mask_rectangle_strip_admissible),
+        available_device_bytes=available_device_bytes,
     )
     record_dispatch_event(
         surface="geopandas.clip",
@@ -6540,6 +6745,8 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
             f"rectangle_strip={bool(mask_rectangle_strip_admissible)}, "
             f"relation_units={relation_estimate.dispatch_unit_count()}, "
             f"union_units={union_estimate.dispatch_unit_count()}, "
+            f"relation_live_bytes={relation_estimate.live_device_byte_count()}, "
+            f"available_device_bytes={available_device_bytes}, "
             "geometry_allocation=source-or-pair-capacity"
         ),
         requested=ExecutionMode.AUTO,

@@ -210,6 +210,35 @@ class PhysicalWorkEstimate:
             return self.primary_unit_name
         return "row" if self.is_row_only else "work-unit"
 
+    def live_device_byte_count(self) -> int:
+        """Return the estimated simultaneously live output and scratch bytes."""
+        return int(self.output_byte_count) + int(self.temporary_byte_count)
+
+    def is_device_memory_admissible(
+        self,
+        available_device_bytes: int,
+        *,
+        budget_numerator: int = 1,
+        budget_denominator: int = 2,
+    ) -> bool:
+        """Return whether this shape fits its reserved share of free device memory.
+
+        A physical plan cannot consume all currently free memory: downstream
+        output carriers, allocator fragmentation, and concurrently resident
+        native inputs remain live. Callers may tune the reserved share for a
+        shape, while the default admits at most half of currently available
+        memory.
+        """
+        available = int(available_device_bytes)
+        numerator = int(budget_numerator)
+        denominator = int(budget_denominator)
+        if available < 0:
+            raise ValueError("available_device_bytes must be non-negative")
+        if numerator <= 0 or denominator <= 0 or numerator > denominator:
+            raise ValueError("device memory budget must be a fraction in (0, 1]")
+        budget = available * numerator // denominator
+        return self.live_device_byte_count() <= budget
+
     def telemetry_detail(self) -> str:
         parts = [
             f"rows={int(self.row_count)}",

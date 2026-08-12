@@ -12,10 +12,10 @@ BBox = tuple[float, float, float, float]
 class GeoParquetMetadataSummary:
     source: str
     row_group_rows: np.ndarray
-    xmin: np.ndarray
-    ymin: np.ndarray
-    xmax: np.ndarray
-    ymax: np.ndarray
+    xmin: np.ndarray | None = None
+    ymin: np.ndarray | None = None
+    xmax: np.ndarray | None = None
+    ymax: np.ndarray | None = None
     source_paths: tuple[str, ...] | None = None
     row_group_source_indices: np.ndarray | None = None
     row_group_source_row_groups: np.ndarray | None = None
@@ -27,6 +27,13 @@ class GeoParquetMetadataSummary:
     @property
     def total_rows(self) -> int:
         return int(self.row_group_rows.sum(dtype=np.int64))
+
+    @property
+    def has_spatial_bounds(self) -> bool:
+        return all(
+            values is not None
+            for values in (self.xmin, self.ymin, self.xmax, self.ymax)
+        )
 
 
 @dataclass(frozen=True)
@@ -54,24 +61,34 @@ def build_geoparquet_metadata_summary(
     *,
     source: str,
     row_group_rows: list[int] | tuple[int, ...] | np.ndarray,
-    xmin: list[float] | tuple[float, ...] | np.ndarray,
-    ymin: list[float] | tuple[float, ...] | np.ndarray,
-    xmax: list[float] | tuple[float, ...] | np.ndarray,
-    ymax: list[float] | tuple[float, ...] | np.ndarray,
+    xmin: list[float] | tuple[float, ...] | np.ndarray | None = None,
+    ymin: list[float] | tuple[float, ...] | np.ndarray | None = None,
+    xmax: list[float] | tuple[float, ...] | np.ndarray | None = None,
+    ymax: list[float] | tuple[float, ...] | np.ndarray | None = None,
     source_paths: list[str] | tuple[str, ...] | None = None,
     row_group_source_indices: list[int] | tuple[int, ...] | np.ndarray | None = None,
     row_group_source_row_groups: list[int] | tuple[int, ...] | np.ndarray | None = None,
 ) -> GeoParquetMetadataSummary:
     rows = np.asarray(row_group_rows, dtype=np.int64)
-    xmin_arr = np.asarray(xmin, dtype=np.float64)
-    ymin_arr = np.asarray(ymin, dtype=np.float64)
-    xmax_arr = np.asarray(xmax, dtype=np.float64)
-    ymax_arr = np.asarray(ymax, dtype=np.float64)
     size = rows.size
     if size == 0:
         raise ValueError("GeoParquet metadata summary requires at least one row group")
-    if not all(array.size == size for array in (xmin_arr, ymin_arr, xmax_arr, ymax_arr)):
-        raise ValueError("row_group_rows and bbox arrays must have matching sizes")
+    raw_bounds = (xmin, ymin, xmax, ymax)
+    if any(values is None for values in raw_bounds) and not all(
+        values is None for values in raw_bounds
+    ):
+        raise ValueError("GeoParquet bbox arrays must be provided together")
+    if all(values is None for values in raw_bounds):
+        xmin_arr = ymin_arr = xmax_arr = ymax_arr = None
+    else:
+        xmin_arr, ymin_arr, xmax_arr, ymax_arr = (
+            np.asarray(values, dtype=np.float64) for values in raw_bounds
+        )
+        if not all(
+            array.size == size
+            for array in (xmin_arr, ymin_arr, xmax_arr, ymax_arr)
+        ):
+            raise ValueError("row_group_rows and bbox arrays must have matching sizes")
     source_indices_arr = None
     source_row_groups_arr = None
     source_paths_tuple = None if source_paths is None else tuple(str(path) for path in source_paths)
@@ -130,6 +147,12 @@ def select_row_groups_full_scan(summary: GeoParquetMetadataSummary) -> GeoParque
 
 
 def select_row_groups_loop(summary: GeoParquetMetadataSummary, bbox: BBox) -> GeoParquetPruneResult:
+    if not summary.has_spatial_bounds:
+        raise ValueError("GeoParquet row-group pruning requires spatial bounds metadata")
+    assert summary.xmin is not None
+    assert summary.ymin is not None
+    assert summary.xmax is not None
+    assert summary.ymax is not None
     xmin, ymin, xmax, ymax = bbox
     selected: list[int] = []
     for index in range(summary.row_group_count):
@@ -149,6 +172,12 @@ def select_row_groups_loop(summary: GeoParquetMetadataSummary, bbox: BBox) -> Ge
 def select_row_groups_vectorized(
     summary: GeoParquetMetadataSummary, bbox: BBox
 ) -> GeoParquetPruneResult:
+    if not summary.has_spatial_bounds:
+        raise ValueError("GeoParquet row-group pruning requires spatial bounds metadata")
+    assert summary.xmin is not None
+    assert summary.ymin is not None
+    assert summary.xmax is not None
+    assert summary.ymax is not None
     xmin, ymin, xmax, ymax = bbox
     mask = ~(
         (summary.xmin > xmax)

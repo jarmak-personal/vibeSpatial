@@ -17,11 +17,15 @@ Internal helpers
 
 from __future__ import annotations
 
+from dataclasses import replace
+from functools import partial
+
 import numpy as np
 
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
+    get_cuda_completion_retainer,
     get_cuda_runtime,
 )
 from vibespatial.cuda.cccl_primitives import (
@@ -78,7 +82,6 @@ def _free_split_event_device_state(split_events: SplitEventTable) -> None:
     ds = split_events.device_state
     if ds is None:
         return
-    runtime.synchronize()
     for arr in (
         ds.source_segment_ids,
         ds.t,
@@ -88,6 +91,7 @@ def _free_split_event_device_state(split_events: SplitEventTable) -> None:
         ds.row_indices,
         ds.part_indices,
         ds.ring_indices,
+        ds.geometry_indices,
     ):
         if arr is not None:
             runtime.free(arr)
@@ -108,14 +112,13 @@ def _free_atomic_edge_excess(atomic_edges: AtomicEdgeTable) -> None:
     ds = atomic_edges.device_state
     if ds is None:
         return
-    runtime.synchronize()
     runtime.free(ds.dst_x)
     runtime.free(ds.dst_y)
 
 
 def _sync_hotpath(runtime) -> None:
     if hotpath_trace_enabled():
-        runtime.synchronize()
+        cp.cuda.get_current_stream().synchronize()
 
 
 def _canonicalize_source_endpoint_coordinates(
@@ -303,6 +306,9 @@ def _deduplicate_atomic_edge_geometry(
     dst_x,
     dst_y,
     *,
+    occurrence_membership=None,
+    occurrence_left_delta,
+    occurrence_right_delta,
     row_indices=None,
     left_segment_count: int,
     preserve_source_orientation: bool = False,
@@ -324,7 +330,14 @@ def _deduplicate_atomic_edge_geometry(
     geometric deduplication.
     """
     d_direction = cp.asarray(direction)
-    forward_indices = cp.flatnonzero(d_direction == 0).astype(cp.int32, copy=False)
+    all_src_x = cp.asarray(src_x)
+    all_src_y = cp.asarray(src_y)
+    all_dst_x = cp.asarray(dst_x)
+    all_dst_y = cp.asarray(dst_y)
+    forward_indices = cp.flatnonzero(
+        (d_direction == 0)
+        & ((all_src_x != all_dst_x) | (all_src_y != all_dst_y))
+    ).astype(cp.int32, copy=False)
     if int(forward_indices.size) == 0:
         return (
             source_ids,
@@ -334,12 +347,14 @@ def _deduplicate_atomic_edge_geometry(
             dst_x,
             dst_y,
             cp.empty(0, dtype=cp.uint8),
+            cp.empty(0, dtype=cp.int32),
+            cp.empty(0, dtype=cp.int32),
         )
 
-    d_src_x = cp.asarray(src_x)[forward_indices]
-    d_src_y = cp.asarray(src_y)[forward_indices]
-    d_dst_x = cp.asarray(dst_x)[forward_indices]
-    d_dst_y = cp.asarray(dst_y)[forward_indices]
+    d_src_x = all_src_x[forward_indices]
+    d_src_y = all_src_y[forward_indices]
+    d_dst_x = all_dst_x[forward_indices]
+    d_dst_y = all_dst_y[forward_indices]
     swap_mask = (d_src_x > d_dst_x) | ((d_src_x == d_dst_x) & (d_src_y > d_dst_y))
     canon_src_x = cp.where(swap_mask, d_dst_x, d_src_x)
     canon_src_y = cp.where(swap_mask, d_dst_y, d_src_y)
@@ -364,6 +379,9 @@ def _deduplicate_atomic_edge_geometry(
     sorted_src_y = canon_src_y[sort_order]
     sorted_dst_x = canon_dst_x[sort_order]
     sorted_dst_y = canon_dst_y[sort_order]
+    sorted_orientation_multiplier = cp.where(
+        swap_mask[sort_order], cp.int32(-1), cp.int32(1)
+    )
     if row_indices is not None:
         sorted_rows = d_rows[sort_order]
 
@@ -381,11 +399,17 @@ def _deduplicate_atomic_edge_geometry(
     representatives = sorted_forward[unique_mask]
     unique_count = int(representatives.size)
 
-    sorted_membership = cp.where(
-        cp.asarray(source_ids)[sorted_forward] < cp.int32(left_segment_count),
-        cp.uint8(1),
-        cp.uint8(2),
-    )
+    if occurrence_membership is None:
+        sorted_membership = cp.where(
+            cp.asarray(source_ids)[sorted_forward] < cp.int32(left_segment_count),
+            cp.uint8(1),
+            cp.uint8(2),
+        )
+    else:
+        sorted_membership = cp.asarray(
+            occurrence_membership,
+            dtype=cp.uint8,
+        )[sorted_forward]
     group_ids = cp.cumsum(unique_mask, dtype=cp.int32) - cp.int32(1)
     representative_membership_u32 = cp.zeros(unique_count, dtype=cp.uint32)
     cp.bitwise_or.at(
@@ -397,8 +421,23 @@ def _deduplicate_atomic_edge_geometry(
         cp.uint8,
         copy=False,
     )
+    representative_left_delta = cp.zeros(unique_count, dtype=cp.int32)
+    representative_right_delta = cp.zeros(unique_count, dtype=cp.int32)
+    cp.add.at(
+        representative_left_delta,
+        group_ids,
+        cp.asarray(occurrence_left_delta, dtype=cp.int32)[sorted_forward]
+        * sorted_orientation_multiplier,
+    )
+    cp.add.at(
+        representative_right_delta,
+        group_ids,
+        cp.asarray(occurrence_right_delta, dtype=cp.int32)[sorted_forward]
+        * sorted_orientation_multiplier,
+    )
 
     rep_source_ids = cp.asarray(source_ids)[representatives]
+    rep_direction_raw = cp.asarray(direction, dtype=cp.int8)[representatives]
     rep_src_x_raw = cp.asarray(src_x)[representatives]
     rep_src_y_raw = cp.asarray(src_y)[representatives]
     rep_dst_x_raw = cp.asarray(dst_x)[representatives]
@@ -411,11 +450,18 @@ def _deduplicate_atomic_edge_geometry(
         rep_src_y = rep_src_y_raw
         rep_dst_x = rep_dst_x_raw
         rep_dst_y = rep_dst_y_raw
+        rep_direction = rep_direction_raw
+        orientation_multiplier = cp.where(rep_swap_mask, cp.int32(-1), cp.int32(1))
     else:
         rep_src_x = cp.where(rep_swap_mask, rep_dst_x_raw, rep_src_x_raw)
         rep_src_y = cp.where(rep_swap_mask, rep_dst_y_raw, rep_src_y_raw)
         rep_dst_x = cp.where(rep_swap_mask, rep_src_x_raw, rep_dst_x_raw)
         rep_dst_y = cp.where(rep_swap_mask, rep_src_y_raw, rep_dst_y_raw)
+        rep_direction = cp.bitwise_xor(
+            rep_direction_raw,
+            rep_swap_mask.astype(cp.int8, copy=False),
+        )
+        orientation_multiplier = cp.ones(unique_count, dtype=cp.int32)
 
     out_size = unique_count * 2
     dedup_source_ids = cp.empty(out_size, dtype=cp.int32)
@@ -425,11 +471,13 @@ def _deduplicate_atomic_edge_geometry(
     dedup_dst_x = cp.empty(out_size, dtype=cp.float64)
     dedup_dst_y = cp.empty(out_size, dtype=cp.float64)
     dedup_source_membership = cp.empty(out_size, dtype=cp.uint8)
+    dedup_left_delta = cp.empty(out_size, dtype=cp.int32)
+    dedup_right_delta = cp.empty(out_size, dtype=cp.int32)
 
     dedup_source_ids[0::2] = rep_source_ids
     dedup_source_ids[1::2] = rep_source_ids
-    dedup_direction[0::2] = cp.int8(0)
-    dedup_direction[1::2] = cp.int8(1)
+    dedup_direction[0::2] = rep_direction
+    dedup_direction[1::2] = cp.int8(1) - rep_direction
     dedup_src_x[0::2] = rep_src_x
     dedup_src_x[1::2] = rep_dst_x
     dedup_src_y[0::2] = rep_src_y
@@ -440,6 +488,10 @@ def _deduplicate_atomic_edge_geometry(
     dedup_dst_y[1::2] = rep_src_y
     dedup_source_membership[0::2] = representative_membership
     dedup_source_membership[1::2] = representative_membership
+    dedup_left_delta[0::2] = representative_left_delta * orientation_multiplier
+    dedup_left_delta[1::2] = -dedup_left_delta[0::2]
+    dedup_right_delta[0::2] = representative_right_delta * orientation_multiplier
+    dedup_right_delta[1::2] = -dedup_right_delta[0::2]
     return (
         dedup_source_ids,
         dedup_direction,
@@ -448,6 +500,8 @@ def _deduplicate_atomic_edge_geometry(
         dedup_dst_x,
         dedup_dst_y,
         dedup_source_membership,
+        dedup_left_delta,
+        dedup_right_delta,
     )
 
 
@@ -653,6 +707,7 @@ def _emit_pair_split_event_batch(
     raw_t = None
     raw_x = None
     raw_y = None
+    raw_priority = None
     try:
         ptr = runtime.pointer
         count_params = (
@@ -675,6 +730,7 @@ def _emit_pair_split_event_batch(
         raw_t = runtime.allocate((capacity,), np.float64)
         raw_x = runtime.allocate((capacity,), np.float64)
         raw_y = runtime.allocate((capacity,), np.float64)
+        raw_priority = runtime.allocate((capacity,), np.int8)
         scatter_params = (
             (
                 ptr(state.left_lookup),
@@ -703,6 +759,7 @@ def _emit_pair_split_event_batch(
                 ptr(raw_t),
                 ptr(raw_x),
                 ptr(raw_y),
+                ptr(raw_priority),
                 result.count,
             ),
             (
@@ -736,6 +793,7 @@ def _emit_pair_split_event_batch(
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
                 KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
                 KERNEL_PARAM_I32,
             ),
         )
@@ -763,10 +821,9 @@ def _emit_pair_split_event_batch(
             cp.asarray(raw_t)[live_indices],
             cp.asarray(raw_x)[live_indices],
             cp.asarray(raw_y)[live_indices],
-            cp.ones(int(live_indices.size), dtype=cp.int8),
+            cp.asarray(raw_priority)[live_indices],
         )
     finally:
-        runtime.synchronize()
         runtime.free(pair_counts)
         if pair_offsets is not None:
             runtime.free(pair_offsets)
@@ -775,6 +832,7 @@ def _emit_pair_split_event_batch(
             raw_t,
             raw_x,
             raw_y,
+            raw_priority,
         ):
             if values is not None:
                 runtime.free(values)
@@ -806,7 +864,12 @@ def _sort_deduplicate_split_event_run(run):
 
 
 def _merge_sorted_split_event_runs(left_run, right_run):
-    """Merge unique exact ``(source id, fp64 t)`` device runs."""
+    """Merge unique exact ``(source id, fp64 t)`` device runs.
+
+    Equal keys retain the highest-priority coordinate payload. Cross-operand
+    arrangement nodes therefore survive later same-side and raw-endpoint runs
+    independently of page count or balanced merge shape.
+    """
     if left_run is None:
         return right_run
     if right_run is None:
@@ -872,8 +935,45 @@ def _merge_sorted_split_event_runs(left_run, right_run):
     keep = cp.empty(total, dtype=cp.bool_)
     keep[:-1] = (merged[0][:-1] != merged[0][1:]) | (merged[1][:-1] != merged[1][1:])
     keep[-1] = True
-    positions = cp.flatnonzero(keep).astype(cp.int64, copy=False)
-    return tuple(values[positions] for values in merged)
+    key_positions = cp.flatnonzero(keep).astype(cp.int64, copy=False)
+    previous_positions = cp.maximum(key_positions - 1, 0)
+    has_equal_previous = (
+        (key_positions > 0)
+        & (merged[0][previous_positions] == merged[0][key_positions])
+        & (merged[1][previous_positions] == merged[1][key_positions])
+    )
+    payload_positions = cp.where(
+        has_equal_previous
+        & (merged[4][previous_positions] > merged[4][key_positions]),
+        previous_positions,
+        key_positions,
+    )
+    return (
+        merged[0][key_positions],
+        merged[1][key_positions],
+        merged[2][payload_positions],
+        merged[3][payload_positions],
+        merged[4][payload_positions],
+    )
+
+
+def _merge_split_event_runs_balanced(runs):
+    """Merge sorted event pages with logarithmic rather than linear depth."""
+    live = [run for run in runs if run is not None]
+    while len(live) > 1:
+        next_level = []
+        for index in range(0, len(live), 2):
+            if index + 1 == len(live):
+                next_level.append(live[index])
+            else:
+                next_level.append(
+                    _merge_sorted_split_event_runs(
+                        live[index],
+                        live[index + 1],
+                    )
+                )
+        live = next_level
+    return None if not live else live[0]
 
 
 # ---------------------------------------------------------------------------
@@ -887,6 +987,7 @@ def build_gpu_split_events(
     *,
     intersection_result: SegmentIntersectionResult | PagedSegmentIntersectionResult | None = None,
     dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
+    _cached_left_segments: DeviceSegmentTable | None = None,
     _cached_right_segments: DeviceSegmentTable | None = None,
     right_segment_broadcast: DeviceBroadcastSegmentRelation | None = None,
     require_same_row: bool = False,
@@ -912,8 +1013,13 @@ def build_gpu_split_events(
     # GPU-native segment extraction -- no CPU loop, no host round-trip.
     # lyy.15: reuse pre-extracted right-side segments when provided
     # (N-vs-1 overlay caches the corridor segments once).
+    _owns_left_segments = _cached_left_segments is None
     with hotpath_stage("overlay.split.extract_left_segments", category="setup"):
-        left_segments = _extract_segments_gpu(left)
+        left_segments = (
+            _extract_segments_gpu(left)
+            if _cached_left_segments is None
+            else _cached_left_segments
+        )
     if right_segment_broadcast is not None:
         if not require_same_row:
             raise ValueError("broadcast-right segment topology requires row isolation")
@@ -981,8 +1087,8 @@ def build_gpu_split_events(
         else right_physical_count
     )
     segment_total = left_count + right_count
-    pair_event_run = None
-    right_right_event_run = None
+    pair_event_runs = []
+    right_right_event_runs = []
 
     def _release_classified_page(page: SegmentIntersectionResult) -> None:
         state = page.device_state
@@ -1006,21 +1112,30 @@ def build_gpu_split_events(
         ):
             runtime.free(values)
 
-    def _consume_classified_page(page: SegmentIntersectionResult) -> None:
-        nonlocal pair_event_run
-        try:
-            batch = _emit_pair_split_event_batch(
-                page,
-                left_segments=left_segments,
-                right_segments=effective_right_segments,
-                kernels=kernels,
-                broadcast_right=right_segment_broadcast is not None,
+    def _append_cross_pair_events(page: SegmentIntersectionResult) -> None:
+        batch = _emit_pair_split_event_batch(
+            page,
+            left_segments=left_segments,
+            right_segments=effective_right_segments,
+            kernels=kernels,
+            broadcast_right=right_segment_broadcast is not None,
+        )
+        if batch is not None:
+            # Cross-operand nodes define the shared arrangement vertex. A
+            # same-side endpoint can carry the source coordinate a few ULPs
+            # away, so the shared arrangement coordinate must win the merge.
+            batch = (
+                batch[0],
+                batch[1],
+                batch[2],
+                batch[3],
+                (batch[4] + cp.int8(4)).astype(cp.int8, copy=False),
             )
-            if batch is not None:
-                pair_event_run = _merge_sorted_split_event_runs(
-                    pair_event_run,
-                    _sort_deduplicate_split_event_run(batch),
-                )
+            pair_event_runs.append(_sort_deduplicate_split_event_run(batch))
+
+    def _consume_classified_page(page: SegmentIntersectionResult) -> None:
+        try:
+            _append_cross_pair_events(page)
         finally:
             _release_classified_page(page)
 
@@ -1035,10 +1150,9 @@ def build_gpu_split_events(
         side_count = int(side_segments.count)
         if not require_same_row or side_count < 2:
             return None
-        side_event_run = None
+        side_event_runs = []
 
         def _consume_side_page(page: SegmentIntersectionResult) -> None:
-            nonlocal side_event_run
             try:
                 batch = _emit_pair_split_event_batch(
                     page,
@@ -1058,9 +1172,8 @@ def build_gpu_split_events(
                     batch[3],
                     batch[4],
                 )
-                side_event_run = _merge_sorted_split_event_runs(
-                    side_event_run,
-                    _sort_deduplicate_split_event_run(normalized),
+                side_event_runs.append(
+                    _sort_deduplicate_split_event_run(normalized)
                 )
             finally:
                 _release_classified_page(page)
@@ -1092,7 +1205,7 @@ def build_gpu_split_events(
                     ),
                     _collect_ambiguous_rows=False,
                     _strict_upper_source_rows=(source_order, source_order),
-                    _compact_paged_non_disjoint=True,
+                    _compact_paged_non_disjoint=False,
                     _classified_page_consumer=_consume_side_page,
                 )
             if side_result.runtime_selection.selected is not ExecutionMode.GPU:
@@ -1105,13 +1218,16 @@ def build_gpu_split_events(
             else:
                 _consume_side_page(side_result)
                 side_result = None
-            return side_event_run
+            return _merge_split_event_runs_balanced(side_event_runs)
         finally:
-            runtime.synchronize()
+            get_cuda_completion_retainer().defer(
+                cp.cuda.get_current_stream(),
+                tuple(side_event_runs),
+                lambda _owners: None,
+            )
 
     def _consume_right_right_page(page: SegmentIntersectionResult) -> None:
         """Filter and emit one grouped right-right classification page."""
-        nonlocal right_right_event_run
         state = page.device_state
         filtered_page = None
         try:
@@ -1178,9 +1294,8 @@ def build_gpu_split_events(
                 batch[3],
                 batch[4],
             )
-            right_right_event_run = _merge_sorted_split_event_runs(
-                right_right_event_run,
-                _sort_deduplicate_split_event_run(normalized),
+            right_right_event_runs.append(
+                _sort_deduplicate_split_event_run(normalized)
             )
         finally:
             if filtered_page is not None:
@@ -1204,7 +1319,9 @@ def build_gpu_split_events(
                 _same_row_single_group=same_row_single_group,
                 _same_row_span_summary=same_row_span_summary,
                 _collect_ambiguous_rows=False,
-                _compact_paged_non_disjoint=True,
+                # Overlay applies a constructive-only ULP near-touch pass to
+                # exact-disjoint candidates before event emission.
+                _compact_paged_non_disjoint=False,
                 _classified_page_consumer=_consume_classified_page,
             )
     except Exception as exc:
@@ -1347,18 +1464,7 @@ def build_gpu_split_events(
 
         if event_result.count:
             with hotpath_stage("overlay.split.emit_pair_event_run", category="emit"):
-                batch = _emit_pair_split_event_batch(
-                    event_result,
-                    left_segments=left_segments,
-                    right_segments=effective_right_segments,
-                    kernels=kernels,
-                    broadcast_right=right_segment_broadcast is not None,
-                )
-                if batch is not None:
-                    pair_event_run = _merge_sorted_split_event_runs(
-                        pair_event_run,
-                        _sort_deduplicate_split_event_run(batch),
-                    )
+                _append_cross_pair_events(event_result)
 
         try:
             if remapped_right_row_indices is not None:
@@ -1391,7 +1497,7 @@ def build_gpu_split_events(
                                 original_right_segment_rows,
                                 original_right_segment_rows,
                             ),
-                            _compact_paged_non_disjoint=True,
+                            _compact_paged_non_disjoint=False,
                             _classified_page_consumer=_consume_right_right_page,
                         )
                     if right_right.runtime_selection.selected is not ExecutionMode.GPU:
@@ -1430,28 +1536,23 @@ def build_gpu_split_events(
 
             try:
                 with hotpath_stage("overlay.split.external_merge_events", category="sort"):
-                    event_run = (
+                    endpoint_event_run = (
                         cp.asarray(endpoint_source_ids),
                         cp.asarray(endpoint_t),
                         cp.asarray(endpoint_x),
                         cp.asarray(endpoint_y),
                         cp.zeros(base_event_count, dtype=cp.int8),
                     )
-                    event_run = _merge_sorted_split_event_runs(
-                        event_run,
-                        pair_event_run,
+                    event_run = _merge_split_event_runs_balanced(
+                        [
+                            endpoint_event_run,
+                            *pair_event_runs,
+                            *right_right_event_runs,
+                            *same_side_event_batches,
+                        ]
                     )
-                    pair_event_run = None
-                    event_run = _merge_sorted_split_event_runs(
-                        event_run,
-                        right_right_event_run,
-                    )
-                    right_right_event_run = None
-                    for side_event_run in same_side_event_batches:
-                        event_run = _merge_sorted_split_event_runs(
-                            event_run,
-                            side_event_run,
-                        )
+                    pair_event_runs.clear()
+                    right_right_event_runs.clear()
                     same_side_event_batches.clear()
                     (
                         unique_source_ids,
@@ -1527,18 +1628,36 @@ def build_gpu_split_events(
                     row_indices=d_row_indices,
                     part_indices=d_part_indices,
                     ring_indices=d_ring_indices,
+                    geometry_indices=d_geometry_indices,
                 ),
                 _count=event_count,
             )
         finally:
-            runtime.synchronize()
+            get_cuda_completion_retainer().defer(
+                cp.cuda.get_current_stream(),
+                (
+                    tuple(pair_event_runs),
+                    tuple(right_right_event_runs),
+                    tuple(locals().get("same_side_event_batches", ())),
+                ),
+                lambda _owners: None,
+            )
     finally:
-        runtime.synchronize()
+        get_cuda_completion_retainer().defer(
+            cp.cuda.get_current_stream(),
+            (
+                endpoint_source_ids,
+                endpoint_t,
+                endpoint_x,
+                endpoint_y,
+            ),
+            lambda _owners: None,
+        )
         # Free DeviceSegmentTable arrays (x0/y0/x1/y1 are aliases of
         # left_x0 etc., plus row/segment/part/ring metadata).
         # lyy.15: skip freeing right_segments when they are cached
         # (caller owns the lifetime of the cached segments).
-        _segs_to_free = [left_segments]
+        _segs_to_free = [left_segments] if _owns_left_segments else []
         if _owns_right_segments:
             _segs_to_free.append(right_segments)
         for _dst in _segs_to_free:
@@ -1575,11 +1694,107 @@ def build_gpu_split_events(
             runtime.free(device_state.ambiguous_rows)
 
 
+def _source_ring_transition_state(split_events, kernels):
+    """Return dense source metadata, tangents, and exact semantic ring signs."""
+    runtime = get_cuda_runtime()
+    state = split_events.device_state
+    segment_total = split_events.left_segment_count + split_events.right_segment_count
+    d_ids = cp.asarray(state.source_segment_ids, dtype=cp.int32)
+    d_t = cp.asarray(state.t, dtype=cp.float64)
+    d_x = cp.asarray(state.x, dtype=cp.float64)
+    d_y = cp.asarray(state.y, dtype=cp.float64)
+    source_rows = cp.empty(segment_total, dtype=cp.int32)
+    source_parts = cp.empty(segment_total, dtype=cp.int32)
+    source_rings = cp.empty(segment_total, dtype=cp.int32)
+    source_geometries = cp.empty(segment_total, dtype=cp.int32)
+    source_rows[d_ids] = cp.asarray(state.row_indices, dtype=cp.int32)
+    source_parts[d_ids] = cp.asarray(state.part_indices, dtype=cp.int32)
+    source_rings[d_ids] = cp.asarray(state.ring_indices, dtype=cp.int32)
+    if state.geometry_indices is None:
+        source_geometries[:] = source_rows
+    else:
+        source_geometries[d_ids] = cp.asarray(
+            state.geometry_indices,
+            dtype=cp.int32,
+        )
+    x0 = cp.empty(segment_total, dtype=cp.float64)
+    y0 = cp.empty(segment_total, dtype=cp.float64)
+    x1 = cp.empty(segment_total, dtype=cp.float64)
+    y1 = cp.empty(segment_total, dtype=cp.float64)
+    start = d_t == 0.0
+    end = d_t == 1.0
+    x0[d_ids[start]] = d_x[start]
+    y0[d_ids[start]] = d_y[start]
+    x1[d_ids[end]] = d_x[end]
+    y1[d_ids[end]] = d_y[end]
+
+    source_side = cp.where(
+        cp.arange(segment_total, dtype=cp.int32) < split_events.left_segment_count,
+        cp.int8(1),
+        cp.int8(2),
+    )
+    ring_start_mask = cp.empty(segment_total, dtype=cp.bool_)
+    ring_start_mask[0] = True
+    if segment_total > 1:
+        ring_start_mask[1:] = (
+            (source_side[1:] != source_side[:-1])
+            | (source_geometries[1:] != source_geometries[:-1])
+            | (source_rows[1:] != source_rows[:-1])
+            | (source_parts[1:] != source_parts[:-1])
+            | (source_rings[1:] != source_rings[:-1])
+        )
+    ring_starts = cp.flatnonzero(ring_start_mask).astype(cp.int32, copy=False)
+    ring_ends = cp.concatenate(
+        (ring_starts[1:], cp.asarray([segment_total], dtype=cp.int32))
+    )
+    ring_count = int(ring_starts.size)
+    transition = cp.empty(segment_total, dtype=cp.int32)
+    grid, block = runtime.launch_config(
+        kernels["derive_source_ring_transition_signs"], ring_count
+    )
+    ptr = runtime.pointer
+    runtime.launch(
+        kernels["derive_source_ring_transition_signs"],
+        grid=grid,
+        block=block,
+        params=((
+            ptr(x0), ptr(y0), ptr(x1), ptr(y1), ptr(ring_starts),
+            ptr(ring_ends), ptr(source_rings), ptr(transition), ring_count,
+        ), (KERNEL_PARAM_PTR,) * 8 + (KERNEL_PARAM_I32,)),
+    )
+    source_tangent_x = x1 - x0
+    source_tangent_y = y1 - y0
+    # ``runtime.launch`` receives raw pointers. Retain ephemeral ring-index and
+    # endpoint owners until this stream reaches the launch; otherwise CuPy's
+    # pool can recycle them while the exact orientation kernel is in flight.
+    get_cuda_completion_retainer().defer(
+        cp.cuda.get_current_stream(),
+        (
+            x0,
+            y0,
+            x1,
+            y1,
+            ring_starts,
+            ring_ends,
+        ),
+        lambda _owners: None,
+    )
+    return (
+        source_rows,
+        source_parts,
+        source_rings,
+        source_tangent_x,
+        source_tangent_y,
+        transition,
+    )
+
+
 def build_gpu_atomic_edges(
     split_events: SplitEventTable,
     *,
     isolate_rows: bool = False,
     preserve_source_orientation: bool = False,
+    _parent_atomic_state: AtomicEdgeDeviceState | None = None,
 ) -> AtomicEdgeTable:
     _require_gpu_arrays()
     runtime = get_cuda_runtime()
@@ -1610,6 +1825,10 @@ def build_gpu_atomic_edges(
                 ring_indices=empty_device_i32,
                 source_side=empty_device_i8,
                 source_membership=runtime.allocate((0,), np.uint8),
+                tangent_x=empty_device_f64,
+                tangent_y=empty_device_f64,
+                left_coverage_delta=empty_device_i32,
+                right_coverage_delta=empty_device_i32,
             ),
             _count=0,
         )
@@ -1670,7 +1889,6 @@ def build_gpu_atomic_edges(
             block=block,
             params=params,
         )
-        runtime.synchronize()
         d_adjacent_positions = cp.flatnonzero(adjacency_mask)
         raw_edge_rows = None
         if isolate_rows:
@@ -1679,6 +1897,69 @@ def build_gpu_atomic_edges(
             raw_edge_rows[0::2] = d_adj_rows
             raw_edge_rows[1::2] = d_adj_rows
         (
+            source_rows,
+            source_parts,
+            source_rings,
+            source_tangent_x,
+            source_tangent_y,
+            source_transition,
+        ) = _source_ring_transition_state(split_events, kernels)
+        raw_ids = cp.asarray(out_source_ids, dtype=cp.int32)
+        raw_sign = cp.where(
+            cp.asarray(out_direction, dtype=cp.int8) == 0,
+            cp.int32(1),
+            cp.int32(-1),
+        )
+        parent_forward_edges = None
+        if _parent_atomic_state is None:
+            raw_membership = cp.where(
+                raw_ids < split_events.left_segment_count,
+                cp.uint8(1),
+                cp.uint8(2),
+            )
+            raw_transition = source_transition[raw_ids] * raw_sign
+            raw_left_delta = cp.where(
+                raw_ids < split_events.left_segment_count,
+                raw_transition,
+                cp.int32(0),
+            )
+            raw_right_delta = cp.where(
+                raw_ids < split_events.left_segment_count,
+                cp.int32(0),
+                raw_transition,
+            )
+        else:
+            parent_forward_edges = cp.arange(
+                0,
+                int(_parent_atomic_state.source_segment_ids.size),
+                2,
+                dtype=cp.int32,
+            )
+            if int(parent_forward_edges.size) != segment_total:
+                raise RuntimeError(
+                    "parent atomic provenance must contain one forward occurrence "
+                    "per re-noded source segment"
+                )
+            raw_parent_edges = parent_forward_edges[raw_ids]
+            raw_membership = cp.asarray(
+                _parent_atomic_state.source_membership,
+                dtype=cp.uint8,
+            )[raw_parent_edges]
+            raw_left_delta = (
+                cp.asarray(
+                    _parent_atomic_state.left_coverage_delta,
+                    dtype=cp.int32,
+                )[raw_parent_edges]
+                * raw_sign
+            )
+            raw_right_delta = (
+                cp.asarray(
+                    _parent_atomic_state.right_coverage_delta,
+                    dtype=cp.int32,
+                )[raw_parent_edges]
+                * raw_sign
+            )
+        (
             dedup_source_ids,
             dedup_direction,
             dedup_src_x,
@@ -1686,6 +1967,8 @@ def build_gpu_atomic_edges(
             dedup_dst_x,
             dedup_dst_y,
             dedup_source_membership,
+            dedup_left_delta,
+            dedup_right_delta,
         ) = _deduplicate_atomic_edge_geometry(
             out_source_ids,
             out_direction,
@@ -1693,6 +1976,9 @@ def build_gpu_atomic_edges(
             out_src_y,
             out_dst_x,
             out_dst_y,
+            occurrence_membership=raw_membership,
+            occurrence_left_delta=raw_left_delta,
+            occurrence_right_delta=raw_right_delta,
             row_indices=raw_edge_rows,
             left_segment_count=split_events.left_segment_count,
             preserve_source_orientation=preserve_source_orientation,
@@ -1714,24 +2000,48 @@ def build_gpu_atomic_edges(
         d_out_ids = cp.asarray(
             dedup_source_ids
         )  # zcopy:ok(already device-resident — cp.asarray is a no-op)
-        left_count = split_events.left_segment_count
-        d_source_side = cp.where(d_out_ids < left_count, cp.int8(1), cp.int8(2))
-
-        se_device = split_events.device_state
-        d_se_source_ids = cp.asarray(se_device.source_segment_ids)
-        d_se_row = cp.asarray(se_device.row_indices)
-        d_se_part = cp.asarray(se_device.part_indices)
-        d_se_ring = cp.asarray(se_device.ring_indices)
-        segment_total = split_events.left_segment_count + split_events.right_segment_count
-        source_rows = cp.empty(segment_total, dtype=cp.int32)
-        source_parts = cp.empty(segment_total, dtype=cp.int32)
-        source_rings = cp.empty(segment_total, dtype=cp.int32)
-        source_rows[d_se_source_ids] = d_se_row
-        source_parts[d_se_source_ids] = d_se_part
-        source_rings[d_se_source_ids] = d_se_ring
         d_row_indices = source_rows[d_out_ids]
         d_part_indices = source_parts[d_out_ids]
         d_ring_indices = source_rings[d_out_ids]
+
+        d_forward_tangent = cp.asarray(dedup_direction, dtype=cp.int8) == 0
+        if _parent_atomic_state is None:
+            output_source_ids = dedup_source_ids
+            d_source_side = cp.where(
+                d_out_ids < split_events.left_segment_count,
+                cp.int8(1),
+                cp.int8(2),
+            )
+            selected_tangent_x = source_tangent_x[d_out_ids]
+            selected_tangent_y = source_tangent_y[d_out_ids]
+        else:
+            selected_parent_edges = parent_forward_edges[d_out_ids]
+            output_source_ids = cp.asarray(
+                _parent_atomic_state.source_segment_ids,
+                dtype=cp.int32,
+            )[selected_parent_edges]
+            d_source_side = cp.asarray(
+                _parent_atomic_state.source_side,
+                dtype=cp.int8,
+            )[selected_parent_edges]
+            selected_tangent_x = cp.asarray(
+                _parent_atomic_state.tangent_x,
+                dtype=cp.float64,
+            )[selected_parent_edges]
+            selected_tangent_y = cp.asarray(
+                _parent_atomic_state.tangent_y,
+                dtype=cp.float64,
+            )[selected_parent_edges]
+        d_tangent_x = cp.where(
+            d_forward_tangent,
+            selected_tangent_x,
+            -selected_tangent_x,
+        )
+        d_tangent_y = cp.where(
+            d_forward_tangent,
+            selected_tangent_y,
+            -selected_tangent_y,
+        )
 
         # Row/part/ring stay on device; downstream build_gpu_half_edge_graph
         # reads device_state directly.  Host copies are lazily materialized
@@ -1742,7 +2052,7 @@ def build_gpu_atomic_edges(
             right_segment_count=split_events.right_segment_count,
             runtime_selection=split_events.runtime_selection,
             device_state=AtomicEdgeDeviceState(
-                source_segment_ids=dedup_source_ids,
+                source_segment_ids=output_source_ids,
                 direction=dedup_direction,
                 src_x=dedup_src_x,
                 src_y=dedup_src_y,
@@ -1753,13 +2063,246 @@ def build_gpu_atomic_edges(
                 ring_indices=d_ring_indices,
                 source_side=d_source_side,
                 source_membership=dedup_source_membership,
+                tangent_x=d_tangent_x,
+                tangent_y=d_tangent_y,
+                left_coverage_delta=dedup_left_delta,
+                right_coverage_delta=dedup_right_delta,
             ),
             _count=int(dedup_source_ids.size),
         )
     finally:
-        runtime.synchronize()
         runtime.free(adjacency_mask)
         runtime.free(adjacency_offsets)
+
+
+def renode_gpu_atomic_edges(
+    atomic_edges: AtomicEdgeTable,
+    *,
+    isolate_rows: bool,
+) -> AtomicEdgeTable:
+    """Split second-order crossings until the atomic relation is planar.
+
+    Refined intersection coordinates can create a new crossing a few ULPs
+    from a source endpoint. A planar overlay graph therefore needs a fixed-
+    point noding stage after the first source-segment split. Each pass is
+    shaped by forward atomic segments and returns immediately when the merged
+    event carrier contains only the two existing endpoints per segment.
+    """
+    _require_gpu_arrays()
+    if atomic_edges.count < 4:
+        return atomic_edges
+
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import (
+        FAMILY_TAGS,
+        DeviceFamilyGeometryBuffer,
+        build_device_resident_owned,
+    )
+    from vibespatial.overlay.gpu import _overlay_split_kernels
+
+    runtime = get_cuda_runtime()
+    kernels = _overlay_split_kernels()
+    current = atomic_edges
+
+    while True:
+        state = current.device_state
+        if state is None:
+            return current
+        segment_count = current.count // 2
+        if segment_count < 2:
+            return current
+
+        d_src_x = cp.asarray(state.src_x, dtype=cp.float64)
+        d_src_y = cp.asarray(state.src_y, dtype=cp.float64)
+        d_forward = cp.arange(0, current.count, 2, dtype=cp.int32)
+        d_rows = cp.asarray(state.row_indices, dtype=cp.int32)[d_forward]
+        d_parts = cp.asarray(state.part_indices, dtype=cp.int32)[d_forward]
+        d_rings = cp.asarray(state.ring_indices, dtype=cp.int32)[d_forward]
+        d_segment_ids = cp.arange(segment_count, dtype=cp.int32)
+        # DeviceSegmentTable is a pointer-based kernel carrier; strided even/
+        # odd half-edge views would be interpreted as dense arrays by CUDA.
+        # Materialize each forward occurrence as one contiguous source segment.
+        d_segment_x0 = cp.ascontiguousarray(d_src_x[0::2])
+        d_segment_y0 = cp.ascontiguousarray(d_src_y[0::2])
+        d_segment_x1 = cp.ascontiguousarray(d_src_x[1::2])
+        d_segment_y1 = cp.ascontiguousarray(d_src_y[1::2])
+        segments = DeviceSegmentTable(
+            row_indices=d_rows,
+            segment_indices=d_segment_ids,
+            x0=d_segment_x0,
+            y0=d_segment_y0,
+            x1=d_segment_x1,
+            y1=d_segment_y1,
+            count=segment_count,
+            part_indices=d_parts,
+            ring_indices=d_rings,
+        )
+        line_owned = build_device_resident_owned(
+            device_families={
+                GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
+                    family=GeometryFamily.LINESTRING,
+                    x=d_src_x,
+                    y=d_src_y,
+                    geometry_offsets=(
+                        cp.arange(segment_count + 1, dtype=cp.int32) * cp.int32(2)
+                    ),
+                    empty_mask=cp.zeros(segment_count, dtype=cp.bool_),
+                    bounds=None,
+                )
+            },
+            row_count=segment_count,
+            tags=cp.full(
+                segment_count,
+                FAMILY_TAGS[GeometryFamily.LINESTRING],
+                dtype=cp.int8,
+            ),
+            validity=cp.ones(segment_count, dtype=cp.bool_),
+            family_row_offsets=d_segment_ids,
+            execution_mode="gpu",
+        )
+
+        pair_runs = []
+
+        def _release_page(page: SegmentIntersectionResult) -> None:
+            page_state = page.device_state
+            if page_state is None:
+                return
+            for values in (
+                page_state.left_rows,
+                page_state.left_segments,
+                page_state.left_lookup,
+                page_state.right_rows,
+                page_state.right_segments,
+                page_state.right_lookup,
+                page_state.kinds,
+                page_state.point_x,
+                page_state.point_y,
+                page_state.overlap_x0,
+                page_state.overlap_y0,
+                page_state.overlap_x1,
+                page_state.overlap_y1,
+                page_state.ambiguous_rows,
+            ):
+                runtime.free(values)
+
+        def _consume_page(
+            page: SegmentIntersectionResult,
+            *,
+            _segments=segments,
+            _pair_runs=pair_runs,
+            _segment_count=segment_count,
+        ) -> None:
+            try:
+                batch = _emit_pair_split_event_batch(
+                    page,
+                    left_segments=_segments,
+                    right_segments=_segments,
+                    kernels=kernels,
+                )
+                if batch is None:
+                    return
+                _pair_runs.append(
+                    _sort_deduplicate_split_event_run(
+                        (
+                            (cp.asarray(batch[0], dtype=cp.int32) % _segment_count).astype(
+                                cp.int32,
+                                copy=False,
+                            ),
+                            batch[1],
+                            batch[2],
+                            batch[3],
+                            batch[4],
+                        )
+                    )
+                )
+            finally:
+                _release_page(page)
+
+        classified = classify_segment_intersections(
+            line_owned,
+            line_owned,
+            dispatch_mode=ExecutionMode.GPU,
+            _cached_left_device_segments=segments,
+            _cached_right_device_segments=segments,
+            _require_same_row=isolate_rows,
+            _use_same_row_fast_path=isolate_rows,
+            _same_row_single_group=False,
+            _collect_ambiguous_rows=False,
+            _strict_upper_source_rows=(d_segment_ids, d_segment_ids),
+            _compact_paged_non_disjoint=False,
+            _classified_page_consumer=_consume_page,
+        )
+        if isinstance(classified, PagedSegmentIntersectionResult):
+            for page in classified.pages:
+                _consume_page(page)
+        else:
+            _consume_page(classified)
+
+        endpoint_ids = cp.repeat(d_segment_ids, 2)
+        endpoint_run = (
+            endpoint_ids,
+            cp.tile(cp.asarray([0.0, 1.0], dtype=cp.float64), segment_count),
+            d_src_x,
+            d_src_y,
+            cp.full(segment_count * 2, cp.int8(127), dtype=cp.int8),
+        )
+        merged = _merge_split_event_runs_balanced([endpoint_run, *pair_runs])
+        if merged is None or int(merged[0].size) == segment_count * 2:
+            return current
+
+        d_event_source = cp.asarray(merged[0], dtype=cp.int32)
+        d_event_forward_edges = d_forward[d_event_source]
+        split_events = SplitEventTable(
+            left_segment_count=segment_count,
+            right_segment_count=0,
+            runtime_selection=current.runtime_selection,
+            device_state=SplitEventDeviceState(
+                source_segment_ids=d_event_source,
+                t=merged[1],
+                x=merged[2],
+                y=merged[3],
+                source_side=cp.asarray(state.source_side, dtype=cp.int8)[
+                    d_event_forward_edges
+                ],
+                row_indices=cp.asarray(state.row_indices, dtype=cp.int32)[
+                    d_event_forward_edges
+                ],
+                part_indices=cp.asarray(state.part_indices, dtype=cp.int32)[
+                    d_event_forward_edges
+                ],
+                ring_indices=cp.asarray(state.ring_indices, dtype=cp.int32)[
+                    d_event_forward_edges
+                ],
+            ),
+            _count=d_event_source.size,
+        )
+        rebuilt = build_gpu_atomic_edges(
+            split_events,
+            isolate_rows=isolate_rows,
+            _parent_atomic_state=state,
+        )
+        rebuilt = replace(
+            rebuilt,
+            left_segment_count=current.left_segment_count,
+            right_segment_count=current.right_segment_count,
+        )
+        reached_fixed_point = rebuilt.count == current.count
+        get_cuda_completion_retainer().defer(
+            cp.cuda.get_current_stream(),
+            split_events.device_state,
+            lambda _state: None,
+        )
+        # Several atomic columns may be views into shared pool allocations.
+        # Keep their Python owners alive through the last consumer instead of
+        # explicitly freeing an underlying allocation through one view.
+        get_cuda_completion_retainer().defer(
+            cp.cuda.get_current_stream(),
+            (state, segments, line_owned),
+            lambda _owners: None,
+        )
+        current = rebuilt
+        if reached_fixed_point:
+            return current
 
 
 def noded_boundary_segments_from_split_events_gpu(
@@ -1792,3 +2335,201 @@ def noded_boundary_segments_from_split_events_gpu(
         d_y[1:][d_adjacency],
         d_rows[:-1][d_adjacency],
     )
+
+
+def renode_grouped_boundary_segments_gpu(
+    start_x,
+    start_y,
+    end_x,
+    end_y,
+    row_indices,
+    *,
+    placeholder_owned,
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
+    """Reach a planar fixed point for grouped boundary atoms on the device.
+
+    Intersection coordinates can induce a crossing between newly split atoms
+    even when every original source pair was classified exactly.  Reclassify
+    the segment relation itself in bounded pages and preserve one output atom
+    per source occurrence; collective coverage depends on that multiplicity.
+    """
+    _require_gpu_arrays()
+    from vibespatial.overlay.gpu import _overlay_split_kernels
+
+    runtime = get_cuda_runtime()
+    kernels = _overlay_split_kernels()
+    current_start_x = cp.asarray(start_x, dtype=cp.float64)
+    current_start_y = cp.asarray(start_y, dtype=cp.float64)
+    current_end_x = cp.asarray(end_x, dtype=cp.float64)
+    current_end_y = cp.asarray(end_y, dtype=cp.float64)
+    current_rows = cp.asarray(row_indices, dtype=cp.int32)
+
+    def _release_page(page: SegmentIntersectionResult) -> None:
+        state = page.device_state
+        if state is None:
+            return
+        for values in (
+            state.left_rows,
+            state.left_segments,
+            state.left_lookup,
+            state.right_rows,
+            state.right_segments,
+            state.right_lookup,
+            state.kinds,
+            state.point_x,
+            state.point_y,
+            state.overlap_x0,
+            state.overlap_y0,
+            state.overlap_x1,
+            state.overlap_y1,
+            state.ambiguous_rows,
+        ):
+            runtime.free(values)
+
+    def _consume_page(
+        page: SegmentIntersectionResult,
+        *,
+        start_x,
+        start_y,
+        end_x,
+        end_y,
+        segments: DeviceSegmentTable,
+        segment_count: int,
+        pair_runs: list,
+    ) -> None:
+        try:
+            batch = _emit_pair_split_event_batch(
+                page,
+                left_segments=segments,
+                right_segments=segments,
+                kernels=kernels,
+            )
+            if batch is None:
+                return
+            pair_runs.append(
+                _sort_deduplicate_split_event_run(
+                    (
+                        (cp.asarray(batch[0], dtype=cp.int32) % segment_count).astype(
+                            cp.int32,
+                            copy=False,
+                        ),
+                        batch[1],
+                        batch[2],
+                        batch[3],
+                        batch[4],
+                    )
+                )
+            )
+        finally:
+            _release_page(page)
+
+    while True:
+        segment_count = current_start_x.size
+        if segment_count < 2:
+            return (
+                current_start_x,
+                current_start_y,
+                current_end_x,
+                current_end_y,
+                current_rows,
+            )
+
+        d_segment_ids = cp.arange(segment_count, dtype=cp.int32)
+        d_zero_metadata = cp.zeros(segment_count, dtype=cp.int32)
+        segments = DeviceSegmentTable(
+            row_indices=current_rows,
+            segment_indices=d_segment_ids,
+            x0=current_start_x,
+            y0=current_start_y,
+            x1=current_end_x,
+            y1=current_end_y,
+            count=segment_count,
+            part_indices=d_zero_metadata,
+            ring_indices=d_zero_metadata,
+        )
+        pair_runs = []
+        consume_page = partial(
+            _consume_page,
+            start_x=current_start_x,
+            start_y=current_start_y,
+            end_x=current_end_x,
+            end_y=current_end_y,
+            segments=segments,
+            segment_count=segment_count,
+            pair_runs=pair_runs,
+        )
+
+        with hotpath_stage("overlay.split.renode_grouped_boundary", category="refine"):
+            classified = classify_segment_intersections(
+                placeholder_owned,
+                placeholder_owned,
+                dispatch_mode=ExecutionMode.GPU,
+                _cached_left_device_segments=segments,
+                _cached_right_device_segments=segments,
+                _require_same_row=True,
+                _use_same_row_fast_path=False,
+                _collect_ambiguous_rows=False,
+                _strict_upper_source_rows=(d_segment_ids, d_segment_ids),
+                _compact_paged_non_disjoint=False,
+                _classified_page_consumer=consume_page,
+            )
+            if isinstance(classified, PagedSegmentIntersectionResult):
+                for page in classified.pages:
+                    consume_page(page)
+            else:
+                consume_page(classified)
+
+        endpoint_source_ids = cp.repeat(d_segment_ids, 2)
+        endpoint_t = cp.tile(cp.asarray([0.0, 1.0], dtype=cp.float64), segment_count)
+        endpoint_x = cp.empty(segment_count * 2, dtype=cp.float64)
+        endpoint_y = cp.empty(segment_count * 2, dtype=cp.float64)
+        endpoint_x[0::2] = current_start_x
+        endpoint_x[1::2] = current_end_x
+        endpoint_y[0::2] = current_start_y
+        endpoint_y[1::2] = current_end_y
+        endpoint_run = (
+            endpoint_source_ids,
+            endpoint_t,
+            endpoint_x,
+            endpoint_y,
+            cp.full(segment_count * 2, cp.int8(127), dtype=cp.int8),
+        )
+        merged = _merge_split_event_runs_balanced([endpoint_run, *pair_runs])
+        if merged is None:
+            return (
+                current_start_x,
+                current_start_y,
+                current_end_x,
+                current_end_y,
+                current_rows,
+            )
+        if int(merged[0].size) == segment_count * 2:
+            return (
+                current_start_x,
+                current_start_y,
+                current_end_x,
+                current_end_y,
+                current_rows,
+            )
+
+        merged_source_ids = cp.asarray(merged[0], dtype=cp.int32)
+        adjacent = merged_source_ids[:-1] == merged_source_ids[1:]
+        next_start_x = cp.asarray(merged[2], dtype=cp.float64)[:-1][adjacent]
+        next_start_y = cp.asarray(merged[3], dtype=cp.float64)[:-1][adjacent]
+        next_end_x = cp.asarray(merged[2], dtype=cp.float64)[1:][adjacent]
+        next_end_y = cp.asarray(merged[3], dtype=cp.float64)[1:][adjacent]
+        next_source_ids = merged_source_ids[:-1][adjacent]
+        live = (next_start_x != next_end_x) | (next_start_y != next_end_y)
+        current_start_x = next_start_x[live]
+        current_start_y = next_start_y[live]
+        current_end_x = next_end_x[live]
+        current_end_y = next_end_y[live]
+        current_rows = current_rows[next_source_ids[live]]
+        if current_start_x.size == segment_count:
+            return (
+                current_start_x,
+                current_start_y,
+                current_end_x,
+                current_end_y,
+                current_rows,
+            )

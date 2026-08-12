@@ -1,4 +1,10 @@
-"""NVRTC kernel sources for point binary relations and multipoint relations."""
+"""NVRTC kernel sources for point binary relations and multipoint relations.
+
+The indexed exact-refine launchers currently admit only an ADR-0002 native-fp64
+``PrecisionPlan``. The ``double`` compute below is therefore an enforced kernel
+variant, not an implicit precision choice. Centered fp32 classification must not
+be admitted until selective fp64 refinement exists for ambiguous pairs.
+"""
 
 from __future__ import annotations
 
@@ -109,10 +115,11 @@ extern "C" __global__ void point_equals_compacted(
     const double* right_x,
     const double* right_y,
     unsigned char* out,
+    const int* logical_count,
     int candidate_count
 ) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count) {
+  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) {
     return;
   }
   const int row = candidate_rows[index];
@@ -143,10 +150,11 @@ extern "C" __global__ void point_on_linestring_compacted(
     const double* line_x,
     const double* line_y,
     unsigned char* out,
+    const int* logical_count,
     int candidate_count
 ) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count) {
+  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) {
     return;
   }
   const int row = candidate_rows[index];
@@ -197,10 +205,11 @@ extern "C" __global__ void point_on_multilinestring_compacted(
     const double* line_x,
     const double* line_y,
     unsigned char* out,
+    const int* logical_count,
     int candidate_count
 ) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count) {
+  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) {
     return;
   }
   const int row = candidate_rows[index];
@@ -255,10 +264,11 @@ extern "C" __global__ void point_in_polygon_polygon_compacted_state(
     const double* polygon_x,
     const double* polygon_y,
     unsigned char* out,
+    const int* logical_count,
     int candidate_count
 ) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count) {
+  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) {
     return;
   }
   const int row = candidate_rows[index];
@@ -295,10 +305,11 @@ extern "C" __global__ void point_in_polygon_multipolygon_compacted_state(
     const double* polygon_x,
     const double* polygon_y,
     unsigned char* out,
+    const int* logical_count,
     int candidate_count
 ) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count) {
+  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) {
     return;
   }
   const int row = candidate_rows[index];
@@ -353,10 +364,11 @@ extern "C" __global__ void multipoint_point_relation_compacted(
     const double* pt_x,
     const double* pt_y,
     unsigned char* out,
+    const int* logical_count,
     int candidate_count
 ) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count) return;
+  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) return;
   const int row = candidate_rows[index];
   const int mp_row = mp_row_offsets[row];
   const int pt_row = pt_row_offsets[row];
@@ -391,10 +403,11 @@ extern "C" __global__ void multipoint_linestring_relation_compacted(
     const double* line_x,
     const double* line_y,
     unsigned char* out,
+    const int* logical_count,
     int candidate_count
 ) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count) return;
+  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) return;
   const int row = candidate_rows[index];
   const int mp_row = mp_row_offsets[row];
   const int line_row = line_row_offsets[row];
@@ -435,10 +448,11 @@ extern "C" __global__ void multipoint_multilinestring_relation_compacted(
     const double* mls_x,
     const double* mls_y,
     unsigned char* out,
+    const int* logical_count,
     int candidate_count
 ) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count) return;
+  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) return;
   const int row = candidate_rows[index];
   const int mp_row = mp_row_offsets[row];
   const int mls_row = mls_row_offsets[row];
@@ -484,10 +498,11 @@ extern "C" __global__ void multipoint_polygon_relation_compacted(
     const double* pg_x,
     const double* pg_y,
     unsigned char* out,
+    const int* logical_count,
     int candidate_count
 ) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count) return;
+  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) return;
   const int row = candidate_rows[index];
   const int mp_row = mp_row_offsets[row];
   const int pg_row = pg_row_offsets[row];
@@ -519,10 +534,11 @@ extern "C" __global__ void multipoint_multipolygon_relation_compacted(
     const double* mpg_x,
     const double* mpg_y,
     unsigned char* out,
+    const int* logical_count,
     int candidate_count
 ) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count) return;
+  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) return;
   const int row = candidate_rows[index];
   const int mp_row = mp_row_offsets[row];
   const int mpg_row = mpg_row_offsets[row];
@@ -552,10 +568,11 @@ extern "C" __global__ void multipoint_multipoint_relation_compacted(
     const double* right_x,
     const double* right_y,
     unsigned char* out,
+    const int* logical_count,
     int candidate_count
 ) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count) return;
+  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) return;
   const int row = candidate_rows[index];
   const int lr = left_row_offsets[row];
   const int rr = right_row_offsets[row];

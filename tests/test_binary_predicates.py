@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,7 @@ from vibespatial import (
     ExecutionMode,
     MonitoringBackend,
     NullBehavior,
+    RuntimeSelection,
     evaluate_binary_predicate,
     from_shapely_geometries,
     has_gpu_runtime,
@@ -346,6 +348,123 @@ def test_indexed_point_relation_device_dispatch_avoids_branch_scalar_syncs() -> 
         )
 
     assert cp.asnumpy(result).tolist() == [True, True, True, True]
+
+
+def test_indexed_point_family_launchers_require_fp64_precision_plan() -> None:
+    from vibespatial.predicates import point_relations
+
+    launchers = (
+        point_relations._classify_indexed_point_equals,
+        point_relations._classify_indexed_point_line,
+        point_relations._classify_indexed_point_region,
+        point_relations._classify_indexed_mp_point,
+        point_relations._classify_indexed_mp_line,
+        point_relations._classify_indexed_mp_region,
+        point_relations._classify_indexed_mp_mp,
+    )
+
+    for launcher in launchers:
+        parameter = inspect.signature(launcher).parameters["precision_plan"]
+        assert parameter.default is inspect.Parameter.empty
+        assert "precision_plan=precision_plan" in inspect.getsource(launcher)
+
+
+def test_indexed_point_precision_planner_distinguishes_auto_and_forced_modes() -> None:
+    from vibespatial.predicates.point_relations import (
+        _plan_indexed_point_precision,
+    )
+    from vibespatial.runtime.precision import PrecisionMode
+
+    auto_plan = _plan_indexed_point_precision(PrecisionMode.AUTO)
+    forced_fp64_plan = _plan_indexed_point_precision(PrecisionMode.FP64)
+
+    assert auto_plan.compute_precision is PrecisionMode.FP64
+    assert "auto precision resolved to native fp64" in auto_plan.reason
+    assert forced_fp64_plan.compute_precision is PrecisionMode.FP64
+    assert "explicit fp64 precision requested" in forced_fp64_plan.reason
+    with pytest.raises(NotImplementedError, match="currently require authoritative fp64"):
+        _plan_indexed_point_precision(PrecisionMode.FP32)
+
+
+@pytest.mark.parametrize("requested", ["auto", "fp32"])
+def test_homogeneous_indexed_point_predicates_reject_fp32_plan(requested) -> None:
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.predicates.point_relations import (
+        classify_homogeneous_point_predicates_indexed_device,
+    )
+    from vibespatial.runtime.precision import (
+        KernelClass,
+        PrecisionMode,
+        select_precision_plan,
+    )
+
+    precision_plan = select_precision_plan(
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="test indexed point predicate precision enforcement",
+        ),
+        kernel_class=KernelClass.PREDICATE,
+        requested=requested,
+    )
+    assert precision_plan.compute_precision is PrecisionMode.FP32
+
+    with pytest.raises(NotImplementedError, match="currently require authoritative fp64"):
+        classify_homogeneous_point_predicates_indexed_device(
+            "intersects",
+            object(),
+            object(),
+            np.asarray([0], dtype=np.int32),
+            np.asarray([0], dtype=np.int32),
+            left_family=GeometryFamily.POINT,
+            right_family=GeometryFamily.POINT,
+            precision_plan=precision_plan,
+        )
+
+
+@pytest.mark.gpu
+def test_homogeneous_indexed_point_predicates_propagate_fp64_plan(monkeypatch) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.predicates import point_relations
+    from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+
+    precision_plan = select_precision_plan(
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="test indexed point predicate precision propagation",
+        ),
+        kernel_class=KernelClass.PREDICATE,
+        requested=PrecisionMode.FP64,
+    )
+    observed = []
+
+    def classify_equals(*args, precision_plan, **kwargs):
+        observed.append(precision_plan)
+        return cp.asarray([2], dtype=cp.uint8)
+
+    monkeypatch.setattr(
+        point_relations,
+        "_classify_indexed_point_equals",
+        classify_equals,
+    )
+    result = point_relations.classify_homogeneous_point_predicates_indexed_device(
+        "intersects",
+        object(),
+        object(),
+        cp.asarray([0], dtype=cp.int32),
+        cp.asarray([0], dtype=cp.int32),
+        left_family=GeometryFamily.POINT,
+        right_family=GeometryFamily.POINT,
+        precision_plan=precision_plan,
+    )
+
+    assert observed == [precision_plan]
+    assert cp.asnumpy(result).tolist() == [True]
 
 
 @pytest.mark.gpu

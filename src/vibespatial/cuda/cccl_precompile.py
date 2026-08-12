@@ -1632,6 +1632,7 @@ _NVRTC_CONSUMER_MODULES: tuple[str, ...] = (
     "vibespatial.constructive.linestring",
     "vibespatial.spatial.segment_distance",
     "vibespatial.spatial.segment_primitives",
+    "vibespatial.spatial.prepared_polygon_mask",
     "vibespatial.constructive.measurement",
     "vibespatial.constructive.centroid",
     "vibespatial.constructive.clip_rect",

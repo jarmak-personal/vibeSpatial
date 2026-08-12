@@ -38,6 +38,50 @@ _POLYGON_DE9IM_PREDICATES = frozenset(
 )
 
 
+class CandidateRelationCapacityError(MemoryError):
+    """A concrete candidate relation cannot fit in device memory."""
+
+
+def available_device_memory_bytes() -> int | None:
+    """Return bytes currently allocatable by the active device memory stack."""
+    try:
+        import cupy as cp
+    except ModuleNotFoundError:
+        return None
+
+    driver_free, driver_total = cp.cuda.Device().mem_info
+    pool_free = int(get_cuda_runtime().memory_pool_stats().get("free_bytes", 0))
+    return min(int(driver_total), int(driver_free) + pool_free)
+
+
+def require_device_candidate_pair_capacity(
+    total_pairs: int,
+    *,
+    relation_name: str,
+    device_capacity_bytes: int | None = None,
+    temporary_bytes: int = 0,
+) -> int:
+    """Admit pair output and scratch against reserved currently free memory."""
+    pair_count = int(total_pairs)
+    required_bytes = pair_count * 2 * np.dtype(np.int32).itemsize
+    live_bytes = required_bytes + max(int(temporary_bytes), 0)
+    if device_capacity_bytes is None:
+        device_capacity_bytes = available_device_memory_bytes()
+        if device_capacity_bytes is None:
+            return required_bytes
+    memory_budget = int(device_capacity_bytes) // 2
+    if live_bytes > memory_budget:
+        gib = 1024**3
+        raise CandidateRelationCapacityError(
+            f"{relation_name} has {pair_count:,} pairs and requires at least "
+            f"{required_bytes / gib:.2f} GiB for its two int32 index columns "
+            f"and {max(int(temporary_bytes), 0) / gib:.2f} GiB scratch; "
+            f"reserved allocation budget is {memory_budget / gib:.2f} GiB "
+            f"from {int(device_capacity_bytes) / gib:.2f} GiB currently available"
+        )
+    return required_bytes
+
+
 def _device_array_detail(values: Any, *, side: str) -> str:
     size = int(getattr(values, "size", 0))
     itemsize = int(getattr(getattr(values, "dtype", None), "itemsize", 0))
@@ -132,6 +176,7 @@ class DeviceSpatialJoinResult:
 
     d_left_idx: Any  # CuPy int32 device array
     d_right_idx: Any  # CuPy int32 device array
+    sorted_by_left: bool = False
 
     def left_to_host(
         self,

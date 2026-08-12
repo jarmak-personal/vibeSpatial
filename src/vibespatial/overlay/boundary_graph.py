@@ -81,8 +81,11 @@ def build_atomic_edges_from_boundary_segments_gpu(
     d_dst_y[1::2] = start_y
     d_source_ids[0::2] = d_segment_ids
     d_source_ids[1::2] = d_segment_ids
-    d_direction[0::2] = 1
-    d_direction[1::2] = -1
+    d_direction[0::2] = 0
+    d_direction[1::2] = 1
+    d_tangent_x = d_dst_x - d_src_x
+    d_tangent_y = d_dst_y - d_src_y
+    d_zero_delta = cp.zeros(total_atomic, dtype=cp.int32)
 
     return AtomicEdgeTable(
         left_segment_count=boundary_count,
@@ -99,6 +102,10 @@ def build_atomic_edges_from_boundary_segments_gpu(
             part_indices=d_part_indices,
             ring_indices=d_ring_indices,
             source_side=d_source_side,
+            tangent_x=d_tangent_x,
+            tangent_y=d_tangent_y,
+            left_coverage_delta=d_zero_delta,
+            right_coverage_delta=d_zero_delta.copy(),
         ),
         _count=total_atomic,
     )
@@ -111,8 +118,9 @@ def undirected_boundary_segment_orders_gpu(
     end_y: DeviceArray,
     row_indices: DeviceArray | None,
     active_mask: DeviceArray | None = None,
+    keep_one_per_run: bool = False,
 ):
-    """Return one source position for each odd exact undirected segment run."""
+    """Return source positions for exact undirected boundary segment runs."""
     if cp is None:
         raise RuntimeError("CuPy is required for device boundary reconstruction")
     from .graph import _fp64_radix_keys, _stable_radix_order_pass
@@ -184,7 +192,12 @@ def undirected_boundary_segment_orders_gpu(
     run_starts = cp.flatnonzero(run_starts_mask).astype(cp.int32, copy=False)
     run_ends = cp.concatenate((run_starts[1:], cp.asarray([segment_count], dtype=cp.int32)))
     run_lengths = run_ends - run_starts
-    boundary_order = order[run_starts[(run_lengths & np.int32(1)) != 0]]
+    selected_runs = (
+        cp.ones(run_lengths.size, dtype=cp.bool_)
+        if keep_one_per_run
+        else (run_lengths & np.int32(1)) != 0
+    )
+    boundary_order = order[run_starts[selected_runs]]
     return boundary_order[active[boundary_order]]
 
 
@@ -357,9 +370,19 @@ def build_polygon_output_from_boundary_segments_gpu(
     if cp is None:
         raise RuntimeError("CuPy is required for device boundary reconstruction")
     from .assemble import _build_polygon_output_from_faces_gpu, _empty_polygon_output
+    from .faces import _build_indexed_component_containment_device_state
     from .gpu import _overlay_face_walk_kernels
-    from .graph import _gpu_face_walk, build_gpu_half_edge_graph
+    from .graph import (
+        _gpu_face_walk,
+        build_endpoint_incidence_device_state,
+        build_gpu_half_edge_graph,
+    )
 
+    start_x = cp.asarray(start_x, dtype=cp.float64)
+    start_y = cp.asarray(start_y, dtype=cp.float64)
+    end_x = cp.asarray(end_x, dtype=cp.float64)
+    end_y = cp.asarray(end_y, dtype=cp.float64)
+    row_indices = cp.asarray(row_indices, dtype=cp.int32)
     atomic_edges = build_atomic_edges_from_boundary_segments_gpu(
         start_x,
         start_y,
@@ -377,71 +400,134 @@ def build_polygon_output_from_boundary_segments_gpu(
                 validity=cp.asarray(d_valid_empty_rows, dtype=cp.bool_),
             )
         return _empty_polygon_output(runtime_selection, row_count=row_count)
+    runtime = get_cuda_runtime()
+    kernels = _overlay_face_walk_kernels()
+    ptr = runtime.pointer
+    incidence = build_endpoint_incidence_device_state(
+        atomic_edges,
+        isolate_rows=True,
+    )
+    segment_count = int(start_x.size)
+    node_capacity = incidence.edge_count
+    d_active_segments = cp.ones(segment_count, dtype=cp.int32)
+    d_node_degree = cp.empty(node_capacity, dtype=cp.int32)
+    d_node_queued = cp.zeros(node_capacity, dtype=cp.int32)
+    d_leaf_queue = cp.empty(node_capacity, dtype=cp.int32)
+    d_queue_ready = cp.zeros(node_capacity, dtype=cp.int32)
+    d_queue_head = cp.zeros(1, dtype=cp.int32)
+    d_queue_tail = cp.zeros(1, dtype=cp.int32)
+    d_pending = cp.zeros(1, dtype=cp.int32)
+    init_grid, init_block = runtime.launch_config(
+        kernels["initialize_degree_two_core_frontier"],
+        node_capacity,
+    )
+    runtime.launch(
+        kernels["initialize_degree_two_core_frontier"],
+        grid=init_grid,
+        block=init_block,
+        params=(
+            (
+                ptr(incidence.node_offsets),
+                ptr(incidence.node_count),
+                ptr(d_node_degree),
+                ptr(d_node_queued),
+                ptr(d_leaf_queue),
+                ptr(d_queue_tail),
+                ptr(d_queue_ready),
+                ptr(d_pending),
+                node_capacity,
+            ),
+            (KERNEL_PARAM_PTR,) * 8 + (KERNEL_PARAM_I32,),
+        ),
+    )
+    peel_grid, peel_block = runtime.launch_config(
+        kernels["peel_degree_two_core_frontier"],
+        node_capacity,
+    )
+    runtime.launch(
+        kernels["peel_degree_two_core_frontier"],
+        grid=peel_grid,
+        block=peel_block,
+        params=(
+            (
+                ptr(incidence.incidence_edge_ids),
+                ptr(incidence.node_offsets),
+                ptr(incidence.src_node_ids),
+                ptr(incidence.node_count),
+                ptr(d_active_segments),
+                ptr(d_node_degree),
+                ptr(d_node_queued),
+                ptr(d_leaf_queue),
+                ptr(d_queue_head),
+                ptr(d_queue_tail),
+                ptr(d_queue_ready),
+                ptr(d_pending),
+                node_capacity,
+                segment_count,
+            ),
+            (KERNEL_PARAM_PTR,) * 12 + (KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+        ),
+    )
+
+    # This is the single admitted physicalization boundary: after the O(E)
+    # device peel, compact surviving undirected segments once. No convergence
+    # state or peel round ever crosses to the host.
+    keep_order = cp.flatnonzero(d_active_segments != 0).astype(cp.int32, copy=False)
+    keep_count = int(keep_order.size)
+    if keep_count == 0:
+        if d_valid_empty_rows is not None:
+            from vibespatial.geometry.owned import build_empty_polygon_rows_device
+
+            return build_empty_polygon_rows_device(
+                row_count,
+                validity=cp.asarray(d_valid_empty_rows, dtype=cp.bool_),
+            )
+        return _empty_polygon_output(runtime_selection, row_count=row_count)
+    atomic_edges = build_atomic_edges_from_boundary_segments_gpu(
+        start_x[keep_order],
+        start_y[keep_order],
+        end_x[keep_order],
+        end_y[keep_order],
+        row_indices=row_indices[keep_order],
+        runtime_selection=runtime_selection,
+    )
     graph = build_gpu_half_edge_graph(atomic_edges, isolate_rows=True)
+    face_walk = _gpu_face_walk(graph)
     (
         d_face_offsets,
         d_face_edge_ids,
+        d_edge_face_ids,
         d_bounded_mask,
         d_signed_area,
         d_centroid_x,
         d_centroid_y,
-        d_label_x,
-        d_label_y,
         face_count,
-    ) = _gpu_face_walk(graph, area_epsilon=0.0)
+    ) = face_walk
     if face_count == 0:
         return _empty_polygon_output(runtime_selection, row_count=row_count)
 
-    runtime = get_cuda_runtime()
-    kernels = _overlay_face_walk_kernels()
-    d_depth = cp.empty(face_count, dtype=cp.int32)
-    block_size = min(
-        256,
-        runtime.optimal_block_size(kernels["count_boundary_face_nesting_depth"]),
+    face_ids = cp.arange(face_count, dtype=cp.int32)
+    first_edges = d_face_edge_ids[d_face_offsets[:-1]]
+    twin_faces = d_edge_face_ids[first_edges ^ cp.int32(1)]
+    d_component = cp.where(
+        face_walk.cycle_orientation < 0,
+        face_ids,
+        twin_faces,
+    ).astype(
+        cp.int32, copy=False
     )
-    block_size = 1 << (max(1, int(block_size)).bit_length() - 1)
-    device = graph.device_state
-    runtime.launch(
-        kernels["count_boundary_face_nesting_depth"],
-        grid=(face_count, 1, 1),
-        block=(block_size, 1, 1),
-        params=(
-            (
-                runtime.pointer(d_face_offsets),
-                runtime.pointer(d_face_edge_ids),
-                runtime.pointer(d_bounded_mask),
-                runtime.pointer(d_label_x),
-                runtime.pointer(d_label_y),
-                runtime.pointer(device.src_x),
-                runtime.pointer(device.src_y),
-                runtime.pointer(device.next_edge_ids),
-                runtime.pointer(device.row_indices),
-                runtime.pointer(device.ring_indices),
-                runtime.pointer(d_depth),
-                np.int32(1),
-                face_count,
-                graph.edge_count,
-            ),
-            (
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_I32,
-                KERNEL_PARAM_I32,
-                KERNEL_PARAM_I32,
-            ),
-        ),
+    nesting = _build_indexed_component_containment_device_state(
+        graph,
+        d_face_offsets,
+        d_face_edge_ids,
+        face_walk.cycle_orientation,
+        d_component,
+        face_count,
+        isolate_rows=True,
     )
+    d_depth = nesting.component_depth
     d_bounded = d_bounded_mask != 0
-    d_even_depth = (d_depth & np.int32(1)) == 0
+    d_even_depth = (d_depth[d_component] & np.int32(1)) == 0
     selected_faces = cp.flatnonzero(d_bounded == d_even_depth).astype(
         cp.int32,
         copy=False,
@@ -453,6 +539,7 @@ def build_polygon_output_from_boundary_segments_gpu(
         device_state=OverlayFaceDeviceState(
             face_offsets=d_face_offsets,
             face_edge_ids=d_face_edge_ids,
+            edge_face_ids=d_edge_face_ids,
             bounded_mask=d_bounded_mask,
             signed_area=d_signed_area,
             centroid_x=d_centroid_x,
@@ -467,7 +554,7 @@ def build_polygon_output_from_boundary_segments_gpu(
         selected_faces,
         preserve_row_count=row_count,
         d_valid_empty_rows=d_valid_empty_rows,
-        area_epsilon=0.0,
+        component_nesting=nesting,
     )
     if result is None:
         raise RuntimeError("device boundary graph assembly did not return an owned result")

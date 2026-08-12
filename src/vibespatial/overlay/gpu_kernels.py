@@ -1,7 +1,7 @@
 """NVRTC kernel sources for overlay/gpu.py.
 
 This module holds the CUDA C++ source strings and kernel name tuples for
-the six NVRTC compilation groups used by the GPU overlay pipeline.  All
+the five NVRTC compilation groups used by the GPU overlay pipeline.  All
 Python dispatch logic, CCCL primitive calls, warmup registration, and
 compile_kernel_group wrappers remain in gpu.py.
 """
@@ -9,11 +9,7 @@ compile_kernel_group wrappers remain in gpu.py.
 from __future__ import annotations
 
 from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
-from vibespatial.cuda.device_functions.point_in_ring import (
-    POINT_IN_RING_DEVICE,
-    POINT_IN_RING_KIND_DEVICE,
-)
-from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
+from vibespatial.cuda.device_functions.point_in_ring import POINT_IN_RING_DEVICE
 from vibespatial.cuda.device_functions.segment_crossing import SEGMENT_CROSSING_DEVICE
 from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
 
@@ -23,7 +19,9 @@ from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
 # Kernels: emit_endpoint_split_events, count_pair_split_events,
 #          scatter_pair_split_events, emit_atomic_edges
 
-_OVERLAY_SPLIT_KERNEL_SOURCE = """
+_OVERLAY_SPLIT_KERNEL_SOURCE = (
+    ORIENT2D_DEVICE
+    + r"""
 extern "C" __device__ double abs_f64(double value) {
   return value < 0.0 ? -value : value;
 }
@@ -123,7 +121,7 @@ count_pair_split_events(
   }
   const signed char kind = kinds[row];
   /* Predicated write: branchless count lookup. */
-  out_counts[row] = (kind == 1 || kind == 2) ? 2 : (kind == 3) ? 4 : 0;
+  out_counts[row] = (kind == 1 || kind == 2 || kind == 4) ? 2 : (kind == 3) ? 4 : 0;
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
@@ -154,6 +152,7 @@ scatter_pair_split_events(
     double* __restrict__ out_t,
     double* __restrict__ out_x,
     double* __restrict__ out_y,
+    signed char* __restrict__ out_priority,
     int row_count
 ) {
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -179,7 +178,7 @@ scatter_pair_split_events(
   );
   const int base = pair_offsets[row];
 
-  if (kind == 1 || kind == 2) {
+  if (kind == 1 || kind == 2 || kind == 4) {
     double x = point_x[row];
     double y = point_y[row];
     const double left_t = project_t(x, y, left_x0[left_index], left_y0[left_index], left_x1[left_index], left_y1[left_index]);
@@ -188,10 +187,12 @@ scatter_pair_split_events(
     out_t[base + 0] = left_t;
     out_x[base + 0] = x;
     out_y[base + 0] = y;
+    out_priority[base + 0] = kind == 1 ? 3 : (kind == 2 ? 2 : 1);
     out_source_segment_ids[base + 1] = right_source_id;
     out_t[base + 1] = right_t;
     out_x[base + 1] = x;
     out_y[base + 1] = y;
+    out_priority[base + 1] = kind == 1 ? 3 : (kind == 2 ? 2 : 1);
     return;
   }
 
@@ -209,18 +210,22 @@ scatter_pair_split_events(
     out_t[base + 0] = left_t0;
     out_x[base + 0] = x0;
     out_y[base + 0] = y0;
+    out_priority[base + 0] = 3;
     out_source_segment_ids[base + 1] = left_index;
     out_t[base + 1] = left_t1;
     out_x[base + 1] = x1;
     out_y[base + 1] = y1;
+    out_priority[base + 1] = 3;
     out_source_segment_ids[base + 2] = right_source_id;
     out_t[base + 2] = right_t0;
     out_x[base + 2] = x0;
     out_y[base + 2] = y0;
+    out_priority[base + 2] = 3;
     out_source_segment_ids[base + 3] = right_source_id;
     out_t[base + 3] = right_t1;
     out_x[base + 3] = x1;
     out_y[base + 3] = y1;
+    out_priority[base + 3] = 3;
   }
 }
 
@@ -346,7 +351,89 @@ emit_atomic_edges(
   out_dst_x[base + 1] = src_x;
   out_dst_y[base + 1] = src_y;
 }
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+derive_source_ring_transition_signs(
+    const double* __restrict__ source_x0,
+    const double* __restrict__ source_y0,
+    const double* __restrict__ source_x1,
+    const double* __restrict__ source_y1,
+    const int* __restrict__ ring_starts,
+    const int* __restrict__ ring_ends,
+    const int* __restrict__ ring_local_ids,
+    int* __restrict__ out_transition,
+    int ring_count
+) {
+  const int ring = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ring >= ring_count) return;
+  const int start = ring_starts[ring];
+  const int end = ring_ends[ring];
+  if (end <= start || source_x0[start] != source_x1[end - 1] ||
+      source_y0[start] != source_y1[end - 1]) {
+    for (int segment = start; segment < end; ++segment) {
+      out_transition[segment] = 0;
+    }
+    return;
+  }
+  /* The extreme-vertex turn determines the source ring winding.  Repeated
+     minima and zero-length source segments are legal input artifacts, so a
+     single adjacent triple is not sufficient.  Search distinct predecessor
+     and successor coordinates and choose the lexicographically first exact
+     non-collinear turn. */
+  int representative = -1;
+  int orientation = 0;
+  const int segment_count = end - start;
+  for (int candidate = start; candidate < end; ++candidate) {
+    const double cx = source_x0[candidate];
+    const double cy = source_y0[candidate];
+    int immediate_prior = candidate - 1;
+    if (immediate_prior < start) immediate_prior = end - 1;
+    if (source_x0[immediate_prior] == cx &&
+        source_y0[immediate_prior] == cy) {
+      continue;
+    }
+    int previous = -1;
+    int next = -1;
+    for (int step = 1; step <= segment_count; ++step) {
+      int prior = candidate - step;
+      if (prior < start) prior += segment_count;
+      if (source_x0[prior] != cx || source_y0[prior] != cy) {
+        previous = prior;
+        break;
+      }
+    }
+    for (int step = 0; step < segment_count; ++step) {
+      int following = candidate + step;
+      if (following >= end) following -= segment_count;
+      if (source_x1[following] != cx || source_y1[following] != cy) {
+        next = following;
+        break;
+      }
+    }
+    if (previous < 0 || next < 0) continue;
+    const int candidate_orientation = vs_orient2d(
+        source_x0[previous], source_y0[previous],
+        cx, cy,
+        source_x1[next], source_y1[next]
+    );
+    if (candidate_orientation == 0) continue;
+    if (representative < 0 || cx < source_x0[representative] ||
+        (cx == source_x0[representative] &&
+         (cy < source_y0[representative] ||
+          (cy == source_y0[representative] && candidate < representative)))) {
+      representative = candidate;
+      orientation = candidate_orientation;
+    }
+  }
+  const int role = ring_local_ids[start] == 0 ? 1 : -1;
+  const int transition = orientation > 0 ? role :
+      (orientation < 0 ? -role : 0);
+  for (int segment = start; segment < end; ++segment) {
+    out_transition[segment] = transition;
+  }
+}
 """
+)
 
 _OVERLAY_SPLIT_KERNEL_NAMES = (
     "emit_endpoint_split_events",
@@ -354,15 +441,17 @@ _OVERLAY_SPLIT_KERNEL_NAMES = (
     "scatter_pair_split_events",
     "rank_exact_split_event_merge",
     "emit_atomic_edges",
+    "derive_source_ring_transition_signs",
 )
 
 # ---------------------------------------------------------------------------
 # 2. Half-edge face traversal kernels
 # ---------------------------------------------------------------------------
-# Kernels: compute_face_metrics, compute_face_sample_points
+# Kernels: face metrics, edge-to-face identity, dual propagation, containment
 
 _OVERLAY_FACE_WALK_KERNEL_SOURCE = (
     SPATIAL_TOLERANCE_PREAMBLE
+    + ORIENT2D_DEVICE
     + r"""
 // -------------------------------------------------------------------
 // Phase 1: GPU Face Walk via Pointer Jumping
@@ -393,6 +482,206 @@ mark_endpoint_group_ends(
   out_group_end[pos] = changed ? 1 : 0;
 }
 
+__device__ __forceinline__ int robust_polar_half(double dx, double dy) {
+  return (dy > 0.0 || (dy == 0.0 && dx >= 0.0)) ? 0 : 1;
+}
+
+__device__ __forceinline__ bool robust_polar_less(
+    int left_edge,
+    int right_edge,
+    const double* __restrict__ tangent_x,
+    const double* __restrict__ tangent_y
+) {
+  const double left_dx = tangent_x[left_edge];
+  const double left_dy = tangent_y[left_edge];
+  const double right_dx = tangent_x[right_edge];
+  const double right_dy = tangent_y[right_edge];
+  const int left_half = robust_polar_half(left_dx, left_dy);
+  const int right_half = robust_polar_half(right_dx, right_dy);
+  if (left_half != right_half) return left_half < right_half;
+  const int orientation = vs_orient2d(
+      0.0, 0.0, left_dx, left_dy, right_dx, right_dy
+  );
+  if (orientation != 0) return orientation > 0;
+  return left_edge < right_edge;
+}
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+scatter_node_offsets(
+    const int* __restrict__ group_ends,
+    const int* __restrict__ group_ids,
+    int* __restrict__ node_offsets,
+    int* __restrict__ out_node_count,
+    int edge_count
+) {
+  const int pos = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pos >= edge_count) return;
+  if (pos == 0) node_offsets[0] = 0;
+  if (group_ends[pos] != 0 || pos + 1 == edge_count) {
+    node_offsets[group_ids[pos] + 1] = pos + 1;
+  }
+  if (pos + 1 == edge_count) out_node_count[0] = group_ids[pos] + 1;
+}
+
+__device__ __forceinline__ void enqueue_degree_two_core_node(
+    int node,
+    int* __restrict__ queued,
+    int* __restrict__ queue,
+    int* __restrict__ queue_tail,
+    int* __restrict__ queue_ready,
+    int* __restrict__ pending
+) {
+  if (atomicCAS(queued + node, 0, 1) != 0) return;
+  atomicAdd(pending, 1);
+  const int slot = atomicAdd(queue_tail, 1);
+  queue[slot] = node;
+  __threadfence();
+  atomicExch(queue_ready + slot, 1);
+}
+
+// Seed every exact endpoint whose active degree is below two. Degrees and the
+// queue use endpoint CSR capacity; no host-visible node count is required.
+extern "C" __global__ void __launch_bounds__(256, 4)
+initialize_degree_two_core_frontier(
+    const int* __restrict__ node_offsets,
+    const int* __restrict__ node_count,
+    int* __restrict__ degree,
+    int* __restrict__ queued,
+    int* __restrict__ queue,
+    int* __restrict__ queue_tail,
+    int* __restrict__ queue_ready,
+    int* __restrict__ pending,
+    int node_capacity
+) {
+  const int node = blockIdx.x * blockDim.x + threadIdx.x;
+  if (node >= node_capacity || node >= node_count[0]) return;
+  const int node_degree = node_offsets[node + 1] - node_offsets[node];
+  degree[node] = node_degree;
+  if (node_degree < 2) {
+    enqueue_degree_two_core_node(
+        node, queued, queue, queue_tail, queue_ready, pending);
+  }
+}
+
+// Persistent CAS-protected leaf-chain peel. Each node enters the frontier at
+// most once and each incidence is visited at most once, so total work is O(E).
+// Segment ownership is claimed atomically when both leaf ends race.
+extern "C" __global__ void __launch_bounds__(256, 4)
+peel_degree_two_core_frontier(
+    const int* __restrict__ incidence_edge_ids,
+    const int* __restrict__ node_offsets,
+    const int* __restrict__ src_node_ids,
+    const int* __restrict__ node_count,
+    int* __restrict__ active_segments,
+    int* __restrict__ degree,
+    int* __restrict__ queued,
+    int* __restrict__ queue,
+    int* __restrict__ queue_head,
+    int* __restrict__ queue_tail,
+    int* __restrict__ queue_ready,
+    int* __restrict__ pending,
+    int node_capacity,
+    int segment_count
+) {
+  while (atomicAdd(pending, 0) != 0) {
+    const int head = atomicAdd(queue_head, 0);
+    const int tail = atomicAdd(queue_tail, 0);
+    if (head >= tail || atomicCAS(queue_head, head, head + 1) != head) {
+      __nanosleep(64);
+      continue;
+    }
+    while (atomicAdd(queue_ready + head, 0) == 0) __nanosleep(32);
+    __threadfence();
+    const int node = queue[head];
+    if (node >= 0 && node < node_count[0] && node < node_capacity) {
+      const int start = node_offsets[node];
+      const int end = node_offsets[node + 1];
+      for (int pos = start; pos < end; ++pos) {
+        const int edge = incidence_edge_ids[pos];
+        const int segment = edge >> 1;
+        if (segment < 0 || segment >= segment_count ||
+            atomicCAS(active_segments + segment, 1, 0) != 1) {
+          continue;
+        }
+        atomicSub(degree + node, 1);
+        const int other = src_node_ids[edge ^ 1];
+        const int previous_degree = atomicSub(degree + other, 1);
+        if (previous_degree == 2) {
+          enqueue_degree_two_core_node(
+              other, queued, queue, queue_tail, queue_ready, pending);
+        }
+      }
+    }
+    atomicSub(pending, 1);
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+merge_node_edges_robust_pass(
+    const double* __restrict__ tangent_x,
+    const double* __restrict__ tangent_y,
+    const int* __restrict__ input_edge_ids,
+    int* __restrict__ output_edge_ids,
+    const int* __restrict__ group_ids,
+    const int* __restrict__ node_offsets,
+    int merge_width,
+    int edge_count
+) {
+  const int pos = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pos >= edge_count) return;
+  const int group_id = group_ids[pos];
+  const int node_start = node_offsets[group_id];
+  const int node_end = node_offsets[group_id + 1];
+  const int local = pos - node_start;
+  const int pair_width = merge_width * 2;
+  const int pair_start = node_start + (local / pair_width) * pair_width;
+  const int left_start = pair_start;
+  const int left_end = min(left_start + merge_width, node_end);
+  const int right_start = left_end;
+  const int right_end = min(right_start + merge_width, node_end);
+  if (right_start >= right_end) {
+    output_edge_ids[pos] = input_edge_ids[pos];
+    return;
+  }
+
+  const int left_count = left_end - left_start;
+  const int right_count = right_end - right_start;
+  const int diagonal = pos - pair_start;
+  int low = max(0, diagonal - right_count);
+  int high = min(diagonal, left_count);
+  while (low < high) {
+    const int left_index = (low + high) >> 1;
+    const int right_index = diagonal - left_index;
+    if (
+        left_index < left_count && right_index > 0 &&
+        robust_polar_less(
+            input_edge_ids[left_start + left_index],
+            input_edge_ids[right_start + right_index - 1],
+            tangent_x,
+            tangent_y
+        )
+    ) {
+      low = left_index + 1;
+    } else {
+      high = left_index;
+    }
+  }
+  const int left_index = low;
+  const int right_index = diagonal - left_index;
+  const bool take_left =
+      left_index < left_count &&
+      (right_index >= right_count ||
+       robust_polar_less(
+           input_edge_ids[left_start + left_index],
+           input_edge_ids[right_start + right_index],
+           tangent_x,
+           tangent_y
+       ));
+  output_edge_ids[pos] = take_left
+      ? input_edge_ids[left_start + left_index]
+      : input_edge_ids[right_start + right_index];
+}
+
 extern "C" __global__ void __launch_bounds__(256, 4)
 build_radial_successors(
     const int* __restrict__ src_node_ids,
@@ -421,41 +710,7 @@ build_radial_successors(
   out_next_edge_ids[edge ^ 1] = sorted_edge_ids[predecessor_pos];
 }
 
-static __device__ __forceinline__ bool
-vs_face_contains_point(
-    double px,
-    double py,
-    const double* __restrict__ src_x,
-    const double* __restrict__ src_y,
-    const int* __restrict__ next_edge_ids,
-    const int* __restrict__ face_edge_ids,
-    int start,
-    int end,
-    int total_edge_count
-) {
-  bool inside = false;
-  for (int k = start; k < end; ++k) {
-    const int eid = face_edge_ids[k];
-    if (eid < 0 || eid >= total_edge_count) continue;
-    const int next_eid = (int)next_edge_ids[eid];
-    if (next_eid < 0 || next_eid >= total_edge_count) continue;
-    const double x0 = src_x[eid];
-    const double y0 = src_y[eid];
-    const double x1 = src_x[next_eid];
-    const double y1 = src_y[next_eid];
-    const bool crosses = (y1 > py) != (y0 > py);
-    if (crosses) {
-      const double denom = y0 - y1;
-      if (denom != 0.0) {
-        const double x_intersection = ((x0 - x1) * (py - y1) / denom) + x1;
-        if (px < x_intersection) inside = !inside;
-      }
-    }
-  }
-  return inside;
-}
-
-// Compute per-face area and centroid in one pass over the face edge span.
+ // Compute per-face area and centroid in one pass over the face edge span.
 // Each block handles one face; threads cooperatively walk the sorted edge ids
 // for that face and reduce. Coordinates are translated to the first vertex so
 // positive-area slivers retain their sign independently of world-coordinate
@@ -554,188 +809,553 @@ compute_face_metrics(
   }
 }
 
-// One thread per face: compute a sample point by walking the face edges.
-// face_starts[f] and face_ends[f] give the range into sorted_edge_ids
-// (edges sorted by face_id). The sample point is the perpendicular-offset
-// midpoint of the first non-degenerate edge.
 extern "C" __global__ void __launch_bounds__(256, 4)
-compute_face_sample_points(
-    const double* __restrict__ src_x,
-    const double* __restrict__ src_y,
-    const int* __restrict__ next_edge_ids,
-    const int* __restrict__ face_starts,
-    const int* __restrict__ face_edge_ids,
-    const double* __restrict__ signed_area,
-    const double* __restrict__ centroid_x,
-    const double* __restrict__ centroid_y,
-    double* __restrict__ out_label_x,
-    double* __restrict__ out_label_y,
-    signed char* __restrict__ out_bounded,
-    double area_epsilon,
-    int face_count,
-    int total_edge_count
-) {
-  const int f = blockIdx.x * blockDim.x + threadIdx.x;
-  if (f >= face_count) return;
-
-  const double area = signed_area[f];
-  if (fabs(area) <= area_epsilon) {
-    out_bounded[f] = 0;
-    out_label_x[f] = 0.0;
-    out_label_y[f] = 0.0;
-    return;
-  }
-  out_bounded[f] = area > area_epsilon ? 1 : 0;
-
-  const int start = face_starts[f];
-  const int end = face_starts[f + 1];
-  const int n_edges = end - start;
-
-  // A cycle centroid is not a valid face label when the cycle contains a
-  // nested hole contour. Walk directed edges and probe locally inward instead.
-  double best_lx = src_x[face_edge_ids[start]];
-  double best_ly = src_y[face_edge_ids[start]];
-  double extent_min_x = best_lx, extent_max_x = best_lx;
-  double extent_min_y = best_ly, extent_max_y = best_ly;
-
-  for (int k = 0; k < n_edges; k++) {
-    const int eid = face_edge_ids[start + k];
-    double ex = src_x[eid];
-    double ey = src_y[eid];
-    if (ex < extent_min_x) extent_min_x = ex;
-    if (ex > extent_max_x) extent_max_x = ex;
-    if (ey < extent_min_y) extent_min_y = ey;
-    if (ey > extent_max_y) extent_max_y = ey;
-  }
-
-  double extent = extent_max_x - extent_min_x;
-  double ey_range = extent_max_y - extent_min_y;
-  if (ey_range > extent) extent = ey_range;
-  if (extent <= 0.0) {
-    out_label_x[f] = best_lx;
-    out_label_y[f] = best_ly;
-    return;
-  }
-  // Bound the first probe by both face extent and area-per-edge. Unlike the
-  // old one-unit floor, this remains inside the scale of narrow real faces.
-  const double area_step = fabs(area) / (extent * (double)n_edges);
-  const double epsilon = fmin(extent * 1e-6, area_step * 0.5);
-
-  for (int k = 0; k < n_edges; k++) {
-    const int eid = face_edge_ids[start + k];
-    const int next_eid = (int)next_edge_ids[eid];
-    // Bounds check: prevent ILLEGAL_ADDRESS from corrupted topology.
-    if (next_eid < 0 || next_eid >= total_edge_count) continue;
-    const double x0 = src_x[eid];
-    const double y0 = src_y[eid];
-    const double x1 = src_x[next_eid];
-    const double y1 = src_y[next_eid];
-    const double dx = x1 - x0;
-    const double dy = y1 - y0;
-    const double length = sqrt(dx * dx + dy * dy);
-    if (length <= 0.0) continue;
-    double trial = epsilon;
-    for (int attempt = 0; attempt < 16; ++attempt) {
-      const double midpoint_x = x0 + (x1 - x0) * 0.5;
-      const double midpoint_y = y0 + (y1 - y0) * 0.5;
-      const double normal_x = -dy / length;
-      const double normal_y = dx / length;
-      double candidate_x = midpoint_x + normal_x * trial;
-      double candidate_y = midpoint_y + normal_y * trial;
-      if (normal_x != 0.0 && candidate_x == midpoint_x) {
-        candidate_x = nextafter(
-            midpoint_x,
-            normal_x > 0.0 ? 1.7976931348623157e308 : -1.7976931348623157e308
-        );
-      }
-      if (normal_y != 0.0 && candidate_y == midpoint_y) {
-        candidate_y = nextafter(
-            midpoint_y,
-            normal_y > 0.0 ? 1.7976931348623157e308 : -1.7976931348623157e308
-        );
-      }
-      best_lx = candidate_x;
-      best_ly = candidate_y;
-      const int cycle_contains = vs_face_contains_point(
-          candidate_x, candidate_y, src_x, src_y, next_edge_ids,
-          face_edge_ids, start, end, total_edge_count);
-      if ((area > 0.0 && cycle_contains) || (area < 0.0 && !cycle_contains)) {
-        out_label_x[f] = candidate_x;
-        out_label_y[f] = candidate_y;
-        return;
-      }
-      trial *= 0.25;
-    }
-  }
-
-  out_label_x[f] = best_lx;
-  out_label_y[f] = best_ly;
-}
-
-// Classify nesting in a disconnected boundary-contour relation. One block
-// owns one face side. Threads first tag every bounded contour with its face id,
-// then cooperatively test both face sides against other same-row bounded
-// contours. A bounded side is selected at even ancestor depth; an unbounded
-// side is selected at odd containment depth. Selecting both sides by parity is
-// what exposes hole contours to the canonical selected-boundary walk.
-extern "C" __global__ void __launch_bounds__(256, 4)
-count_boundary_face_nesting_depth(
+scatter_edge_face_ids(
     const int* __restrict__ face_offsets,
     const int* __restrict__ face_edge_ids,
-    const signed char* __restrict__ bounded_mask,
-    const double* __restrict__ label_x,
-    const double* __restrict__ label_y,
+    int* __restrict__ out_edge_face_ids,
+    int face_count
+) {
+  const int face = blockIdx.x;
+  if (face >= face_count) return;
+  for (int pos = face_offsets[face] + threadIdx.x;
+       pos < face_offsets[face + 1]; pos += blockDim.x) {
+    out_edge_face_ids[face_edge_ids[pos]] = face;
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+scatter_previous_edge_ids(
+    const int* __restrict__ next_edge_ids,
+    int* __restrict__ out_previous_edge_ids,
+    int edge_count
+) {
+  const int edge = blockIdx.x * blockDim.x + threadIdx.x;
+  if (edge >= edge_count) return;
+  const int next = next_edge_ids[edge];
+  if (next >= 0 && next < edge_count) out_previous_edge_ids[next] = edge;
+}
+
+// Topological cycle orientation is an exact adaptive-predicate carrier, not a
+// sign extracted from the fp64 shoelace metric.  Each block classifies the
+// lexicographic extreme of one face cycle; a retraced extreme spike is the
+// exact unbounded-face signature for weak cycles with attached linework.
+extern "C" __global__ void __launch_bounds__(256, 4)
+compute_face_exact_orientation(
+    const int* __restrict__ face_offsets,
+    const int* __restrict__ face_edge_ids,
+    const int* __restrict__ previous_edge_ids,
+    const int* __restrict__ next_edge_ids,
     const double* __restrict__ src_x,
     const double* __restrict__ src_y,
-    const int* __restrict__ next_edge_ids,
-    const int* __restrict__ source_rows,
-    int* __restrict__ source_ring_ids,
-    int* __restrict__ out_depth,
-    int isolate_rows,
+    signed char* __restrict__ out_orientation,
     int face_count,
-    int total_edge_count
+    int edge_count
 ) {
   const int face = blockIdx.x;
   const int tid = threadIdx.x;
   if (face >= face_count) return;
+  __shared__ double sh_x[256];
+  __shared__ double sh_y[256];
+  __shared__ int sh_edge[256];
+  __shared__ int sh_orientation[256];
+  __shared__ int sh_rank[256];
+  __shared__ int sh_valid[256];
 
+  int local_edge = -1;
+  int local_orientation = 0;
+  int local_rank = 3;
+  double local_x = 0.0;
+  double local_y = 0.0;
+  for (int pos = face_offsets[face] + tid;
+       pos < face_offsets[face + 1]; pos += blockDim.x) {
+    const int edge = face_edge_ids[pos];
+    if (edge < 0 || edge >= edge_count) continue;
+    const int previous = previous_edge_ids[edge];
+    const int next = next_edge_ids[edge];
+    if (previous < 0 || previous >= edge_count ||
+        next < 0 || next >= edge_count) continue;
+    const int orientation = vs_orient2d(
+        src_x[previous], src_y[previous],
+        src_x[edge], src_y[edge],
+        src_x[next], src_y[next]
+    );
+    // At the lexicographic extreme, a retraced collinear spike is itself an
+    // exact unbounded-face signature.  Prefer a clockwise turn, then a
+    // counter-clockwise turn, and use the spike only when no turn exists at
+    // that same extreme coordinate.
+    const int orientation_rank = orientation < 0 ? 0 : (orientation > 0 ? 1 : 2);
+    const double x = src_x[edge];
+    const double y = src_y[edge];
+    if (local_edge < 0 || x < local_x ||
+        (x == local_x && (y < local_y ||
+         (y == local_y &&
+          (orientation_rank < local_rank ||
+           (orientation_rank == local_rank && edge < local_edge)))))) {
+      local_edge = edge;
+      local_orientation = orientation;
+      local_rank = orientation_rank;
+      local_x = x;
+      local_y = y;
+    }
+  }
+  sh_x[tid] = local_x;
+  sh_y[tid] = local_y;
+  sh_edge[tid] = local_edge;
+  sh_orientation[tid] = local_orientation;
+  sh_rank[tid] = local_rank;
+  sh_valid[tid] = local_edge >= 0;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride && sh_valid[tid + stride]) {
+      const bool take = !sh_valid[tid] || sh_x[tid + stride] < sh_x[tid] ||
+          (sh_x[tid + stride] == sh_x[tid] &&
+           (sh_y[tid + stride] < sh_y[tid] ||
+            (sh_y[tid + stride] == sh_y[tid] &&
+             (sh_rank[tid + stride] < sh_rank[tid] ||
+              (sh_rank[tid + stride] == sh_rank[tid] &&
+               sh_edge[tid + stride] < sh_edge[tid])))));
+      if (take) {
+        sh_x[tid] = sh_x[tid + stride];
+        sh_y[tid] = sh_y[tid + stride];
+        sh_edge[tid] = sh_edge[tid + stride];
+        sh_orientation[tid] = sh_orientation[tid + stride];
+        sh_rank[tid] = sh_rank[tid + stride];
+        sh_valid[tid] = 1;
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    out_orientation[face] = sh_valid[0]
+        ? (signed char)(sh_orientation[0] > 0 ? 1 : -1)
+        : (signed char)0;
+  }
+}
+
+// Exact fp64 bounds for each cycle. One thread walks one CSR span, so total
+// work is linear in the number of half-edges and bounds are computed once.
+extern "C" __global__ void __launch_bounds__(256, 4)
+compute_face_bounds(
+    const int* __restrict__ face_offsets,
+    const int* __restrict__ face_edge_ids,
+    const double* __restrict__ src_x,
+    const double* __restrict__ src_y,
+    double* __restrict__ out_bounds,
+    int face_count
+) {
+  const int face = blockIdx.x * blockDim.x + threadIdx.x;
+  if (face >= face_count) return;
   const int start = face_offsets[face];
   const int end = face_offsets[face + 1];
-  if (bounded_mask[face] != 0) {
-    for (int pos = start + tid; pos < end; pos += blockDim.x) {
-      source_ring_ids[face_edge_ids[pos]] = face + 1;
-    }
+  const int first_edge = face_edge_ids[start];
+  double min_x = src_x[first_edge];
+  double min_y = src_y[first_edge];
+  double max_x = min_x;
+  double max_y = min_y;
+  for (int pos = start + 1; pos < end; ++pos) {
+    const int edge = face_edge_ids[pos];
+    min_x = fmin(min_x, src_x[edge]);
+    min_y = fmin(min_y, src_y[edge]);
+    max_x = fmax(max_x, src_x[edge]);
+    max_y = fmax(max_y, src_y[edge]);
   }
+  out_bounds[face * 4] = min_x;
+  out_bounds[face * 4 + 1] = min_y;
+  out_bounds[face * 4 + 2] = max_x;
+  out_bounds[face * 4 + 3] = max_y;
+}
 
-  __shared__ int sh_depth[256];
-  int local_depth = 0;
-  if (start < end) {
-    const int target_row = source_rows[face_edge_ids[start]];
-    const double px = label_x[face];
-    const double py = label_y[face];
-    for (int container = tid; container < face_count; container += blockDim.x) {
-      if (container == face || bounded_mask[container] == 0) continue;
-      const int container_start = face_offsets[container];
-      const int container_end = face_offsets[container + 1];
-      if (container_start >= container_end) continue;
-      if (isolate_rows != 0
-          && source_rows[face_edge_ids[container_start]] != target_row) {
-        continue;
-      }
-      if (vs_face_contains_point(
-          px, py, src_x, src_y, next_edge_ids, face_edge_ids,
-          container_start, container_end, total_edge_count)) {
-        local_depth += 1;
+extern "C" __global__ void __launch_bounds__(256, 4)
+initialize_dual_face_queue(
+    const signed char* __restrict__ cycle_orientation,
+    const int* __restrict__ face_offsets,
+    const int* __restrict__ face_edge_ids,
+    int* __restrict__ queue,
+    int* __restrict__ queue_tail,
+    int* __restrict__ queue_ready,
+    int* __restrict__ pending,
+    int* __restrict__ left_winding,
+    int* __restrict__ right_winding,
+    int* __restrict__ face_component,
+    int face_count
+) {
+  const int face = blockIdx.x * blockDim.x + threadIdx.x;
+  if (face >= face_count) return;
+  if (cycle_orientation[face] < 0) {
+    left_winding[face] = 0;
+    right_winding[face] = 0;
+    face_component[face] = face;
+    const int start = face_offsets[face];
+    const int degree = face_offsets[face + 1] - start;
+    if (degree > 0) {
+      atomicAdd(pending, degree);
+      const int queue_start = atomicAdd(queue_tail, degree);
+      for (int local = 0; local < degree; ++local) {
+        queue[queue_start + local] = face_edge_ids[start + local];
+        queue_ready[queue_start + local] = 1;
       }
     }
   }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+propagate_dual_face_queue(
+    const int* __restrict__ face_offsets,
+    const int* __restrict__ face_edge_ids,
+    const int* __restrict__ edge_face_ids,
+    const int* __restrict__ left_delta,
+    const int* __restrict__ right_delta,
+    int* __restrict__ queue,
+    int* __restrict__ queue_head,
+    int* __restrict__ queue_tail,
+    int* __restrict__ queue_ready,
+    int* __restrict__ pending,
+    int* __restrict__ left_winding,
+    int* __restrict__ right_winding,
+    int* __restrict__ face_component,
+    int face_count,
+    int edge_count
+) {
+  // Every face is claimed at most once and contributes each incidence once,
+  // so queue capacity is exactly edge_count.  ``pending`` counts published or
+  // actively processed incidences;
+  // it can reach zero only after the last producer has finished enqueueing.
+  while (atomicAdd(pending, 0) != 0) {
+    const int head = atomicAdd(queue_head, 0);
+    const int tail = atomicAdd(queue_tail, 0);
+    if (head >= tail || atomicCAS(queue_head, head, head + 1) != head) {
+      __nanosleep(64);
+      continue;
+    }
+    while (atomicAdd(queue_ready + head, 0) == 0) __nanosleep(32);
+    __threadfence();
+    const int edge = queue[head];
+    if (edge < 0 || edge >= edge_count) {
+      atomicSub(pending, 1);
+      continue;
+    }
+    const int face = edge_face_ids[edge];
+    if (face < 0 || face >= face_count) {
+      atomicSub(pending, 1);
+      continue;
+    }
+    const int current_left = left_winding[face];
+    const int current_right = right_winding[face];
+    const int component = face_component[face];
+    const int neighbor = edge_face_ids[edge ^ 1];
+    if (neighbor >= 0 && neighbor < face_count) {
+      const int candidate_left = current_left - left_delta[edge];
+      const int candidate_right = current_right - right_delta[edge];
+      if (atomicCAS(left_winding + neighbor, (-2147483647 - 1), candidate_left)
+              == (-2147483647 - 1)) {
+        right_winding[neighbor] = candidate_right;
+        face_component[neighbor] = component;
+        const int neighbor_start = face_offsets[neighbor];
+        const int degree = face_offsets[neighbor + 1] - neighbor_start;
+        if (degree > 0) {
+          atomicAdd(pending, degree);
+          const int queue_start = atomicAdd(queue_tail, degree);
+          for (int local = 0; local < degree; ++local) {
+            const int slot = queue_start + local;
+            if (slot < edge_count) {
+              queue[slot] = face_edge_ids[neighbor_start + local];
+            }
+          }
+          __threadfence();
+          for (int local = 0; local < degree; ++local) {
+            const int slot = queue_start + local;
+            if (slot < edge_count) atomicExch(queue_ready + slot, 1);
+          }
+        }
+      }
+    }
+    atomicSub(pending, 1);
+  }
+}
+
+__device__ __forceinline__ bool exact_cycle_contains_vertex(
+    double px, double py,
+    const double* __restrict__ src_x,
+    const double* __restrict__ src_y,
+    const int* __restrict__ face_edge_ids,
+    int start, int end
+) {
+  bool inside = false;
+  for (int pos = start; pos < end; ++pos) {
+    const int edge = face_edge_ids[pos];
+    const int twin = edge ^ 1;
+    const double ax = src_x[edge];
+    const double ay = src_y[edge];
+    const double bx = src_x[twin];
+    const double by = src_y[twin];
+    if ((ay <= py && py < by && vs_orient2d(ax, ay, bx, by, px, py) > 0) ||
+        (by <= py && py < ay && vs_orient2d(ax, ay, bx, by, px, py) < 0)) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+__device__ __forceinline__ int face_bounds_prefix_upper_bound(
+    double px,
+    const int* __restrict__ candidate_faces,
+    const double* __restrict__ face_bounds,
+    int candidate_capacity
+) {
+  int lo = 0;
+  int hi = candidate_capacity;
+  while (lo < hi) {
+    const int mid = lo + ((hi - lo) >> 1);
+    const int candidate = candidate_faces[mid];
+    if (candidate >= 0 && face_bounds[candidate * 4] <= px) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+__device__ __forceinline__ bool indexed_containment_bounds_match(
+    int root_face,
+    int candidate_face,
+    double px,
+    double py,
+    const int* __restrict__ face_offsets,
+    const int* __restrict__ face_edge_ids,
+    const double* __restrict__ face_bounds,
+    const int* __restrict__ source_rows,
+    const int* __restrict__ face_component,
+    int isolate_rows
+) {
+  if (face_component[root_face] < 0 || face_component[candidate_face] < 0 ||
+      face_component[root_face] == face_component[candidate_face]) return false;
+  const int root_edge = face_edge_ids[face_offsets[root_face]];
+  const int candidate_edge = face_edge_ids[face_offsets[candidate_face]];
+  if (isolate_rows != 0 && source_rows[root_edge] != source_rows[candidate_edge]) {
+    return false;
+  }
+  return px >= face_bounds[candidate_face * 4] &&
+      px <= face_bounds[candidate_face * 4 + 2] &&
+      py >= face_bounds[candidate_face * 4 + 1] &&
+      py <= face_bounds[candidate_face * 4 + 3];
+}
+
+// Fixed-capacity indexed reduction for disconnected component containment.
+// One block owns one face-capacity root lane.  Inactive lanes return uniformly;
+// active negative roots split the max-X tree at depth eight so all 256 threads
+// traverse disjoint subtrees.  Index nodes are therefore visited once per root,
+// while exact orient2d PIP runs only for actual bbox candidates.
+extern "C" __global__ void __launch_bounds__(256, 2)
+reduce_indexed_component_containment(
+    const int* __restrict__ root_faces,
+    const int* __restrict__ candidate_faces,
+    const double* __restrict__ interval_max_x,
+    const int* __restrict__ face_offsets,
+    const int* __restrict__ face_edge_ids,
+    const double* __restrict__ face_bounds,
+    const double* __restrict__ src_x,
+    const double* __restrict__ src_y,
+    const int* __restrict__ source_rows,
+    const int* __restrict__ face_component,
+    const int* __restrict__ left_winding,
+    const int* __restrict__ right_winding,
+    int* __restrict__ out_left_baseline,
+    int* __restrict__ out_right_baseline,
+    int* __restrict__ out_depth,
+    int face_capacity,
+    int leaf_count,
+    int isolate_rows,
+    int reduce_winding
+) {
+  const int root_pos = blockIdx.x;
+  if (root_pos >= face_capacity) return;
+  const int root_face = root_faces[root_pos];
+  if (root_face < 0) return;
+  const int tid = threadIdx.x;
+  __shared__ int sh_upper;
+  __shared__ int sh_left[256];
+  __shared__ int sh_right[256];
+  __shared__ int sh_depth[256];
+  const int root_edge = face_edge_ids[face_offsets[root_face]];
+  const double px = src_x[root_edge];
+  const double py = src_y[root_edge];
+  if (tid == 0) {
+    sh_upper = face_bounds_prefix_upper_bound(
+        px, candidate_faces, face_bounds, face_capacity);
+  }
+  __syncthreads();
+
+  const int tree_depth = 31 - __clz(leaf_count);
+  const int split_depth = tree_depth < 8 ? tree_depth : 8;
+  const int split_width = 1 << split_depth;
+  int stack[24];
+  int stack_size = 0;
+  if (tid < split_width) stack[stack_size++] = split_width + tid;
+  int local_left = 0;
+  int local_right = 0;
+  int local_depth = 0;
+  while (stack_size > 0) {
+    const int node = stack[--stack_size];
+    const int depth = 31 - __clz(node);
+    const int level_start = 1 << depth;
+    const int span = leaf_count >> depth;
+    const int left = (node - level_start) * span;
+    if (left >= sh_upper || interval_max_x[node] < px) continue;
+    if (node >= leaf_count) {
+      const int candidate_pos = node - leaf_count;
+      if (candidate_pos < sh_upper && candidate_pos < face_capacity) {
+        const int candidate = candidate_faces[candidate_pos];
+        if (candidate >= 0 && indexed_containment_bounds_match(
+                root_face, candidate, px, py, face_offsets, face_edge_ids,
+                face_bounds, source_rows, face_component, isolate_rows) &&
+            exact_cycle_contains_vertex(
+                px, py, src_x, src_y, face_edge_ids,
+                face_offsets[candidate], face_offsets[candidate + 1])) {
+          ++local_depth;
+          if (reduce_winding != 0) {
+            local_left += left_winding[candidate];
+            local_right += right_winding[candidate];
+          }
+        }
+      }
+      continue;
+    }
+    stack[stack_size++] = node * 2 + 1;
+    stack[stack_size++] = node * 2;
+  }
+  sh_left[tid] = local_left;
+  sh_right[tid] = local_right;
   sh_depth[tid] = local_depth;
   __syncthreads();
   for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (tid < stride) sh_depth[tid] += sh_depth[tid + stride];
+    if (tid < stride) {
+      sh_left[tid] += sh_left[tid + stride];
+      sh_right[tid] += sh_right[tid + stride];
+      sh_depth[tid] += sh_depth[tid + stride];
+    }
     __syncthreads();
   }
-  if (tid == 0) out_depth[face] = sh_depth[0];
+  if (tid == 0) {
+    out_left_baseline[root_face] = sh_left[0];
+    out_right_baseline[root_face] = sh_right[0];
+    out_depth[root_face] = sh_depth[0];
+  }
+}
+
+// A second indexed pass selects the structurally immediate containing face.
+// Component depth, not fp64 area ordering, defines parenthood.
+extern "C" __global__ void __launch_bounds__(256, 2)
+select_indexed_component_containment_parent(
+    const int* __restrict__ root_faces,
+    const int* __restrict__ candidate_faces,
+    const double* __restrict__ interval_max_x,
+    const int* __restrict__ face_offsets,
+    const int* __restrict__ face_edge_ids,
+    const double* __restrict__ face_bounds,
+    const double* __restrict__ src_x,
+    const double* __restrict__ src_y,
+    const int* __restrict__ source_rows,
+    const int* __restrict__ face_component,
+    const int* __restrict__ component_depth,
+    int* __restrict__ out_parent,
+    int face_capacity,
+    int leaf_count,
+    int isolate_rows
+) {
+  const int root_pos = blockIdx.x;
+  if (root_pos >= face_capacity) return;
+  const int root_face = root_faces[root_pos];
+  if (root_face < 0 || component_depth[root_face] <= 0) return;
+  const int tid = threadIdx.x;
+  __shared__ int sh_upper;
+  __shared__ int sh_parent[256];
+  const int root_edge = face_edge_ids[face_offsets[root_face]];
+  const double px = src_x[root_edge];
+  const double py = src_y[root_edge];
+  if (tid == 0) {
+    sh_upper = face_bounds_prefix_upper_bound(
+        px, candidate_faces, face_bounds, face_capacity);
+  }
+  __syncthreads();
+
+  const int tree_depth = 31 - __clz(leaf_count);
+  const int split_depth = tree_depth < 8 ? tree_depth : 8;
+  const int split_width = 1 << split_depth;
+  int stack[24];
+  int stack_size = 0;
+  if (tid < split_width) stack[stack_size++] = split_width + tid;
+  int local_parent = -1;
+  const int target_depth = component_depth[root_face] - 1;
+  while (stack_size > 0) {
+    const int node = stack[--stack_size];
+    const int depth = 31 - __clz(node);
+    const int level_start = 1 << depth;
+    const int span = leaf_count >> depth;
+    const int left = (node - level_start) * span;
+    if (left >= sh_upper || interval_max_x[node] < px) continue;
+    if (node >= leaf_count) {
+      const int candidate_pos = node - leaf_count;
+      if (candidate_pos < sh_upper && candidate_pos < face_capacity) {
+        const int candidate = candidate_faces[candidate_pos];
+        const int candidate_component = candidate >= 0
+            ? face_component[candidate] : -1;
+        if (candidate_component >= 0 &&
+            component_depth[candidate_component] == target_depth &&
+            indexed_containment_bounds_match(
+                root_face, candidate, px, py, face_offsets, face_edge_ids,
+                face_bounds, source_rows, face_component, isolate_rows) &&
+            exact_cycle_contains_vertex(
+                px, py, src_x, src_y, face_edge_ids,
+                face_offsets[candidate], face_offsets[candidate + 1]) &&
+            (local_parent < 0 || candidate < local_parent)) {
+          local_parent = candidate;
+        }
+      }
+      continue;
+    }
+    stack[stack_size++] = node * 2 + 1;
+    stack[stack_size++] = node * 2;
+  }
+  sh_parent[tid] = local_parent;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      const int other_parent = sh_parent[tid + stride];
+      if (other_parent >= 0 &&
+          (sh_parent[tid] < 0 || other_parent < sh_parent[tid])) {
+        sh_parent[tid] = other_parent;
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) out_parent[root_face] = sh_parent[0];
+}
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+finalize_face_coverage(
+    const int* __restrict__ face_component,
+    const int* __restrict__ left_baseline,
+    const int* __restrict__ right_baseline,
+    int* __restrict__ left_winding,
+    int* __restrict__ right_winding,
+    signed char* __restrict__ left_covered,
+    signed char* __restrict__ right_covered,
+    int face_count
+) {
+  const int face = blockIdx.x * blockDim.x + threadIdx.x;
+  if (face >= face_count) return;
+  const int component = face_component[face];
+  if (component < 0 || component >= face_count) {
+    left_covered[face] = 0;
+    right_covered[face] = 0;
+    return;
+  }
+  left_winding[face] += left_baseline[component];
+  right_winding[face] += right_baseline[component];
+  left_covered[face] = left_winding[face] != 0 ? 1 : 0;
+  right_covered[face] = right_winding[face] != 0 ? 1 : 0;
 }
 
 """
@@ -743,1225 +1363,53 @@ count_boundary_face_nesting_depth(
 
 _OVERLAY_FACE_WALK_KERNEL_NAMES = (
     "mark_endpoint_group_ends",
+    "scatter_node_offsets",
+    "initialize_degree_two_core_frontier",
+    "peel_degree_two_core_frontier",
+    "merge_node_edges_robust_pass",
     "build_radial_successors",
     "compute_face_metrics",
-    "compute_face_sample_points",
-    "count_boundary_face_nesting_depth",
-)
-
-# ---------------------------------------------------------------------------
-# 3. Face coverage labeling kernels
-# ---------------------------------------------------------------------------
-# Kernels: label_face_coverage_polygon, label_face_coverage_multipolygon
-
-_OVERLAY_FACE_LABEL_KERNEL_SOURCE = (
-    POINT_ON_SEGMENT_DEVICE
-    + ORIENT2D_DEVICE
-    + POINT_IN_RING_KIND_DEVICE
-    + r"""
-// -------------------------------------------------------------------
-// Phase 2: GPU Face Labeling via Batch Point-in-Polygon
-// -------------------------------------------------------------------
-#define OVERLAY_BOUNDARY_TOLERANCE 0.0
-
-__device__ __forceinline__ bool vs_ring_contains_point_with_boundary(
-    double px,
-    double py,
-    const double* __restrict__ x,
-    const double* __restrict__ y,
-    int start,
-    int end,
-    double tolerance,
-    bool* on_boundary
-) {
-  (void)tolerance;
-  const unsigned char kind = vs_ring_point_classify(
-      px, py, x, y, start, end, 0.0);
-  *on_boundary = kind == (unsigned char)1;
-  return kind != (unsigned char)0;
-}
-
-__device__ __forceinline__ int overlay_lower_bound_i32(
-    const int* values,
-    int count,
-    int target
-) {
-  int first = 0;
-  while (first < count) {
-    const int step = (count - first) >> 1;
-    const int probe = first + step;
-    if (values[probe] < target) first = probe + 1;
-    else count = probe;
-  }
-  return first;
-}
-
-__device__ __forceinline__ int overlay_upper_bound_i32(
-    const int* values,
-    int count,
-    int target
-) {
-  int first = 0;
-  while (first < count) {
-    const int step = (count - first) >> 1;
-    const int probe = first + step;
-    if (values[probe] <= target) first = probe + 1;
-    else count = probe;
-  }
-  return first;
-}
-
-__device__ __forceinline__ bool overlay_block_polygon_contains_point(
-    double px,
-    double py,
-    const double* __restrict__ polygon_x,
-    const double* __restrict__ polygon_y,
-    const int* __restrict__ polygon_geometry_offsets,
-    const int* __restrict__ polygon_ring_offsets,
-    const double* __restrict__ polygon_ring_bounds,
-    int polygon,
-    int* warp_crossings,
-    int* warp_boundary
-) {
-  __shared__ int polygon_crossings;
-  __shared__ int polygon_boundary;
-  if (threadIdx.x == 0) {
-    polygon_crossings = 0;
-    polygon_boundary = 0;
-  }
-  __syncthreads();
-
-  const int ring_start = polygon_geometry_offsets[polygon];
-  const int ring_end = polygon_geometry_offsets[polygon + 1];
-  for (int ring = ring_start; ring < ring_end; ++ring) {
-    if (polygon_ring_bounds != nullptr) {
-      const int base = ring * 4;
-      if (
-          px < polygon_ring_bounds[base + 0] - OVERLAY_BOUNDARY_TOLERANCE ||
-          px > polygon_ring_bounds[base + 2] + OVERLAY_BOUNDARY_TOLERANCE ||
-          py < polygon_ring_bounds[base + 1] - OVERLAY_BOUNDARY_TOLERANCE ||
-          py > polygon_ring_bounds[base + 3] + OVERLAY_BOUNDARY_TOLERANCE
-      ) {
-        continue;
-      }
-    }
-    const int coord_start = polygon_ring_offsets[ring];
-    const int coord_end = polygon_ring_offsets[ring + 1];
-    const int edge_count = coord_end - coord_start - 1;
-    int local_crossings = 0;
-    int local_boundary = 0;
-    for (int edge = (int)threadIdx.x; edge < edge_count; edge += (int)blockDim.x) {
-      const int coord = coord_start + edge;
-      const double ax = polygon_x[coord];
-      const double ay = polygon_y[coord];
-      const double bx = polygon_x[coord + 1];
-      const double by = polygon_y[coord + 1];
-      const bool crosses_scanline = (ay > py) != (by > py);
-      const bool boundary_candidate =
-          py >= fmin(ay, by) && py <= fmax(ay, by) &&
-          px >= fmin(ax, bx) && px <= fmax(ax, bx);
-      if (boundary_candidate && vs_orient2d(ax, ay, bx, by, px, py) == 0) {
-        local_boundary = 1;
-      }
-      if (crosses_scanline) {
-        if (px < (bx - ax) * (py - ay) / (by - ay) + ax) {
-          local_crossings ^= 1;
-        }
-      }
-    }
-
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      local_crossings ^= __shfl_xor_sync(0xFFFFFFFFu, local_crossings, offset);
-      local_boundary |= __shfl_xor_sync(0xFFFFFFFFu, local_boundary, offset);
-    }
-    const int lane = (int)threadIdx.x & 31;
-    const int warp = (int)threadIdx.x >> 5;
-    if (lane == 0) {
-      warp_crossings[warp] = local_crossings;
-      warp_boundary[warp] = local_boundary;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      int ring_crossings = 0;
-      int ring_boundary = 0;
-      const int warp_count = ((int)blockDim.x + 31) >> 5;
-      for (int index = 0; index < warp_count; ++index) {
-        ring_crossings ^= warp_crossings[index];
-        ring_boundary |= warp_boundary[index];
-      }
-      polygon_crossings ^= ring_crossings;
-      polygon_boundary |= ring_boundary;
-    }
-    __syncthreads();
-  }
-  return polygon_boundary != 0 || polygon_crossings != 0;
-}
-
-__device__ __forceinline__ int overlay_block_ring_point_relation(
-    double px,
-    double py,
-    const double* __restrict__ polygon_x,
-    const double* __restrict__ polygon_y,
-    const int* __restrict__ polygon_ring_offsets,
-    int ring,
-    int* warp_crossings,
-    int* warp_boundary
-) {
-  const int coord_start = polygon_ring_offsets[ring];
-  const int coord_end = polygon_ring_offsets[ring + 1];
-  const int edge_count = coord_end - coord_start - 1;
-  int local_crossings = 0;
-  int local_boundary = 0;
-  for (int edge = (int)threadIdx.x; edge < edge_count;
-       edge += (int)blockDim.x) {
-    const int coord = coord_start + edge;
-    const double ax = polygon_x[coord];
-    const double ay = polygon_y[coord];
-    const double bx = polygon_x[coord + 1];
-    const double by = polygon_y[coord + 1];
-    const bool crosses_scanline = (ay > py) != (by > py);
-    const bool boundary_candidate =
-        py >= fmin(ay, by) && py <= fmax(ay, by) &&
-        px >= fmin(ax, bx) && px <= fmax(ax, bx);
-    if (boundary_candidate && vs_orient2d(ax, ay, bx, by, px, py) == 0) {
-      local_boundary = 1;
-    }
-    if (crosses_scanline &&
-        px < (bx - ax) * (py - ay) / (by - ay) + ax) {
-      local_crossings ^= 1;
-    }
-  }
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    local_crossings ^= __shfl_xor_sync(0xFFFFFFFFu, local_crossings, offset);
-    local_boundary |= __shfl_xor_sync(0xFFFFFFFFu, local_boundary, offset);
-  }
-  const int lane = (int)threadIdx.x & 31;
-  const int warp = (int)threadIdx.x >> 5;
-  if (lane == 0) {
-    warp_crossings[warp] = local_crossings;
-    warp_boundary[warp] = local_boundary;
-  }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    int crossings = 0;
-    int boundary = 0;
-    const int warp_count = ((int)blockDim.x + 31) >> 5;
-    for (int i = 0; i < warp_count; ++i) {
-      crossings ^= warp_crossings[i];
-      boundary |= warp_boundary[i];
-    }
-    warp_crossings[0] = crossings;
-    warp_boundary[0] = boundary;
-  }
-  __syncthreads();
-  return (warp_boundary[0] != 0 ? 2 : 0) | (warp_crossings[0] != 0 ? 1 : 0);
-}
-
-__device__ __forceinline__ int overlay_block_polygon_holes_point_relation(
-    double px,
-    double py,
-    const double* __restrict__ polygon_x,
-    const double* __restrict__ polygon_y,
-    const int* __restrict__ polygon_geometry_offsets,
-    const int* __restrict__ polygon_ring_offsets,
-    const double* __restrict__ polygon_ring_bounds,
-    int polygon,
-    int* warp_crossings,
-    int* warp_boundary
-) {
-  const int ring_start = polygon_geometry_offsets[polygon] + 1;
-  const int ring_end = polygon_geometry_offsets[polygon + 1];
-  int local_crossings = 0;
-  int local_boundary = 0;
-  for (int ring = ring_start + (int)threadIdx.x; ring < ring_end;
-       ring += (int)blockDim.x) {
-    if (polygon_ring_bounds != nullptr) {
-      const int base = ring * 4;
-      if (
-          px < polygon_ring_bounds[base + 0] - OVERLAY_BOUNDARY_TOLERANCE ||
-          px > polygon_ring_bounds[base + 2] + OVERLAY_BOUNDARY_TOLERANCE ||
-          py < polygon_ring_bounds[base + 1] - OVERLAY_BOUNDARY_TOLERANCE ||
-          py > polygon_ring_bounds[base + 3] + OVERLAY_BOUNDARY_TOLERANCE
-      ) {
-        continue;
-      }
-    }
-    const int coord_start = polygon_ring_offsets[ring];
-    const int coord_end = polygon_ring_offsets[ring + 1];
-    int ring_crossings = 0;
-    for (int coord = coord_start; coord + 1 < coord_end; ++coord) {
-      const double ax = polygon_x[coord];
-      const double ay = polygon_y[coord];
-      const double bx = polygon_x[coord + 1];
-      const double by = polygon_y[coord + 1];
-      const bool crosses_scanline = (ay > py) != (by > py);
-      const bool boundary_candidate =
-          py >= fmin(ay, by) && py <= fmax(ay, by) &&
-          px >= fmin(ax, bx) && px <= fmax(ax, bx);
-      if (boundary_candidate && vs_orient2d(ax, ay, bx, by, px, py) == 0) {
-        local_boundary = 1;
-      }
-      if (crosses_scanline &&
-          px < (bx - ax) * (py - ay) / (by - ay) + ax) {
-        ring_crossings ^= 1;
-      }
-    }
-    local_crossings ^= ring_crossings;
-  }
-
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    local_crossings ^= __shfl_xor_sync(0xFFFFFFFFu, local_crossings, offset);
-    local_boundary |= __shfl_xor_sync(0xFFFFFFFFu, local_boundary, offset);
-  }
-  const int lane = (int)threadIdx.x & 31;
-  const int warp = (int)threadIdx.x >> 5;
-  if (lane == 0) {
-    warp_crossings[warp] = local_crossings;
-    warp_boundary[warp] = local_boundary;
-  }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    int crossings = 0;
-    int boundary = 0;
-    const int warp_count = ((int)blockDim.x + 31) >> 5;
-    for (int i = 0; i < warp_count; ++i) {
-      crossings ^= warp_crossings[i];
-      boundary |= warp_boundary[i];
-    }
-    warp_crossings[0] = crossings;
-    warp_boundary[0] = boundary;
-  }
-  __syncthreads();
-  return (warp_boundary[0] != 0 ? 2 : 0) | (warp_crossings[0] != 0 ? 1 : 0);
-}
-
-// Test face sample points against all polygons on one side.
-// One thread per face.
-// polygon_geometry_offsets: maps polygon row -> ring range
-// polygon_ring_offsets: maps ring -> coordinate range
-// polygon_x, polygon_y: flat coordinate arrays
-// polygon_count: number of polygons
-extern "C" __global__ void __launch_bounds__(256, 4)
-label_face_coverage_polygon(
-    const double* __restrict__ label_x,
-    const double* __restrict__ label_y,
-    const int* __restrict__ face_source_rows,
-    const double* __restrict__ polygon_x,
-    const double* __restrict__ polygon_y,
-    const int* __restrict__ polygon_geometry_offsets,
-    const int* __restrict__ polygon_ring_offsets,
-    const double* __restrict__ polygon_bounds,
-    const int* __restrict__ polygon_source_rows,
-    int polygon_count,
-    signed char* __restrict__ out_covered,
-    int face_count
-) {
-  const int f = blockIdx.x * blockDim.x + threadIdx.x;
-  if (f >= face_count) return;
-  if (out_covered[f] == 1) return;
-  const double px = label_x[f];
-  const double py = label_y[f];
-  const bool restrict_row = face_source_rows != nullptr && polygon_source_rows != nullptr;
-  const int face_row = restrict_row ? face_source_rows[f] : -1;
-
-  for (int poly = 0; poly < polygon_count; ++poly) {
-    if (restrict_row && polygon_source_rows[poly] != face_row) continue;
-    if (polygon_bounds != nullptr) {
-      const int bounds_base = poly * 4;
-      if (
-          px < polygon_bounds[bounds_base + 0] - OVERLAY_BOUNDARY_TOLERANCE ||
-          px > polygon_bounds[bounds_base + 2] + OVERLAY_BOUNDARY_TOLERANCE ||
-          py < polygon_bounds[bounds_base + 1] - OVERLAY_BOUNDARY_TOLERANCE ||
-          py > polygon_bounds[bounds_base + 3] + OVERLAY_BOUNDARY_TOLERANCE
-      ) {
-        continue;
-      }
-    }
-    const int ring_start = polygon_geometry_offsets[poly];
-    const int ring_end = polygon_geometry_offsets[poly + 1];
-    bool inside = false;
-    for (int ring = ring_start; ring < ring_end; ++ring) {
-      bool on_boundary = false;
-      const int coord_start = polygon_ring_offsets[ring];
-      const int coord_end = polygon_ring_offsets[ring + 1];
-      const bool ring_inside = vs_ring_contains_point_with_boundary(
-          px, py, polygon_x, polygon_y, coord_start, coord_end,
-          OVERLAY_BOUNDARY_TOLERANCE, &on_boundary);
-      if (on_boundary) { inside = true; break; }
-      if (ring_inside) inside = !inside;
-    }
-    if (inside) { out_covered[f] = 1; return; }
-  }
-}
-
-// Warp-cooperative polygon coverage for grouped batches. One warp owns one
-// face and lanes fan out over polygon rows, preserving the same optional
-// source-row restriction and bounds pruning as label_face_coverage_polygon.
-extern "C" __global__ void __launch_bounds__(256, 4)
-label_face_coverage_polygon_warp(
-    const double* __restrict__ label_x,
-    const double* __restrict__ label_y,
-    const int* __restrict__ face_source_rows,
-    const double* __restrict__ polygon_x,
-    const double* __restrict__ polygon_y,
-    const int* __restrict__ polygon_geometry_offsets,
-    const int* __restrict__ polygon_ring_offsets,
-    const double* __restrict__ polygon_bounds,
-    const int* __restrict__ polygon_source_rows,
-    int polygon_count,
-    signed char* __restrict__ out_covered,
-    int face_count
-) {
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  const int f = tid >> 5;
-  const int lane = tid & 31;
-  if (f >= face_count) return;
-  if (out_covered[f] == 1) return;
-
-  const double px = label_x[f];
-  const double py = label_y[f];
-  const bool restrict_row = face_source_rows != nullptr && polygon_source_rows != nullptr;
-  const int face_row = restrict_row ? face_source_rows[f] : -1;
-
-  for (int base_poly = 0; base_poly < polygon_count; base_poly += 32) {
-    const int poly = base_poly + lane;
-    int hit = 0;
-    if (poly < polygon_count) {
-      hit = 1;
-      if (restrict_row && polygon_source_rows[poly] != face_row) {
-        hit = 0;
-      }
-      if (hit && polygon_bounds != nullptr) {
-        const int bounds_base = poly * 4;
-        if (
-            px < polygon_bounds[bounds_base + 0] - OVERLAY_BOUNDARY_TOLERANCE ||
-            px > polygon_bounds[bounds_base + 2] + OVERLAY_BOUNDARY_TOLERANCE ||
-            py < polygon_bounds[bounds_base + 1] - OVERLAY_BOUNDARY_TOLERANCE ||
-            py > polygon_bounds[bounds_base + 3] + OVERLAY_BOUNDARY_TOLERANCE
-        ) {
-          hit = 0;
-        }
-      }
-      if (hit) {
-        const int ring_start = polygon_geometry_offsets[poly];
-        const int ring_end = polygon_geometry_offsets[poly + 1];
-        bool inside = false;
-        for (int ring = ring_start; ring < ring_end; ++ring) {
-          bool on_boundary = false;
-          const int coord_start = polygon_ring_offsets[ring];
-          const int coord_end = polygon_ring_offsets[ring + 1];
-          const bool ring_inside = vs_ring_contains_point_with_boundary(
-              px, py, polygon_x, polygon_y, coord_start, coord_end,
-              OVERLAY_BOUNDARY_TOLERANCE, &on_boundary);
-          if (on_boundary) {
-            inside = true;
-            break;
-          }
-          if (ring_inside) inside = !inside;
-        }
-        hit = inside ? 1 : 0;
-      }
-    }
-    const unsigned mask = __ballot_sync(0xFFFFFFFFu, hit != 0);
-    if (mask) {
-      if (lane == 0) out_covered[f] = 1;
-      return;
-    }
-  }
-}
-
-extern "C" __global__ void __launch_bounds__(256, 4)
-label_face_coverage_polygon_block(
-    const double* __restrict__ label_x,
-    const double* __restrict__ label_y,
-    const int* __restrict__ face_source_rows,
-    const double* __restrict__ polygon_x,
-    const double* __restrict__ polygon_y,
-    const int* __restrict__ polygon_geometry_offsets,
-    const int* __restrict__ polygon_ring_offsets,
-    const double* __restrict__ polygon_bounds,
-    const double* __restrict__ polygon_ring_bounds,
-    const int* __restrict__ polygon_source_rows,
-    int polygon_count,
-    signed char* __restrict__ out_covered,
-    int face_count
-) {
-  const int face = (int)blockIdx.x;
-  if (face >= face_count || out_covered[face] == 1) return;
-  const double px = label_x[face];
-  const double py = label_y[face];
-  const bool restrict_row = face_source_rows != nullptr && polygon_source_rows != nullptr;
-  const int face_row = restrict_row ? face_source_rows[face] : -1;
-  __shared__ int warp_crossings[8];
-  __shared__ int warp_boundary[8];
-
-  for (int polygon = 0; polygon < polygon_count; ++polygon) {
-    if (restrict_row && polygon_source_rows[polygon] != face_row) continue;
-    if (polygon_bounds != nullptr) {
-      const int base = polygon * 4;
-      if (
-          px < polygon_bounds[base + 0] - OVERLAY_BOUNDARY_TOLERANCE ||
-          px > polygon_bounds[base + 2] + OVERLAY_BOUNDARY_TOLERANCE ||
-          py < polygon_bounds[base + 1] - OVERLAY_BOUNDARY_TOLERANCE ||
-          py > polygon_bounds[base + 3] + OVERLAY_BOUNDARY_TOLERANCE
-      ) {
-        continue;
-      }
-    }
-    const int ring_count =
-        polygon_geometry_offsets[polygon + 1] - polygon_geometry_offsets[polygon];
-    bool covered;
-    if (ring_count > 32) {
-      const int exterior_relation = overlay_block_ring_point_relation(
-          px, py, polygon_x, polygon_y, polygon_ring_offsets,
-          polygon_geometry_offsets[polygon], warp_crossings, warp_boundary);
-      const int holes_relation = overlay_block_polygon_holes_point_relation(
-          px, py, polygon_x, polygon_y, polygon_geometry_offsets,
-          polygon_ring_offsets, polygon_ring_bounds, polygon,
-          warp_crossings, warp_boundary);
-      covered = ((exterior_relation | holes_relation) & 2) != 0 ||
-          ((exterior_relation ^ holes_relation) & 1) != 0;
-    } else {
-      covered = overlay_block_polygon_contains_point(
-            px, py, polygon_x, polygon_y, polygon_geometry_offsets,
-            polygon_ring_offsets, polygon_ring_bounds, polygon,
-            warp_crossings, warp_boundary);
-    }
-    if (covered) {
-      if (threadIdx.x == 0) out_covered[face] = 1;
-      return;
-    }
-  }
-}
-
-// Row-isolated fast path: each face only needs to test against the polygon
-// whose row id matches the face source row.
-extern "C" __global__ void __launch_bounds__(256, 4)
-label_face_coverage_polygon_same_row(
-    const double* __restrict__ label_x,
-    const double* __restrict__ label_y,
-    const int* __restrict__ face_source_rows,
-    const double* __restrict__ polygon_x,
-    const double* __restrict__ polygon_y,
-    const int* __restrict__ polygon_geometry_offsets,
-    const int* __restrict__ polygon_ring_offsets,
-    int polygon_count,
-    signed char* __restrict__ out_covered,
-    int face_count
-) {
-  const int f = blockIdx.x * blockDim.x + threadIdx.x;
-  if (f >= face_count) return;
-  if (out_covered[f] == 1) return;
-  const int poly = face_source_rows[f];
-  if (poly < 0 || poly >= polygon_count) return;
-  const double px = label_x[f];
-  const double py = label_y[f];
-  const int ring_start = polygon_geometry_offsets[poly];
-  const int ring_end = polygon_geometry_offsets[poly + 1];
-  bool inside = false;
-  for (int ring = ring_start; ring < ring_end; ++ring) {
-    bool on_boundary = false;
-    const int coord_start = polygon_ring_offsets[ring];
-    const int coord_end = polygon_ring_offsets[ring + 1];
-    const bool ring_inside = vs_ring_contains_point_with_boundary(
-        px, py, polygon_x, polygon_y, coord_start, coord_end,
-        OVERLAY_BOUNDARY_TOLERANCE, &on_boundary);
-    if (on_boundary) { out_covered[f] = 1; return; }
-    if (ring_inside) inside = !inside;
-  }
-  if (inside) out_covered[f] = 1;
-}
-
-// Row-indirected grouped path: logical rows may be indexed views over shared
-// physical family rows.  Source-row matching therefore has to happen against
-// logical rows, then dereference the physical family row for coordinate tests.
-extern "C" __global__ void __launch_bounds__(256, 4)
-label_face_coverage_polygon_logical_rows(
-    const double* __restrict__ label_x,
-    const double* __restrict__ label_y,
-    const int* __restrict__ face_source_rows,
-    const double* __restrict__ polygon_x,
-    const double* __restrict__ polygon_y,
-    const int* __restrict__ polygon_geometry_offsets,
-    const int* __restrict__ polygon_ring_offsets,
-    const double* __restrict__ polygon_bounds,
-    const int* __restrict__ logical_family_rows,
-    const int* __restrict__ logical_source_rows,
-    int logical_row_count,
-    signed char* __restrict__ out_covered,
-    int face_count
-) {
-  const int f = blockIdx.x * blockDim.x + threadIdx.x;
-  if (f >= face_count) return;
-  if (out_covered[f] == 1) return;
-  const double px = label_x[f];
-  const double py = label_y[f];
-  const bool restrict_row = face_source_rows != nullptr && logical_source_rows != nullptr;
-  const int face_row = restrict_row ? face_source_rows[f] : -1;
-  const int logical_start = restrict_row
-      ? overlay_lower_bound_i32(logical_source_rows, logical_row_count, face_row)
-      : 0;
-  const int logical_end = restrict_row
-      ? overlay_upper_bound_i32(logical_source_rows, logical_row_count, face_row)
-      : logical_row_count;
-
-  for (int logical = logical_start; logical < logical_end; ++logical) {
-    const int poly = logical_family_rows[logical];
-    if (poly < 0) continue;
-    if (polygon_bounds != nullptr) {
-      const int bounds_base = poly * 4;
-      if (
-          px < polygon_bounds[bounds_base + 0] - OVERLAY_BOUNDARY_TOLERANCE ||
-          px > polygon_bounds[bounds_base + 2] + OVERLAY_BOUNDARY_TOLERANCE ||
-          py < polygon_bounds[bounds_base + 1] - OVERLAY_BOUNDARY_TOLERANCE ||
-          py > polygon_bounds[bounds_base + 3] + OVERLAY_BOUNDARY_TOLERANCE
-      ) {
-        continue;
-      }
-    }
-    const int ring_start = polygon_geometry_offsets[poly];
-    const int ring_end = polygon_geometry_offsets[poly + 1];
-    bool inside = false;
-    for (int ring = ring_start; ring < ring_end; ++ring) {
-      bool on_boundary = false;
-      const int coord_start = polygon_ring_offsets[ring];
-      const int coord_end = polygon_ring_offsets[ring + 1];
-      const bool ring_inside = vs_ring_contains_point_with_boundary(
-          px, py, polygon_x, polygon_y, coord_start, coord_end,
-          OVERLAY_BOUNDARY_TOLERANCE, &on_boundary);
-      if (on_boundary) { inside = true; break; }
-      if (ring_inside) inside = !inside;
-    }
-    if (inside) { out_covered[f] = 1; return; }
-  }
-}
-
-// Warp-cooperative row-indirected grouped path.  One warp owns one face and
-// lanes fan out over logical rows before dereferencing the physical polygon
-// row.  This keeps indexed grouped coverage device-shaped without a serial
-// per-face logical-row scan.
-extern "C" __global__ void __launch_bounds__(256, 4)
-label_face_coverage_polygon_logical_rows_warp(
-    const double* __restrict__ label_x,
-    const double* __restrict__ label_y,
-    const int* __restrict__ face_source_rows,
-    const double* __restrict__ polygon_x,
-    const double* __restrict__ polygon_y,
-    const int* __restrict__ polygon_geometry_offsets,
-    const int* __restrict__ polygon_ring_offsets,
-    const double* __restrict__ polygon_bounds,
-    const int* __restrict__ logical_family_rows,
-    const int* __restrict__ logical_source_rows,
-    int logical_row_count,
-    signed char* __restrict__ out_covered,
-    int face_count
-) {
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  const int f = tid >> 5;
-  const int lane = tid & 31;
-  if (f >= face_count) return;
-  if (out_covered[f] == 1) return;
-
-  const double px = label_x[f];
-  const double py = label_y[f];
-  const bool restrict_row = face_source_rows != nullptr && logical_source_rows != nullptr;
-  const int face_row = restrict_row ? face_source_rows[f] : -1;
-  const int logical_start = restrict_row
-      ? overlay_lower_bound_i32(logical_source_rows, logical_row_count, face_row)
-      : 0;
-  const int logical_end = restrict_row
-      ? overlay_upper_bound_i32(logical_source_rows, logical_row_count, face_row)
-      : logical_row_count;
-
-  for (int base_logical = logical_start; base_logical < logical_end; base_logical += 32) {
-    const int logical = base_logical + lane;
-    int hit = 0;
-    if (logical < logical_end) {
-      hit = 1;
-      const int poly = hit ? logical_family_rows[logical] : -1;
-      if (poly < 0) {
-        hit = 0;
-      }
-      if (hit && polygon_bounds != nullptr) {
-        const int bounds_base = poly * 4;
-        if (
-            px < polygon_bounds[bounds_base + 0] - OVERLAY_BOUNDARY_TOLERANCE ||
-            px > polygon_bounds[bounds_base + 2] + OVERLAY_BOUNDARY_TOLERANCE ||
-            py < polygon_bounds[bounds_base + 1] - OVERLAY_BOUNDARY_TOLERANCE ||
-            py > polygon_bounds[bounds_base + 3] + OVERLAY_BOUNDARY_TOLERANCE
-        ) {
-          hit = 0;
-        }
-      }
-      if (hit) {
-        const int ring_start = polygon_geometry_offsets[poly];
-        const int ring_end = polygon_geometry_offsets[poly + 1];
-        bool inside = false;
-        for (int ring = ring_start; ring < ring_end; ++ring) {
-          bool on_boundary = false;
-          const int coord_start = polygon_ring_offsets[ring];
-          const int coord_end = polygon_ring_offsets[ring + 1];
-          const bool ring_inside = vs_ring_contains_point_with_boundary(
-              px, py, polygon_x, polygon_y, coord_start, coord_end,
-              OVERLAY_BOUNDARY_TOLERANCE, &on_boundary);
-          if (on_boundary) {
-            inside = true;
-            break;
-          }
-          if (ring_inside) inside = !inside;
-        }
-        hit = inside ? 1 : 0;
-      }
-    }
-    const unsigned mask = __ballot_sync(0xFFFFFFFFu, hit != 0);
-    if (mask) {
-      if (lane == 0) out_covered[f] = 1;
-      return;
-    }
-  }
-}
-
-// Coordinate-cooperative row-indirected path. One block owns one face and
-// divides the matching physical polygon edges across threads. This is the
-// saturation shape for indexed views over large shared polygons.
-extern "C" __global__ void __launch_bounds__(256, 4)
-label_face_coverage_polygon_logical_rows_block(
-    const double* __restrict__ label_x,
-    const double* __restrict__ label_y,
-    const int* __restrict__ face_source_rows,
-    const double* __restrict__ polygon_x,
-    const double* __restrict__ polygon_y,
-    const int* __restrict__ polygon_geometry_offsets,
-    const int* __restrict__ polygon_ring_offsets,
-    const double* __restrict__ polygon_bounds,
-    const int* __restrict__ logical_family_rows,
-    const int* __restrict__ logical_source_rows,
-    int logical_row_count,
-    signed char* __restrict__ out_covered,
-    int face_count
-) {
-  const int face = (int)blockIdx.x;
-  if (face >= face_count || out_covered[face] == 1) return;
-  const double px = label_x[face];
-  const double py = label_y[face];
-  const bool restrict_row = face_source_rows != nullptr && logical_source_rows != nullptr;
-  const int face_row = restrict_row ? face_source_rows[face] : -1;
-  const int logical_start = restrict_row
-      ? overlay_lower_bound_i32(logical_source_rows, logical_row_count, face_row)
-      : 0;
-  const int logical_end = restrict_row
-      ? overlay_upper_bound_i32(logical_source_rows, logical_row_count, face_row)
-      : logical_row_count;
-  __shared__ int warp_crossings[8];
-  __shared__ int warp_boundary[8];
-
-  for (int logical = logical_start; logical < logical_end; ++logical) {
-    const int polygon = logical_family_rows[logical];
-    if (polygon < 0) continue;
-    if (polygon_bounds != nullptr) {
-      const int base = polygon * 4;
-      if (
-          px < polygon_bounds[base + 0] - OVERLAY_BOUNDARY_TOLERANCE ||
-          px > polygon_bounds[base + 2] + OVERLAY_BOUNDARY_TOLERANCE ||
-          py < polygon_bounds[base + 1] - OVERLAY_BOUNDARY_TOLERANCE ||
-          py > polygon_bounds[base + 3] + OVERLAY_BOUNDARY_TOLERANCE
-      ) {
-        continue;
-      }
-    }
-    if (overlay_block_polygon_contains_point(
-            px, py, polygon_x, polygon_y, polygon_geometry_offsets,
-            polygon_ring_offsets, nullptr, polygon,
-            warp_crossings, warp_boundary)) {
-      if (threadIdx.x == 0) out_covered[face] = 1;
-      return;
-    }
-  }
-}
-
-// Compute per-polygon bounds for a polygon family buffer.
-extern "C" __global__ void __launch_bounds__(256, 4)
-compute_polygon_bounds(
-    const double* __restrict__ polygon_x,
-    const double* __restrict__ polygon_y,
-    const int* __restrict__ polygon_geometry_offsets,
-    const int* __restrict__ polygon_ring_offsets,
-    int polygon_count,
-    double* __restrict__ out_bounds
-) {
-  const int polygon = blockIdx.x * blockDim.x + threadIdx.x;
-  if (polygon >= polygon_count) return;
-  const int ring_start = polygon_geometry_offsets[polygon];
-  const int ring_end = polygon_geometry_offsets[polygon + 1];
-  if (ring_start >= ring_end) {
-    const int base = polygon * 4;
-    out_bounds[base + 0] = 0.0;
-    out_bounds[base + 1] = 0.0;
-    out_bounds[base + 2] = 0.0;
-    out_bounds[base + 3] = 0.0;
-    return;
-  }
-  const int first_coord = polygon_ring_offsets[ring_start];
-  double min_x = polygon_x[first_coord];
-  double min_y = polygon_y[first_coord];
-  double max_x = min_x;
-  double max_y = min_y;
-  for (int ring = ring_start; ring < ring_end; ++ring) {
-    const int coord_start = polygon_ring_offsets[ring];
-    const int coord_end = polygon_ring_offsets[ring + 1];
-    for (int coord = coord_start; coord < coord_end; ++coord) {
-      const double x = polygon_x[coord];
-      const double y = polygon_y[coord];
-      min_x = fmin(min_x, x);
-      min_y = fmin(min_y, y);
-      max_x = fmax(max_x, x);
-      max_y = fmax(max_y, y);
-    }
-  }
-  const int base = polygon * 4;
-  out_bounds[base + 0] = min_x;
-  out_bounds[base + 1] = min_y;
-  out_bounds[base + 2] = max_x;
-  out_bounds[base + 3] = max_y;
-}
-
-// Compute per-ring bounds for coordinate-heavy broadcast point-in-polygon.
-extern "C" __global__ void __launch_bounds__(256, 4)
-compute_polygon_ring_bounds(
-    const double* __restrict__ polygon_x,
-    const double* __restrict__ polygon_y,
-    const int* __restrict__ polygon_ring_offsets,
-    int ring_count,
-    double* __restrict__ out_bounds
-) {
-  const int ring = blockIdx.x * blockDim.x + threadIdx.x;
-  if (ring >= ring_count) return;
-  const int coord_start = polygon_ring_offsets[ring];
-  const int coord_end = polygon_ring_offsets[ring + 1];
-  const int base = ring * 4;
-  if (coord_start >= coord_end) {
-    out_bounds[base + 0] = 0.0;
-    out_bounds[base + 1] = 0.0;
-    out_bounds[base + 2] = 0.0;
-    out_bounds[base + 3] = 0.0;
-    return;
-  }
-  double min_x = polygon_x[coord_start];
-  double min_y = polygon_y[coord_start];
-  double max_x = min_x;
-  double max_y = min_y;
-  for (int coord = coord_start + 1; coord < coord_end; ++coord) {
-    const double x = polygon_x[coord];
-    const double y = polygon_y[coord];
-    min_x = fmin(min_x, x);
-    min_y = fmin(min_y, y);
-    max_x = fmax(max_x, x);
-    max_y = fmax(max_y, y);
-  }
-  out_bounds[base + 0] = min_x;
-  out_bounds[base + 1] = min_y;
-  out_bounds[base + 2] = max_x;
-  out_bounds[base + 3] = max_y;
-}
-
-// Compute per-polygon bounds for a multipolygon family buffer.
-extern "C" __global__ void __launch_bounds__(256, 4)
-compute_multipolygon_polygon_bounds(
-    const double* __restrict__ mp_x,
-    const double* __restrict__ mp_y,
-    const int* __restrict__ mp_part_offsets,
-    const int* __restrict__ mp_ring_offsets,
-    int polygon_count,
-    double* __restrict__ out_bounds
-) {
-  const int polygon = blockIdx.x * blockDim.x + threadIdx.x;
-  if (polygon >= polygon_count) return;
-  const int ring_start = mp_part_offsets[polygon];
-  const int ring_end = mp_part_offsets[polygon + 1];
-  if (ring_start >= ring_end) {
-    const int base = polygon * 4;
-    out_bounds[base + 0] = 0.0;
-    out_bounds[base + 1] = 0.0;
-    out_bounds[base + 2] = 0.0;
-    out_bounds[base + 3] = 0.0;
-    return;
-  }
-  const int first_coord = mp_ring_offsets[ring_start];
-  double min_x = mp_x[first_coord];
-  double min_y = mp_y[first_coord];
-  double max_x = min_x;
-  double max_y = min_y;
-  for (int ring = ring_start; ring < ring_end; ++ring) {
-    const int coord_start = mp_ring_offsets[ring];
-    const int coord_end = mp_ring_offsets[ring + 1];
-    for (int coord = coord_start; coord < coord_end; ++coord) {
-      const double x = mp_x[coord];
-      const double y = mp_y[coord];
-      min_x = fmin(min_x, x);
-      min_y = fmin(min_y, y);
-      max_x = fmax(max_x, x);
-      max_y = fmax(max_y, y);
-    }
-  }
-  const int base = polygon * 4;
-  out_bounds[base + 0] = min_x;
-  out_bounds[base + 1] = min_y;
-  out_bounds[base + 2] = max_x;
-  out_bounds[base + 3] = max_y;
-}
-
-// Test face sample points against all multipolygons on one side.
-// One thread per face.
-extern "C" __global__ void __launch_bounds__(256, 4)
-label_face_coverage_multipolygon(
-    const double* __restrict__ label_x,
-    const double* __restrict__ label_y,
-    const int* __restrict__ face_source_rows,
-    const double* __restrict__ mp_x,
-    const double* __restrict__ mp_y,
-    const int* __restrict__ mp_geometry_offsets,
-    const int* __restrict__ mp_part_offsets,
-    const int* __restrict__ mp_ring_offsets,
-    const int* __restrict__ mp_source_rows,
-    int mp_count,
-    signed char* __restrict__ out_covered,
-    int face_count
-) {
-  const int f = blockIdx.x * blockDim.x + threadIdx.x;
-  if (f >= face_count) return;
-  if (out_covered[f] == 1) return;  // already covered by polygon pass
-  const double px = label_x[f];
-  const double py = label_y[f];
-  const bool restrict_row = face_source_rows != nullptr && mp_source_rows != nullptr;
-  const int face_row = restrict_row ? face_source_rows[f] : -1;
-
-  for (int mp = 0; mp < mp_count; ++mp) {
-    if (restrict_row && mp_source_rows[mp] != face_row) continue;
-    const int polygon_start = mp_geometry_offsets[mp];
-    const int polygon_end = mp_geometry_offsets[mp + 1];
-    for (int polygon = polygon_start; polygon < polygon_end; ++polygon) {
-      const int ring_start = mp_part_offsets[polygon];
-      const int ring_end = mp_part_offsets[polygon + 1];
-      bool inside = false;
-      for (int ring = ring_start; ring < ring_end; ++ring) {
-        bool on_boundary = false;
-        const int coord_start = mp_ring_offsets[ring];
-        const int coord_end = mp_ring_offsets[ring + 1];
-        const bool ring_inside = vs_ring_contains_point_with_boundary(
-            px, py, mp_x, mp_y, coord_start, coord_end,
-            OVERLAY_BOUNDARY_TOLERANCE, &on_boundary);
-        if (on_boundary) { inside = true; break; }
-        if (ring_inside) inside = !inside;
-      }
-      if (inside) { out_covered[f] = 1; return; }
-    }
-  }
-}
-
-extern "C" __global__ void __launch_bounds__(256, 4)
-label_face_coverage_multipolygon_block(
-    const double* __restrict__ label_x,
-    const double* __restrict__ label_y,
-    const int* __restrict__ face_source_rows,
-    const double* __restrict__ mp_x,
-    const double* __restrict__ mp_y,
-    const int* __restrict__ mp_geometry_offsets,
-    const int* __restrict__ mp_part_offsets,
-    const int* __restrict__ mp_ring_offsets,
-    const int* __restrict__ mp_source_rows,
-    int mp_count,
-    signed char* __restrict__ out_covered,
-    int face_count
-) {
-  const int face = (int)blockIdx.x;
-  if (face >= face_count || out_covered[face] == 1) return;
-  const double px = label_x[face];
-  const double py = label_y[face];
-  const bool restrict_row = face_source_rows != nullptr && mp_source_rows != nullptr;
-  const int face_row = restrict_row ? face_source_rows[face] : -1;
-  __shared__ int warp_crossings[8];
-  __shared__ int warp_boundary[8];
-
-  for (int multipolygon = 0; multipolygon < mp_count; ++multipolygon) {
-    if (restrict_row && mp_source_rows[multipolygon] != face_row) continue;
-    const int polygon_start = mp_geometry_offsets[multipolygon];
-    const int polygon_end = mp_geometry_offsets[multipolygon + 1];
-    for (int polygon = polygon_start; polygon < polygon_end; ++polygon) {
-      if (overlay_block_polygon_contains_point(
-              px, py, mp_x, mp_y, mp_part_offsets, mp_ring_offsets,
-              nullptr, polygon, warp_crossings, warp_boundary)) {
-        if (threadIdx.x == 0) out_covered[face] = 1;
-        return;
-      }
-    }
-  }
-}
-
-// Row-isolated fast path: each face only needs to test against the
-// multipolygon whose row id matches the face source row.
-extern "C" __global__ void __launch_bounds__(256, 4)
-label_face_coverage_multipolygon_same_row(
-    const double* __restrict__ label_x,
-    const double* __restrict__ label_y,
-    const int* __restrict__ face_source_rows,
-    const double* __restrict__ mp_x,
-    const double* __restrict__ mp_y,
-    const int* __restrict__ mp_geometry_offsets,
-    const int* __restrict__ mp_part_offsets,
-    const int* __restrict__ mp_ring_offsets,
-    const double* __restrict__ mp_polygon_bounds,
-    int mp_count,
-    signed char* __restrict__ out_covered,
-    int face_count
-) {
-  const int f = blockIdx.x * blockDim.x + threadIdx.x;
-  if (f >= face_count) return;
-  if (out_covered[f] == 1) return;
-  const int mp = face_source_rows[f];
-  if (mp < 0 || mp >= mp_count) return;
-  const double px = label_x[f];
-  const double py = label_y[f];
-  const int polygon_start = mp_geometry_offsets[mp];
-  const int polygon_end = mp_geometry_offsets[mp + 1];
-  for (int polygon = polygon_start; polygon < polygon_end; ++polygon) {
-    const int bounds_base = polygon * 4;
-    if (
-        px < mp_polygon_bounds[bounds_base + 0] ||
-        px > mp_polygon_bounds[bounds_base + 2] ||
-        py < mp_polygon_bounds[bounds_base + 1] ||
-        py > mp_polygon_bounds[bounds_base + 3]
-    ) {
-      continue;
-    }
-    const int ring_start = mp_part_offsets[polygon];
-    const int ring_end = mp_part_offsets[polygon + 1];
-    bool inside = false;
-    for (int ring = ring_start; ring < ring_end; ++ring) {
-      bool on_boundary = false;
-      const int coord_start = mp_ring_offsets[ring];
-      const int coord_end = mp_ring_offsets[ring + 1];
-      const bool ring_inside = vs_ring_contains_point_with_boundary(
-          px, py, mp_x, mp_y, coord_start, coord_end,
-          OVERLAY_BOUNDARY_TOLERANCE, &on_boundary);
-      if (on_boundary) { out_covered[f] = 1; return; }
-      if (ring_inside) inside = !inside;
-    }
-    if (inside) { out_covered[f] = 1; return; }
-  }
-}
-
-// Row-indirected grouped path for indexed multipolygon logical rows.  The
-// logical row supplies the grouping/source semantics while the physical
-// family row supplies the coordinate spans.
-extern "C" __global__ void __launch_bounds__(256, 4)
-label_face_coverage_multipolygon_logical_rows(
-    const double* __restrict__ label_x,
-    const double* __restrict__ label_y,
-    const int* __restrict__ face_source_rows,
-    const double* __restrict__ mp_x,
-    const double* __restrict__ mp_y,
-    const int* __restrict__ mp_geometry_offsets,
-    const int* __restrict__ mp_part_offsets,
-    const int* __restrict__ mp_ring_offsets,
-    const int* __restrict__ logical_family_rows,
-    const int* __restrict__ logical_source_rows,
-    int logical_row_count,
-    signed char* __restrict__ out_covered,
-    int face_count
-) {
-  const int f = blockIdx.x * blockDim.x + threadIdx.x;
-  if (f >= face_count) return;
-  if (out_covered[f] == 1) return;
-  const double px = label_x[f];
-  const double py = label_y[f];
-  const bool restrict_row = face_source_rows != nullptr && logical_source_rows != nullptr;
-  const int face_row = restrict_row ? face_source_rows[f] : -1;
-  const int logical_start = restrict_row
-      ? overlay_lower_bound_i32(logical_source_rows, logical_row_count, face_row)
-      : 0;
-  const int logical_end = restrict_row
-      ? overlay_upper_bound_i32(logical_source_rows, logical_row_count, face_row)
-      : logical_row_count;
-
-  for (int logical = logical_start; logical < logical_end; ++logical) {
-    const int mp = logical_family_rows[logical];
-    if (mp < 0) continue;
-    const int polygon_start = mp_geometry_offsets[mp];
-    const int polygon_end = mp_geometry_offsets[mp + 1];
-    for (int polygon = polygon_start; polygon < polygon_end; ++polygon) {
-      const int ring_start = mp_part_offsets[polygon];
-      const int ring_end = mp_part_offsets[polygon + 1];
-      bool inside = false;
-      for (int ring = ring_start; ring < ring_end; ++ring) {
-        bool on_boundary = false;
-        const int coord_start = mp_ring_offsets[ring];
-        const int coord_end = mp_ring_offsets[ring + 1];
-        const bool ring_inside = vs_ring_contains_point_with_boundary(
-            px, py, mp_x, mp_y, coord_start, coord_end,
-            OVERLAY_BOUNDARY_TOLERANCE, &on_boundary);
-        if (on_boundary) { inside = true; break; }
-        if (ring_inside) inside = !inside;
-      }
-      if (inside) { out_covered[f] = 1; return; }
-    }
-  }
-}
-
-// Warp-cooperative row-indirected grouped path for multipolygon logical rows.
-extern "C" __global__ void __launch_bounds__(256, 4)
-label_face_coverage_multipolygon_logical_rows_warp(
-    const double* __restrict__ label_x,
-    const double* __restrict__ label_y,
-    const int* __restrict__ face_source_rows,
-    const double* __restrict__ mp_x,
-    const double* __restrict__ mp_y,
-    const int* __restrict__ mp_geometry_offsets,
-    const int* __restrict__ mp_part_offsets,
-    const int* __restrict__ mp_ring_offsets,
-    const int* __restrict__ logical_family_rows,
-    const int* __restrict__ logical_source_rows,
-    int logical_row_count,
-    signed char* __restrict__ out_covered,
-    int face_count
-) {
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  const int f = tid >> 5;
-  const int lane = tid & 31;
-  if (f >= face_count) return;
-  if (out_covered[f] == 1) return;
-
-  const double px = label_x[f];
-  const double py = label_y[f];
-  const bool restrict_row = face_source_rows != nullptr && logical_source_rows != nullptr;
-  const int face_row = restrict_row ? face_source_rows[f] : -1;
-  const int logical_start = restrict_row
-      ? overlay_lower_bound_i32(logical_source_rows, logical_row_count, face_row)
-      : 0;
-  const int logical_end = restrict_row
-      ? overlay_upper_bound_i32(logical_source_rows, logical_row_count, face_row)
-      : logical_row_count;
-
-  for (int base_logical = logical_start; base_logical < logical_end; base_logical += 32) {
-    const int logical = base_logical + lane;
-    int hit = 0;
-    if (logical < logical_end) {
-      int active = 1;
-      const int mp = active ? logical_family_rows[logical] : -1;
-      if (mp < 0) {
-        active = 0;
-      }
-      if (active) {
-        const int polygon_start = mp_geometry_offsets[mp];
-        const int polygon_end = mp_geometry_offsets[mp + 1];
-        for (int polygon = polygon_start; polygon < polygon_end && hit == 0; ++polygon) {
-          const int ring_start = mp_part_offsets[polygon];
-          const int ring_end = mp_part_offsets[polygon + 1];
-          bool inside = false;
-          for (int ring = ring_start; ring < ring_end; ++ring) {
-            bool on_boundary = false;
-            const int coord_start = mp_ring_offsets[ring];
-            const int coord_end = mp_ring_offsets[ring + 1];
-            const bool ring_inside = vs_ring_contains_point_with_boundary(
-                px, py, mp_x, mp_y, coord_start, coord_end,
-                OVERLAY_BOUNDARY_TOLERANCE, &on_boundary);
-            if (on_boundary) {
-              inside = true;
-              break;
-            }
-            if (ring_inside) inside = !inside;
-          }
-          if (inside) {
-            hit = 1;
-          }
-        }
-      }
-    }
-    const unsigned mask = __ballot_sync(0xFFFFFFFFu, hit != 0);
-    if (mask) {
-      if (lane == 0) out_covered[f] = 1;
-      return;
-    }
-  }
-}
-
-extern "C" __global__ void __launch_bounds__(256, 4)
-label_face_coverage_multipolygon_logical_rows_block(
-    const double* __restrict__ label_x,
-    const double* __restrict__ label_y,
-    const int* __restrict__ face_source_rows,
-    const double* __restrict__ mp_x,
-    const double* __restrict__ mp_y,
-    const int* __restrict__ mp_geometry_offsets,
-    const int* __restrict__ mp_part_offsets,
-    const int* __restrict__ mp_ring_offsets,
-    const int* __restrict__ logical_family_rows,
-    const int* __restrict__ logical_source_rows,
-    int logical_row_count,
-    signed char* __restrict__ out_covered,
-    int face_count
-) {
-  const int face = (int)blockIdx.x;
-  if (face >= face_count || out_covered[face] == 1) return;
-  const double px = label_x[face];
-  const double py = label_y[face];
-  const bool restrict_row = face_source_rows != nullptr && logical_source_rows != nullptr;
-  const int face_row = restrict_row ? face_source_rows[face] : -1;
-  const int logical_start = restrict_row
-      ? overlay_lower_bound_i32(logical_source_rows, logical_row_count, face_row)
-      : 0;
-  const int logical_end = restrict_row
-      ? overlay_upper_bound_i32(logical_source_rows, logical_row_count, face_row)
-      : logical_row_count;
-  __shared__ int warp_crossings[8];
-  __shared__ int warp_boundary[8];
-
-  for (int logical = logical_start; logical < logical_end; ++logical) {
-    const int multipolygon = logical_family_rows[logical];
-    if (multipolygon < 0) continue;
-    const int polygon_start = mp_geometry_offsets[multipolygon];
-    const int polygon_end = mp_geometry_offsets[multipolygon + 1];
-    for (int polygon = polygon_start; polygon < polygon_end; ++polygon) {
-      if (overlay_block_polygon_contains_point(
-              px, py, mp_x, mp_y, mp_part_offsets, mp_ring_offsets,
-              nullptr, polygon, warp_crossings, warp_boundary)) {
-        if (threadIdx.x == 0) out_covered[face] = 1;
-        return;
-      }
-    }
-  }
-}
-"""
-)
-
-_OVERLAY_FACE_LABEL_KERNEL_NAMES = (
-    "label_face_coverage_polygon",
-    "label_face_coverage_polygon_warp",
-    "label_face_coverage_polygon_block",
-    "label_face_coverage_polygon_same_row",
-    "label_face_coverage_polygon_logical_rows",
-    "label_face_coverage_polygon_logical_rows_warp",
-    "label_face_coverage_polygon_logical_rows_block",
-    "compute_polygon_bounds",
-    "compute_polygon_ring_bounds",
-    "compute_multipolygon_polygon_bounds",
-    "label_face_coverage_multipolygon",
-    "label_face_coverage_multipolygon_block",
-    "label_face_coverage_multipolygon_same_row",
-    "label_face_coverage_multipolygon_logical_rows",
-    "label_face_coverage_multipolygon_logical_rows_warp",
-    "label_face_coverage_multipolygon_logical_rows_block",
+    "scatter_edge_face_ids",
+    "scatter_previous_edge_ids",
+    "compute_face_exact_orientation",
+    "compute_face_bounds",
+    "initialize_dual_face_queue",
+    "propagate_dual_face_queue",
+    "reduce_indexed_component_containment",
+    "select_indexed_component_containment_parent",
+    "finalize_face_coverage",
 )
 
 # ---------------------------------------------------------------------------
 # 4. Face assembly (ring reconstruction) kernels
 # ---------------------------------------------------------------------------
-# Kernels: compute_boundary_edges, compute_boundary_next,
-#          scatter_boundary_ring_coordinates, compute_ring_sample_points,
-#          assign_holes_to_exteriors, count_sibling_hole_depth
+# Kernels: boundary extraction, exact ring references/bounds, and nesting
 
 _OVERLAY_FACE_ASSEMBLY_KERNEL_SOURCE = (
-    POINT_IN_RING_DEVICE
+    ORIENT2D_DEVICE
     + r"""
+__device__ __forceinline__ bool exact_ring_contains_vertex(
+    double px,
+    double py,
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    int start,
+    int end
+) {
+  bool inside = false;
+  for (int i = start; i + 1 < end; ++i) {
+    const double ax = x[i];
+    const double ay = y[i];
+    const double bx = x[i + 1];
+    const double by = y[i + 1];
+    if ((ay <= py && py < by && vs_orient2d(ax, ay, bx, by, px, py) > 0) ||
+        (by <= py && py < ay && vs_orient2d(ax, ay, bx, by, px, py) < 0)) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
 // Scatter one selected-face bit to each edge in the face-membership carrier.
 // One block owns one face so no slot-to-face inverse relation is needed.
 extern "C" __global__ void __launch_bounds__(256, 4)
@@ -2141,11 +1589,9 @@ compute_centered_boundary_ring_areas(
   if (tid == 0) out_area[ring] = sh_cross[0] * 0.5;
 }
 
-// Compute one host-style sample point per ring. The sample point is taken
-// from the first non-degenerate edge midpoint, offset by a tiny inward
-// perpendicular scaled by the ring extent. This mirrors the host fallback's
-// _face_sample_point helper and avoids using centroids that can lie outside
-// concave rings.
+// Preserve one existing boundary vertex and exact fp64 bounds per ring. The
+// historical entry-point name is retained as an internal ABI for the assembly
+// launcher; no synthetic interior coordinate is constructed.
 extern "C" __global__ void __launch_bounds__(256, 4)
 compute_ring_sample_points(
     const int* __restrict__ ring_coord_offsets,
@@ -2153,23 +1599,32 @@ compute_ring_sample_points(
     const bool* __restrict__ ring_active,
     const double* __restrict__ all_x,
     const double* __restrict__ all_y,
-    double* __restrict__ out_sample_x,
-    double* __restrict__ out_sample_y,
+    double* __restrict__ out_reference_x,
+    double* __restrict__ out_reference_y,
+    double* __restrict__ out_bounds,
     int ring_count
 ) {
   const int r = blockIdx.x * blockDim.x + threadIdx.x;
   if (r >= ring_count) return;
   if (!ring_active[r]) {
-    out_sample_x[r] = 0.0;
-    out_sample_y[r] = 0.0;
+    out_reference_x[r] = 0.0;
+    out_reference_y[r] = 0.0;
+    out_bounds[r * 4] = 0.0;
+    out_bounds[r * 4 + 1] = 0.0;
+    out_bounds[r * 4 + 2] = 0.0;
+    out_bounds[r * 4 + 3] = 0.0;
     return;
   }
 
   const int start = ring_coord_offsets[r];
   const int n_edges = ring_edge_counts[r];
   if (n_edges <= 0) {
-    out_sample_x[r] = 0.0;
-    out_sample_y[r] = 0.0;
+    out_reference_x[r] = 0.0;
+    out_reference_y[r] = 0.0;
+    out_bounds[r * 4] = 0.0;
+    out_bounds[r * 4 + 1] = 0.0;
+    out_bounds[r * 4 + 2] = 0.0;
+    out_bounds[r * 4 + 3] = 0.0;
     return;
   }
 
@@ -2185,83 +1640,153 @@ compute_ring_sample_points(
     if (y < min_y) min_y = y;
     if (y > max_y) max_y = y;
   }
-  double extent = max_x - min_x;
-  const double extent_y = max_y - min_y;
-  if (extent_y > extent) extent = extent_y;
-  if (extent < 1.0) extent = 1.0;
-  const double epsilon = extent * 1.0e-6;
+  out_bounds[r * 4] = min_x;
+  out_bounds[r * 4 + 1] = min_y;
+  out_bounds[r * 4 + 2] = max_x;
+  out_bounds[r * 4 + 3] = max_y;
 
-  for (int i = 0; i < n_edges; ++i) {
-    const int j = (i + 1) % n_edges;
-    const double x0 = all_x[start + i];
-    const double y0 = all_y[start + i];
-    const double x1 = all_x[start + j];
-    const double y1 = all_y[start + j];
-    const double dx = x1 - x0;
-    const double dy = y1 - y0;
-    const double length = sqrt(dx * dx + dy * dy);
-    if (length <= 0.0) continue;
-    const double midpoint_x = 0.5 * (x0 + x1);
-    const double midpoint_y = 0.5 * (y0 + y1);
-    out_sample_x[r] = midpoint_x - (dy / length) * epsilon;
-    out_sample_y[r] = midpoint_y + (dx / length) * epsilon;
-    return;
-  }
-
-  out_sample_x[r] = all_x[start];
-  out_sample_y[r] = all_y[start];
+  out_reference_x[r] = all_x[start];
+  out_reference_y[r] = all_y[start];
 }
 
-// Test each ring sample point against each exterior ring to determine
-// hole-to-exterior assignment. One thread per candidate ring.
+// Locate the equal-key source-row span for each sorted ring lane. Inactive
+// capacity lanes are never consumed by containment kernels and receive a
+// one-lane span to keep every output initialized.
 extern "C" __global__ void __launch_bounds__(256, 4)
-assign_holes_to_exteriors(
-    const double* __restrict__ ring_sample_x,
-    const double* __restrict__ ring_sample_y,
+locate_boundary_ring_group_spans(
+    const int* __restrict__ sorted_group_keys,
+    const int* __restrict__ sorted_ring_ids,
+    const signed char* __restrict__ ring_active,
+    int* __restrict__ out_group_start,
+    int* __restrict__ out_group_end,
+    int ring_count
+) {
+  const int pos = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pos >= ring_count) return;
+  const int ring = sorted_ring_ids[pos];
+  if (ring_active[ring] == 0) {
+    out_group_start[pos] = pos;
+    out_group_end[pos] = pos + 1;
+    return;
+  }
+  const int key = sorted_group_keys[pos];
+  int lo = 0;
+  int hi = pos + 1;
+  while (lo < hi) {
+    const int mid = lo + ((hi - lo) >> 1);
+    if (sorted_group_keys[mid] < key) lo = mid + 1;
+    else hi = mid;
+  }
+  out_group_start[pos] = lo;
+  lo = pos;
+  hi = ring_count;
+  while (lo < hi) {
+    const int mid = lo + ((hi - lo) >> 1);
+    if (sorted_group_keys[mid] <= key) lo = mid + 1;
+    else hi = mid;
+  }
+  out_group_end[pos] = lo;
+}
+
+// Classify all boundary cycles by containment parity.  sorted_ring_ids and
+// group_start/end keep each thread's search within one source-row span, so a
+// million independent one-ring rows remain O(R), not O(R^2).
+extern "C" __global__ void __launch_bounds__(256, 4)
+count_boundary_ring_containment_depth(
+    const double* __restrict__ ring_reference_x,
+    const double* __restrict__ ring_reference_y,
     const double* __restrict__ ring_area,
-    const signed char* __restrict__ is_true_exterior,
-    const int* __restrict__ source_rows,
+    const signed char* __restrict__ ring_active,
+    const int* __restrict__ sorted_ring_ids,
+    const int* __restrict__ group_start,
+    const int* __restrict__ group_end,
     const int* __restrict__ ring_coord_offsets,
     const int* __restrict__ ring_edge_counts,
     const double* __restrict__ all_x,
     const double* __restrict__ all_y,
-    const int* __restrict__ exterior_indices,
-    const long long* __restrict__ exterior_count_ptr,
+    const double* __restrict__ ring_bounds,
+    int* __restrict__ out_depth,
+    int ring_count
+) {
+  const int pos = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pos >= ring_count) return;
+  const int r = sorted_ring_ids[pos];
+  if (ring_active[r] == 0) {
+    out_depth[r] = 0;
+    return;
+  }
+
+  const double px = ring_reference_x[r];
+  const double py = ring_reference_y[r];
+  const double area_r = ring_area[r] < 0.0 ? -ring_area[r] : ring_area[r];
+  int depth = 0;
+  for (int candidate_pos = group_start[pos];
+       candidate_pos < group_end[pos]; ++candidate_pos) {
+    const int c = sorted_ring_ids[candidate_pos];
+    if (c == r || ring_active[c] == 0) continue;
+    const double area_c = ring_area[c] < 0.0 ? -ring_area[c] : ring_area[c];
+    if (area_c <= area_r) continue;
+    const double* bounds = ring_bounds + c * 4;
+    if (px < bounds[0] || py < bounds[1]
+        || px > bounds[2] || py > bounds[3]) continue;
+    const int coord_start = ring_coord_offsets[c];
+    const int coord_end = coord_start + ring_edge_counts[c] + 1;
+    if (exact_ring_contains_vertex(px, py, all_x, all_y, coord_start, coord_end)) {
+      depth += 1;
+    }
+  }
+  out_depth[r] = depth;
+}
+
+// Assign each odd-depth boundary cycle to the smallest containing even-depth
+// cycle in the same source-row span.  Exterior cycles map to themselves.
+extern "C" __global__ void __launch_bounds__(256, 4)
+assign_holes_to_exteriors(
+    const double* __restrict__ ring_reference_x,
+    const double* __restrict__ ring_reference_y,
+    const double* __restrict__ ring_area,
+    const signed char* __restrict__ is_true_exterior,
+    const signed char* __restrict__ ring_active,
+    const int* __restrict__ sorted_ring_ids,
+    const int* __restrict__ group_start,
+    const int* __restrict__ group_end,
+    const int* __restrict__ ring_coord_offsets,
+    const int* __restrict__ ring_edge_counts,
+    const double* __restrict__ all_x,
+    const double* __restrict__ all_y,
+    const double* __restrict__ ring_bounds,
     int* __restrict__ out_exterior_id,
     int ring_count
 ) {
-  const int r = blockIdx.x * blockDim.x + threadIdx.x;
-  if (r >= ring_count) return;
-  if (source_rows[r] < 0) {
+  const int pos = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pos >= ring_count) return;
+  const int r = sorted_ring_ids[pos];
+  if (ring_active[r] == 0) {
     out_exterior_id[r] = -1;
     return;
   }
-  const long long exterior_count = exterior_count_ptr[0];
-  // Only true exteriors map to themselves. Nested positive-area boundary
-  // rings still need containment assignment, matching the host assembler.
   if (is_true_exterior[r] != 0) {
     out_exterior_id[r] = r;
     return;
   }
-  // Non-exterior ring: find smallest containing exterior of the same row
-  // whose area exceeds |ring area|.
-  const double px = ring_sample_x[r];
-  const double py = ring_sample_y[r];
+  const double px = ring_reference_x[r];
+  const double py = ring_reference_y[r];
   const double abs_ring_area = ring_area[r] < 0.0 ? -ring_area[r] : ring_area[r];
-  const int row_r = source_rows[r];
   double best_area = 1e308;
   int best_exterior = -1;
-  for (long long ei = 0; ei < exterior_count; ++ei) {
-    const int ext = exterior_indices[ei];
-    if (source_rows[ext] != row_r) continue;
-    const double ext_area = ring_area[ext];
-    if (ext_area <= 0.0 || ext_area >= best_area) continue;
-    // Exterior must be strictly larger than the candidate ring
+  for (int candidate_pos = group_start[pos];
+       candidate_pos < group_end[pos]; ++candidate_pos) {
+    const int ext = sorted_ring_ids[candidate_pos];
+    if (is_true_exterior[ext] == 0) continue;
+    const double ext_area = ring_area[ext] < 0.0 ? -ring_area[ext] : ring_area[ext];
+    if (ext_area >= best_area) continue;
     if (ext_area <= abs_ring_area) continue;
-    // PIP test against exterior ring coordinates
+    const double* bounds = ring_bounds + ext * 4;
+    if (px < bounds[0] || py < bounds[1]
+        || px > bounds[2] || py > bounds[3]) continue;
     const int coord_start = ring_coord_offsets[ext];
     const int coord_end = coord_start + ring_edge_counts[ext] + 1;
-    if (vs_ring_contains_point(px, py, all_x, all_y, coord_start, coord_end)) {
+    if (exact_ring_contains_vertex(px, py, all_x, all_y, coord_start, coord_end)) {
       best_area = ext_area;
       best_exterior = ext;
     }
@@ -2375,8 +1900,8 @@ assign_grouped_complement_exterior_parents(
   const int group = part_group_rows[part];
   const int candidate_start = group_interior_offsets[group];
   const int candidate_end = group_interior_offsets[group + 1];
-  const double sample_x = x[start];
-  const double sample_y = y[start];
+  const double reference_x = x[start];
+  const double reference_y = y[start];
   double best_area = 1.7976931348623157e308;
   int best = -1;
   for (int h = candidate_start; h < candidate_end; ++h) {
@@ -2390,8 +1915,8 @@ assign_grouped_complement_exterior_parents(
     const int hole_ring = interior_ring_ids[h];
     const int hole_start = ring_offsets[hole_ring];
     const int hole_end = ring_offsets[hole_ring + 1];
-    if (!vs_ring_contains_point(
-            sample_x, sample_y, x, y, hole_start, hole_end)) {
+    if (!exact_ring_contains_vertex(
+            reference_x, reference_y, x, y, hole_start, hole_end)) {
       continue;
     }
     if (area < best_area || best < 0 || h < best) {
@@ -2400,61 +1925,6 @@ assign_grouped_complement_exterior_parents(
     }
   }
   out_parent_interior[part] = best;
-}
-
-// Count nesting depth among sibling holes assigned to the same exterior.
-// For each ring r that has been assigned to an exterior (exterior_id[r] >= 0
-// and exterior_id[r] != r), count how many other rings sharing the same
-// exterior with strictly larger |area| contain r's sample point.
-// Even local depth -> direct hole; odd -> nested inside another hole (skip).
-extern "C" __global__ void __launch_bounds__(256, 4)
-count_sibling_hole_depth(
-    const double* __restrict__ sample_x,
-    const double* __restrict__ sample_y,
-    const double* __restrict__ ring_area,
-    const int* __restrict__ exterior_id,
-    const signed char* __restrict__ can_be_hole,
-    const int* __restrict__ coord_offsets,
-    const int* __restrict__ edge_counts,
-    const double* __restrict__ all_x,
-    const double* __restrict__ all_y,
-    const int* __restrict__ hole_ring_ids,
-    const long long* __restrict__ hole_count_ptr,
-    int* __restrict__ out_depth,
-    int ring_count
-) {
-  const int r = blockIdx.x * blockDim.x + threadIdx.x;
-  if (r >= ring_count) return;
-
-  const int ext_r = exterior_id[r];
-  const long long hole_count = hole_count_ptr[0];
-  // Not a hole: either unassigned or self-assigned (exterior)
-  if (ext_r < 0 || ext_r == r || can_be_hole[r] == 0 || hole_count <= 1) {
-    out_depth[r] = 0;
-    return;
-  }
-
-  const double px = sample_x[r];
-  const double py = sample_y[r];
-  const double abs_area_r = ring_area[r] < 0.0 ? -ring_area[r] : ring_area[r];
-  int depth = 0;
-
-  for (long long pos = 0; pos < hole_count; ++pos) {
-    const int c = hole_ring_ids[pos];
-    if (c == r) continue;
-    if (can_be_hole[c] == 0) continue;
-    if (exterior_id[c] != ext_r) continue;  // same exterior
-    if (exterior_id[c] == c) continue;       // c is the exterior itself
-    // c must have strictly larger |area|
-    const double abs_area_c = ring_area[c] < 0.0 ? -ring_area[c] : ring_area[c];
-    if (abs_area_c <= abs_area_r) continue;
-
-    // PIP test: does ring c contain (px, py)?
-    const int cs = coord_offsets[c];
-    const int ce = cs + edge_counts[c] + 1;
-    if (vs_ring_contains_point(px, py, all_x, all_y, cs, ce)) depth += 1;
-  }
-  out_depth[r] = depth;
 }
 
 // Ring membership is already known at structural capacity. Scatter holes into
@@ -2485,10 +1955,11 @@ _OVERLAY_FACE_ASSEMBLY_KERNEL_NAMES = (
     "scatter_boundary_ring_coordinates",
     "compute_centered_boundary_ring_areas",
     "compute_ring_sample_points",
+    "locate_boundary_ring_group_spans",
+    "count_boundary_ring_containment_depth",
     "assign_holes_to_exteriors",
     "grouped_complement_hole_metrics",
     "assign_grouped_complement_exterior_parents",
-    "count_sibling_hole_depth",
     "scatter_output_holes",
 )
 

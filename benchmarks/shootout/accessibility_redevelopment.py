@@ -28,7 +28,8 @@ MAX_NEAREST_DISTANCE_M = 1_800.0
 TRANSIT_BUFFER_M = 900.0
 SIMPLIFY_TOLERANCE_M = 25.0
 
-tmpdir = Path(tempfile.mkdtemp(prefix="shootout_accessibility_redevelopment_"))
+_tmpdir = tempfile.TemporaryDirectory(prefix="shootout_accessibility_redevelopment_")
+tmpdir = Path(_tmpdir.name)
 fixtures = setup_fixtures(tmpdir)
 
 # --- timed work starts here ---

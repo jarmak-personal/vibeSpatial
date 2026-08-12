@@ -184,9 +184,18 @@ class NativeIndexPlan:
     selection_source_token: str | None = None
     selection_source_row_count: int | None = None
     selection_positions: Any | None = None
+    selection_grouped: bool = False
 
     @classmethod
     def from_index(cls, index: pd.Index) -> NativeIndexPlan:
+        # MultiIndex intentionally has no single backing array. Native public
+        # index carriers are single-level ExtensionArrays, so only probe that
+        # structural domain for an embedded plan.
+        index_array = index.array if index.nlevels == 1 else None
+        embedded_plan = getattr(index_array, "index_plan", None)
+        if isinstance(embedded_plan, cls):
+            embedded_plan.validate_length(len(index))
+            return replace(embedded_plan, name=index.name)
         if isinstance(index, pd.RangeIndex):
             return cls(
                 kind="range",
@@ -396,6 +405,7 @@ class NativeIndexPlan:
         source_token: str,
         source_row_count: int,
         unique: bool,
+        grouped: bool = False,
     ) -> NativeIndexPlan:
         """Attach source-frame row positions for native public label selection."""
         return replace(
@@ -403,6 +413,7 @@ class NativeIndexPlan:
             selection_source_token=source_token,
             selection_source_row_count=int(source_row_count),
             selection_positions=row_positions,
+            selection_grouped=bool(grouped),
             has_duplicates=self.has_duplicates or not bool(unique),
         )
 
@@ -765,6 +776,41 @@ class NativeDeviceSelection:
             trusted_all_valid_rows=self.trusted_all_valid_rows,
         )
 
+    def remap_source_positions(
+        self,
+        source_positions: Any,
+        *,
+        source_token: str,
+        source_row_count: int,
+    ) -> NativeDeviceSelection:
+        """Map a capacity partition into an enclosing source-row domain.
+
+        ``source_positions`` maps every row in the current source domain to a
+        row in the enclosing domain. The complete stable partition is mapped,
+        including its inactive tail, so downstream concatenation can preserve
+        row indirection without a cardinality fence.
+        """
+        import cupy as cp
+
+        d_source_positions = cp.asarray(source_positions, dtype=cp.int64)
+        if d_source_positions.ndim != 1 or int(d_source_positions.size) != int(
+            self.source_row_count if self.source_row_count is not None else -1
+        ):
+            raise ValueError("selection source-position map must match its source domain")
+        return type(self)(
+            positions=d_source_positions[
+                cp.asarray(self.partition_capacity_positions(), dtype=cp.int64)
+            ],
+            logical_count=self.logical_count,
+            source_token=source_token,
+            source_row_count=int(source_row_count),
+            ordered=self.ordered,
+            unique=self.unique,
+            full_selection_implies_identity=False,
+            geometry_family_domain=self.geometry_family_domain,
+            trusted_all_valid_rows=self.trusted_all_valid_rows,
+        )
+
     def _host_logical_count(
         self,
         *,
@@ -1100,6 +1146,32 @@ class NativeRowSet:
 
     def difference(self, other: NativeRowSet) -> NativeRowSet:
         return self._combine(other, "difference")
+
+    def complement(self) -> NativeRowSet:
+        """Return source rows absent from this rowset without host export."""
+        if self.source_row_count is None:
+            raise ValueError("NativeRowSet complement requires source_row_count")
+
+        source_row_count = int(self.source_row_count)
+        _validate_rowset_bounds_if_host(self, source_row_count)
+        xp = _array_namespace_for(self.positions)
+        if self._is_full_identity(source_row_count):
+            positions = xp.empty(0, dtype=xp.int64)
+        elif len(self) == 0:
+            positions = xp.arange(source_row_count, dtype=xp.int64)
+        else:
+            mask = xp.ones(source_row_count, dtype=xp.bool_)
+            mask[_as_position_array(self.positions, xp)] = False
+            positions = xp.nonzero(mask)[0].astype(xp.int64, copy=False)
+
+        return type(self).from_positions(
+            positions,
+            source_token=self.source_token,
+            source_row_count=source_row_count,
+            ordered=True,
+            unique=True,
+            identity=len(self) == 0,
+        )
 
     def to_host_positions(
         self,

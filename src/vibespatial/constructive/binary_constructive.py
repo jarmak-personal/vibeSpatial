@@ -50,7 +50,9 @@ from vibespatial.geometry.owned import (
     _device_take_family_buffer,
     build_device_resident_owned,
     device_concat_owned_scatter,
+    device_physicalize_owned_row_selections_exact,
     device_select_owned_capacity_partitions,
+    device_take_owned_capacity_selection,
     device_take_owned_family_capacity_selection,
     from_shapely_geometries,
     seed_all_validity_cache,
@@ -101,6 +103,22 @@ _DIRECT_MULTIPART_PACK_MAX_PAIR_PROBE = 512
 # union carrier instead of spending another relation refine proving they need it.
 _DIRECT_MULTIPART_PACK_MAX_EXACT_REFINE_PAIRS = 64
 
+# A direct-pack admission is optional work ahead of collective topology. Bound
+# its worst-case segment relation to one candidate page so proving the shortcut
+# cannot cost more than the constructive plan it is intended to avoid.
+_DIRECT_MULTIPART_PACK_MAX_EXACT_REFINE_SEGMENT_PAIRS = 8 * 1024 * 1024
+
+# Above this physical shape, repeating a scalar mask's complete boundary in
+# every logical topology row is categorically the wrong plan. Prepare the one
+# physical boundary and prove pass-through/exterior rows before topology.
+_BROADCAST_PREPARED_MASK_MIN_PHYSICAL_SEGMENTS = 2048
+_BROADCAST_PREPARED_MASK_MIN_LOGICAL_SEGMENTS = 2 * 1024 * 1024
+
+# Keep the fixed-capacity simple-polygon coordinate workspace bounded while
+# chunk outputs and upstream native frames remain resident. The planner's row
+# hint is additionally capped by this physical byte budget.
+_POLYGON_INTERSECTION_CHUNK_WORKSPACE_BYTES = 192 * 1024 * 1024
+
 # Overlay can emit sub-microscopic near-collinear polygons that are valid but
 # have no material area contribution at projected-coordinate scale.  If exact
 # partition union cannot produce polygon pieces for such a pair, preserve the
@@ -117,6 +135,19 @@ def _device_take_unique_rowset(
         allow_capacity_allocation=True,
         assume_unique_indices=True,
     )
+
+
+def _polygon_constructive_chunk_rows(planned_rows: int) -> int:
+    from vibespatial.kernels.constructive.polygon_simple_intersection import (
+        polygon_simple_intersection_workspace_bytes_per_row,
+    )
+
+    workspace_rows = max(
+        1,
+        _POLYGON_INTERSECTION_CHUNK_WORKSPACE_BYTES
+        // polygon_simple_intersection_workspace_bytes_per_row(),
+    )
+    return max(1, min(int(planned_rows), int(workspace_rows)))
 
 
 # Full OGC validity for complex face-assembled multipolygons is an O(ring^2)
@@ -582,7 +613,7 @@ def _dispatch_partitioned_polygon_intersection_gpu(
 
     from vibespatial.api._native_rowset import NativeDeviceSelection
     from vibespatial.constructive.envelope import _build_device_boxes_from_bounds
-    from vibespatial.geometry.owned import device_scatter_owned_capacity_selection
+    from vibespatial.geometry.owned import device_scatter_owned_capacity_selections_many
     from vibespatial.kernels.constructive.polygon_intersection import (
         polygon_intersection,
         polygon_intersection_sh_eligible_mask,
@@ -933,19 +964,16 @@ def _dispatch_partitioned_polygon_intersection_gpu(
     if exact_result is None or exact_result.row_count != row_count:
         return None
 
-    result = _empty_device_constructive_output(row_count)
-    for replacement, selection in (
-        (right_rect_result, right_rect_selection),
-        (left_rect_result, left_rect_selection),
-        (sh_result, sh_selection),
-        (swapped_sh_result, swapped_sh_selection),
-        (exact_result, exact_selection),
-    ):
-        result = device_scatter_owned_capacity_selection(
-            result,
-            replacement,
-            selection,
-        )
+    result = device_scatter_owned_capacity_selections_many(
+        _empty_device_constructive_output(row_count),
+        [
+            (right_rect_result, right_rect_selection, None),
+            (left_rect_result, left_rect_selection, None),
+            (sh_result, sh_selection, None),
+            (swapped_sh_result, swapped_sh_selection, None),
+            (exact_result, exact_selection, None),
+        ],
+    )
 
     def _scatter_metadata(base, values, selection: NativeDeviceSelection):
         d_base = cp.asarray(base, dtype=cp.bool_)
@@ -1040,6 +1068,74 @@ def _dispatch_partitioned_polygon_intersection_gpu(
     return result
 
 
+def _dispatch_chunked_polygon_intersection_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    chunk_rows: int,
+    dispatch_mode: ExecutionMode,
+):
+    """Execute aligned polygon intersections in bounded device workspaces."""
+    if cp is None or left.row_count != right.row_count:
+        return None
+    row_count = int(left.row_count)
+    chunk_rows = int(chunk_rows)
+    if chunk_rows <= 0:
+        raise ValueError("polygon intersection chunk_rows must be positive")
+
+    from vibespatial.api._native_result_core import (
+        GeometryNativeResult,
+        NativeGeometryComposition,
+    )
+
+    chunks = []
+    for start in range(0, row_count, chunk_rows):
+        stop = min(start + chunk_rows, row_count)
+        d_rows = cp.arange(start, stop, dtype=cp.int64)
+        left_chunk = left._device_indexed_take(
+            d_rows,
+            assume_unique_indices=True,
+        )
+        right_chunk = right._device_indexed_take(
+            d_rows,
+            assume_unique_indices=True,
+        )
+        chunk = _dispatch_partitioned_polygon_intersection_gpu(
+            left_chunk,
+            right_chunk,
+            dispatch_mode=dispatch_mode,
+        )
+        if chunk is None or int(chunk.row_count) != stop - start:
+            return None
+        # The partition dispatcher returns a row-indirected scatter view whose
+        # expanded metadata already addresses its exact shared family buffers.
+        # A completed chunk is the ownership boundary: detach that metadata
+        # carrier so its inactive scatter root can be released immediately.
+        chunk.detach_expanded_device_view()
+        chunks.append(GeometryNativeResult.from_owned(chunk, crs=None))
+
+    result = GeometryNativeResult.from_composition(
+        NativeGeometryComposition.concat(chunks, crs=None),
+        crs=None,
+    )
+    record_dispatch_event(
+        surface="vibespatial.constructive.binary",
+        operation="intersection",
+        implementation="chunked_polygon_intersection_composition_gpu",
+        reason=(
+            "aligned polygon relation exceeded its bounded device workspace "
+            "and retained chunk outputs in a contiguous native composition"
+        ),
+        detail=(
+            f"rows={row_count}; chunk_rows={chunk_rows}; "
+            f"chunks={len(chunks)}; workload_shape=bounded_relation_chunks"
+        ),
+        requested=dispatch_mode,
+        selected=ExecutionMode.GPU,
+    )
+    return result
+
+
 def broadcast_right_polygon_intersection_capacity_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
@@ -1071,6 +1167,27 @@ def broadcast_right_polygon_intersection_capacity_gpu(
         right_one = right
     else:
         right_one = right.device_take(cp.asarray([right_row], dtype=cp.int64))
+
+    right_segment_span = _polygon_segment_span_bound(right_one)
+    if (
+        right_segment_span is not None
+        and int(right_segment_span) >= _BROADCAST_PREPARED_MASK_MIN_PHYSICAL_SEGMENTS
+        and int(right_segment_span) * int(left.row_count)
+        >= _BROADCAST_PREPARED_MASK_MIN_LOGICAL_SEGMENTS
+    ):
+        prepared_result = _dispatch_prepared_polygon_intersection_broadcast_right_gpu(
+            left,
+            right_one,
+            dispatch_mode=dispatch_mode,
+        )
+        if prepared_result is not None:
+            prepared_result._aligned_left_pairs_owned = left
+            prepared_result._aligned_right_pairs_owned = tile_single_row(
+                right_one,
+                int(left.row_count),
+            )
+            return prepared_result
+
     right_capacity = tile_single_row(right_one, int(left.row_count))
     result = _dispatch_partitioned_polygon_intersection_gpu(
         left,
@@ -1082,6 +1199,133 @@ def broadcast_right_polygon_intersection_capacity_gpu(
         return None
     result._aligned_left_pairs_owned = left
     result._aligned_right_pairs_owned = right_capacity
+    return result
+
+
+def _dispatch_prepared_polygon_intersection_broadcast_right_gpu(
+    left: OwnedGeometryArray,
+    right_one: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode,
+) -> OwnedGeometryArray | None:
+    """Partition one-mask intersections by sparse boundary evidence.
+
+    Contained rows pass through unchanged and exterior rows become valid empty
+    polygons. Rows whose bounds overlap a physical mask segment remain in a
+    row-aligned device capacity while exact topology masks inactive lanes.
+    """
+    if cp is None or int(right_one.row_count) != 1:
+        return None
+
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+    from vibespatial.geometry.owned import build_empty_polygon_rows_device
+    from vibespatial.spatial.prepared_polygon_mask import (
+        PreparedPolygonMask,
+        prepared_polygon_mask_fp64_plan,
+    )
+
+    prepared = PreparedPolygonMask.from_owned(
+        right_one,
+        precision_plan=prepared_polygon_mask_fp64_plan(),
+    )
+    if prepared is None:
+        return None
+    classification = prepared.classify_polygon_rows(left)
+    if classification is None:
+        return None
+
+    row_count = int(left.row_count)
+    d_valid = cp.asarray(classification.valid, dtype=cp.bool_)
+    d_covered = cp.asarray(classification.covered_by, dtype=cp.bool_)
+    d_unresolved = cp.asarray(
+        classification.boundary_unresolved,
+        dtype=cp.bool_,
+    )
+    unresolved_selection = NativeDeviceSelection.from_mask(
+        d_unresolved,
+        source_row_count=row_count,
+    )
+    result = build_empty_polygon_rows_device(row_count, validity=d_valid)
+    result = device_select_owned_capacity_partitions(
+        result,
+        [(left, d_covered)],
+    )
+
+    exact_capacity = device_take_owned_capacity_selection(
+        left,
+        unresolved_selection,
+    )
+    (exact_left,) = device_physicalize_owned_row_selections_exact(
+        [(exact_capacity, unresolved_selection.active_capacity_mask())],
+        reason="prepared broadcast exact topology allocation packet",
+        compact_concrete_prefix=True,
+    )
+    exact_result = None
+    d_exact_rows = cp.empty(0, dtype=cp.int64)
+    if exact_left is not None:
+        exact_result = _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
+            exact_left,
+            right_one,
+            dispatch_mode=dispatch_mode,
+        )
+        if exact_result is None or int(exact_result.row_count) != int(exact_left.row_count):
+            return None
+        d_exact_rows = cp.asarray(
+            unresolved_selection.positions[: exact_result.row_count],
+            dtype=cp.int64,
+        )
+        result = device_concat_owned_scatter(
+            result,
+            exact_result,
+            d_exact_rows,
+        )
+
+    def _scatter_exact_metadata(name: str, *, base):
+        d_values = cp.asarray(base, dtype=cp.bool_).copy()
+        if exact_result is None:
+            return d_values
+        exact_values = getattr(exact_result, name, None)
+        if exact_values is not None:
+            d_values[d_exact_rows] = cp.asarray(exact_values, dtype=cp.bool_)
+        return d_values
+
+    result._polygon_rect_exact_polygon_only = _scatter_exact_metadata(
+        "_polygon_rect_exact_polygon_only",
+        base=d_covered,
+    )
+    result._polygon_intersection_exact_area = _scatter_exact_metadata(
+        "_polygon_intersection_exact_area",
+        base=d_covered,
+    )
+    result._polygon_rect_boundary_overlap = _scatter_exact_metadata(
+        "_polygon_rect_boundary_overlap",
+        base=cp.zeros(row_count, dtype=cp.bool_),
+    )
+    result._polygon_intersection_lower_dimensional_remnant = _scatter_exact_metadata(
+        "_polygon_intersection_lower_dimensional_remnant",
+        base=cp.zeros(row_count, dtype=cp.bool_),
+    )
+    result._many_vs_one_containment_passthrough_mask = d_covered
+    result._many_vs_one_left_containment_bypass_applied = True
+    _apply_polygonal_device_row_segment_bound(
+        result,
+        _polygon_segment_span_bound(left),
+    )
+    record_dispatch_event(
+        surface="vibespatial.constructive.binary",
+        operation="intersection",
+        requested=dispatch_mode,
+        selected=ExecutionMode.GPU,
+        implementation="prepared_broadcast_mask_capacity_partition_gpu",
+        reason=(
+            "one physical polygon mask classified contained, exterior, and "
+            "boundary-unresolved rows before exact topology"
+        ),
+        detail=(
+            f"rows={row_count}; exact_rows={int(d_exact_rows.size)}; "
+            "workload_shape=sparse_boundary_relation_plus_exact_physicalization"
+        ),
+    )
     return result
 
 
@@ -2127,6 +2371,18 @@ def _native_grouped_strict_disjoint_mask_gpu(
     if pair_capacity == 0:
         return (d_counts > 0) & (d_counts <= max_group_size) & d_all_rows_valid
 
+    source_segment_span = _polygon_segment_span_bound(valid_parts)
+    if source_segment_span is None:
+        return None
+    segment_pair_bound = (
+        group_count
+        * pair_capacity
+        * int(source_segment_span)
+        * int(source_segment_span)
+    )
+    if segment_pair_bound > _DIRECT_MULTIPART_PACK_MAX_EXACT_REFINE_SEGMENT_PAIRS:
+        return None
+
     d_left_slots, d_right_slots = cp.triu_indices(max_group_size, k=1)
     d_pair_valid = (d_left_slots[None, :] < d_counts[:, None]) & (
         d_right_slots[None, :] < d_counts[:, None]
@@ -2402,7 +2658,7 @@ def _pack_native_grouped_disjoint_polygon_parts_gpu(
 
 
 def _polygon_segment_span_bound(owned: OwnedGeometryArray) -> int | None:
-    """Return a host-known per-row polygon segment bound without D2H scans."""
+    """Return a host-known per-row segment bound without D2H scans."""
     carried_bound = getattr(
         owned,
         "_active_family_row_segment_capacity_bound",
@@ -2415,16 +2671,44 @@ def _polygon_segment_span_bound(owned: OwnedGeometryArray) -> int | None:
         if base_bound is not None:
             owned._active_family_row_segment_capacity_bound = int(base_bound)
             return int(base_bound)
-    if set(owned.families) != {GeometryFamily.POLYGON}:
-        return None
     device_state = getattr(owned, "device_state", None)
-    if device_state is not None and set(device_state.families) == {GeometryFamily.POLYGON}:
-        device_buffer = device_state.families.get(GeometryFamily.POLYGON)
-        width = None if device_buffer is None else device_buffer.dense_single_ring_width
-        if width is not None and int(width) > 1:
-            bound = int(width) - 1
+    if device_state is not None:
+        segment_families = {
+            GeometryFamily.LINESTRING,
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTILINESTRING,
+            GeometryFamily.MULTIPOLYGON,
+        }
+        family_bounds: list[int] = []
+        for family, device_buffer in device_state.families.items():
+            if family not in segment_families:
+                continue
+            width = getattr(device_buffer, "dense_single_ring_width", None)
+            if family is GeometryFamily.POLYGON and width is not None and int(width) > 1:
+                family_bounds.append(int(width) - 1)
+                continue
+            fixed_size = getattr(device_buffer, "fixed_size", None)
+            coord_bound = (
+                None
+                if fixed_size is None
+                else getattr(fixed_size, "max_coord_count_per_row", None)
+            )
+            if coord_bound is None:
+                family_bounds = []
+                break
+            family_bounds.append(max(int(coord_bound), 0))
+        if family_bounds:
+            bound = max(family_bounds)
             owned._active_family_row_segment_capacity_bound = bound
             return bound
+        from vibespatial.geometry.owned import ensure_device_geometry_size_bounds
+
+        return ensure_device_geometry_size_bounds(
+            owned,
+            reason="constructive device geometry row-size planning packet",
+        )
+    if set(owned.families) != {GeometryFamily.POLYGON}:
+        return None
     buffer = owned.families.get(GeometryFamily.POLYGON)
     if buffer is None:
         return None
@@ -2614,15 +2898,21 @@ def _assemble_sorted_polygon_part_capacity_gpu(
         d_part_ring_starts[d_ring_part_rows] + d_ring_local,
         cp.int64(0),
     ).astype(cp.int32, copy=False)
-    d_edge_counts = cp.maximum(
-        d_ring_offsets[1:] - d_ring_offsets[:-1] - 1,
-        0,
+    d_sorted_output_edge_counts = cp.where(
+        d_ring_active,
+        cp.maximum(
+            d_ring_offsets[d_sorted_output_ids.astype(cp.int64, copy=False) + 1]
+            - d_ring_offsets[d_sorted_output_ids.astype(cp.int64, copy=False)]
+            - 1,
+            0,
+        ),
+        cp.int64(0),
     ).astype(cp.int32, copy=False)
     return _build_device_resident_polygon_output(
         d_all_x=cp.asarray(polygon_buffer.x, dtype=cp.float64),
         d_all_y=cp.asarray(polygon_buffer.y, dtype=cp.float64),
         d_all_coord_offsets=d_ring_offsets,
-        d_all_edge_counts=d_edge_counts,
+        d_all_edge_counts=None,
         d_sorted_output_ids=d_sorted_output_ids,
         d_rings_per_poly=d_rings_per_part,
         d_polys_per_row=cp.asarray(d_part_counts, dtype=cp.int32),
@@ -2637,6 +2927,7 @@ def _assemble_sorted_polygon_part_capacity_gpu(
         preserve_row_count=output_row_count,
         d_valid_empty_rows=d_valid_empty_rows,
         coord_capacity=coord_capacity,
+        d_sorted_output_edge_counts=d_sorted_output_edge_counts,
     )
 
 
@@ -3195,6 +3486,12 @@ def _indexed_polygonal_part_capacities(
     max_coords_per_row: int | None = None,
 ) -> list[tuple[OwnedGeometryArray, DeviceArray, DeviceArray, int, int]] | None:
     """Expose indexed Polygon parts through logical row/part-slot capacity."""
+    from vibespatial.geometry.owned import ensure_device_geometry_size_bounds
+
+    ensure_device_geometry_size_bounds(
+        owned,
+        reason="constructive indexed polygon-part size planning packet",
+    )
     carried_segment_bound = _polygon_segment_span_bound(owned)
     if carried_segment_bound is not None:
         if max_parts_per_row is None:
@@ -4444,6 +4741,7 @@ def _dispatch_grouped_polygon_noded_coverage_union_gpu(
     )
 
 
+
 def _dispatch_row_aligned_polygon_known_coverage_union_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
@@ -4869,7 +5167,6 @@ def _dispatch_polygon_partition_union_gpu(
             )
         )
 
-    if _partition_disjoint:
         pair_sources = OwnedGeometryArray.concat([left, right])
         d_rows = cp.arange(row_count, dtype=cp.int64)
         d_pair_order = cp.empty(row_count * 2, dtype=cp.int64)
@@ -5380,59 +5677,40 @@ def _apply_binary_empty_row_semantics_gpu(
     from vibespatial.geometry.owned import device_mask_owned_capacity
 
     if isinstance(result, GeometryNativeResult):
-        native_parts = [result.mask_capacity(d_core)]
+        fallback_sources = []
         if op in {"union", "symmetric_difference"}:
-            native_parts.extend(
+            fallback_sources.extend(
                 [
-                    GeometryNativeResult.from_owned(
-                        device_mask_owned_capacity(
-                            left,
-                            d_both_valid & ~d_right_nonempty,
-                        ),
-                        crs=result.crs,
-                    ),
-                    GeometryNativeResult.from_owned(
-                        device_mask_owned_capacity(
-                            right,
-                            d_both_valid & d_right_nonempty & ~d_left_nonempty,
-                        ),
-                        crs=result.crs,
-                    ),
+                    (left, d_both_valid & ~d_right_nonempty),
+                    (right, d_both_valid & d_right_nonempty & ~d_left_nonempty),
                 ]
             )
         elif op == "difference":
-            native_parts.append(
-                GeometryNativeResult.from_owned(
-                    device_mask_owned_capacity(
-                        left,
-                        d_both_valid & (~d_left_nonempty | ~d_right_nonempty),
-                    ),
-                    crs=result.crs,
-                )
+            fallback_sources.append(
+                (left, d_both_valid & (~d_left_nonempty | ~d_right_nonempty))
             )
         elif op == "intersection":
-            native_parts.extend(
+            fallback_sources.extend(
                 [
-                    GeometryNativeResult.from_owned(
-                        device_mask_owned_capacity(
-                            left,
-                            d_both_valid & ~d_left_nonempty,
-                        ),
-                        crs=result.crs,
-                    ),
-                    GeometryNativeResult.from_owned(
-                        device_mask_owned_capacity(
-                            right,
-                            d_both_valid & d_left_nonempty & ~d_right_nonempty,
-                        ),
-                        crs=result.crs,
-                    ),
+                    (left, d_both_valid & ~d_left_nonempty),
+                    (right, d_both_valid & d_left_nonempty & ~d_right_nonempty),
                 ]
             )
         else:  # pragma: no cover - guarded by the public operation contract
             return result
+
+        core = result.mask_capacity(d_core)
+        fallback_parts = [core]
+        for source, d_mask in fallback_sources:
+            source_part = device_mask_owned_capacity(
+                source,
+                d_mask,
+            )
+            fallback_parts.append(
+                GeometryNativeResult.from_owned(source_part, crs=result.crs)
+            )
         return _compose_aligned_native_geometries(
-            native_parts,
+            fallback_parts,
             row_count=result.row_count,
             crs=result.crs,
         )
@@ -5654,7 +5932,8 @@ def _binary_constructive_gpu(
     *,
     dispatch_mode: ExecutionMode = ExecutionMode.GPU,
     _cached_right_segments: DeviceSegmentTable | None = None,
-) -> OwnedGeometryArray | None:
+    _chunk_rows: int | None = None,
+) -> object | None:
     """GPU binary constructive for all family combinations.
 
     Dispatches to specialized GPU kernels based on the geometry family
@@ -5760,6 +6039,16 @@ def _binary_constructive_gpu(
             return result
 
         if op == "intersection":
+            if _chunk_rows is not None and left.row_count > int(_chunk_rows):
+                result = _dispatch_chunked_polygon_intersection_gpu(
+                    left,
+                    right,
+                    chunk_rows=int(_chunk_rows),
+                    dispatch_mode=dispatch_mode,
+                )
+                if result is None or result.row_count != left.row_count:
+                    return None
+                return result
             result = _dispatch_partitioned_polygon_intersection_gpu(
                 left,
                 right,
@@ -5891,9 +6180,8 @@ def _binary_constructive_result(
     precision: PrecisionMode | str = PrecisionMode.AUTO,
     _cached_right_segments: DeviceSegmentTable | None = None,
     workload_shape: WorkloadShape | None = None,
-    _return_native_geometry: bool = False,
 ):
-    """Element-wise binary constructive operation on owned arrays.
+    """Return an element-wise constructive result through the native carrier.
 
     Uses the standard dispatch framework: ``plan_dispatch_selection`` for
     GPU/CPU routing, ``select_precision_plan`` for precision, and
@@ -5937,8 +6225,6 @@ def _binary_constructive_result(
 
     if left.row_count == 0:
         empty = from_shapely_geometries([])
-        if not _return_native_geometry:
-            return empty
         from vibespatial.api._native_result_core import GeometryNativeResult
 
         return GeometryNativeResult.from_owned(empty, crs=None)
@@ -5993,6 +6279,9 @@ def _binary_constructive_result(
             right,
             dispatch_mode=selection.selected,
             _cached_right_segments=_cached_right_segments,
+            _chunk_rows=_polygon_constructive_chunk_rows(
+                int(selection.chunk_rows),
+            ),
         )
         if result is not None:
             result = _apply_binary_empty_row_semantics_gpu(
@@ -6028,13 +6317,6 @@ def _binary_constructive_result(
                 if isinstance(result, GeometryNativeResult)
                 else GeometryNativeResult.from_owned(result, crs=None)
             )
-            if not _return_native_geometry and native_result.owned is None:
-                raise NotImplementedError(
-                    "binary_constructive_owned cannot represent a native geometry "
-                    "composition; use binary_constructive_native"
-                )
-            else:
-                selected_result = native_result if _return_native_geometry else native_result.owned
         if result is not None:
             record_dispatch_event(
                 surface=f"geopandas.array.{op}",
@@ -6049,7 +6331,7 @@ def _binary_constructive_result(
                 requested=selection.requested,
                 selected=ExecutionMode.GPU,
             )
-            return selected_result
+            return native_result
 
     # CPU fallback: Shapely element-wise
     if grid_size is not None:
@@ -6090,11 +6372,48 @@ def _binary_constructive_result(
         requested=selection.requested,
         selected=ExecutionMode.CPU,
     )
-    if not _return_native_geometry:
-        return result
     from vibespatial.api._native_result_core import GeometryNativeResult
 
     return GeometryNativeResult.from_owned(result, crs=None)
+
+
+def _physicalize_binary_constructive_owned_boundary(native_result):
+    """Cross the named legacy-owned boundary for a singular native result.
+
+    Native constructive execution retains partitioned dynamic output.  Callers
+    whose contract still requires one ``OwnedGeometryArray`` cross that shape
+    boundary here, never through result inspection or an incidental property.
+    """
+    owned = native_result.cached_owned()
+    if owned is not None:
+        return owned
+    composition = native_result.composition
+    if composition is None:
+        raise NotImplementedError(
+            "binary constructive result has no device-owned geometry carrier"
+        )
+    owned = composition._singular_owned_device()
+    if owned is None:
+        raise NotImplementedError(
+            "binary_constructive_owned requires at most one concrete geometry per row; "
+            "use binary_constructive_native for heterogeneous compositions"
+        )
+    record_dispatch_event(
+        surface="vibespatial.constructive.binary",
+        operation="owned_physicalization_boundary",
+        implementation="binary_constructive_owned_composition_physicalization",
+        reason=(
+            "legacy owned caller explicitly physicalized a singular native "
+            "geometry composition"
+        ),
+        detail=(
+            f"rows={native_result.row_count}; parts={len(composition.parts)}; "
+            "workload_shape=terminal_owned_physicalization"
+        ),
+        requested=ExecutionMode.GPU,
+        selected=ExecutionMode.GPU,
+    )
+    return owned
 
 
 def binary_constructive_owned(
@@ -6108,17 +6427,18 @@ def binary_constructive_owned(
     _cached_right_segments: DeviceSegmentTable | None = None,
     workload_shape: WorkloadShape | None = None,
 ) -> OwnedGeometryArray:
-    """Return a constructive result representable by owned geometry families."""
-    return _binary_constructive_result(
-        op,
-        left,
-        right,
-        grid_size=grid_size,
-        dispatch_mode=dispatch_mode,
-        precision=precision,
-        _cached_right_segments=_cached_right_segments,
-        workload_shape=workload_shape,
-        _return_native_geometry=False,
+    """Return a constructive result at the explicit legacy-owned boundary."""
+    return _physicalize_binary_constructive_owned_boundary(
+        _binary_constructive_result(
+            op,
+            left,
+            right,
+            grid_size=grid_size,
+            dispatch_mode=dispatch_mode,
+            precision=precision,
+            _cached_right_segments=_cached_right_segments,
+            workload_shape=workload_shape,
+        )
     )
 
 
@@ -6129,12 +6449,9 @@ def binary_constructive_native(
     **kwargs,
 ):
     """Return binary constructive geometry through the native result boundary."""
-    if "_return_native_geometry" in kwargs:
-        raise TypeError("native constructive callers cannot override result mode")
     return _binary_constructive_result(
         op,
         left,
         right,
-        _return_native_geometry=True,
         **kwargs,
     )

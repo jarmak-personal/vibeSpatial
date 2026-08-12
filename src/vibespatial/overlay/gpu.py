@@ -43,6 +43,7 @@ from vibespatial.spatial.segment_primitives import (  # noqa: E402
     DeviceBroadcastSegmentRelation,
     DeviceSegmentTable,
     SegmentIntersectionResult,
+    _extract_segments_gpu,
 )
 
 from .types import (  # noqa: E402, F401  # Re-exported for backward compatibility
@@ -79,9 +80,13 @@ class _RowIsolatedTopologyPageShape:
     rows_per_page: int
     live_event_budget: int
     worst_live_events_per_row: int
+    complete_row_spans: tuple[tuple[int, int], ...] | None = None
+    total_live_events: int | None = None
 
     @property
     def page_count(self) -> int:
+        if self.complete_row_spans is not None:
+            return len(self.complete_row_spans)
         return (self.row_count + self.rows_per_page - 1) // self.rows_per_page
 
     @property
@@ -89,6 +94,8 @@ class _RowIsolatedTopologyPageShape:
         return self.worst_live_events_per_row > self.live_event_budget
 
     def row_spans(self) -> tuple[tuple[int, int], ...]:
+        if self.complete_row_spans is not None:
+            return self.complete_row_spans
         return tuple(
             (start, min(start + self.rows_per_page, self.row_count))
             for start in range(0, self.row_count, self.rows_per_page)
@@ -149,6 +156,127 @@ def _row_isolated_topology_page_shape(
     )
 
 
+def _compact_bounded_device_work_spans(
+    row_live_events,
+    *,
+    live_event_budget: int,
+    initial_span_limit: int = 256,
+) -> tuple[tuple[int, int], ...]:
+    """Pack exact device row weights into bounded complete-row spans.
+
+    Only compact span totals cross to the host.  Overweight spans are refined
+    on device until they fit or contain one intrinsically oversized row.
+    """
+    d_work = cp.asarray(row_live_events, dtype=cp.int64)
+    row_count = int(d_work.size)
+    if row_count == 0:
+        return ()
+    budget = max(int(live_event_budget), 1)
+    d_prefix = cp.empty(row_count + 1, dtype=cp.int64)
+    d_prefix[0] = 0
+    d_prefix[1:] = cp.cumsum(d_work, dtype=cp.int64)
+
+    initial_count = min(max(int(initial_span_limit), 1), row_count)
+    width = (row_count + initial_count - 1) // initial_count
+    pending = [
+        (start, min(start + width, row_count))
+        for start in range(0, row_count, width)
+    ]
+    leaves: list[tuple[int, int, int]] = []
+    runtime = get_cuda_runtime()
+    while pending:
+        d_starts = cp.asarray([span[0] for span in pending], dtype=cp.int64)
+        d_ends = cp.asarray([span[1] for span in pending], dtype=cp.int64)
+        host_weights = runtime.copy_device_to_host(
+            d_prefix[d_ends] - d_prefix[d_starts],
+            reason="overlay compact topology page-weight planning packet",
+        )
+        refine: list[tuple[int, int]] = []
+        for (start, end), weight in zip(pending, host_weights, strict=True):
+            resolved_weight = int(weight)
+            if resolved_weight <= budget or end - start <= 1:
+                leaves.append((start, end, resolved_weight))
+            else:
+                midpoint = start + (end - start) // 2
+                refine.extend(((start, midpoint), (midpoint, end)))
+        pending = refine
+
+    packed: list[tuple[int, int]] = []
+    page_start = -1
+    page_end = -1
+    page_weight = 0
+    for start, end, weight in sorted(leaves):
+        if page_start < 0:
+            page_start, page_end, page_weight = start, end, weight
+            continue
+        if page_end == start and page_weight <= budget and page_weight + weight <= budget:
+            page_end = end
+            page_weight += weight
+            continue
+        packed.append((page_start, page_end))
+        page_start, page_end, page_weight = start, end, weight
+    if page_start >= 0:
+        packed.append((page_start, page_end))
+    return tuple(packed)
+
+
+def _row_isolated_device_topology_page_shape(
+    left_segments: DeviceSegmentTable,
+    right_segments: DeviceSegmentTable,
+    *,
+    row_count: int,
+    right_geometry_source_rows,
+    include_same_side_splits: bool,
+    live_event_budget: int | None = None,
+) -> _RowIsolatedTopologyPageShape:
+    """Plan complete-row pages from exact device segment ownership."""
+    budget = max(
+        int(_compute_live_split_event_budget() if live_event_budget is None else live_event_budget),
+        1,
+    )
+    d_left_rows = cp.asarray(left_segments.row_indices, dtype=cp.int32)
+    d_right_rows = cp.asarray(right_segments.row_indices, dtype=cp.int32)
+    if right_geometry_source_rows is not None:
+        d_right_rows = cp.asarray(right_geometry_source_rows, dtype=cp.int32)[d_right_rows]
+    d_left_counts = (
+        cp.zeros(row_count, dtype=cp.int64)
+        if int(d_left_rows.size) == 0
+        else cp.bincount(d_left_rows, minlength=row_count).astype(cp.int64, copy=False)
+    )
+    d_right_counts = (
+        cp.zeros(row_count, dtype=cp.int64)
+        if int(d_right_rows.size) == 0
+        else cp.bincount(d_right_rows, minlength=row_count).astype(cp.int64, copy=False)
+    )
+    d_events = 2 * (d_left_counts + d_right_counts)
+    d_events += 4 * d_left_counts * d_right_counts
+    if include_same_side_splits:
+        d_events += 2 * d_left_counts * cp.maximum(d_left_counts - 1, 0)
+        d_events += 2 * d_right_counts * cp.maximum(d_right_counts - 1, 0)
+    spans = _compact_bounded_device_work_spans(
+        d_events,
+        live_event_budget=budget,
+    )
+    summary = get_cuda_runtime().copy_device_to_host(
+        cp.stack(
+            (
+                cp.max(d_events),
+                cp.sum(d_events, dtype=cp.int64),
+            )
+        ).astype(cp.int64, copy=False),
+        reason="overlay compact topology work-summary planning packet",
+    )
+    max_rows_per_page = max((end - start for start, end in spans), default=0)
+    return _RowIsolatedTopologyPageShape(
+        row_count=row_count,
+        rows_per_page=max(max_rows_per_page, 1),
+        live_event_budget=budget,
+        worst_live_events_per_row=int(summary[0]),
+        complete_row_spans=spans,
+        total_live_events=int(summary[1]),
+    )
+
+
 from vibespatial.overlay.gpu_kernels import (  # noqa: E402
     _BATCH_POINT_IN_RING_KERNEL_NAMES,
     _BATCH_POINT_IN_RING_KERNEL_SOURCE,
@@ -156,8 +284,6 @@ from vibespatial.overlay.gpu_kernels import (  # noqa: E402
     _CONTAINMENT_BYPASS_KERNEL_SOURCE,
     _OVERLAY_FACE_ASSEMBLY_KERNEL_NAMES,
     _OVERLAY_FACE_ASSEMBLY_KERNEL_SOURCE,
-    _OVERLAY_FACE_LABEL_KERNEL_NAMES,
-    _OVERLAY_FACE_LABEL_KERNEL_SOURCE,
     _OVERLAY_FACE_WALK_KERNEL_NAMES,
     _OVERLAY_FACE_WALK_KERNEL_SOURCE,
     _OVERLAY_SPLIT_KERNEL_NAMES,
@@ -172,7 +298,6 @@ request_nvrtc_warmup(
     [
         ("overlay-split", _OVERLAY_SPLIT_KERNEL_SOURCE, _OVERLAY_SPLIT_KERNEL_NAMES),
         ("overlay-face-walk", _OVERLAY_FACE_WALK_KERNEL_SOURCE, _OVERLAY_FACE_WALK_KERNEL_NAMES),
-        ("overlay-face-label", _OVERLAY_FACE_LABEL_KERNEL_SOURCE, _OVERLAY_FACE_LABEL_KERNEL_NAMES),
         (
             "overlay-face-assembly",
             _OVERLAY_FACE_ASSEMBLY_KERNEL_SOURCE,
@@ -221,22 +346,6 @@ def _overlay_split_kernels():
 def _overlay_face_walk_kernels():
     return compile_kernel_group(
         "overlay-face-walk", _OVERLAY_FACE_WALK_KERNEL_SOURCE, _OVERLAY_FACE_WALK_KERNEL_NAMES
-    )
-
-
-@register_kernel_variant(
-    "overlay_face_label",
-    "gpu-nvrtc",
-    kernel_class=KernelClass.CONSTRUCTIVE,
-    execution_modes=(ExecutionMode.GPU,),
-    geometry_families=("polygon", "multipolygon"),
-    supports_mixed=False,
-    preferred_residency=Residency.DEVICE,
-    tags=("nvrtc", "overlay", "face-label"),
-)
-def _overlay_face_label_kernels():
-    return compile_kernel_group(
-        "overlay-face-label", _OVERLAY_FACE_LABEL_KERNEL_SOURCE, _OVERLAY_FACE_LABEL_KERNEL_NAMES
     )
 
 
@@ -376,7 +485,6 @@ from vibespatial.overlay.assemble import (  # noqa: E402, F401
 )
 from vibespatial.overlay.faces import (  # noqa: E402, F401
     _assemble_faces_from_device_indices,
-    _gpu_label_face_coverage,
     build_gpu_overlay_faces,
 )
 from vibespatial.overlay.graph import (  # noqa: E402, F401
@@ -398,6 +506,7 @@ def build_gpu_split_events(
     *,
     intersection_result: SegmentIntersectionResult | None = None,
     dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
+    _cached_left_segments: DeviceSegmentTable | None = None,
     _cached_right_segments: DeviceSegmentTable | None = None,
     right_segment_broadcast: DeviceBroadcastSegmentRelation | None = None,
     require_same_row: bool = False,
@@ -415,6 +524,7 @@ def build_gpu_split_events(
         right,
         intersection_result=intersection_result,
         dispatch_mode=dispatch_mode,
+        _cached_left_segments=_cached_left_segments,
         _cached_right_segments=_cached_right_segments,
         right_segment_broadcast=right_segment_broadcast,
         require_same_row=require_same_row,
@@ -1032,6 +1142,8 @@ def _build_overlay_execution_plan(
     | ComponentOverlayExecutionPlan
     | MicrocellOverlayExecutionPlan
 ):
+    planned_left_segments = None
+    planned_right_segments = None
     if (
         _allow_component_decomposition
         and _row_isolated
@@ -1122,18 +1234,35 @@ def _build_overlay_execution_plan(
         and left.row_count > 1
     ):
         left_span, right_span, max_row_id = _same_row_span_summary
-        page_shape = _row_isolated_topology_page_shape(
-            row_count=left.row_count,
-            max_left_segments_per_row=left_span,
-            max_right_segments_per_row=right_span,
-            include_same_side_splits=_include_same_side_splits,
-        )
         right_source_rows = (
             _right_segment_source_rows
             if _right_segment_source_rows is not None
             else _right_geometry_source_rows
         )
         right_rows_admit_paging = right_source_rows is not None or right.row_count == left.row_count
+        if right_rows_admit_paging:
+            planned_left_segments = _extract_segments_gpu(left)
+            try:
+                planned_right_segments = _extract_segments_gpu(right)
+                page_shape = _row_isolated_device_topology_page_shape(
+                    planned_left_segments,
+                    planned_right_segments,
+                    row_count=left.row_count,
+                    right_geometry_source_rows=right_source_rows,
+                    include_same_side_splits=_include_same_side_splits,
+                )
+            except Exception:
+                planned_left_segments.free()
+                if planned_right_segments is not None:
+                    planned_right_segments.free()
+                raise
+        else:
+            page_shape = _row_isolated_topology_page_shape(
+                row_count=left.row_count,
+                max_left_segments_per_row=left_span,
+                max_right_segments_per_row=right_span,
+                include_same_side_splits=_include_same_side_splits,
+            )
         if (
             page_shape.page_count > 1
             and int(max_row_id) < left.row_count
@@ -1149,14 +1278,21 @@ def _build_overlay_execution_plan(
                 ),
                 detail=(
                     f"rows={left.row_count}; pages={page_shape.page_count}; "
-                    f"rows_per_page={page_shape.rows_per_page}; "
+                    f"max_rows_per_page={page_shape.rows_per_page}; "
                     f"worst_events_per_row={page_shape.worst_live_events_per_row}; "
+                    f"total_events={page_shape.total_live_events}; "
                     f"event_budget={page_shape.live_event_budget}; "
                     f"single_row_oversized={page_shape.single_row_oversized}"
                 ),
                 requested=dispatch_mode,
                 selected=ExecutionMode.GPU,
             )
+            if planned_left_segments is not None:
+                planned_left_segments.free()
+                planned_left_segments = None
+            if planned_right_segments is not None:
+                planned_right_segments.free()
+                planned_right_segments = None
             return PagedOverlayExecutionPlan(
                 left=left,
                 right=right,
@@ -1170,6 +1306,7 @@ def _build_overlay_execution_plan(
                 right_geometry_source_rows=_right_geometry_source_rows,
                 right_segment_source_rows=_right_segment_source_rows,
                 allow_component_decomposition=_allow_component_decomposition,
+                complete_row_spans=page_shape.row_spans(),
             )
 
     try:
@@ -1177,7 +1314,12 @@ def _build_overlay_execution_plan(
             left,
             right,
             dispatch_mode=dispatch_mode,
-            _cached_right_segments=_cached_right_segments,
+            _cached_left_segments=planned_left_segments,
+            _cached_right_segments=(
+                planned_right_segments
+                if planned_right_segments is not None
+                else _cached_right_segments
+            ),
             right_segment_broadcast=_right_segment_broadcast,
             require_same_row=_row_isolated,
             use_same_row_fast_path=_use_same_row_fast_path,
@@ -1190,6 +1332,11 @@ def _build_overlay_execution_plan(
         raise RuntimeError(
             f"overlay plan build_gpu_split_events failed: {type(exc).__name__}: {exc}"
         ) from exc
+    finally:
+        if planned_left_segments is not None:
+            planned_left_segments.free()
+        if planned_right_segments is not None:
+            planned_right_segments.free()
     try:
         atomic_edges = build_gpu_atomic_edges(split_events, isolate_rows=_row_isolated)
     except Exception as exc:
@@ -1322,6 +1469,10 @@ def _materialize_overlay_execution_plan(
                 d_left_rows,
                 assume_unique_indices=True,
             )
+            if plan.right_segment_broadcast is None and page_left.is_indexed_view:
+                page_left = page_left.physicalize_device_rows(
+                    allow_capacity_allocation=True,
+                )
             if plan.right_segment_broadcast is not None:
                 d_right_rows = cp.arange(plan.right.row_count, dtype=cp.int64)
                 page_right = plan.right
@@ -1345,6 +1496,10 @@ def _materialize_overlay_execution_plan(
                     d_right_rows,
                     assume_unique_indices=True,
                 )
+                if page_right.is_indexed_view:
+                    page_right = page_right.physicalize_device_rows(
+                        allow_capacity_allocation=True,
+                    )
 
             def _page_source_rows(
                 source_rows,

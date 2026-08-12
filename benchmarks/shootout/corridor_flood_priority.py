@@ -20,7 +20,8 @@ from _data import fingerprint, setup_fixtures
 
 import geopandas as gpd
 
-tmpdir = Path(tempfile.mkdtemp(prefix="shootout_corridor_flood_"))
+_tmpdir = tempfile.TemporaryDirectory(prefix="shootout_corridor_flood_")
+tmpdir = Path(_tmpdir.name)
 fixtures = setup_fixtures(tmpdir)
 
 # --- timed work starts here ---

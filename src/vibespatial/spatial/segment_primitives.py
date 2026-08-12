@@ -37,7 +37,13 @@ from vibespatial.cuda._runtime import (  # noqa: E402
     get_cuda_runtime,
 )
 from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
-from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray  # noqa: E402
+from vibespatial.geometry.owned import (  # noqa: E402
+    FAMILY_TAGS,
+    DeviceFamilyGeometryBuffer,
+    DeviceFixedGeometrySizeMetadata,
+    OwnedGeometryArray,
+    build_device_resident_owned,
+)
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
 from vibespatial.runtime.adaptive import AdaptivePlan, plan_dispatch_selection  # noqa: E402
 from vibespatial.runtime.config import SEGMENT_TILE_SIZE  # noqa: E402
@@ -159,6 +165,75 @@ class DeviceSegmentTable:
             runtime.free(self.part_indices)
         if self.ring_indices is not None:
             runtime.free(self.ring_indices)
+
+
+def device_segment_table_as_linestrings(
+    segments: DeviceSegmentTable,
+) -> OwnedGeometryArray:
+    """Expose segment rows as a compact fixed-width device geometry carrier.
+
+    Segment coordinates remain device-only. The returned rows are independent
+    two-coordinate LineStrings whose bounds can participate in the canonical
+    native spatial-index relation without interpreting the source geometry's
+    nested offsets again.
+    """
+    import cupy as cp
+
+    row_count = int(segments.count)
+    d_x = cp.empty(row_count * 2, dtype=cp.float64)
+    d_y = cp.empty(row_count * 2, dtype=cp.float64)
+    d_x[0::2] = cp.asarray(segments.x0, dtype=cp.float64)
+    d_x[1::2] = cp.asarray(segments.x1, dtype=cp.float64)
+    d_y[0::2] = cp.asarray(segments.y0, dtype=cp.float64)
+    d_y[1::2] = cp.asarray(segments.y1, dtype=cp.float64)
+    d_bounds = cp.stack(
+        (
+            cp.minimum(d_x[0::2], d_x[1::2]),
+            cp.minimum(d_y[0::2], d_y[1::2]),
+            cp.maximum(d_x[0::2], d_x[1::2]),
+            cp.maximum(d_y[0::2], d_y[1::2]),
+        ),
+        axis=1,
+    )
+    result = build_device_resident_owned(
+        device_families={
+            GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.LINESTRING,
+                x=d_x,
+                y=d_y,
+                geometry_offsets=cp.arange(
+                    0,
+                    (row_count + 1) * 2,
+                    2,
+                    dtype=cp.int32,
+                ),
+                empty_mask=cp.zeros(row_count, dtype=cp.bool_),
+                bounds=d_bounds,
+                fixed_size=DeviceFixedGeometrySizeMetadata(
+                    coord_count_per_row=2,
+                    max_coord_count_per_row=2,
+                ),
+            )
+        },
+        row_count=row_count,
+        tags=cp.full(
+            row_count,
+            FAMILY_TAGS[GeometryFamily.LINESTRING],
+            dtype=cp.int8,
+        ),
+        validity=cp.ones(row_count, dtype=cp.bool_),
+        family_row_offsets=cp.arange(row_count, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+    state = result._ensure_device_state(preserve_indexed_view=True)
+    state.row_bounds = d_bounds
+    state.trusted_all_valid = True
+    state.trusted_all_non_empty = True
+    state.trusted_homogeneous_family = GeometryFamily.LINESTRING
+    state.trusted_unique_family_rows = True
+    state.trusted_family_domain = (GeometryFamily.LINESTRING,)
+    result._active_family_row_segment_capacity_bound = 1
+    return result
 
 
 @dataclass(frozen=True)
@@ -1016,16 +1091,25 @@ def _device_segment_capacity_for_family(
     unit_capacity = max(int(buffer.x.size), 0)
     if not indexed_view:
         return unit_capacity, None
-    if unique_family_rows:
-        return unit_capacity, None
     if active_family_row_segment_capacity_bound is not None:
-        return row_count * int(active_family_row_segment_capacity_bound), None
+        per_row_capacity = int(active_family_row_segment_capacity_bound)
+        total_capacity = row_count * per_row_capacity
+        if total_capacity <= _SEGMENT_EXTRACTION_CAPACITY_MAX_SLOTS:
+            return total_capacity, None
+        return None, per_row_capacity
     if active_family_row_multiplicity_bound is not None:
-        return unit_capacity * int(active_family_row_multiplicity_bound), None
+        total_capacity = unit_capacity * int(active_family_row_multiplicity_bound)
+        if total_capacity <= _SEGMENT_EXTRACTION_CAPACITY_MAX_SLOTS:
+            return total_capacity, None
+        return None, unit_capacity
     fixed_size = getattr(buffer, "fixed_size", None)
     max_coord_count = (
         None if fixed_size is None else getattr(fixed_size, "max_coord_count_per_row", None)
     )
+    if unique_family_rows:
+        if unit_capacity <= _SEGMENT_EXTRACTION_CAPACITY_MAX_SLOTS:
+            return unit_capacity, None
+        return None, unit_capacity if max_coord_count is None else int(max_coord_count)
     if max_coord_count is not None:
         unit_capacity = max(int(max_coord_count), 0)
     row_count = max(int(row_count), 0)
@@ -1636,6 +1720,7 @@ _MIN_BATCH_PAIRS = 1 * 1024 * 1024
 
 _MAX_BATCH_PAIRS_CAP = 8 * 1024 * 1024  # 8M pairs hard cap (~960 MB peak)
 _SAME_ROW_WARP_MAX_RIGHT_SEGMENTS_PER_ROW = 2048
+_PREFERRED_INITIAL_SWEEP_TIER_WIDTH = 256
 
 
 @dataclass(frozen=True)
@@ -1933,7 +2018,6 @@ def _generate_candidates_gpu_same_row_warp(
             and _allow_swap
             and max_left_span <= _SAME_ROW_WARP_MAX_RIGHT_SEGMENTS_PER_ROW
         ):
-
             def _consume_swapped_page(page):
                 page_consumer(
                     DeviceSegmentIntersectionCandidates(
@@ -2142,7 +2226,10 @@ def _device_counted_sweep_candidates(
         d_selected_left = cp.arange(left_count, dtype=cp.int32)
         selected_count = left_count
         tier_start = 0
-        preferred_tier_width = 8
+        preferred_tier_width = min(
+            _PREFERRED_INITIAL_SWEEP_TIER_WIDTH,
+            max(1, max_batch_pairs // selected_count),
+        )
         while selected_count > 0 and tier_start < range_chunk:
             tier_width = min(
                 range_chunk - tier_start,
@@ -2269,29 +2356,13 @@ def _generate_candidates_gpu(
             if int(upper_left_rows.size) != left.count or int(upper_right_rows.size) != right.count:
                 raise ValueError("strict upper source-row arrays must match segment counts")
 
-    # Sort right segments by midpoint on the cheaper physical sweep axis.
-    # Algorithm: sort right segments by midpoint, then for each left segment
-    # binary-search for the range of rights whose midpoint falls within the
-    # left segment span expanded by the selected right half-width.  The
-    # surviving candidates are still filtered by the full 2D MBR, so choosing
-    # x or y only changes work volume, not correctness.
-    # Complexity: O(n log n + k) where k is the number of candidate pairs.
+    # Assign right segments to their cheaper normalized sweep axis. Both axis
+    # plans retain full row capacity and sort inactive lanes to an infinity
+    # tail, avoiding a device-count fence between classification and sorting.
+    # Every segment is active in exactly one plan, and each plan is refined by
+    # the full 2D MBR test, so the candidate relation remains exact.
     right_half_w_x = (right_maxx - right_minx) * 0.5
     right_half_w_y = (right_maxy - right_miny) * 0.5
-    if right.count < 20:
-        d_search_hw_x = cp.max(right_half_w_x)
-        d_search_hw_y = cp.max(right_half_w_y)
-        outlier_mask_x = None
-        outlier_mask_y = None
-    else:
-        p95_idx = int(right.count * 95) // 100
-        partitioned_hw_x = cp.partition(right_half_w_x, p95_idx)
-        partitioned_hw_y = cp.partition(right_half_w_y, p95_idx)
-        d_search_hw_x = partitioned_hw_x[p95_idx]
-        d_search_hw_y = partitioned_hw_y[p95_idx]
-        outlier_mask_x = right_half_w_x > d_search_hw_x
-        outlier_mask_y = right_half_w_y > d_search_hw_y
-
     d_extent_x = cp.maximum(
         cp.maximum(cp.max(left_maxx), cp.max(right_maxx))
         - cp.minimum(cp.min(left_minx), cp.min(right_minx)),
@@ -2302,42 +2373,7 @@ def _generate_candidates_gpu(
         - cp.minimum(cp.min(left_miny), cp.min(right_miny)),
         cp.asarray(1.0e-12, dtype=cp.float64),
     )
-    d_score_x = (cp.mean(left_maxx - left_minx) + 2.0 * d_search_hw_x) / d_extent_x
-    d_score_y = (cp.mean(left_maxy - left_miny) + 2.0 * d_search_hw_y) / d_extent_y
-    d_use_y_sweep = d_score_y < d_score_x
-    sweep_left_min = cp.where(d_use_y_sweep, left_miny, left_minx)
-    sweep_left_max = cp.where(d_use_y_sweep, left_maxy, left_maxx)
-    sweep_right_min = cp.where(d_use_y_sweep, right_miny, right_minx)
-    sweep_right_max = cp.where(d_use_y_sweep, right_maxy, right_maxx)
-    d_search_hw = cp.where(d_use_y_sweep, d_search_hw_y, d_search_hw_x)
-    outlier_mask_bool = (
-        None if outlier_mask_x is None else cp.where(d_use_y_sweep, outlier_mask_y, outlier_mask_x)
-    )
-    has_outliers = outlier_mask_bool is not None
-    right_mid = (sweep_right_min + sweep_right_max) * 0.5
-    # NOTE (P5/LOW): cp.arange allocates a 4MB array at 1M scale just to
-    # provide [0..n-1] indices.  A counting_iterator would be zero-alloc,
-    # but sort_pairs calls _validate_vector("values", values) which
-    # requires a 1D DeviceArray (ndim check).  Both the CuPy argsort
-    # fallback and the CCCL radix_sort path index into the values array,
-    # so accepting an iterator would require invasive changes to
-    # sort_pairs + its strategy dispatch.  Not worth the churn for a
-    # one-shot 4MB allocation.
-    with hotpath_stage("segment.candidates.sort_right_midpoints", category="sort"):
-        right_indices = cp.arange(right.count, dtype=cp.int32)
-        sort_result = sort_pairs(right_mid, right_indices, synchronize=False)
-        sorted_right_mid = sort_result.keys
-        sorted_right_idx = sort_result.values
-
-    # --- Main sweep: binary search using P95 (or max) half-width ---
-    with hotpath_stage("segment.candidates.binary_search", category="filter"):
-        search_lo = sweep_left_min - d_search_hw
-        search_hi = sweep_left_max + d_search_hw
-
-        # Binary search in sorted_right_xmid (same-stream ordering guarantees
-        # sort_pairs completes before lower_bound/upper_bound read its output)
-        range_start = lower_bound(sorted_right_mid, search_lo, synchronize=False)
-        range_end = upper_bound(sorted_right_mid, search_hi, synchronize=False)
+    d_use_y_sweep = (right_half_w_y / d_extent_y) < (right_half_w_x / d_extent_x)
 
     candidate_accumulator = _DeviceCandidatePageAccumulator(
         left=left,
@@ -2346,66 +2382,97 @@ def _generate_candidates_gpu(
         page_consumer=page_consumer,
     )
 
-    with hotpath_stage("segment.candidates.device_counted_sweep", category="filter"):
-        _device_counted_sweep_candidates(
-            left=left,
-            right=right,
-            range_start=range_start,
-            range_end=range_end,
-            range_capacity=right.count,
-            sorted_right_idx=sorted_right_idx,
-            left_minx=left_minx,
-            left_maxx=left_maxx,
-            left_miny=left_miny,
-            left_maxy=left_maxy,
-            right_minx=right_minx,
-            right_maxx=right_maxx,
-            right_miny=right_miny,
-            right_maxy=right_maxy,
-            left_rows_all=left_rows_all,
-            right_rows_all=right_rows_all,
-            require_same_row=require_same_row,
-            outlier_mask_bool=outlier_mask_bool,
-            accumulator=candidate_accumulator,
-            upper_left_rows=upper_left_rows,
-            upper_right_rows=upper_right_rows,
-        )
-
-    # --- Outlier pass: brute-force MBR test for right segs with hw > P95 ---
-    if has_outliers:
-        # Identify outlier right segment indices (boolean mask -> compact).
-        # These are right segments whose half-width exceeds P95, meaning
-        # the main sweep's narrower window may have missed them.
-        with hotpath_stage("segment.candidates.outlier_pass", category="filter"):
-            outlier_mask_u8 = outlier_mask_bool.astype(cp.uint8)
-            outlier_compact = compact_indices(outlier_mask_u8)
-
-            if outlier_compact.count > 0:
-                outlier_right_idx = outlier_compact.values  # indices into right arrays
-                outlier_count = int(outlier_right_idx.size)
-                _device_counted_sweep_candidates(
-                    left=left,
-                    right=right,
-                    range_start=cp.zeros(left.count, dtype=cp.int64),
-                    range_end=cp.full(left.count, outlier_count, dtype=cp.int64),
-                    range_capacity=outlier_count,
-                    sorted_right_idx=outlier_right_idx,
-                    left_minx=left_minx,
-                    left_maxx=left_maxx,
-                    left_miny=left_miny,
-                    left_maxy=left_maxy,
-                    right_minx=right_minx,
-                    right_maxx=right_maxx,
-                    right_miny=right_miny,
-                    right_maxy=right_maxy,
-                    left_rows_all=left_rows_all,
-                    right_rows_all=right_rows_all,
-                    require_same_row=require_same_row,
-                    outlier_mask_bool=None,
-                    accumulator=candidate_accumulator,
-                    upper_left_rows=upper_left_rows,
-                    upper_right_rows=upper_right_rows,
+    right_indices = cp.arange(right.count, dtype=cp.int32)
+    for axis_name, axis_mask, sweep_left_min, sweep_left_max, sweep_right_min, sweep_right_max in (
+        (
+            "x",
+            ~d_use_y_sweep,
+            left_minx,
+            left_maxx,
+            right_minx,
+            right_maxx,
+        ),
+        (
+            "y",
+            d_use_y_sweep,
+            left_miny,
+            left_maxy,
+            right_miny,
+            right_maxy,
+        ),
+    ):
+        with hotpath_stage(
+            f"segment.candidates.partition_{axis_name}_axis",
+            category="mask",
+        ):
+            partition_right_idx = right_indices
+            partition_right_min = sweep_right_min
+            partition_right_max = sweep_right_max
+            partition_right_mid = cp.where(
+                axis_mask,
+                (partition_right_min + partition_right_max) * 0.5,
+                cp.inf,
+            )
+            d_search_hw = cp.max(
+                cp.where(
+                    axis_mask,
+                    (partition_right_max - partition_right_min) * 0.5,
+                    0.0,
                 )
+            )
+
+        with hotpath_stage(
+            f"segment.candidates.sort_{axis_name}_midpoints",
+            category="sort",
+        ):
+            sort_result = sort_pairs(
+                partition_right_mid,
+                partition_right_idx,
+                synchronize=False,
+            )
+
+        with hotpath_stage(
+            f"segment.candidates.search_{axis_name}_ranges",
+            category="filter",
+        ):
+            range_start = lower_bound(
+                sort_result.keys,
+                sweep_left_min - d_search_hw,
+                synchronize=False,
+            )
+            range_end = upper_bound(
+                sort_result.keys,
+                sweep_left_max + d_search_hw,
+                synchronize=False,
+            )
+
+        with hotpath_stage(
+            "segment.candidates.device_counted_sweep",
+            category="filter",
+        ):
+            _device_counted_sweep_candidates(
+                left=left,
+                right=right,
+                range_start=range_start,
+                range_end=range_end,
+                range_capacity=right.count,
+                sorted_right_idx=sort_result.values,
+                left_minx=left_minx,
+                left_maxx=left_maxx,
+                left_miny=left_miny,
+                left_maxy=left_maxy,
+                right_minx=right_minx,
+                right_maxx=right_maxx,
+                right_miny=right_miny,
+                right_maxy=right_maxy,
+                left_rows_all=left_rows_all,
+                right_rows_all=right_rows_all,
+                require_same_row=require_same_row,
+                outlier_mask_bool=None,
+                accumulator=candidate_accumulator,
+                upper_left_rows=upper_left_rows,
+                upper_right_rows=upper_right_rows,
+            )
 
     with hotpath_stage("segment.candidates.assemble_output", category="emit"):
         return candidate_accumulator.finish(runtime)

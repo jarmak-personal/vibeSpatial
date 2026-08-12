@@ -9,6 +9,7 @@ from shapely.geometry import MultiPolygon, Polygon
 
 from vibespatial import (
     ExecutionMode,
+    RuntimeSelection,
     build_gpu_atomic_edges,
     build_gpu_half_edge_graph,
     build_gpu_overlay_faces,
@@ -16,7 +17,7 @@ from vibespatial import (
     from_shapely_geometries,
     has_gpu_runtime,
 )
-from vibespatial.runtime.hotpath_trace import get_hotpath_trace, reset_hotpath_trace
+from vibespatial.overlay.types import AtomicEdgeDeviceState, AtomicEdgeTable
 from vibespatial.runtime.residency import Residency
 
 
@@ -75,10 +76,11 @@ def test_row_isolated_face_output_stays_capacity_backed() -> None:
 
     assert "cp.flatnonzero(" not in capacity_branch
     assert "_device_int_scalar(" not in capacity_branch
-    sibling_position = assemble_source.index(
-        'kernels["count_sibling_hole_depth"]',
+    containment_position = assemble_source.index(
+        'kernels["count_boundary_ring_containment_depth"]',
     )
-    assert sibling_position < branch_start
+    assert containment_position < branch_start
+    assert 'kernels["locate_boundary_ring_group_spans"]' in assemble_source
     assert "d_explicit_polygon_output_rows" in capacity_branch
     assert "d_explicit_polygon_active" in capacity_branch
     assert "excluded_rings" not in assemble_source
@@ -97,6 +99,10 @@ def test_half_edge_graph_uses_source_twins_and_stable_radix_passes() -> None:
     ).read_text()
 
     assert "build_radial_successors" in graph_source
+    assert "scatter_node_offsets" in graph_source
+    assert "merge_node_edges_robust_pass" in graph_source
+    assert "sort_node_edges_robust" not in graph_source
+    assert "cp.maximum.accumulate" not in graph_source
     assert "edge_positions = cp.empty" not in graph_source
     assert "twin_positions" not in graph_source
     assert "cp.concatenate((device.src_x, device.dst_x))" not in graph_source
@@ -137,6 +143,64 @@ def test_half_edge_graph_uses_source_twins_and_stable_radix_passes() -> None:
     assert "scatter_edge_face_selection" in kernel_source
     assert "assign_holes_to_exteriors" in kernel_source
     assert "scatter_boundary_ring_coordinates" in kernel_source
+
+
+@pytest.mark.gpu
+def test_half_edge_radial_merge_handles_high_degree_node() -> None:
+    cp = pytest.importorskip("cupy")
+
+    ray_count = 1024
+    angles = np.arange(ray_count, dtype=np.float64) * (2.0 * np.pi / ray_count)
+    outer_x = np.cos(angles)
+    outer_y = np.sin(angles)
+    edge_count = ray_count * 2
+    src_x = np.empty(edge_count, dtype=np.float64)
+    src_y = np.empty(edge_count, dtype=np.float64)
+    dst_x = np.empty(edge_count, dtype=np.float64)
+    dst_y = np.empty(edge_count, dtype=np.float64)
+    src_x[0::2] = 0.0
+    src_y[0::2] = 0.0
+    dst_x[0::2] = outer_x
+    dst_y[0::2] = outer_y
+    src_x[1::2] = outer_x
+    src_y[1::2] = outer_y
+    dst_x[1::2] = 0.0
+    dst_y[1::2] = 0.0
+    edge_ids = cp.arange(edge_count, dtype=cp.int32)
+    atomic_edges = AtomicEdgeTable(
+        left_segment_count=ray_count,
+        right_segment_count=0,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="high-degree radial merge test",
+        ),
+        device_state=AtomicEdgeDeviceState(
+            source_segment_ids=edge_ids // cp.int32(2),
+            direction=cp.where((edge_ids & 1) == 0, cp.int8(1), cp.int8(-1)),
+            src_x=cp.asarray(src_x),
+            src_y=cp.asarray(src_y),
+            dst_x=cp.asarray(dst_x),
+            dst_y=cp.asarray(dst_y),
+            row_indices=cp.zeros(edge_count, dtype=cp.int32),
+            part_indices=cp.zeros(edge_count, dtype=cp.int32),
+            ring_indices=cp.zeros(edge_count, dtype=cp.int32),
+            source_side=cp.ones(edge_count, dtype=cp.int8),
+            source_membership=cp.ones(edge_count, dtype=cp.uint8),
+            tangent_x=cp.asarray(dst_x - src_x),
+            tangent_y=cp.asarray(dst_y - src_y),
+        ),
+        _count=edge_count,
+    )
+
+    graph = build_gpu_half_edge_graph(atomic_edges)
+    actual = cp.asnumpy(graph.device_state.next_edge_ids)
+    expected = np.empty(edge_count, dtype=np.int32)
+    expected[0::2] = np.arange(1, edge_count, 2, dtype=np.int32)
+    expected[1] = edge_count - 2
+    expected[3::2] = np.arange(0, edge_count - 2, 2, dtype=np.int32)
+
+    assert np.array_equal(actual, expected)
 
 
 def test_radial_successor_relation_uses_clockwise_predecessor_of_twin() -> None:
@@ -386,187 +450,381 @@ def test_gpu_face_labels_include_overlap_band_for_collinear_rectangle_overlap() 
 
 
 @pytest.mark.gpu
-def test_gpu_face_coverage_trace_accounts_for_mixed_family_overlap(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    if not has_gpu_runtime():
-        pytest.skip("CUDA runtime not available")
-
-    left_polygon = Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)])
-    left_multi = MultiPolygon(
-        [
-            Polygon([(5, 0), (7, 0), (7, 2), (5, 2), (5, 0)]),
-            Polygon([(5, 3), (7, 3), (7, 5), (5, 5), (5, 3)]),
-        ]
-    )
-    right_polygon = Polygon([(2, -1), (6, -1), (6, 6), (2, 6), (2, -1)])
-
-    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
-    reset_hotpath_trace()
-
-    _build_face_table([left_polygon, left_multi], [right_polygon])
-    trace_names = [stage.name for stage in get_hotpath_trace()]
-
-    assert "overlay.faces.coverage.left.mixed_family_overlap" in trace_names
-
-
-@pytest.mark.gpu
-def test_gpu_face_coverage_trace_uses_same_row_multipolygon_fast_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_adjacent_ulp_triangle_has_exact_direct_and_public_intersection_labels() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
 
     from vibespatial.overlay.gpu import _overlay_owned
 
-    left = from_shapely_geometries(
-        [
-            Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)]),
-            Polygon([(5, 0), (9, 0), (9, 4), (5, 4), (5, 0)]),
-        ],
-        residency=Residency.DEVICE,
-    )
-    right_multi = MultiPolygon(
-        [
-            Polygon([(1, -1), (3, -1), (3, 5), (1, 5), (1, -1)]),
-            Polygon([(6, -1), (8, -1), (8, 5), (6, 5), (6, -1)]),
-        ]
-    )
-    right = from_shapely_geometries(
-        [right_multi, right_multi],
-        residency=Residency.DEVICE,
-    )
+    x0 = np.float64(1.0)
+    x1 = np.nextafter(x0, np.float64(np.inf))
+    triangle = Polygon([(x0, 0.0), (x1, 0.0), (x0, 1.0), (x0, 0.0)])
+    container = shapely.box(0.0, -1.0, 2.0, 2.0)
+    assert triangle.area > 0.0
+    assert np.nextafter(x0, x1) == x1
 
-    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
-    reset_hotpath_trace()
+    _, _, _, _, _, faces = _build_face_table([triangle], [container])
+    overlap = (
+        faces.bounded_mask.astype(bool, copy=False)
+        & faces.left_covered.astype(bool, copy=False)
+        & faces.right_covered.astype(bool, copy=False)
+    )
+    assert np.count_nonzero(overlap) == 1
+    assert faces.signed_area[overlap][0] == triangle.area
 
     result = _overlay_owned(
-        left,
-        right,
+        from_shapely_geometries([triangle], residency=Residency.DEVICE),
+        from_shapely_geometries([container], residency=Residency.DEVICE),
         operation="intersection",
         dispatch_mode=ExecutionMode.GPU,
         _row_isolated=True,
-    )
-    trace_names = [stage.name for stage in get_hotpath_trace()]
-
-    assert result.row_count == left.row_count
-    assert "overlay.faces.coverage.right.multipolygon_same_row" in trace_names
+    ).to_shapely()[0]
+    assert shapely.equals(result, triangle)
 
 
 @pytest.mark.gpu
-def test_gpu_face_coverage_trace_uses_warp_for_indexed_polygon_logical_rows(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_reversed_shell_and_hole_orientation_preserves_exact_coverage() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
 
-    import cupy as cp
+    from vibespatial.overlay.gpu import _overlay_owned
 
-    from vibespatial.overlay.faces import _gpu_label_face_coverage
+    shell = [(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)]
+    hole = [(3, 3), (7, 3), (7, 7), (3, 7), (3, 3)]
+    reversed_donut = Polygon(shell=list(reversed(shell)), holes=[list(reversed(hole))])
+    container = shapely.box(-1.0, -1.0, 11.0, 11.0)
 
-    left = from_shapely_geometries(
-        [Polygon([(100, 100), (104, 100), (104, 104), (100, 104), (100, 100)])],
-        residency=Residency.DEVICE,
+    _, _, _, atomic_edges, _, faces = _build_face_table(
+        [reversed_donut],
+        [container],
     )
-    right_base = from_shapely_geometries(
-        [
-            Polygon([(0, 0), (3, 0), (3, 3), (0, 3), (0, 0)]),
-            Polygon([(10, 0), (13, 0), (14, 2), (12, 4), (10, 3), (10, 0)]),
-        ],
-        residency=Residency.DEVICE,
-    )
-    right = right_base._device_indexed_take(
-        cp.asarray([0, 1] * 16, dtype=cp.int64),
-    )
+    assert np.any(atomic_edges.device_state.left_coverage_delta != 0)
+    bounded_labels = {
+        (int(left), int(right))
+        for left, right, bounded in zip(
+            faces.left_covered,
+            faces.right_covered,
+            faces.bounded_mask,
+            strict=True,
+        )
+        if bounded
+    }
+    assert bounded_labels == {(0, 1), (1, 1)}
 
-    assert right.is_indexed_view
-
-    label_x = cp.asarray([1.0, 12.0, 6.0], dtype=cp.float64)
-    label_y = cp.asarray([1.0, 2.0, 6.0], dtype=cp.float64)
-    face_source_rows = cp.zeros(3, dtype=cp.int32)
-    right_source_rows = cp.zeros(right.row_count, dtype=cp.int32)
-
-    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
-    reset_hotpath_trace()
-
-    _left_covered, right_covered = _gpu_label_face_coverage(
-        left,
-        right,
-        label_x,
-        label_y,
-        3,
-        face_source_rows=face_source_rows,
-        right_geometry_source_rows=right_source_rows,
-    )
-    trace_names = [stage.name for stage in get_hotpath_trace()]
-
-    assert np.array_equal(cp.asnumpy(right_covered), np.asarray([1, 1, 0], dtype=np.int8))
-    assert "overlay.faces.coverage.right.polygon_logical_rows_warp" in trace_names
+    result = _overlay_owned(
+        from_shapely_geometries([reversed_donut], residency=Residency.DEVICE),
+        from_shapely_geometries([container], residency=Residency.DEVICE),
+        operation="intersection",
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+    ).to_shapely()[0]
+    assert shapely.equals(result, reversed_donut)
 
 
 @pytest.mark.gpu
-def test_gpu_face_coverage_uses_coordinate_cooperative_indexed_and_broadcast_shapes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_duplicate_minimum_public_overlay_preserves_exact_ring_transition() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
 
-    import cupy as cp
+    from vibespatial.overlay.gpu import _overlay_owned
 
-    from vibespatial.overlay.faces import _gpu_label_face_coverage
+    duplicate_minimum = Polygon(
+        [(0, 0), (0, 0), (2, 0), (2, 2), (0, 2), (0, 0)]
+    )
+    container = shapely.box(-1.0, -1.0, 3.0, 3.0)
+    _, _, _, atomic_edges, _, faces = _build_face_table(
+        [duplicate_minimum],
+        [container],
+    )
 
-    left = from_shapely_geometries(
-        [Polygon([(100, 100), (104, 100), (104, 104), (100, 104), (100, 100)])],
-        residency=Residency.DEVICE,
-    )
-    complex_polygon = shapely.Point(0.0, 0.0).buffer(10.0, quad_segs=512)
-    right_base = from_shapely_geometries(
-        [complex_polygon],
-        residency=Residency.DEVICE,
-    )
-    right_indexed = right_base._device_indexed_take(
-        cp.zeros(16, dtype=cp.int64),
-    )
-    label_x = cp.asarray([0.0, 9.0, 11.0], dtype=cp.float64)
-    label_y = cp.zeros(3, dtype=cp.float64)
-    face_source_rows = cp.zeros(3, dtype=cp.int32)
-
-    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
-    reset_hotpath_trace()
-    _left_covered, indexed_covered = _gpu_label_face_coverage(
-        left,
-        right_indexed,
-        label_x,
-        label_y,
-        3,
-        face_source_rows=face_source_rows,
-        right_geometry_source_rows=cp.zeros(right_indexed.row_count, dtype=cp.int32),
-    )
-    indexed_trace_names = [stage.name for stage in get_hotpath_trace()]
-
+    assert np.any(atomic_edges.device_state.left_coverage_delta != 0)
     assert np.array_equal(
-        cp.asnumpy(indexed_covered),
-        np.asarray([1, 1, 0], dtype=np.int8),
+        faces.bounded_mask,
+        (faces.cycle_orientation > 0).astype(np.int8),
     )
-    assert (
-        "overlay.faces.coverage.right.polygon_logical_rows_block"
-        in indexed_trace_names
+    result = _overlay_owned(
+        from_shapely_geometries(
+            [duplicate_minimum],
+            residency=Residency.DEVICE,
+        ),
+        from_shapely_geometries([container], residency=Residency.DEVICE),
+        operation="intersection",
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+    ).to_shapely()[0]
+
+    assert shapely.equals(result, duplicate_minimum)
+
+
+@pytest.mark.gpu
+def test_nested_disconnected_shell_hole_island_uses_exact_component_containment() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    from vibespatial.overlay.gpu import _overlay_owned
+
+    outer = Polygon(
+        shell=[(0, 0), (20, 0), (20, 20), (0, 20), (0, 0)],
+        holes=[[(4, 4), (16, 4), (16, 16), (4, 16), (4, 4)]],
+    )
+    island = shapely.box(8.0, 8.0, 12.0, 12.0)
+    nested = MultiPolygon([outer, island])
+    container = shapely.box(-1.0, -1.0, 21.0, 21.0)
+
+    producer_stream = cp.cuda.Stream(non_blocking=True)
+    with producer_stream:
+        _, _, _, _, _, faces = _build_face_table([nested], [container])
+    producer_stream.synchronize()
+    bounded = faces.bounded_mask.astype(bool, copy=False)
+    left_areas = np.sort(faces.signed_area[bounded & (faces.left_covered != 0)])
+    assert np.array_equal(left_areas, np.asarray([16.0, 400.0], dtype=np.float64))
+
+    result = _overlay_owned(
+        from_shapely_geometries([nested], residency=Residency.DEVICE),
+        from_shapely_geometries([container], residency=Residency.DEVICE),
+        operation="intersection",
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+    ).to_shapely()[0]
+    assert shapely.equals(result, nested)
+
+
+@pytest.mark.gpu
+def test_dual_work_queue_labels_long_diameter_connected_strip_faces() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    strip_count = 256
+    horizontal = shapely.box(0.0, 0.0, float(strip_count * 2), 2.0)
+    vertical_parts = [
+        shapely.box(float(index * 2), -1.0, float(index * 2 + 1), 3.0)
+        for index in range(strip_count)
+    ]
+    vertical = MultiPolygon(vertical_parts)
+    _, _, _, _, _, faces = _build_face_table([horizontal], [vertical])
+
+    assert faces.face_count > strip_count
+    overlap = (
+        faces.bounded_mask.astype(bool, copy=False)
+        & faces.left_covered.astype(bool, copy=False)
+        & faces.right_covered.astype(bool, copy=False)
+    )
+    assert np.count_nonzero(overlap) == strip_count
+    assert faces.signed_area[overlap].sum() == strip_count * 2.0
+
+
+@pytest.mark.gpu
+def test_dual_queue_and_containment_launch_shapes_are_valid_above_65535_faces() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR,
+        get_cuda_runtime,
+    )
+    from vibespatial.overlay.gpu import _overlay_face_walk_kernels
+
+    face_count = 65_536
+    runtime = get_cuda_runtime()
+    kernels = _overlay_face_walk_kernels()
+    ptr = runtime.pointer
+    orientation = cp.full(face_count, -1, dtype=cp.int8)
+    queue = cp.empty(face_count, dtype=cp.int32)
+    queue_head = cp.zeros(1, dtype=cp.int32)
+    queue_tail = cp.zeros(1, dtype=cp.int32)
+    queue_ready = cp.zeros(face_count, dtype=cp.int32)
+    pending = cp.zeros(1, dtype=cp.int32)
+    left_winding = cp.full(face_count, np.iinfo(np.int32).min, dtype=cp.int32)
+    right_winding = cp.full_like(left_winding, np.iinfo(np.int32).min)
+    face_component = cp.full(face_count, -1, dtype=cp.int32)
+    face_offsets = cp.arange(face_count + 1, dtype=cp.int32)
+    face_edge_ids = cp.arange(face_count, dtype=cp.int32)
+    edge_face_ids = cp.arange(face_count, dtype=cp.int32)
+    zero_delta = cp.zeros(face_count, dtype=cp.int32)
+
+    init_grid, init_block = runtime.launch_config(
+        kernels["initialize_dual_face_queue"],
+        face_count,
+    )
+    runtime.launch(
+        kernels["initialize_dual_face_queue"],
+        grid=init_grid,
+        block=init_block,
+        params=(
+            (
+                ptr(orientation),
+                ptr(face_offsets),
+                ptr(face_edge_ids),
+                ptr(queue),
+                ptr(queue_tail),
+                ptr(queue_ready),
+                ptr(pending),
+                ptr(left_winding),
+                ptr(right_winding),
+                ptr(face_component),
+                face_count,
+            ),
+            (KERNEL_PARAM_PTR,) * 10 + (KERNEL_PARAM_I32,),
+        ),
+    )
+    queue_grid, queue_block = runtime.launch_config(
+        kernels["propagate_dual_face_queue"],
+        face_count,
+    )
+    assert queue_grid[0] > 1
+    assert queue_grid[1:] == (1, 1)
+    runtime.launch(
+        kernels["propagate_dual_face_queue"],
+        grid=queue_grid,
+        block=queue_block,
+        params=(
+            (
+                ptr(face_offsets),
+                ptr(face_edge_ids),
+                ptr(edge_face_ids),
+                ptr(zero_delta),
+                ptr(zero_delta),
+                ptr(queue),
+                ptr(queue_head),
+                ptr(queue_tail),
+                ptr(queue_ready),
+                ptr(pending),
+                ptr(left_winding),
+                ptr(right_winding),
+                ptr(face_component),
+                face_count,
+                face_count,
+            ),
+            (KERNEL_PARAM_PTR,) * 13 + (KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+        ),
     )
 
-    reset_hotpath_trace()
-    _left_covered, broadcast_covered = _gpu_label_face_coverage(
-        left,
-        right_base,
-        label_x,
-        label_y,
-        3,
-        face_source_rows=face_source_rows,
-        right_geometry_broadcast=True,
-    )
-    broadcast_trace_names = [stage.name for stage in get_hotpath_trace()]
+    assert int(cp.asnumpy(queue_tail)[0]) == face_count
+    assert int(cp.asnumpy(queue_head)[0]) == face_count
+    assert int(cp.asnumpy(pending)[0]) == 0
 
-    assert np.array_equal(
-        cp.asnumpy(broadcast_covered),
-        np.asarray([1, 1, 0], dtype=np.int8),
+    indexed_face_count = face_count + 1
+    root_faces = cp.arange(face_count, dtype=cp.int32)
+    candidate_faces = cp.full(face_count, -1, dtype=cp.int32)
+    candidate_faces[0] = face_count
+    indexed_offsets = cp.arange(indexed_face_count + 1, dtype=cp.int32)
+    indexed_edges = cp.arange(indexed_face_count, dtype=cp.int32)
+    indexed_x = cp.full(indexed_face_count, 2.0, dtype=cp.float64)
+    indexed_y = cp.zeros(indexed_face_count, dtype=cp.float64)
+    indexed_bounds = cp.zeros(indexed_face_count * 4, dtype=cp.float64)
+    indexed_bounds[face_count * 4 : face_count * 4 + 4] = cp.asarray(
+        [0.0, -1.0, 1.0, 1.0],
+        dtype=cp.float64,
     )
-    assert "overlay.faces.coverage.right.polygon_block" in broadcast_trace_names
+    interval_max_x = cp.full(face_count * 2, -cp.inf, dtype=cp.float64)
+    interval_max_x[face_count] = 1.0
+    level_start = face_count >> 1
+    while level_start:
+        interval_max_x[level_start : level_start * 2] = cp.maximum(
+            interval_max_x[level_start * 2 : level_start * 4 : 2],
+            interval_max_x[level_start * 2 + 1 : level_start * 4 : 2],
+        )
+        level_start >>= 1
+    indexed_components = cp.arange(indexed_face_count, dtype=cp.int32)
+    source_rows = cp.zeros(indexed_face_count, dtype=cp.int32)
+    left_baseline = cp.zeros(face_count, dtype=cp.int32)
+    right_baseline = cp.zeros(face_count, dtype=cp.int32)
+    component_depth = cp.zeros(face_count, dtype=cp.int32)
+    containment_grid = (face_count, 1, 1)
+    containment_block = (256, 1, 1)
+    assert containment_grid[0] > 65_535
+    runtime.launch(
+        kernels["reduce_indexed_component_containment"],
+        grid=containment_grid,
+        block=containment_block,
+        params=(
+            (
+                ptr(root_faces),
+                ptr(candidate_faces),
+                ptr(interval_max_x),
+                ptr(indexed_offsets),
+                ptr(indexed_edges),
+                ptr(indexed_bounds),
+                ptr(indexed_x),
+                ptr(indexed_y),
+                ptr(source_rows),
+                ptr(indexed_components),
+                ptr(None),
+                ptr(None),
+                ptr(left_baseline),
+                ptr(right_baseline),
+                ptr(component_depth),
+                face_count,
+                face_count,
+                0,
+                0,
+            ),
+            (KERNEL_PARAM_PTR,) * 15 + (KERNEL_PARAM_I32,) * 4,
+        ),
+    )
+    assert not bool(cp.any(component_depth))
+
+
+def test_exact_face_labeling_has_no_probe_refinement_or_host_convergence() -> None:
+    root = Path(__file__).resolve().parents[1]
+    faces_source = (root / "src/vibespatial/overlay/faces.py").read_text()
+    kernels_source = (root / "src/vibespatial/overlay/gpu_kernels.py").read_text()
+    types_source = (root / "src/vibespatial/overlay/types.py").read_text()
+    split_source = (root / "src/vibespatial/overlay/split.py").read_text()
+    walk_start = kernels_source.index("_OVERLAY_FACE_WALK_KERNEL_SOURCE")
+    walk_end = kernels_source.index("_OVERLAY_FACE_WALK_KERNEL_NAMES", walk_start)
+    walk_source = kernels_source[walk_start:walk_end]
+    propagation_start = faces_source.index("def _gpu_propagate_face_coverage(")
+    propagation_end = faces_source.index("\ndef _overlay_face_selection_mask_gpu", propagation_start)
+    propagation_source = faces_source[propagation_start:propagation_end]
+    carrier_start = faces_source.index(
+        "def _build_indexed_component_containment_device_state(",
+    )
+    carrier_end = faces_source.index("\ndef _gpu_propagate_face_coverage(", carrier_start)
+    carrier_source = faces_source[carrier_start:carrier_end]
+    graph_source = (root / "src/vibespatial/overlay/graph.py").read_text()
+    split_kernel_start = kernels_source.index("derive_source_ring_transition_signs(")
+    split_kernel_end = kernels_source.index("\n}\n\"\"\"", split_kernel_start)
+    split_kernel_source = kernels_source[split_kernel_start:split_kernel_end]
+
+    assert "compute_face_sample_points" not in kernels_source
+    assert "count_boundary_face_nesting_depth" not in kernels_source
+    assert "collapsed_triangle" not in faces_source
+    assert "area_epsilon" not in walk_source
+    assert "copy_device_to_host(" not in propagation_source
+    assert "copy_device_to_host_async(" not in carrier_source
+    assert "overlay indexed component relation allocation fence" not in carrier_source
+    assert "producer_stream.synchronize()" not in carrier_source
+    assert "runtime.synchronize()" not in propagation_source
+    assert "grid=(1, 1, 1)" not in propagation_source
+    assert "accumulate_component_containment_baseline" not in kernels_source
+    assert "blockIdx.y" not in carrier_source
+    assert "_build_indexed_component_containment_device_state" in propagation_source
+    assert "reduce_indexed_component_containment" in carrier_source
+    assert "select_indexed_component_containment_parent" in carrier_source
+    assert "relation_" not in carrier_source
+    assert "count_indexed_component_containment_candidates" not in kernels_source
+    assert "scatter_indexed_component_containment_candidates" not in kernels_source
+    assert "refine_component_containment_relation_exact" not in kernels_source
+    assert "reduce_component_containment_segments" not in kernels_source
+    assert "reduce_component_containment_nesting" not in kernels_source
+    containment_type = types_source[
+        types_source.index("class IndexedComponentContainmentDeviceState:") :
+        types_source.index("\n\n@dataclass", types_source.index("class IndexedComponentContainmentDeviceState:"))
+    ]
+    assert "relation_" not in containment_type
+    assert "face_capacity: int" in containment_type
+    assert "interval_max_x: DeviceArray" in containment_type
+    assert "interval_max_x" in carrier_source
+    assert "root_block = (256, 1, 1)" in carrier_source
+    assert "split_depth = tree_depth < 8 ? tree_depth : 8" in kernels_source
+    assert "component_depth[candidate_component] == target_depth" in kernels_source
+    assert "cycle_orientation > 0" in graph_source
+    assert "signed_area > 0.0" not in graph_source
+    assert "candidate_orientation == 0" in split_kernel_source
+    assert "source_x0[prior] != cx" in split_kernel_source
+    assert "max_passes" not in split_source
+    assert "_OVERLAY_FACE_LABEL_KERNEL_SOURCE" not in kernels_source

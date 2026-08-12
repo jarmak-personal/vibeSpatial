@@ -313,6 +313,23 @@ def test_physical_work_estimate_dispatches_on_relation_pairs() -> None:
     assert estimate.dispatch_unit_name() == "refine-relation-pair"
 
 
+def test_physical_work_estimate_admits_only_reserved_live_device_bytes() -> None:
+    estimate = PhysicalWorkEstimate(
+        row_count=10,
+        output_byte_count=200,
+        temporary_byte_count=300,
+    )
+
+    assert estimate.live_device_byte_count() == 500
+    assert estimate.is_device_memory_admissible(1_000)
+    assert not estimate.is_device_memory_admissible(999)
+    assert estimate.is_device_memory_admissible(
+        500,
+        budget_numerator=1,
+        budget_denominator=1,
+    )
+
+
 @pytest.mark.parametrize(
     ("constructor", "pair_keyword"),
     [

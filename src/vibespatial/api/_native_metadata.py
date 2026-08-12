@@ -76,6 +76,24 @@ def _gather_optional(values: Any | None, row_positions: Any) -> Any | None:
 
 
 @dataclass(frozen=True)
+class NativeGeometryMetadataPart:
+    """Concrete metadata rows mapped into a logical geometry composition."""
+
+    metadata: Any
+    output_rows: Any
+    geometry: Any | None = None
+    collection_position: int | None = None
+
+    def __post_init__(self) -> None:
+        if _array_size(self.output_rows) != int(self.metadata.row_count):
+            raise ValueError("composition metadata rows must match concrete metadata")
+
+    @property
+    def is_device(self) -> bool:
+        return bool(self.metadata.is_device or _is_device_array(self.output_rows))
+
+
+@dataclass(frozen=True)
 class NativeGeometryMetadata:
     """Private reusable geometry metadata carrier."""
 
@@ -90,6 +108,9 @@ class NativeGeometryMetadata:
     coordinate_stats: Any | None = None
     dimensional_flags: Any | None = None
     shape_summary: dict[str, Any] = field(default_factory=dict)
+    composition_parts: tuple[NativeGeometryMetadataPart, ...] = ()
+    composition_source_row_count: int | None = None
+    composition_row_positions: Any | None = None
     residency: Residency = Residency.HOST
     readiness: NativeStreamReadiness = field(default_factory=NativeStreamReadiness)
 
@@ -98,6 +119,16 @@ class NativeGeometryMetadata:
             raise ValueError("NativeGeometryMetadata row_count must be non-negative")
         if self.bounds is not None and _array_size(self.bounds) != int(self.row_count):
             raise ValueError("NativeGeometryMetadata bounds length must match row_count")
+        for part in self.composition_parts:
+            if _array_size(part.output_rows) != int(part.metadata.row_count):
+                raise ValueError("composition metadata part row count mismatch")
+        if self.composition_parts and self.composition_source_row_count is None:
+            raise ValueError("composition metadata requires its source row count")
+        if (
+            self.composition_row_positions is not None
+            and _array_size(self.composition_row_positions) != int(self.row_count)
+        ):
+            raise ValueError("composition metadata row indirection must match row count")
 
     @classmethod
     def from_owned(
@@ -214,6 +245,56 @@ class NativeGeometryMetadata:
         )
 
     @classmethod
+    def from_native_geometry(
+        cls,
+        geometry,
+        *,
+        source_token: str | None = None,
+    ) -> NativeGeometryMetadata:
+        """Build logical-row metadata for owned or composed native geometry."""
+        owned = getattr(geometry, "owned", None)
+        if owned is not None:
+            return cls.from_cached_owned(owned, source_token=source_token)
+
+        composition = getattr(geometry, "composition", None)
+        if composition is None:
+            raise TypeError("native geometry metadata requires owned or composed geometry")
+
+        row_count = int(composition.row_count)
+        family_names: set[str] = set()
+        metadata_parts = []
+        for part in composition.parts:
+            part_owned = getattr(part.geometry, "owned", None)
+            if part_owned is None:
+                raise TypeError("native geometry metadata composition parts must be owned")
+            part_metadata = cls.from_cached_owned(part_owned)
+            family_names.update(part_metadata.family_names)
+            metadata_parts.append(
+                NativeGeometryMetadataPart(
+                    metadata=part_metadata,
+                    output_rows=part.output_rows,
+                    geometry=part.geometry,
+                    collection_position=part.collection_position,
+                )
+            )
+        return cls(
+            row_count=row_count,
+            source_token=source_token,
+            family_names=tuple(sorted(family_names)),
+            shape_summary={
+                "physical_shape": "sparse-native-composition",
+                "part_count": len(composition.parts),
+            },
+            composition_parts=tuple(metadata_parts),
+            composition_source_row_count=row_count,
+            residency=(
+                Residency.DEVICE
+                if any(part.is_device for part in metadata_parts)
+                else Residency.HOST
+            ),
+        )
+
+    @classmethod
     def from_spatial_index(
         cls,
         flat_index,
@@ -256,7 +337,12 @@ class NativeGeometryMetadata:
 
     @property
     def is_device(self) -> bool:
-        return self.residency is Residency.DEVICE or _is_device_array(self.bounds)
+        return (
+            self.residency is Residency.DEVICE
+            or _is_device_array(self.bounds)
+            or _is_device_array(self.composition_row_positions)
+            or any(part.is_device for part in self.composition_parts)
+        )
 
     def validate_row_count(self, row_count: int) -> None:
         if int(row_count) != int(self.row_count):
@@ -279,6 +365,25 @@ class NativeGeometryMetadata:
     ) -> NativeGeometryMetadata:
         """Gather row-aligned metadata without forcing device buffers to host."""
         positions = _normalize_row_positions(row_positions)
+        if self.composition_parts:
+            logical_positions = (
+                positions
+                if self.composition_row_positions is None
+                else _gather_optional(self.composition_row_positions, positions)
+            )
+            return type(self)(
+                row_count=_array_size(positions),
+                source_token=self.source_token if source_token is None else source_token,
+                family_names=self.family_names,
+                coordinate_stats=self.coordinate_stats,
+                dimensional_flags=self.dimensional_flags,
+                shape_summary=dict(self.shape_summary),
+                composition_parts=self.composition_parts,
+                composition_source_row_count=self.composition_source_row_count,
+                composition_row_positions=logical_positions,
+                residency=self.residency,
+                readiness=self.readiness,
+            )
         bounds = _gather_optional(self.bounds, positions)
         validity = _gather_optional(self.validity, positions)
         family_tags = _gather_optional(self.family_tags, positions)
@@ -300,6 +405,9 @@ class NativeGeometryMetadata:
             coordinate_stats=self.coordinate_stats,
             dimensional_flags=self.dimensional_flags,
             shape_summary=dict(self.shape_summary),
+            composition_parts=(),
+            composition_source_row_count=None,
+            composition_row_positions=None,
             residency=_device_or_host_residency(
                 bounds,
                 validity,
@@ -376,6 +484,11 @@ class NativeGeometryMetadata:
         surface: str = "vibespatial.api.NativeGeometryMetadata.bounds_to_host",
         strict_disallowed: bool = True,
     ) -> np.ndarray:
+        if self.bounds is None and self.composition_parts:
+            return self.physicalize_logical_rows().bounds_to_host(
+                surface=surface,
+                strict_disallowed=strict_disallowed,
+            )
         if self.bounds is None:
             return np.empty((int(self.row_count), 4), dtype=np.float64)
         if _is_device_array(self.bounds):
@@ -397,6 +510,82 @@ class NativeGeometryMetadata:
                 reason=f"{surface}::native_geometry_metadata_bounds_to_host",
             ).astype(np.float64, copy=False)
         return np.asarray(self.bounds, dtype=np.float64)
+
+    def physicalize_logical_rows(self) -> NativeGeometryMetadata:
+        """Reduce sparse composition metadata into dense logical-row columns."""
+        if not self.composition_parts:
+            return self
+
+        import cupy as cp
+
+        bounds = cp.empty((self.row_count, 4), dtype=cp.float64)
+        bounds[:, 0:2] = cp.inf
+        bounds[:, 2:4] = -cp.inf
+        validity = cp.zeros(self.row_count, dtype=cp.bool_)
+        bounded = cp.zeros(self.row_count, dtype=cp.bool_)
+        selected_source_rows = (
+            cp.arange(self.row_count, dtype=cp.int64)
+            if self.composition_row_positions is None
+            else cp.asarray(self.composition_row_positions, dtype=cp.int64)
+        )
+        from vibespatial.api._native_result_core import _composition_part_take_relation
+
+        for part in self.composition_parts:
+            relation = _composition_part_take_relation(
+                part.output_rows,
+                selected_source_rows,
+            )
+            concrete_positions = relation.left_indices
+            if _array_size(concrete_positions) == 0:
+                continue
+            part_metadata = part.metadata.take(concrete_positions)
+            if part_metadata.composition_parts:
+                part_metadata = part_metadata.physicalize_logical_rows()
+            if part_metadata.bounds is None:
+                part_owned = getattr(part.geometry, "owned", None)
+                if part_owned is None:
+                    raise TypeError(
+                        "composition metadata bounds require concrete owned geometry"
+                    )
+                selected_geometry = part.geometry.take(
+                    concrete_positions,
+                    defer_device_metadata=True,
+                )
+                selected_owned = getattr(selected_geometry, "owned", None)
+                if selected_owned is None:
+                    raise TypeError(
+                        "composition metadata bounds require selected owned geometry"
+                    )
+                part_metadata = type(self).from_owned(selected_owned)
+            part_bounds = cp.asarray(part_metadata.bounds, dtype=cp.float64)
+            part_validity = (
+                cp.ones(part_metadata.row_count, dtype=cp.bool_)
+                if part_metadata.validity is None
+                else cp.asarray(part_metadata.validity, dtype=cp.bool_)
+            )
+            part_rows = cp.asarray(relation.right_indices, dtype=cp.int64)
+            validity[part_rows[part_validity]] = True
+            finite = part_validity & cp.all(cp.isfinite(part_bounds), axis=1)
+            finite_rows = part_rows[finite]
+            cp.minimum.at(bounds[:, 0], finite_rows, part_bounds[finite, 0])
+            cp.minimum.at(bounds[:, 1], finite_rows, part_bounds[finite, 1])
+            cp.maximum.at(bounds[:, 2], finite_rows, part_bounds[finite, 2])
+            cp.maximum.at(bounds[:, 3], finite_rows, part_bounds[finite, 3])
+            bounded[finite_rows] = True
+        bounds[~bounded] = cp.nan
+        return replace(
+            self,
+            bounds=bounds,
+            validity=validity,
+            composition_parts=(),
+            composition_source_row_count=None,
+            composition_row_positions=None,
+            shape_summary={
+                **self.shape_summary,
+                "physical_shape": "dense-logical-rows",
+            },
+            residency=Residency.DEVICE,
+        )
 
 
 @dataclass(frozen=True)
@@ -572,9 +761,275 @@ class NativeSpatialIndex:
             predicate=predicate,
             left_row_count=int(resolved_query_row_count),
             right_row_count=int(self.row_count),
-            sorted_by_left=sort,
+            sorted_by_left=bool(
+                sort or getattr(query_result, "sorted_by_left", False)
+            ),
         )
         return (relation, execution) if return_metadata else relation
+
+    def _query_device_reduction(
+        self,
+        query_owned: Any,
+        *,
+        predicate: str | None,
+        precomputed_query_bounds: Any | None,
+        reduction: str,
+    ):
+        if not (
+            self.is_device
+            and _is_device_array(self.order)
+            and _is_device_array(self.morton_keys)
+            and self.metadata is not None
+            and self.metadata.bounds is not None
+        ):
+            return None, None
+
+        from vibespatial.kernels.core.geometry_analysis import (
+            compute_geometry_bounds_device,
+        )
+        from vibespatial.spatial.spatial_index_device import (
+            spatial_index_device_left_match_counts,
+            spatial_index_device_left_semijoin_rows,
+            spatial_index_device_right_semijoin_rows,
+        )
+
+        query_bounds = (
+            precomputed_query_bounds
+            if precomputed_query_bounds is not None
+            else compute_geometry_bounds_device(
+                query_owned,
+                preserve_indexed_view=True,
+            )
+        )
+        reducer = {
+            "exists": spatial_index_device_left_semijoin_rows,
+            "right_exists": spatial_index_device_right_semijoin_rows,
+            "count": spatial_index_device_left_match_counts,
+        }[reduction]
+        return reducer(
+            self.to_flat_index(),
+            query_owned,
+            self.geometry,
+            query_bounds,
+            predicate=predicate,
+        )
+
+    def query_left_semijoin(
+        self,
+        query_geometry: Any,
+        *,
+        predicate: str | None = None,
+        distance: float | np.ndarray | None = None,
+        query_token: str | None = None,
+        query_row_count: int | None = None,
+        return_metadata: bool = False,
+        precomputed_query_bounds: Any | None = None,
+    ):
+        """Return matched query rows without materializing relation pairs.
+
+        Physical shape: reusable ``NativeSpatialIndex`` Morton ranges feed
+        range-sliced candidate-refine tiles and reduce existential matches into
+        a capacity-backed ``NativeDeviceSelection``. This preserves the device
+        logical count for consumers that discard duplicate relation pairs.
+        """
+        from vibespatial.api._native_rowset import NativeDeviceSelection
+
+        query_owned = _query_owned_geometry(query_geometry)
+        resolved_query_token = (
+            getattr(query_geometry, "lineage_token", None)
+            if query_token is None
+            else query_token
+        )
+        resolved_query_row_count = (
+            getattr(query_owned, "row_count", None)
+            if query_row_count is None
+            else query_row_count
+        )
+        if resolved_query_row_count is None:
+            raise ValueError("NativeSpatialIndex.query_left_semijoin requires query row count")
+
+        direct_rows = None
+        execution = None
+        if distance is None:
+            direct_rows, execution = self._query_device_reduction(
+                query_owned,
+                predicate=predicate,
+                precomputed_query_bounds=precomputed_query_bounds,
+                reduction="exists",
+            )
+
+        if direct_rows is None:
+            relation, execution = self.query_relation(
+                query_geometry,
+                predicate=predicate,
+                distance=distance,
+                query_token=resolved_query_token,
+                query_row_count=int(resolved_query_row_count),
+                return_device=True,
+                return_metadata=True,
+                precomputed_query_bounds=precomputed_query_bounds,
+            )
+            rowset = relation.left_semijoin_rowset(order="sorted")
+        else:
+            if not isinstance(direct_rows, NativeDeviceSelection):
+                raise TypeError("native device semijoin must return a device selection")
+            rowset = replace(
+                direct_rows,
+                source_token=resolved_query_token,
+                source_row_count=int(resolved_query_row_count),
+            )
+        return (rowset, execution) if return_metadata else rowset
+
+    def query_left_antijoin(
+        self,
+        query_geometry: Any,
+        *,
+        predicate: str | None = None,
+        distance: float | np.ndarray | None = None,
+        query_token: str | None = None,
+        query_row_count: int | None = None,
+        return_metadata: bool = False,
+        precomputed_query_bounds: Any | None = None,
+    ):
+        """Return unmatched query rows without materializing relation pairs."""
+        matched, execution = self.query_left_semijoin(
+            query_geometry,
+            predicate=predicate,
+            distance=distance,
+            query_token=query_token,
+            query_row_count=query_row_count,
+            return_metadata=True,
+            precomputed_query_bounds=precomputed_query_bounds,
+        )
+        from vibespatial.api._native_rowset import NativeDeviceSelection
+
+        if isinstance(matched, NativeDeviceSelection):
+            rowset = NativeDeviceSelection.from_mask(
+                ~matched.source_mask(),
+                source_token=matched.source_token,
+                source_row_count=matched.source_row_count,
+                geometry_family_domain=matched.geometry_family_domain,
+                trusted_all_valid_rows=matched.trusted_all_valid_rows,
+            )
+        else:
+            rowset = matched.complement()
+        return (rowset, execution) if return_metadata else rowset
+
+    def query_right_semijoin(
+        self,
+        query_geometry: Any,
+        *,
+        predicate: str | None = None,
+        distance: float | np.ndarray | None = None,
+        query_row_count: int | None = None,
+        return_metadata: bool = False,
+        precomputed_query_bounds: Any | None = None,
+    ):
+        """Return matched indexed rows without materializing relation pairs."""
+        from vibespatial.api._native_rowset import NativeDeviceSelection
+
+        query_owned = _query_owned_geometry(query_geometry)
+        resolved_query_row_count = (
+            getattr(query_owned, "row_count", None)
+            if query_row_count is None
+            else query_row_count
+        )
+        if resolved_query_row_count is None:
+            raise ValueError("NativeSpatialIndex.query_right_semijoin requires query row count")
+
+        direct_rows = None
+        execution = None
+        if distance is None:
+            direct_rows, execution = self._query_device_reduction(
+                query_owned,
+                predicate=predicate,
+                precomputed_query_bounds=precomputed_query_bounds,
+                reduction="right_exists",
+            )
+
+        if direct_rows is None:
+            relation, execution = self.query_relation(
+                query_geometry,
+                predicate=predicate,
+                distance=distance,
+                query_row_count=int(resolved_query_row_count),
+                return_device=True,
+                return_metadata=True,
+                precomputed_query_bounds=precomputed_query_bounds,
+            )
+            rowset = relation.right_semijoin_rowset(order="sorted")
+        else:
+            if not isinstance(direct_rows, NativeDeviceSelection):
+                raise TypeError("native device semijoin must return a device selection")
+            rowset = replace(
+                direct_rows,
+                source_token=self.source_token,
+                source_row_count=int(self.row_count),
+            )
+        return (rowset, execution) if return_metadata else rowset
+
+    def query_left_match_count_expression(
+        self,
+        query_geometry: Any,
+        *,
+        predicate: str | None = None,
+        distance: float | np.ndarray | None = None,
+        query_token: str | None = None,
+        query_row_count: int | None = None,
+        return_metadata: bool = False,
+        precomputed_query_bounds: Any | None = None,
+    ):
+        """Return exact per-query match counts without a relation carrier."""
+        from vibespatial.api._native_expression import NativeExpression
+
+        query_owned = _query_owned_geometry(query_geometry)
+        resolved_query_token = (
+            getattr(query_geometry, "lineage_token", None)
+            if query_token is None
+            else query_token
+        )
+        resolved_query_row_count = (
+            getattr(query_owned, "row_count", None)
+            if query_row_count is None
+            else query_row_count
+        )
+        if resolved_query_row_count is None:
+            raise ValueError(
+                "NativeSpatialIndex.query_left_match_count_expression requires "
+                "query row count"
+            )
+
+        direct_counts = None
+        execution = None
+        if distance is None:
+            direct_counts, execution = self._query_device_reduction(
+                query_owned,
+                predicate=predicate,
+                precomputed_query_bounds=precomputed_query_bounds,
+                reduction="count",
+            )
+
+        if direct_counts is None:
+            relation, execution = self.query_relation(
+                query_geometry,
+                predicate=predicate,
+                distance=distance,
+                query_token=resolved_query_token,
+                query_row_count=int(resolved_query_row_count),
+                return_device=True,
+                return_metadata=True,
+                precomputed_query_bounds=precomputed_query_bounds,
+            )
+            expression = relation.left_match_count_expression()
+        else:
+            expression = NativeExpression(
+                operation="spatial_index.left_match_count",
+                values=direct_counts,
+                source_token=resolved_query_token,
+                source_row_count=int(resolved_query_row_count),
+                dtype="int64",
+            )
+        return (expression, execution) if return_metadata else expression
 
 
 def _query_owned_geometry(value: Any):

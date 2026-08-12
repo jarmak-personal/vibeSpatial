@@ -25,7 +25,8 @@ TRANSIT_ACCESS_DISTANCE = 120.0
 ROAD_FRONTAGE_DISTANCE = 45.0
 COMPETITOR_EXCLUSION_DISTANCE = 90.0
 
-tmpdir = Path(tempfile.mkdtemp(prefix="shootout_retail_trade_area_"))
+_tmpdir = tempfile.TemporaryDirectory(prefix="shootout_retail_trade_area_")
+tmpdir = Path(_tmpdir.name)
 fixtures = setup_fixtures(tmpdir)
 
 # --- timed work starts here ---

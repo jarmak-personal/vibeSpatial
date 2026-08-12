@@ -647,6 +647,7 @@ def _write_geoparquet_native_tabular_result(
         payload.attributes,
         payload.geometry.owned,
         path,
+        geometry_composition=payload.geometry.composition,
         geometry_name=payload.geometry_name,
         geometry_crs=payload.geometry.crs,
         index=index,
@@ -1250,7 +1251,11 @@ def plan_geoparquet_scan(
         uses_covering_bbox = "covering" in column_meta
         uses_point_encoding_pushdown = column_meta.get("encoding") == "point"
     prune_result = None
-    if metadata_summary is not None and bbox is not None:
+    if (
+        metadata_summary is not None
+        and metadata_summary.has_spatial_bounds
+        and bbox is not None
+    ):
         prune_result = select_row_groups(metadata_summary, bbox, strategy=planner_strategy)
     return GeoParquetScanPlan(
         selected_path=plan.selected_path,
@@ -2043,7 +2048,8 @@ def _build_geoparquet_metadata_summary_from_pyarrow(
         ymax_path = ymin_path
         source = "point_encoding"
     else:
-        return None
+        xmin_path = ymin_path = xmax_path = ymax_path = None
+        source = "row_group_metadata"
 
     row_group_rows: list[int] = []
     xmin: list[float] = []
@@ -2053,11 +2059,25 @@ def _build_geoparquet_metadata_summary_from_pyarrow(
     source_paths: list[str] | None = None
     row_group_source_indices: list[int] | None = None
     row_group_source_row_groups: list[int] | None = None
-    required = (xmin_path, ymin_path, xmax_path, ymax_path)
+    required = (
+        None
+        if xmin_path is None
+        else (xmin_path, ymin_path, xmax_path, ymax_path)
+    )
+    complete_spatial_bounds = required is not None
 
-    def append_metadata(file_metadata, *, source_index: int | None = None) -> bool:
+    def append_metadata(file_metadata, *, source_index: int | None = None) -> None:
+        nonlocal complete_spatial_bounds
         for row_group_index in range(file_metadata.num_row_groups):
             group = file_metadata.row_group(row_group_index)
+            row_group_rows.append(int(group.num_rows))
+            if source_index is not None:
+                assert row_group_source_indices is not None
+                assert row_group_source_row_groups is not None
+                row_group_source_indices.append(int(source_index))
+                row_group_source_row_groups.append(int(row_group_index))
+            if not complete_spatial_bounds or required is None:
+                continue
             stats_by_path: dict[str, tuple[float, float]] = {}
             for column_index in range(group.num_columns):
                 column = group.column(column_index)
@@ -2068,18 +2088,16 @@ def _build_geoparquet_metadata_summary_from_pyarrow(
                     continue
                 stats_by_path[column.path_in_schema] = (float(stats.min), float(stats.max))
             if any(path_name not in stats_by_path for path_name in required):
-                return False
-            row_group_rows.append(int(group.num_rows))
+                complete_spatial_bounds = False
+                continue
+            assert xmin_path is not None
+            assert ymin_path is not None
+            assert xmax_path is not None
+            assert ymax_path is not None
             xmin.append(stats_by_path[xmin_path][0])
             ymin.append(stats_by_path[ymin_path][0])
             xmax.append(stats_by_path[xmax_path][1])
             ymax.append(stats_by_path[ymax_path][1])
-            if source_index is not None:
-                assert row_group_source_indices is not None
-                assert row_group_source_row_groups is not None
-                row_group_source_indices.append(int(source_index))
-                row_group_source_row_groups.append(int(row_group_index))
-        return True
 
     if filesystem is not None and hasattr(filesystem, "get_file_info"):
         info = filesystem.get_file_info(path)
@@ -2094,12 +2112,10 @@ def _build_geoparquet_metadata_summary_from_pyarrow(
                 if file_metadata is None:
                     return None
                 source_paths.append(str(fragment.path))
-                if not append_metadata(file_metadata, source_index=source_index):
-                    return None
+                append_metadata(file_metadata, source_index=source_index)
         elif info.type == pafs.FileType.File:
             path = _coerce_pyarrow_parquet_source(path)
-            if not append_metadata(parquet.ParquetFile(path, filesystem=filesystem).metadata):
-                return None
+            append_metadata(parquet.ParquetFile(path, filesystem=filesystem).metadata)
         else:
             return None
     elif filesystem is None and isinstance(path, (str, PathLike)) and Path(path).is_dir():
@@ -2113,20 +2129,22 @@ def _build_geoparquet_metadata_summary_from_pyarrow(
             if file_metadata is None:
                 return None
             source_paths.append(str(fragment.path))
-            if not append_metadata(file_metadata, source_index=source_index):
-                return None
+            append_metadata(file_metadata, source_index=source_index)
     else:
         path = _coerce_pyarrow_parquet_source(path)
-        if not append_metadata(parquet.ParquetFile(path, filesystem=filesystem).metadata):
-            return None
+        append_metadata(parquet.ParquetFile(path, filesystem=filesystem).metadata)
+
+    if not row_group_rows:
+        return None
+    has_spatial_bounds = complete_spatial_bounds and len(xmin) == len(row_group_rows)
 
     return build_geoparquet_metadata_summary(
-        source=source,
+        source=source if has_spatial_bounds else "row_group_metadata",
         row_group_rows=row_group_rows,
-        xmin=xmin,
-        ymin=ymin,
-        xmax=xmax,
-        ymax=ymax,
+        xmin=xmin if has_spatial_bounds else None,
+        ymin=ymin if has_spatial_bounds else None,
+        xmax=xmax if has_spatial_bounds else None,
+        ymax=ymax if has_spatial_bounds else None,
         source_paths=source_paths,
         row_group_source_indices=row_group_source_indices,
         row_group_source_row_groups=row_group_source_row_groups,
@@ -2635,6 +2653,7 @@ def _read_geoparquet_native_impl(
         geometry_name=native_results[0].geometry_name,
         crs=native_results[0].geometry.crs,
         provenance=provenance,
+        ignore_index=False,
     )
 
 

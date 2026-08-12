@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 from collections import Counter
 from pathlib import Path
 
@@ -77,6 +78,26 @@ def test_paged_overlay_plan_keeps_page_boundaries_algebraic() -> None:
     assert plan.row_span(0) == (0, 100_000)
     assert plan.row_span(10) == (1_000_000, 1_000_001)
     assert not hasattr(plan, "page_row_offsets")
+
+
+def test_paged_overlay_plan_accepts_compact_weighted_row_spans() -> None:
+    plan = PagedOverlayExecutionPlan(
+        left=object(),
+        right=object(),
+        row_count=10,
+        rows_per_page=6,
+        max_left_segments_per_row=4,
+        max_right_segments_per_row=40,
+        dispatch_mode=ExecutionMode.GPU,
+        complete_row_spans=((0, 2), (2, 9), (9, 10)),
+    )
+
+    assert plan.page_count == 3
+    assert [plan.row_span(index) for index in range(plan.page_count)] == [
+        (0, 2),
+        (2, 9),
+        (9, 10),
+    ]
 
 
 def test_split_consumes_classified_candidate_pages_without_relation_concat() -> None:
@@ -198,7 +219,15 @@ def test_gpu_row_isolated_topology_pages_preserve_complete_rows(
         (2, 3),
     ]
     assert plan.row_isolated
-    assert events == []
+    assert events
+    assert {
+        event.reason
+        for event in events
+    } <= {
+        "overlay compact topology page-weight planning packet",
+        "overlay compact topology work-summary planning packet",
+    }
+    assert sum(event.item_count for event in events) <= 5
 
     result, selected = overlay_gpu._materialize_overlay_execution_plan(
         plan,
@@ -637,6 +666,265 @@ def test_gpu_atomic_edges_use_dense_metadata_lookup_without_sort_pairs() -> None
 
     assert atomic_edges.count > 0
     assert atomic_edges.row_indices.shape[0] == atomic_edges.count
+
+
+def test_split_helper_call_graph_has_no_context_wide_synchronization() -> None:
+    split_source = inspect.getsource(importlib.import_module("vibespatial.overlay.split"))
+    renode_start = split_source.index("def renode_gpu_atomic_edges(")
+    grouped_start = split_source.index("def renode_grouped_boundary_segments_gpu(")
+
+    assert "runtime.synchronize()" not in split_source
+    assert "overlay_bool_scalar" not in split_source[grouped_start:]
+    assert "cp.int8(127)" in split_source[renode_start:grouped_start]
+    assert "cp.int8(127)" in split_source[grouped_start:]
+
+
+@pytest.mark.gpu
+def test_split_helper_call_graph_performs_no_context_wide_synchronization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    split_module = importlib.import_module("vibespatial.overlay.split")
+    runtime = split_module.get_cuda_runtime()
+
+    class _SyncCountingRuntime:
+        def __init__(self, delegate) -> None:
+            self.delegate = delegate
+            self.synchronize_calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self.delegate, name)
+
+        def synchronize(self) -> None:
+            self.synchronize_calls += 1
+
+    counting_runtime = _SyncCountingRuntime(runtime)
+    monkeypatch.setattr(
+        split_module,
+        "get_cuda_runtime",
+        lambda: counting_runtime,
+    )
+    left = from_shapely_geometries([box(0, 0, 2, 2)])
+    right = from_shapely_geometries([box(1, 0, 3, 2)])
+
+    split_events = split_module.build_gpu_split_events(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        require_same_row=True,
+        use_same_row_fast_path=False,
+        include_same_side_splits=True,
+    )
+    atomic_edges = split_module.build_gpu_atomic_edges(
+        split_events,
+        isolate_rows=True,
+    )
+    noded = split_module.renode_gpu_atomic_edges(
+        atomic_edges,
+        isolate_rows=True,
+    )
+    split_module._free_split_event_device_state(split_events)
+    split_module._free_atomic_edge_excess(noded)
+
+    assert counting_runtime.synchronize_calls == 0
+
+
+@pytest.mark.gpu
+def test_renoding_endpoint_event_is_the_exact_duplicate_representative() -> None:
+    import cupy as cp
+
+    from vibespatial.overlay.split import _merge_split_event_runs_balanced
+
+    endpoint = (
+        cp.asarray([0], dtype=cp.int32),
+        cp.asarray([0.0], dtype=cp.float64),
+        cp.asarray([1.0], dtype=cp.float64),
+        cp.asarray([2.0], dtype=cp.float64),
+        cp.asarray([127], dtype=cp.int8),
+    )
+    rounded_intersection = (
+        cp.asarray([0], dtype=cp.int32),
+        cp.asarray([0.0], dtype=cp.float64),
+        cp.asarray([cp.nextafter(cp.float64(1.0), cp.float64(2.0))]),
+        cp.asarray([2.0], dtype=cp.float64),
+        cp.asarray([4], dtype=cp.int8),
+    )
+
+    merged = _merge_split_event_runs_balanced([endpoint, rounded_intersection])
+
+    assert merged[0].size == 1
+    assert float(merged[2][0]) == 1.0
+    assert float(merged[3][0]) == 2.0
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("reverse_right", [False, True])
+def test_coincident_operand_deltas_aggregate_with_semantic_orientation(
+    reverse_right: bool,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    shell = [(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)]
+    right_shell = list(reversed(shell)) if reverse_right else shell
+    split_events = build_gpu_split_events(
+        from_shapely_geometries([Polygon(shell)]),
+        from_shapely_geometries([Polygon(right_shell)]),
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    atomic_edges = build_gpu_atomic_edges(split_events)
+    device = atomic_edges.device_state
+    forward = device.direction == 0
+    left_delta = device.left_coverage_delta
+    right_delta = device.right_coverage_delta
+
+    assert np.all(device.source_membership[forward] == 3)
+    assert np.array_equal(left_delta[forward], right_delta[forward])
+    assert np.all(np.abs(left_delta[forward]) == 1)
+    assert np.array_equal(left_delta[1::2], -left_delta[0::2])
+    assert np.array_equal(right_delta[1::2], -right_delta[0::2])
+
+
+@pytest.mark.gpu
+def test_atomic_edge_deltas_are_preserved_through_structural_renoding() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    from vibespatial import RuntimeSelection
+    from vibespatial.overlay.split import renode_gpu_atomic_edges
+    from vibespatial.overlay.types import AtomicEdgeDeviceState, AtomicEdgeTable
+
+    source_ids = cp.asarray([0, 0, 1, 1, 2, 2], dtype=cp.int32)
+    direction = cp.asarray([0, 1, 0, 1, 0, 1], dtype=cp.int8)
+    src_x = cp.asarray([0.0, 2.0, 0.0, 2.0, 5.0, 6.0], dtype=cp.float64)
+    src_y = cp.asarray([0.0, 2.0, 2.0, 0.0, 0.0, 0.0], dtype=cp.float64)
+    dst_x = cp.asarray([2.0, 0.0, 2.0, 0.0, 6.0, 5.0], dtype=cp.float64)
+    dst_y = cp.asarray([2.0, 0.0, 0.0, 2.0, 0.0, 0.0], dtype=cp.float64)
+    atomic_edges = AtomicEdgeTable(
+        left_segment_count=3,
+        right_segment_count=0,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="delta re-node regression",
+        ),
+        device_state=AtomicEdgeDeviceState(
+            source_segment_ids=source_ids,
+            direction=direction,
+            src_x=src_x,
+            src_y=src_y,
+            dst_x=dst_x,
+            dst_y=dst_y,
+            row_indices=cp.zeros(6, dtype=cp.int32),
+            part_indices=cp.zeros(6, dtype=cp.int32),
+            ring_indices=cp.zeros(6, dtype=cp.int32),
+            source_side=cp.ones(6, dtype=cp.int8),
+            source_membership=cp.ones(6, dtype=cp.uint8),
+            tangent_x=dst_x - src_x,
+            tangent_y=dst_y - src_y,
+            left_coverage_delta=cp.asarray([2, -2, 3, -3, 4, -4], dtype=cp.int32),
+            right_coverage_delta=cp.zeros(6, dtype=cp.int32),
+        ),
+        _count=6,
+    )
+
+    noded = renode_gpu_atomic_edges(atomic_edges, isolate_rows=True)
+    device = noded.device_state
+    forward = device.direction == 0
+
+    assert noded.count == 10
+    assert np.all(device.left_coverage_delta[device.source_segment_ids == 0][forward[device.source_segment_ids == 0]] == 2)
+    assert np.all(device.left_coverage_delta[device.source_segment_ids == 1][forward[device.source_segment_ids == 1]] == 3)
+    assert np.array_equal(
+        device.left_coverage_delta[1::2],
+        -device.left_coverage_delta[0::2],
+    )
+    assert np.all(device.right_coverage_delta == 0)
+
+
+@pytest.mark.gpu
+def test_partial_collinear_renoding_sums_every_parent_occurrence() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    from vibespatial import RuntimeSelection
+    from vibespatial.overlay.split import renode_gpu_atomic_edges
+    from vibespatial.overlay.types import AtomicEdgeDeviceState, AtomicEdgeTable
+
+    source_ids = cp.asarray([0, 0, 1, 1], dtype=cp.int32)
+    direction = cp.asarray([0, 1, 0, 1], dtype=cp.int8)
+    src_x = cp.asarray([0.0, 2.0, 1.0, 3.0], dtype=cp.float64)
+    dst_x = cp.asarray([2.0, 0.0, 3.0, 1.0], dtype=cp.float64)
+    zeros_f64 = cp.zeros(4, dtype=cp.float64)
+    atomic_edges = AtomicEdgeTable(
+        left_segment_count=2,
+        right_segment_count=0,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="partial collinear provenance canary",
+        ),
+        device_state=AtomicEdgeDeviceState(
+            source_segment_ids=source_ids,
+            direction=direction,
+            src_x=src_x,
+            src_y=zeros_f64,
+            dst_x=dst_x,
+            dst_y=zeros_f64.copy(),
+            row_indices=cp.zeros(4, dtype=cp.int32),
+            part_indices=cp.zeros(4, dtype=cp.int32),
+            ring_indices=cp.zeros(4, dtype=cp.int32),
+            source_side=cp.asarray([1, 1, 2, 2], dtype=cp.int8),
+            source_membership=cp.asarray([1, 1, 2, 2], dtype=cp.uint8),
+            tangent_x=dst_x - src_x,
+            tangent_y=zeros_f64.copy(),
+            left_coverage_delta=cp.asarray([2, -2, 3, -3], dtype=cp.int32),
+            right_coverage_delta=cp.asarray([7, -7, 11, -11], dtype=cp.int32),
+        ),
+        _count=4,
+    )
+
+    noded = renode_gpu_atomic_edges(atomic_edges, isolate_rows=True)
+    device = noded.device_state
+    forward = cp.asarray(device.direction, dtype=cp.int8) == 0
+    actual = cp.asnumpy(
+        cp.stack(
+            (
+                cp.asarray(device.src_x)[forward],
+                cp.asarray(device.dst_x)[forward],
+                cp.asarray(device.left_coverage_delta)[forward],
+                cp.asarray(device.right_coverage_delta)[forward],
+                cp.asarray(device.source_membership)[forward],
+            ),
+            axis=1,
+        )
+    )
+
+    assert noded.count == 6
+    assert np.array_equal(
+        actual,
+        np.asarray(
+            [
+                [0.0, 1.0, 2, 7, 1],
+                [1.0, 2.0, 5, 18, 3],
+                [2.0, 3.0, 3, 11, 2],
+            ]
+        ),
+    )
+    assert np.array_equal(
+        cp.asnumpy(cp.asarray(device.left_coverage_delta)[1::2]),
+        -cp.asnumpy(cp.asarray(device.left_coverage_delta)[0::2]),
+    )
+    assert np.array_equal(
+        cp.asnumpy(cp.asarray(device.right_coverage_delta)[1::2]),
+        -cp.asnumpy(cp.asarray(device.right_coverage_delta)[0::2]),
+    )
 
 
 @pytest.mark.gpu

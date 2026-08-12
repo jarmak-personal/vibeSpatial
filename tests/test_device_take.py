@@ -338,6 +338,64 @@ def test_polygonal_explode_from_capacity_multipolygon_view_retains_capacity():
     assert np.array_equal(cp.asnumpy(polygon.y[: logical_y.size]), logical_y)
 
 
+def test_nullable_homogeneous_device_placeholder_physicalizes_exact_rows():
+    _require_gpu()
+    import cupy as cp
+
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    polygons = [
+        Polygon(
+            [
+                (float(i), 0.0),
+                (float(i + 1), 0.0),
+                (float(i + 1), 1.0),
+                (float(i), 1.0),
+                (float(i), 0.0),
+            ]
+        )
+        for i in range(8)
+    ]
+    owned = from_shapely_geometries(polygons, residency=Residency.DEVICE)
+    activity = cp.asarray(
+        [True, True, False, True, True, False, True, True],
+        dtype=cp.bool_,
+    )
+
+    nullable = owned._device_indexed_take(
+        cp.arange(owned.row_count, dtype=cp.int64),
+        assume_unique_indices=True,
+    )
+    nullable._apply_row_activity(activity, assume_active_indices_unique=True)
+    first = nullable.physicalize_device_rows(allow_capacity_allocation=True)
+    assert not first.families[GeometryFamily.POLYGON].host_materialized
+
+    second_view = first._device_indexed_take(
+        cp.arange(first.row_count, dtype=cp.int64),
+        assume_unique_indices=True,
+    )
+    second = second_view.physicalize_device_rows(allow_capacity_allocation=True)
+    polygon = second._ensure_device_state().families[GeometryFamily.POLYGON]
+    geometry_offsets = cp.asnumpy(polygon.geometry_offsets)
+    ring_offsets = cp.asnumpy(polygon.ring_offsets)
+
+    assert np.array_equal(geometry_offsets, [0, 1, 2, 2, 3, 4, 4, 5, 6])
+    assert np.array_equal(ring_offsets, [0, 5, 10, 15, 20, 25, 30, 30, 30])
+    _assert_geometries_equal(
+        second.to_shapely(),
+        [
+            polygons[0],
+            polygons[1],
+            None,
+            polygons[3],
+            polygons[4],
+            None,
+            polygons[6],
+            polygons[7],
+        ],
+    )
+
+
 def test_lineal_explode_retains_physical_part_capacity():
     _require_gpu()
     import cupy as cp
@@ -830,6 +888,52 @@ class TestDeviceTakeMultiLevel:
         _assert_geometries_equal(
             result.to_shapely(),
             [base_geoms[0], replacement_geoms[0], base_geoms[2], base_geoms[3]],
+        )
+
+    def test_fused_capacity_scatter_physicalizes_multiple_roots_once(self):
+        _require_gpu()
+        import cupy as cupy_mod
+
+        from vibespatial.api._native_rowset import NativeDeviceSelection
+        from vibespatial.geometry.owned import (
+            device_scatter_owned_capacity_selections_many,
+        )
+
+        base_geoms = [Point(float(i), 0.0) for i in range(4)]
+        first_geoms = [
+            LineString([(10.0 + i, 0.0), (10.0 + i, 1.0)]) for i in range(4)
+        ]
+        second_geoms = [
+            LineString([(20.0 + i, 0.0), (20.0 + i, 1.0)]) for i in range(4)
+        ]
+        base = from_shapely_geometries(base_geoms, residency=Residency.DEVICE)
+        first = from_shapely_geometries(first_geoms, residency=Residency.DEVICE)
+        second = from_shapely_geometries(second_geoms, residency=Residency.DEVICE)
+        first_selection = NativeDeviceSelection.from_mask(
+            cupy_mod.asarray([False, True, False, True]),
+            source_row_count=4,
+        )
+        second_selection = NativeDeviceSelection.from_mask(
+            cupy_mod.asarray([False, False, True, True]),
+            source_row_count=4,
+        )
+
+        result = device_scatter_owned_capacity_selections_many(
+            base,
+            [
+                (first, first_selection, None),
+                (second, second_selection, None),
+            ],
+        )
+
+        assert result.is_indexed_view
+        assert (
+            result._device_scatter_implementation
+            == "device_exact_capacity_selection_scatter_many"
+        )
+        _assert_geometries_equal(
+            result.to_shapely(),
+            [base_geoms[0], first_geoms[0], second_geoms[0], second_geoms[1]],
         )
 
     def test_concat_flattens_nested_device_indexed_views_without_take_fence(self):

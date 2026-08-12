@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from vibespatial.cuda.cccl_precompile import (
+    _NVRTC_CONSUMER_MODULES,
     PRECOMPILE_ENV_VAR,
     SPEC_REGISTRY,
     CCCLPrecompiler,
@@ -86,6 +87,9 @@ class TestSpecRegistry:
     def test_spec_names_match_keys(self):
         for key, spec in SPEC_REGISTRY.items():
             assert spec.name == key
+
+    def test_prepared_polygon_mask_is_in_complete_nvrtc_inventory(self):
+        assert "vibespatial.spatial.prepared_polygon_mask" in _NVRTC_CONSUMER_MODULES
 
 
 # ---------------------------------------------------------------------------

@@ -76,6 +76,22 @@ def test_segment_primitives_d2h_exports_are_runtime_accounted() -> None:
     assert raw_scalar_syncs == []
 
 
+def test_general_segment_axis_partition_keeps_fixed_device_capacity() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source = (
+        repo_root / "src" / "vibespatial" / "spatial" / "segment_primitives.py"
+    ).read_text()
+    function_source = source.split(
+        "def _generate_candidates_gpu(",
+        1,
+    )[1].split("\n\ndef ", 1)[0]
+
+    assert "partition_right_mid = cp.where(" in function_source
+    assert "range_capacity=right.count" in function_source
+    assert "compact_indices(axis_mask" not in function_source
+    assert "partition.count" not in function_source
+
+
 def test_segment_candidates_use_device_physicalized_bounded_pages() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     source = (repo_root / "src" / "vibespatial" / "spatial" / "segment_primitives.py").read_text()
@@ -98,6 +114,11 @@ def test_segment_candidates_use_device_physicalized_bounded_pages() -> None:
     assert "d_selected_left = compact_indices(" in source
     assert "output_capacity = selected_count * tier_width" in source
     assert "d_counts > tier_start" in source
+    assert "_PREFERRED_INITIAL_SWEEP_TIER_WIDTH = 256" in source
+    assert "segment.candidates.outlier_pass" not in source
+    assert "cp.partition(right_half_w" not in source
+    assert '"segment.candidates.partition_{axis_name}_axis"' in source
+    assert '"segment.candidates.search_{axis_name}_ranges"' in source
     assert "d_left_pair = d_batch_left[d_local_left]" not in source
     assert "d_candidate_active = d_local_pair < d_chunk_counts[d_local_left]" not in source
 
@@ -485,6 +506,36 @@ def test_indexed_segment_capacity_uses_active_relation_bounds() -> None:
     assert capacity_per_row is None
 
 
+def test_unique_indexed_segment_capacity_stays_bounded() -> None:
+    from types import SimpleNamespace
+
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import DeviceFixedGeometrySizeMetadata
+    from vibespatial.spatial.segment_primitives import (
+        _SEGMENT_EXTRACTION_CAPACITY_MAX_SLOTS,
+        _device_segment_capacity_for_family,
+    )
+
+    row_width = 17
+    buffer = SimpleNamespace(
+        x=SimpleNamespace(size=_SEGMENT_EXTRACTION_CAPACITY_MAX_SLOTS + 1),
+        fixed_size=DeviceFixedGeometrySizeMetadata(
+            max_coord_count_per_row=row_width,
+        ),
+    )
+
+    capacity, capacity_per_row = _device_segment_capacity_for_family(
+        GeometryFamily.POLYGON,
+        buffer,
+        indexed_view=True,
+        row_count=500_000,
+        unique_family_rows=True,
+    )
+
+    assert capacity is None
+    assert capacity_per_row == row_width
+
+
 def test_segment_primitives_classify_proper_cross() -> None:
     left = from_shapely_geometries([LineString([(0, 0), (4, 4)])])
     right = from_shapely_geometries([LineString([(0, 4), (4, 0)])])
@@ -765,7 +816,7 @@ def test_segment_candidate_strict_upper_capacity_path_avoids_filtered_total_fenc
 
 
 @pytest.mark.gpu
-def test_segment_candidate_outlier_capacity_path_avoids_outlier_total_fence() -> None:
+def test_segment_candidate_skewed_spans_use_axis_partition_without_total_fence() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
     from vibespatial.cuda._runtime import (
@@ -884,7 +935,10 @@ def test_same_row_unproved_large_segment_table_uses_generic_native_shape(
     assert "segment same-row span summary scalar fence" not in {event.reason for event in events}
     summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
     assert "segment.candidates.same_row_fast_path" not in summary
-    assert summary.get("segment.candidates.binary_search") == 1
+    assert sum(
+        summary.get(f"segment.candidates.search_{axis}_ranges", 0)
+        for axis in ("x", "y")
+    ) == 2
 
 
 @pytest.mark.gpu
@@ -1189,7 +1243,10 @@ def test_segment_primitives_same_row_sort_sweep_path_matches_cpu(
 
     summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
     assert summary.get("segment.candidates.same_row_fast_path") is None
-    assert summary.get("segment.candidates.binary_search") == 1
+    assert sum(
+        summary.get(f"segment.candidates.search_{axis}_ranges", 0)
+        for axis in ("x", "y")
+    ) == 2
 
 
 def test_benchmark_segment_intersections_reports_degenerate_mix() -> None:

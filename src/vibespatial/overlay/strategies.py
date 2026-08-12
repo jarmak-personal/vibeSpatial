@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 
 
 class OverlayExecutionFamily(StrEnum):
-    CLIP_REWRITE = "clip_rewrite"
     BROADCAST_RIGHT_INTERSECTION = "broadcast_right_intersection"
     BROADCAST_RIGHT_DIFFERENCE = "broadcast_right_difference"
     COVERAGE_UNION = "coverage_union"
@@ -36,7 +35,6 @@ class OverlayExecutionFamily(StrEnum):
 
 
 class OverlayTopologyClass(StrEnum):
-    MASK_CLIP = "mask_clip"
     BROADCAST_MASK = "broadcast_mask"
     COVERAGE = "coverage"
     GROUPED_SET = "grouped_set"
@@ -54,7 +52,7 @@ class OverlayResultShape(StrEnum):
 class OverlayStrategy:
     """Immutable constructive planning object for overlay execution."""
 
-    name: str  # e.g. "broadcast_right", "per_group", "clip_rewrite"
+    name: str  # e.g. "broadcast_right", "per_group"
     many_side: str  # "left", "right", or "both" (for N-vs-M)
     reason: str  # human-readable explanation for provenance
     workload_shape: WorkloadShape | None = None  # shared enum, None for overlay-only shapes
@@ -115,30 +113,7 @@ def _detect_overlay_workload_shape(left_rows: int, right_rows: int):
 
 def _overlay_fusion_steps(
     family: OverlayExecutionFamily,
-    *,
-    clip_rewrite: bool,
 ) -> tuple[PipelineStep, ...]:
-    if clip_rewrite or family is OverlayExecutionFamily.CLIP_REWRITE:
-        return (
-            PipelineStep(
-                name="mask_bounds_filter",
-                kind=StepKind.FILTER,
-                output_name="mask_rows",
-                reusable_output=True,
-            ),
-            PipelineStep(
-                name="emit_clip_slice",
-                kind=StepKind.GEOMETRY,
-                output_name="clipped_geometry",
-            ),
-            PipelineStep(
-                name="constructive_export",
-                kind=StepKind.MATERIALIZATION,
-                output_name="geodataframe",
-                materializes_host_output=True,
-            ),
-        )
-
     if family is OverlayExecutionFamily.BROADCAST_RIGHT_INTERSECTION:
         return (
             PipelineStep(
@@ -274,14 +249,11 @@ def _overlay_fusion_steps(
 
 def _overlay_semantics_flags(
     *,
-    clip_rewrite: bool,
     keep_geom_type: bool | None,
     prefer_exact_polygon_gpu: bool,
     preserve_lower_dim_results: bool,
 ) -> frozenset[str]:
     flags: set[str] = set()
-    if clip_rewrite:
-        flags.add("geometry_only_mask")
     if keep_geom_type is True:
         flags.add("keep_geom_type")
     elif keep_geom_type is False:
@@ -299,7 +271,6 @@ def plan_overlay_operation(
     right_rows: int,
     how: str,
     candidate_pair_count: int = 0,
-    clip_rewrite: bool = False,
     keep_geom_type: bool | None = None,
     prefer_exact_polygon_gpu: bool = False,
     preserve_lower_dim_results: bool = False,
@@ -310,22 +281,12 @@ def plan_overlay_operation(
 
     workload_shape = _detect_overlay_workload_shape(left_rows, right_rows)
     semantics_flags = _overlay_semantics_flags(
-        clip_rewrite=clip_rewrite,
         keep_geom_type=keep_geom_type,
         prefer_exact_polygon_gpu=prefer_exact_polygon_gpu,
         preserve_lower_dim_results=preserve_lower_dim_results,
     )
 
-    if clip_rewrite:
-        family = OverlayExecutionFamily.CLIP_REWRITE
-        topology_class = OverlayTopologyClass.MASK_CLIP
-        result_shape = OverlayResultShape.LEFT_ROWS
-        name = "clip_rewrite"
-        many_side = "left"
-        reason = (
-            f"single-mask clip rewrite: {left_rows} left rows vs {right_rows} right rows, how={how}"
-        )
-    elif (
+    if (
         workload_shape is not None
         and workload_shape.value == "broadcast_right"
         and how == "intersection"
@@ -400,7 +361,7 @@ def plan_overlay_operation(
                 f"how={how}, pairs={candidate_pair_count}"
             )
 
-    fusion_plan = plan_fusion(_overlay_fusion_steps(family, clip_rewrite=clip_rewrite))
+    fusion_plan = plan_fusion(_overlay_fusion_steps(family))
     return OverlayStrategy(
         name=name,
         many_side=many_side,

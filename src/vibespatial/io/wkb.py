@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import os
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib.util import find_spec
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +13,7 @@ import numpy as np
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
+    get_cuda_completion_retainer,
     get_cuda_runtime,
     make_kernel_cache_key,
     pylibcudf_column_from_arrow,
@@ -27,10 +28,13 @@ from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     TAG_FAMILIES,
     DeviceFamilyGeometryBuffer,
+    DeviceFixedGeometrySizeMetadata,
     DiagnosticKind,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
+    build_null_owned_array,
+    device_family_coordinate_counts,
     from_wkb,
 )
 from vibespatial.io.wkb_kernels import (
@@ -458,23 +462,59 @@ def _wkb_upper_bound_bytes(
     for family, (row_indexes, _family_rows) in family_selections.items():
         n_rows_family = row_indexes.shape[0]
         buf = state.families[family]
-        n_coords = buf.x.shape[0]
+        fixed_size = getattr(buf, "fixed_size", None)
+        max_coords = (
+            None
+            if fixed_size is None
+            else fixed_size.max_coord_count_per_row
+        )
+        max_first = (
+            None
+            if fixed_size is None
+            else fixed_size.max_first_level_count_per_row
+        )
+        max_second = (
+            None
+            if fixed_size is None
+            else fixed_size.max_second_level_count_per_row
+        )
+        n_coords = (
+            buf.x.shape[0]
+            if max_coords is None
+            else int(max_coords) * n_rows_family
+        )
 
         if family is GeometryFamily.POINT:
             total += 21 * n_rows_family
         elif family is GeometryFamily.LINESTRING:
             total += 9 * n_rows_family + 16 * n_coords
         elif family is GeometryFamily.POLYGON:
-            n_rings = buf.ring_offsets.shape[0] - 1 if buf.ring_offsets is not None else 0
+            n_rings = (
+                buf.ring_offsets.shape[0] - 1
+                if max_first is None and buf.ring_offsets is not None
+                else int(max_first or 0) * n_rows_family
+            )
             total += 9 * n_rows_family + 4 * n_rings + 16 * n_coords
         elif family is GeometryFamily.MULTIPOINT:
             total += 9 * n_rows_family + 21 * n_coords
         elif family is GeometryFamily.MULTILINESTRING:
-            n_parts = buf.part_offsets.shape[0] - 1 if buf.part_offsets is not None else 0
+            n_parts = (
+                buf.part_offsets.shape[0] - 1
+                if max_first is None and buf.part_offsets is not None
+                else int(max_first or 0) * n_rows_family
+            )
             total += 9 * n_rows_family + 9 * n_parts + 16 * n_coords
         elif family is GeometryFamily.MULTIPOLYGON:
-            n_parts = buf.part_offsets.shape[0] - 1 if buf.part_offsets is not None else 0
-            n_rings = buf.ring_offsets.shape[0] - 1 if buf.ring_offsets is not None else 0
+            n_parts = (
+                buf.part_offsets.shape[0] - 1
+                if max_first is None and buf.part_offsets is not None
+                else int(max_first or 0) * n_rows_family
+            )
+            n_rings = (
+                buf.ring_offsets.shape[0] - 1
+                if max_second is None and buf.ring_offsets is not None
+                else int(max_second or 0) * n_rows_family
+            )
             total += 9 * n_rows_family + 9 * n_parts + 4 * n_rings + 16 * n_coords
     return total
 
@@ -1824,11 +1864,883 @@ def _write_pylibcudf_parquet_table(
     plc.io.parquet.write_parquet(builder.build(), stream=stream)
 
 
+_NATIVE_DEVICE_PARQUET_CHUNK_ROWS = 1_000_000
+_NATIVE_WKB_AVAILABLE_MEMORY_DIVISOR = 2
+_NATIVE_WKB_MAX_COLUMN_BYTES = int(np.iinfo(np.int32).max)
+_NATIVE_WKB_ROW_TEMPORARY_BYTES = 32
+_NATIVE_WKB_BBOX_TEMPORARY_BYTES = 64
+
+
+@dataclass(frozen=True)
+class _NativeWkbChunkEstimate:
+    row_count: int
+    output_bytes: int
+    temporary_bytes: int
+    composition_bytes: int
+
+    @property
+    def live_allocation_bytes(self) -> int:
+        return self.output_bytes + self.temporary_bytes + self.composition_bytes
+
+
+@dataclass(frozen=True)
+class _NativeWkbCapacityPlan:
+    """Physical allocation plan for one terminal native WKB export."""
+
+    metadata: Any
+    max_chunk_rows: int
+    max_output_bytes_per_row: int
+    max_owned_bytes_per_row: int
+    metadata_bytes_per_row: int
+    composition: bool
+    write_covering_bbox: bool
+    ordered_parts: tuple[tuple[int, int, Any], ...] | None = None
+    planning_packet_scalars: int = 0
+
+    def estimate(self, row_count: int) -> _NativeWkbChunkEstimate:
+        rows = max(int(row_count), 0)
+        output_bytes = rows * self.max_output_bytes_per_row
+        row_temporary_bytes = (
+            _NATIVE_WKB_ROW_TEMPORARY_BYTES
+            + self.metadata_bytes_per_row
+            + (
+                _NATIVE_WKB_BBOX_TEMPORARY_BYTES
+                if self.write_covering_bbox
+                else 0
+            )
+        )
+        # Reserve one output-sized scratch region for WKB assembly and
+        # libcudf compression.  The encoded payload itself is accounted for
+        # separately as output_bytes.
+        temporary_bytes = output_bytes + rows * row_temporary_bytes
+        # Composition may first compact selected fragments and then allocate
+        # a second contiguous owned carrier for concat.  Both are live when
+        # encoding starts, so admission must cover the doubled geometry shape.
+        composition_bytes = (
+            2 * rows * self.max_owned_bytes_per_row if self.composition else 0
+        )
+        return _NativeWkbChunkEstimate(
+            row_count=rows,
+            output_bytes=output_bytes,
+            temporary_bytes=temporary_bytes,
+            composition_bytes=composition_bytes,
+        )
+
+    def admitted_rows(
+        self,
+        remaining_rows: int,
+        *,
+        available_device_bytes: int | None = None,
+    ) -> int:
+        remaining = max(int(remaining_rows), 0)
+        if remaining == 0:
+            return 0
+        row_limit = min(remaining, self.max_chunk_rows)
+        if self.max_output_bytes_per_row:
+            row_limit = min(
+                row_limit,
+                _NATIVE_WKB_MAX_COLUMN_BYTES // self.max_output_bytes_per_row,
+            )
+        if available_device_bytes is None:
+            available_device_bytes = _available_native_wkb_device_bytes()
+        if available_device_bytes is not None:
+            allocation_budget = max(int(available_device_bytes), 0) // (
+                _NATIVE_WKB_AVAILABLE_MEMORY_DIVISOR
+            )
+            one_row_live_bytes = self.estimate(1).live_allocation_bytes
+            if one_row_live_bytes:
+                row_limit = min(row_limit, allocation_budget // one_row_live_bytes)
+        if row_limit > 0:
+            return row_limit
+
+        one_row = self.estimate(1)
+        available_detail = (
+            "unknown"
+            if available_device_bytes is None
+            else f"{int(available_device_bytes):,}"
+        )
+        raise MemoryError(
+            "one native WKB export row exceeds the current device allocation "
+            f"budget: output_bytes={one_row.output_bytes:,}; "
+            f"temporary_bytes={one_row.temporary_bytes:,}; "
+            f"composition_bytes={one_row.composition_bytes:,}; "
+            f"available_device_bytes={available_detail}"
+        )
+
+    def requires_chunking(self, row_count: int) -> bool:
+        rows = max(int(row_count), 0)
+        return rows > 0 and self.admitted_rows(rows) < rows
+
+
+def _available_native_wkb_device_bytes() -> int | None:
+    """Return bytes allocatable through the active driver and memory pool."""
+    try:
+        import cupy as cp
+    except ModuleNotFoundError:
+        return None
+
+    driver_free, driver_total = cp.cuda.Device().mem_info
+    pool_free = int(get_cuda_runtime().memory_pool_stats().get("free_bytes", 0))
+    return min(int(driver_total), int(driver_free) + pool_free)
+
+
+def _device_maximum_i64(values):
+    import cupy as cp
+
+    values = cp.asarray(values, dtype=cp.int64)
+    if int(values.size) == 0:
+        return cp.asarray(0, dtype=cp.int64)
+    return cp.max(values).astype(cp.int64, copy=False)
+
+
+def _device_family_size_packet(family: GeometryFamily, buffer):
+    """Return first-level, second-level, and coordinate maxima on device."""
+    import cupy as cp
+
+    geometry_offsets = cp.asarray(buffer.geometry_offsets, dtype=cp.int64)
+    geometry_counts = geometry_offsets[1:] - geometry_offsets[:-1]
+    first_maximum = cp.asarray(0, dtype=cp.int64)
+    second_maximum = cp.asarray(0, dtype=cp.int64)
+    if family in {
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTILINESTRING,
+        GeometryFamily.MULTIPOLYGON,
+    }:
+        first_maximum = _device_maximum_i64(geometry_counts)
+    if family is GeometryFamily.MULTIPOLYGON:
+        part_offsets = cp.asarray(buffer.part_offsets, dtype=cp.int64)
+        ring_starts = part_offsets[geometry_offsets[:-1]]
+        ring_stops = part_offsets[geometry_offsets[1:]]
+        second_maximum = _device_maximum_i64(ring_stops - ring_starts)
+    coordinate_maximum = _device_maximum_i64(
+        device_family_coordinate_counts(buffer)
+    )
+    return cp.stack((first_maximum, second_maximum, coordinate_maximum))
+
+
+def _fixed_or_maximum(fixed_size, field: str) -> int | None:
+    if fixed_size is None:
+        return None
+    maximum = getattr(fixed_size, f"max_{field}", None)
+    if maximum is not None:
+        return int(maximum)
+    fixed = getattr(fixed_size, field, None)
+    return None if fixed is None else int(fixed)
+
+
+def _family_size_proof_complete(family: GeometryFamily, fixed_size) -> bool:
+    if _fixed_or_maximum(fixed_size, "coord_count_per_row") is None:
+        return False
+    if family in {
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTILINESTRING,
+        GeometryFamily.MULTIPOLYGON,
+    } and _fixed_or_maximum(fixed_size, "first_level_count_per_row") is None:
+        return False
+    return not (
+        family is GeometryFamily.MULTIPOLYGON
+        and _fixed_or_maximum(fixed_size, "second_level_count_per_row") is None
+    )
+
+
+def _candidate_ordered_composition_parts(composition):
+    """Return candidate contiguous parts and device-only certification checks."""
+    if (
+        not composition.trusted_singular_rows
+        or composition.residency is not Residency.DEVICE
+        or any(part.collection_position is not None for part in composition.parts)
+    ):
+        return None, ()
+
+    import cupy as cp
+
+    owned_parts = []
+    total_rows = 0
+    for part in composition.parts:
+        part_owned = part.geometry.owned
+        if part_owned is None:
+            return None, ()
+        part_rows = int(part_owned.row_count)
+        if part_rows != int(part.output_rows.shape[0]):
+            return None, ()
+        if part_rows:
+            owned_parts.append(
+                (total_rows, total_rows + part_rows, part_owned, part.output_rows)
+            )
+        total_rows += part_rows
+    if total_rows != int(composition.row_count):
+        return None, ()
+
+    checks = []
+    if not composition.contiguous_row_partitions:
+        for start, stop, _part_owned, output_rows in owned_parts:
+            rows = cp.asarray(output_rows, dtype=cp.int64)
+            internally_contiguous = (
+                cp.asarray(True)
+                if rows.size == 1
+                else cp.all(rows[1:] == rows[:-1] + cp.int64(1))
+            )
+            checks.append(
+                internally_contiguous
+                & (rows[0] == cp.int64(start))
+                & (rows[-1] == cp.int64(stop - 1))
+            )
+    return tuple(
+        (start, stop, part_owned)
+        for start, stop, part_owned, _output_rows in owned_parts
+    ), tuple(checks)
+
+
+def _native_wkb_family_output_bytes(
+    family: GeometryFamily,
+    *,
+    first_count: int,
+    second_count: int,
+    coordinate_count: int,
+) -> int:
+    if family is GeometryFamily.POINT:
+        return 21
+    if family is GeometryFamily.LINESTRING:
+        return 9 + 16 * coordinate_count
+    if family is GeometryFamily.POLYGON:
+        return 9 + 4 * first_count + 16 * coordinate_count
+    if family is GeometryFamily.MULTIPOINT:
+        return 9 + 21 * coordinate_count
+    if family is GeometryFamily.MULTILINESTRING:
+        return 9 + 9 * first_count + 16 * coordinate_count
+    if family is GeometryFamily.MULTIPOLYGON:
+        return (
+            9
+            + 9 * first_count
+            + 4 * second_count
+            + 16 * coordinate_count
+        )
+    raise ValueError(f"Unsupported geometry family for WKB capacity: {family}")
+
+
+def _device_row_metadata_bytes(state) -> int:
+    total = 0
+    for values in (
+        state.validity,
+        state.tags,
+        state.family_row_offsets,
+        state.row_bounds,
+    ):
+        if values is None:
+            continue
+        shape = tuple(int(size) for size in values.shape)
+        trailing_count = int(np.prod(shape[1:], dtype=np.int64)) if len(shape) > 1 else 1
+        total += int(values.dtype.itemsize) * trailing_count
+    return total
+
+
+def _native_wkb_capacity_plan_from_metadata(
+    metadata,
+    *,
+    max_chunk_rows: int,
+    composition: bool,
+    write_covering_bbox: bool,
+    ordered_parts=None,
+    planning_packet_scalars: int = 0,
+) -> _NativeWkbCapacityPlan:
+    """Build a reusable admission plan from structural native metadata."""
+    summary = metadata.shape_summary
+    return _NativeWkbCapacityPlan(
+        metadata=metadata,
+        max_chunk_rows=max(int(max_chunk_rows), 1),
+        max_output_bytes_per_row=max(
+            int(summary.get("max_wkb_output_bytes_per_row", 0)),
+            0,
+        ),
+        max_owned_bytes_per_row=max(
+            int(summary.get("max_owned_bytes_per_row", 0)),
+            0,
+        ),
+        metadata_bytes_per_row=max(
+            int(summary.get("metadata_bytes_per_row", 0)),
+            0,
+        ),
+        composition=bool(composition),
+        write_covering_bbox=bool(write_covering_bbox),
+        ordered_parts=ordered_parts,
+        planning_packet_scalars=max(int(planning_packet_scalars), 0),
+    )
+
+
+def _plan_native_wkb_capacity(
+    *,
+    owned,
+    composition,
+    max_chunk_rows: int,
+    write_covering_bbox: bool,
+) -> _NativeWkbCapacityPlan:
+    """Plan terminal WKB allocations from native structure and live memory."""
+    import cupy as cp
+
+    from vibespatial.api._native_metadata import NativeGeometryMetadata
+
+    if owned is not None:
+        sources = ((0, int(owned.row_count), owned),)
+        ordered_parts = None
+        layout_checks = ()
+        row_count = int(owned.row_count)
+    else:
+        ordered_parts, layout_checks = _candidate_ordered_composition_parts(
+            composition
+        )
+        sources = (
+            ordered_parts
+            if ordered_parts is not None
+            else tuple(
+                (0, int(part.geometry.owned.row_count), part.geometry.owned)
+                for part in composition.parts
+                if part.geometry.owned is not None
+            )
+        )
+        row_count = int(composition.row_count)
+
+    pending_buffers = []
+    seen_buffers: set[int] = set()
+    packet_arrays = []
+    for _start, _stop, source_owned in sources:
+        state = source_owned._ensure_device_state(preserve_indexed_view=True)
+        for family, buffer in state.families.items():
+            buffer_key = id(buffer)
+            if buffer_key in seen_buffers:
+                continue
+            seen_buffers.add(buffer_key)
+            if _family_size_proof_complete(family, buffer.fixed_size):
+                continue
+            pending_buffers.append((family, buffer))
+            packet_arrays.append(_device_family_size_packet(family, buffer))
+
+    packet_arrays.extend(
+        cp.asarray(check, dtype=cp.int64).reshape(1) for check in layout_checks
+    )
+    planning_packet_scalars = sum(int(values.size) for values in packet_arrays)
+    packet_values: list[int] = []
+    if packet_arrays:
+        device_packet = cp.concatenate(
+            [cp.asarray(values, dtype=cp.int64).reshape(-1) for values in packet_arrays]
+        )
+        packet_values = np.asarray(
+            get_cuda_runtime().copy_device_to_host(
+                device_packet,
+                reason=(
+                    "native WKB capacity and contiguous composition allocation packet"
+                ),
+            ),
+            dtype=np.int64,
+        ).tolist()
+
+    cursor = 0
+    for family, buffer in pending_buffers:
+        first_maximum, second_maximum, coordinate_maximum = packet_values[
+            cursor : cursor + 3
+        ]
+        cursor += 3
+        existing = buffer.fixed_size
+        buffer.fixed_size = DeviceFixedGeometrySizeMetadata(
+            first_level_count_per_row=(
+                None if existing is None else existing.first_level_count_per_row
+            ),
+            second_level_count_per_row=(
+                None if existing is None else existing.second_level_count_per_row
+            ),
+            coord_count_per_row=(
+                None if existing is None else existing.coord_count_per_row
+            ),
+            max_first_level_count_per_row=max(
+                first_maximum,
+                _fixed_or_maximum(existing, "first_level_count_per_row") or 0,
+            ),
+            max_second_level_count_per_row=max(
+                second_maximum,
+                _fixed_or_maximum(existing, "second_level_count_per_row") or 0,
+            ),
+            max_coord_count_per_row=max(
+                coordinate_maximum,
+                _fixed_or_maximum(existing, "coord_count_per_row") or 0,
+            ),
+        )
+        buffer._device_size_bounds_exact = True
+
+    if layout_checks:
+        layout_values = packet_values[cursor : cursor + len(layout_checks)]
+        if bool(np.all(layout_values)):
+            object.__setattr__(composition, "contiguous_row_partitions", True)
+        else:
+            ordered_parts = None
+
+    maximum_output_bytes = 0
+    maximum_owned_bytes = 0
+    maximum_metadata_bytes = 0
+    coordinate_count = 0
+    family_row_count = 0
+    unique_structural_buffers: set[int] = set()
+    for _start, _stop, source_owned in sources:
+        state = source_owned._ensure_device_state(preserve_indexed_view=True)
+        row_metadata_bytes = _device_row_metadata_bytes(state)
+        maximum_metadata_bytes = max(maximum_metadata_bytes, row_metadata_bytes)
+        source_output_bytes = 0
+        source_owned_bytes = row_metadata_bytes
+        for family, buffer in state.families.items():
+            fixed_size = buffer.fixed_size
+            first_count = _fixed_or_maximum(
+                fixed_size,
+                "first_level_count_per_row",
+            ) or 0
+            second_count = _fixed_or_maximum(
+                fixed_size,
+                "second_level_count_per_row",
+            ) or 0
+            family_coordinate_count = _fixed_or_maximum(
+                fixed_size,
+                "coord_count_per_row",
+            ) or 0
+            source_output_bytes = max(
+                source_output_bytes,
+                _native_wkb_family_output_bytes(
+                    family,
+                    first_count=first_count,
+                    second_count=second_count,
+                    coordinate_count=family_coordinate_count,
+                ),
+            )
+            source_owned_bytes = max(
+                source_owned_bytes,
+                row_metadata_bytes
+                + 16 * family_coordinate_count
+                + 4 * (first_count + second_count + 1)
+                + 1,
+            )
+            buffer_key = id(buffer)
+            if buffer_key not in unique_structural_buffers:
+                unique_structural_buffers.add(buffer_key)
+                coordinate_count += int(buffer.x.size)
+                family_row_count += max(int(buffer.geometry_offsets.size) - 1, 0)
+        maximum_output_bytes = max(maximum_output_bytes, source_output_bytes)
+        maximum_owned_bytes = max(maximum_owned_bytes, source_owned_bytes)
+
+    geometry_view = SimpleNamespace(owned=owned, composition=composition)
+    metadata = NativeGeometryMetadata.from_native_geometry(geometry_view)
+    metadata = replace(
+        metadata,
+        shape_summary={
+            **metadata.shape_summary,
+            "physical_shape": "terminal-native-wkb-export",
+            "coordinate_count": coordinate_count,
+            "family_row_count": family_row_count,
+            "max_wkb_output_bytes_per_row": maximum_output_bytes,
+            "max_owned_bytes_per_row": maximum_owned_bytes,
+            "metadata_bytes_per_row": maximum_metadata_bytes,
+            "planning_packet_scalars": planning_packet_scalars,
+            "output_row_count": row_count,
+        },
+    )
+    return _native_wkb_capacity_plan_from_metadata(
+        metadata,
+        max_chunk_rows=max_chunk_rows,
+        composition=composition is not None,
+        write_covering_bbox=write_covering_bbox,
+        ordered_parts=ordered_parts,
+        planning_packet_scalars=planning_packet_scalars,
+    )
+
+
+def _iter_native_wkb_capacity_spans(row_count: int, capacity_plan):
+    start = 0
+    total_rows = max(int(row_count), 0)
+    while start < total_rows:
+        admitted_rows = capacity_plan.admitted_rows(total_rows - start)
+        stop = start + admitted_rows
+        yield start, stop
+        start = stop
+
+
+def _physicalize_native_wkb_composition_span(composition, start: int, stop: int):
+    """Assemble one trusted singular logical span without host allocation reads."""
+    import cupy as cp
+
+    span_rows = max(int(stop) - int(start), 0)
+    selected_parts = []
+    selected_destinations = []
+    selected_row_count = 0
+    for part in composition.parts:
+        part_owned = part.geometry.owned
+        if part_owned is None:
+            raise RuntimeError("native WKB composition part lost owned geometry")
+        output_rows = cp.asarray(part.output_rows, dtype=cp.int64)
+        selected_lanes = cp.flatnonzero(
+            (output_rows >= cp.int64(start)) & (output_rows < cp.int64(stop))
+        ).astype(cp.int64, copy=False)
+        part_row_count = int(selected_lanes.size)
+        if part_row_count == 0:
+            continue
+        selected = part_owned._device_indexed_take(
+            selected_lanes,
+            assume_unique_indices=True,
+        ).physicalize_device_rows(allow_capacity_allocation=True)
+        selected_parts.append(selected)
+        selected_destinations.append(
+            output_rows[selected_lanes] - cp.int64(start)
+        )
+        selected_row_count += part_row_count
+
+    if selected_row_count > span_rows:
+        raise RuntimeError("trusted singular WKB composition produced duplicate rows")
+
+    arrays = []
+    if selected_row_count < span_rows:
+        arrays.append(build_null_owned_array(span_rows, residency=Residency.DEVICE))
+        index_map = cp.arange(span_rows, dtype=cp.int64)
+        source_offset = span_rows
+    else:
+        index_map = cp.zeros(span_rows, dtype=cp.int64)
+        source_offset = 0
+
+    for selected, destinations in zip(
+        selected_parts,
+        selected_destinations,
+        strict=True,
+    ):
+        part_row_count = int(selected.row_count)
+        index_map[destinations] = source_offset + cp.arange(
+            part_row_count,
+            dtype=cp.int64,
+        )
+        arrays.append(selected)
+        source_offset += part_row_count
+
+    root = OwnedGeometryArray.concat(arrays)
+    return OwnedGeometryArray._indexed_view(
+        root,
+        index_map,
+        assume_unique_indices=True,
+    )
+
+
+def _iter_bounded_native_wkb_owned_chunks(*, owned, composition, capacity_plan):
+    """Yield capacity-admitted contiguous chunks in logical output order."""
+    import cupy as cp
+
+    if owned is not None:
+        for start, stop in _iter_native_wkb_capacity_spans(
+            owned.row_count,
+            capacity_plan,
+        ):
+            d_rows = cp.arange(start, stop, dtype=cp.int64)
+            yield start, stop, owned._device_indexed_take(
+                d_rows,
+                assume_unique_indices=True,
+            )
+        return
+
+    ordered_parts = capacity_plan.ordered_parts
+    if ordered_parts is None:
+        for start, stop in _iter_native_wkb_capacity_spans(
+            composition.row_count,
+            capacity_plan,
+        ):
+            yield start, stop, _physicalize_native_wkb_composition_span(
+                composition,
+                start,
+                stop,
+            )
+        return
+
+    batch_start = 0
+    batch_rows = 0
+    batch_parts = []
+    target_batch_rows = 0
+    for _part_start, _part_stop, part_owned in ordered_parts:
+        local_start = 0
+        part_rows = int(part_owned.row_count)
+        while local_start < part_rows:
+            if batch_rows == 0:
+                target_batch_rows = capacity_plan.admitted_rows(
+                    int(composition.row_count) - batch_start
+                )
+            remaining = target_batch_rows - batch_rows
+            take_rows = min(remaining, part_rows - local_start)
+            local_stop = local_start + take_rows
+            if local_start == 0 and local_stop == part_rows:
+                selected_owned = (
+                    part_owned.physicalize_device_rows(
+                        allow_capacity_allocation=True
+                    )
+                    if part_owned.is_indexed_view
+                    else part_owned
+                )
+            else:
+                d_rows = cp.arange(local_start, local_stop, dtype=cp.int64)
+                selected_owned = part_owned._device_indexed_take(
+                    d_rows,
+                    assume_unique_indices=True,
+                ).physicalize_device_rows(allow_capacity_allocation=True)
+            batch_parts.append(selected_owned)
+            batch_rows += take_rows
+            local_start = local_stop
+            if batch_rows == target_batch_rows:
+                chunk_owned = (
+                    batch_parts[0]
+                    if len(batch_parts) == 1
+                    else OwnedGeometryArray.concat(batch_parts)
+                )
+                yield batch_start, batch_start + batch_rows, chunk_owned
+                batch_start += batch_rows
+                batch_rows = 0
+                batch_parts = []
+
+    if batch_rows:
+        chunk_owned = (
+            batch_parts[0]
+            if len(batch_parts) == 1
+            else OwnedGeometryArray.concat(batch_parts)
+        )
+        yield batch_start, batch_start + batch_rows, chunk_owned
+
+
+def _write_geoparquet_native_device_wkb_chunks(
+    plc,
+    *,
+    attribute_schema,
+    device_attribute_columns,
+    host_table,
+    ordered_column_names,
+    owned,
+    composition,
+    geometry_name,
+    geometry_crs,
+    schema_version,
+    write_covering_bbox,
+    frame_attrs,
+    sink,
+    compression,
+    writer_kwargs,
+    capacity_plan,
+) -> None:
+    """Encode and write capacity-admitted native WKB row groups on device."""
+    import base64
+    import json
+
+    import cupy as cp
+    import pyarrow as pa
+
+    from vibespatial.api.io.arrow import _create_geometry_metadata, _encode_metadata
+    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+    requested_row_group_size = writer_kwargs.get("row_group_size")
+    if requested_row_group_size is not None:
+        requested_row_group_size = int(requested_row_group_size)
+        if requested_row_group_size <= 0:
+            raise ValueError("row_group_size must be greater than zero")
+    normalized_geometry_crs = geometry_crs
+    if normalized_geometry_crs is not None and not hasattr(
+        normalized_geometry_crs,
+        "to_json_dict",
+    ):
+        try:
+            from pyproj import CRS
+
+            normalized_geometry_crs = CRS.from_user_input(normalized_geometry_crs)
+        except Exception:
+            pass
+
+    geometry_encoding_dict = {geometry_name: "WKB"}
+    geometry_array = (
+        DeviceGeometryArray._from_owned(owned, crs=normalized_geometry_crs)
+        if owned is not None
+        else DeviceGeometryArray._from_composition(
+            composition,
+            crs=normalized_geometry_crs,
+        )
+    )
+    geometry_metadata_view = SimpleNamespace(
+        array=geometry_array,
+        crs=normalized_geometry_crs,
+    )
+    geo_metadata = _create_geometry_metadata(
+        {geometry_name: geometry_metadata_view},
+        primary_column=geometry_name,
+        schema_version=schema_version,
+        geometry_encoding=geometry_encoding_dict,
+        write_covering_bbox=write_covering_bbox,
+    )
+    footer_metadata = {
+        (key.decode() if isinstance(key, bytes) else str(key)): (
+            value.decode() if isinstance(value, bytes) else str(value)
+        )
+        for key, value in (attribute_schema.metadata or {}).items()
+    }
+    footer_metadata["geo"] = _encode_metadata(geo_metadata).decode()
+    if frame_attrs:
+        footer_metadata["PANDAS_ATTRS"] = json.dumps(frame_attrs)
+
+    geometry_field_metadata = {
+        b"ARROW:extension:name": b"geoarrow.wkb",
+        b"ARROW:extension:metadata": b"{}",
+    }
+    if normalized_geometry_crs is not None:
+        try:
+            crs_json = normalized_geometry_crs.to_json_dict()
+        except AttributeError:
+            crs_json = None
+        if crs_json is not None:
+            geometry_field_metadata[b"ARROW:extension:metadata"] = json.dumps(
+                {"crs": crs_json}
+            ).encode()
+
+    bbox_column_names = ["bbox"] if write_covering_bbox else []
+    all_column_names = list(ordered_column_names) + bbox_column_names
+    host_fields = {field.name: field for field in attribute_schema}
+    schema_fields = []
+    for column_name in all_column_names:
+        if column_name == geometry_name:
+            schema_fields.append(
+                pa.field(
+                    geometry_name,
+                    pa.binary(),
+                    nullable=True,
+                    metadata=geometry_field_metadata,
+                )
+            )
+        elif column_name == "bbox":
+            schema_fields.append(
+                pa.field(
+                    "bbox",
+                    pa.struct(
+                        [
+                            pa.field("xmin", pa.float64(), nullable=False),
+                            pa.field("ymin", pa.float64(), nullable=False),
+                            pa.field("xmax", pa.float64(), nullable=False),
+                            pa.field("ymax", pa.float64(), nullable=False),
+                        ]
+                    ),
+                    nullable=True,
+                )
+            )
+        else:
+            schema_fields.append(host_fields[column_name])
+    schema_metadata = dict(attribute_schema.metadata or {})
+    schema_metadata[b"geo"] = _encode_metadata(geo_metadata)
+    if frame_attrs:
+        schema_metadata[b"PANDAS_ATTRS"] = json.dumps(frame_attrs).encode()
+    arrow_schema = pa.schema(schema_fields, metadata=schema_metadata)
+    footer_metadata["ARROW:schema"] = base64.b64encode(
+        arrow_schema.serialize().to_pybytes()
+    ).decode()
+
+    attribute_names = [
+        column_name
+        for column_name in ordered_column_names
+        if column_name != geometry_name
+    ]
+    if device_attribute_columns is not None:
+        full_attribute_columns = [
+            device_attribute_columns[column_name] for column_name in attribute_names
+        ]
+    else:
+        full_attribute_columns = [
+            _attribute_column_to_plc(host_table[column_name], column_name, plc=plc)
+            for column_name in attribute_names
+        ]
+    full_attribute_table = (
+        plc.Table(full_attribute_columns) if full_attribute_columns else None
+    )
+    completion_stream = cp.cuda.get_current_stream()
+    stream = pylibcudf_current_stream(
+        *([] if full_attribute_table is None else [full_attribute_table])
+    )
+    writer = None
+    try:
+        for start, stop, chunk_owned in _iter_bounded_native_wkb_owned_chunks(
+            owned=owned,
+            composition=composition,
+            capacity_plan=capacity_plan,
+        ):
+            if full_attribute_table is None:
+                chunk_attributes = {}
+            else:
+                sliced_attributes = plc.copying.slice(
+                    full_attribute_table,
+                    [start, stop],
+                    stream=stream,
+                )[0]
+                chunk_attributes = dict(
+                    zip(attribute_names, sliced_attributes.columns(), strict=True)
+                )
+
+            chunk_columns = []
+            for column_name in ordered_column_names:
+                if column_name == geometry_name:
+                    chunk_columns.append(_encode_owned_wkb_column_device(chunk_owned))
+                else:
+                    chunk_columns.append(chunk_attributes[column_name])
+
+            if write_covering_bbox:
+                from vibespatial.kernels.core.geometry_analysis import (
+                    compute_geometry_bounds_device,
+                )
+
+                bounds = cp.asarray(compute_geometry_bounds_device(chunk_owned))
+                bbox_children = [
+                    pylibcudf_column_from_device(cp.ascontiguousarray(bounds[:, index]))
+                    for index in range(4)
+                ]
+                chunk_columns.append(plc.Column.struct_from_children(bbox_children))
+
+            chunk_table = plc.Table(chunk_columns)
+            if writer is None:
+                metadata = plc.io.types.TableInputMetadata(chunk_table)
+                for index, column_name in enumerate(all_column_names):
+                    metadata.column_metadata[index].set_name(column_name)
+                    if column_name == geometry_name:
+                        metadata.column_metadata[index].set_output_as_binary(True)
+                    elif column_name == "bbox":
+                        for child_index, child_name in enumerate(
+                            ("xmin", "ymin", "xmax", "ymax")
+                        ):
+                            metadata.column_metadata[index].child(child_index).set_name(
+                                child_name
+                            )
+                builder = plc.io.parquet.ChunkedParquetWriterOptions.builder(
+                    plc.io.types.SinkInfo([sink])
+                )
+                builder.metadata(metadata)
+                builder.key_value_metadata([footer_metadata])
+                builder.write_arrow_schema(False)
+                builder.compression(_compression_type_from_name(compression))
+                builder.row_group_size_rows(
+                    requested_row_group_size or capacity_plan.max_chunk_rows
+                )
+                if "max_page_size" in writer_kwargs:
+                    builder.max_page_size_bytes(int(writer_kwargs["max_page_size"]))
+                writer = plc.io.parquet.ChunkedParquetWriter.from_options(
+                    builder.build(),
+                    stream=stream,
+                )
+            writer.write(chunk_table)
+            # The chunk table owns the WKB payload and offset buffers consumed
+            # asynchronously by libcudf.  Keep those owners alive until the
+            # writer stream reaches this point instead of serializing the CUDA
+            # context before assembling the next chunk.
+            get_cuda_completion_retainer().defer(
+                completion_stream,
+                (chunk_table, tuple(chunk_columns), chunk_owned),
+                lambda _owners: None,
+            )
+    finally:
+        if writer is not None:
+            writer.close([])
+
+
 def _write_geoparquet_native_device_payload(
     attribute_frame,
     geometry_owned,
     path,
     *,
+    geometry_composition=None,
     geometry_name,
     geometry_crs,
     index,
@@ -1865,10 +2777,25 @@ def _write_geoparquet_native_device_payload(
     recognized_kwargs = {k: v for k, v in kwargs.items() if k in _RECOGNIZED_KWARGS}
     unrecognized_kwargs = {k: v for k, v in kwargs.items() if k not in _RECOGNIZED_KWARGS}
     owned = geometry_owned
-    if owned is None:
+    composition = geometry_composition
+    if owned is None and composition is None:
         return _NativeDeviceWriteStatus(written=False)
-    if owned.residency is not Residency.DEVICE or owned.device_state is None:
+    if owned is not None and (
+        owned.residency is not Residency.DEVICE or owned.device_state is None
+    ):
         return _NativeDeviceWriteStatus(written=False)
+    if composition is not None and (
+        composition.residency is not Residency.DEVICE
+        or not composition.trusted_singular_rows
+    ):
+        return _NativeDeviceWriteStatus(written=False)
+    if composition is not None and geometry_encoding.lower() != "wkb":
+        return _NativeDeviceWriteStatus(
+            written=False,
+            compatibility_detail=(
+                "partitioned native GeoParquet export currently requires WKB encoding"
+            ),
+        )
     if unrecognized_kwargs:
         return _NativeDeviceWriteStatus(
             written=False,
@@ -1947,6 +2874,74 @@ def _write_geoparquet_native_device_payload(
         for column_name in device_extra_columns:
             if column_name not in ordered_column_names:
                 ordered_column_names.append(column_name)
+    requested_row_group_size = recognized_kwargs.get("row_group_size")
+    if requested_row_group_size is not None:
+        requested_row_group_size = int(requested_row_group_size)
+        if requested_row_group_size <= 0:
+            raise ValueError("row_group_size must be greater than zero")
+    bounded_chunk_rows = min(
+        int(requested_row_group_size or _NATIVE_DEVICE_PARQUET_CHUNK_ROWS),
+        _NATIVE_DEVICE_PARQUET_CHUNK_ROWS,
+    )
+    wkb_capacity_plan = None
+    capacity_chunk_rows = 0
+    native_row_count = int(
+        composition.row_count if composition is not None else owned.row_count
+    )
+    if geometry_encoding.lower() == "wkb":
+        wkb_capacity_plan = _plan_native_wkb_capacity(
+            owned=owned,
+            composition=composition,
+            max_chunk_rows=bounded_chunk_rows,
+            write_covering_bbox=write_covering_bbox,
+        )
+        if native_row_count:
+            capacity_chunk_rows = wkb_capacity_plan.admitted_rows(native_row_count)
+    if (
+        wkb_capacity_plan is not None
+        and native_row_count > 0
+        and (
+            composition is not None
+            or capacity_chunk_rows < native_row_count
+        )
+    ):
+        _write_geoparquet_native_device_wkb_chunks(
+            plc,
+            attribute_schema=attribute_schema,
+            device_attribute_columns=device_attribute_columns,
+            host_table=host_table,
+            ordered_column_names=ordered_column_names,
+            owned=owned,
+            composition=composition,
+            geometry_name=geometry_name,
+            geometry_crs=geometry_crs,
+            schema_version=schema_version,
+            write_covering_bbox=write_covering_bbox,
+            frame_attrs=frame_attrs,
+            sink=sink,
+            compression=compression,
+            writer_kwargs=recognized_kwargs,
+            capacity_plan=wkb_capacity_plan,
+        )
+        record_dispatch_event(
+            surface="vibespatial.io.geoparquet",
+            operation="to_parquet",
+            implementation="pylibcudf_chunked_device_wkb_parquet_writer",
+            reason=(
+                "native WKB encoding and Parquet compression stayed within "
+                "structural and live-memory allocation capacity"
+            ),
+            detail=(
+                f"rows={native_row_count}; "
+                f"admitted_rows={capacity_chunk_rows}; "
+                f"coordinates={wkb_capacity_plan.metadata.shape_summary['coordinate_count']}; "
+                f"max_output_bytes_per_row={wkb_capacity_plan.max_output_bytes_per_row}; "
+                f"max_owned_bytes_per_row={wkb_capacity_plan.max_owned_bytes_per_row}; "
+                "workload_shape=capacity_planned_terminal_native_wkb_export"
+            ),
+            selected=ExecutionMode.GPU,
+        )
+        return _NativeDeviceWriteStatus(written=True)
     table_columns = []
     geometry_encoding_dict = {}
 

@@ -467,12 +467,20 @@ def _native_display_export_payload(obj):
         state = None
 
     values = _active_geometry_values(obj)
-    owned = getattr(values, "owned", None)
-    if owned is None:
-        owned = getattr(values, "_owned", None)
+    cached_owned = getattr(values, "cached_owned", None)
+    owned = (
+        cached_owned()
+        if callable(cached_owned)
+        else getattr(values, "_owned", None)
+    )
+    composition = getattr(values, "native_composition", None)
 
     dtype_name = getattr(getattr(values, "dtype", None), "name", None)
-    native_geometry = owned is not None or dtype_name == "device_geometry"
+    native_geometry = (
+        owned is not None
+        or composition is not None
+        or dtype_name == "device_geometry"
+    )
     if state is None and not native_geometry:
         return None
 
@@ -489,6 +497,18 @@ def _native_display_export_payload(obj):
         owned_residency = getattr(getattr(owned, "residency", None), "value", None)
         detail_parts.append(f"geometry_residency={owned_residency or 'unknown'}")
         d2h_transfer = d2h_transfer or owned.residency is Residency.DEVICE
+    elif composition is not None:
+        composition_residency = getattr(
+            getattr(composition, "residency", None),
+            "value",
+            None,
+        )
+        detail_parts.append(
+            f"geometry_residency={composition_residency or 'unknown'}"
+        )
+        d2h_transfer = (
+            d2h_transfer or composition.residency is Residency.DEVICE
+        )
     elif dtype_name is not None:
         detail_parts.append(f"geometry_dtype={dtype_name}")
 

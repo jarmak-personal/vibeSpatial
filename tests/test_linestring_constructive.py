@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -219,6 +220,41 @@ def test_two_point_device_admission_consumes_trusted_layout_metadata() -> None:
         join_style="round",
         single_sided=False,
     )
+
+
+@pytest.mark.gpu
+def test_two_point_device_admission_certifies_missing_fixed_size_metadata() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    lines = from_shapely_geometries(
+        [
+            LineString([(0.0, 0.0), (1.0, 0.0)]),
+            LineString([(0.0, 1.0), (1.0, 1.0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    state = lines._ensure_device_state()
+    device_buffer = state.families[GeometryFamily.LINESTRING]
+    lines.families[GeometryFamily.LINESTRING] = replace(
+        lines.families[GeometryFamily.LINESTRING],
+        host_materialized=False,
+    )
+    device_buffer.fixed_size = None
+    state.trusted_all_non_empty = None
+
+    assert supports_two_point_linestring_buffer_fast_path(
+        lines,
+        quad_segs=8,
+        cap_style="round",
+        join_style="round",
+        single_sided=False,
+    )
+    assert device_buffer.fixed_size == DeviceFixedGeometrySizeMetadata(
+        coord_count_per_row=2,
+        max_coord_count_per_row=2,
+    )
+    assert state.trusted_all_non_empty is True
 
 
 @pytest.mark.gpu

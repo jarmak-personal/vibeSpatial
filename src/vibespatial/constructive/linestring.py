@@ -27,6 +27,7 @@ from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
+    DeviceFixedGeometrySizeMetadata,
     OwnedGeometryArray,
 )
 from vibespatial.runtime import ExecutionMode
@@ -84,6 +85,45 @@ def _has_trusted_two_point_linestring_layout(lines: OwnedGeometryArray) -> bool:
     )
 
 
+def certify_two_point_linestring_layout_device(lines: OwnedGeometryArray) -> bool:
+    """Certify and cache a fixed two-coordinate device row layout.
+
+    GeoArrow/WKB decoding can produce exact homogeneous device buffers before
+    fixed-size metadata has been attached.  Reduce the offsets to one boolean
+    planning packet once, then retain the proof on the owned carrier so buffer,
+    dissolve, and later consumers do not repeat the scan or export row data.
+    """
+    if _has_trusted_two_point_linestring_layout(lines):
+        return True
+    if cp is None or getattr(lines, "residency", None) is not Residency.DEVICE:
+        return False
+    state = lines._ensure_device_state()
+    if (
+        state.trusted_all_valid is not True
+        or state.trusted_homogeneous_family is not GeometryFamily.LINESTRING
+    ):
+        return False
+    device_buffer = state.families.get(GeometryFamily.LINESTRING)
+    if (
+        device_buffer is None
+        or int(device_buffer.geometry_offsets.size) != int(lines.row_count) + 1
+    ):
+        return False
+    d_offsets = cp.asarray(device_buffer.geometry_offsets, dtype=cp.int64)
+    if not _device_scalar_bool(
+        cp.all((d_offsets[1:] - d_offsets[:-1]) == 2)
+        & ~cp.any(cp.asarray(device_buffer.empty_mask, dtype=cp.bool_)),
+        reason="two-point linestring device row-layout certification fence",
+    ):
+        return False
+    device_buffer.fixed_size = DeviceFixedGeometrySizeMetadata(
+        coord_count_per_row=2,
+        max_coord_count_per_row=2,
+    )
+    state.trusted_all_non_empty = True
+    return True
+
+
 def supports_two_point_linestring_buffer_fast_path(
     lines: OwnedGeometryArray,
     *,
@@ -122,7 +162,7 @@ def supports_two_point_linestring_buffer_fast_path(
             offsets.shape == (lines.row_count + 1,) and np.all((offsets[1:] - offsets[:-1]) == 2)
         )
 
-    return _has_trusted_two_point_linestring_layout(lines)
+    return certify_two_point_linestring_layout_device(lines)
 
 
 def _linestring_device_input_valid(lines: OwnedGeometryArray) -> bool:

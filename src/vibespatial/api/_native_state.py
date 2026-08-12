@@ -515,28 +515,67 @@ class NativeFrameState:
         self._apply_rowset_geometry_proofs(result.geometry, rowset)
         return result
 
+    def _geometry_measurement_expression(self, evaluator, *, operation: str):
+        """Reduce concrete native geometry parts into one device value per row."""
+        owned = getattr(self.geometry, "owned", None)
+        if owned is not None:
+            return evaluator(owned, source_token=self.lineage_token)
+
+        composition = getattr(self.geometry, "composition", None)
+        if composition is None:
+            raise TypeError(
+                f"NativeFrameState {operation} expression requires native geometry"
+            )
+
+        import cupy as cp
+
+        from vibespatial.api._native_expression import NativeExpression
+
+        values = cp.zeros(self.row_count, dtype=cp.float64)
+        present = cp.zeros(self.row_count, dtype=cp.bool_)
+        for part in composition.parts:
+            part_owned = getattr(part.geometry, "owned", None)
+            if part_owned is None:
+                raise TypeError(
+                    f"NativeFrameState {operation} composition parts require owned geometry"
+                )
+            part_expression = evaluator(part_owned, source_token=self.lineage_token)
+            part_values = cp.asarray(part_expression.values, dtype=cp.float64)
+            part_rows = cp.asarray(part.output_rows, dtype=cp.int64)
+            part_state = part_owned._ensure_device_state(preserve_indexed_view=True)
+            part_validity = cp.asarray(part_state.validity, dtype=cp.bool_)
+            if int(part_rows.size) != int(part_values.size):
+                raise ValueError(
+                    f"native geometry {operation} part rows do not match values"
+                )
+            cp.add.at(values, part_rows[part_validity], part_values[part_validity])
+            present[part_rows[part_validity]] = True
+        values[~present] = cp.nan
+        return NativeExpression(
+            operation=f"geometry.{operation}",
+            values=values,
+            source_token=self.lineage_token,
+            source_row_count=self.row_count,
+            dtype="float64",
+            precision="fp64",
+        )
+
     def geometry_area_expression(self):
         """Return a private device area vector for sanctioned native consumers."""
-        owned = getattr(self.geometry, "owned", None)
-        if owned is None:
-            raise TypeError("NativeFrameState geometry area expression requires owned geometry")
         from vibespatial.constructive.measurement import area_expression_owned
 
-        return area_expression_owned(
-            owned,
-            source_token=self.lineage_token,
+        return self._geometry_measurement_expression(
+            area_expression_owned,
+            operation="area",
         )
 
     def geometry_length_expression(self):
         """Return a private device length vector for sanctioned native consumers."""
-        owned = getattr(self.geometry, "owned", None)
-        if owned is None:
-            raise TypeError("NativeFrameState geometry length expression requires owned geometry")
         from vibespatial.constructive.measurement import length_expression_owned
 
-        return length_expression_owned(
-            owned,
-            source_token=self.lineage_token,
+        return self._geometry_measurement_expression(
+            length_expression_owned,
+            operation="length",
         )
 
     def geometry_validity_expression(self):

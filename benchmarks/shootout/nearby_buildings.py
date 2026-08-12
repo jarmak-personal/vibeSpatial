@@ -21,7 +21,8 @@ import geopandas as gpd
 
 SEARCH_RADIUS_M = 1_000
 
-tmpdir = Path(tempfile.mkdtemp(prefix="shootout_nearby_buildings_"))
+_tmpdir = tempfile.TemporaryDirectory(prefix="shootout_nearby_buildings_")
+tmpdir = Path(_tmpdir.name)
 fixtures = setup_fixtures(tmpdir)
 
 # --- timed work starts here ---

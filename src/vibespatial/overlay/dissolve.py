@@ -55,7 +55,6 @@ if TYPE_CHECKING:
 
 
 _EMPTY = GeometryCollection()
-_BUFFERED_TWO_POINT_EXACT_UNION_MAX_UNIQUE_ROWS = 256
 _BUFFERED_LINE_EXACT_CPU_MAX_ROWS = 2_048
 _COVERAGE_REWRITE_MAX_CANDIDATE_PAIRS = 250_000
 _COVERAGE_REWRITE_NEGATIVE_PROBE_PAIRS = 1
@@ -3234,13 +3233,23 @@ def _repair_grouped_union_owned_if_needed(
     )
 
 
-def _reduce_buffered_line_polygons_gpu(buffered: OwnedGeometryArray) -> OwnedGeometryArray:
-    """Reduce line-buffer polygons through the grouped constructive carrier.
+_BUFFERED_LINE_GROUPED_UNION_FAN_IN = 32
+_BUFFERED_LINE_AGGREGATE_UNION_FAN_IN = 2
+_BUFFERED_LINE_DIRECTION_PARTITIONS = 16
 
-    Buffered-line dissolve has already proven the physical shape: one
-    device-resident source-line group reduced into one corridor. The generic
-    grouped overlay keeps all fragments attached to their output group while
-    the constructive plan sees the whole group at once.
+
+def _reduce_buffered_line_polygons_gpu(
+    buffered: OwnedGeometryArray,
+    *,
+    d_direction_partitions: Any | None = None,
+) -> OwnedGeometryArray:
+    """Reduce line buffers through bounded exact grouped-union levels.
+
+    A buffered network is one logical output group, but making an entire
+    direction partition one physical segment-classification row creates a
+    quadratic candidate relation. Preserve direction partitions as locality
+    boundaries while reducing each through bounded fan-in levels. Unary union
+    is associative, so the hierarchy preserves public dissolve topology.
     """
     if buffered.row_count <= 1:
         return buffered
@@ -3248,33 +3257,94 @@ def _reduce_buffered_line_polygons_gpu(buffered: OwnedGeometryArray) -> OwnedGeo
     if cp is None or buffered.device_state is None:
         raise RuntimeError("buffered-line grouped union requires a device-resident polygon carrier")
 
-    from vibespatial.api._native_grouped import NativeGrouped
     from vibespatial.constructive.binary_constructive import (
         _regroup_native_grouped_parts_with_grouped_union_gpu,
     )
 
-    row_count = int(buffered.row_count)
-    grouped_shape = NativeGrouped.from_dense_sorted_offsets(
-        cp.asarray([0, row_count], dtype=cp.int64),
-        row_count=row_count,
-        all_groups_observed=True,
-        group_size_min=row_count,
-        group_size_max=row_count,
-    )
-    grouped = _regroup_native_grouped_parts_with_grouped_union_gpu(
-        buffered,
-        grouped_shape.sorted_order,
-        grouped_shape.group_offsets,
-        grouped_shape.group_ids,
-        output_row_count=1,
-        dispatch_mode=ExecutionMode.GPU,
-        allow_direct_disjoint_pack=False,
-        use_same_row_fast_path=True,
-        group_size_max=row_count,
-    )
-    if grouped is None or grouped.row_count != 1:
-        raise RuntimeError("buffered-line grouped union did not produce its admitted output row")
-    return grouped
+    current = buffered
+    if d_direction_partitions is None:
+        d_partition_counts = cp.asarray([current.row_count], dtype=cp.int64)
+    else:
+        d_direction_partitions = cp.asarray(d_direction_partitions, dtype=cp.int32)
+        if int(d_direction_partitions.size) != current.row_count:
+            raise ValueError("buffered-line direction partitions must match row count")
+        d_partition_counts = cp.bincount(
+            d_direction_partitions,
+            minlength=_BUFFERED_LINE_DIRECTION_PARTITIONS,
+        ).astype(cp.int64, copy=False)
+        d_partition_counts = d_partition_counts[d_partition_counts > 0]
+
+    reduction_level = 0
+    while True:
+        max_partition_span = overlay_int_scalar(
+            cp.max(d_partition_counts),
+            reason="buffered-line grouped union partition-span planning fence",
+        )
+        if max_partition_span <= 1:
+            if current.row_count <= 1:
+                break
+            # Direction partitions are locality boundaries for leaf work, not
+            # permission to combine every large partition result in one final
+            # topology row.  Continue through the same bounded aggregate tree.
+            d_partition_counts = cp.asarray([current.row_count], dtype=cp.int64)
+            continue
+        row_count = int(current.row_count)
+        direct_buffer_level = reduction_level == 0
+        fan_in = (
+            _BUFFERED_LINE_GROUPED_UNION_FAN_IN
+            if direct_buffer_level
+            else _BUFFERED_LINE_AGGREGATE_UNION_FAN_IN
+        )
+        d_partition_offsets = cp.empty(d_partition_counts.size + 1, dtype=cp.int64)
+        d_partition_offsets[0] = 0
+        cp.cumsum(d_partition_counts, out=d_partition_offsets[1:])
+        d_chunk_counts = (
+            d_partition_counts + fan_in - 1
+        ) // fan_in
+        d_chunk_offsets = cp.empty(d_chunk_counts.size + 1, dtype=cp.int64)
+        d_chunk_offsets[0] = 0
+        cp.cumsum(d_chunk_counts, out=d_chunk_offsets[1:])
+        group_count = overlay_int_scalar(
+            d_chunk_offsets[-1],
+            reason="buffered-line grouped union output-count planning fence",
+        )
+        d_positions = cp.arange(row_count, dtype=cp.int64)
+        d_partition_ids = cp.searchsorted(
+            d_partition_offsets[1:],
+            d_positions,
+            side="right",
+        ).astype(cp.int64, copy=False)
+        d_local_positions = d_positions - d_partition_offsets[d_partition_ids]
+        d_group_codes = (
+            d_chunk_offsets[d_partition_ids]
+            + d_local_positions // fan_in
+        ).astype(cp.int32, copy=False)
+        d_group_counts = cp.bincount(
+            d_group_codes,
+            minlength=group_count,
+        ).astype(cp.int64, copy=False)
+        d_group_offsets = cp.empty(group_count + 1, dtype=cp.int64)
+        d_group_offsets[0] = 0
+        cp.cumsum(d_group_counts, out=d_group_offsets[1:])
+        grouped = _regroup_native_grouped_parts_with_grouped_union_gpu(
+            current,
+            cp.arange(row_count, dtype=cp.int64),
+            d_group_offsets,
+            cp.arange(group_count, dtype=cp.int64),
+            output_row_count=group_count,
+            dispatch_mode=ExecutionMode.GPU,
+            allow_direct_disjoint_pack=False,
+            use_same_row_fast_path=True,
+            group_size_max=min(fan_in, row_count),
+        )
+        if grouped is None or grouped.row_count != group_count:
+            raise RuntimeError(
+                "buffered-line grouped union level did not produce its admitted output rows"
+            )
+        current = grouped
+        d_partition_counts = d_chunk_counts
+        reduction_level += 1
+    return current
 
 
 def _rectangle_bounds(values: np.ndarray) -> np.ndarray | None:
@@ -5964,14 +6034,14 @@ def _dedupe_two_point_linestring_rows_gpu(
 
     if cp is not None and lines.residency is Residency.DEVICE:
         from vibespatial.constructive.linestring import (
-            _has_trusted_two_point_linestring_layout,
+            certify_two_point_linestring_layout_device,
         )
         from vibespatial.overlay.graph import (
             _fp64_radix_keys,
             _stable_radix_order_pass,
         )
 
-        if not _has_trusted_two_point_linestring_layout(lines):
+        if not certify_two_point_linestring_layout_device(lines):
             return None
         state = lines._ensure_device_state()
         line_buf = state.families[GeometryFamily.LINESTRING]
@@ -6039,6 +6109,84 @@ def _dedupe_two_point_linestring_rows_gpu(
         | (sorted_by[1:] != sorted_by[:-1])
     )
     return np.sort(order[unique_mask]).astype(np.int64, copy=False)
+
+
+def _order_two_point_lines_for_cascaded_union_gpu(
+    lines: OwnedGeometryArray,
+    *,
+    assume_two_point_layout: bool = False,
+) -> Any | None:
+    """Order LineStrings by endpoint direction and midpoint on device.
+
+    Cascaded polygon union is most efficient when early groups have similar
+    boundaries.  Direction is the primary key so parallel line buffers reduce
+    together; midpoint keys preserve spatial locality within each direction.
+    Ordering changes only the associative reduction tree, never membership.
+    The returned direction partitions remain attached to that order so the
+    grouped reducer does not mix unrelated boundary orientations prematurely.
+    """
+    if cp is None or lines.row_count == 0:
+        return None
+
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.overlay.graph import (
+        _fp64_radix_keys,
+        _stable_radix_order_pass,
+    )
+
+    lines._ensure_device_state()
+    state = lines.device_state
+    if (
+        state is None
+        or state.trusted_all_valid is not True
+        or state.trusted_homogeneous_family is not GeometryFamily.LINESTRING
+    ):
+        return None
+    line_buffer = state.families[GeometryFamily.LINESTRING]
+    d_offsets = cp.asarray(line_buffer.geometry_offsets)
+    if int(d_offsets.size) != lines.row_count + 1:
+        return None
+    if not assume_two_point_layout and not overlay_bool_scalar(
+        cp.all((d_offsets[1:] - d_offsets[:-1]) >= 2)
+        & ~cp.any(cp.asarray(line_buffer.empty_mask, dtype=cp.bool_)),
+        reason="buffered-line cascaded-order row-layout certification fence",
+    ):
+        return None
+    d_starts = d_offsets[:-1]
+    d_ends = d_offsets[1:] - 1
+    d_x = cp.asarray(line_buffer.x)
+    d_y = cp.asarray(line_buffer.y)
+    x0 = d_x[d_starts]
+    y0 = d_y[d_starts]
+    x1 = d_x[d_ends]
+    y1 = d_y[d_ends]
+    swap = (x0 > x1) | ((x0 == x1) & (y0 > y1))
+    ax = cp.where(swap, x1, x0)
+    ay = cp.where(swap, y1, y0)
+    bx = cp.where(swap, x0, x1)
+    by = cp.where(swap, y0, y1)
+    midpoint_x = ax + (bx - ax) * 0.5
+    midpoint_y = ay + (by - ay) * 0.5
+    direction = cp.arctan2(by - ay, bx - ax)
+    direction_partition = cp.clip(
+        cp.floor(
+            (direction + np.pi * 0.5)
+            * (_BUFFERED_LINE_DIRECTION_PARTITIONS / np.pi)
+        ),
+        0,
+        _BUFFERED_LINE_DIRECTION_PARTITIONS - 1,
+    ).astype(cp.int32, copy=False)
+    order = cp.arange(lines.row_count, dtype=cp.int32)
+    for coordinate in (midpoint_y, midpoint_x):
+        order = _stable_radix_order_pass(order, _fp64_radix_keys(coordinate))
+    order = _stable_radix_order_pass(
+        order,
+        direction_partition.astype(cp.uint64, copy=False),
+    )
+    return (
+        order.astype(cp.int64, copy=False),
+        direction_partition[order].astype(cp.int32, copy=False),
+    )
 
 
 def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
@@ -6119,12 +6267,17 @@ def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
         if deduped
         else source_owned
     )
-    # This rewrite is the device-resident exact dissolve path for simple line
-    # buffers. Cap the reduced union size directly instead of routing small
-    # device-backed groups through an exact host rescue.
-    if unique_owned.row_count > _BUFFERED_TWO_POINT_EXACT_UNION_MAX_UNIQUE_ROWS:
+    unique_owned = unique_owned.physicalize_device_rows(
+        allow_capacity_allocation=True,
+    )
+    cascaded_layout = _order_two_point_lines_for_cascaded_union_gpu(
+        unique_owned,
+        assume_two_point_layout=True,
+    )
+    if cascaded_layout is None:
         return None
-
+    cascaded_order, d_direction_partitions = cascaded_layout
+    unique_owned = unique_owned.device_take(cascaded_order)
     buffered_unique = linestring_buffer_owned_array(
         unique_owned,
         distance_value,
@@ -6133,7 +6286,10 @@ def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
         join_style=join_style,
         dispatch_mode=ExecutionMode.GPU,
     )
-    reduced = _reduce_buffered_line_polygons_gpu(buffered_unique)
+    reduced = _reduce_buffered_line_polygons_gpu(
+        buffered_unique,
+        d_direction_partitions=d_direction_partitions,
+    )
 
     record_rewrite_event(
         rule_name="R9_dissolve_buffered_two_point_lines_exact_union",
@@ -6290,6 +6446,11 @@ def _maybe_execute_buffered_line_grouped_union_rewrite(
 
     from vibespatial.constructive.linestring import linestring_buffer_owned_array
 
+    cascaded_layout = _order_two_point_lines_for_cascaded_union_gpu(source_owned)
+    d_direction_partitions = None
+    if cascaded_layout is not None:
+        cascaded_order, d_direction_partitions = cascaded_layout
+        source_owned = source_owned.device_take(cascaded_order)
     buffered_source = linestring_buffer_owned_array(
         source_owned,
         distance_value,
@@ -6298,7 +6459,10 @@ def _maybe_execute_buffered_line_grouped_union_rewrite(
         join_style=join_style,
         dispatch_mode=ExecutionMode.GPU,
     )
-    reduced = _reduce_buffered_line_polygons_gpu(buffered_source)
+    reduced = _reduce_buffered_line_polygons_gpu(
+        buffered_source,
+        d_direction_partitions=d_direction_partitions,
+    )
 
     record_rewrite_event(
         rule_name="R12_dissolve_buffered_lines_grouped_union",

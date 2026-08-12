@@ -35,6 +35,7 @@ class SplitEventDeviceState:
     row_indices: DeviceArray | None = None
     part_indices: DeviceArray | None = None
     ring_indices: DeviceArray | None = None
+    geometry_indices: DeviceArray | None = None
 
 
 @dataclass
@@ -203,6 +204,16 @@ class AtomicEdgeDeviceState:
     # bit 0 = left, bit 1 = right. Coincident boundaries therefore retain
     # dual-source provenance after geometric deduplication.
     source_membership: DeviceArray | None = None
+    # Oriented source-support tangent for robust radial ordering. Reconstructed
+    # intersection coordinates can round away a component of a very short
+    # atom, but the source segment direction remains topology-defining.
+    tangent_x: DeviceArray | None = None
+    tangent_y: DeviceArray | None = None
+    # Exact winding transition when crossing from the twin (right-hand face)
+    # to this directed edge's left-hand face.  Coincident source occurrences
+    # are summed independently for the two overlay operands.
+    left_coverage_delta: DeviceArray | None = None
+    right_coverage_delta: DeviceArray | None = None
 
 
 @dataclass
@@ -388,6 +399,25 @@ class AtomicEdgeTable:
 
 
 @dataclass(frozen=True)
+class EndpointIncidenceDeviceState:
+    """Exact endpoint grouping and node-incidence CSR on device.
+
+    ``incidence_edge_ids`` stores outgoing half-edge ids grouped by exact
+    endpoint (and optionally source row). ``node_offsets`` has edge-capacity
+    storage; ``node_count`` is a one-element device scalar delimiting its live
+    prefix. Keeping this state separate from radial ordering lets topology
+    consumers peel or classify the graph without first building successors.
+    """
+
+    incidence_edge_ids: DeviceArray
+    node_offsets: DeviceArray
+    src_node_ids: DeviceArray
+    node_count: DeviceArray
+    edge_count: int
+    isolate_rows: bool = False
+
+
+@dataclass(frozen=True)
 class HalfEdgeGraphDeviceState:
     node_x: DeviceArray | None
     node_y: DeviceArray | None
@@ -408,6 +438,8 @@ class HalfEdgeGraphDeviceState:
     part_indices: DeviceArray | None = None
     ring_indices: DeviceArray | None = None
     direction: DeviceArray | None = None
+    left_coverage_delta: DeviceArray | None = None
+    right_coverage_delta: DeviceArray | None = None
 
 
 @dataclass
@@ -742,12 +774,72 @@ class HalfEdgeGraph:
 class OverlayFaceDeviceState:
     face_offsets: DeviceArray
     face_edge_ids: DeviceArray
+    edge_face_ids: DeviceArray
     bounded_mask: DeviceArray
     signed_area: DeviceArray
     centroid_x: DeviceArray
     centroid_y: DeviceArray
     left_covered: DeviceArray
     right_covered: DeviceArray
+    # Exact adaptive-orientation sign for each face cycle.  This carrier is
+    # deliberately independent of the fp64 shoelace metric: topology must not
+    # change when area accumulation rounds to zero or to the wrong sign.
+    cycle_orientation: DeviceArray | None = None
+
+
+@dataclass(frozen=True)
+class GpuFaceWalkResult:
+    """Device face-walk result with a backward-compatible unpacking surface.
+
+    Existing shared callers unpack the historical eight fields.  Exact overlay
+    consumers additionally read ``cycle_orientation`` without forcing those
+    callers to change in lockstep.
+    """
+
+    face_offsets: DeviceArray
+    face_edge_ids: DeviceArray
+    edge_face_ids: DeviceArray
+    bounded_mask: DeviceArray
+    signed_area: DeviceArray
+    centroid_x: DeviceArray
+    centroid_y: DeviceArray
+    face_count: int
+    cycle_orientation: DeviceArray
+
+    def __iter__(self):
+        yield self.face_offsets
+        yield self.face_edge_ids
+        yield self.edge_face_ids
+        yield self.bounded_mask
+        yield self.signed_area
+        yield self.centroid_x
+        yield self.centroid_y
+        yield self.face_count
+
+
+@dataclass(frozen=True)
+class IndexedComponentContainmentDeviceState:
+    """Fixed-capacity indexed containment metadata for face components.
+
+    Negative roots occupy face-capacity lanes with ``-1`` sentinels. Positive
+    candidate faces are min-X sorted into the same capacity and indexed by an
+    interval max-X tree. Device reductions fill winding baselines, containment
+    depth, and the structurally immediate parent without materializing a compact
+    pair relation or crossing a host allocation fence.
+    """
+
+    face_component: DeviceArray
+    face_bounds: DeviceArray
+    root_faces: DeviceArray
+    candidate_faces: DeviceArray
+    interval_max_x: DeviceArray
+    left_baseline: DeviceArray
+    right_baseline: DeviceArray
+    component_depth: DeviceArray
+    component_parent: DeviceArray
+    face_capacity: int
+    leaf_count: int
+    transient_owners: tuple[object, ...] = ()
 
 
 @dataclass
@@ -763,6 +855,7 @@ class OverlayFaceTable:
     _centroid_y: np.ndarray | None = None
     _left_covered: np.ndarray | None = None
     _right_covered: np.ndarray | None = None
+    _cycle_orientation: np.ndarray | None = None
 
     def _ensure_host(self) -> None:
         if self._face_offsets is not None:
@@ -819,6 +912,12 @@ class OverlayFaceTable:
             np.int8,
             reason="overlay face-table right-coverage host export",
         )
+        self._cycle_orientation = _runtime_host_array(
+            runtime,
+            ds.cycle_orientation,
+            np.int8,
+            reason="overlay face-table exact cycle-orientation host export",
+        )
 
     @property
     def face_offsets(self) -> np.ndarray:
@@ -839,6 +938,13 @@ class OverlayFaceTable:
     def signed_area(self) -> np.ndarray:
         self._ensure_host()
         return self._signed_area  # type: ignore[return-value]
+
+    @property
+    def cycle_orientation(self) -> np.ndarray:
+        self._ensure_host()
+        if self._cycle_orientation is None:
+            return np.empty(0, dtype=np.int8)
+        return self._cycle_orientation
 
     @property
     def centroid_x(self) -> np.ndarray:
@@ -939,8 +1045,10 @@ class PagedOverlayExecutionPlan:
     """Independent row-isolated topology plans bounded by live-event work.
 
     Every page owns complete logical rows, source-segment runs, and face graphs.
-    Page boundaries are algebraic from ``rows_per_page``; no device row/event
-    metadata is exported and no row-shaped host offset table is retained.
+    Page boundaries are either algebraic from ``rows_per_page`` or compact
+    complete-row spans derived from device work weights.  The latter keeps
+    skewed grouped workloads bounded without charging every row for the
+    largest geometry in the batch.
     """
 
     left: object
@@ -956,10 +1064,13 @@ class PagedOverlayExecutionPlan:
     right_segment_source_rows: DeviceArray | np.ndarray | None = None
     right_segment_broadcast: object | None = None
     allow_component_decomposition: bool = True
+    complete_row_spans: tuple[tuple[int, int], ...] | None = None
     row_isolated: bool = True
 
     @property
     def page_count(self) -> int:
+        if self.complete_row_spans is not None:
+            return len(self.complete_row_spans)
         if self.row_count == 0:
             return 0
         return (self.row_count + self.rows_per_page - 1) // self.rows_per_page
@@ -967,5 +1078,7 @@ class PagedOverlayExecutionPlan:
     def row_span(self, page_index: int) -> tuple[int, int]:
         if page_index < 0 or page_index >= self.page_count:
             raise IndexError(f"overlay topology page index out of range: {page_index}")
+        if self.complete_row_spans is not None:
+            return self.complete_row_spans[page_index]
         start = page_index * self.rows_per_page
         return start, min(start + self.rows_per_page, self.row_count)

@@ -52,6 +52,11 @@ logger = logging.getLogger(__name__)
 
 _MAX_INPUT_VERTS = 64
 _MAX_CANDIDATE_VERTS = 192
+
+
+def polygon_simple_intersection_workspace_bytes_per_row() -> int:
+    """Return the fixed coordinate workspace reserved per aligned row."""
+    return 2 * (_MAX_CANDIDATE_VERTS + 1) * 8
 _KERNEL_NAMES = (
     "polygon_simple_intersection_count",
     "polygon_simple_intersection_scatter",

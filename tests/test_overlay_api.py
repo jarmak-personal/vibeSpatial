@@ -72,6 +72,45 @@ if str(_SHOOTOUT_DIR) not in sys.path:
 
 
 @pytest.mark.skipif(not vibespatial.has_gpu_runtime(), reason="GPU runtime required")
+def test_overlay_inspects_native_composition_without_owned_physicalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.api._native_result_core import NativeGeometryComposition
+
+    parts = [
+        GeometryNativeResult.from_owned(
+            from_shapely_geometries([geometry], residency=Residency.DEVICE),
+            crs=None,
+        )
+        for geometry in (box(0.0, 0.0, 1.0, 1.0), box(2.0, 0.0, 3.0, 1.0))
+    ]
+    composition = NativeGeometryComposition.concat(parts, crs=None)
+    values = DeviceGeometryArray._from_composition(composition, crs=None)
+    series = GeoSeries(values, crs=None, copy=False)
+
+    def _fail_physicalization(_self):
+        raise AssertionError("overlay inspection must not physicalize composition")
+
+    monkeypatch.setattr(
+        NativeGeometryComposition,
+        "_singular_owned_device",
+        _fail_physicalization,
+    )
+
+    assert overlay_module._series_owned(series) is None
+    assert overlay_module._series_family_summary(series) == (True, True, False, False)
+    assert overlay_module._series_non_missing_all_polygons(series) == (True, True)
+    assert overlay_module._series_first_geom_type(series) == "Polygon"
+    np.testing.assert_array_equal(
+        overlay_module._series_polygon_mask(series),
+        np.asarray([True, True]),
+    )
+    assert values.native_composition is composition
+    assert values.cached_owned() is None
+    assert composition._singular_owned_cache is None
+
+
+@pytest.mark.skipif(not vibespatial.has_gpu_runtime(), reason="GPU runtime required")
 def test_overlay_intersection_preserves_strictly_contained_fp64_sliver() -> None:
     sliver = Polygon(
         [
@@ -101,6 +140,63 @@ def test_overlay_intersection_preserves_strictly_contained_fp64_sliver() -> None
 
     assert len(result) == 1
     assert shapely.equals_exact(result.geometry.iloc[0], sliver, tolerance=0.0)
+
+
+@pytest.mark.skipif(not vibespatial.has_gpu_runtime(), reason="GPU runtime required")
+def test_sparse_polygon_composition_proves_logical_family_domain() -> None:
+    import cupy as cp
+
+    from vibespatial.api._native_result_core import (
+        GeometryNativeResult,
+        NativeGeometryComposition,
+        NativeGeometryCompositionPart,
+    )
+    from vibespatial.geometry.device_array import DeviceGeometryArray
+
+    parts = tuple(
+        NativeGeometryCompositionPart(
+            geometry=GeometryNativeResult.from_owned(
+                from_shapely_geometries([box(float(row), 0.0, float(row + 1), 1.0)]),
+                crs=None,
+            ),
+            output_rows=cp.asarray([row], dtype=cp.int64),
+        )
+        for row in range(2)
+    )
+    composition = NativeGeometryComposition(
+        parts=parts,
+        row_count=2,
+        crs=None,
+        trusted_singular_rows=True,
+    )
+    series = GeoSeries(DeviceGeometryArray._from_composition(composition))
+
+    assert overlay_module._series_family_summary(series) == (True, True, False, False)
+
+
+@pytest.mark.skipif(not vibespatial.has_gpu_runtime(), reason="GPU runtime required")
+def test_keep_geom_type_device_mask_preserves_positive_fp64_slivers() -> None:
+    import cupy as cp
+
+    left_geom = box(0.0, 0.0, 1_000.0, 1_000.0)
+    right_geom = box(999.9999999999, 0.0, 2_000.0, 1_000.0)
+    overlap = shapely.intersection(left_geom, right_geom)
+
+    left_owned = from_shapely_geometries([left_geom], residency=Residency.DEVICE)
+    right_owned = from_shapely_geometries([right_geom], residency=Residency.DEVICE)
+    area_owned = from_shapely_geometries([overlap], residency=Residency.DEVICE)
+    left = GeoSeries(GeometryArray.from_owned(left_owned))
+    right = GeoSeries(GeometryArray.from_owned(right_owned))
+
+    keep = overlay_module._native_polygon_keep_geom_type_positive_area_device_mask(
+        left,
+        right,
+        np.asarray([0], dtype=np.intp),
+        np.asarray([0], dtype=np.intp),
+        np.asarray([0], dtype=np.intp),
+        area_owned=area_owned,
+    )
+    assert bool(cp.asnumpy(keep)[0])
 
 
 def test_few_right_exact_path_uses_canonical_row_indirected_topology() -> None:
@@ -743,7 +839,7 @@ def test_overlay_gpu_face_selection_stays_capacity_backed() -> None:
     assert face_assembly_source.count("_extract_face_boundary_rings_gpu(") == 1
     assert "1 - d_face_selected" not in face_assembly_source
     assert "classify_hole_faces" not in face_assembly_source
-    assert "count_boundary_nesting_depth" not in face_assembly_source
+    assert "count_boundary_ring_containment_depth" in face_assembly_source
 
     helper_start = assemble_source.index("def _extract_face_boundary_rings_gpu(")
     helper_end = assemble_source.index("\ndef ", helper_start + 1)
@@ -767,23 +863,25 @@ def test_overlay_gpu_face_selection_stays_capacity_backed() -> None:
     assert "ring_active" in ring_scatter_source
     assert "if (!ring_active[ring])" in ring_scatter_source
     nesting_section = face_assembly_source[
-        face_assembly_source.index(
-            "# --- Step 8: Classify selected-side"
-        ) : face_assembly_source.index('with hotpath_stage("overlay.assemble.output_grouping"')
+        face_assembly_source.index("d_ring_active_i8 =") : face_assembly_source.index(
+            'with hotpath_stage("overlay.assemble.output_grouping"'
+        )
     ]
-    assert nesting_section.count("NativeDeviceSelection.from_mask") == 2
+    assert nesting_section.count("NativeDeviceSelection.from_mask") == 1
     assert "positive_boundary_selection" not in nesting_section
-    assert "exterior_selection.logical_count" in nesting_section
-    assert "assigned_hole_selection.logical_count" in nesting_section
+    assert "d_containment_group_start" in nesting_section
+    assert "d_containment_group_end" in nesting_section
     assert "cp.flatnonzero" not in nesting_section
 
-    for kernel_name, count_name in (
-        ("assign_holes_to_exteriors(", "exterior_count_ptr"),
-        ("count_sibling_hole_depth(", "hole_count_ptr"),
+    for kernel_name in (
+        "count_boundary_ring_containment_depth(",
+        "assign_holes_to_exteriors(",
     ):
         kernel_start = kernel_source.index(kernel_name)
         kernel_end = kernel_source.index("\n}", kernel_start) + 2
-        assert count_name in kernel_source[kernel_start:kernel_end]
+        kernel_body = kernel_source[kernel_start:kernel_end]
+        assert "group_start" in kernel_body
+        assert "group_end" in kernel_body
 
 
 def test_overlay_face_assembly_prefers_device_path_without_selected_face_export(
@@ -1241,9 +1339,7 @@ def test_overlay_intersection_reuses_cached_pairs_when_only_nonparticipating_row
     assert len(result) == 2
 
 
-def test_overlay_intersection_single_mask_does_not_rewrite_to_clip_on_gpu(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_overlay_intersection_single_mask_uses_broadcast_right_carrier_on_gpu() -> None:
     if not vibespatial.has_gpu_runtime():
         pytest.skip("GPU runtime not available")
 
@@ -1260,16 +1356,9 @@ def test_overlay_intersection_single_mask_does_not_rewrite_to_clip_on_gpu(
         geometry=GeoSeries([box(1, -1, 4, 3)]),
     )
 
-    clip_module = importlib.import_module("vibespatial.api.tools.clip")
-    monkeypatch.setattr(
-        clip_module,
-        "clip",
-        lambda *args, **kwargs: pytest.fail(
-            "single-mask overlay intersection should stay on the native overlay path"
-        ),
-    )
-
+    vibespatial.clear_dispatch_events()
     result = overlay(left, right, how="intersection")
+    events = vibespatial.get_dispatch_events(clear=True)
 
     expected = GeoDataFrame(
         {"name": ["west", "east"]},
@@ -1284,6 +1373,12 @@ def test_overlay_intersection_single_mask_does_not_rewrite_to_clip_on_gpu(
         result.reset_index(drop=True),
         expected.reset_index(drop=True),
         check_like=True,
+    )
+    assert any(
+        event.surface == "geopandas.overlay"
+        and event.implementation == "broadcast_right_capacity_partition_gpu"
+        and event.selected is ExecutionMode.GPU
+        for event in events
     )
 
 
@@ -1526,7 +1621,10 @@ def test_overlay_symmetric_difference_native_concat_preserves_device_geometry_st
     with strict_native_environment():
         result = overlay(buffered, mask, how="symmetric_difference")
 
-    owned = result.geometry.values._owned
+    values = result.geometry.values
+    assert values.cached_owned() is None
+    assert values.native_composition is not None
+    owned = values.physicalize_owned()
     assert owned.residency is Residency.DEVICE
     assert owned.device_state is not None
     assert owned.row_count == len(result)
@@ -1896,9 +1994,7 @@ def test_overlay_intersection_drops_empty_rows_after_bbox_false_positive_in_stri
     assert len(result) == 0
 
 
-def test_overlay_intersection_single_geometry_only_mask_rewrites_to_clip(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_overlay_intersection_single_geometry_only_mask_uses_overlay_carrier() -> None:
     left = GeoDataFrame(
         {"col1": [1, 2]},
         geometry=GeoSeries(
@@ -1912,33 +2008,22 @@ def test_overlay_intersection_single_geometry_only_mask_rewrites_to_clip(
         geometry=GeoSeries([box(1, -1, 3, 1)]),
     )
 
-    expected = geopandas.clip(
-        left,
+    expected_geometries = shapely.intersection(
+        np.asarray(left.geometry.values, dtype=object),
         right.geometry.iloc[0],
-        keep_geom_type=True,
-        sort=False,
     )
-
-    def _fail_overlay_intersection(*_args, **_kwargs):
-        raise AssertionError("single-mask geometry-only intersection should rewrite to clip")
-
-    monkeypatch.setattr(
-        overlay_module,
-        "_overlay_intersection",
-        _fail_overlay_intersection,
-    )
-    monkeypatch.setattr(overlay_module, "has_gpu_runtime", lambda: False)
-
     vibespatial.clear_dispatch_events()
     result = overlay(left, right, how="intersection")
     events = vibespatial.get_dispatch_events(clear=True)
 
-    assert_geodataframe_equal(result, expected)
+    assert result["col1"].tolist() == [1, 2]
+    for actual, expected in zip(result.geometry, expected_geometries, strict=True):
+        assert shapely.normalize(actual).equals(shapely.normalize(expected))
     assert any(
         event.surface == "geopandas.overlay"
-        and event.implementation == "clip_rewrite"
-        and "execution_family=clip_rewrite" in event.detail
-        and "topology_class=mask_clip" in event.detail
+        and event.implementation == "owned_dispatch"
+        and "execution_family=broadcast_right_intersection" in event.detail
+        and "topology_class=broadcast_mask" in event.detail
         for event in events
     )
 
@@ -2226,7 +2311,7 @@ def test_grouped_overlay_difference_device_metadata_path_has_no_runtime_d2h() ->
         _group_size_min=2,
         _group_size_max=2,
     )
-    runtime_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+    runtime_events = get_d2h_transfer_events(clear=True)
 
     expected = [
         shapely.difference(
@@ -2241,7 +2326,11 @@ def test_grouped_overlay_difference_device_metadata_path_has_no_runtime_d2h() ->
     actual = np.asarray(result.to_shapely(), dtype=object)
 
     assert result.row_count == 2
-    assert runtime_reasons == []
+    assert [event.reason for event in runtime_events] == [
+        "overlay compact topology page-weight planning packet",
+        "overlay compact topology work-summary planning packet",
+    ]
+    assert sum(event.bytes_transferred for event in runtime_events) <= 32
     for got, want in zip(actual, expected, strict=True):
         assert shapely.symmetric_difference(got, want).area < 1e-8
 
@@ -5215,7 +5304,7 @@ def test_aligned_polygon_intersection_partitions_at_row_capacity() -> None:
     assert "cp.flatnonzero" not in function_source
     assert "except Exception" not in function_source
     assert router_source.count("NativeDeviceSelection.from_mask(") == 5
-    assert "device_scatter_owned_capacity_selection(" in router_source
+    assert "device_scatter_owned_capacity_selections_many(" in router_source
     assert "partition_counts=device-resident" in router_source
     assert "cp.flatnonzero" not in router_source
     assert "except Exception" not in router_source
@@ -5690,7 +5779,7 @@ def test_overlay_intersection_keep_geom_type_warning_keeps_positive_polygon_part
     assert result.geometry.geom_type.tolist() == ["Polygon"]
     assert float(result.geometry.iloc[0].area) > 0.0
     assert any(
-        event.implementation == "polygon_pair_warning_candidate_remnants_gpu" for event in events
+        event.implementation == "polygon_intersection_topology_remnant_gpu" for event in events
     )
 
 
@@ -6078,7 +6167,7 @@ def test_keep_geom_type_filter_uses_aligned_owned_pairs_without_pair_series(
     assert len(filtered) == 1
 
 
-def test_keep_geom_type_filter_device_tolerance_uses_fp64_area_rows(
+def test_keep_geom_type_filter_preserves_positive_fp64_area_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not vibespatial.has_gpu_runtime():
@@ -6137,7 +6226,7 @@ def test_keep_geom_type_filter_device_tolerance_uses_fp64_area_rows(
         )
     )
 
-    assert keep_mask.tolist() == [False]
+    assert keep_mask.tolist() == [True]
     assert dropped == 0
     assert len(filtered) == 1
     assert filtered.values._owned.row_count == 1
@@ -7035,7 +7124,7 @@ def test_keep_geom_type_filter_rect_overlap_device_sources_stay_off_host_probe()
     assert vibespatial.get_fallback_events(clear=True) == []
 
 
-def test_keep_geom_type_filter_rect_overlap_applies_native_area_tolerance() -> None:
+def test_keep_geom_type_filter_rect_overlap_preserves_positive_fp64_sliver() -> None:
     if not vibespatial.has_gpu_runtime():
         pytest.skip("GPU runtime not available")
 
@@ -7076,9 +7165,9 @@ def test_keep_geom_type_filter_rect_overlap_applies_native_area_tolerance() -> N
         )
     )
 
-    assert keep_mask.tolist() == [False]
-    assert dropped == 1
-    assert len(filtered) == 0
+    assert keep_mask.tolist() == [True]
+    assert dropped == 0
+    assert len(filtered) == 1
     assert vibespatial.get_fallback_events(clear=True) == []
 
 
@@ -8242,6 +8331,39 @@ def test_series_all_polygons_uses_device_family_flags_for_indexed_owned(
     assert "overlay source geometry type scalar fence" not in reasons
 
 
+def test_series_all_polygons_uses_logical_rows_not_unreferenced_physical_families() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.geometry.owned import FAMILY_TAGS, build_device_resident_owned
+
+    physical = from_shapely_geometries(
+        [
+            box(0.0, 0.0, 1.0, 1.0),
+            MultiPolygon([box(10.0, 10.0, 11.0, 11.0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    physical_state = physical._ensure_device_state(preserve_indexed_view=True)
+    logical = build_device_resident_owned(
+        device_families=physical_state.families,
+        row_count=1,
+        tags=cp.asarray([FAMILY_TAGS[GeometryFamily.POLYGON]], dtype=cp.int8),
+        validity=cp.ones(1, dtype=cp.bool_),
+        family_row_offsets=cp.zeros(1, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+    logical_state = logical._ensure_device_state(preserve_indexed_view=True)
+    logical_state.trusted_polygonal_only = None
+    logical_state.trusted_family_domain = None
+    logical_state.trusted_all_valid = None
+    geometries = GeoSeries(GeometryArray.from_owned(logical))
+
+    assert sum(buffer.row_count for buffer in logical.families.values()) == 2
+    assert overlay_module._series_all_polygons(geometries)
+    assert logical_state.trusted_polygonal_only is True
+
+
 def test_few_right_partitioned_intersection_has_no_scalar_validity_fence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9252,7 +9374,10 @@ def test_rowwise_polygon_intersection_uses_validated_simple_carrier() -> None:
         np.asarray([right_source[1], right_source[0]], dtype=object),
     )
     for got_geom, expected_geom in zip(got, expected, strict=True):
-        assert got_geom.normalize().equals(expected_geom.normalize())
+        assert got_geom.normalize().equals_exact(
+            expected_geom.normalize(),
+            tolerance=1e-12,
+        )
 
 
 def test_rowwise_polygon_intersection_uses_logical_polygonal_proof_for_mixed_indexed_views(
@@ -11707,6 +11832,7 @@ def test_overlay_intersection_general_pairs_preserve_mixed_native_composition(
         left_owned=left_owned,
         right_owned=right_owned,
         _prefer_exact_polygon_gpu=True,
+        _preserve_lower_dim_polygon_results=True,
         _index_result=DeviceSpatialJoinResult(
             cp.asarray([0, 1], dtype=cp.int32),
             cp.asarray([0, 1], dtype=cp.int32),

@@ -8,6 +8,7 @@ import os
 import re
 import runpy
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,7 @@ _TIMED_END_MARKER = "# --- timed work ends here ---"
 _HARNESS_CODE = """\
 import ast
 import faulthandler
+import gc
 import io
 import json
 import os
@@ -591,6 +593,12 @@ for i in range(repeat):
 
 profile = None
 if do_pipeline_warm and do_profile:
+    # Timed-script globals can contain pandas/native-state reference cycles.
+    # Profiling is a separate execution, so reclaim those dead carriers before
+    # asking the allocator to hold another full workflow graph.
+    gc.collect()
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    get_cuda_runtime().free_pool_memory()
     profile = _profile_timed_sections(script, sections)
 
 with open(result_path, "w") as f:
@@ -846,8 +854,56 @@ def _run_harness(
     timeout: int = 300,
     quiet: bool = False,
     profile: bool = False,
+    _profile_only: bool = False,
 ) -> ShootoutRun:
     """Run the timing harness in a subprocess and return results."""
+    if profile and not _profile_only:
+        timed_run = _run_harness(
+            label=label,
+            python_cmd=python_cmd,
+            script=script,
+            repeat=repeat,
+            warmup=warmup,
+            pipeline_warm=pipeline_warm,
+            env=env,
+            timeout=timeout,
+            quiet=quiet,
+            profile=False,
+        )
+        if timed_run.error is not None:
+            return timed_run
+        profile_run = _run_harness(
+            label=label,
+            python_cmd=python_cmd,
+            script=script,
+            repeat=0,
+            warmup=False,
+            pipeline_warm=pipeline_warm,
+            env=env,
+            timeout=timeout,
+            quiet=True,
+            profile=True,
+            _profile_only=True,
+        )
+        profile_result = profile_run.profile
+        if profile_result is not None:
+            profile_result = dict(profile_result)
+            profile_result["mode"] = "isolated_post_timing_profile"
+        if profile_result is None and profile_run.error is not None:
+            profile_result = {
+                "available": False,
+                "backend": label,
+                "mode": "isolated_post_timing_profile",
+                "error": profile_run.error,
+            }
+        return ShootoutRun(
+            label=timed_run.label,
+            timing=timed_run.timing,
+            error=timed_run.error,
+            stdout=timed_run.stdout,
+            profile=profile_result,
+        )
+
     harness_fd, harness_path = tempfile.mkstemp(suffix=".py", prefix="vsbench_harness_")
     result_fd, result_path = tempfile.mkstemp(suffix=".json", prefix="vsbench_result_")
     os.close(result_fd)
@@ -875,17 +931,45 @@ def _run_harness(
                 file=sys.stderr,
             )
 
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            # A uv launcher can leave its Python descendant alive when only
+            # the launcher PID is killed. The harness owns a full session so
+            # timed-out work cannot contaminate later benchmark items.
+            os.killpg(proc.pid, signal.SIGKILL)
+            final_stdout, final_stderr = proc.communicate()
+            exc.stdout = final_stdout or exc.stdout
+            exc.stderr = final_stderr or exc.stderr
+            raise
+        except BaseException:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+            raise
+
+        completed = subprocess.CompletedProcess(
+            cmd,
+            proc.returncode,
+            stdout=stdout,
+            stderr=stderr,
         )
 
         result_file = Path(result_path)
         if not result_file.exists() or result_file.stat().st_size == 0:
-            msg = proc.stderr.strip() or proc.stdout.strip() or "harness produced no output"
+            msg = (
+                completed.stderr.strip()
+                or completed.stdout.strip()
+                or "harness produced no output"
+            )
             if not quiet:
                 print(" ERROR", file=sys.stderr)
             return _error_run(label, msg)

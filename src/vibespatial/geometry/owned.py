@@ -391,6 +391,149 @@ def device_family_coordinate_counts(
     return buffer.ring_offsets[ring_ends] - buffer.ring_offsets[ring_starts]
 
 
+def ensure_device_geometry_size_bounds(
+    owned: OwnedGeometryArray,
+    *,
+    reason: str,
+) -> int:
+    """Attach host-visible per-row size bounds derived from device offsets.
+
+    Variable-width native inputs can arrive without fixed-size metadata even
+    though their nested offsets already prove tight allocation bounds. Reduce
+    every missing family proof on device and export one small planning packet;
+    geometry coordinates and row metadata remain resident.
+
+    Returns the maximum coordinate span of any segment-producing source row.
+    A coordinate span is a conservative segment bound for lineal/polygonal
+    families and can therefore size row-isolated topology pages safely.
+    """
+    if cp is None:  # pragma: no cover - GPU-only helper
+        raise RuntimeError("CuPy is required for device geometry size bounds")
+
+    root = owned
+    while root.is_indexed_view:
+        if root._base is None:
+            raise RuntimeError("indexed geometry size proof is missing its physical root")
+        root = root._base
+    state = root._ensure_device_state(preserve_indexed_view=True)
+
+    missing: list[tuple[GeometryFamily, DeviceFamilyGeometryBuffer]] = []
+    packets = []
+
+    def _maximum(values):
+        return (
+            cp.asarray(0, dtype=cp.int64)
+            if int(values.size) == 0
+            else cp.max(values).astype(cp.int64, copy=False)
+        )
+
+    for family, buffer in state.families.items():
+        if getattr(buffer, "_device_size_bounds_exact", False):
+            continue
+        fixed_size = _device_buffer_fixed_size_metadata(family, buffer)
+        exact_width_fields = ["coord_count_per_row"]
+        if family in (
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTILINESTRING,
+            GeometryFamily.MULTIPOLYGON,
+        ):
+            exact_width_fields.append("first_level_count_per_row")
+        if family is GeometryFamily.MULTIPOLYGON:
+            exact_width_fields.append("second_level_count_per_row")
+        if fixed_size is not None and all(
+            getattr(fixed_size, field) is not None for field in exact_width_fields
+        ):
+            buffer._device_size_bounds_exact = True
+            continue
+
+        d_geometry_offsets = cp.asarray(buffer.geometry_offsets, dtype=cp.int64)
+        d_first_counts = d_geometry_offsets[1:] - d_geometry_offsets[:-1]
+        d_max_first = cp.asarray(0, dtype=cp.int64)
+        d_max_second = cp.asarray(0, dtype=cp.int64)
+        if family in (
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTILINESTRING,
+            GeometryFamily.MULTIPOLYGON,
+        ):
+            d_max_first = _maximum(d_first_counts)
+        if family is GeometryFamily.MULTIPOLYGON:
+            if buffer.part_offsets is None:
+                raise RuntimeError("multipolygon device buffer is missing part offsets")
+            d_part_offsets = cp.asarray(buffer.part_offsets, dtype=cp.int64)
+            d_ring_starts = d_part_offsets[d_geometry_offsets[:-1]]
+            d_ring_ends = d_part_offsets[d_geometry_offsets[1:]]
+            d_max_second = _maximum(d_ring_ends - d_ring_starts)
+
+        d_coord_counts = device_family_coordinate_counts(buffer)
+        d_max_coord = _maximum(d_coord_counts)
+        packets.append(cp.stack((d_max_first, d_max_second, d_max_coord)))
+        missing.append((family, buffer))
+
+    if packets:
+        d_packet = cp.concatenate(packets)
+        h_packet = np.asarray(
+            get_cuda_runtime().copy_device_to_host(d_packet, reason=reason),
+            dtype=np.int64,
+        ).reshape(len(missing), 3)
+        for (family, buffer), (max_first, max_second, max_coord) in zip(
+            missing,
+            h_packet,
+            strict=True,
+        ):
+            existing = _device_buffer_fixed_size_metadata(family, buffer)
+            fixed_first = None if existing is None else existing.first_level_count_per_row
+            fixed_second = None if existing is None else existing.second_level_count_per_row
+            fixed_coord = None if existing is None else existing.coord_count_per_row
+            buffer.fixed_size = DeviceFixedGeometrySizeMetadata(
+                first_level_count_per_row=fixed_first,
+                second_level_count_per_row=fixed_second,
+                coord_count_per_row=fixed_coord,
+                max_first_level_count_per_row=max(
+                    int(max_first),
+                    0 if fixed_first is None else int(fixed_first),
+                ),
+                max_second_level_count_per_row=max(
+                    int(max_second),
+                    0 if fixed_second is None else int(fixed_second),
+                ),
+                max_coord_count_per_row=max(
+                    int(max_coord),
+                    0 if fixed_coord is None else int(fixed_coord),
+                ),
+            )
+            buffer._device_size_bounds_exact = True
+
+    segment_families = {
+        GeometryFamily.LINESTRING,
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTILINESTRING,
+        GeometryFamily.MULTIPOLYGON,
+    }
+    segment_bound = max(
+        (
+            int(state.families[family].fixed_size.max_coord_count_per_row)
+            for family in state.families
+            if family in segment_families
+            and state.families[family].fixed_size is not None
+            and state.families[family].fixed_size.max_coord_count_per_row is not None
+        ),
+        default=0,
+    )
+    carried_bounds = [
+        bound
+        for bound in (
+            root._active_family_row_segment_capacity_bound,
+            owned._active_family_row_segment_capacity_bound,
+        )
+        if bound is not None
+    ]
+    if carried_bounds:
+        segment_bound = min(segment_bound, *(int(bound) for bound in carried_bounds))
+    root._active_family_row_segment_capacity_bound = segment_bound
+    owned._active_family_row_segment_capacity_bound = segment_bound
+    return segment_bound
+
+
 def build_updated_device_family_buffer(
     family: GeometryFamily,
     device_buf: DeviceFamilyGeometryBuffer,
@@ -871,6 +1014,7 @@ class OwnedGeometryArray:
         index_map: Any,
         *,
         assume_unique_indices: bool = False,
+        expand_device_metadata: bool = True,
     ) -> OwnedGeometryArray:
         """Create an indexed view: a virtual expansion of *base* via *index_map*.
 
@@ -894,6 +1038,23 @@ class OwnedGeometryArray:
         index_map_size = int(index_map.size)
 
         if _index_map_on_device:
+            if not expand_device_metadata:
+                d_index_map = cp.asarray(index_map)
+                if d_index_map.dtype not in (cp.int32, cp.int64):
+                    d_index_map = d_index_map.astype(cp.int64, copy=False)
+                view = cls(
+                    validity=None,
+                    tags=None,
+                    family_row_offsets=None,
+                    families=base.families,
+                    residency=Residency.DEVICE,
+                    device_state=None,
+                    _row_count=index_map_size,
+                )
+                view._base = base
+                view._index_map = d_index_map
+                view._index_map_unique = bool(assume_unique_indices)
+                return view
             # Device path: expand metadata on device using CuPy fancy indexing.
             # This avoids the D2H transfer of the inverse map and the base
             # metadata arrays that the old code path forced.
@@ -1132,6 +1293,40 @@ class OwnedGeometryArray:
         )
         return self
 
+    def detach_expanded_device_view(self) -> OwnedGeometryArray:
+        """Promote an expanded device view to a standalone shared-buffer carrier.
+
+        Device indexed views with an expanded ``device_state`` already own
+        their logical routing metadata; only family coordinate buffers are
+        shared with the source.  Clearing the source row map is therefore a
+        zero-copy ownership transition.  It is useful at bounded chunk
+        boundaries where retaining the source scatter root would otherwise
+        retain inactive workspace lanes until terminal assembly.
+
+        Deferred-metadata views cannot detach because their row map is still
+        required to derive logical routing metadata.
+        """
+        if not self.is_indexed_view:
+            return self
+        if self.device_state is None:
+            raise RuntimeError(
+                "device indexed view requires expanded metadata before detaching"
+            )
+        if cp is None or not hasattr(self._index_map, "__cuda_array_interface__"):
+            raise RuntimeError("device indexed view detachment requires a device row map")
+
+        self._base = None
+        self._index_map = None
+        self._index_map_unique = False
+        self._active_index_map_unique = False
+        self._row_active_mask = None
+        self._record(
+            DiagnosticKind.CREATED,
+            "detached expanded device row view with shared family buffers",
+            visible=False,
+        )
+        return self
+
     def physicalize_device_rows(
         self,
         *,
@@ -1205,6 +1400,9 @@ class OwnedGeometryArray:
             allow_capacity_allocation=allow_capacity_allocation,
             assume_unique_indices=assume_unique_indices,
             active_row_mask=d_active if has_activity else None,
+        )
+        result._active_family_row_segment_capacity_bound = (
+            self._active_family_row_segment_capacity_bound
         )
         result._record(
             DiagnosticKind.MATERIALIZATION,
@@ -2388,6 +2586,7 @@ class OwnedGeometryArray:
         assume_unique_indices: bool = False,
         active_family_row_multiplicity_bound: int | None = None,
         active_family_row_segment_capacity_bound: int | None = None,
+        defer_device_metadata: bool = False,
     ) -> OwnedGeometryArray:
         """Return a device-backed row-indirection view for a take rowset."""
         if cp is None:
@@ -2426,7 +2625,11 @@ class OwnedGeometryArray:
                 )
 
         base = self
-        d_index_map = d_indices.astype(cp.int64, copy=False)
+        d_index_map = (
+            d_indices
+            if defer_device_metadata and d_indices.dtype in (cp.int32, cp.int64)
+            else d_indices.astype(cp.int64, copy=False)
+        )
         index_map_unique = bool(assume_unique_indices)
         selected_activity = None
         active_index_map_unique = False
@@ -2450,6 +2653,7 @@ class OwnedGeometryArray:
             base,
             d_index_map,
             assume_unique_indices=index_map_unique,
+            expand_device_metadata=not defer_device_metadata,
         )
         view._active_family_row_multiplicity_bound = active_family_row_multiplicity_bound
         view._active_family_row_segment_capacity_bound = active_family_row_segment_capacity_bound
@@ -2802,164 +3006,124 @@ class OwnedGeometryArray:
                 and bool(np.all(self._tags == family_tag))
             )
             trusted_single_family = d_state.trusted_homogeneous_family is family
-            trusted_nullable_family_domain = d_state.trusted_family_domain == (family,)
             single_family_all_rows = (
-                (host_family is not None and int(host_family.row_count) == self.row_count)
+                (
+                    host_family is not None
+                    and host_family.host_materialized
+                    and int(host_family.row_count) == self.row_count
+                )
                 or homogeneous_host_metadata
-                or trusted_single_family
+                or (
+                    trusted_single_family
+                    and d_state.trusted_all_valid is True
+                )
             )
-            if n_indices == 0 or single_family_all_rows:
-                selected_tags_are_family = True
-            elif trusted_nullable_family_domain:
-                selected_tags_are_family = True
-            elif host_tags_for_sizing is not None:
-                selected_tags_are_family = bool(
-                    np.all(np.asarray(host_tags_for_sizing, dtype=np.int8) == family_tag)
+            # A device state with one physical family may also contain null
+            # rows, but every active tag and family-row offset belongs to that
+            # family by construction.  Keep nullable rows masked instead of
+            # synchronizing to revalidate the carrier invariant on each take.
+            d_family_active = d_new_validity & (d_new_tags == family_tag)
+            source_family_rows = d_state.family_row_offsets[d_indices].astype(
+                cp.int64,
+                copy=False,
+            )
+            if not single_family_all_rows or d_active_rows is not None:
+                source_family_rows = cp.where(
+                    d_family_active,
+                    source_family_rows,
+                    cp.int64(0),
                 )
-            elif host_indices_for_sizing is not None and self._tags is not None:
-                selected_tags_are_family = bool(
-                    np.all(self._tags[host_indices_for_sizing] == family_tag)
+            d_new_family_row_offsets = cp.arange(n_indices, dtype=cp.int32)
+            if not single_family_all_rows or d_active_rows is not None:
+                d_new_family_row_offsets = cp.where(
+                    d_family_active,
+                    d_new_family_row_offsets,
+                    cp.int32(-1),
                 )
-            else:
-                selected_tags_are_family = _owned_device_bool_scalar(
-                    cp.all(d_new_tags == family_tag),
-                    reason="owned geometry device-take single-family tag-domain scalar fence",
+            host_family_rows = None
+            if single_family_all_rows and host_family_rows_for_sizing is not None:
+                host_family_rows = np.asarray(
+                    host_family_rows_for_sizing,
+                    dtype=np.int64,
                 )
-            if selected_tags_are_family:
-                d_family_active = d_new_validity & (d_new_tags == family_tag)
-                source_family_rows = d_state.family_row_offsets[d_indices].astype(
-                    cp.int64,
-                    copy=False,
-                )
-                if not single_family_all_rows or d_active_rows is not None:
-                    source_family_rows = cp.where(
-                        d_family_active,
-                        source_family_rows,
-                        cp.int64(0),
-                    )
-                source_family_rows_valid = True
-                if (
-                    not single_family_all_rows
-                    and not trusted_nullable_family_domain
-                    and int(source_family_rows.size)
-                ):
-                    if host_family_rows_for_sizing is not None:
-                        source_family_rows_valid = bool(
-                            np.all(np.asarray(host_family_rows_for_sizing, dtype=np.int64) >= 0)
-                        )
-                    elif (
-                        host_indices_for_sizing is not None and self._family_row_offsets is not None
-                    ):
-                        source_family_rows_valid = bool(
-                            np.all(self._family_row_offsets[host_indices_for_sizing] >= 0)
-                        )
-                    else:
-                        source_family_rows_valid = _owned_device_bool_scalar(
-                            cp.all(source_family_rows >= 0),
-                            reason="owned geometry device-take family-row-domain scalar fence",
-                        )
-                if not source_family_rows_valid:
-                    return self._physical_device_take_mixed(
-                        d_state,
-                        d_indices,
-                        d_new_validity,
-                        d_new_tags,
-                        n_indices,
-                        host_indices_for_sizing=host_indices_for_sizing,
-                        host_tags_for_sizing=host_tags_for_sizing,
-                        host_family_rows_for_sizing=host_family_rows_for_sizing,
-                    )
-                d_new_family_row_offsets = cp.arange(n_indices, dtype=cp.int32)
-                if not single_family_all_rows or d_active_rows is not None:
-                    d_new_family_row_offsets = cp.where(
-                        d_family_active,
-                        d_new_family_row_offsets,
-                        cp.int32(-1),
-                    )
-                host_family_rows = None
-                if single_family_all_rows and host_family_rows_for_sizing is not None:
+            elif single_family_all_rows and host_indices_for_sizing is not None:
+                if self._family_row_offsets is not None:
                     host_family_rows = np.asarray(
-                        host_family_rows_for_sizing,
+                        self._family_row_offsets[host_indices_for_sizing],
                         dtype=np.int64,
                     )
-                elif single_family_all_rows and host_indices_for_sizing is not None:
-                    if self._family_row_offsets is not None:
-                        host_family_rows = np.asarray(
-                            self._family_row_offsets[host_indices_for_sizing],
-                            dtype=np.int64,
-                        )
-                    elif single_family_all_rows:
-                        host_family_rows = np.asarray(
-                            host_indices_for_sizing,
-                            dtype=np.int64,
-                        )
-                new_device_families[family] = _device_take_family_buffer(
-                    device_buffer,
-                    family,
-                    source_family_rows,
-                    self.families.get(family),
-                    host_family_rows=host_family_rows,
-                    allow_capacity_allocation=allow_capacity_allocation,
-                    assume_unique_indices=assume_unique_indices,
-                    active_row_mask=(
-                        d_active_rows
-                        if single_family_all_rows and d_active_rows is not None
-                        else (None if single_family_all_rows else d_family_active)
-                    ),
-                )
-                schema = get_geometry_buffer_schema(family)
-                new_host_families[family] = FamilyGeometryBuffer(
-                    family=family,
-                    schema=schema,
-                    row_count=n_indices,
-                    x=np.empty(0, dtype=np.float64),
-                    y=np.empty(0, dtype=np.float64),
-                    geometry_offsets=np.empty(0, dtype=np.int32),
-                    empty_mask=np.empty(0, dtype=np.bool_),
-                    host_materialized=False,
-                )
-                result = OwnedGeometryArray(
-                    validity=None,
-                    tags=None,
-                    family_row_offsets=None,
-                    families=new_host_families,
-                    residency=Residency.DEVICE,
-                    device_state=OwnedGeometryDeviceState(
-                        validity=d_new_validity,
-                        tags=d_new_tags,
-                        family_row_offsets=d_new_family_row_offsets,
-                        families=new_device_families,
-                        trusted_unique_family_rows=True,
-                        trusted_family_domain=(family,),
-                    ),
-                    _row_count=n_indices,
-                )
-                if result.device_state is not None:
-                    if d_state.row_bounds is not None:
-                        result.device_state.row_bounds = cp.asarray(d_state.row_bounds)[
-                            d_indices
-                        ].reshape(n_indices, 4)
-                    if source_all_rows_valid and d_active_rows is None:
-                        result.device_state.trusted_all_valid = True
-                    if single_family_all_rows and d_active_rows is None:
-                        result.device_state.trusted_homogeneous_family = family
-                    if (
-                        d_active_rows is None
-                        and d_state.trusted_all_non_empty is True
-                        and d_state.trusted_homogeneous_family is family
-                    ):
-                        result.device_state.trusted_all_non_empty = True
-                    if d_state.trusted_polygonal_only is True or family in (
-                        GeometryFamily.POLYGON,
-                        GeometryFamily.MULTIPOLYGON,
-                    ):
-                        result.device_state.trusted_polygonal_only = True
-                result._record(
-                    DiagnosticKind.CREATED,
-                    f"device-side subset {n_indices} rows via device_take",
-                    visible=False,
-                )
-                return result
+                else:
+                    host_family_rows = np.asarray(
+                        host_indices_for_sizing,
+                        dtype=np.int64,
+                    )
+            new_device_families[family] = _device_take_family_buffer(
+                device_buffer,
+                family,
+                source_family_rows,
+                self.families.get(family),
+                host_family_rows=host_family_rows,
+                allow_capacity_allocation=allow_capacity_allocation,
+                assume_unique_indices=assume_unique_indices,
+                active_row_mask=(
+                    d_active_rows
+                    if single_family_all_rows and d_active_rows is not None
+                    else (None if single_family_all_rows else d_family_active)
+                ),
+            )
+            schema = get_geometry_buffer_schema(family)
+            new_host_families[family] = FamilyGeometryBuffer(
+                family=family,
+                schema=schema,
+                row_count=n_indices,
+                x=np.empty(0, dtype=np.float64),
+                y=np.empty(0, dtype=np.float64),
+                geometry_offsets=np.empty(0, dtype=np.int32),
+                empty_mask=np.empty(0, dtype=np.bool_),
+                host_materialized=False,
+            )
+            result = OwnedGeometryArray(
+                validity=None,
+                tags=None,
+                family_row_offsets=None,
+                families=new_host_families,
+                residency=Residency.DEVICE,
+                device_state=OwnedGeometryDeviceState(
+                    validity=d_new_validity,
+                    tags=d_new_tags,
+                    family_row_offsets=d_new_family_row_offsets,
+                    families=new_device_families,
+                    trusted_unique_family_rows=True,
+                    trusted_family_domain=(family,),
+                ),
+                _row_count=n_indices,
+            )
+            if result.device_state is not None:
+                if d_state.row_bounds is not None:
+                    result.device_state.row_bounds = cp.asarray(d_state.row_bounds)[
+                        d_indices
+                    ].reshape(n_indices, 4)
+                if source_all_rows_valid and d_active_rows is None:
+                    result.device_state.trusted_all_valid = True
+                if single_family_all_rows and d_active_rows is None:
+                    result.device_state.trusted_homogeneous_family = family
+                if (
+                    d_active_rows is None
+                    and d_state.trusted_all_non_empty is True
+                    and d_state.trusted_homogeneous_family is family
+                ):
+                    result.device_state.trusted_all_non_empty = True
+                if d_state.trusted_polygonal_only is True or family in (
+                    GeometryFamily.POLYGON,
+                    GeometryFamily.MULTIPOLYGON,
+                ):
+                    result.device_state.trusted_polygonal_only = True
+            result._record(
+                DiagnosticKind.CREATED,
+                f"device-side subset {n_indices} rows via device_take",
+                visible=False,
+            )
+            return result
 
         return self._physical_device_take_mixed(
             d_state,
@@ -4201,12 +4365,16 @@ def device_physicalize_owned_row_selections_exact(
     selections: list[tuple[OwnedGeometryArray, DeviceArray]],
     *,
     reason: str,
+    compact_concrete_prefix: bool = False,
 ) -> list[OwnedGeometryArray | None]:
     """Gather several logical row selections through one exact-allocation packet.
 
     This is the physical-layout boundary for multi-root native compositions.
     Coordinates and nested offsets remain on device; only aggregate allocation
-    totals cross once so each selected span is copied exactly once.
+    totals cross once so each selected span is copied exactly once. When
+    ``compact_concrete_prefix`` is true, every active lane must be concrete and
+    active lanes must form a prefix. The result then uses that prefix's exact
+    logical row count instead of retaining source capacity.
     """
     if cp is None:  # pragma: no cover - exercised only on CPU-only installs
         raise RuntimeError("CuPy is required for exact device row physicalization")
@@ -4216,21 +4384,55 @@ def device_physicalize_owned_row_selections_exact(
         for selection_index, selection in enumerate(prepared)
         for family in selection.family_stats
     ]
-    if work_keys:
-        d_packet = cp.concatenate(
-            [prepared[index].family_stats[family] for index, family in work_keys]
-        )
+    prefix_stats = []
+    if compact_concrete_prefix:
+        prefix_stats = [
+            cp.concatenate(
+                (
+                    cp.stack(
+                        (
+                            cp.sum(selection.active, dtype=cp.int64),
+                            cp.sum(selection.validity, dtype=cp.int64),
+                        )
+                    ),
+                    cp.zeros(5, dtype=cp.int64),
+                )
+            )
+            for selection in prepared
+        ]
+    packet_parts = prefix_stats + [
+        prepared[index].family_stats[family] for index, family in work_keys
+    ]
+    if packet_parts:
+        d_packet = cp.concatenate(packet_parts)
         h_packet = np.asarray(
             get_cuda_runtime().copy_device_to_host(d_packet, reason=reason),
             dtype=np.int64,
-        ).reshape(len(work_keys), 7)
+        ).reshape(len(packet_parts), 7)
     else:
         h_packet = np.empty((0, 7), dtype=np.int64)
-    host_stats = {key: h_packet[position] for position, key in enumerate(work_keys)}
+    prefix_offset = len(prefix_stats)
+    host_stats = {
+        key: h_packet[prefix_offset + position]
+        for position, key in enumerate(work_keys)
+    }
 
     results: list[OwnedGeometryArray | None] = []
     for selection_index, selection in enumerate(prepared):
-        row_count = int(selection.indices.size)
+        capacity = int(selection.indices.size)
+        row_count = capacity
+        if compact_concrete_prefix:
+            active_count = int(h_packet[selection_index, 0])
+            valid_count = int(h_packet[selection_index, 1])
+            family_count = sum(
+                int(host_stats[(selection_index, family)][0])
+                for family in selection.family_stats
+            )
+            if active_count != valid_count or valid_count != family_count:
+                raise ValueError(
+                    "compact exact physicalization requires concrete active lanes"
+                )
+            row_count = active_count
         device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
         d_family_row_offsets = cp.full(row_count, -1, dtype=cp.int32)
         segment_bound = 0
@@ -4275,7 +4477,8 @@ def device_physicalize_owned_row_selections_exact(
                     max_second_level_count_per_row=max_second,
                     max_coord_count_per_row=max_coord,
                 )
-            d_family_active = selection.family_active[family]
+            d_family_rows = d_family_rows[:row_count]
+            d_family_active = selection.family_active[family][:row_count]
             d_family_row_offsets = cp.where(
                 d_family_active,
                 cp.arange(row_count, dtype=cp.int32),
@@ -4299,8 +4502,8 @@ def device_physicalize_owned_row_selections_exact(
         result = build_device_resident_owned(
             device_families=device_families,
             row_count=row_count,
-            tags=selection.tags,
-            validity=selection.validity,
+            tags=selection.tags[:row_count],
+            validity=selection.validity[:row_count],
             family_row_offsets=d_family_row_offsets,
             execution_mode="gpu",
         )
@@ -4313,16 +4516,19 @@ def device_physicalize_owned_row_selections_exact(
             d_bounds = cp.asarray(source_state.row_bounds, dtype=cp.float64).reshape(
                 selection.base.row_count,
                 4,
-            )[selection.indices]
+            )[selection.indices[:row_count]]
             result_state.row_bounds = cp.where(
-                selection.validity[:, None],
+                selection.validity[:row_count, None],
                 d_bounds,
                 cp.asarray(cp.nan, dtype=cp.float64),
             )
         result._active_family_row_segment_capacity_bound = segment_bound
         result._record(
             DiagnosticKind.MATERIALIZATION,
-            f"exact device row physicalization: {row_count} row-capacity lanes",
+            (
+                "exact device row physicalization: "
+                f"{row_count} rows from {capacity} capacity lanes"
+            ),
             visible=False,
         )
         results.append(result)
@@ -5575,7 +5781,12 @@ def _device_take_dense_single_ring_polygon_buffer(
                 KERNEL_PARAM_I32,
             ),
         )
-        runtime.launch(kernel, grid=grid, block=block, params=params)
+        runtime.launch(
+            kernel,
+            grid=grid,
+            block=block,
+            params=params,
+        )
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.POLYGON,
         x=new_x,
@@ -7078,6 +7289,92 @@ def device_scatter_owned_capacity_selection(
     return result
 
 
+def device_scatter_owned_capacity_selections_many(
+    base: OwnedGeometryArray,
+    replacements: list[tuple[OwnedGeometryArray, Any, DeviceArray | None]],
+) -> OwnedGeometryArray:
+    """Fuse multi-root capacity scatters through one exact physicalization.
+
+    A single-root ``OwnedGeometryArray`` cannot retain row indirection into
+    several unrelated geometry buffers. This is the explicit physical-layout
+    boundary for that shape: all active logical rows are sized by one sparse
+    device packet, copied once, concatenated once, and selected by one row map.
+    """
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        raise RuntimeError("CuPy is required for fused device capacity scatter")
+
+    row_count = int(base.row_count)
+    normalized: list[tuple[OwnedGeometryArray, Any, DeviceArray]] = []
+    exact_selections: list[tuple[OwnedGeometryArray, DeviceArray]] = [
+        (base, cp.ones(row_count, dtype=cp.bool_))
+    ]
+    for replacement, selection, active_mask in replacements:
+        capacity = int(selection.capacity)
+        if replacement.row_count != capacity:
+            raise ValueError("capacity replacement row count must match selection capacity")
+        if selection.source_row_count is not None and int(selection.source_row_count) != row_count:
+            raise ValueError("capacity selection source row count must match scatter base")
+        d_active = selection.active_capacity_mask()
+        if active_mask is not None:
+            d_requested = cp.asarray(active_mask, dtype=cp.bool_)
+            if d_requested.ndim != 1 or d_requested.size != capacity:
+                raise ValueError("capacity scatter active mask must match selection capacity")
+            d_active &= d_requested
+        normalized.append((replacement, selection, d_active))
+        exact_selections.append((replacement, d_active))
+
+    physical = device_physicalize_owned_row_selections_exact(
+        exact_selections,
+        reason="fused multi-root capacity scatter exact allocation packet",
+    )
+    physical_base = physical[0] if physical[0] is not None else base
+    arrays = [physical_base]
+    d_index_map = cp.arange(row_count, dtype=cp.int64)
+    source_offset = np.int64(row_count)
+    emitted = 0
+    for (replacement, selection, d_active), physical_replacement in zip(
+        normalized,
+        physical[1:],
+        strict=True,
+    ):
+        if physical_replacement is None:
+            continue
+        capacity = replacement.row_count
+        d_lanes = cp.arange(capacity, dtype=cp.int64)
+        d_destinations = cp.where(
+            d_active,
+            selection.safe_capacity_positions(),
+            np.int64(row_count) + d_lanes,
+        )
+        d_extended_map = cp.concatenate(
+            [d_index_map, cp.zeros(capacity, dtype=cp.int64)]
+        )
+        d_extended_map[d_destinations] = source_offset + d_lanes
+        d_index_map = d_extended_map[:row_count]
+        arrays.append(physical_replacement)
+        source_offset += np.int64(capacity)
+        emitted += 1
+
+    if emitted == 0:
+        return physical_base
+    scatter_base = OwnedGeometryArray.concat(arrays)
+    result = OwnedGeometryArray._indexed_view(
+        scatter_base,
+        d_index_map,
+        assume_unique_indices=True,
+    )
+    result._device_scatter_implementation = "device_exact_capacity_selection_scatter_many"
+    result._record(
+        DiagnosticKind.CREATED,
+        (
+            f"device exact fused capacity scatter of {emitted} replacement "
+            f"partitions into {row_count} output rows"
+        ),
+        visible=False,
+    )
+    return result
+
+
 def device_take_owned_family_capacity_selection(
     owned: OwnedGeometryArray,
     selection,
@@ -7384,6 +7681,9 @@ def device_mask_owned_capacity(
             trusted_family_domain=state.trusted_family_domain,
         ),
         _row_count=row_count,
+    )
+    result._active_family_row_segment_capacity_bound = (
+        owned._active_family_row_segment_capacity_bound
     )
     result._record(
         DiagnosticKind.CREATED,

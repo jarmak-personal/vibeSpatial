@@ -50,6 +50,57 @@ _CONSTRUCTIVE_OPS = ("intersection", "union", "difference", "symmetric_differenc
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
 
 
+@requires_gpu
+def test_owned_boundary_physicalizes_threshold_crossing_chunk_composition() -> None:
+    """The first bounded row count remains consumable by legacy owned callers."""
+    cp = pytest.importorskip("cupy")
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    chunk_rows = binary_constructive_module._polygon_constructive_chunk_rows(1 << 30)
+    row_count = chunk_rows + 1
+    left = tile_single_row(
+        from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)], residency=Residency.DEVICE),
+        row_count,
+    )
+    right = tile_single_row(
+        from_shapely_geometries([box(1.0, 0.0, 3.0, 2.0)], residency=Residency.DEVICE),
+        row_count,
+    )
+
+    clear_dispatch_events()
+    result = binary_constructive_owned(
+        "intersection",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    events = get_dispatch_events(clear=True)
+
+    assert result.row_count == row_count
+    assert result.residency is Residency.DEVICE
+    assert cp.asarray(result.device_state.validity).shape == (row_count,)
+    sample = result._device_indexed_take(
+        cp.asarray([0, row_count - 1], dtype=cp.int64),
+        assume_unique_indices=True,
+    ).to_shapely()
+    expected = shapely.normalize(box(1.0, 0.0, 2.0, 2.0))
+    assert all(
+        shapely.normalize(geometry).equals_exact(expected, tolerance=1e-12)
+        for geometry in sample
+    )
+    assert any(
+        event.implementation == "chunked_polygon_intersection_composition_gpu"
+        and f"chunk_rows={chunk_rows}" in event.detail
+        and "chunks=2" in event.detail
+        for event in events
+    )
+    assert any(
+        event.implementation
+        == "binary_constructive_owned_composition_physicalization"
+        for event in events
+    )
+
+
 def test_row_isolated_polygon_overlay_has_no_per_row_fallback_executor() -> None:
     source = Path(binary_constructive_module.__file__).read_text()
     tree = ast.parse(source)
@@ -1516,6 +1567,267 @@ def test_exact_broadcast_polygon_topology_keeps_one_physical_mask(
         event.implementation == "broadcast_right_complete_row_topology_pages_gpu"
         for event in events
     )
+
+
+@requires_gpu
+def test_exact_broadcast_polygon_coverage_respects_logical_right_row() -> None:
+    import cupy as cp
+
+    from vibespatial.constructive.binary_constructive import (
+        _dispatch_polygon_intersection_overlay_broadcast_right_gpu,
+    )
+
+    left_geoms = [
+        box(1.0, 1.0, 2.0, 2.0),
+        box(20.0, 20.0, 21.0, 21.0),
+    ]
+    right_source = from_shapely_geometries(
+        [
+            box(-100.0, -100.0, 100.0, 100.0),
+            Polygon([(0.0, 0.0), (4.0, 0.0), (2.0, 4.0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    right = right_source.device_take(cp.asarray([1], dtype=cp.int64))
+    left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+
+    result = _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result is not None
+    expected = shapely.intersection(
+        np.asarray(left_geoms, dtype=object),
+        Polygon([(0.0, 0.0), (4.0, 0.0), (2.0, 4.0)]),
+    )
+    for actual, oracle in zip(result.to_shapely(), expected, strict=True):
+        if oracle.is_empty:
+            assert actual is None or actual.is_empty
+        else:
+            assert actual is not None
+            assert shapely.normalize(actual).equals(shapely.normalize(oracle))
+
+
+@requires_gpu
+def test_prepared_broadcast_mask_partitions_contained_exterior_and_boundary_rows() -> None:
+    import cupy as cp
+
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+    from vibespatial.spatial.prepared_polygon_mask import (
+        PreparedPolygonMask,
+        prepared_polygon_mask_fp64_plan,
+    )
+
+    mask = Polygon(
+        [(0, 0), (12, 0), (12, 12), (0, 12), (0, 0)],
+        holes=[[(4, 4), (8, 4), (8, 8), (4, 8), (4, 4)]],
+    )
+    left_geoms = [
+        box(1, 1, 2, 2),
+        box(5, 5, 6, 6),
+        box(3.5, 5, 4.5, 6),
+        box(13, 1, 14, 2),
+        box(-1, 9, 1, 11),
+    ]
+    left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+    right = from_shapely_geometries([mask], residency=Residency.DEVICE)
+
+    clear_dispatch_events()
+    prepared = PreparedPolygonMask.from_owned(
+        right,
+        precision_plan=prepared_polygon_mask_fp64_plan(),
+    )
+    assert prepared is not None
+    classification = prepared.classify_polygon_rows(left)
+    assert classification is not None
+    cp.cuda.get_current_stream().synchronize()
+
+    assert cp.asnumpy(classification.valid).tolist() == [True] * 5
+    assert cp.asnumpy(classification.covered_by).tolist() == [
+        True,
+        False,
+        False,
+        False,
+        False,
+    ]
+    assert cp.asnumpy(classification.exterior).tolist() == [
+        False,
+        True,
+        False,
+        True,
+        False,
+    ]
+    assert cp.asnumpy(classification.boundary_unresolved).tolist() == [
+        False,
+        False,
+        True,
+        False,
+        True,
+    ]
+    assert any(
+        event.implementation == "prepared_single_mask_indexed_relation_exact_ray_gpu"
+        and "candidate_work=" in event.detail
+        and "scheduled_index_lane_bound=" in event.detail
+        and "exact_lane_bound=" in event.detail
+        and "total_scheduled_lane_bound=" in event.detail
+        and "candidate_tile_capacity=" in event.detail
+        and "precision=fp64" in event.detail
+        and "precision_reason=" in event.detail
+        for event in get_dispatch_events(clear=True)
+    )
+
+
+def test_prepared_mask_shape_bounds_virtual_candidate_capacity_by_live_memory() -> None:
+    from vibespatial.spatial.prepared_polygon_mask import (
+        _MORTON_SPAN_BUCKET_UPPER_BOUNDS,
+        _plan_mask_classification_shape,
+    )
+
+    span_bucket_counts = [0] * len(_MORTON_SPAN_BUCKET_UPPER_BOUNDS)
+    span_bucket_counts[1] = 2_000_000
+    constrained = _plan_mask_classification_shape(
+        row_count=1_000_000,
+        segment_count=1_000,
+        free_device_bytes=64 << 20,
+        span_bucket_counts=span_bucket_counts,
+    )
+    roomier = _plan_mask_classification_shape(
+        row_count=1_000_000,
+        segment_count=1_000,
+        free_device_bytes=512 << 20,
+        span_bucket_counts=span_bucket_counts,
+    )
+
+    assert constrained.dense_candidate_work == 1_000_000_000
+    assert constrained.candidate_work == 2_000_000
+    assert constrained.scheduled_index_lane_bound == 4_000_000
+    assert constrained.exact_lane_bound == 2_000_000
+    assert constrained.total_scheduled_lane_bound == 6_000_000
+    assert constrained.output_bytes == 4_000_000
+    assert constrained.candidate_work < constrained.dense_candidate_work
+    assert 0 < constrained.candidate_tile_capacity < constrained.candidate_work
+    assert (
+        constrained.row_tile_size * constrained.segment_tile_size
+        <= constrained.candidate_tile_capacity
+    )
+    assert constrained.tile_count > 1
+    assert roomier.candidate_tile_capacity > constrained.candidate_tile_capacity
+
+
+def test_prepared_mask_classification_does_not_materialize_candidate_relations() -> None:
+    from vibespatial.spatial import prepared_polygon_mask as prepared_module
+
+    source = Path(prepared_module.__file__).read_text()
+    tree = ast.parse(source)
+    classify = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "PreparedPolygonMask"
+        for node in node.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "classify_polygon_rows"
+    )
+
+    assert not any(isinstance(node, (ast.For, ast.While)) for node in ast.walk(classify))
+    assert "generate_bounds_pairs" not in source
+    assert "boundary_pairs" not in source
+    assert "ray_pairs" not in source
+    assert "cp.bincount" not in source
+    assert "_prepare_morton_range_query" in source
+    assert 'kernels["morton_range_tile_count"]' in source
+    assert 'kernels["morton_range_tile_scatter"]' in source
+    assert "exclusive_sum" in source
+    assert "count_scatter_total" not in source
+    assert "spatial_index_device_query" not in source
+    assert "vs_mask_orient2d_exact" in source
+    assert "precision_plan: PrecisionPlan" in source
+    assert "_require_prepared_polygon_mask_precision_plan" in source
+
+    constructive_source = Path(binary_constructive_module.__file__).read_text()
+    dispatch_start = constructive_source.index(
+        "def _dispatch_prepared_polygon_intersection_broadcast_right_gpu("
+    )
+    dispatch_end = constructive_source.index("\ndef ", dispatch_start + 1)
+    dispatch_source = constructive_source[dispatch_start:dispatch_end]
+    assert ".compact_rowset(" not in dispatch_source
+    assert "device_physicalize_owned_row_selections_exact" in dispatch_source
+    assert "compact_concrete_prefix=True" in dispatch_source
+    assert "sparse_boundary_relation_plus_exact_physicalization" in dispatch_source
+
+    empty_semantics_start = constructive_source.index(
+        "def _apply_binary_empty_row_semantics_gpu("
+    )
+    empty_semantics_end = constructive_source.index(
+        "\ndef ",
+        empty_semantics_start + 1,
+    )
+    empty_semantics_source = constructive_source[
+        empty_semantics_start:empty_semantics_end
+    ]
+    assert "device_mask_owned_capacity(" in empty_semantics_source
+    assert "_compose_aligned_native_geometries(" in empty_semantics_source
+    assert ".compact_rowset(" not in empty_semantics_source
+    assert "_device_indexed_take(" not in empty_semantics_source
+
+
+def test_prepared_mask_precision_contract_is_explicit_fp64_predicate() -> None:
+    from dataclasses import replace
+
+    from vibespatial.runtime.precision import KernelClass, PrecisionMode
+    from vibespatial.spatial.prepared_polygon_mask import (
+        _require_prepared_polygon_mask_precision_plan,
+        prepared_polygon_mask_fp64_plan,
+    )
+
+    plan = prepared_polygon_mask_fp64_plan()
+    assert plan.kernel_class is KernelClass.PREDICATE
+    assert plan.storage_precision is PrecisionMode.FP64
+    assert plan.compute_precision is PrecisionMode.FP64
+    assert _require_prepared_polygon_mask_precision_plan(plan) is plan
+
+    with pytest.raises(ValueError, match="PREDICATE PrecisionPlan"):
+        _require_prepared_polygon_mask_precision_plan(
+            replace(plan, kernel_class=KernelClass.CONSTRUCTIVE)
+        )
+    with pytest.raises(NotImplementedError, match="authoritative fp64"):
+        _require_prepared_polygon_mask_precision_plan(
+            replace(plan, compute_precision=PrecisionMode.FP32)
+        )
+
+
+@requires_gpu
+def test_prepared_mask_ray_crossing_uses_exact_orientation_sign() -> None:
+    import cupy as cp
+
+    from vibespatial.spatial.prepared_polygon_mask import (
+        _classify_mask_candidate_relation_tile_device,
+        prepared_polygon_mask_fp64_plan,
+    )
+
+    point_x = float(1.0 / 10.0)
+    direct_cross_x = 0.0 + (1.0 - 0.0) * (1.0 - 0.0) / (10.0 - 0.0)
+    assert direct_cross_x == point_x
+    assert not (direct_cross_x < point_x)
+
+    flags, candidate_capacity = _classify_mask_candidate_relation_tile_device(
+        cp.asarray([1], dtype=cp.int32),
+        cp.asarray([0], dtype=cp.int32),
+        cp.asarray([1], dtype=cp.int64),
+        cp.asarray([point_x], dtype=cp.float64),
+        cp.asarray([1.0], dtype=cp.float64),
+        cp.asarray([0.0, 1.0], dtype=cp.float64),
+        cp.asarray([0.0, 10.0], dtype=cp.float64),
+        1,
+        precision_plan=prepared_polygon_mask_fp64_plan(),
+    )
+    cp.cuda.get_current_stream().synchronize()
+    actual = int(flags.get()[0])
+
+    assert candidate_capacity == 1
+    assert actual & 1 == 0
+    assert actual & 2 == 2
 
 
 @requires_gpu
