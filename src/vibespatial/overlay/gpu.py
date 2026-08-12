@@ -36,6 +36,7 @@ from vibespatial.geometry.owned import (  # noqa: E402
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
 from vibespatial.runtime.dispatch import record_dispatch_event  # noqa: E402
 from vibespatial.runtime.fallbacks import record_fallback_event  # noqa: E402
+from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled  # noqa: E402
 from vibespatial.runtime.kernel_registry import register_kernel_variant  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
 from vibespatial.runtime.residency import Residency  # noqa: E402
@@ -71,7 +72,14 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
 # conservative execution-layout estimate, not the persistent table width.
 _BYTES_PER_LIVE_SPLIT_EVENT = 192
 _MIN_LIVE_SPLIT_EVENT_BUDGET = 64 * 1024
-_MAX_LIVE_SPLIT_EVENT_BUDGET = 2 * 1024 * 1024
+# The memory-derived one-fifth limit remains authoritative on smaller devices.
+# This ceiling prevents one plan from reserving more than 6 GiB on large GPUs.
+_MAX_LIVE_SPLIT_EVENT_BUDGET = 32 * 1024 * 1024
+
+
+def _sync_hotpath() -> None:
+    if hotpath_trace_enabled():
+        get_cuda_runtime().synchronize()
 
 
 @dataclass(frozen=True)
@@ -1309,25 +1317,28 @@ def _build_overlay_execution_plan(
                 complete_row_spans=page_shape.row_spans(),
             )
 
+    _sync_hotpath()
     try:
-        split_events = build_gpu_split_events(
-            left,
-            right,
-            dispatch_mode=dispatch_mode,
-            _cached_left_segments=planned_left_segments,
-            _cached_right_segments=(
-                planned_right_segments
-                if planned_right_segments is not None
-                else _cached_right_segments
-            ),
-            right_segment_broadcast=_right_segment_broadcast,
-            require_same_row=_row_isolated,
-            use_same_row_fast_path=_use_same_row_fast_path,
-            same_row_single_group=_same_row_single_group,
-            same_row_span_summary=_same_row_span_summary,
-            right_geometry_source_rows=_right_segment_source_rows,
-            include_same_side_splits=_include_same_side_splits,
-        )
+        with hotpath_stage("overlay.plan.split_events", category="refine"):
+            split_events = build_gpu_split_events(
+                left,
+                right,
+                dispatch_mode=dispatch_mode,
+                _cached_left_segments=planned_left_segments,
+                _cached_right_segments=(
+                    planned_right_segments
+                    if planned_right_segments is not None
+                    else _cached_right_segments
+                ),
+                right_segment_broadcast=_right_segment_broadcast,
+                require_same_row=_row_isolated,
+                use_same_row_fast_path=_use_same_row_fast_path,
+                same_row_single_group=_same_row_single_group,
+                same_row_span_summary=_same_row_span_summary,
+                right_geometry_source_rows=_right_segment_source_rows,
+                include_same_side_splits=_include_same_side_splits,
+            )
+        _sync_hotpath()
     except Exception as exc:
         raise RuntimeError(
             f"overlay plan build_gpu_split_events failed: {type(exc).__name__}: {exc}"
@@ -1338,7 +1349,9 @@ def _build_overlay_execution_plan(
         if planned_right_segments is not None:
             planned_right_segments.free()
     try:
-        atomic_edges = build_gpu_atomic_edges(split_events, isolate_rows=_row_isolated)
+        with hotpath_stage("overlay.plan.atomic_edges", category="refine"):
+            atomic_edges = build_gpu_atomic_edges(split_events, isolate_rows=_row_isolated)
+        _sync_hotpath()
     except Exception as exc:
         _free_split_event_device_state(split_events)
         maybe_trim_pool_memory()
@@ -1346,11 +1359,18 @@ def _build_overlay_execution_plan(
             f"overlay plan build_gpu_atomic_edges failed: {type(exc).__name__}: {exc}"
         ) from exc
     # split_events are fully consumed by build_gpu_atomic_edges.
-    _free_split_event_device_state(split_events)
+    with hotpath_stage("overlay.plan.release_split_events", category="setup"):
+        _free_split_event_device_state(split_events)
+        _sync_hotpath()
     maybe_trim_pool_memory()
 
     try:
-        half_edge_graph = build_gpu_half_edge_graph(atomic_edges, isolate_rows=_row_isolated)
+        with hotpath_stage("overlay.plan.half_edge_graph", category="refine"):
+            half_edge_graph = build_gpu_half_edge_graph(
+                atomic_edges,
+                isolate_rows=_row_isolated,
+            )
+            _sync_hotpath()
     except Exception as exc:
         _free_atomic_edge_excess(atomic_edges)
         maybe_trim_pool_memory()
@@ -1358,19 +1378,23 @@ def _build_overlay_execution_plan(
             f"overlay plan build_gpu_half_edge_graph failed: {type(exc).__name__}: {exc}"
         ) from exc
     # half_edge_graph retains the atomic-edge arrays it still needs.
-    _free_atomic_edge_excess(atomic_edges)
+    with hotpath_stage("overlay.plan.release_atomic_excess", category="setup"):
+        _free_atomic_edge_excess(atomic_edges)
+        _sync_hotpath()
     maybe_trim_pool_memory()
 
     try:
-        faces = build_gpu_overlay_faces(
-            left,
-            right,
-            half_edge_graph=half_edge_graph,
-            row_isolated=_row_isolated,
-            left_geometry_source_rows=_left_geometry_source_rows,
-            right_geometry_source_rows=_right_geometry_source_rows,
-            right_geometry_broadcast=_right_segment_broadcast is not None,
-        )
+        with hotpath_stage("overlay.plan.faces", category="refine"):
+            faces = build_gpu_overlay_faces(
+                left,
+                right,
+                half_edge_graph=half_edge_graph,
+                row_isolated=_row_isolated,
+                left_geometry_source_rows=_left_geometry_source_rows,
+                right_geometry_source_rows=_right_geometry_source_rows,
+                right_geometry_broadcast=_right_segment_broadcast is not None,
+            )
+            _sync_hotpath()
     except Exception as exc:
         raise RuntimeError(
             f"overlay plan build_gpu_overlay_faces failed: {type(exc).__name__}: {exc}"

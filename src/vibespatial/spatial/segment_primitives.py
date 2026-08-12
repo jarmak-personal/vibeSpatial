@@ -34,6 +34,7 @@ from vibespatial.cuda._runtime import (  # noqa: E402
     KERNEL_PARAM_PTR,
     DeviceArray,
     compile_kernel_group,
+    get_cuda_completion_retainer,
     get_cuda_runtime,
 )
 from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
@@ -1191,7 +1192,6 @@ def _extract_segments_gpu(
     max_segments_per_row = 0
     pending_families: list[_PendingSegmentFamily] = []
     scatter_scratch = []
-    scatter_refs = []
 
     for family_enum, family_tag in [
         (GeometryFamily.LINESTRING, _FAMILY_LINESTRING),
@@ -1624,11 +1624,12 @@ def _extract_segments_gpu(
         )
 
     if total_segments == 0 or not all_row_idx:
-        if scatter_scratch or scatter_refs:
-            runtime.synchronize()
-            for scratch in scatter_scratch:
-                runtime.free(scratch)
-            scatter_refs.clear()
+        if scatter_scratch:
+            get_cuda_completion_retainer().defer(
+                cp.cuda.get_current_stream(),
+                tuple(scatter_scratch),
+                lambda _owners: None,
+            )
         return DeviceSegmentTable(
             row_indices=runtime.allocate((0,), np.int32),
             segment_indices=runtime.allocate((0,), np.int32),
@@ -1642,13 +1643,14 @@ def _extract_segments_gpu(
             ring_indices=runtime.allocate((0,), np.int32),
         )
 
-    runtime.synchronize()
-    for scratch in scatter_scratch:
-        runtime.free(scratch)
-    scatter_refs.clear()
-
     # Concatenate per-family results on device (CuPy Tier 2)
     if len(all_row_idx) == 1:
+        if scatter_scratch:
+            get_cuda_completion_retainer().defer(
+                cp.cuda.get_current_stream(),
+                tuple(scatter_scratch),
+                lambda _owners: None,
+            )
         return DeviceSegmentTable(
             row_indices=all_row_idx[0],
             segment_indices=all_seg_idx[0],
@@ -1684,7 +1686,25 @@ def _extract_segments_gpu(
         part_indices=cp.concatenate(all_part_idx)[d_order],
         ring_indices=cp.concatenate(all_ring_idx)[d_order],
     )
-    runtime.synchronize()
+    get_cuda_completion_retainer().defer(
+        cp.cuda.get_current_stream(),
+        (
+            *scatter_scratch,
+            *all_row_idx,
+            *all_seg_idx,
+            *all_part_idx,
+            *all_ring_idx,
+            *all_x0,
+            *all_y0,
+            *all_x1,
+            *all_y1,
+            d_rows,
+            d_segments,
+            d_order_keys,
+            d_order,
+        ),
+        lambda _owners: None,
+    )
     return concatenated
 
 

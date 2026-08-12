@@ -625,6 +625,7 @@ def test_dual_queue_and_containment_launch_shapes_are_valid_above_65535_faces() 
         KERNEL_PARAM_PTR,
         get_cuda_runtime,
     )
+    from vibespatial.overlay.faces import _DUAL_FACE_QUEUE_MAX_WORKERS
     from vibespatial.overlay.gpu import _overlay_face_walk_kernels
 
     face_count = 65_536
@@ -672,7 +673,7 @@ def test_dual_queue_and_containment_launch_shapes_are_valid_above_65535_faces() 
     )
     queue_grid, queue_block = runtime.launch_config(
         kernels["propagate_dual_face_queue"],
-        face_count,
+        min(face_count, _DUAL_FACE_QUEUE_MAX_WORKERS),
     )
     assert queue_grid[0] > 1
     assert queue_grid[1:] == (1, 1)

@@ -5807,21 +5807,28 @@ def test_buffered_two_point_line_rewrite_has_bounded_device_grouped_union_shape(
     reducer_start = source.index("def _reduce_buffered_line_polygons_gpu(")
     reducer_end = source.index("\ndef ", reducer_start + 1)
     reducer_source = source[reducer_start:reducer_end]
-    assert reducer_source.count("_regroup_native_grouped_parts_with_grouped_union_gpu(") == 1
-    assert "while True:" in reducer_source
-    assert "if current.row_count <= 1:" in reducer_source
-    assert "d_partition_counts = cp.asarray([current.row_count]" in reducer_source
-    assert "_BUFFERED_LINE_GROUPED_UNION_FAN_IN" in reducer_source
-    assert "_BUFFERED_LINE_AGGREGATE_UNION_FAN_IN" in reducer_source
-    assert "output_row_count=group_count" in reducer_source
-    assert "group_size_max=current.row_count" not in reducer_source
+    assert reducer_source.count("single_group_polygon_collective_union_gpu(") == 1
+    assert "while True:" not in reducer_source
+    assert "if buffered.row_count <= 1:" in reducer_source
     assert "d_direction_partitions" in reducer_source
-    assert "d_partition_counts" in reducer_source
     assert "cp.flatnonzero(" not in reducer_source
     assert "_regroup_polygonal_parts_with_grouped_union_gpu(" not in source
     assert "except Exception" not in reducer_source
     assert "_tree_reduce_global" not in reducer_source
     assert "_gpu_union_group" not in source
+    assert "_BUFFERED_LINE_GROUPED_UNION_FAN_IN" not in source
+    assert "_BUFFERED_LINE_AGGREGATE_UNION_FAN_IN" not in source
+
+    from vibespatial.constructive import tiled_union as tiled_union_module
+
+    tiled_source = Path(tiled_union_module.__file__).read_text()
+    assert "_DIRECT_COLLECTIVE_SEGMENT_PEER_PRESSURE" in tiled_source
+    assert "_clip_topology_tile_page" in tiled_source
+    assert "_assemble_noded_polygon_coverage_split_events_gpu" in tiled_source
+    assert "right_geometry_source_rows=cp.zeros(tile_count" in tiled_source
+    assert "shapely" not in tiled_source
+    assert ".to_shapely(" not in tiled_source
+    assert ".get(" not in tiled_source
 
     grouped_start = source.index("def _maybe_execute_buffered_line_grouped_union_rewrite(")
     grouped_end = source.index("\ndef ", grouped_start + 1)

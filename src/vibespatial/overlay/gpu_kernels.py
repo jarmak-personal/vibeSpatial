@@ -989,12 +989,11 @@ initialize_dual_face_queue(
     const int start = face_offsets[face];
     const int degree = face_offsets[face + 1] - start;
     if (degree > 0) {
-      atomicAdd(pending, degree);
-      const int queue_start = atomicAdd(queue_tail, degree);
-      for (int local = 0; local < degree; ++local) {
-        queue[queue_start + local] = face_edge_ids[start + local];
-        queue_ready[queue_start + local] = 1;
-      }
+      atomicAdd(pending, 1);
+      const int slot = atomicAdd(queue_tail, 1);
+      queue[slot] = face;
+      __threadfence();
+      atomicExch(queue_ready + slot, 1);
     }
   }
 }
@@ -1017,10 +1016,10 @@ propagate_dual_face_queue(
     int face_count,
     int edge_count
 ) {
-  // Every face is claimed at most once and contributes each incidence once,
-  // so queue capacity is exactly edge_count.  ``pending`` counts published or
-  // actively processed incidences;
-  // it can reach zero only after the last producer has finished enqueueing.
+  // Exterior cycles seed one work item per connected component. Every face is
+  // claimed and queued at most once, then its complete CSR incidence span is
+  // consumed by one worker. ``pending`` includes published and active faces,
+  // so it reaches zero only after the final producer has published its child.
   while (atomicAdd(pending, 0) != 0) {
     const int head = atomicAdd(queue_head, 0);
     const int tail = atomicAdd(queue_tail, 0);
@@ -1030,12 +1029,7 @@ propagate_dual_face_queue(
     }
     while (atomicAdd(queue_ready + head, 0) == 0) __nanosleep(32);
     __threadfence();
-    const int edge = queue[head];
-    if (edge < 0 || edge >= edge_count) {
-      atomicSub(pending, 1);
-      continue;
-    }
-    const int face = edge_face_ids[edge];
+    const int face = queue[head];
     if (face < 0 || face >= face_count) {
       atomicSub(pending, 1);
       continue;
@@ -1043,30 +1037,26 @@ propagate_dual_face_queue(
     const int current_left = left_winding[face];
     const int current_right = right_winding[face];
     const int component = face_component[face];
-    const int neighbor = edge_face_ids[edge ^ 1];
-    if (neighbor >= 0 && neighbor < face_count) {
-      const int candidate_left = current_left - left_delta[edge];
-      const int candidate_right = current_right - right_delta[edge];
-      if (atomicCAS(left_winding + neighbor, (-2147483647 - 1), candidate_left)
-              == (-2147483647 - 1)) {
-        right_winding[neighbor] = candidate_right;
-        face_component[neighbor] = component;
-        const int neighbor_start = face_offsets[neighbor];
-        const int degree = face_offsets[neighbor + 1] - neighbor_start;
-        if (degree > 0) {
-          atomicAdd(pending, degree);
-          const int queue_start = atomicAdd(queue_tail, degree);
-          for (int local = 0; local < degree; ++local) {
-            const int slot = queue_start + local;
-            if (slot < edge_count) {
-              queue[slot] = face_edge_ids[neighbor_start + local];
-            }
-          }
+    const int start = face_offsets[face];
+    const int end = face_offsets[face + 1];
+    for (int pos = start; pos < end; ++pos) {
+      const int edge = face_edge_ids[pos];
+      if (edge < 0 || edge >= edge_count) continue;
+      const int neighbor = edge_face_ids[edge ^ 1];
+      if (neighbor >= 0 && neighbor < face_count) {
+        const int candidate_left = current_left - left_delta[edge];
+        const int candidate_right = current_right - right_delta[edge];
+        if (atomicCAS(
+                left_winding + neighbor,
+                (-2147483647 - 1),
+                candidate_left) == (-2147483647 - 1)) {
+          right_winding[neighbor] = candidate_right;
+          face_component[neighbor] = component;
+          atomicAdd(pending, 1);
+          const int slot = atomicAdd(queue_tail, 1);
+          if (slot < face_count) queue[slot] = neighbor;
           __threadfence();
-          for (int local = 0; local < degree; ++local) {
-            const int slot = queue_start + local;
-            if (slot < edge_count) atomicExch(queue_ready + slot, 1);
-          }
+          if (slot < face_count) atomicExch(queue_ready + slot, 1);
         }
       }
     }

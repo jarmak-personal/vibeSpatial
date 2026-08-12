@@ -271,16 +271,64 @@ def test_buffered_line_dissolve_gpu_result_is_valid() -> None:
 
     geopandas.clear_dispatch_events()
     dissolved = buffered.dissolve(by="group")
-    events = geopandas.get_dispatch_events(clear=True)
     dissolved_geom = np.asarray(dissolved.geometry.array, dtype=object)[0]
+    expected_geom = shapely.union_all(np.asarray(buffered.geometry.array, dtype=object))
+    events = geopandas.get_dispatch_events(clear=True)
 
     assert dissolved.geometry.dtype.name == "device_geometry"
     assert bool(shapely.is_valid(dissolved_geom))
+    assert shapely.area(
+        shapely.symmetric_difference(dissolved_geom, expected_geom)
+    ) == pytest.approx(0.0, abs=1.0e-8)
+    assert any(
+        event.surface == "vibespatial.constructive.collective_union"
+        and event.implementation == "gpu_single_group_collective_topology"
+        for event in events
+    )
     assert not any(
         event.surface == "constructive.disjoint_subset_union_all"
         and event.operation == "disjoint_subset_union_all"
         and event.implementation == "disjoint_subset_union_all_gpu"
         and event.selected.value == "gpu"
+        for event in events
+    )
+
+
+@pytest.mark.gpu
+def test_large_buffered_line_collective_union_uses_exact_tiled_topology() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.constructive.linestring import linestring_buffer_owned_array
+    from vibespatial.constructive.tiled_union import (
+        single_group_polygon_collective_union_gpu,
+    )
+    from vibespatial.runtime import ExecutionMode
+
+    lines = from_shapely_geometries(
+        _river_lines(500, seed=10),
+        residency=Residency.DEVICE,
+    )
+    buffered = linestring_buffer_owned_array(
+        lines,
+        10.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    expected = shapely.union_all(np.asarray(buffered.to_shapely(), dtype=object))
+
+    geopandas.clear_dispatch_events()
+    actual_owned = single_group_polygon_collective_union_gpu(buffered)
+    events = geopandas.get_dispatch_events(clear=True)
+    actual = actual_owned.to_shapely()[0]
+
+    assert bool(shapely.is_valid(actual))
+    assert shapely.area(shapely.symmetric_difference(actual, expected)) == pytest.approx(
+        0.0,
+        abs=1.0e-8,
+    )
+    assert any(
+        event.surface == "vibespatial.constructive.collective_union"
+        and event.implementation == "gpu_single_group_tiled_collective_topology"
         for event in events
     )
 

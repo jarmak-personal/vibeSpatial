@@ -12,6 +12,7 @@ from vibespatial.cuda._runtime import (
 )
 from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
 from vibespatial.spatial.segment_primitives import SegmentIntersectionResult
 
 from ._host_boundary import overlay_device_to_host
@@ -28,6 +29,14 @@ try:
     import cupy as cp
 except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
     cp = None
+
+
+_DUAL_FACE_QUEUE_MAX_WORKERS = 4096
+
+
+def _sync_hotpath(runtime) -> None:
+    if hotpath_trace_enabled():
+        runtime.synchronize()
 
 
 def _build_indexed_component_containment_device_state(
@@ -229,120 +238,129 @@ def _gpu_propagate_face_coverage(
 
     ptr = runtime.pointer
     sentinel = np.iinfo(np.int32).min
-    left_winding = cp.full(face_count, sentinel, dtype=cp.int32)
-    right_winding = cp.full(face_count, sentinel, dtype=cp.int32)
-    face_component = cp.full(face_count, -1, dtype=cp.int32)
-    queue = cp.empty(edge_count, dtype=cp.int32)
-    queue_head = cp.zeros(1, dtype=cp.int32)
-    queue_tail = cp.zeros(1, dtype=cp.int32)
-    queue_ready = cp.zeros(edge_count, dtype=cp.int32)
-    pending = cp.zeros(1, dtype=cp.int32)
+    with hotpath_stage("overlay.faces.coverage_scratch", category="setup"):
+        left_winding = cp.full(face_count, sentinel, dtype=cp.int32)
+        right_winding = cp.full(face_count, sentinel, dtype=cp.int32)
+        face_component = cp.full(face_count, -1, dtype=cp.int32)
+        queue = cp.empty(face_count, dtype=cp.int32)
+        queue_head = cp.zeros(1, dtype=cp.int32)
+        queue_tail = cp.zeros(1, dtype=cp.int32)
+        queue_ready = cp.zeros(face_count, dtype=cp.int32)
+        pending = cp.zeros(1, dtype=cp.int32)
     propagation_grid, propagation_block = runtime.launch_config(
         kernels["initialize_dual_face_queue"],
         face_count,
     )
-    runtime.launch(
-        kernels["initialize_dual_face_queue"],
-        grid=propagation_grid,
-        block=propagation_block,
-        params=(
-            (
-                ptr(cycle_orientation),
-                ptr(face_offsets),
-                ptr(face_edge_ids),
-                ptr(queue),
-                ptr(queue_tail),
-                ptr(queue_ready),
-                ptr(pending),
-                ptr(left_winding),
-                ptr(right_winding),
-                ptr(face_component),
-                face_count,
+    _sync_hotpath(runtime)
+    with hotpath_stage("overlay.faces.dual_winding", category="refine"):
+        runtime.launch(
+            kernels["initialize_dual_face_queue"],
+            grid=propagation_grid,
+            block=propagation_block,
+            params=(
+                (
+                    ptr(cycle_orientation),
+                    ptr(face_offsets),
+                    ptr(face_edge_ids),
+                    ptr(queue),
+                    ptr(queue_tail),
+                    ptr(queue_ready),
+                    ptr(pending),
+                    ptr(left_winding),
+                    ptr(right_winding),
+                    ptr(face_component),
+                    face_count,
+                ),
+                (KERNEL_PARAM_PTR,) * 10 + (KERNEL_PARAM_I32,),
             ),
-            (KERNEL_PARAM_PTR,) * 10 + (KERNEL_PARAM_I32,),
-        ),
-    )
-    queue_grid, queue_block = runtime.launch_config(
-        kernels["propagate_dual_face_queue"],
-        face_count,
-    )
-    runtime.launch(
-        kernels["propagate_dual_face_queue"],
-        grid=queue_grid,
-        block=queue_block,
-        params=(
-            (
-                ptr(face_offsets),
-                ptr(face_edge_ids),
-                ptr(edge_face_ids),
-                ptr(device.left_coverage_delta),
-                ptr(device.right_coverage_delta),
-                ptr(queue),
-                ptr(queue_head),
-                ptr(queue_tail),
-                ptr(queue_ready),
-                ptr(pending),
-                ptr(left_winding),
-                ptr(right_winding),
-                ptr(face_component),
-                face_count,
-                edge_count,
+        )
+        queue_grid, queue_block = runtime.launch_config(
+            kernels["propagate_dual_face_queue"],
+            min(face_count, _DUAL_FACE_QUEUE_MAX_WORKERS),
+        )
+        runtime.launch(
+            kernels["propagate_dual_face_queue"],
+            grid=queue_grid,
+            block=queue_block,
+            params=(
+                (
+                    ptr(face_offsets),
+                    ptr(face_edge_ids),
+                    ptr(edge_face_ids),
+                    ptr(device.left_coverage_delta),
+                    ptr(device.right_coverage_delta),
+                    ptr(queue),
+                    ptr(queue_head),
+                    ptr(queue_tail),
+                    ptr(queue_ready),
+                    ptr(pending),
+                    ptr(left_winding),
+                    ptr(right_winding),
+                    ptr(face_component),
+                    face_count,
+                    edge_count,
+                ),
+                (KERNEL_PARAM_PTR,) * 13 + (KERNEL_PARAM_I32, KERNEL_PARAM_I32),
             ),
-            (KERNEL_PARAM_PTR,) * 13 + (KERNEL_PARAM_I32, KERNEL_PARAM_I32),
-        ),
-    )
+        )
+        _sync_hotpath(runtime)
 
-    containment = _build_indexed_component_containment_device_state(
-        half_edge_graph,
-        face_offsets,
-        face_edge_ids,
-        cycle_orientation,
-        face_component,
-        face_count,
-        isolate_rows=isolate_rows,
-        left_winding=left_winding,
-        right_winding=right_winding,
-    )
+    with hotpath_stage("overlay.faces.component_containment", category="refine"):
+        containment = _build_indexed_component_containment_device_state(
+            half_edge_graph,
+            face_offsets,
+            face_edge_ids,
+            cycle_orientation,
+            face_component,
+            face_count,
+            isolate_rows=isolate_rows,
+            left_winding=left_winding,
+            right_winding=right_winding,
+        )
+        _sync_hotpath(runtime)
     left_baseline = containment.left_baseline
     right_baseline = containment.right_baseline
 
     left_covered = cp.empty(face_count, dtype=cp.int8)
     right_covered = cp.empty(face_count, dtype=cp.int8)
-    runtime.launch(
-        kernels["finalize_face_coverage"],
-        grid=propagation_grid,
-        block=propagation_block,
-        params=(
-            (
-                ptr(face_component),
-                ptr(left_baseline),
-                ptr(right_baseline),
-                ptr(left_winding),
-                ptr(right_winding),
-                ptr(left_covered),
-                ptr(right_covered),
-                face_count,
+    with hotpath_stage("overlay.faces.coverage_finalize", category="refine"):
+        runtime.launch(
+            kernels["finalize_face_coverage"],
+            grid=propagation_grid,
+            block=propagation_block,
+            params=(
+                (
+                    ptr(face_component),
+                    ptr(left_baseline),
+                    ptr(right_baseline),
+                    ptr(left_winding),
+                    ptr(right_winding),
+                    ptr(left_covered),
+                    ptr(right_covered),
+                    face_count,
+                ),
+                (KERNEL_PARAM_PTR,) * 7 + (KERNEL_PARAM_I32,),
             ),
-            (KERNEL_PARAM_PTR,) * 7 + (KERNEL_PARAM_I32,),
-        ),
-    )
-    get_cuda_completion_retainer().defer(
-        cp.cuda.get_current_stream(),
-        (
-            queue,
-            queue_head,
-            queue_tail,
-            queue_ready,
-            pending,
-            left_winding,
-            right_winding,
-            face_component,
-            containment,
-            left_baseline,
-            right_baseline,
-        ),
-        lambda _owners: None,
-    )
+        )
+        _sync_hotpath(runtime)
+    with hotpath_stage("overlay.faces.coverage_retention", category="setup"):
+        get_cuda_completion_retainer().defer(
+            cp.cuda.get_current_stream(),
+            (
+                queue,
+                queue_head,
+                queue_tail,
+                queue_ready,
+                pending,
+                left_winding,
+                right_winding,
+                face_component,
+                containment,
+                left_baseline,
+                right_baseline,
+            ),
+            lambda _owners: None,
+        )
     return left_covered, right_covered
 
 
@@ -516,7 +534,10 @@ def build_gpu_overlay_faces(
             ),
         )
 
-    face_walk_result = _gpu_face_walk(half_edge_graph)
+    _sync_hotpath(runtime)
+    with hotpath_stage("overlay.faces.face_walk", category="refine"):
+        face_walk_result = _gpu_face_walk(half_edge_graph)
+    _sync_hotpath(runtime)
     (
         face_offsets,
         face_edge_ids,

@@ -3233,8 +3233,6 @@ def _repair_grouped_union_owned_if_needed(
     )
 
 
-_BUFFERED_LINE_GROUPED_UNION_FAN_IN = 32
-_BUFFERED_LINE_AGGREGATE_UNION_FAN_IN = 2
 _BUFFERED_LINE_DIRECTION_PARTITIONS = 16
 
 
@@ -3243,108 +3241,21 @@ def _reduce_buffered_line_polygons_gpu(
     *,
     d_direction_partitions: Any | None = None,
 ) -> OwnedGeometryArray:
-    """Reduce line buffers through bounded exact grouped-union levels.
-
-    A buffered network is one logical output group, but making an entire
-    direction partition one physical segment-classification row creates a
-    quadratic candidate relation. Preserve direction partitions as locality
-    boundaries while reducing each through bounded fan-in levels. Unary union
-    is associative, so the hierarchy preserves public dissolve topology.
-    """
+    """Reduce line buffers through one exact collective topology carrier."""
     if buffered.row_count <= 1:
         return buffered
 
     if cp is None or buffered.device_state is None:
         raise RuntimeError("buffered-line grouped union requires a device-resident polygon carrier")
 
-    from vibespatial.constructive.binary_constructive import (
-        _regroup_native_grouped_parts_with_grouped_union_gpu,
+    from vibespatial.constructive.tiled_union import (
+        single_group_polygon_collective_union_gpu,
     )
-
-    current = buffered
-    if d_direction_partitions is None:
-        d_partition_counts = cp.asarray([current.row_count], dtype=cp.int64)
-    else:
+    if d_direction_partitions is not None:
         d_direction_partitions = cp.asarray(d_direction_partitions, dtype=cp.int32)
-        if int(d_direction_partitions.size) != current.row_count:
+        if int(d_direction_partitions.size) != buffered.row_count:
             raise ValueError("buffered-line direction partitions must match row count")
-        d_partition_counts = cp.bincount(
-            d_direction_partitions,
-            minlength=_BUFFERED_LINE_DIRECTION_PARTITIONS,
-        ).astype(cp.int64, copy=False)
-        d_partition_counts = d_partition_counts[d_partition_counts > 0]
-
-    reduction_level = 0
-    while True:
-        max_partition_span = overlay_int_scalar(
-            cp.max(d_partition_counts),
-            reason="buffered-line grouped union partition-span planning fence",
-        )
-        if max_partition_span <= 1:
-            if current.row_count <= 1:
-                break
-            # Direction partitions are locality boundaries for leaf work, not
-            # permission to combine every large partition result in one final
-            # topology row.  Continue through the same bounded aggregate tree.
-            d_partition_counts = cp.asarray([current.row_count], dtype=cp.int64)
-            continue
-        row_count = int(current.row_count)
-        direct_buffer_level = reduction_level == 0
-        fan_in = (
-            _BUFFERED_LINE_GROUPED_UNION_FAN_IN
-            if direct_buffer_level
-            else _BUFFERED_LINE_AGGREGATE_UNION_FAN_IN
-        )
-        d_partition_offsets = cp.empty(d_partition_counts.size + 1, dtype=cp.int64)
-        d_partition_offsets[0] = 0
-        cp.cumsum(d_partition_counts, out=d_partition_offsets[1:])
-        d_chunk_counts = (
-            d_partition_counts + fan_in - 1
-        ) // fan_in
-        d_chunk_offsets = cp.empty(d_chunk_counts.size + 1, dtype=cp.int64)
-        d_chunk_offsets[0] = 0
-        cp.cumsum(d_chunk_counts, out=d_chunk_offsets[1:])
-        group_count = overlay_int_scalar(
-            d_chunk_offsets[-1],
-            reason="buffered-line grouped union output-count planning fence",
-        )
-        d_positions = cp.arange(row_count, dtype=cp.int64)
-        d_partition_ids = cp.searchsorted(
-            d_partition_offsets[1:],
-            d_positions,
-            side="right",
-        ).astype(cp.int64, copy=False)
-        d_local_positions = d_positions - d_partition_offsets[d_partition_ids]
-        d_group_codes = (
-            d_chunk_offsets[d_partition_ids]
-            + d_local_positions // fan_in
-        ).astype(cp.int32, copy=False)
-        d_group_counts = cp.bincount(
-            d_group_codes,
-            minlength=group_count,
-        ).astype(cp.int64, copy=False)
-        d_group_offsets = cp.empty(group_count + 1, dtype=cp.int64)
-        d_group_offsets[0] = 0
-        cp.cumsum(d_group_counts, out=d_group_offsets[1:])
-        grouped = _regroup_native_grouped_parts_with_grouped_union_gpu(
-            current,
-            cp.arange(row_count, dtype=cp.int64),
-            d_group_offsets,
-            cp.arange(group_count, dtype=cp.int64),
-            output_row_count=group_count,
-            dispatch_mode=ExecutionMode.GPU,
-            allow_direct_disjoint_pack=False,
-            use_same_row_fast_path=True,
-            group_size_max=min(fan_in, row_count),
-        )
-        if grouped is None or grouped.row_count != group_count:
-            raise RuntimeError(
-                "buffered-line grouped union level did not produce its admitted output rows"
-            )
-        current = grouped
-        d_partition_counts = d_chunk_counts
-        reduction_level += 1
-    return current
+    return single_group_polygon_collective_union_gpu(buffered)
 
 
 def _rectangle_bounds(values: np.ndarray) -> np.ndarray | None:

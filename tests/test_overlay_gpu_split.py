@@ -63,6 +63,36 @@ def test_row_isolated_topology_page_shape_accounts_for_same_side_events() -> Non
     assert shape.single_row_oversized
 
 
+def test_live_split_event_budget_tracks_free_memory_and_safety_ceiling(
+    monkeypatch,
+) -> None:
+    import importlib
+
+    gpu = importlib.import_module("vibespatial.overlay.gpu")
+
+    class _Runtime:
+        @staticmethod
+        def memory_pool_stats():
+            return {"free_bytes": 5 * gpu._BYTES_PER_LIVE_SPLIT_EVENT * 1_000_000}
+
+    monkeypatch.setattr(gpu, "get_cuda_runtime", lambda: _Runtime())
+    assert gpu._compute_live_split_event_budget() == 1_000_000
+
+    class _LargeRuntime:
+        @staticmethod
+        def memory_pool_stats():
+            return {
+                "free_bytes": (
+                    10
+                    * gpu._BYTES_PER_LIVE_SPLIT_EVENT
+                    * gpu._MAX_LIVE_SPLIT_EVENT_BUDGET
+                )
+            }
+
+    monkeypatch.setattr(gpu, "get_cuda_runtime", lambda: _LargeRuntime())
+    assert gpu._compute_live_split_event_budget() == gpu._MAX_LIVE_SPLIT_EVENT_BUDGET
+
+
 def test_paged_overlay_plan_keeps_page_boundaries_algebraic() -> None:
     plan = PagedOverlayExecutionPlan(
         left=object(),
