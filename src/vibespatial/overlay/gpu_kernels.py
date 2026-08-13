@@ -1064,6 +1064,97 @@ propagate_dual_face_queue(
   }
 }
 
+// Warp-cooperative dual propagation. One warp owns each dequeued face and
+// scans its complete CSR incidence span lane-stride. This preserves the
+// claim-once queue semantics while matching work to half-edge incidence
+// rather than serializing every face span through one thread.
+extern "C" __global__ void __launch_bounds__(256, 4)
+propagate_dual_face_queue_warp(
+    const int* __restrict__ face_offsets,
+    const int* __restrict__ face_edge_ids,
+    const int* __restrict__ edge_face_ids,
+    const int* __restrict__ left_delta,
+    const int* __restrict__ right_delta,
+    int* __restrict__ queue,
+    int* __restrict__ queue_head,
+    int* __restrict__ queue_tail,
+    int* __restrict__ queue_ready,
+    int* __restrict__ pending,
+    int* __restrict__ left_winding,
+    int* __restrict__ right_winding,
+    int* __restrict__ face_component,
+    int face_count,
+    int edge_count,
+    int worker_warps
+) {
+  const int global_thread = blockIdx.x * blockDim.x + threadIdx.x;
+  const int worker = global_thread >> 5;
+  const int lane = threadIdx.x & 31;
+  if (worker >= worker_warps) return;
+  const unsigned int mask = 0xFFFFFFFFu;
+
+  while (true) {
+    int work_pending = 0;
+    int claimed_head = -1;
+    if (lane == 0) {
+      work_pending = atomicAdd(pending, 0);
+      if (work_pending != 0) {
+        const int head = atomicAdd(queue_head, 0);
+        const int tail = atomicAdd(queue_tail, 0);
+        if (head < tail && atomicCAS(queue_head, head, head + 1) == head) {
+          claimed_head = head;
+        }
+      }
+    }
+    work_pending = __shfl_sync(mask, work_pending, 0);
+    claimed_head = __shfl_sync(mask, claimed_head, 0);
+    if (work_pending == 0) return;
+    if (claimed_head < 0) {
+      if (lane == 0) __nanosleep(64);
+      continue;
+    }
+
+    if (lane == 0) {
+      while (atomicAdd(queue_ready + claimed_head, 0) == 0) __nanosleep(32);
+      __threadfence();
+    }
+    __syncwarp(mask);
+    const int face = queue[claimed_head];
+    if (face < 0 || face >= face_count) {
+      if (lane == 0) atomicSub(pending, 1);
+      continue;
+    }
+
+    const int current_left = left_winding[face];
+    const int current_right = right_winding[face];
+    const int component = face_component[face];
+    const int start = face_offsets[face];
+    const int end = face_offsets[face + 1];
+    for (int pos = start + lane; pos < end; pos += 32) {
+      const int edge = face_edge_ids[pos];
+      if (edge < 0 || edge >= edge_count) continue;
+      const int neighbor = edge_face_ids[edge ^ 1];
+      if (neighbor < 0 || neighbor >= face_count) continue;
+      const int candidate_left = current_left - left_delta[edge];
+      const int candidate_right = current_right - right_delta[edge];
+      if (atomicCAS(
+              left_winding + neighbor,
+              (-2147483647 - 1),
+              candidate_left) == (-2147483647 - 1)) {
+        right_winding[neighbor] = candidate_right;
+        face_component[neighbor] = component;
+        atomicAdd(pending, 1);
+        const int slot = atomicAdd(queue_tail, 1);
+        if (slot < face_count) queue[slot] = neighbor;
+        __threadfence();
+        if (slot < face_count) atomicExch(queue_ready + slot, 1);
+      }
+    }
+    __syncwarp(mask);
+    if (lane == 0) atomicSub(pending, 1);
+  }
+}
+
 __device__ __forceinline__ bool exact_cycle_contains_vertex(
     double px, double py,
     const double* __restrict__ src_x,
@@ -1237,6 +1328,200 @@ reduce_indexed_component_containment(
   }
 }
 
+// Adapt containment scheduling to the physical root density without a host
+// count fence. A lone active root in an eight-root block receives all 256
+// lanes and a depth-eight tree split. Multi-root blocks map one warp per root,
+// which keeps many independent shallow components resident together.
+extern "C" __global__ void __launch_bounds__(256, 4)
+reduce_indexed_component_containment_adaptive(
+    const int* __restrict__ root_faces,
+    const int* __restrict__ candidate_faces,
+    const double* __restrict__ interval_max_x,
+    const int* __restrict__ face_offsets,
+    const int* __restrict__ face_edge_ids,
+    const double* __restrict__ face_bounds,
+    const double* __restrict__ src_x,
+    const double* __restrict__ src_y,
+    const int* __restrict__ source_rows,
+    const int* __restrict__ face_component,
+    const int* __restrict__ left_winding,
+    const int* __restrict__ right_winding,
+    int* __restrict__ out_left_baseline,
+    int* __restrict__ out_right_baseline,
+    int* __restrict__ out_depth,
+    int face_capacity,
+    int leaf_count,
+    int isolate_rows,
+    int reduce_winding
+) {
+  const int tid = threadIdx.x;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int root_pos = blockIdx.x * 8 + warp;
+  __shared__ int sh_roots[8];
+  __shared__ int sh_active_root_count;
+  __shared__ int sh_single_root;
+  __shared__ int sh_upper[8];
+  __shared__ int sh_left[256];
+  __shared__ int sh_right[256];
+  __shared__ int sh_depth[256];
+  if (lane == 0) {
+    sh_roots[warp] = root_pos < face_capacity ? root_faces[root_pos] : -1;
+  }
+  if (tid == 0) {
+    sh_active_root_count = 0;
+    sh_single_root = -1;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    for (int root_slot = 0; root_slot < 8; ++root_slot) {
+      if (sh_roots[root_slot] >= 0) {
+        ++sh_active_root_count;
+        sh_single_root = sh_roots[root_slot];
+      }
+    }
+  }
+  __syncthreads();
+
+  if (sh_active_root_count == 1) {
+    const int root_face = sh_single_root;
+    const int root_edge = face_edge_ids[face_offsets[root_face]];
+    const int root_twin = root_edge ^ 1;
+    const double root_x = src_x[root_edge];
+    const double root_y = src_y[root_edge];
+    const double px = root_x + (src_x[root_twin] - root_x) * 0.5;
+    const double py = root_y + (src_y[root_twin] - root_y) * 0.5;
+    if (tid == 0) {
+      sh_upper[0] = face_bounds_prefix_upper_bound(
+          px, candidate_faces, face_bounds, face_capacity);
+    }
+    __syncthreads();
+
+    const int tree_depth = 31 - __clz(leaf_count);
+    const int split_depth = tree_depth < 8 ? tree_depth : 8;
+    const int split_width = 1 << split_depth;
+    int stack[24];
+    int stack_size = 0;
+    if (tid < split_width) stack[stack_size++] = split_width + tid;
+    int local_left = 0;
+    int local_right = 0;
+    int local_depth = 0;
+    while (stack_size > 0) {
+      const int node = stack[--stack_size];
+      const int depth = 31 - __clz(node);
+      const int level_start = 1 << depth;
+      const int span = leaf_count >> depth;
+      const int left = (node - level_start) * span;
+      if (left >= sh_upper[0] || interval_max_x[node] < px) continue;
+      if (node >= leaf_count) {
+        const int candidate_pos = node - leaf_count;
+        if (candidate_pos < sh_upper[0] && candidate_pos < face_capacity) {
+          const int candidate = candidate_faces[candidate_pos];
+          if (candidate >= 0 && indexed_containment_bounds_match(
+                  root_face, candidate, px, py, face_offsets, face_edge_ids,
+                  face_bounds, source_rows, face_component, isolate_rows) &&
+              exact_cycle_contains_vertex(
+                  px, py, src_x, src_y, face_edge_ids,
+                  face_offsets[candidate], face_offsets[candidate + 1])) {
+            ++local_depth;
+            if (reduce_winding != 0) {
+              local_left += left_winding[candidate];
+              local_right += right_winding[candidate];
+            }
+          }
+        }
+        continue;
+      }
+      stack[stack_size++] = node * 2 + 1;
+      stack[stack_size++] = node * 2;
+    }
+    sh_left[tid] = local_left;
+    sh_right[tid] = local_right;
+    sh_depth[tid] = local_depth;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        sh_left[tid] += sh_left[tid + stride];
+        sh_right[tid] += sh_right[tid + stride];
+        sh_depth[tid] += sh_depth[tid + stride];
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      out_left_baseline[root_face] = sh_left[0];
+      out_right_baseline[root_face] = sh_right[0];
+      out_depth[root_face] = sh_depth[0];
+    }
+    return;
+  }
+
+  const int root_face = sh_roots[warp];
+  if (root_face < 0) return;
+  const int root_edge = face_edge_ids[face_offsets[root_face]];
+  const int root_twin = root_edge ^ 1;
+  const double root_x = src_x[root_edge];
+  const double root_y = src_y[root_edge];
+  const double px = root_x + (src_x[root_twin] - root_x) * 0.5;
+  const double py = root_y + (src_y[root_twin] - root_y) * 0.5;
+  if (lane == 0) {
+    sh_upper[warp] = face_bounds_prefix_upper_bound(
+        px, candidate_faces, face_bounds, face_capacity);
+  }
+  __syncwarp();
+
+  const int upper = sh_upper[warp];
+  const int tree_depth = 31 - __clz(leaf_count);
+  const int split_depth = tree_depth < 5 ? tree_depth : 5;
+  const int split_width = 1 << split_depth;
+  int stack[32];
+  int stack_size = 0;
+  if (lane < split_width) stack[stack_size++] = split_width + lane;
+  int local_left = 0;
+  int local_right = 0;
+  int local_depth = 0;
+  while (stack_size > 0) {
+    const int node = stack[--stack_size];
+    const int depth = 31 - __clz(node);
+    const int level_start = 1 << depth;
+    const int span = leaf_count >> depth;
+    const int left = (node - level_start) * span;
+    if (left >= upper || interval_max_x[node] < px) continue;
+    if (node >= leaf_count) {
+      const int candidate_pos = node - leaf_count;
+      if (candidate_pos < upper && candidate_pos < face_capacity) {
+        const int candidate = candidate_faces[candidate_pos];
+        if (candidate >= 0 && indexed_containment_bounds_match(
+                root_face, candidate, px, py, face_offsets, face_edge_ids,
+                face_bounds, source_rows, face_component, isolate_rows) &&
+            exact_cycle_contains_vertex(
+                px, py, src_x, src_y, face_edge_ids,
+                face_offsets[candidate], face_offsets[candidate + 1])) {
+          ++local_depth;
+          if (reduce_winding != 0) {
+            local_left += left_winding[candidate];
+            local_right += right_winding[candidate];
+          }
+        }
+      }
+      continue;
+    }
+    stack[stack_size++] = node * 2 + 1;
+    stack[stack_size++] = node * 2;
+  }
+
+  const unsigned int mask = 0xFFFFFFFFu;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_left += __shfl_down_sync(mask, local_left, offset);
+    local_right += __shfl_down_sync(mask, local_right, offset);
+    local_depth += __shfl_down_sync(mask, local_depth, offset);
+  }
+  if (lane == 0) {
+    out_left_baseline[root_face] = local_left;
+    out_right_baseline[root_face] = local_right;
+    out_depth[root_face] = local_depth;
+  }
+}
+
 // A second indexed pass selects the structurally immediate containing face.
 // Component depth, not fp64 area ordering, defines parenthood.
 extern "C" __global__ void __launch_bounds__(256, 2)
@@ -1371,7 +1656,9 @@ _OVERLAY_FACE_WALK_KERNEL_NAMES = (
     "compute_face_bounds",
     "initialize_dual_face_queue",
     "propagate_dual_face_queue",
+    "propagate_dual_face_queue_warp",
     "reduce_indexed_component_containment",
+    "reduce_indexed_component_containment_adaptive",
     "select_indexed_component_containment_parent",
     "finalize_face_coverage",
 )

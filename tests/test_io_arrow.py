@@ -4095,6 +4095,81 @@ def test_partitioned_native_device_wkb_writer_batches_ordered_owned_parts(
     not has_gpu_runtime() or not has_pylibcudf_support(),
     reason="GPU GeoParquet writer unavailable",
 )
+def test_native_wkb_writer_prunes_null_capacity_carriers(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import cupy as cp
+
+    from vibespatial.api._native_result_core import (
+        GeometryNativeResult,
+        NativeGeometryComposition,
+        NativeGeometryCompositionPart,
+    )
+    from vibespatial.geometry.owned import build_null_owned_array
+
+    geometries = [box(float(index), 0.0, float(index + 1), 1.0) for index in range(5)]
+    first = from_shapely_geometries(geometries[:3], residency=Residency.DEVICE)
+    second = from_shapely_geometries(geometries[3:], residency=Residency.DEVICE)
+    null_lines = build_null_owned_array(5, residency=Residency.DEVICE)
+    null_points = build_null_owned_array(5, residency=Residency.DEVICE)
+    d_rows = cp.arange(5, dtype=cp.int64)
+    composition = NativeGeometryComposition(
+        parts=(
+            NativeGeometryCompositionPart(
+                GeometryNativeResult.from_owned(first, crs="EPSG:4326"),
+                d_rows[:3],
+            ),
+            NativeGeometryCompositionPart(
+                GeometryNativeResult.from_owned(second, crs="EPSG:4326"),
+                d_rows[3:],
+            ),
+            NativeGeometryCompositionPart(
+                GeometryNativeResult.from_owned(null_lines, crs="EPSG:4326"),
+                d_rows,
+            ),
+            NativeGeometryCompositionPart(
+                GeometryNativeResult.from_owned(null_points, crs="EPSG:4326"),
+                d_rows,
+            ),
+        ),
+        row_count=5,
+        crs="EPSG:4326",
+    )
+    geometry = GeometryNativeResult.from_composition(
+        composition,
+        crs="EPSG:4326",
+    )
+    assert len(composition.parts) == 2
+    assert not composition.trusted_singular_rows
+
+    payload = NativeTabularResult(
+        attributes=NativeAttributeTable(
+            dataframe=pd.DataFrame({"parcel_id": np.arange(5, dtype=np.int64)})
+        ),
+        geometry=geometry,
+        geometry_name="geometry",
+        column_order=("parcel_id", "geometry"),
+    )
+    path = tmp_path / "native-null-capacity-carriers.parquet"
+    monkeypatch.setattr(io_wkb, "_NATIVE_DEVICE_PARQUET_CHUNK_ROWS", 2)
+
+    payload.to_parquet(path, geometry_encoding="WKB")
+
+    assert composition.trusted_singular_rows
+    assert composition.contiguous_row_partitions
+    result = geopandas.read_parquet(path)
+    assert result["parcel_id"].tolist() == list(range(5))
+    assert all(
+        actual.equals(expected)
+        for actual, expected in zip(result.geometry, geometries, strict=True)
+    )
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU GeoParquet writer unavailable",
+)
 def test_interleaved_native_wkb_composition_uses_one_allocation_packet(
     monkeypatch,
     tmp_path,

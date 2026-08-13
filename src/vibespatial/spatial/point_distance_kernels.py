@@ -82,14 +82,12 @@ extern "C" __device__ inline bool point_inside_polygon(
       const compute_t ax = CX(x[c - 1]), ay = CY(y[c - 1]);
       const compute_t bx = CX(x[c]),     by = CY(y[c]);
       const compute_t cross_val = ((px - ax) * (by - ay)) - ((py - ay) * (bx - ax));
-      const compute_t scale = (bx > ax ? bx - ax : ax - bx) + (by > ay ? by - ay : ay - by) + (compute_t)1.0;
-      if ((cross_val > (compute_t)0.0 ? cross_val : -cross_val) <= ((compute_t)1e-7 * scale)) {{
+      if (cross_val == (compute_t)0.0) {{
         const compute_t minx = ax < bx ? ax : bx;
         const compute_t maxx = ax > bx ? ax : bx;
         const compute_t miny = ay < by ? ay : by;
         const compute_t maxy = ay > by ? ay : by;
-        if (px >= (minx - (compute_t)1e-7) && px <= (maxx + (compute_t)1e-7) &&
-            py >= (miny - (compute_t)1e-7) && py <= (maxy + (compute_t)1e-7)) {{
+        if (px >= minx && px <= maxx && py >= miny && py <= maxy) {{
           return true;
         }}
       }}
@@ -127,12 +125,13 @@ extern "C" __global__ __launch_bounds__(256, 4) void point_linestring_distance_f
     const int*           __restrict__ right_idx,
     double*              __restrict__ out_distances,
     int                  exclusive,
-    int                  pair_count,
-    double               center_x,
-    double               center_y
+    const long long*     __restrict__ logical_count,
+    int                  pair_capacity,
+    const double*        __restrict__ center
 ) {{
+  const double center_x = center[0], center_y = center[1];
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= pair_count) return;
+  if (i >= pair_capacity || (logical_count != 0 && i >= logical_count[0])) return;
 
   const int li = left_idx[i];
   const int ri = right_idx[i];
@@ -189,12 +188,13 @@ extern "C" __global__ __launch_bounds__(256, 4) void point_multilinestring_dista
     const int*           __restrict__ right_idx,
     double*              __restrict__ out_distances,
     int                  exclusive,
-    int                  pair_count,
-    double               center_x,
-    double               center_y
+    const long long*     __restrict__ logical_count,
+    int                  pair_capacity,
+    const double*        __restrict__ center
 ) {{
+  const double center_x = center[0], center_y = center[1];
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= pair_count) return;
+  if (i >= pair_capacity || (logical_count != 0 && i >= logical_count[0])) return;
 
   const int li = left_idx[i];
   const int ri = right_idx[i];
@@ -257,12 +257,13 @@ extern "C" __global__ __launch_bounds__(256, 4) void point_polygon_distance_from
     const int*           __restrict__ right_idx,
     double*              __restrict__ out_distances,
     int                  exclusive,
-    int                  pair_count,
-    double               center_x,
-    double               center_y
+    const long long*     __restrict__ logical_count,
+    int                  pair_capacity,
+    const double*        __restrict__ center
 ) {{
+  const double center_x = center[0], center_y = center[1];
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= pair_count) return;
+  if (i >= pair_capacity || (logical_count != 0 && i >= logical_count[0])) return;
 
   const int li = left_idx[i];
   const int ri = right_idx[i];
@@ -331,12 +332,13 @@ extern "C" __global__ __launch_bounds__(256, 4) void point_multipolygon_distance
     const int*           __restrict__ right_idx,
     double*              __restrict__ out_distances,
     int                  exclusive,
-    int                  pair_count,
-    double               center_x,
-    double               center_y
+    const long long*     __restrict__ logical_count,
+    int                  pair_capacity,
+    const double*        __restrict__ center
 ) {{
+  const double center_x = center[0], center_y = center[1];
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= pair_count) return;
+  if (i >= pair_capacity || (logical_count != 0 && i >= logical_count[0])) return;
 
   const int li = left_idx[i];
   const int ri = right_idx[i];
@@ -381,14 +383,12 @@ extern "C" __global__ __launch_bounds__(256, 4) void point_multipolygon_distance
         const compute_t ax = CX(tree_x[c - 1]), ay = CY(tree_y[c - 1]);
         const compute_t bx = CX(tree_x[c]),     by = CY(tree_y[c]);
         const compute_t cross_val = ((px - ax) * (by - ay)) - ((py - ay) * (bx - ax));
-        const compute_t scale = (bx > ax ? bx - ax : ax - bx) + (by > ay ? by - ay : ay - by) + (compute_t)1.0;
-        if ((cross_val > (compute_t)0.0 ? cross_val : -cross_val) <= ((compute_t)1e-7 * scale)) {{
+        if (cross_val == (compute_t)0.0) {{
           const compute_t minx = ax < bx ? ax : bx;
           const compute_t maxx = ax > bx ? ax : bx;
           const compute_t miny = ay < by ? ay : by;
           const compute_t maxy = ay > by ? ay : by;
-          if (px >= (minx - (compute_t)1e-7) && px <= (maxx + (compute_t)1e-7) &&
-              py >= (miny - (compute_t)1e-7) && py <= (maxy + (compute_t)1e-7)) {{
+          if (px >= minx && px <= maxx && py >= miny && py <= maxy) {{
             on_boundary = true;
           }}
         }}
@@ -408,6 +408,162 @@ extern "C" __global__ __launch_bounds__(256, 4) void point_multipolygon_distance
   }}
   out_distances[i] = (double)sqrt((double)best);
 }}
+
+extern "C" __device__ inline bool point_inside_ring_span(
+    compute_t px, compute_t py,
+    const double* __restrict__ x, const double* __restrict__ y,
+    const int* __restrict__ ring_offsets,
+    int ring_start, int ring_end,
+    double center_x, double center_y
+) {{
+  bool inside = false;
+  for (int ring = ring_start; ring < ring_end; ++ring) {{
+    const int cs = ring_offsets[ring], ce = ring_offsets[ring + 1];
+    bool ring_inside = false;
+    for (int c = cs + 1; c < ce; ++c) {{
+      const compute_t ax = CX(x[c - 1]), ay = CY(y[c - 1]);
+      const compute_t bx = CX(x[c]), by = CY(y[c]);
+      const compute_t cross = (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+      if (cross == (compute_t)0.0) {{
+        const compute_t minx = ax < bx ? ax : bx, maxx = ax > bx ? ax : bx;
+        const compute_t miny = ay < by ? ay : by, maxy = ay > by ? ay : by;
+        if (px >= minx && px <= maxx && py >= miny && py <= maxy) return true;
+      }}
+      if (((ay > py) != (by > py)) &&
+          px <= ((bx - ax) * (py - ay)) / (by - ay) + ax) ring_inside = !ring_inside;
+    }}
+    if (ring_inside) inside = !inside;
+  }}
+  return inside;
+}}
+
+extern "C" __device__ inline compute_t point_family_sq_distance(
+    compute_t px, compute_t py,
+    const int* __restrict__ geometry_offsets,
+    const int* __restrict__ part_offsets,
+    const int* __restrict__ ring_offsets,
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    int row, int target_kind,
+    double center_x, double center_y
+) {{
+  compute_t best = (compute_t)INFINITY;
+  if (target_kind <= 1) {{
+    const int cs = geometry_offsets[row], ce = geometry_offsets[row + 1];
+    for (int c = cs; c < ce; ++c) {{
+      const compute_t dx = px - CX(x[c]), dy = py - CY(y[c]);
+      const compute_t sq = dx * dx + dy * dy;
+      if (sq < best) best = sq;
+    }}
+    return best;
+  }}
+  if (target_kind == 2) {{
+    return point_coords_min_sq_distance(
+        px, py, x, y, center_x, center_y,
+        geometry_offsets[row], geometry_offsets[row + 1]);
+  }}
+  if (target_kind == 3) {{
+    for (int part = geometry_offsets[row]; part < geometry_offsets[row + 1]; ++part) {{
+      const compute_t sq = point_coords_min_sq_distance(
+          px, py, x, y, center_x, center_y, part_offsets[part], part_offsets[part + 1]);
+      if (sq < best) best = sq;
+      if (best <= (compute_t)0.0) return best;
+    }}
+    return best;
+  }}
+  if (target_kind == 4) {{
+    if (point_inside_polygon(
+            px, py, x, y, center_x, center_y, geometry_offsets, ring_offsets, row))
+      return (compute_t)0.0;
+    for (int ring = geometry_offsets[row]; ring < geometry_offsets[row + 1]; ++ring) {{
+      const compute_t sq = point_coords_min_sq_distance(
+          px, py, x, y, center_x, center_y, ring_offsets[ring], ring_offsets[ring + 1]);
+      if (sq < best) best = sq;
+      if (best <= (compute_t)0.0) return best;
+    }}
+    return best;
+  }}
+  for (int polygon = geometry_offsets[row]; polygon < geometry_offsets[row + 1]; ++polygon) {{
+    const int ring_start = part_offsets[polygon], ring_end = part_offsets[polygon + 1];
+    if (point_inside_ring_span(
+            px, py, x, y, ring_offsets, ring_start, ring_end, center_x, center_y))
+      return (compute_t)0.0;
+    for (int ring = ring_start; ring < ring_end; ++ring) {{
+      const compute_t sq = point_coords_min_sq_distance(
+          px, py, x, y, center_x, center_y, ring_offsets[ring], ring_offsets[ring + 1]);
+      if (sq < best) best = sq;
+      if (best <= (compute_t)0.0) return best;
+    }}
+  }}
+  return best;
+}}
+
+// One family span from a shared NativeRelationFamilyPartition.  Point and
+// multipoint rows are both coordinate ranges, so no host-side expansion is
+// needed; each thread reduces one relation pair directly.
+extern "C" __global__ __launch_bounds__(256, 4) void pointset_family_distance_from_owned(
+    const unsigned char* __restrict__ query_validity,
+    const signed char* __restrict__ query_tags,
+    const int* __restrict__ query_family_row_offsets,
+    const int* __restrict__ query_geometry_offsets,
+    const unsigned char* __restrict__ query_empty_mask,
+    const double* __restrict__ query_x,
+    const double* __restrict__ query_y,
+    int query_tag,
+    const unsigned char* __restrict__ tree_validity,
+    const signed char* __restrict__ tree_tags,
+    const int* __restrict__ tree_family_row_offsets,
+    const int* __restrict__ tree_geometry_offsets,
+    const int* __restrict__ tree_part_offsets,
+    const int* __restrict__ tree_ring_offsets,
+    const unsigned char* __restrict__ tree_empty_mask,
+    const double* __restrict__ tree_x,
+    const double* __restrict__ tree_y,
+    int tree_tag,
+    int target_kind,
+    const int* __restrict__ left_idx,
+    const int* __restrict__ right_idx,
+    const int* __restrict__ source_positions,
+    const long long* __restrict__ source_offset,
+    const long long* __restrict__ logical_count,
+    double* __restrict__ out_distances,
+    int exclusive,
+    int launch_capacity,
+    const double* __restrict__ center
+) {{
+  const double center_x = center[0], center_y = center[1];
+  const long long offset = source_offset == 0 ? 0 : source_offset[0];
+  const long long count = logical_count == 0 ? (long long)launch_capacity : logical_count[0];
+  const long long stride = (long long)blockDim.x * gridDim.x;
+  for (long long lane = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+       lane < count; lane += stride) {{
+    const long long pair = offset + lane;
+    const int out_pos = source_positions == 0 ? (int)pair : source_positions[pair];
+    const int li = left_idx[pair], ri = right_idx[pair];
+    if ((exclusive && li == ri) || !query_validity[li] || !tree_validity[ri] ||
+        query_tags[li] != query_tag || tree_tags[ri] != tree_tag) {{
+      out_distances[out_pos] = INFINITY;
+      continue;
+    }}
+    const int qrow = query_family_row_offsets[li];
+    const int trow = tree_family_row_offsets[ri];
+    if (qrow < 0 || trow < 0 || query_empty_mask[qrow] || tree_empty_mask[trow]) {{
+      out_distances[out_pos] = INFINITY;
+      continue;
+    }}
+    compute_t best = (compute_t)INFINITY;
+    for (int coord = query_geometry_offsets[qrow];
+         coord < query_geometry_offsets[qrow + 1]; ++coord) {{
+      const compute_t px = CX(query_x[coord]), py = CY(query_y[coord]);
+      const compute_t sq = point_family_sq_distance(
+          px, py, tree_geometry_offsets, tree_part_offsets, tree_ring_offsets,
+          tree_x, tree_y, trow, target_kind, center_x, center_y);
+      if (sq < best) best = sq;
+      if (best <= (compute_t)0.0) break;
+    }}
+    out_distances[out_pos] = (double)sqrt((double)best);
+  }}
+}}
 """
 )
 
@@ -416,6 +572,7 @@ _POINT_DISTANCE_KERNEL_NAMES = (
     "point_multilinestring_distance_from_owned",
     "point_polygon_distance_from_owned",
     "point_multipolygon_distance_from_owned",
+    "pointset_family_distance_from_owned",
 )
 
 
@@ -426,3 +583,4 @@ def format_distance_kernel_source(compute_type: str = "double") -> str:
 
 # Pre-formatted default source for warmup
 POINT_DISTANCE_KERNEL_SOURCE_FP64 = format_distance_kernel_source("double")
+POINT_DISTANCE_KERNEL_SOURCE_FP32 = format_distance_kernel_source("float")

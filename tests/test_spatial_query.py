@@ -6,7 +6,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box
+from shapely.geometry import (
+    LineString,
+    MultiLineString,
+    MultiPoint,
+    MultiPolygon,
+    Point,
+    Polygon,
+    box,
+)
 
 import vibespatial.spatial.nearest as spatial_nearest_module
 import vibespatial.spatial.query as spatial_query_module
@@ -15,6 +23,7 @@ from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
+from vibespatial.runtime.precision import PrecisionMode
 from vibespatial.runtime.residency import Residency
 from vibespatial.spatial.indexing import build_flat_spatial_index
 from vibespatial.spatial.query import (
@@ -92,6 +101,22 @@ def _device_regular_box_owned_for_test(
         tags=np.full(row_count, FAMILY_TAGS[family], dtype=np.int8),
         validity=np.ones(row_count, dtype=np.bool_),
         family_row_offsets=np.arange(row_count, dtype=np.int32),
+    )
+
+
+def _device_only_clone_for_test(owned: OwnedGeometryArray) -> OwnedGeometryArray:
+    import cupy as cp
+
+    from vibespatial.geometry.owned import build_device_resident_owned
+
+    state = owned._ensure_device_state()
+    return build_device_resident_owned(
+        device_families=state.families,
+        row_count=owned.row_count,
+        tags=cp.asarray(state.tags, dtype=cp.int8),
+        validity=cp.asarray(state.validity, dtype=cp.bool_),
+        family_row_offsets=cp.asarray(state.family_row_offsets, dtype=cp.int32),
+        execution_mode="gpu",
     )
 
 
@@ -1100,6 +1125,579 @@ def test_nearest_spatial_index_with_max_distance_returns_ties_and_distances() ->
     assert indices.tolist() == [[0, 0], [0, 1]]
     assert np.allclose(distances, [1.0, 1.0])
     assert impl in ("owned_cpu_nearest", "owned_gpu_nearest")
+
+
+def _force_nearest_fp32_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_plan = spatial_nearest_module.plan_dispatch_selection
+
+    def _plan(**kwargs):
+        if kwargs.get("kernel_name") in {
+            "nearest_point_family_distance",
+            "device_resident_point_family_distance",
+        }:
+            kwargs["requested_precision"] = PrecisionMode.FP32
+        return original_plan(**kwargs)
+
+    monkeypatch.setattr(spatial_nearest_module, "plan_dispatch_selection", _plan)
+
+
+def _record_point_distance_precision(monkeypatch: pytest.MonkeyPatch):
+    import vibespatial.spatial.point_distance as point_distance_module
+
+    calls: list[tuple[PrecisionMode, int, object | None]] = []
+    original_compute = point_distance_module.compute_point_distance_gpu
+    original_pointset_compute = point_distance_module.compute_pointset_distance_gpu
+
+    def _compute(*args, **kwargs):
+        calls.append(
+            (
+                kwargs["compute_precision"],
+                int(args[5]),
+                kwargs.get("logical_count"),
+            )
+        )
+        return original_compute(*args, **kwargs)
+
+    monkeypatch.setattr(point_distance_module, "compute_point_distance_gpu", _compute)
+
+    def _compute_pointset(*args, **kwargs):
+        calls.append(
+            (
+                kwargs["compute_precision"],
+                int(args[5]),
+                kwargs.get("logical_count"),
+            )
+        )
+        return original_pointset_compute(*args, **kwargs)
+
+    monkeypatch.setattr(
+        point_distance_module,
+        "compute_pointset_distance_gpu",
+        _compute_pointset,
+    )
+    return calls
+
+
+def test_nearest_host_ambiguity_refines_nonfinite_coarse_distances() -> None:
+    ambiguous = spatial_nearest_module._nearest_ambiguity_mask_host(
+        np.asarray([0, 0, 1], dtype=np.int32),
+        np.asarray([np.inf, np.nan, 2.0], dtype=np.float64),
+        2,
+        max_distance=np.inf,
+        error_bound=1.0e-5,
+    )
+
+    assert ambiguous.tolist() == [True, True, True]
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required for nearest precision refinement")
+def test_nearest_gpu_fp32_refines_near_ties_without_refining_all_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = pytest.importorskip("cupy")
+    base = 1_000_000_000.0
+    query_owned = from_shapely_geometries([Point(base, 0.0)], residency=Residency.DEVICE)
+    tree_owned = from_shapely_geometries(
+        [
+            LineString([(base + 1.0, -1.0), (base + 1.0, 1.0)]),
+            LineString([(base - 1.0, -1.0), (base - 1.0, 1.0)]),
+            LineString([(base - 1.0002, -1.0), (base - 1.0002, 1.0)]),
+            LineString([(base + 100_000.0, -1.0), (base + 100_000.0, 1.0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    _force_nearest_fp32_plan(monkeypatch)
+    precision_calls = _record_point_distance_precision(monkeypatch)
+
+    refined = spatial_nearest_module._nearest_refine_gpu(
+        query_owned,
+        tree_owned,
+        np.zeros(4, dtype=np.int32),
+        np.arange(4, dtype=np.int32),
+        1,
+        max_distance=2.0,
+        return_all=True,
+        return_distance=True,
+    )
+
+    assert refined is not None
+    (indices, distances), used_fallback = refined
+    assert used_fallback is False
+    assert set(indices[1].tolist()) == {0, 1}
+    np.testing.assert_allclose(distances, [1.0, 1.0], rtol=0.0, atol=1e-12)
+    assert precision_calls[0] == (PrecisionMode.FP32, 4, None)
+    fp64_calls = [call for call in precision_calls if call[0] is PrecisionMode.FP64]
+    assert fp64_calls
+    assert all(capacity == 4 for _, capacity, _ in fp64_calls)
+    assert all(logical_count is not None for _, _, logical_count in fp64_calls)
+    assert max(int(cp.asnumpy(logical_count)[0]) for _, _, logical_count in fp64_calls) < 4
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required for nearest precision refinement")
+def test_nearest_gpu_fp32_refines_max_distance_ambiguity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cp = pytest.importorskip("cupy")
+    base = 1_000_000_000.0
+    query_owned = from_shapely_geometries([Point(base, 0.0)], residency=Residency.DEVICE)
+    tree_owned = from_shapely_geometries(
+        [
+            LineString([(base + 2.0002, -1.0), (base + 2.0002, 1.0)]),
+            LineString([(base + 100_000.0, -1.0), (base + 100_000.0, 1.0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    _force_nearest_fp32_plan(monkeypatch)
+    precision_calls = _record_point_distance_precision(monkeypatch)
+
+    refined = spatial_nearest_module._nearest_refine_gpu(
+        query_owned,
+        tree_owned,
+        np.zeros(2, dtype=np.int32),
+        np.arange(2, dtype=np.int32),
+        1,
+        max_distance=2.0,
+        return_all=True,
+        return_distance=True,
+    )
+
+    assert refined is not None
+    (indices, distances), used_fallback = refined
+    assert used_fallback is False
+    assert indices.shape == (2, 0)
+    assert distances.shape == (0,)
+    assert precision_calls[0] == (PrecisionMode.FP32, 2, None)
+    fp64_calls = [call for call in precision_calls if call[0] is PrecisionMode.FP64]
+    assert any(
+        capacity == 2 and int(cp.asnumpy(logical_count)[0]) == 1
+        for _, capacity, logical_count in fp64_calls
+    )
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required for nearest precision refinement")
+def test_nearest_gpu_fp32_refines_finite_distance_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+    strict_device_guard,
+) -> None:
+    cp = pytest.importorskip("cupy")
+    query_owned = from_shapely_geometries([Point(0.0, 0.0)], residency=Residency.DEVICE)
+    tree_owned = from_shapely_geometries(
+        [
+            LineString([(5.0e19, -1.0), (5.0e19, 1.0)]),
+            LineString([(7.0e19, -1.0), (7.0e19, 1.0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    _force_nearest_fp32_plan(monkeypatch)
+    precision_calls = _record_point_distance_precision(monkeypatch)
+
+    result = spatial_nearest_module._nearest_refine_gpu(
+        query_owned,
+        tree_owned,
+        np.zeros(2, dtype=np.int32),
+        np.arange(2, dtype=np.int32),
+        1,
+        max_distance=6.0e19,
+        return_all=True,
+        return_distance=True,
+        return_device=True,
+    )
+
+    assert result is not None
+    ((d_left, d_right), d_distances), used_fallback = result
+    assert used_fallback is False
+    assert cp.asnumpy(d_left).tolist() == [0]
+    assert cp.asnumpy(d_right).tolist() == [0]
+    np.testing.assert_allclose(cp.asnumpy(d_distances), [5.0e19], rtol=1.0e-15)
+    assert any(mode is PrecisionMode.FP64 for mode, _, _ in precision_calls)
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required for nearest precision refinement")
+def test_dwithin_gpu_fp32_refines_threshold_ambiguity_without_host_export(
+    monkeypatch: pytest.MonkeyPatch,
+    strict_device_guard,
+) -> None:
+    cp = pytest.importorskip("cupy")
+    from vibespatial.api._native_relation import NativeRelationSelection
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+
+    base = 1_000_000_000.0
+    query_owned = from_shapely_geometries([Point(base, 0.0)], residency=Residency.DEVICE)
+    tree_owned = from_shapely_geometries(
+        [
+            LineString([(base + 5.0002, -1.0), (base + 5.0002, 1.0)]),
+            LineString([(base + 100_000.0, -1.0), (base + 100_000.0, 1.0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    _force_nearest_fp32_plan(monkeypatch)
+    precision_calls = _record_point_distance_precision(monkeypatch)
+    selection_counts = []
+    original_from_mask = NativeDeviceSelection.from_mask
+
+    def _from_mask(*args, **kwargs):
+        selection = original_from_mask(*args, **kwargs)
+        selection_counts.append(selection.logical_count)
+        return selection
+
+    monkeypatch.setattr(NativeDeviceSelection, "from_mask", staticmethod(_from_mask))
+
+    refined = spatial_nearest_module._dwithin_refine_gpu(
+        query_owned,
+        tree_owned,
+        np.zeros(2, dtype=np.int32),
+        np.arange(2, dtype=np.int32),
+        np.asarray([5.0], dtype=np.float64),
+        return_device=True,
+    )
+
+    assert refined is not None
+    relation_selection, used_fallback = refined
+    assert used_fallback is False
+    assert isinstance(relation_selection, NativeRelationSelection)
+    assert relation_selection.capacity == 2
+    assert cp.asnumpy(relation_selection.logical_count).tolist() == [0]
+    assert precision_calls[0][0] is PrecisionMode.FP32
+    assert precision_calls[0][1] == 1
+    assert int(cp.asnumpy(precision_calls[0][2])[0]) == 2
+    fp64_calls = [call for call in precision_calls if call[0] is PrecisionMode.FP64]
+    assert len(selection_counts) == 2  # one ambiguity rowset and one final result rowset
+    assert any(
+        capacity == 1
+        and logical_count is not None
+        and int(cp.asnumpy(logical_count)[0]) == 1
+        for _, capacity, logical_count in fp64_calls
+    )
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required for dwithin refinement")
+def test_dwithin_gpu_fp32_refines_finite_distance_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+    strict_device_guard,
+) -> None:
+    cp = pytest.importorskip("cupy")
+    query_owned = from_shapely_geometries([Point(0.0, 0.0)], residency=Residency.DEVICE)
+    tree_owned = from_shapely_geometries(
+        [
+            LineString([(5.0e19, -1.0), (5.0e19, 1.0)]),
+            LineString([(7.0e19, -1.0), (7.0e19, 1.0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    _force_nearest_fp32_plan(monkeypatch)
+    precision_calls = _record_point_distance_precision(monkeypatch)
+
+    result = spatial_nearest_module._dwithin_refine_gpu(
+        query_owned,
+        tree_owned,
+        np.zeros(2, dtype=np.int32),
+        np.arange(2, dtype=np.int32),
+        np.asarray([6.0e19], dtype=np.float64),
+        return_device=True,
+    )
+
+    assert result is not None
+    relation_selection, used_fallback = result
+    assert used_fallback is False
+    count = int(cp.asnumpy(relation_selection.logical_count)[0])
+    positions = relation_selection.selection.positions[:count]
+    assert cp.asnumpy(relation_selection.relation.left_indices[positions]).tolist() == [0]
+    assert cp.asnumpy(relation_selection.relation.right_indices[positions]).tolist() == [0]
+    assert any(mode is PrecisionMode.FP64 for mode, _, _ in precision_calls)
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required for nearest precision refinement")
+def test_nearest_fp32_refinement_return_device_has_no_host_export(
+    monkeypatch: pytest.MonkeyPatch,
+    strict_device_guard,
+) -> None:
+    base = 1_000_000_000.0
+    query_owned = from_shapely_geometries([Point(base, 0.0)], residency=Residency.DEVICE)
+    tree_owned = from_shapely_geometries(
+        [
+            LineString([(base + 1.0, -1.0), (base + 1.0, 1.0)]),
+            LineString([(base + 100_000.0, -1.0), (base + 100_000.0, 1.0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    _force_nearest_fp32_plan(monkeypatch)
+
+    refined = spatial_nearest_module._nearest_refine_gpu(
+        query_owned,
+        tree_owned,
+        np.zeros(2, dtype=np.int32),
+        np.arange(2, dtype=np.int32),
+        1,
+        max_distance=2.0,
+        return_all=True,
+        return_distance=True,
+        return_device=True,
+    )
+
+    assert refined is not None
+    ((d_left, d_right), d_distances), used_fallback = refined
+    assert used_fallback is False
+    assert d_left.size == 1
+    assert d_right.size == 1
+    assert d_distances.size == 1
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required for nearest precision refinement")
+def test_mixed_multipoint_nearest_gpu_refines_fp32_ordering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = 1_000_000_000.0
+    query_owned = from_shapely_geometries(
+        [MultiPoint([(base, 0.0)])],
+        residency=Residency.DEVICE,
+    )
+    tree_owned = from_shapely_geometries(
+        [
+            LineString([(base + 1.0, -1.0), (base + 1.0, 1.0)]),
+            box(base - 2.0002, -1.0, base - 1.0002, 1.0),
+            Point(base + 100_000.0, 0.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+    _force_nearest_fp32_plan(monkeypatch)
+    precision_calls = _record_point_distance_precision(monkeypatch)
+
+    refined = spatial_nearest_module._nearest_refine_gpu(
+        query_owned,
+        tree_owned,
+        np.zeros(3, dtype=np.int32),
+        np.arange(3, dtype=np.int32),
+        1,
+        max_distance=200_000.0,
+        return_all=True,
+        return_distance=True,
+    )
+
+    assert refined is not None
+    (indices, distances), used_fallback = refined
+    assert used_fallback is False
+    assert indices.tolist() == [[0], [0]]
+    np.testing.assert_allclose(distances, [1.0], rtol=0.0, atol=1e-12)
+    assert any(mode is PrecisionMode.FP32 for mode, _, _ in precision_calls)
+    assert any(mode is PrecisionMode.FP64 for mode, _, _ in precision_calls)
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required for device-only centering")
+def test_device_only_large_origin_nearest_and_dwithin_use_device_center(
+    monkeypatch: pytest.MonkeyPatch,
+    strict_device_guard,
+) -> None:
+    cp = pytest.importorskip("cupy")
+    base = 1_000_000_000.0
+    query_owned = _device_only_clone_for_test(
+        from_shapely_geometries([Point(base, 0.0)], residency=Residency.DEVICE)
+    )
+    tree_owned = _device_only_clone_for_test(
+        from_shapely_geometries(
+            [
+                LineString([(base + 1.0, -1.0), (base + 1.0, 1.0)]),
+                LineString([(base + 100_000.0, -1.0), (base + 100_000.0, 1.0)]),
+            ],
+            residency=Residency.DEVICE,
+        )
+    )
+    assert all(buffer.x.size == 0 for buffer in query_owned.families.values())
+    assert all(buffer.x.size == 0 for buffer in tree_owned.families.values())
+    _force_nearest_fp32_plan(monkeypatch)
+
+    nearest = spatial_nearest_module._nearest_refine_gpu(
+        query_owned,
+        tree_owned,
+        np.zeros(2, dtype=np.int32),
+        np.arange(2, dtype=np.int32),
+        1,
+        max_distance=2.0,
+        return_all=True,
+        return_distance=True,
+        return_device=True,
+    )
+    dwithin = spatial_nearest_module._dwithin_refine_gpu(
+        query_owned,
+        tree_owned,
+        np.zeros(2, dtype=np.int32),
+        np.arange(2, dtype=np.int32),
+        np.asarray([1.5], dtype=np.float64),
+        return_device=True,
+    )
+
+    assert nearest is not None and dwithin is not None
+    ((d_left, d_right), d_distances), nearest_fallback = nearest[0], nearest[1]
+    relation_selection, dwithin_fallback = dwithin
+    assert nearest_fallback is False
+    assert dwithin_fallback is False
+    assert cp.asnumpy(d_left).tolist() == [0]
+    assert cp.asnumpy(d_right).tolist() == [0]
+    np.testing.assert_allclose(cp.asnumpy(d_distances), [1.0], rtol=0.0, atol=1e-12)
+    count = int(cp.asnumpy(relation_selection.logical_count)[0])
+    positions = relation_selection.selection.positions[:count]
+    assert cp.asnumpy(relation_selection.relation.left_indices[positions]).tolist() == [0]
+    assert cp.asnumpy(relation_selection.relation.right_indices[positions]).tolist() == [0]
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required for mixed multipoint distance")
+def test_strict_multipoint_dwithin_supports_every_owned_target_family(
+    strict_device_guard,
+) -> None:
+    cp = pytest.importorskip("cupy")
+    query_geometry = MultiPoint([(0.0, 0.0), (0.0, 1.0)])
+    tree_geometries = [
+        Point(3.0, 0.0),
+        MultiPoint([(2.0, 0.0), (10.0, 0.0)]),
+        LineString([(4.0, -1.0), (4.0, 2.0)]),
+        MultiLineString([[(5.0, -1.0), (5.0, 2.0)], [(20.0, 0.0), (21.0, 0.0)]]),
+        box(6.0, -1.0, 7.0, 2.0),
+        MultiPolygon([box(8.0, -1.0, 9.0, 2.0), box(30.0, 0.0, 31.0, 1.0)]),
+    ]
+    query_owned = from_shapely_geometries([query_geometry], residency=Residency.DEVICE)
+    tree_owned = from_shapely_geometries(tree_geometries, residency=Residency.DEVICE)
+
+    result = spatial_nearest_module._dwithin_refine_gpu(
+        query_owned,
+        tree_owned,
+        np.zeros(len(tree_geometries), dtype=np.int32),
+        np.arange(len(tree_geometries), dtype=np.int32),
+        np.asarray([4.5], dtype=np.float64),
+        return_device=True,
+    )
+
+    assert result is not None
+    relation_selection, used_fallback = result
+    assert used_fallback is False
+    count = int(cp.asnumpy(relation_selection.logical_count)[0])
+    positions = relation_selection.selection.positions[:count]
+    d_left = relation_selection.relation.left_indices[positions]
+    d_right = relation_selection.relation.right_indices[positions]
+    expected_right = [
+        index
+        for index, geometry in enumerate(tree_geometries)
+        if shapely.dwithin(query_geometry, geometry, 4.5)
+    ]
+    assert bool(cp.array_equal(d_left, cp.zeros(len(expected_right), dtype=cp.int32)))
+    assert bool(cp.array_equal(d_right, cp.asarray(expected_right, dtype=cp.int32)))
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required for mixed distance partition")
+def test_mixed_distance_partition_matches_all_owned_family_pairs_and_skew(
+    strict_device_guard,
+) -> None:
+    cp = pytest.importorskip("cupy")
+    geometries = [
+        Point(0.0, 0.0),
+        MultiPoint([(0.0, 0.0), (0.0, 1.0)]),
+        LineString([(2.0, -1.0), (2.0, 2.0)]),
+        MultiLineString([[(3.0, -1.0), (3.0, 2.0)], [(20.0, 0.0), (21.0, 0.0)]]),
+        box(4.0, -1.0, 5.0, 2.0),
+        MultiPolygon([box(6.0, -1.0, 7.0, 2.0), box(30.0, 0.0, 31.0, 1.0)]),
+    ]
+    query_owned = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+    tree_owned = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+    left = np.repeat(np.arange(len(geometries), dtype=np.int32), len(geometries))
+    right = np.tile(np.arange(len(geometries), dtype=np.int32), len(geometries))
+    expected = np.asarray(
+        [shapely.distance(geometries[li], geometries[ri]) for li, ri in zip(left, right)],
+        dtype=np.float64,
+    )
+
+    result = spatial_nearest_module._compute_mixed_distances_gpu_device(
+        query_owned,
+        tree_owned,
+        left,
+        right,
+    )
+    assert result is not None
+    distances, used_fallback = result
+    assert used_fallback is False
+    assert bool(cp.allclose(distances, cp.asarray(expected), rtol=1e-5, atol=1e-6))
+
+    skew_count = 513
+    skew = spatial_nearest_module._compute_mixed_distances_gpu_device(
+        from_shapely_geometries(
+            [MultiPoint([(0.0, 0.0), (0.0, 1.0)])],
+            residency=Residency.DEVICE,
+        ),
+        from_shapely_geometries(
+            [LineString([(2.0, -1.0), (2.0, 2.0)])],
+            residency=Residency.DEVICE,
+        ),
+        np.zeros(skew_count, dtype=np.int32),
+        np.zeros(skew_count, dtype=np.int32),
+    )
+    assert skew is not None
+    skew_distances, skew_fallback = skew
+    assert skew_fallback is False
+    assert bool(cp.all(skew_distances == 2.0))
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required for mixed distance partition")
+def test_mixed_distance_checks_every_multipart_component_for_containment(
+    strict_device_guard,
+) -> None:
+    cp = pytest.importorskip("cupy")
+    polygon = box(0.0, 0.0, 10.0, 10.0)
+    multiline = MultiLineString(
+        [
+            [(20.0, 20.0), (21.0, 20.0)],
+            [(2.0, 2.0), (3.0, 3.0)],
+        ]
+    )
+    multipolygon = MultiPolygon(
+        [
+            box(20.0, 20.0, 21.0, 21.0),
+            box(2.0, 2.0, 3.0, 3.0),
+        ]
+    )
+    left_geometries = [multiline, multipolygon, polygon, polygon]
+    right_geometries = [polygon, polygon, multiline, multipolygon]
+
+    result = spatial_nearest_module._compute_mixed_distances_gpu_device(
+        from_shapely_geometries(left_geometries, residency=Residency.DEVICE),
+        from_shapely_geometries(right_geometries, residency=Residency.DEVICE),
+        np.arange(4, dtype=np.int32),
+        np.arange(4, dtype=np.int32),
+    )
+
+    assert result is not None
+    distances, used_fallback = result
+    assert used_fallback is False
+    assert bool(cp.all(distances == 0.0))
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required for dwithin refinement")
+def test_dwithin_does_not_collapse_sub_epsilon_polygon_gap(
+    monkeypatch: pytest.MonkeyPatch,
+    strict_device_guard,
+) -> None:
+    cp = pytest.importorskip("cupy")
+    query_owned = from_shapely_geometries(
+        [Point(1.0 + 5e-8, 0.5)],
+        residency=Residency.DEVICE,
+    )
+    tree_owned = from_shapely_geometries(
+        [box(0.0, 0.0, 1.0, 1.0)],
+        residency=Residency.DEVICE,
+    )
+    _force_nearest_fp32_plan(monkeypatch)
+    precision_calls = _record_point_distance_precision(monkeypatch)
+
+    result = spatial_nearest_module._dwithin_refine_gpu(
+        query_owned,
+        tree_owned,
+        np.asarray([0], dtype=np.int32),
+        np.asarray([0], dtype=np.int32),
+        np.asarray([1e-9], dtype=np.float64),
+        return_device=True,
+    )
+
+    assert result is not None
+    relation_selection, used_fallback = result
+    assert used_fallback is False
+    assert int(cp.asnumpy(relation_selection.logical_count)[0]) == 0
+    assert any(mode is PrecisionMode.FP64 for mode, _, _ in precision_calls)
 
 
 def test_nearest_spatial_index_gpu_avoids_host_point_coordinate_extraction(
@@ -2194,7 +2792,8 @@ def test_return_device_polygonal_intersects_refine_avoids_pair_d2h(monkeypatch) 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
 def test_dwithin_return_device_true_stays_device_resident(strict_device_guard) -> None:
     """Per-row dwithin thresholds should stay device-native for return_device=True."""
-    from vibespatial.spatial.query_types import DeviceSpatialJoinResult
+    cp = pytest.importorskip("cupy")
+    from vibespatial.api._native_relation import NativeRelationSelection
 
     tree = np.asarray([Point(0, 0), Point(10, 0), Point(20, 0)], dtype=object)
     tree_owned, flat = build_owned_spatial_index(tree)
@@ -2215,10 +2814,90 @@ def test_dwithin_return_device_true_stays_device_resident(strict_device_guard) -
     )
 
     assert execution.selected is ExecutionMode.GPU
-    assert isinstance(result, DeviceSpatialJoinResult)
-    assert result.size == 2
-    assert hasattr(result.d_left_idx, "__cuda_array_interface__")
-    assert hasattr(result.d_right_idx, "__cuda_array_interface__")
+    assert isinstance(result, NativeRelationSelection)
+    assert result.capacity >= 2
+    assert cp.asnumpy(result.logical_count).tolist() == [2]
+    assert hasattr(result.relation.left_indices, "__cuda_array_interface__")
+    assert hasattr(result.relation.right_indices, "__cuda_array_interface__")
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+def test_native_spatial_index_consumes_dwithin_relation_selection(
+    strict_device_guard,
+) -> None:
+    cp = pytest.importorskip("cupy")
+    from vibespatial.api._native_relation import NativeRelationSelection
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+
+    tree_owned, flat = build_owned_spatial_index(
+        np.asarray([Point(0, 0), Point(10, 0), Point(20, 0)], dtype=object)
+    )
+    query_owned = from_shapely_geometries(
+        [Point(1, 0), Point(16, 0)],
+        residency=Residency.DEVICE,
+    )
+    native_index = flat.to_native_spatial_index(source_token="tree")
+
+    relation, execution = native_index.query_relation(
+        query_owned,
+        predicate="dwithin",
+        distance=np.asarray([5.0, 5.0], dtype=np.float64),
+        query_token="query",
+        query_row_count=2,
+        return_device=True,
+        return_metadata=True,
+    )
+    left_rows = native_index.query_left_semijoin(
+        query_owned,
+        predicate="dwithin",
+        distance=np.asarray([5.0, 5.0], dtype=np.float64),
+        query_token="query",
+        query_row_count=2,
+    )
+
+    assert execution.selected is ExecutionMode.GPU
+    assert isinstance(relation, NativeRelationSelection)
+    assert relation.relation.left_token == "query"
+    assert relation.relation.right_token == "tree"
+    assert cp.asnumpy(relation.logical_count).tolist() == [2]
+    assert isinstance(left_rows, NativeDeviceSelection)
+    assert cp.asnumpy(left_rows.logical_count).tolist() == [2]
+
+
+def test_dwithin_strict_device_return_precedes_terminal_compaction() -> None:
+    path = Path(spatial_nearest_module.__file__)
+    source = path.read_text()
+    tree = ast.parse(source, filename=str(path))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_dwithin_refine_gpu"
+    )
+    function_source = ast.get_source_segment(source, function) or ""
+    device_return = function_source.index("if return_device:", function_source.index("d_keep ="))
+    terminal_compaction = function_source.index("d_keep_idx = cp.flatnonzero(d_keep)")
+
+    assert device_return < terminal_compaction
+    strict_section = function_source[device_return:terminal_compaction]
+    assert "NativeDeviceSelection.from_mask" in strict_section
+    assert "filter_pairs_selection" in strict_section
+    assert "NativeRelationSelection" in function_source
+    assert "if d_keep_idx.size" not in function_source
+
+    mixed = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_compute_mixed_distances_gpu_device"
+    )
+    mixed_source = ast.get_source_segment(source, mixed) or ""
+    assert "NativeRelationFamilyPartition.from_pair_capacity" in mixed_source
+    assert "cp.flatnonzero" not in mixed_source
+    assert "copy_device_to_host" not in mixed_source
+    assert "to_shapely" not in mixed_source
+    assert "NativeDeviceSelection.from_mask" not in mixed_source
+    assert "sub_mask" not in mixed_source
+    assert "sub_count" not in mixed_source
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")

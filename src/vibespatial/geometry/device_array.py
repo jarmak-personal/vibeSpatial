@@ -415,16 +415,13 @@ class DeviceGeometryArray(ExtensionArray):
                 for part in self._composition.parts
                 if part.geometry.owned is not None
             )
-        if (
-            self.to_owned().residency is Residency.DEVICE
-            and self.to_owned().device_state is not None
-            and (
-                self.to_owned()._validity is None
-                or self.to_owned()._tags is None
-                or self.to_owned()._family_row_offsets is None
-            )
+        owned = self.to_owned()
+        if owned.residency is Residency.DEVICE and (
+            owned._validity is None
+            or owned._tags is None
+            or owned._family_row_offsets is None
         ):
-            state = self.to_owned()._ensure_device_state(preserve_indexed_view=True)
+            state = owned._ensure_device_state(preserve_indexed_view=True)
             total = state.validity.nbytes + state.tags.nbytes
             total += state.family_row_offsets.nbytes
             for buffer in state.families.values():
@@ -460,11 +457,11 @@ class DeviceGeometryArray(ExtensionArray):
             result = np.ones(len(self), dtype=bool)
             for part in self._composition.parts:
                 rows = self._composition_part_rows_host(part)
-                values = DeviceGeometryArray._from_owned(
+                missing = DeviceGeometryArray._from_owned(
                     part.geometry.owned,
                     crs=self._crs,
                 ).isna()
-                result[rows] = values
+                result[rows[~missing]] = False
             return result
         if getattr(self.to_owned(), "_validity", None) is not None:
             return ~np.asarray(self.to_owned()._validity, dtype=bool)
@@ -503,10 +500,13 @@ class DeviceGeometryArray(ExtensionArray):
             result[:] = None
             for part in self._composition.parts:
                 rows = self._composition_part_rows_host(part)
-                result[rows] = DeviceGeometryArray._from_owned(
+                part_array = DeviceGeometryArray._from_owned(
                     part.geometry.owned,
                     crs=self._crs,
-                ).geom_type
+                )
+                missing = part_array.isna()
+                values = part_array.geom_type
+                result[rows[~missing]] = values[~missing]
             return result
         single_type = _single_family_geom_type_if_no_nulls(self.to_owned())
         if single_type is not None:
@@ -534,10 +534,13 @@ class DeviceGeometryArray(ExtensionArray):
             result = np.zeros(len(self), dtype=bool)
             for part in self._composition.parts:
                 rows = self._composition_part_rows_host(part)
-                result[rows] = DeviceGeometryArray._from_owned(
+                part_array = DeviceGeometryArray._from_owned(
                     part.geometry.owned,
                     crs=self._crs,
-                ).is_empty
+                )
+                missing = part_array.isna()
+                values = part_array.is_empty
+                result[rows[~missing]] = values[~missing]
             return result
         tags = self.to_owned().tags
         offsets = self.to_owned().family_row_offsets
@@ -567,7 +570,13 @@ class DeviceGeometryArray(ExtensionArray):
             result = np.full((len(self), 4), np.nan, dtype=np.float64)
             for part in self._composition.parts:
                 rows = self._composition_part_rows_host(part)
-                result[rows] = _compute_bounds_from_owned(part.geometry.owned)
+                part_array = DeviceGeometryArray._from_owned(
+                    part.geometry.owned,
+                    crs=self._crs,
+                )
+                missing = part_array.isna()
+                values = _compute_bounds_from_owned(part.geometry.owned)
+                result[rows[~missing]] = values[~missing]
             return result
         return _compute_bounds_from_owned(self.to_owned())
 
@@ -2001,10 +2010,12 @@ class DeviceGeometryArray(ExtensionArray):
             cache[:] = None
             for part in self._composition.parts:
                 rows = self._composition_part_rows_host(part)
-                cache[rows] = owned_to_shapely(
+                values = owned_to_shapely(
                     part.geometry.owned,
                     record_event=True,
                 )
+                present = pd.notna(values)
+                cache[rows[present]] = values[present]
             self._shapely_cache = cache
             return cache
         self.to_owned()._record(
@@ -2285,6 +2296,52 @@ class DeviceGeometryArray(ExtensionArray):
             )
             return cls._from_owned(empty_owned)
 
+        target_residency = next(
+            (
+                native.residency
+                for arr in to_concat
+                if (
+                    native := (
+                        getattr(arr, "_owned", None)
+                        or getattr(arr, "_composition", None)
+                    )
+                )
+                is not None
+            ),
+            Residency.HOST,
+        )
+        normalized = []
+        for arr in to_concat:
+            if isinstance(arr, cls):
+                normalized.append(arr)
+                continue
+            try:
+                normalized.append(
+                    cls._from_owned(
+                        from_shapely_geometries(
+                            np.asarray(arr, dtype=object).tolist(),
+                            residency=target_residency,
+                        ),
+                        crs=getattr(arr, "crs", None),
+                    )
+                )
+            except NotImplementedError:
+                from vibespatial.api.geometry_array import GeometryArray
+
+                data = np.concatenate(
+                    [np.asarray(geometry, dtype=object) for geometry in to_concat]
+                )
+                crs = next(
+                    (
+                        getattr(geometry, "crs", None)
+                        for geometry in to_concat
+                        if getattr(geometry, "crs", None) is not None
+                    ),
+                    None,
+                )
+                return GeometryArray(data, crs=crs)
+        to_concat = normalized
+
         if any(arr._composition is not None for arr in to_concat):
             from vibespatial.api._native_result_core import (
                 GeometryNativeResult,
@@ -2311,14 +2368,6 @@ class DeviceGeometryArray(ExtensionArray):
                 provenance=provenance,
             )
 
-        target_residency = next(
-            (
-                owned.residency
-                for arr in to_concat
-                if (owned := getattr(arr, "_owned", None)) is not None
-            ),
-            Residency.HOST,
-        )
         all_owned = []
         for arr in to_concat:
             owned = getattr(arr, "_owned", None)
@@ -3017,50 +3066,25 @@ def _compute_total_bounds_from_owned_device(owned: OwnedGeometryArray) -> np.nda
     except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
         return _compute_total_bounds_from_owned_host(owned)
 
-    if getattr(owned, "is_indexed_view", False):
-        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
+    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
 
-        d_bounds = compute_geometry_bounds_device(
-            owned,
-            preserve_indexed_view=True,
-        )
-        finite = ~cp.isnan(d_bounds[:, 0])
-        runtime = get_cuda_runtime()
-        has_finite = runtime.copy_device_to_host(
-            cp.asarray(cp.any(finite), dtype=cp.bool_).reshape(1),
-            reason="DeviceGeometryArray total-bounds row-indirected finite scalar boundary",
-        )
-        if not bool(np.asarray(has_finite, dtype=np.bool_).reshape(1)[0]):
-            return np.array([np.nan, np.nan, np.nan, np.nan], dtype=np.float64)
-        selected = d_bounds[finite]
-        bounds_device = cp.concatenate(
-            (
-                cp.amin(selected[:, :2], axis=0),
-                cp.amax(selected[:, 2:], axis=0),
-            )
-        ).astype(cp.float64)
-        return runtime.copy_device_to_host(
-            bounds_device,
-            reason="DeviceGeometryArray total-bounds row-indirected device summary host boundary",
-        )
-
-    state = owned._ensure_device_state()
-    mins: list[object] = []
-    maxs: list[object] = []
-
-    for device_buffer in state.families.values():
-        if getattr(device_buffer.x, "size", 0) == 0:
-            continue
-        mins.append(cp.stack((cp.amin(device_buffer.x), cp.amin(device_buffer.y))))
-        maxs.append(cp.stack((cp.amax(device_buffer.x), cp.amax(device_buffer.y))))
-
-    if not mins:
+    d_bounds = compute_geometry_bounds_device(
+        owned,
+        preserve_indexed_view=True,
+    )
+    if int(d_bounds.shape[0]) == 0:
         return np.array([np.nan, np.nan, np.nan, np.nan], dtype=np.float64)
-
-    min_xy = cp.amin(cp.stack(mins), axis=0)
-    max_xy = cp.amax(cp.stack(maxs), axis=0)
-    # Single D->H transfer for all 4 bounds (avoid 4 separate .item() syncs)
-    bounds_device = cp.concatenate([min_xy, max_xy]).astype(cp.float64)
+    finite = ~cp.isnan(d_bounds[:, 0])
+    min_xy = cp.amin(
+        cp.where(finite[:, None], d_bounds[:, :2], cp.inf),
+        axis=0,
+    )
+    max_xy = cp.amax(
+        cp.where(finite[:, None], d_bounds[:, 2:], -cp.inf),
+        axis=0,
+    )
+    bounds_device = cp.concatenate((min_xy, max_xy)).astype(cp.float64)
+    bounds_device = cp.where(cp.any(finite), bounds_device, cp.nan)
     return get_cuda_runtime().copy_device_to_host(
         bounds_device,
         reason="DeviceGeometryArray total-bounds device summary host boundary",

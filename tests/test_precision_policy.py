@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 from vibespatial import (
     DEFAULT_CONSUMER_PROFILE,
     DEFAULT_DATACENTER_PROFILE,
@@ -12,6 +15,154 @@ from vibespatial import (
     RuntimeSelection,
     select_precision_plan,
 )
+
+
+def test_nearest_precision_overrides_only_flow_through_precision_plan() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "src" / "vibespatial" / "spatial" / "nearest.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    direct_compute_overrides: list[int] = []
+    unplanned_fp64_requests: list[int] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function_name = (
+            node.func.id
+            if isinstance(node.func, ast.Name)
+            else node.func.attr
+            if isinstance(node.func, ast.Attribute)
+            else ""
+        )
+        for keyword in node.keywords:
+            value = keyword.value
+            is_precision_constant = (
+                isinstance(value, ast.Attribute)
+                and isinstance(value.value, ast.Name)
+                and value.value.id == "PrecisionMode"
+                and value.attr in {"FP32", "FP64"}
+            )
+            if keyword.arg == "compute_precision" and is_precision_constant:
+                direct_compute_overrides.append(node.lineno)
+            if is_precision_constant and value.attr == "FP64":
+                if not (function_name == "select_precision_plan" and keyword.arg == "requested"):
+                    unplanned_fp64_requests.append(node.lineno)
+
+    # Constructor/function defaults are another way to smuggle an override
+    # around PrecisionPlan, so reject those too.
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "PrecisionMode"
+            and node.attr == "FP64"
+        ):
+            continue
+        parent = parents.get(node)
+        if isinstance(parent, ast.keyword):
+            grandparent = parents.get(parent)
+            if (
+                isinstance(grandparent, ast.Call)
+                and isinstance(grandparent.func, ast.Name)
+                and grandparent.func.id == "select_precision_plan"
+                and parent.arg == "requested"
+            ):
+                continue
+        if node.lineno not in unplanned_fp64_requests:
+            unplanned_fp64_requests.append(node.lineno)
+
+    assert direct_compute_overrides == []
+    assert unplanned_fp64_requests == []
+
+
+def test_nearest_ambiguity_refinement_has_no_exact_device_compaction() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "src" / "vibespatial" / "spatial" / "nearest.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    refiners = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name
+        in {
+            "_refine_ambiguous_point_family_distances",
+            "_dwithin_refine_gpu",
+        }
+    }
+
+    assert set(refiners) == {
+        "_refine_ambiguous_point_family_distances",
+        "_dwithin_refine_gpu",
+    }
+    for name, function in refiners.items():
+        flatnonzero_calls = [
+            node.value.lineno
+            for node in ast.walk(function)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name) and "ambiguous" in target.id
+                for target in (
+                    node.targets if isinstance(node, ast.Assign) else (node.target,)
+                )
+            )
+            and any(
+                isinstance(descendant, ast.Call)
+                and isinstance(descendant.func, ast.Attribute)
+                and descendant.func.attr == "flatnonzero"
+                for descendant in ast.walk(node.value)
+            )
+        ]
+        ambiguous_size_branches = [
+            node.lineno
+            for node in ast.walk(function)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(descendant, ast.Attribute)
+                and descendant.attr == "size"
+                and isinstance(descendant.value, ast.Name)
+                and "ambiguous" in descendant.value.id
+                for descendant in ast.walk(node.test)
+            )
+        ]
+        source = ast.get_source_segment(path.read_text(), function) or ""
+
+        assert flatnonzero_calls == [], f"{name} exact-compacts ambiguity at {flatnonzero_calls}"
+        assert ambiguous_size_branches == [], (
+            f"{name} branches on exact ambiguity size at {ambiguous_size_branches}"
+        )
+        assert "NativeDeviceSelection.from_mask" in source
+        assert ".gather_capacity" in source
+        if name == "_refine_ambiguous_point_family_distances":
+            assert ".logical_count" in source
+        else:
+            assert "pair_active=d_ambiguity_active" in source
+            assert "source_positions=d_ambiguity_partition" in source
+
+    mixed = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_compute_mixed_distances_gpu_device"
+    )
+    mixed_source = ast.get_source_segment(path.read_text(), mixed) or ""
+    forbidden = (
+        "flatnonzero",
+        "copy_device_to_host",
+        "to_shapely",
+        "shapely.distance",
+        "NativeDeviceSelection.from_mask",
+        "sub_count",
+        "sub_mask",
+    )
+    assert not any(token in mixed_source for token in forbidden)
+    assert "NativeRelationFamilyPartition.from_pair_capacity" in mixed_source
+    assert "source_positions=group.source_positions" in mixed_source
+    assert "launch_capacity = max(1, (pair_count + group_count - 1) // group_count)" in mixed_source
 
 
 def test_cpu_runtime_forces_native_fp64() -> None:

@@ -2330,7 +2330,7 @@ def renode_gpu_atomic_edges(
             d_refine_segment_ids = cp.flatnonzero(
                 cp.asarray(state.planarity_risk, dtype=cp.bool_)[d_forward]
             ).astype(cp.int32, copy=False)
-        refine_segment_count = int(d_refine_segment_ids.size)
+        refine_segment_count = d_refine_segment_ids.shape[0]
         if refine_segment_count == 0:
             return current
         refine_segments = DeviceSegmentTable(

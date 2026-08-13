@@ -385,6 +385,12 @@ class LazyGroupedUnionOwned:
     """
 
     _is_lazy_grouped_union_owned = True
+    # Every concrete exit from _materialize_owned() passes through
+    # _grouped_union_geometry_payload(), which validates and atomically repairs
+    # grouped-union output before publishing it.  Keep that semantic proof on
+    # the delayed carrier so validity-only consumers do not force topology.
+    trusted_all_valid = True
+    trusted_all_ogc_valid = True
 
     def __init__(
         self,
@@ -409,6 +415,7 @@ class LazyGroupedUnionOwned:
         self._source_provenance = source_provenance
         self._exact_materializer = exact_materializer
         self._materialized_owned: OwnedGeometryArray | None = None
+        self._collective_coverage_owned: OwnedGeometryArray | None = None
         self.row_count = int(grouped.resolved_group_count)
         self.residency = source_owned.residency
         self.runtime_history = list(getattr(source_owned, "runtime_history", []))
@@ -538,6 +545,23 @@ class LazyGroupedUnionOwned:
         )
         return owned
 
+    def _materialize_collective_coverage(self) -> OwnedGeometryArray | None:
+        """Retain exact tiled coverage for a downstream relation consumer."""
+        cached = self._collective_coverage_owned
+        if cached is not None:
+            return cached
+        if self.row_count != 1:
+            return None
+        from vibespatial.constructive.tiled_union import (
+            single_group_polygon_collective_coverage_gpu,
+        )
+
+        coverage = single_group_polygon_collective_coverage_gpu(self._source_owned)
+        if coverage is None:
+            return None
+        self._collective_coverage_owned = coverage
+        return coverage
+
     def _ensure_device_state(self, *args, **kwargs):
         return self._materialize_owned()._ensure_device_state(*args, **kwargs)
 
@@ -570,6 +594,7 @@ class LazyGroupedUnionOwned:
             exact_materializer=self._exact_materializer,
         )
         copied._materialized_owned = self._materialized_owned
+        copied._collective_coverage_owned = self._collective_coverage_owned
         return copied
 
     def to_shapely(self):

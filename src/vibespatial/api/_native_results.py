@@ -69,7 +69,25 @@ def _geometry_composition_from_owned_parts_at_capacity(
     """
     if int(row_count) < 0:
         raise ValueError("geometry composition row capacity must be non-negative")
-    if not capacity_parts:
+    concrete_parts = []
+    family_domains = []
+    for part_owned, part_rows in capacity_parts:
+        if part_owned.residency is Residency.DEVICE:
+            state = part_owned.device_state
+            has_concrete_family = state is None or bool(state.families)
+            family_domain = (
+                None
+                if state is None
+                else getattr(state, "trusted_family_domain", None)
+                or tuple(state.families)
+            )
+        else:
+            has_concrete_family = bool(part_owned.families)
+            family_domain = tuple(part_owned.families)
+        if has_concrete_family:
+            concrete_parts.append((part_owned, part_rows))
+            family_domains.append(family_domain)
+    if not concrete_parts:
         return None
     return GeometryNativeResult.from_composition(
         NativeGeometryComposition(
@@ -78,11 +96,23 @@ def _geometry_composition_from_owned_parts_at_capacity(
                     geometry=GeometryNativeResult.from_owned(part_owned, crs=crs),
                     output_rows=part_rows,
                 )
-                for part_owned, part_rows in capacity_parts
+                for part_owned, part_rows in concrete_parts
             ),
             row_count=int(row_count),
             crs=crs,
             trusted_all_ogc_valid=trusted_all_ogc_valid,
+            trusted_singular_rows=len(concrete_parts) == 1,
+            trusted_family_domain=(
+                tuple(
+                    dict.fromkeys(
+                        family
+                        for domain in family_domains
+                        for family in domain
+                    )
+                )
+                if all(domain is not None for domain in family_domains)
+                else None
+            ),
         ),
         crs=crs,
     )

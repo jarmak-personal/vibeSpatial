@@ -594,6 +594,36 @@ def _query_with_owned_spatial_index(
         return_metadata=True,
         return_device=return_device,
     )
+    from vibespatial.api._native_relation import (
+        NativeRelation,
+        NativeRelationSelection,
+    )
+
+    if isinstance(indices, NativeRelationSelection):
+        relation = indices.relation
+        if query_positions is not None or tree_positions is not None:
+            import cupy as cp
+
+            left_idx = cp.asarray(relation.left_indices, dtype=cp.int32)
+            right_idx = cp.asarray(relation.right_indices, dtype=cp.int32)
+            if query_positions is not None:
+                left_idx = cp.asarray(query_positions, dtype=left_idx.dtype)[left_idx]
+            if tree_positions is not None:
+                right_idx = cp.asarray(tree_positions, dtype=right_idx.dtype)[right_idx]
+            relation = NativeRelation(
+                left_indices=left_idx,
+                right_indices=right_idx,
+                predicate=relation.predicate,
+                left_row_count=len(left_df),
+                right_row_count=len(right_df),
+                sorted_by_left=relation.sorted_by_left,
+                duplicate_policy=relation.duplicate_policy,
+            )
+            indices = NativeRelationSelection(
+                relation=relation,
+                selection=indices.selection,
+            )
+        return indices, execution
     if hasattr(indices, "d_left_idx") and hasattr(indices, "d_right_idx"):
         left_idx = indices.d_left_idx
         right_idx = indices.d_right_idx
@@ -968,9 +998,21 @@ def _geom_predicate_query(
     )
     if native_result is not None:
         native_relation, native_execution = native_result
-        l_idx = native_relation.left_indices
-        r_idx = native_relation.right_indices
-        sorted_by_left = native_relation.sorted_by_left
+        from vibespatial.api._native_relation import NativeRelationSelection
+
+        if isinstance(native_relation, NativeRelationSelection):
+            pair_rows = native_relation.selection.compact_rowset(
+                surface="geopandas.tools.sjoin._geom_predicate_query",
+                strict_disallowed=False,
+            )
+            compact_relation = native_relation.relation.filter_pairs(pair_rows)
+            l_idx = compact_relation.left_indices
+            r_idx = compact_relation.right_indices
+            sorted_by_left = compact_relation.sorted_by_left
+        else:
+            l_idx = native_relation.left_indices
+            r_idx = native_relation.right_indices
+            sorted_by_left = native_relation.sorted_by_left
         query_implementation = "native_spatial_index"
         query_execution = native_execution
     else:
@@ -986,9 +1028,21 @@ def _geom_predicate_query(
         )
         if owned_result is not None:
             owned_relation, owned_execution = owned_result
-            l_idx = owned_relation.left_indices
-            r_idx = owned_relation.right_indices
-            sorted_by_left = owned_relation.sorted_by_left
+            from vibespatial.api._native_relation import NativeRelationSelection
+
+            if isinstance(owned_relation, NativeRelationSelection):
+                pair_rows = owned_relation.selection.compact_rowset(
+                    surface="geopandas.tools.sjoin._geom_predicate_query",
+                    strict_disallowed=False,
+                )
+                compact_relation = owned_relation.relation.filter_pairs(pair_rows)
+                l_idx = compact_relation.left_indices
+                r_idx = compact_relation.right_indices
+                sorted_by_left = compact_relation.sorted_by_left
+            else:
+                l_idx = owned_relation.left_indices
+                r_idx = owned_relation.right_indices
+                sorted_by_left = owned_relation.sorted_by_left
             query_implementation = "owned_spatial_query"
             query_execution = owned_execution
         else:

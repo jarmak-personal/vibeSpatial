@@ -450,6 +450,8 @@ def _launch_device_wkb_write_kernel(
 def _wkb_upper_bound_bytes(
     state,
     family_selections: dict,
+    *,
+    indexed_view: bool,
 ) -> int:
     """Compute a host-side upper bound for total WKB output bytes.
 
@@ -479,9 +481,9 @@ def _wkb_upper_bound_bytes(
             else fixed_size.max_second_level_count_per_row
         )
         n_coords = (
-            buf.x.shape[0]
-            if max_coords is None
-            else int(max_coords) * n_rows_family
+            int(max_coords) * n_rows_family
+            if indexed_view and max_coords is not None
+            else buf.x.shape[0]
         )
 
         if family is GeometryFamily.POINT:
@@ -490,30 +492,30 @@ def _wkb_upper_bound_bytes(
             total += 9 * n_rows_family + 16 * n_coords
         elif family is GeometryFamily.POLYGON:
             n_rings = (
-                buf.ring_offsets.shape[0] - 1
-                if max_first is None and buf.ring_offsets is not None
-                else int(max_first or 0) * n_rows_family
+                int(max_first or 0) * n_rows_family
+                if indexed_view and max_first is not None
+                else buf.ring_offsets.shape[0] - 1
             )
             total += 9 * n_rows_family + 4 * n_rings + 16 * n_coords
         elif family is GeometryFamily.MULTIPOINT:
             total += 9 * n_rows_family + 21 * n_coords
         elif family is GeometryFamily.MULTILINESTRING:
             n_parts = (
-                buf.part_offsets.shape[0] - 1
-                if max_first is None and buf.part_offsets is not None
-                else int(max_first or 0) * n_rows_family
+                int(max_first or 0) * n_rows_family
+                if indexed_view and max_first is not None
+                else buf.part_offsets.shape[0] - 1
             )
             total += 9 * n_rows_family + 9 * n_parts + 16 * n_coords
         elif family is GeometryFamily.MULTIPOLYGON:
             n_parts = (
-                buf.part_offsets.shape[0] - 1
-                if max_first is None and buf.part_offsets is not None
-                else int(max_first or 0) * n_rows_family
+                int(max_first or 0) * n_rows_family
+                if indexed_view and max_first is not None
+                else buf.part_offsets.shape[0] - 1
             )
             n_rings = (
-                buf.ring_offsets.shape[0] - 1
-                if max_second is None and buf.ring_offsets is not None
-                else int(max_second or 0) * n_rows_family
+                int(max_second or 0) * n_rows_family
+                if indexed_view and max_second is not None
+                else buf.ring_offsets.shape[0] - 1
             )
             total += 9 * n_rows_family + 9 * n_parts + 4 * n_rings + 16 * n_coords
     return total
@@ -546,7 +548,15 @@ def _encode_owned_wkb_column_device(owned: OwnedGeometryArray):
     # Upper-bound allocation: compute total from host-side buffer shapes
     # (no device sync). Slightly over-estimates if invalid rows contribute
     # coordinates to family buffers but are excluded from encoding.
-    total_bytes = _wkb_upper_bound_bytes(state, family_selections) if row_count else 0
+    total_bytes = (
+        _wkb_upper_bound_bytes(
+            state,
+            family_selections,
+            indexed_view=owned.is_indexed_view,
+        )
+        if row_count
+        else 0
+    )
     payload = cp.empty(total_bytes, dtype=cp.uint8)
 
     for family, (row_indexes, family_rows) in family_selections.items():
@@ -1972,6 +1982,13 @@ class _NativeWkbCapacityPlan:
         return rows > 0 and self.admitted_rows(rows) < rows
 
 
+@dataclass(frozen=True)
+class _NativeWkbCompositionLayoutCandidate:
+    ordered_parts: tuple[tuple[int, int, Any], ...] | None
+    parts: tuple[tuple[Any, Any], ...]
+    checks: tuple[Any, ...]
+
+
 def _available_native_wkb_device_bytes() -> int | None:
     """Return bytes allocatable through the active driver and memory pool."""
     try:
@@ -2046,11 +2063,10 @@ def _family_size_proof_complete(family: GeometryFamily, fixed_size) -> bool:
 def _candidate_ordered_composition_parts(composition):
     """Return candidate contiguous parts and device-only certification checks."""
     if (
-        not composition.trusted_singular_rows
-        or composition.residency is not Residency.DEVICE
+        composition.residency is not Residency.DEVICE
         or any(part.collection_position is not None for part in composition.parts)
     ):
-        return None, ()
+        return _NativeWkbCompositionLayoutCandidate(None, (), ())
 
     import cupy as cp
 
@@ -2059,36 +2075,62 @@ def _candidate_ordered_composition_parts(composition):
     for part in composition.parts:
         part_owned = part.geometry.owned
         if part_owned is None:
-            return None, ()
+            return _NativeWkbCompositionLayoutCandidate(None, (), ())
         part_rows = int(part_owned.row_count)
         if part_rows != int(part.output_rows.shape[0]):
-            return None, ()
+            return _NativeWkbCompositionLayoutCandidate(None, (), ())
         if part_rows:
-            owned_parts.append(
-                (total_rows, total_rows + part_rows, part_owned, part.output_rows)
-            )
+            owned_parts.append((part_owned, part.output_rows))
         total_rows += part_rows
-    if total_rows != int(composition.row_count):
-        return None, ()
+    if (
+        composition.contiguous_row_partitions
+        and composition.trusted_singular_rows
+        and total_rows == int(composition.row_count)
+    ):
+        ordered_parts = []
+        start = 0
+        for part_owned, _output_rows in owned_parts:
+            stop = start + int(part_owned.row_count)
+            ordered_parts.append((start, stop, part_owned))
+            start = stop
+        return _NativeWkbCompositionLayoutCandidate(
+            tuple(ordered_parts),
+            tuple(owned_parts),
+            (),
+        )
 
     checks = []
-    if not composition.contiguous_row_partitions:
-        for start, stop, _part_owned, output_rows in owned_parts:
-            rows = cp.asarray(output_rows, dtype=cp.int64)
-            internally_contiguous = (
-                cp.asarray(True)
-                if rows.size == 1
-                else cp.all(rows[1:] == rows[:-1] + cp.int64(1))
-            )
-            checks.append(
-                internally_contiguous
-                & (rows[0] == cp.int64(start))
-                & (rows[-1] == cp.int64(stop - 1))
-            )
-    return tuple(
-        (start, stop, part_owned)
-        for start, stop, part_owned, _output_rows in owned_parts
-    ), tuple(checks)
+    for part_owned, output_rows in owned_parts:
+        state = part_owned._ensure_device_state(preserve_indexed_view=True)
+        d_valid = cp.asarray(state.validity, dtype=cp.bool_)
+        rows = cp.asarray(output_rows, dtype=cp.int64)
+        valid_rows = rows[d_valid]
+        valid_count = valid_rows.size
+        internally_contiguous = (
+            cp.asarray(True)
+            if valid_count <= 1
+            else cp.all(valid_rows[1:] == valid_rows[:-1] + cp.int64(1))
+        )
+        first = valid_rows[0] if valid_count else cp.asarray(0, dtype=cp.int64)
+        last = valid_rows[-1] if valid_count else cp.asarray(0, dtype=cp.int64)
+        checks.append(
+            cp.stack(
+                (
+                    cp.all(d_valid),
+                    cp.all(~d_valid),
+                    internally_contiguous,
+                    first,
+                    last,
+                    cp.asarray(rows.size, dtype=cp.int64),
+                    cp.asarray(valid_count, dtype=cp.int64),
+                )
+            ).astype(cp.int64, copy=False)
+        )
+    return _NativeWkbCompositionLayoutCandidate(
+        None,
+        tuple(owned_parts),
+        tuple(checks),
+    )
 
 
 def _native_wkb_family_output_bytes(
@@ -2183,19 +2225,15 @@ def _plan_native_wkb_capacity(
         sources = ((0, int(owned.row_count), owned),)
         ordered_parts = None
         layout_checks = ()
+        layout_candidate = None
         row_count = int(owned.row_count)
     else:
-        ordered_parts, layout_checks = _candidate_ordered_composition_parts(
-            composition
-        )
-        sources = (
-            ordered_parts
-            if ordered_parts is not None
-            else tuple(
-                (0, int(part.geometry.owned.row_count), part.geometry.owned)
-                for part in composition.parts
-                if part.geometry.owned is not None
-            )
+        layout_candidate = _candidate_ordered_composition_parts(composition)
+        ordered_parts = layout_candidate.ordered_parts
+        layout_checks = layout_candidate.checks
+        sources = tuple(
+            (0, int(part_owned.row_count), part_owned)
+            for part_owned, _output_rows in layout_candidate.parts
         )
         row_count = int(composition.row_count)
 
@@ -2215,7 +2253,7 @@ def _plan_native_wkb_capacity(
             packet_arrays.append(_device_family_size_packet(family, buffer))
 
     packet_arrays.extend(
-        cp.asarray(check, dtype=cp.int64).reshape(1) for check in layout_checks
+        cp.asarray(check, dtype=cp.int64).reshape(-1) for check in layout_checks
     )
     planning_packet_scalars = sum(int(values.size) for values in packet_arrays)
     packet_values: list[int] = []
@@ -2266,9 +2304,57 @@ def _plan_native_wkb_capacity(
         buffer._device_size_bounds_exact = True
 
     if layout_checks:
-        layout_values = packet_values[cursor : cursor + len(layout_checks)]
-        if bool(np.all(layout_values)):
-            object.__setattr__(composition, "contiguous_row_partitions", True)
+        layout_value_count = sum(int(check.size) for check in layout_checks)
+        layout_values = np.asarray(
+            packet_values[cursor : cursor + layout_value_count],
+            dtype=np.int64,
+        ).reshape(len(layout_checks), 7)
+        certified_parts = []
+        certified_start = 0
+        layout_valid = True
+        direct_layout = True
+        for (part_owned, _output_rows), values in zip(
+            layout_candidate.parts,
+            layout_values,
+            strict=True,
+        ):
+            (
+                all_valid,
+                all_invalid,
+                contiguous,
+                first,
+                last,
+                part_rows,
+                valid_rows,
+            ) = values
+            if bool(all_invalid):
+                direct_layout = False
+                continue
+            stop = certified_start + int(valid_rows)
+            if not (
+                bool(contiguous)
+                and int(first) == certified_start
+                and int(last) == stop - 1
+            ):
+                layout_valid = False
+                break
+            if bool(all_valid):
+                selected_owned = part_owned
+            else:
+                state = part_owned._ensure_device_state(preserve_indexed_view=True)
+                d_valid = cp.asarray(state.validity, dtype=cp.bool_)
+                selected_owned = part_owned._device_indexed_take(
+                    cp.flatnonzero(d_valid).astype(cp.int64, copy=False),
+                    assume_unique_indices=True,
+                )
+                direct_layout = False
+            certified_parts.append((certified_start, stop, selected_owned))
+            certified_start = stop
+        if layout_valid and certified_start == int(composition.row_count):
+            ordered_parts = tuple(certified_parts)
+            object.__setattr__(composition, "trusted_singular_rows", True)
+            if direct_layout:
+                object.__setattr__(composition, "contiguous_row_partitions", True)
         else:
             ordered_parts = None
 
@@ -2420,6 +2506,25 @@ def _physicalize_native_wkb_composition_span(composition, start: int, stop: int)
     )
 
 
+def _physical_owned_wkb_live_bytes(owned) -> int | None:
+    """Return an exact structural live-byte bound for one physical WKB page."""
+    if owned.is_indexed_view:
+        return None
+    state = owned._ensure_device_state(preserve_indexed_view=True)
+    family_selections = {}
+    for family in state.families:
+        row_indexes, family_rows = _device_family_row_selection(owned, family)
+        if int(row_indexes.size):
+            family_selections[family] = (row_indexes, family_rows)
+    output_bytes = _wkb_upper_bound_bytes(
+        state,
+        family_selections,
+        indexed_view=False,
+    )
+    row_bytes = int(owned.row_count) * _NATIVE_WKB_ROW_TEMPORARY_BYTES
+    return 2 * output_bytes + row_bytes
+
+
 def _iter_bounded_native_wkb_owned_chunks(*, owned, composition, capacity_plan):
     """Yield capacity-admitted contiguous chunks in logical output order."""
     import cupy as cp
@@ -2457,6 +2562,22 @@ def _iter_bounded_native_wkb_owned_chunks(*, owned, composition, capacity_plan):
         local_start = 0
         part_rows = int(part_owned.row_count)
         while local_start < part_rows:
+            if batch_rows == 0 and local_start == 0:
+                exact_live_bytes = _physical_owned_wkb_live_bytes(part_owned)
+                available_bytes = _available_native_wkb_device_bytes()
+                if (
+                    exact_live_bytes is not None
+                    and part_rows <= capacity_plan.max_chunk_rows
+                    and (
+                        available_bytes is None
+                        or exact_live_bytes
+                        <= int(available_bytes) // _NATIVE_WKB_AVAILABLE_MEMORY_DIVISOR
+                    )
+                ):
+                    yield batch_start, batch_start + part_rows, part_owned
+                    batch_start += part_rows
+                    local_start = part_rows
+                    continue
             if batch_rows == 0:
                 target_batch_rows = capacity_plan.admitted_rows(
                     int(composition.row_count) - batch_start
@@ -2784,10 +2905,7 @@ def _write_geoparquet_native_device_payload(
         owned.residency is not Residency.DEVICE or owned.device_state is None
     ):
         return _NativeDeviceWriteStatus(written=False)
-    if composition is not None and (
-        composition.residency is not Residency.DEVICE
-        or not composition.trusted_singular_rows
-    ):
+    if composition is not None and composition.residency is not Residency.DEVICE:
         return _NativeDeviceWriteStatus(written=False)
     if composition is not None and geometry_encoding.lower() != "wkb":
         return _NativeDeviceWriteStatus(
@@ -2897,6 +3015,8 @@ def _write_geoparquet_native_device_payload(
         )
         if native_row_count:
             capacity_chunk_rows = wkb_capacity_plan.admitted_rows(native_row_count)
+        if composition is not None and not composition.trusted_singular_rows:
+            return _NativeDeviceWriteStatus(written=False)
     if (
         wkb_capacity_plan is not None
         and native_row_count > 0

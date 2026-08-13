@@ -499,10 +499,7 @@ def _extract_batch_coords_device(
     _device_take_family_buffer. Host structural offsets, when still available,
     provide allocation sizes for the nested gather without D->H scalar fences.
     """
-    from vibespatial.geometry.owned import (
-        _device_take_family_buffer,
-        _DeviceTakeFamilySizePlan,
-    )
+    from vibespatial.geometry.owned import _device_take_family_buffer
 
     if invalid_family_rows.size == 0:
         return None
@@ -526,40 +523,6 @@ def _extract_batch_coords_device(
         d_sorted_rows,
         fill_value=0,
     ).astype(cp.int32, copy=False)
-    d_geometry_offsets = cp.asarray(d_buffer.geometry_offsets, dtype=cp.int64)
-    d_ring_offsets = cp.asarray(d_buffer.ring_offsets, dtype=cp.int64)
-    d_geom_starts = d_geometry_offsets[d_unique_rows]
-    d_geom_ends = d_geometry_offsets[d_unique_rows + 1]
-    d_ring_counts = cp.where(
-        d_unique_active,
-        d_geom_ends - d_geom_starts,
-        cp.int64(0),
-    )
-    d_coord_counts = cp.where(
-        d_unique_active,
-        d_ring_offsets[d_geom_ends] - d_ring_offsets[d_geom_starts],
-        cp.int64(0),
-    )
-    d_batch_shape = cp.stack(
-        (
-            cp.sum(d_ring_counts, dtype=cp.int64),
-            cp.sum(d_coord_counts, dtype=cp.int64),
-            cp.max(d_ring_counts),
-            cp.max(d_coord_counts),
-        )
-    )
-    batch_shape = get_cuda_runtime().copy_device_to_host(
-        d_batch_shape,
-        reason="make-valid compact selected-batch shape planning packet",
-    )
-    exact_size_plan = _DeviceTakeFamilySizePlan(
-        first_level_count=int(batch_shape[0]),
-        coord_count=int(batch_shape[1]),
-    )
-    output_fixed_size = DeviceFixedGeometrySizeMetadata(
-        max_first_level_count_per_row=int(batch_shape[2]),
-        max_coord_count_per_row=int(batch_shape[3]),
-    )
     taken = _device_take_family_buffer(
         d_buffer,
         GeometryFamily.POLYGON,
@@ -569,8 +532,6 @@ def _extract_batch_coords_device(
         assume_unique_indices=True,
         active_row_count=unique_selection.logical_count,
         active_row_mask=d_unique_active,
-        exact_size_plan=exact_size_plan,
-        output_fixed_size=output_fixed_size,
     )
 
     if taken.x.size == 0:

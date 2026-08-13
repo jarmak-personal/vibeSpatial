@@ -61,9 +61,8 @@ def test_spatial_epsilon_is_centralized_in_kernel_sources() -> None:
         assert "1e-12" not in source
         assert "VS_SPATIAL_EPSILON" in source
 
-    exact_overlay_source = gpu_kernels._OVERLAY_FACE_LABEL_KERNEL_SOURCE
-    assert "1e-12" not in exact_overlay_source
-    assert "#define OVERLAY_BOUNDARY_TOLERANCE 0.0" in exact_overlay_source
+    assert not hasattr(gpu_kernels, "_OVERLAY_FACE_LABEL_KERNEL_SOURCE")
+    assert "twice_area == 0.0" in gpu_kernels._OVERLAY_FACE_WALK_KERNEL_SOURCE
 
 
 def test_tile_size_defaults_are_centralized() -> None:

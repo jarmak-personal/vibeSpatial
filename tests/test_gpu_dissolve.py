@@ -398,7 +398,7 @@ def test_collective_topology_tile_relation_is_sparse_and_tile_sorted() -> None:
     )
     segments = _extract_segments_gpu(owned)
 
-    relation, host_offsets, d_full_tile_mask, max_pressure = (
+    relation, host_offsets, host_pressure, d_full_tile_mask, max_pressure = (
         _build_topology_tile_candidate_relation(
             owned,
             segments,
@@ -428,8 +428,31 @@ def test_collective_topology_tile_relation_is_sparse_and_tile_sorted() -> None:
     assert relation.left_row_count == 8
     assert relation.right_row_count == 2
     assert host_offsets.shape == (9,)
+    assert host_pressure.shape == (8,)
     assert np.all(np.diff(host_offsets) >= 0)
+    assert np.all(host_pressure >= 0)
     assert max_pressure >= 0
+
+
+def test_collective_topology_batches_sparse_tiles_by_aggregate_pressure() -> None:
+    from vibespatial.constructive.tiled_union import (
+        _TARGET_TILE_SEGMENT_PEER_PRESSURE,
+        _topology_constructive_batch_spans,
+    )
+
+    budget = _TARGET_TILE_SEGMENT_PEER_PRESSURE
+    offsets = np.asarray([0, 2, 2, 5, 9, 9, 10], dtype=np.int64)
+    pressure = np.asarray([budget // 8, 0, budget // 8, budget, 0, 1], dtype=np.int64)
+
+    assert _topology_constructive_batch_spans(
+        offsets,
+        pressure,
+        max_tiles_per_batch=32,
+    ) == (
+        (0, 3),
+        (3, 4),
+        (5, 6),
+    )
 
 
 @pytest.mark.gpu
@@ -488,6 +511,51 @@ def test_collective_topology_scanline_proof_preserves_holes_and_multipart_parts(
     expected = shapely.union_all(geometries)
 
     assert bool(shapely.is_valid(actual))
+    assert shapely.area(shapely.symmetric_difference(actual, expected)) == pytest.approx(
+        0.0,
+        abs=1.0e-10,
+    )
+
+
+@pytest.mark.gpu
+def test_collective_topology_coverage_rows_have_exact_union() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.constructive.tiled_union import (
+        single_group_polygon_collective_coverage_gpu,
+    )
+
+    geometries = np.asarray(
+        [
+            Polygon(
+                [(0.0, 0.0), (12.0, 0.0), (12.0, 12.0), (0.0, 12.0)],
+                holes=[[(3.0, 3.0), (9.0, 3.0), (9.0, 9.0), (3.0, 9.0)]],
+            ),
+            box(4.0, 4.0, 5.0, 5.0),
+            box(7.0, 7.0, 8.0, 8.0),
+        ],
+        dtype=object,
+    )
+    owned = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+    state = owned._ensure_device_state(preserve_indexed_view=True)
+    state.trusted_all_valid = True
+    state.trusted_all_non_empty = True
+
+    coverage = single_group_polygon_collective_coverage_gpu(
+        owned,
+        force_tile_count=32,
+    )
+
+    assert coverage is not None
+    assert coverage.row_count > 1
+    coverage_rows = np.asarray(coverage.to_shapely(), dtype=object)
+    actual = shapely.union_all(coverage_rows)
+    expected = shapely.union_all(geometries)
+    assert float(np.sum(shapely.area(coverage_rows))) == pytest.approx(
+        float(shapely.area(actual)),
+        abs=1.0e-10,
+    )
     assert shapely.area(shapely.symmetric_difference(actual, expected)) == pytest.approx(
         0.0,
         abs=1.0e-10,

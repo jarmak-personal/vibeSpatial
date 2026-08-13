@@ -626,7 +626,7 @@ def test_dual_queue_and_containment_launch_shapes_are_valid_above_65535_faces() 
         KERNEL_PARAM_PTR,
         get_cuda_runtime,
     )
-    from vibespatial.overlay.faces import _DUAL_FACE_QUEUE_MAX_WORKERS
+    from vibespatial.overlay.faces import _DUAL_FACE_QUEUE_MAX_WARPS
     from vibespatial.overlay.gpu import _overlay_face_walk_kernels
 
     face_count = 65_536
@@ -672,14 +672,15 @@ def test_dual_queue_and_containment_launch_shapes_are_valid_above_65535_faces() 
             (KERNEL_PARAM_PTR,) * 10 + (KERNEL_PARAM_I32,),
         ),
     )
+    worker_warps = min(face_count, _DUAL_FACE_QUEUE_MAX_WARPS)
     queue_grid, queue_block = runtime.launch_config(
-        kernels["propagate_dual_face_queue"],
-        min(face_count, _DUAL_FACE_QUEUE_MAX_WORKERS),
+        kernels["propagate_dual_face_queue_warp"],
+        worker_warps * 32,
     )
     assert queue_grid[0] > 1
     assert queue_grid[1:] == (1, 1)
     runtime.launch(
-        kernels["propagate_dual_face_queue"],
+        kernels["propagate_dual_face_queue_warp"],
         grid=queue_grid,
         block=queue_block,
         params=(
@@ -699,8 +700,9 @@ def test_dual_queue_and_containment_launch_shapes_are_valid_above_65535_faces() 
                 ptr(face_component),
                 face_count,
                 face_count,
+                worker_warps,
             ),
-            (KERNEL_PARAM_PTR,) * 13 + (KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+            (KERNEL_PARAM_PTR,) * 13 + (KERNEL_PARAM_I32,) * 3,
         ),
     )
 
@@ -805,6 +807,7 @@ def test_exact_face_labeling_has_no_probe_refinement_or_host_convergence() -> No
     assert "accumulate_component_containment_baseline" not in kernels_source
     assert "blockIdx.y" not in carrier_source
     assert "_build_indexed_component_containment_device_state" in propagation_source
+    assert "select_parent=False" in propagation_source
     assert "reduce_indexed_component_containment" in carrier_source
     assert "select_indexed_component_containment_parent" in carrier_source
     assert "relation_" not in carrier_source
@@ -821,8 +824,17 @@ def test_exact_face_labeling_has_no_probe_refinement_or_host_convergence() -> No
     assert "face_capacity: int" in containment_type
     assert "interval_max_x: DeviceArray" in containment_type
     assert "interval_max_x" in carrier_source
+    assert "root_grid = ((face_count + 7) // 8, 1, 1)" in carrier_source
     assert "root_block = (256, 1, 1)" in carrier_source
+    assert "reduce_indexed_component_containment_adaptive" in carrier_source
+    assert "const int root_pos = blockIdx.x * 8 + warp" in kernels_source
+    assert "if (sh_active_root_count == 1)" in kernels_source
+    assert "propagate_dual_face_queue_warp" in propagation_source
+    assert "_DUAL_FACE_WARP_MIN_AVERAGE_DEGREE" in propagation_source
+    assert "const int worker = global_thread >> 5" in kernels_source
+    assert "for (int pos = start + lane; pos < end; pos += 32)" in kernels_source
     assert "split_depth = tree_depth < 8 ? tree_depth : 8" in kernels_source
+    assert "split_depth = tree_depth < 5 ? tree_depth : 5" in kernels_source
     assert "component_depth[candidate_component] == target_depth" in kernels_source
     assert "cycle_orientation > 0" in graph_source
     assert "signed_area > 0.0" not in graph_source

@@ -843,7 +843,7 @@ class IndexedComponentContainmentDeviceState:
     left_baseline: DeviceArray
     right_baseline: DeviceArray
     component_depth: DeviceArray
-    component_parent: DeviceArray
+    component_parent: DeviceArray | None
     face_capacity: int
     leaf_count: int
     transient_owners: tuple[object, ...] = ()

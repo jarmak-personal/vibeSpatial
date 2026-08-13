@@ -8,6 +8,7 @@ import numpy as np
 from vibespatial.api._native_state import get_native_state
 
 _MAX_INTERSECTION_PAIR_CACHE_ENTRIES = 64
+_MAX_INTERSECTION_PAIR_CACHE_BYTES = 256 * 1024 * 1024
 
 
 def _is_device_array(values) -> bool:
@@ -30,6 +31,42 @@ _INTERSECTION_PAIR_CACHE: OrderedDict[
     tuple[tuple[str, int, int], tuple[str, int, int]],
     _CachedIntersectionPairs,
 ] = OrderedDict()
+
+
+def _pair_cache_array_bytes(values) -> int:
+    if values is None:
+        return 0
+    nbytes = getattr(values, "nbytes", None)
+    if nbytes is not None:
+        return int(nbytes)
+    return int(np.asarray(values).nbytes)
+
+
+def _intersection_pair_cache_bytes() -> int:
+    """Return retained pair-column bytes without double-counting reverse views."""
+    seen: set[int] = set()
+    total = 0
+    for entry in _INTERSECTION_PAIR_CACHE.values():
+        for values in (
+            entry.left_indices,
+            entry.right_indices,
+            entry.device_left_indices,
+            entry.device_right_indices,
+        ):
+            if values is None or id(values) in seen:
+                continue
+            seen.add(id(values))
+            total += _pair_cache_array_bytes(values)
+    return total
+
+
+def _trim_intersection_pair_cache() -> None:
+    while _INTERSECTION_PAIR_CACHE and (
+        len(_INTERSECTION_PAIR_CACHE) > _MAX_INTERSECTION_PAIR_CACHE_ENTRIES
+        or _intersection_pair_cache_bytes() > _MAX_INTERSECTION_PAIR_CACHE_BYTES
+    ):
+        key, _entry = _INTERSECTION_PAIR_CACHE.popitem(last=False)
+        _INTERSECTION_PAIR_CACHE.pop((key[1], key[0]), None)
 
 
 def pair_cache_token(df) -> tuple[str, int, int]:
@@ -144,8 +181,7 @@ def cache_intersection_pairs(left_df, right_df, left_indices, right_indices) -> 
     )
     _INTERSECTION_PAIR_CACHE.move_to_end(left_key)
     _INTERSECTION_PAIR_CACHE.move_to_end(right_key)
-    while len(_INTERSECTION_PAIR_CACHE) > _MAX_INTERSECTION_PAIR_CACHE_ENTRIES:
-        _INTERSECTION_PAIR_CACHE.popitem(last=False)
+    _trim_intersection_pair_cache()
 
 
 def _device_intersection_pairs(left_indices, right_indices):

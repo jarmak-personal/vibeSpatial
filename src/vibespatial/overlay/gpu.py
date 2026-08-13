@@ -1249,7 +1249,15 @@ def _build_overlay_execution_plan(
             else _right_geometry_source_rows
         )
         right_rows_admit_paging = right_source_rows is not None or right.row_count == left.row_count
-        if right_rows_admit_paging:
+        capacity_page_shape = _row_isolated_topology_page_shape(
+            row_count=left.row_count,
+            max_left_segments_per_row=left_span,
+            max_right_segments_per_row=right_span,
+            include_same_side_splits=_include_same_side_splits,
+        )
+        if capacity_page_shape.page_count <= 1:
+            page_shape = capacity_page_shape
+        elif right_rows_admit_paging:
             planned_left_segments = _extract_segments_gpu(left)
             try:
                 planned_right_segments = _extract_segments_gpu(right)
@@ -1266,12 +1274,7 @@ def _build_overlay_execution_plan(
                     planned_right_segments.free()
                 raise
         else:
-            page_shape = _row_isolated_topology_page_shape(
-                row_count=left.row_count,
-                max_left_segments_per_row=left_span,
-                max_right_segments_per_row=right_span,
-                include_same_side_splits=_include_same_side_splits,
-            )
+            page_shape = capacity_page_shape
         if (
             page_shape.page_count > 1
             and int(max_row_id) < left.row_count

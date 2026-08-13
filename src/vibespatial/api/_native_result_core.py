@@ -3249,14 +3249,66 @@ class NativeGeometryComposition:
     def __post_init__(self) -> None:
         if int(self.row_count) < 0:
             raise ValueError("geometry composition row_count must be non-negative")
+        concrete_parts = []
+        null_parts = []
         for part in self.parts:
             if part.geometry.crs != self.crs:
                 raise ValueError("geometry composition part CRS must match composition CRS")
-            if _is_device_array(part.output_rows):
-                continue
-            rows = np.asarray(part.output_rows, dtype=np.int64)
-            if rows.size > 0 and (np.any(rows < 0) or np.any(rows >= int(self.row_count))):
-                raise ValueError("geometry composition output rows are out of bounds")
+            if not _is_device_array(part.output_rows):
+                rows = np.asarray(part.output_rows, dtype=np.int64)
+                if rows.size > 0 and (
+                    np.any(rows < 0) or np.any(rows >= int(self.row_count))
+                ):
+                    raise ValueError("geometry composition output rows are out of bounds")
+            owned = part.geometry.owned
+            if owned is not None:
+                if owned.residency is Residency.DEVICE:
+                    state = owned.device_state
+                    family_empty = state is not None and not state.families
+                else:
+                    family_empty = not owned.families
+                if family_empty and part.collection_position is None:
+                    null_parts.append(part)
+                    continue
+            concrete_parts.append(part)
+        normalized_parts = tuple(concrete_parts or null_parts[:1])
+        if len(normalized_parts) != len(self.parts) or any(
+            normalized is not original
+            for normalized, original in zip(
+                normalized_parts,
+                self.parts,
+                strict=False,
+            )
+        ):
+            object.__setattr__(self, "parts", normalized_parts)
+        if self.trusted_family_domain is None:
+            domains = []
+            for part in normalized_parts:
+                owned = part.geometry.owned
+                if owned is None:
+                    domains.append(None)
+                elif owned.residency is Residency.DEVICE:
+                    state = owned.device_state
+                    domains.append(
+                        None
+                        if state is None
+                        else getattr(state, "trusted_family_domain", None)
+                        or tuple(state.families)
+                    )
+                else:
+                    domains.append(tuple(owned.families))
+            if all(domain is not None for domain in domains):
+                object.__setattr__(
+                    self,
+                    "trusted_family_domain",
+                    tuple(
+                        dict.fromkeys(
+                            family
+                            for domain in domains
+                            for family in domain
+                        )
+                    ),
+                )
 
     @property
     def residency(self) -> Residency:
@@ -3418,6 +3470,8 @@ class NativeGeometryComposition:
             return None
         if any(part.collection_position is not None for part in self.parts):
             return None
+        if self.trusted_singular_rows and self.contiguous_row_partitions:
+            return self
         if self.row_count == 0:
             result = type(self)(
                 parts=(),
@@ -3433,7 +3487,8 @@ class NativeGeometryComposition:
         import cupy as cp
 
         concrete = []
-        d_counts = cp.zeros(self.row_count, dtype=cp.int32)
+        sentinel_row = cp.int64(self.row_count)
+        d_counts_with_sentinel = cp.zeros(self.row_count + 1, dtype=cp.int32)
         for part in self.parts:
             owned = part.geometry.owned
             if owned is None:
@@ -3447,13 +3502,13 @@ class NativeGeometryComposition:
             d_rows = cp.asarray(part.output_rows, dtype=cp.int64)
             if int(d_valid.size) != int(d_rows.size):
                 raise ValueError("composition concrete validity must align with output rows")
-            part_count = int(d_rows.size)
             cp.add.at(
-                d_counts,
-                d_rows[d_nonempty],
-                cp.ones_like(d_rows[d_nonempty], dtype=cp.int32),
+                d_counts_with_sentinel,
+                cp.where(d_nonempty, d_rows, sentinel_row),
+                d_nonempty.astype(cp.int32),
             )
             concrete.append((owned, d_rows, d_valid, d_nonempty))
+        d_counts = d_counts_with_sentinel[: self.row_count]
 
         if not self.trusted_singular_rows:
             singular = _host_array(
@@ -3471,7 +3526,10 @@ class NativeGeometryComposition:
             if not bool(singular[0]):
                 return None
 
-        selected_codes = cp.zeros(self.row_count, dtype=cp.uint64)
+        selected_codes_with_sentinel = cp.zeros(
+            self.row_count + 1,
+            dtype=cp.uint64,
+        )
         part_codes = []
         high_bit = cp.uint64(1) << cp.uint64(63)
         for part_index, (owned, d_rows, d_valid, d_nonempty) in enumerate(concrete):
@@ -3482,11 +3540,12 @@ class NativeGeometryComposition:
             )
             d_codes = cp.where(d_nonempty, d_codes | high_bit, d_codes)
             cp.maximum.at(
-                selected_codes,
-                d_rows[d_valid],
-                d_codes[d_valid],
+                selected_codes_with_sentinel,
+                cp.where(d_valid, d_rows, sentinel_row),
+                cp.where(d_valid, d_codes, cp.uint64(0)),
             )
             part_codes.append(d_codes)
+        selected_codes = selected_codes_with_sentinel[: self.row_count]
 
         selected_parts = []
         for (owned, d_rows, d_valid, _d_nonempty), d_codes in zip(
@@ -3495,19 +3554,12 @@ class NativeGeometryComposition:
             strict=True,
         ):
             d_selected = d_valid & (selected_codes[d_rows] == d_codes)
-            d_lanes = cp.flatnonzero(d_selected).astype(cp.int64, copy=False)
-            if int(d_lanes.size) == 0:
-                continue
             selected_parts.append(
                 NativeGeometryCompositionPart(
-                    geometry=GeometryNativeResult.from_owned(
-                        owned._device_indexed_take(
-                            d_lanes,
-                            assume_unique_indices=True,
-                        ),
-                        crs=self.crs,
+                    geometry=GeometryNativeResult.from_owned(owned, crs=self.crs).mask_capacity(
+                        d_selected
                     ),
-                    output_rows=d_rows[d_lanes],
+                    output_rows=d_rows,
                 )
             )
 

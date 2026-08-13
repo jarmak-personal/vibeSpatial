@@ -715,13 +715,14 @@ class SpatialIndex:
             precomputed_query_bounds=precomputed_query_bounds,
         )
         indices = self._public_relation_indices_to_host(relation, scalar=scalar)
+        relation_metadata = getattr(relation, "relation", relation)
         return (
             self._format_public_relation_output(
                 indices,
                 output_format=output_format,
                 scalar=scalar,
                 query_row_count=query_row_count,
-                tree_row_count=relation.right_row_count,
+                tree_row_count=relation_metadata.right_row_count,
             ),
             execution,
         )
@@ -729,7 +730,18 @@ class SpatialIndex:
     @staticmethod
     def _public_relation_indices_to_host(relation, *, scalar: bool):
         """Export native relation pairs at the public ``sindex.query`` boundary."""
+        from vibespatial.api._native_relation import NativeRelationSelection
         from vibespatial.api._native_result_core import _host_array
+
+        if isinstance(relation, NativeRelationSelection):
+            pair_rows = relation.selection.compact_rowset(
+                surface=(
+                    "vibespatial.api.sindex.SpatialIndex."
+                    "_public_relation_indices_to_host"
+                ),
+                strict_disallowed=False,
+            )
+            relation = relation.relation.filter_pairs(pair_rows)
 
         right = _host_array(
             relation.right_indices,

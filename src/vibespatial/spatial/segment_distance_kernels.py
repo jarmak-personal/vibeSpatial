@@ -115,8 +115,10 @@ extern "C" __device__ inline bool seg_point_in_rings(
     const int ce = ring_offsets[ring + 1];
     if ((ce - cs) < 2) continue;
     bool on_boundary = false;
+    // Distance must not collapse a positive gap into boundary contact. The
+    // fp64 metric path therefore uses exact on-segment classification.
     bool ring_inside = vs_ring_contains_point_with_boundary(
-        px, py, x, y, cs, ce, VS_SPATIAL_EPSILON, &on_boundary);
+        px, py, x, y, cs, ce, 0.0, &on_boundary);
     if (on_boundary) return true;
     if (ring_inside) inside = !inside;
   }
@@ -489,6 +491,176 @@ extern "C" __global__ __launch_bounds__(256, 4) void distance_mpg_mpg_from_owned
   }
   out[i] = sqrt(best);
 }
+
+extern "C" __device__ inline int boundary_range_count(
+    int kind, int row,
+    const int* __restrict__ geometry_offsets,
+    const int* __restrict__ part_offsets
+) {
+  if (kind == 0) return 1;
+  if (kind == 1 || kind == 2)
+    return geometry_offsets[row + 1] - geometry_offsets[row];
+  const int polygon_start = geometry_offsets[row];
+  const int polygon_end = geometry_offsets[row + 1];
+  return part_offsets[polygon_end] - part_offsets[polygon_start];
+}
+
+extern "C" __device__ inline void boundary_coord_range(
+    int kind, int row, int range_index,
+    const int* __restrict__ geometry_offsets,
+    const int* __restrict__ part_offsets,
+    const int* __restrict__ ring_offsets,
+    int* coord_start, int* coord_end
+) {
+  if (kind == 0) {
+    *coord_start = geometry_offsets[row];
+    *coord_end = geometry_offsets[row + 1];
+    return;
+  }
+  if (kind == 1) {
+    const int part = geometry_offsets[row] + range_index;
+    *coord_start = part_offsets[part];
+    *coord_end = part_offsets[part + 1];
+    return;
+  }
+  const int ring = kind == 2
+      ? geometry_offsets[row] + range_index
+      : part_offsets[geometry_offsets[row]] + range_index;
+  *coord_start = ring_offsets[ring];
+  *coord_end = ring_offsets[ring + 1];
+}
+
+extern "C" __device__ inline bool point_in_polygonal_family(
+    double px, double py, int kind, int row,
+    const int* __restrict__ geometry_offsets,
+    const int* __restrict__ part_offsets,
+    const int* __restrict__ ring_offsets,
+    const double* __restrict__ x,
+    const double* __restrict__ y
+) {
+  if (kind == 2) {
+    return seg_point_in_rings(
+        px, py, x, y, ring_offsets,
+        geometry_offsets[row], geometry_offsets[row + 1]);
+  }
+  for (int polygon = geometry_offsets[row]; polygon < geometry_offsets[row + 1]; ++polygon) {
+    if (seg_point_in_rings(
+            px, py, x, y, ring_offsets,
+            part_offsets[polygon], part_offsets[polygon + 1])) return true;
+  }
+  return false;
+}
+
+extern "C" __device__ inline double segment_family_sq_distance(
+    int left_kind, int left_row,
+    const int* __restrict__ left_go,
+    const int* __restrict__ left_po,
+    const int* __restrict__ left_ro,
+    const double* __restrict__ left_x,
+    const double* __restrict__ left_y,
+    int right_kind, int right_row,
+    const int* __restrict__ right_go,
+    const int* __restrict__ right_po,
+    const int* __restrict__ right_ro,
+    const double* __restrict__ right_x,
+    const double* __restrict__ right_y
+) {
+  const int left_ranges = boundary_range_count(left_kind, left_row, left_go, left_po);
+  const int right_ranges = boundary_range_count(right_kind, right_row, right_go, right_po);
+  int left_start, left_end, right_start, right_end;
+  if (right_kind >= 2) {
+    for (int left_range = 0; left_range < left_ranges; ++left_range) {
+      boundary_coord_range(
+          left_kind, left_row, left_range, left_go, left_po, left_ro,
+          &left_start, &left_end);
+      if (left_end > left_start && point_in_polygonal_family(
+              left_x[left_start], left_y[left_start], right_kind, right_row,
+              right_go, right_po, right_ro, right_x, right_y)) return 0.0;
+    }
+  }
+  if (left_kind >= 2) {
+    for (int right_range = 0; right_range < right_ranges; ++right_range) {
+      boundary_coord_range(
+          right_kind, right_row, right_range, right_go, right_po, right_ro,
+          &right_start, &right_end);
+      if (right_end > right_start && point_in_polygonal_family(
+              right_x[right_start], right_y[right_start], left_kind, left_row,
+              left_go, left_po, left_ro, left_x, left_y)) return 0.0;
+    }
+  }
+
+  double best = INFINITY;
+  for (int left_range = 0; left_range < left_ranges; ++left_range) {
+    boundary_coord_range(
+        left_kind, left_row, left_range, left_go, left_po, left_ro,
+        &left_start, &left_end);
+    for (int right_range = 0; right_range < right_ranges; ++right_range) {
+      boundary_coord_range(
+          right_kind, right_row, right_range, right_go, right_po, right_ro,
+          &right_start, &right_end);
+      const double sq = coords_coords_min_sq_dist(
+          left_x, left_y, left_start, left_end,
+          right_x, right_y, right_start, right_end);
+      if (sq < best) best = sq;
+      if (best <= 0.0) return 0.0;
+    }
+  }
+  return best;
+}
+
+// One non-point family span from a shared NativeRelationFamilyPartition.
+extern "C" __global__ __launch_bounds__(256, 4) void distance_family_partition_from_owned(
+    const unsigned char* __restrict__ left_validity,
+    const signed char* __restrict__ left_tags,
+    const int* __restrict__ left_fro,
+    const int* __restrict__ left_go,
+    const int* __restrict__ left_po,
+    const int* __restrict__ left_ro,
+    const unsigned char* __restrict__ left_em,
+    const double* __restrict__ left_x,
+    const double* __restrict__ left_y,
+    int left_tag, int left_kind,
+    const unsigned char* __restrict__ right_validity,
+    const signed char* __restrict__ right_tags,
+    const int* __restrict__ right_fro,
+    const int* __restrict__ right_go,
+    const int* __restrict__ right_po,
+    const int* __restrict__ right_ro,
+    const unsigned char* __restrict__ right_em,
+    const double* __restrict__ right_x,
+    const double* __restrict__ right_y,
+    int right_tag, int right_kind,
+    const int* __restrict__ left_idx,
+    const int* __restrict__ right_idx,
+    const int* __restrict__ source_positions,
+    const long long* __restrict__ source_offset,
+    const long long* __restrict__ logical_count,
+    double* __restrict__ out,
+    int exclusive,
+    int launch_capacity
+) {
+  const long long offset = source_offset[0], count = logical_count[0];
+  const long long stride = (long long)blockDim.x * gridDim.x;
+  for (long long lane = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+       lane < count; lane += stride) {
+    const long long pair = offset + lane;
+    const int out_pos = source_positions[pair];
+    const int li = left_idx[pair], ri = right_idx[pair];
+    if ((exclusive && li == ri) || !left_validity[li] || !right_validity[ri] ||
+        left_tags[li] != left_tag || right_tags[ri] != right_tag) {
+      out[out_pos] = INFINITY;
+      continue;
+    }
+    const int left_row = left_fro[li], right_row = right_fro[ri];
+    if (left_row < 0 || right_row < 0 || left_em[left_row] || right_em[right_row]) {
+      out[out_pos] = INFINITY;
+      continue;
+    }
+    out[out_pos] = sqrt(segment_family_sq_distance(
+        left_kind, left_row, left_go, left_po, left_ro, left_x, left_y,
+        right_kind, right_row, right_go, right_po, right_ro, right_x, right_y));
+  }
+}
 """
 )
 
@@ -503,4 +675,5 @@ _SEGMENT_DISTANCE_KERNEL_NAMES = (
     "distance_pg_pg_from_owned",
     "distance_pg_mpg_from_owned",
     "distance_mpg_mpg_from_owned",
+    "distance_family_partition_from_owned",
 )

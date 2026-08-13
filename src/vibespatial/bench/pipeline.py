@@ -2518,6 +2518,11 @@ def _profile_grouped_capacity_partitions_pipeline(
         stage.metadata["remainder_implementation"] = mixed_remainder_implementation
         stage.metadata["input_carrier"] = "NativeGrouped"
         stage.metadata["result_storage"] = mixed_result.owned.residency.value
+        stage.metadata["result_unique_family_rows"] = (
+            mixed_result.owned._ensure_device_state(
+                preserve_indexed_view=True,
+            ).trusted_unique_family_rows
+        )
         _record_stage_overheads(stage, audit, memory, mixed_result.owned)
 
     with profiler.stage(
@@ -2553,6 +2558,11 @@ def _profile_grouped_capacity_partitions_pipeline(
         stage.metadata["remainder_implementation"] = degenerate_remainder_implementation
         stage.metadata["input_carrier"] = "NativeGrouped"
         stage.metadata["result_storage"] = degenerate_result.owned.residency.value
+        stage.metadata["result_unique_family_rows"] = (
+            degenerate_result.owned._ensure_device_state(
+                preserve_indexed_view=True,
+            ).trusted_unique_family_rows
+        )
         _record_stage_overheads(stage, audit, memory, degenerate_result.owned)
 
     partition_stages = {stage.name: stage for stage in profiler._stages}

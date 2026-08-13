@@ -7,9 +7,42 @@ from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, P
 
 from vibespatial import has_gpu_runtime
 from vibespatial.geometry.buffers import GeometryFamily
+from vibespatial.runtime.precision import PrecisionMode
 from vibespatial.testing import build_owned as _make_owned
 
 pytestmark = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+
+
+def test_point_distance_kernel_guards_inactive_capacity_with_device_count(make_owned):
+    cp = pytest.importorskip("cupy")
+    from vibespatial.spatial.point_distance import compute_point_distance_gpu
+
+    query_owned = make_owned([Point(0, 0), Point(10, 10)])
+    tree_owned = make_owned(
+        [
+            LineString([(0, 2), (2, 2)]),
+            LineString([(10, 12), (12, 12)]),
+        ]
+    )
+    d_left = cp.asarray([0, 1], dtype=cp.int32)
+    d_right = cp.asarray([0, 1], dtype=cp.int32)
+    d_distances = cp.full(2, -123.0, dtype=cp.float64)
+    d_logical_count = cp.asarray([1], dtype=cp.int64)
+
+    ok = compute_point_distance_gpu(
+        query_owned,
+        tree_owned,
+        d_left,
+        d_right,
+        d_distances,
+        2,
+        tree_family=GeometryFamily.LINESTRING,
+        compute_precision=PrecisionMode.FP64,
+        logical_count=d_logical_count,
+    )
+
+    assert ok is True
+    np.testing.assert_allclose(cp.asnumpy(d_distances), [2.0, -123.0])
 
 
 def _compute_distances(query_owned, tree_owned, left_idx, right_idx, tree_family, exclusive=False):

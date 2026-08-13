@@ -1829,6 +1829,28 @@ class TestDeviceResidentConcat:
         assert owned._tags is None
         assert owned._family_row_offsets is None
 
+    def test_empty_deferred_indexed_view_exposes_array_metadata(self) -> None:
+        """A zero-row relation view must resolve metadata from its device base."""
+        cp = pytest.importorskip("cupy")
+
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        base = _make_device_resident([Point(0.0, 0.0)])
+        view = OwnedGeometryArray._indexed_view(
+            base,
+            cp.empty(0, dtype=cp.int64),
+            assume_unique_indices=True,
+            expand_device_metadata=False,
+        )
+        array = DeviceGeometryArray._from_owned(view)
+
+        assert view.device_state is None
+        assert array.nbytes >= 0
+        assert array.is_empty.shape == (0,)
+        assert array.isna().shape == (0,)
+        assert view.device_state is not None
+
     def test_provenance_infer_geom_types_uses_device_family_domain_no_d2h(self) -> None:
         """Provenance type summaries should use resident device family metadata."""
         from vibespatial.cuda._runtime import (

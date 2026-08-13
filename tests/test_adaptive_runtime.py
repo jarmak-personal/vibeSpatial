@@ -228,7 +228,6 @@ def test_overlay_kernel_groups_are_registered() -> None:
     for kernel_name, tag in (
         ("overlay_split", "split"),
         ("overlay_face_walk", "face-walk"),
-        ("overlay_face_label", "face-label"),
         ("overlay_face_assembly", "face-assembly"),
         ("overlay_batch_point_in_ring", "batch-pip"),
         ("overlay_containment_bypass", "containment-bypass"),

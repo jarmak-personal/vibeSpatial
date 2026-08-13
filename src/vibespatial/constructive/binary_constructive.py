@@ -108,6 +108,11 @@ _DIRECT_MULTIPART_PACK_MAX_EXACT_REFINE_PAIRS = 64
 # cannot cost more than the constructive plan it is intended to avoid.
 _DIRECT_MULTIPART_PACK_MAX_EXACT_REFINE_SEGMENT_PAIRS = 8 * 1024 * 1024
 
+# Aggregate root-coordinate capacity is a valid row bound for injective
+# carriers, but only use that conservative proof when expanding it across
+# logical rows remains within one bounded multipart work page.
+_INDEXED_AGGREGATE_SEGMENT_BOUND_MAX_LANES = 8 * 1024 * 1024
+
 # Above this physical shape, repeating a scalar mask's complete boundary in
 # every logical topology row is categorically the wrong plan. Prepare the one
 # physical boundary and prove pass-through/exterior rows before topology.
@@ -2701,6 +2706,20 @@ def _polygon_segment_span_bound(owned: OwnedGeometryArray) -> int | None:
             bound = max(family_bounds)
             owned._active_family_row_segment_capacity_bound = bound
             return bound
+        if device_state.trusted_unique_family_rows is True:
+            aggregate_coord_capacity = sum(
+                int(device_buffer.x.size)
+                for family, device_buffer in device_state.families.items()
+                if family in segment_families
+            )
+            if (
+                int(owned.row_count) * aggregate_coord_capacity
+                <= _INDEXED_AGGREGATE_SEGMENT_BOUND_MAX_LANES
+            ):
+                owned._active_family_row_segment_capacity_bound = (
+                    aggregate_coord_capacity
+                )
+                return aggregate_coord_capacity
         from vibespatial.geometry.owned import ensure_device_geometry_size_bounds
 
         return ensure_device_geometry_size_bounds(
@@ -3488,11 +3507,15 @@ def _indexed_polygonal_part_capacities(
     """Expose indexed Polygon parts through logical row/part-slot capacity."""
     from vibespatial.geometry.owned import ensure_device_geometry_size_bounds
 
-    ensure_device_geometry_size_bounds(
-        owned,
-        reason="constructive indexed polygon-part size planning packet",
+    unique_family_rows = state.trusted_unique_family_rows is True
+    carried_segment_bound = (
+        None if unique_family_rows else _polygon_segment_span_bound(owned)
     )
-    carried_segment_bound = _polygon_segment_span_bound(owned)
+    if not unique_family_rows and carried_segment_bound is None:
+        ensure_device_geometry_size_bounds(
+            owned,
+            reason="constructive indexed polygon-part size planning packet",
+        )
     if carried_segment_bound is not None:
         if max_parts_per_row is None:
             max_parts_per_row = int(carried_segment_bound)
@@ -3513,8 +3536,6 @@ def _indexed_polygonal_part_capacities(
     d_family_rows = cp.asarray(state.family_row_offsets, dtype=cp.int64)
     d_source_rows = cp.arange(owned.row_count, dtype=cp.int32)
     partitions: list[tuple[OwnedGeometryArray, DeviceArray, DeviceArray, int, int]] = []
-    unique_family_rows = state.trusted_unique_family_rows is True
-
     polygon = state.families.get(GeometryFamily.POLYGON)
     if polygon is not None:
         family_capacity = max(int(polygon.geometry_offsets.size) - 1, 0)

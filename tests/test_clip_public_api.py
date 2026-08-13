@@ -1246,9 +1246,7 @@ def test_clip_polygon_area_and_boundary_remnants_use_native_composition() -> Non
         for part in capacity_result.geometry.composition.parts
     )
     d2h_events = get_d2h_transfer_events(clear=True)
-    assert len(d2h_events) == 1
-    assert d2h_events[0].reason == "constructive device geometry row-size planning packet"
-    assert d2h_events[0].bytes_transferred <= 24
+    assert d2h_events == []
 
     exported = native_result.to_geodataframe()
     expected = shapely.intersection(source_geometry, mask)
@@ -1299,7 +1297,6 @@ def test_clip_geometrycollection_ingress_uses_native_grouped_union() -> None:
     d2h_events = get_d2h_transfer_events(clear=True)
     assert [event.reason for event in d2h_events] == [
         "fused multi-root capacity scatter exact allocation packet",
-        "constructive indexed polygon-part size planning packet",
     ]
     assert sum(event.bytes_transferred for event in d2h_events) <= 440
 
@@ -6013,6 +6010,23 @@ def test_clip_rectangle_lower_dimensional_rows_stay_native(
         crs="EPSG:3857",
     )
 
+    import vibespatial.constructive.binary_constructive as binary_constructive_module
+
+    original_binary_constructive = binary_constructive_module.binary_constructive_owned
+
+    def _reject_redundant_rectangle_boundary_difference(op, *args, **kwargs):
+        if op == "difference":
+            raise AssertionError(
+                "rectangle-pair boundary remnants must not reopen generic difference topology"
+            )
+        return original_binary_constructive(op, *args, **kwargs)
+
+    monkeypatch.setattr(
+        binary_constructive_module,
+        "binary_constructive_owned",
+        _reject_redundant_rectangle_boundary_difference,
+    )
+
     native_result = clip_module._clip_homogeneous_polygon_device_candidates_native(
         gdf,
         mask,
@@ -7192,6 +7206,79 @@ def test_clip_consumes_lazy_grouped_union_mask_without_materializing_union() -> 
     expected = shapely.intersection(np.asarray(source_geoms, dtype=object), mask_union)
     actual = np.asarray(result.geometry.array, dtype=object)
     assert result["value"].tolist() == list(range(len(source_geoms)))
+    assert all(
+        shapely.area(shapely.symmetric_difference(got, want)) == pytest.approx(0.0)
+        for got, want in zip(actual, expected, strict=True)
+    )
+
+
+def test_clip_consumes_tiled_collective_coverage_without_union_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+    pytest.importorskip("cupy")
+    from vibespatial.constructive import tiled_union
+
+    monkeypatch.setattr(
+        tiled_union,
+        "_DIRECT_COLLECTIVE_SEGMENT_PEER_PRESSURE",
+        1,
+    )
+    source_geoms = [
+        box(0.25, 0.25, 2.75, 0.75),
+        box(4.25, 0.25, 6.75, 0.75),
+        box(20.0, 20.0, 21.0, 21.0),
+    ]
+    source = vibespatial.GeoDataFrame(
+        {
+            "value": np.arange(len(source_geoms), dtype=np.int32),
+            "geometry": DeviceGeometryArray._from_owned(
+                from_shapely_geometries(source_geoms, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+        },
+        crs="EPSG:3857",
+    )
+    mask_geoms = [
+        box(float(i), 0.0, float(i) + 1.0, 1.0)
+        for i in range(8)
+    ]
+    mask_frame = vibespatial.GeoDataFrame(
+        {
+            "group": np.zeros(len(mask_geoms), dtype=np.int32),
+            "geometry": DeviceGeometryArray._from_owned(
+                from_shapely_geometries(mask_geoms, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+        },
+        crs="EPSG:3857",
+    )
+    dissolved_mask = mask_frame.dissolve(
+        by="group",
+        aggfunc="first",
+        method="unary",
+    ).reset_index()
+
+    vibespatial.clear_dispatch_events()
+    result = clip(source, dissolved_mask, sort=False)
+    dispatch_events = vibespatial.get_dispatch_events(clear=True)
+
+    assert result["value"].tolist() == [0, 1]
+    assert any(
+        event.implementation == "gpu_single_group_tiled_collective_coverage"
+        for event in dispatch_events
+    )
+    assert not any(
+        event.surface == "vibespatial.overlay.dissolve.LazyGroupedUnionOwned"
+        and event.operation == "materialize_grouped_union"
+        for event in dispatch_events
+    )
+    expected = shapely.intersection(
+        np.asarray(source_geoms[:2], dtype=object),
+        shapely.union_all(np.asarray(mask_geoms, dtype=object)),
+    )
+    actual = np.asarray(result.geometry.array, dtype=object)
     assert all(
         shapely.area(shapely.symmetric_difference(got, want)) == pytest.approx(0.0)
         for got, want in zip(actual, expected, strict=True)

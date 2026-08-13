@@ -186,7 +186,7 @@ def test_make_valid_repair_mapping_stays_device_rowset_shaped() -> None:
         repo_root / "src" / "vibespatial" / "overlay" / "faces.py"
     ).read_text()
     assert 'elif operation == "polygonize"' in face_source
-    assert "cp.asarray(ds.signed_area) > 0" in face_source
+    assert "mask = bounded != 0" in face_source
 
     pipeline_source = (
         repo_root

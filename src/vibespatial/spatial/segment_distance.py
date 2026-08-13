@@ -47,6 +47,8 @@ _MLS = GeometryFamily.MULTILINESTRING
 _PG = GeometryFamily.POLYGON
 _MPG = GeometryFamily.MULTIPOLYGON
 
+_FAMILY_KIND = {_LS: 0, _MLS: 1, _PG: 2, _MPG: 3}
+
 _CANONICAL_KERNELS: dict[tuple[GeometryFamily, GeometryFamily], str] = {
     (_LS, _LS): "distance_ls_ls_from_owned",
     (_LS, _MLS): "distance_ls_mls_from_owned",
@@ -184,3 +186,128 @@ def compute_segment_distance_gpu(
 def supported_segment_distance_families() -> frozenset[GeometryFamily]:
     """Return the set of geometry families supported by segment-distance kernels."""
     return frozenset(_FAMILY_ORDER.keys())
+
+
+def compute_segment_distance_partition_gpu(
+    query_owned: OwnedGeometryArray,
+    tree_owned: OwnedGeometryArray,
+    d_left,
+    d_right,
+    d_distances,
+    launch_capacity: int,
+    *,
+    query_family: GeometryFamily,
+    tree_family: GeometryFamily,
+    source_offset,
+    logical_count,
+    source_positions,
+    exclusive: bool = False,
+) -> bool:
+    """Run one non-point family span from a shared relation partition."""
+    left_kind = _FAMILY_KIND.get(query_family)
+    right_kind = _FAMILY_KIND.get(tree_family)
+    if left_kind is None or right_kind is None:
+        return False
+
+    from vibespatial.runtime.residency import Residency, TransferTrigger
+
+    query_owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"partitioned segment distance: left {query_family.name}",
+    )
+    tree_owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"partitioned segment distance: right {tree_family.name}",
+    )
+    left_state = query_owned._ensure_device_state()
+    right_state = tree_owned._ensure_device_state()
+    left_buffer = left_state.families[query_family]
+    right_buffer = right_state.families[tree_family]
+
+    def _offsets(buffer, family):
+        part = (
+            buffer.part_offsets
+            if family in (_MLS, _MPG)
+            else buffer.geometry_offsets
+        )
+        ring = (
+            buffer.ring_offsets
+            if family in (_PG, _MPG)
+            else buffer.geometry_offsets
+        )
+        return part, ring
+
+    left_part, left_ring = _offsets(left_buffer, query_family)
+    right_part, right_ring = _offsets(right_buffer, tree_family)
+    runtime = get_cuda_runtime()
+    ptr = runtime.pointer
+    kernel = _segment_distance_kernels()["distance_family_partition_from_owned"]
+    args = (
+        ptr(left_state.validity),
+        ptr(left_state.tags),
+        ptr(left_state.family_row_offsets),
+        ptr(left_buffer.geometry_offsets),
+        ptr(left_part),
+        ptr(left_ring),
+        ptr(left_buffer.empty_mask),
+        ptr(left_buffer.x),
+        ptr(left_buffer.y),
+        FAMILY_TAGS[query_family],
+        left_kind,
+        ptr(right_state.validity),
+        ptr(right_state.tags),
+        ptr(right_state.family_row_offsets),
+        ptr(right_buffer.geometry_offsets),
+        ptr(right_part),
+        ptr(right_ring),
+        ptr(right_buffer.empty_mask),
+        ptr(right_buffer.x),
+        ptr(right_buffer.y),
+        FAMILY_TAGS[tree_family],
+        right_kind,
+        ptr(d_left),
+        ptr(d_right),
+        ptr(source_positions),
+        ptr(source_offset),
+        ptr(logical_count),
+        ptr(d_distances),
+        1 if exclusive else 0,
+        launch_capacity,
+    )
+    types = (
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_I32,
+    )
+    grid, block = runtime.launch_config(kernel, launch_capacity)
+    runtime.launch(kernel, grid=grid, block=block, params=(args, types))
+    return True

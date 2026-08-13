@@ -31,7 +31,9 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
     cp = None
 
 
-_DUAL_FACE_QUEUE_MAX_WORKERS = 4096
+_DUAL_FACE_QUEUE_MAX_THREADS = 4096
+_DUAL_FACE_QUEUE_MAX_WARPS = 1024
+_DUAL_FACE_WARP_MIN_AVERAGE_DEGREE = 8
 
 
 def _sync_hotpath(runtime) -> None:
@@ -50,6 +52,7 @@ def _build_indexed_component_containment_device_state(
     isolate_rows: bool,
     left_winding=None,
     right_winding=None,
+    select_parent: bool = True,
 ) -> IndexedComponentContainmentDeviceState:
     """Build fixed-capacity exact containment metadata on device."""
     from vibespatial.overlay.gpu import _overlay_face_walk_kernels
@@ -123,18 +126,27 @@ def _build_indexed_component_containment_device_state(
     left_baseline = cp.zeros(face_count, dtype=cp.int32)
     right_baseline = cp.zeros(face_count, dtype=cp.int32)
     component_depth = cp.zeros(face_count, dtype=cp.int32)
-    component_parent = cp.full(face_count, -1, dtype=cp.int32)
+    component_parent = (
+        cp.full(face_count, -1, dtype=cp.int32) if select_parent else None
+    )
     reduce_winding = left_winding is not None and right_winding is not None
     if (left_winding is None) != (right_winding is None):
         raise ValueError("component winding baselines require both winding arrays")
 
-    # This shape intentionally uses one 256-lane block per face-capacity root
-    # lane.  The kernel skips inactive roots and maps its lanes to depth-eight
-    # tree subtrees, preserving block saturation even for one deeply nested root.
-    root_grid = (face_count, 1, 1)
     root_block = (256, 1, 1)
+    if select_parent:
+        # Parent-producing assembly admits deeply nested single components;
+        # retain a full block's depth-eight traversal for that large-single
+        # shape. Coverage-only labeling below is the many-small warp shape.
+        root_grid = (face_count, 1, 1)
+        containment_kernel = kernels["reduce_indexed_component_containment"]
+    else:
+        root_grid = ((face_count + 7) // 8, 1, 1)
+        containment_kernel = kernels[
+            "reduce_indexed_component_containment_adaptive"
+        ]
     runtime.launch(
-        kernels["reduce_indexed_component_containment"],
+        containment_kernel,
         grid=root_grid,
         block=root_block,
         params=(
@@ -162,31 +174,32 @@ def _build_indexed_component_containment_device_state(
             (KERNEL_PARAM_PTR,) * 15 + (KERNEL_PARAM_I32,) * 4,
         ),
     )
-    runtime.launch(
-        kernels["select_indexed_component_containment_parent"],
-        grid=root_grid,
-        block=root_block,
-        params=(
-            (
-                ptr(root_faces),
-                ptr(candidate_faces),
-                ptr(interval_max_x),
-                ptr(face_offsets),
-                ptr(face_edge_ids),
-                ptr(face_bounds),
-                ptr(device.src_x),
-                ptr(device.src_y),
-                ptr(device.row_indices),
-                ptr(face_component),
-                ptr(component_depth),
-                ptr(component_parent),
-                face_count,
-                leaf_count,
-                np.int32(isolate_rows),
+    if select_parent:
+        runtime.launch(
+            kernels["select_indexed_component_containment_parent"],
+            grid=root_grid,
+            block=root_block,
+            params=(
+                (
+                    ptr(root_faces),
+                    ptr(candidate_faces),
+                    ptr(interval_max_x),
+                    ptr(face_offsets),
+                    ptr(face_edge_ids),
+                    ptr(face_bounds),
+                    ptr(device.src_x),
+                    ptr(device.src_y),
+                    ptr(device.row_indices),
+                    ptr(face_component),
+                    ptr(component_depth),
+                    ptr(component_parent),
+                    face_count,
+                    leaf_count,
+                    np.int32(isolate_rows),
+                ),
+                (KERNEL_PARAM_PTR,) * 12 + (KERNEL_PARAM_I32,) * 3,
             ),
-            (KERNEL_PARAM_PTR,) * 12 + (KERNEL_PARAM_I32,) * 3,
-        ),
-    )
+        )
 
     return IndexedComponentContainmentDeviceState(
         face_component=face_component,
@@ -274,34 +287,66 @@ def _gpu_propagate_face_coverage(
                 (KERNEL_PARAM_PTR,) * 10 + (KERNEL_PARAM_I32,),
             ),
         )
-        queue_grid, queue_block = runtime.launch_config(
-            kernels["propagate_dual_face_queue"],
-            min(face_count, _DUAL_FACE_QUEUE_MAX_WORKERS),
+        use_warp_workers = (
+            edge_count
+            >= face_count * _DUAL_FACE_WARP_MIN_AVERAGE_DEGREE
         )
+        if use_warp_workers:
+            worker_warps = min(face_count, _DUAL_FACE_QUEUE_MAX_WARPS)
+            queue_grid, queue_block = runtime.launch_config(
+                kernels["propagate_dual_face_queue_warp"],
+                worker_warps * 32,
+            )
+            queue_kernel = kernels["propagate_dual_face_queue_warp"]
+            queue_values = (
+                ptr(face_offsets),
+                ptr(face_edge_ids),
+                ptr(edge_face_ids),
+                ptr(device.left_coverage_delta),
+                ptr(device.right_coverage_delta),
+                ptr(queue),
+                ptr(queue_head),
+                ptr(queue_tail),
+                ptr(queue_ready),
+                ptr(pending),
+                ptr(left_winding),
+                ptr(right_winding),
+                ptr(face_component),
+                face_count,
+                edge_count,
+                worker_warps,
+            )
+            queue_types = (KERNEL_PARAM_PTR,) * 13 + (KERNEL_PARAM_I32,) * 3
+        else:
+            worker_threads = min(face_count, _DUAL_FACE_QUEUE_MAX_THREADS)
+            queue_grid, queue_block = runtime.launch_config(
+                kernels["propagate_dual_face_queue"],
+                worker_threads,
+            )
+            queue_kernel = kernels["propagate_dual_face_queue"]
+            queue_values = (
+                ptr(face_offsets),
+                ptr(face_edge_ids),
+                ptr(edge_face_ids),
+                ptr(device.left_coverage_delta),
+                ptr(device.right_coverage_delta),
+                ptr(queue),
+                ptr(queue_head),
+                ptr(queue_tail),
+                ptr(queue_ready),
+                ptr(pending),
+                ptr(left_winding),
+                ptr(right_winding),
+                ptr(face_component),
+                face_count,
+                edge_count,
+            )
+            queue_types = (KERNEL_PARAM_PTR,) * 13 + (KERNEL_PARAM_I32,) * 2
         runtime.launch(
-            kernels["propagate_dual_face_queue"],
+            queue_kernel,
             grid=queue_grid,
             block=queue_block,
-            params=(
-                (
-                    ptr(face_offsets),
-                    ptr(face_edge_ids),
-                    ptr(edge_face_ids),
-                    ptr(device.left_coverage_delta),
-                    ptr(device.right_coverage_delta),
-                    ptr(queue),
-                    ptr(queue_head),
-                    ptr(queue_tail),
-                    ptr(queue_ready),
-                    ptr(pending),
-                    ptr(left_winding),
-                    ptr(right_winding),
-                    ptr(face_component),
-                    face_count,
-                    edge_count,
-                ),
-                (KERNEL_PARAM_PTR,) * 13 + (KERNEL_PARAM_I32, KERNEL_PARAM_I32),
-            ),
+            params=(queue_values, queue_types),
         )
         _sync_hotpath(runtime)
 
@@ -316,6 +361,7 @@ def _gpu_propagate_face_coverage(
             isolate_rows=isolate_rows,
             left_winding=left_winding,
             right_winding=right_winding,
+            select_parent=False,
         )
         _sync_hotpath(runtime)
     left_baseline = containment.left_baseline

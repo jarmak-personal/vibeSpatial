@@ -1118,18 +1118,22 @@ extern "C" __global__ void polygon_polygon_de9im_from_owned(
     const int*           left_idx,
     const int*           right_idx,
     unsigned short*      out_mask,
+    const long long*     pair_offset,
     const int*           pair_count_device,
     int                  pair_count
 ) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
   const int effective_pair_count = pair_count_device ? *pair_count_device : pair_count;
-  if (i >= effective_pair_count) return;
+  const int offset = pair_offset ? (int)*pair_offset : 0;
+  for (int local_i = lane; local_i < effective_pair_count; local_i += stride) {
+  const int i = offset + local_i;
 
   const int li = left_idx[i], ri = right_idx[i];
-  if (!left_validity[li] || !right_validity[ri]) { out_mask[i] = 0; return; }
-  if (left_tags[li] != left_tag || right_tags[ri] != right_tag) { out_mask[i] = 0; return; }
+  if (!left_validity[li] || !right_validity[ri]) { out_mask[i] = 0; continue; }
+  if (left_tags[li] != left_tag || right_tags[ri] != right_tag) { out_mask[i] = 0; continue; }
   const int lr = left_fro[li], rr = right_fro[ri];
-  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out_mask[i] = 0; return; }
+  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out_mask[i] = 0; continue; }
 
   // Single polygon: 1 sub-polygon whose rings span the full geometry_offsets range.
   const int l_ring_start = left_go[lr], l_ring_end = left_go[lr + 1];
@@ -1140,6 +1144,7 @@ extern "C" __global__ void polygon_polygon_de9im_from_owned(
       &l_ring_start, &l_ring_end, 1,
       right_x, right_y, right_ro,
       &r_ring_start, &r_ring_end, 1);
+  }
 }
 
 extern "C" __global__ void polygon_polygon_intersects_from_owned(
@@ -1164,18 +1169,22 @@ extern "C" __global__ void polygon_polygon_intersects_from_owned(
     const int*           left_idx,
     const int*           right_idx,
     unsigned char*       out,
+    const long long*     pair_offset,
     const int*           pair_count_device,
     int                  pair_count
 ) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
   const int effective_pair_count = pair_count_device ? *pair_count_device : pair_count;
-  if (i >= effective_pair_count) return;
+  const int offset = pair_offset ? (int)*pair_offset : 0;
+  for (int local_i = lane; local_i < effective_pair_count; local_i += stride) {
+  const int i = offset + local_i;
 
   const int li = left_idx[i], ri = right_idx[i];
-  if (!left_validity[li] || !right_validity[ri]) { out[i] = 0; return; }
-  if (left_tags[li] != left_tag || right_tags[ri] != right_tag) { out[i] = 0; return; }
+  if (!left_validity[li] || !right_validity[ri]) { out[i] = 0; continue; }
+  if (left_tags[li] != left_tag || right_tags[ri] != right_tag) { out[i] = 0; continue; }
   const int lr = left_fro[li], rr = right_fro[ri];
-  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out[i] = 0; return; }
+  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out[i] = 0; continue; }
 
   const int l_ring_start = left_go[lr], l_ring_end = left_go[lr + 1];
   const int r_ring_start = right_go[rr], r_ring_end = right_go[rr + 1];
@@ -1184,6 +1193,7 @@ extern "C" __global__ void polygon_polygon_intersects_from_owned(
       &l_ring_start, &l_ring_end, 1,
       right_x, right_y, right_ro,
       &r_ring_start, &r_ring_end, 1);
+  }
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)
@@ -1257,18 +1267,22 @@ extern "C" __global__ void multipolygon_multipolygon_de9im_from_owned(
     const int*           left_idx,
     const int*           right_idx,
     unsigned short*      out_mask,
+    const long long*     pair_offset,
     const int*           pair_count_device,
     int                  pair_count
 ) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
   const int effective_pair_count = pair_count_device ? *pair_count_device : pair_count;
-  if (i >= effective_pair_count) return;
+  const int offset = pair_offset ? (int)*pair_offset : 0;
+  for (int local_i = lane; local_i < effective_pair_count; local_i += stride) {
+  const int i = offset + local_i;
 
   const int li = left_idx[i], ri = right_idx[i];
-  if (!left_validity[li] || !right_validity[ri]) { out_mask[i] = 0; return; }
-  if (left_tags[li] != left_tag || right_tags[ri] != right_tag) { out_mask[i] = 0; return; }
+  if (!left_validity[li] || !right_validity[ri]) { out_mask[i] = 0; continue; }
+  if (left_tags[li] != left_tag || right_tags[ri] != right_tag) { out_mask[i] = 0; continue; }
   const int lr = left_fro[li], rr = right_fro[ri];
-  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out_mask[i] = 0; return; }
+  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out_mask[i] = 0; continue; }
 
   // MultiPolygon: geometry_offsets gives polygon range, part_offsets gives ring range per polygon.
   const int l_poly_start = left_go[lr], l_poly_end = left_go[lr + 1];
@@ -1276,25 +1290,15 @@ extern "C" __global__ void multipolygon_multipolygon_de9im_from_owned(
   const int n_l = l_poly_end - l_poly_start;
   const int n_r = r_poly_end - r_poly_start;
 
-  // Build ring-start / ring-end arrays from part_offsets.
-  // Stack-allocate for geometries with up to 32 sub-polygons per side.
-  int l_ring_starts[32], l_ring_ends[32];
-  int r_ring_starts[32], r_ring_ends[32];
-
-  const int nl = n_l < 32 ? n_l : 32;
-  const int nr = n_r < 32 ? n_r : 32;
-  for (int p = 0; p < nl; ++p) {
-    l_ring_starts[p] = left_po[l_poly_start + p];
-    l_ring_ends[p]   = left_po[l_poly_start + p + 1];
-  }
-  for (int p = 0; p < nr; ++p) {
-    r_ring_starts[p] = right_po[r_poly_start + p];
-    r_ring_ends[p]   = right_po[r_poly_start + p + 1];
-  }
+  const int* l_ring_starts = left_po + l_poly_start;
+  const int* l_ring_ends = l_ring_starts + 1;
+  const int* r_ring_starts = right_po + r_poly_start;
+  const int* r_ring_ends = r_ring_starts + 1;
 
   out_mask[i] = de9im_polygon_polygon(
-      left_x, left_y, left_ro, l_ring_starts, l_ring_ends, nl,
-      right_x, right_y, right_ro, r_ring_starts, r_ring_ends, nr);
+      left_x, left_y, left_ro, l_ring_starts, l_ring_ends, n_l,
+      right_x, right_y, right_ro, r_ring_starts, r_ring_ends, n_r);
+  }
 }
 
 extern "C" __global__ void multipolygon_multipolygon_intersects_from_owned(
@@ -1321,39 +1325,36 @@ extern "C" __global__ void multipolygon_multipolygon_intersects_from_owned(
     const int*           left_idx,
     const int*           right_idx,
     unsigned char*       out,
+    const long long*     pair_offset,
     const int*           pair_count_device,
     int                  pair_count
 ) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
   const int effective_pair_count = pair_count_device ? *pair_count_device : pair_count;
-  if (i >= effective_pair_count) return;
+  const int offset = pair_offset ? (int)*pair_offset : 0;
+  for (int local_i = lane; local_i < effective_pair_count; local_i += stride) {
+  const int i = offset + local_i;
 
   const int li = left_idx[i], ri = right_idx[i];
-  if (!left_validity[li] || !right_validity[ri]) { out[i] = 0; return; }
-  if (left_tags[li] != left_tag || right_tags[ri] != right_tag) { out[i] = 0; return; }
+  if (!left_validity[li] || !right_validity[ri]) { out[i] = 0; continue; }
+  if (left_tags[li] != left_tag || right_tags[ri] != right_tag) { out[i] = 0; continue; }
   const int lr = left_fro[li], rr = right_fro[ri];
-  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out[i] = 0; return; }
+  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out[i] = 0; continue; }
 
   const int l_poly_start = left_go[lr], l_poly_end = left_go[lr + 1];
   const int r_poly_start = right_go[rr], r_poly_end = right_go[rr + 1];
   const int n_l = l_poly_end - l_poly_start;
   const int n_r = r_poly_end - r_poly_start;
-  int l_ring_starts[32], l_ring_ends[32];
-  int r_ring_starts[32], r_ring_ends[32];
-  const int nl = n_l < 32 ? n_l : 32;
-  const int nr = n_r < 32 ? n_r : 32;
-  for (int p = 0; p < nl; ++p) {
-    l_ring_starts[p] = left_po[l_poly_start + p];
-    l_ring_ends[p]   = left_po[l_poly_start + p + 1];
-  }
-  for (int p = 0; p < nr; ++p) {
-    r_ring_starts[p] = right_po[r_poly_start + p];
-    r_ring_ends[p]   = right_po[r_poly_start + p + 1];
-  }
+  const int* l_ring_starts = left_po + l_poly_start;
+  const int* l_ring_ends = l_ring_starts + 1;
+  const int* r_ring_starts = right_po + r_poly_start;
+  const int* r_ring_ends = r_ring_starts + 1;
 
   out[i] = polygonal_intersects_polygonal(
-      left_x, left_y, left_ro, l_ring_starts, l_ring_ends, nl,
-      right_x, right_y, right_ro, r_ring_starts, r_ring_ends, nr);
+      left_x, left_y, left_ro, l_ring_starts, l_ring_ends, n_l,
+      right_x, right_y, right_ro, r_ring_starts, r_ring_ends, n_r);
+  }
 }
 
 // ---- Polygon × MultiPolygon DE-9IM bitmask ----
@@ -1380,33 +1381,34 @@ extern "C" __global__ void polygon_multipolygon_de9im_from_owned(
     const int*           left_idx,
     const int*           right_idx,
     unsigned short*      out_mask,
+    const long long*     pair_offset,
     const int*           pair_count_device,
     int                  pair_count
 ) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
   const int effective_pair_count = pair_count_device ? *pair_count_device : pair_count;
-  if (i >= effective_pair_count) return;
+  const int offset = pair_offset ? (int)*pair_offset : 0;
+  for (int local_i = lane; local_i < effective_pair_count; local_i += stride) {
+  const int i = offset + local_i;
 
   const int li = left_idx[i], ri = right_idx[i];
-  if (!left_validity[li] || !right_validity[ri]) { out_mask[i] = 0; return; }
-  if (left_tags[li] != left_tag || right_tags[ri] != right_tag) { out_mask[i] = 0; return; }
+  if (!left_validity[li] || !right_validity[ri]) { out_mask[i] = 0; continue; }
+  if (left_tags[li] != left_tag || right_tags[ri] != right_tag) { out_mask[i] = 0; continue; }
   const int lr = left_fro[li], rr = right_fro[ri];
-  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out_mask[i] = 0; return; }
+  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out_mask[i] = 0; continue; }
 
   const int l_ring_start = left_go[lr], l_ring_end = left_go[lr + 1];
 
   const int r_poly_start = right_go[rr], r_poly_end = right_go[rr + 1];
   const int nr = r_poly_end - r_poly_start;
-  int r_ring_starts[32], r_ring_ends[32];
-  const int nr_capped = nr < 32 ? nr : 32;
-  for (int p = 0; p < nr_capped; ++p) {
-    r_ring_starts[p] = right_po[r_poly_start + p];
-    r_ring_ends[p]   = right_po[r_poly_start + p + 1];
-  }
+  const int* r_ring_starts = right_po + r_poly_start;
+  const int* r_ring_ends = r_ring_starts + 1;
 
   out_mask[i] = de9im_polygon_polygon(
       left_x, left_y, left_ro, &l_ring_start, &l_ring_end, 1,
-      right_x, right_y, right_ro, r_ring_starts, r_ring_ends, nr_capped);
+      right_x, right_y, right_ro, r_ring_starts, r_ring_ends, nr);
+  }
 }
 
 extern "C" __global__ void polygon_multipolygon_intersects_from_owned(
@@ -1432,32 +1434,33 @@ extern "C" __global__ void polygon_multipolygon_intersects_from_owned(
     const int*           left_idx,
     const int*           right_idx,
     unsigned char*       out,
+    const long long*     pair_offset,
     const int*           pair_count_device,
     int                  pair_count
 ) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
   const int effective_pair_count = pair_count_device ? *pair_count_device : pair_count;
-  if (i >= effective_pair_count) return;
+  const int offset = pair_offset ? (int)*pair_offset : 0;
+  for (int local_i = lane; local_i < effective_pair_count; local_i += stride) {
+  const int i = offset + local_i;
 
   const int li = left_idx[i], ri = right_idx[i];
-  if (!left_validity[li] || !right_validity[ri]) { out[i] = 0; return; }
-  if (left_tags[li] != left_tag || right_tags[ri] != right_tag) { out[i] = 0; return; }
+  if (!left_validity[li] || !right_validity[ri]) { out[i] = 0; continue; }
+  if (left_tags[li] != left_tag || right_tags[ri] != right_tag) { out[i] = 0; continue; }
   const int lr = left_fro[li], rr = right_fro[ri];
-  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out[i] = 0; return; }
+  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out[i] = 0; continue; }
 
   const int l_ring_start = left_go[lr], l_ring_end = left_go[lr + 1];
   const int r_poly_start = right_go[rr], r_poly_end = right_go[rr + 1];
   const int nr = r_poly_end - r_poly_start;
-  int r_ring_starts[32], r_ring_ends[32];
-  const int nr_capped = nr < 32 ? nr : 32;
-  for (int p = 0; p < nr_capped; ++p) {
-    r_ring_starts[p] = right_po[r_poly_start + p];
-    r_ring_ends[p]   = right_po[r_poly_start + p + 1];
-  }
+  const int* r_ring_starts = right_po + r_poly_start;
+  const int* r_ring_ends = r_ring_starts + 1;
 
   out[i] = polygonal_intersects_polygonal(
       left_x, left_y, left_ro, &l_ring_start, &l_ring_end, 1,
-      right_x, right_y, right_ro, r_ring_starts, r_ring_ends, nr_capped);
+      right_x, right_y, right_ro, r_ring_starts, r_ring_ends, nr);
+  }
 }
 
 // ---- Polygon × single Polygon mask covered_by probe ----
@@ -2396,14 +2399,19 @@ extern "C" __device__ inline unsigned short de9im_line_line(
 
 // Preamble for line-family kernels.
 #define LINE_PREAMBLE(lt, rt) \\
-  const int i = blockIdx.x * blockDim.x + threadIdx.x; \\
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x; \\
+  const int stride = blockDim.x * gridDim.x; \\
   const int effective_pair_count = pair_count_device ? *pair_count_device : pair_count; \\
-  if (i >= effective_pair_count) return; \\
+  const int offset = pair_offset ? (int)*pair_offset : 0; \\
+  for (int local_i = lane; local_i < effective_pair_count; local_i += stride) { \\
+  const int i = offset + local_i; \\
   const int li = left_idx[i], ri = right_idx[i]; \\
-  if (!left_validity[li] || !right_validity[ri]) { out_mask[i] = 0; return; } \\
-  if (left_tags[li] != (lt) || right_tags[ri] != (rt)) { out_mask[i] = 0; return; } \\
+  if (!left_validity[li] || !right_validity[ri]) { out_mask[i] = 0; continue; } \\
+  if (left_tags[li] != (lt) || right_tags[ri] != (rt)) { out_mask[i] = 0; continue; } \\
   const int lr = left_fro[li], rr = right_fro[ri]; \\
-  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out_mask[i] = 0; return; }
+  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out_mask[i] = 0; continue; }
+
+#define LINE_POSTAMBLE }
 
 // ---- LineString × LineString ----
 extern "C" __global__ void ls_ls_de9im_from_owned(
@@ -2412,6 +2420,7 @@ extern "C" __global__ void ls_ls_de9im_from_owned(
     const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
     const int* right_go, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
     const int* left_idx, const int* right_idx, unsigned short* out_mask,
+    const long long* pair_offset,
     const int* pair_count_device, int pair_count
 ) {
   LINE_PREAMBLE(left_tag, right_tag)
@@ -2419,6 +2428,7 @@ extern "C" __global__ void ls_ls_de9im_from_owned(
   const int rcs = right_go[rr], rce = right_go[rr + 1];
   out_mask[i] = de9im_line_line(left_x, left_y, &lcs, &lce, 1,
                                  right_x, right_y, &rcs, &rce, 1);
+  LINE_POSTAMBLE
 }
 
 // ---- LineString × MultiLineString ----
@@ -2428,16 +2438,18 @@ extern "C" __global__ void ls_mls_de9im_from_owned(
     const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
     const int* right_go, const int* right_po, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
     const int* left_idx, const int* right_idx, unsigned short* out_mask,
+    const long long* pair_offset,
     const int* pair_count_device, int pair_count
 ) {
   LINE_PREAMBLE(left_tag, right_tag)
   const int lcs = left_go[lr], lce = left_go[lr + 1];
   const int ps = right_go[rr], pe = right_go[rr + 1];
-  const int np = pe - ps < 32 ? pe - ps : 32;
-  int r_starts[32], r_ends[32];
-  for (int p = 0; p < np; ++p) { r_starts[p] = right_po[ps + p]; r_ends[p] = right_po[ps + p + 1]; }
+  const int np = pe - ps;
+  const int* r_starts = right_po + ps;
+  const int* r_ends = r_starts + 1;
   out_mask[i] = de9im_line_line(left_x, left_y, &lcs, &lce, 1,
                                  right_x, right_y, r_starts, r_ends, np);
+  LINE_POSTAMBLE
 }
 
 // ---- MultiLineString × MultiLineString ----
@@ -2447,21 +2459,23 @@ extern "C" __global__ void mls_mls_de9im_from_owned(
     const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
     const int* right_go, const int* right_po, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
     const int* left_idx, const int* right_idx, unsigned short* out_mask,
+    const long long* pair_offset,
     const int* pair_count_device, int pair_count
 ) {
   LINE_PREAMBLE(left_tag, right_tag)
   const int lps = left_go[lr], lpe = left_go[lr + 1];
-  const int nl = lpe - lps < 32 ? lpe - lps : 32;
-  int l_starts[32], l_ends[32];
-  for (int p = 0; p < nl; ++p) { l_starts[p] = left_po[lps + p]; l_ends[p] = left_po[lps + p + 1]; }
+  const int nl = lpe - lps;
+  const int* l_starts = left_po + lps;
+  const int* l_ends = l_starts + 1;
 
   const int rps = right_go[rr], rpe = right_go[rr + 1];
-  const int nr = rpe - rps < 32 ? rpe - rps : 32;
-  int r_starts[32], r_ends[32];
-  for (int p = 0; p < nr; ++p) { r_starts[p] = right_po[rps + p]; r_ends[p] = right_po[rps + p + 1]; }
+  const int nr = rpe - rps;
+  const int* r_starts = right_po + rps;
+  const int* r_ends = r_starts + 1;
 
   out_mask[i] = de9im_line_line(left_x, left_y, l_starts, l_ends, nl,
                                  right_x, right_y, r_starts, r_ends, nr);
+  LINE_POSTAMBLE
 }
 
 // ---- LineString × Polygon ----
@@ -2471,6 +2485,7 @@ extern "C" __global__ void ls_pg_de9im_from_owned(
     const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
     const int* right_go, const int* right_ro, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
     const int* left_idx, const int* right_idx, unsigned short* out_mask,
+    const long long* pair_offset,
     const int* pair_count_device, int pair_count
 ) {
   LINE_PREAMBLE(left_tag, right_tag)
@@ -2479,6 +2494,7 @@ extern "C" __global__ void ls_pg_de9im_from_owned(
   out_mask[i] = de9im_line_polygon(left_x, left_y, &lcs, &lce, 1,
                                     right_x, right_y, right_ro,
                                     &r_ring_start, &r_ring_end, 1);
+  LINE_POSTAMBLE
 }
 
 // ---- LineString × MultiPolygon ----
@@ -2488,20 +2504,19 @@ extern "C" __global__ void ls_mpg_de9im_from_owned(
     const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
     const int* right_go, const int* right_po, const int* right_ro, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
     const int* left_idx, const int* right_idx, unsigned short* out_mask,
+    const long long* pair_offset,
     const int* pair_count_device, int pair_count
 ) {
   LINE_PREAMBLE(left_tag, right_tag)
   const int lcs = left_go[lr], lce = left_go[lr + 1];
   const int r_poly_start = right_go[rr], r_poly_end = right_go[rr + 1];
-  const int nr = r_poly_end - r_poly_start < 32 ? r_poly_end - r_poly_start : 32;
-  int r_ring_starts[32], r_ring_ends[32];
-  for (int p = 0; p < nr; ++p) {
-    r_ring_starts[p] = right_po[r_poly_start + p];
-    r_ring_ends[p]   = right_po[r_poly_start + p + 1];
-  }
+  const int nr = r_poly_end - r_poly_start;
+  const int* r_ring_starts = right_po + r_poly_start;
+  const int* r_ring_ends = r_ring_starts + 1;
   out_mask[i] = de9im_line_polygon(left_x, left_y, &lcs, &lce, 1,
                                     right_x, right_y, right_ro,
                                     r_ring_starts, r_ring_ends, nr);
+  LINE_POSTAMBLE
 }
 
 // ---- MultiLineString × Polygon ----
@@ -2511,17 +2526,19 @@ extern "C" __global__ void mls_pg_de9im_from_owned(
     const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
     const int* right_go, const int* right_ro, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
     const int* left_idx, const int* right_idx, unsigned short* out_mask,
+    const long long* pair_offset,
     const int* pair_count_device, int pair_count
 ) {
   LINE_PREAMBLE(left_tag, right_tag)
   const int lps = left_go[lr], lpe = left_go[lr + 1];
-  const int nl = lpe - lps < 32 ? lpe - lps : 32;
-  int l_starts[32], l_ends[32];
-  for (int p = 0; p < nl; ++p) { l_starts[p] = left_po[lps + p]; l_ends[p] = left_po[lps + p + 1]; }
+  const int nl = lpe - lps;
+  const int* l_starts = left_po + lps;
+  const int* l_ends = l_starts + 1;
   const int r_ring_start = right_go[rr], r_ring_end = right_go[rr + 1];
   out_mask[i] = de9im_line_polygon(left_x, left_y, l_starts, l_ends, nl,
                                     right_x, right_y, right_ro,
                                     &r_ring_start, &r_ring_end, 1);
+  LINE_POSTAMBLE
 }
 
 // ---- MultiLineString × MultiPolygon ----
@@ -2531,24 +2548,23 @@ extern "C" __global__ void mls_mpg_de9im_from_owned(
     const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
     const int* right_go, const int* right_po_r, const int* right_ro, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
     const int* left_idx, const int* right_idx, unsigned short* out_mask,
+    const long long* pair_offset,
     const int* pair_count_device, int pair_count
 ) {
   LINE_PREAMBLE(left_tag, right_tag)
   const int lps = left_go[lr], lpe = left_go[lr + 1];
-  const int nl = lpe - lps < 32 ? lpe - lps : 32;
-  int l_starts[32], l_ends[32];
-  for (int p = 0; p < nl; ++p) { l_starts[p] = left_po[lps + p]; l_ends[p] = left_po[lps + p + 1]; }
+  const int nl = lpe - lps;
+  const int* l_starts = left_po + lps;
+  const int* l_ends = l_starts + 1;
 
   const int r_poly_start = right_go[rr], r_poly_end = right_go[rr + 1];
-  const int nr = r_poly_end - r_poly_start < 32 ? r_poly_end - r_poly_start : 32;
-  int r_ring_starts[32], r_ring_ends[32];
-  for (int p = 0; p < nr; ++p) {
-    r_ring_starts[p] = right_po_r[r_poly_start + p];
-    r_ring_ends[p]   = right_po_r[r_poly_start + p + 1];
-  }
+  const int nr = r_poly_end - r_poly_start;
+  const int* r_ring_starts = right_po_r + r_poly_start;
+  const int* r_ring_ends = r_ring_starts + 1;
   out_mask[i] = de9im_line_polygon(left_x, left_y, l_starts, l_ends, nl,
                                     right_x, right_y, right_ro,
                                     r_ring_starts, r_ring_ends, nr);
+  LINE_POSTAMBLE
 }
 """
 )

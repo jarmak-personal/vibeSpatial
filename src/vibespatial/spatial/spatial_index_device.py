@@ -48,6 +48,7 @@ from vibespatial.cuda.cccl_primitives import (
     upper_bound,
 )
 from vibespatial.geometry.buffers import GeometryFamily
+from vibespatial.geometry.owned import FAMILY_TAGS
 from vibespatial.kernels.core.spatial_query_kernels import (
     _morton_range_kernels,
     _spatial_query_kernels,
@@ -980,6 +981,11 @@ def _classify_homogeneous_reduction_tile(
     precision_plan: PrecisionPlan | None = None,
     logical_count=None,
     pair_capacity: int | None = None,
+    source_offset=None,
+    launch_capacity: int | None = None,
+    d_exact_out=None,
+    d_relation_scratch=None,
+    d_de9im_scratch=None,
 ):
     """Return one fixed-capacity exact predicate mask for a family pair."""
     import cupy as cp
@@ -1009,6 +1015,10 @@ def _classify_homogeneous_reduction_tile(
             right_family=tree_family,
             precision_plan=precision_plan,
             logical_count=logical_count,
+            source_offset=source_offset,
+            launch_capacity=launch_capacity,
+            predicate_out=d_exact_out,
+            relation_out=d_relation_scratch,
         )
 
     from vibespatial.predicates.binary import _evaluate_de9im_device
@@ -1028,6 +1038,9 @@ def _classify_homogeneous_reduction_tile(
             d_right=d_right,
             d_pair_count=logical_count,
             pair_capacity=pair_capacity,
+            d_pair_offset=source_offset,
+            launch_capacity=launch_capacity,
+            d_out=d_exact_out,
             return_device=True,
         )
     d_masks = compute_polygon_de9im_gpu(
@@ -1039,11 +1052,43 @@ def _classify_homogeneous_reduction_tile(
         d_right=d_right,
         d_pair_count=logical_count,
         pair_capacity=pair_capacity,
+        d_pair_offset=source_offset,
+        launch_capacity=launch_capacity,
+        d_mask=d_de9im_scratch,
         return_device=True,
     )
     if d_masks is None:
         return None
+    if source_offset is not None:
+        from vibespatial.predicates.polygon import evaluate_de9im_grouped_device
+
+        return evaluate_de9im_grouped_device(
+            d_masks,
+            predicate,
+            source_offset=source_offset,
+            logical_count=logical_count,
+            launch_capacity=launch_capacity,
+            out=d_exact_out,
+        )
     return _evaluate_de9im_device(d_masks, predicate)
+
+
+def _family_group_launch_capacities(
+    pair_capacity: int,
+    family_pair_count: int,
+) -> tuple[int, ...]:
+    """Bound aggregate grouped classifier launch lanes by one tile plus metadata."""
+    pair_capacity = int(pair_capacity)
+    family_pair_count = int(family_pair_count)
+    if pair_capacity < 0 or family_pair_count < 0:
+        raise ValueError("grouped launch dimensions must be nonnegative")
+    if family_pair_count == 0:
+        return ()
+    quotient, remainder = divmod(pair_capacity, family_pair_count)
+    return tuple(
+        max(1, quotient + (group_index < remainder))
+        for group_index in range(family_pair_count)
+    )
 
 
 def _morton_reduction_span_schedule(d_starts, d_ends):
@@ -1182,22 +1227,23 @@ def _spatial_index_device_relation_reduction(
     tree_families = tuple(
         family for family in tree_owned.families if tree_owned.family_has_rows(family)
     )
-    if len(query_families) != 1 or len(tree_families) != 1:
-        return None, SpatialQueryExecution(
-            requested=ExecutionMode.GPU,
-            selected=ExecutionMode.CPU,
-            implementation="owned_cpu_spatial_query",
-            reason=(
-                f"native {reduction_name} requires one physical family per side; "
-                "mixed-family reduction retains the canonical relation path"
-            ),
-        )
+    homogeneous_family_pair = len(query_families) == 1 and len(tree_families) == 1
+    family_pairs = tuple(
+        (query_family, tree_family)
+        for query_family in query_families
+        for tree_family in tree_families
+    )
+    family_partition_type = None
+    if not homogeneous_family_pair:
+        from vibespatial.api._native_relation import NativeRelationFamilyPartition
+
+        family_partition_type = NativeRelationFamilyPartition
 
     point_families = {GeometryFamily.POINT, GeometryFamily.MULTIPOINT}
     indexed_point_precision_plan = None
     if predicate is not None and (
-        query_families[0] in point_families
-        or tree_families[0] in point_families
+        any(family in point_families for family in query_families)
+        or any(family in point_families for family in tree_families)
     ):
         from vibespatial.predicates.point_relations import (
             _plan_indexed_point_precision,
@@ -1241,9 +1287,14 @@ def _spatial_index_device_relation_reduction(
     )
     query_tile_rows = max(1, min(query_count, max_tile_lanes // tile_width))
     tile_count = 0
+    family_partition_pass_count = 0
 
     try:
         runtime = get_cuda_runtime()
+        query_state = query_owned._ensure_device_state(preserve_indexed_view=True)
+        tree_state = tree_owned._ensure_device_state(preserve_indexed_view=True)
+        d_query_tags = cp.asarray(query_state.tags, dtype=cp.int8)
+        d_tree_tags = cp.asarray(tree_state.tags, dtype=cp.int8)
         d_query_order, bucket_counts = _morton_reduction_span_schedule(
             state.d_starts,
             state.d_ends,
@@ -1373,7 +1424,7 @@ def _spatial_index_device_relation_reduction(
                         d_reduce_left = d_pair_left
                         d_reduce_right = d_pair_right
                         d_keep = d_active
-                    else:
+                    elif homogeneous_family_pair:
                         d_reduce_left = d_pair_left
                         d_reduce_right = d_pair_right
                         d_exact = _classify_homogeneous_reduction_tile(
@@ -1396,6 +1447,72 @@ def _spatial_index_device_relation_reduction(
                                 reason=f"native {reduction_name} exact refinement declined",
                             )
                         d_keep = d_active & cp.asarray(d_exact, dtype=cp.bool_)
+                    else:
+                        family_partition = family_partition_type.from_pair_capacity(
+                            d_pair_left,
+                            d_pair_right,
+                            d_active,
+                            d_query_tags,
+                            d_tree_tags,
+                            family_count=len(FAMILY_TAGS),
+                        )
+                        family_partition_pass_count += 1
+                        d_exact = cp.zeros(pair_capacity, dtype=cp.bool_)
+                        d_relation_scratch = cp.empty(pair_capacity, dtype=cp.uint8)
+                        d_de9im_scratch = cp.empty(pair_capacity, dtype=cp.uint16)
+                        family_launch_capacities = _family_group_launch_capacities(
+                            pair_capacity,
+                            len(family_pairs),
+                        )
+                        for (
+                            (query_family, tree_family),
+                            family_launch_capacity,
+                        ) in zip(
+                            family_pairs,
+                            family_launch_capacities,
+                            strict=True,
+                        ):
+                            partition = family_partition.family_pair(
+                                left_family=query_family,
+                                right_family=tree_family,
+                                left_family_tag=FAMILY_TAGS[query_family],
+                                right_family_tag=FAMILY_TAGS[tree_family],
+                                launch_capacity=family_launch_capacity,
+                            )
+                            d_partition_count_i32 = cp.asarray(
+                                partition.logical_count,
+                                dtype=cp.int32,
+                            )
+                            d_exact = _classify_homogeneous_reduction_tile(
+                                predicate,
+                                query_owned,
+                                tree_owned,
+                                partition.left_indices,
+                                partition.right_indices,
+                                query_family=query_family,
+                                tree_family=tree_family,
+                                precision_plan=indexed_point_precision_plan,
+                                logical_count=d_partition_count_i32,
+                                pair_capacity=family_launch_capacity,
+                                source_offset=partition.source_offset,
+                                launch_capacity=family_launch_capacity,
+                                d_exact_out=d_exact,
+                                d_relation_scratch=d_relation_scratch,
+                                d_de9im_scratch=d_de9im_scratch,
+                            )
+                            if d_exact is None:
+                                return None, SpatialQueryExecution(
+                                    requested=ExecutionMode.GPU,
+                                    selected=ExecutionMode.CPU,
+                                    implementation="owned_cpu_spatial_query",
+                                    reason=(
+                                        f"native {reduction_name} exact family "
+                                        "partition refinement declined"
+                                    ),
+                                )
+                        d_reduce_left = family_partition.left_indices
+                        d_reduce_right = family_partition.right_indices
+                        d_keep = d_exact
                     if reduction == "right_exists":
                         cp.maximum.at(
                             d_reduced,
@@ -1429,6 +1546,12 @@ def _spatial_index_device_relation_reduction(
             reason=(
                 "range-sliced Morton candidate prefixes reduced directly to "
                 f"{reduction_name} in {tile_count} structural tiles"
+                + (
+                    " with one all-family grouped partition pass per mixed tile "
+                    f"({family_partition_pass_count} passes)"
+                    if family_partition_pass_count
+                    else ""
+                )
             ),
         )
     finally:

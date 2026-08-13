@@ -2330,10 +2330,7 @@ def test_grouped_overlay_difference_device_metadata_path_has_no_runtime_d2h() ->
     actual = np.asarray(result.to_shapely(), dtype=object)
 
     assert result.row_count == 2
-    assert [event.reason for event in runtime_events] == [
-        "overlay compact topology page-weight planning packet",
-        "overlay compact topology work-summary planning packet",
-    ]
+    assert runtime_events == []
     assert sum(event.bytes_transferred for event in runtime_events) <= 32
     for got, want in zip(actual, expected, strict=True):
         assert shapely.symmetric_difference(got, want).area < 1e-8

@@ -1559,9 +1559,9 @@ def coverage_union_all_gpu_owned(
 ) -> OwnedGeometryArray:
     """GPU coverage-optimized union for non-overlapping input.
 
-    The input is lowered to the same one-group constructive carrier as
-    ``union_all_gpu_owned``. Coverage/disjoint proofs can therefore select
-    direct device assembly without changing the execution topology.
+    The input is lowered to the same noded grouped-boundary carrier used by
+    grouped coverage dissolve.  Scalar and grouped coverage reductions must
+    share one canonical assembler so their contour and part ordering agree.
 
     Parameters
     ----------
@@ -1621,17 +1621,33 @@ def coverage_union_all_gpu_owned(
         return owned
 
     if selection.selected is ExecutionMode.GPU and cp is not None:
-        result = _native_grouped_polygon_union_all(
-            owned,
-            precision_plan=precision_plan,
+        from vibespatial.constructive.binary_constructive import (
+            _dispatch_grouped_polygon_known_coverage_union_gpu,
         )
+
+        state = owned._ensure_device_state(preserve_indexed_view=True)
+        d_source_rows = cp.where(
+            cp.asarray(state.validity, dtype=cp.bool_),
+            cp.int32(0),
+            cp.int32(-1),
+        )
+        result = _dispatch_grouped_polygon_known_coverage_union_gpu(
+            owned,
+            d_source_rows,
+            output_row_count=1,
+            dispatch_mode=ExecutionMode.GPU,
+            assume_all_valid=True,
+            d_valid_empty_rows=cp.ones(1, dtype=cp.bool_),
+        )
+        if result is None or result.row_count != 1:
+            raise RuntimeError("native grouped coverage union did not produce one output row")
         record_dispatch_event(
             surface="constructive.coverage_union_all_gpu",
             operation="coverage_union_all",
             implementation=getattr(
                 result,
                 "_native_grouped_union_implementation",
-                "native_grouped_overlay_union_plan",
+                "gpu_grouped_noded_boundary_coverage_assembly",
             ),
             reason=selection.reason,
             detail=(f"rows={row_count}, precision={precision_plan.compute_precision.value}"),

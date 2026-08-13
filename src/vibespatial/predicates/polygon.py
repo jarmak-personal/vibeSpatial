@@ -55,6 +55,8 @@ def _polygon_predicates_kernels():
 _DE9IM_EVAL_KERNEL_NAMES = (
     "transpose_de9im_kernel",
     "evaluate_de9im_kernel",
+    "transpose_de9im_grouped_kernel",
+    "evaluate_de9im_grouped_kernel",
 )
 
 _DE9IM_EVAL_KERNEL_SOURCE = r"""
@@ -127,6 +129,65 @@ extern "C" __global__ void evaluate_de9im_kernel(
     }
     out[i] = value ? 1u : 0u;
 }
+
+extern "C" __global__ void transpose_de9im_grouped_kernel(
+    unsigned short* masks,
+    const long long* source_offset,
+    const int* logical_count
+) {
+    const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    const int offset = (int)source_offset[0];
+    const int count = logical_count[0];
+    for (int local_i = lane; local_i < count; local_i += stride) {
+        const int i = offset + local_i;
+        const unsigned short m = masks[i];
+        unsigned short value = 0;
+        value |= (unsigned short)(m & 1u);
+        value |= (unsigned short)(m & 256u);
+        if (m & 2u) value |= 8u;
+        if (m & 8u) value |= 2u;
+        if (m & 4u) value |= 64u;
+        if (m & 64u) value |= 4u;
+        if (m & 32u) value |= 128u;
+        if (m & 128u) value |= 32u;
+        value |= (unsigned short)(m & 16u);
+        masks[i] = value;
+    }
+}
+
+extern "C" __global__ void evaluate_de9im_grouped_kernel(
+    const unsigned short* masks,
+    unsigned char* out,
+    const long long* source_offset,
+    const int* logical_count,
+    int predicate_code
+) {
+    const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    const int offset = (int)source_offset[0];
+    const int count = logical_count[0];
+    for (int local_i = lane; local_i < count; local_i += stride) {
+        const int i = offset + local_i;
+        const unsigned short m = masks[i];
+        const unsigned short contact = (unsigned short)(1u | 2u | 8u | 16u);
+        bool value = false;
+        switch (predicate_code) {
+            case 0: value = (m & contact) != 0u; break;
+            case 1: value = ((m & (2u | 8u | 16u)) != 0u) && ((m & 1u) == 0u); break;
+            case 2: value = ((m & contact) != 0u) && ((m & (64u | 128u)) == 0u); break;
+            case 3: value = ((m & contact) != 0u) && ((m & (4u | 32u)) == 0u); break;
+            case 4: value = ((m & 1u) == 1u) && ((m & (64u | 128u)) == 0u); break;
+            case 5: value = ((m & 1u) == 1u) && ((m & (4u | 32u)) == 0u); break;
+            case 6: value = ((m & (1u | 4u | 64u)) == (1u | 4u | 64u)); break;
+            case 7: value = (m & contact) == 0u; break;
+            case 8: value = ((m & 1u) == 1u) && ((m & (64u | 128u | 16u)) == 0u); break;
+            case 9: value = ((m & 1u) == 1u) && ((m & (4u | 32u | 64u | 128u)) == 0u); break;
+            default: value = false; break;
+        }
+        out[i] = value ? 1u : 0u;
+    }
+}
 """
 
 request_nvrtc_warmup(
@@ -142,6 +203,47 @@ def _de9im_eval_kernels():
         _DE9IM_EVAL_KERNEL_SOURCE,
         _DE9IM_EVAL_KERNEL_NAMES,
     )
+
+
+def evaluate_de9im_grouped_device(
+    d_masks,
+    predicate: str,
+    *,
+    source_offset,
+    logical_count,
+    launch_capacity: int,
+    out,
+):
+    """Evaluate one device-counted DE-9IM span into shared tile output."""
+    predicate_code = _PREDICATE_DEVICE_CODES.get(predicate)
+    if predicate_code is None:
+        raise ValueError(f"unsupported grouped DE-9IM predicate: {predicate}")
+    runtime = get_cuda_runtime()
+    kernel = _de9im_eval_kernels()["evaluate_de9im_grouped_kernel"]
+    ptr = runtime.pointer
+    grid, block = runtime.launch_config(kernel, int(launch_capacity))
+    runtime.launch(
+        kernel,
+        grid=grid,
+        block=block,
+        params=(
+            (
+                ptr(d_masks),
+                ptr(out),
+                ptr(source_offset),
+                ptr(logical_count),
+                int(predicate_code),
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -756,6 +858,9 @@ def compute_polygonal_intersects_gpu(
     d_right: object | None = None,
     d_pair_count: object | None = None,
     pair_capacity: int | None = None,
+    d_pair_offset: object | None = None,
+    launch_capacity: int | None = None,
+    d_out: object | None = None,
     return_device: bool = False,
 ) -> np.ndarray | None:
     """Evaluate polygonal ``intersects`` as a boolean relation-pair refine.
@@ -829,7 +934,9 @@ def compute_polygonal_intersects_gpu(
         eff_d_left = runtime.from_host(np.ascontiguousarray(eff_left, dtype=np.int32))
     if own_d_right:
         eff_d_right = runtime.from_host(np.ascontiguousarray(eff_right, dtype=np.int32))
-    d_out = runtime.allocate((pair_count,), np.bool_)
+    own_d_out = d_out is None
+    if own_d_out:
+        d_out = runtime.allocate((pair_count,), np.bool_)
 
     try:
         kernels = _polygon_predicates_kernels()
@@ -852,11 +959,13 @@ def compute_polygonal_intersects_gpu(
             ptr(eff_d_left),
             ptr(eff_d_right),
             ptr(d_out),
+            ptr(d_pair_offset),
             ptr(d_pair_count),
             pair_count,
         ]
-        tail_types = [P, P, P, P, I32]
-        grid, block = runtime.launch_config(kernels[kernel_name], pair_count)
+        tail_types = [P, P, P, P, P, I32]
+        launch_items = pair_count if launch_capacity is None else int(launch_capacity)
+        grid, block = runtime.launch_config(kernels[kernel_name], launch_items)
         runtime.launch(
             kernels[kernel_name],
             grid=grid,
@@ -882,7 +991,7 @@ def compute_polygonal_intersects_gpu(
             runtime.free(eff_d_left)
         if own_d_right:
             runtime.free(eff_d_right)
-        if not return_device:
+        if own_d_out and not return_device:
             runtime.free(d_out)
 
 
@@ -898,6 +1007,9 @@ def compute_polygon_de9im_gpu(
     d_right: object | None = None,
     d_pair_count: object | None = None,
     pair_capacity: int | None = None,
+    d_pair_offset: object | None = None,
+    launch_capacity: int | None = None,
+    d_mask: object | None = None,
     return_device: bool = False,
 ) -> np.ndarray | None:
     """Compute DE-9IM bitmasks for geometry candidate pairs on GPU.
@@ -1002,7 +1114,9 @@ def compute_polygon_de9im_gpu(
         eff_d_left = runtime.from_host(np.ascontiguousarray(eff_left, dtype=np.int32))
     if own_d_right:
         eff_d_right = runtime.from_host(np.ascontiguousarray(eff_right, dtype=np.int32))
-    d_mask = runtime.allocate((pair_count,), np.uint16)
+    own_d_mask = d_mask is None
+    if own_d_mask:
+        d_mask = runtime.allocate((pair_count,), np.uint16)
 
     try:
         kernels = _polygon_predicates_kernels()
@@ -1015,15 +1129,17 @@ def compute_polygon_de9im_gpu(
             ptr(eff_d_left),
             ptr(eff_d_right),
             ptr(d_mask),
+            ptr(d_pair_offset),
             ptr(d_pair_count),
             pair_count,
         ]
-        tail_types = [P, P, P, P, I32]
+        tail_types = [P, P, P, P, P, I32]
 
         all_args = tuple(left_args + right_args + tail_args)
         all_types = tuple(left_types + right_types + tail_types)
 
-        grid, block = runtime.launch_config(kernels[kernel_name], pair_count)
+        launch_items = pair_count if launch_capacity is None else int(launch_capacity)
+        grid, block = runtime.launch_config(kernels[kernel_name], launch_items)
         runtime.launch(
             kernels[kernel_name],
             grid=grid,
@@ -1034,7 +1150,33 @@ def compute_polygon_de9im_gpu(
             # Return device-resident CuPy array — caller takes ownership.
             # No sync needed: CuPy ops on the same stream are ordered.
             if swap:
-                d_mask = _transpose_de9im_device(d_mask)
+                if d_pair_offset is None:
+                    d_mask = _transpose_de9im_device(d_mask)
+                else:
+                    transpose_kernel = _de9im_eval_kernels()[
+                        "transpose_de9im_grouped_kernel"
+                    ]
+                    transpose_grid, transpose_block = runtime.launch_config(
+                        transpose_kernel,
+                        launch_items,
+                    )
+                    runtime.launch(
+                        transpose_kernel,
+                        grid=transpose_grid,
+                        block=transpose_block,
+                        params=(
+                            (
+                                ptr(d_mask),
+                                ptr(d_pair_offset),
+                                ptr(d_pair_count),
+                            ),
+                            (
+                                KERNEL_PARAM_PTR,
+                                KERNEL_PARAM_PTR,
+                                KERNEL_PARAM_PTR,
+                            ),
+                        ),
+                    )
             return d_mask
 
         runtime.synchronize()
@@ -1055,7 +1197,7 @@ def compute_polygon_de9im_gpu(
             runtime.free(eff_d_left)
         if own_d_right:
             runtime.free(eff_d_right)
-        if not return_device:
+        if own_d_mask and not return_device:
             runtime.free(d_mask)
 
 

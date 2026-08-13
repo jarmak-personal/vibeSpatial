@@ -118,7 +118,7 @@ def test_grouped_union_capacity_noops_keep_row_indirected_group_shape() -> None:
     assert "grouped union degenerate topology admission packet" not in function_source
     assert "d_admission_flags" not in function_source
     assert "safe_parts = device_select_owned_capacity_partitions(" in function_source
-    assert "degenerate_parts = device_select_owned_capacity_partitions(" in function_source
+    assert "degenerate_parts = device_take_owned_capacity_selection(" in function_source
     assert "cp.flatnonzero(" not in function_source
 
 
@@ -291,7 +291,7 @@ def test_polygon_global_union_filters_at_device_row_capacity() -> None:
         "_native_grouped_polygon_union_all("
     )
     assert coverage_source.index("retain_device_capacity=polygonal_gpu") < coverage_source.index(
-        "_native_grouped_polygon_union_all("
+        "_dispatch_grouped_polygon_known_coverage_union_gpu("
     )
 
 
@@ -1036,14 +1036,15 @@ class TestCoverageUnionAllGPU:
 
     def test_native_grouped_failure_propagates_without_cpu_retry(self, monkeypatch):
         """Coverage reduction must not switch engines after admission."""
+        from vibespatial.constructive import binary_constructive as binary_module
         from vibespatial.constructive import union_all as union_all_module
 
         def _fail_grouped(*_args, **_kwargs):
             raise RuntimeError("forced native coverage failure")
 
         monkeypatch.setattr(
-            union_all_module,
-            "_native_grouped_polygon_union_all",
+            binary_module,
+            "_dispatch_grouped_polygon_known_coverage_union_gpu",
             _fail_grouped,
         )
         owned = from_shapely_geometries(

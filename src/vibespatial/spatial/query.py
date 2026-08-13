@@ -159,6 +159,64 @@ def _indices_to_device_result(
     return (result, execution) if return_metadata else result
 
 
+def _sort_relation_selection_capacity(result):
+    """Lexicographically sort active relation lanes without reading their count."""
+    import cupy as cp
+
+    from vibespatial.api._native_relation import (
+        NativeRelation,
+        NativeRelationSelection,
+    )
+
+    if not isinstance(result, NativeRelationSelection):
+        raise TypeError("capacity relation sort requires NativeRelationSelection")
+    if result.capacity == 0:
+        return result
+
+    active = result.selection.active_capacity_mask()
+    d_left = result.selection.gather_capacity(
+        result.relation.left_indices,
+        fill_value=0,
+    ).astype(cp.int32, copy=False)
+    d_right = result.selection.gather_capacity(
+        result.relation.right_indices,
+        fill_value=0,
+    ).astype(cp.int32, copy=False)
+    inactive_key = (~active).astype(cp.int8, copy=False)
+    order = cp.lexsort(
+        cp.stack(
+            (
+                d_right.astype(cp.int64, copy=False),
+                d_left.astype(cp.int64, copy=False),
+                inactive_key.astype(cp.int64, copy=False),
+            )
+        )
+    )
+    relation = result.relation
+    return NativeRelationSelection(
+        relation=NativeRelation(
+            left_indices=d_left[order],
+            right_indices=d_right[order],
+            left_token=relation.left_token,
+            right_token=relation.right_token,
+            predicate=relation.predicate,
+            distances=(
+                None
+                if relation.distances is None
+                else result.selection.gather_capacity(
+                    relation.distances,
+                    fill_value=0.0,
+                )[order]
+            ),
+            left_row_count=relation.left_row_count,
+            right_row_count=relation.right_row_count,
+            sorted_by_left=True,
+            duplicate_policy=relation.duplicate_policy,
+        ),
+        selection=result.selection.as_capacity_prefix(),
+    )
+
+
 def _regular_grid_max_cells_per_query(
     flat_index,
     query_owned: OwnedGeometryArray | None,
@@ -637,8 +695,8 @@ def query_spatial_index(
             )
 
         # Try GPU dwithin refinement first.
-        # When return_device is requested, ask _dwithin_refine_gpu to keep
-        # results on device (CuPy arrays) to avoid D->H + H->D round-trip.
+        # Strict device return preserves dynamic cardinality in a native
+        # capacity-backed relation selection.
         gpu_dwithin_result = _dwithin_refine_gpu(
             query_owned,
             tree_owned,
@@ -649,12 +707,19 @@ def query_spatial_index(
             return_device=return_device,
         )
         if gpu_dwithin_result is not None:
-            (left_idx, right_idx), used_shapely_fallback = gpu_dwithin_result
+            refined_pairs, used_shapely_fallback = gpu_dwithin_result
             dwithin_used_shapely_fallback = used_shapely_fallback
+            from vibespatial.api._native_relation import NativeRelationSelection
+
+            pair_work_count = (
+                refined_pairs.capacity
+                if isinstance(refined_pairs, NativeRelationSelection)
+                else refined_pairs[0].size
+            )
             refine_selection = _planned_query_runtime_selection(
                 kernel_name="dwithin_refine",
                 kernel_class=KernelClass.METRIC,
-                row_count=left_idx.size,
+                row_count=pair_work_count,
                 requested_mode=ExecutionMode.CPU if used_shapely_fallback else ExecutionMode.GPU,
                 gpu_available=True,
                 reason=(
@@ -663,38 +728,59 @@ def query_spatial_index(
                     else "GPU candidate generation with Shapely dwithin refinement"
                 ),
             )
-            # When return_device is True and results are already device-
-            # resident CuPy arrays, return early to avoid the generic
-            # return_device block which would D->H->D round-trip via
-            # cp.asarray.  The _dwithin_refine_gpu(return_device=True)
-            # path keeps indices on device throughout.
+            if isinstance(refined_pairs, NativeRelationSelection):
+                if return_device and not used_shapely_fallback:
+                    if sort:
+                        refined_pairs = _sort_relation_selection_capacity(refined_pairs)
+                    execution = SpatialQueryExecution(
+                        requested=ExecutionMode.AUTO,
+                        selected=ExecutionMode.GPU,
+                        implementation="owned_gpu_spatial_query",
+                        reason="repo-owned GPU bbox candidate generation with GPU exact predicate refinement",
+                    )
+                    return (
+                        (refined_pairs, execution)
+                        if return_metadata
+                        else refined_pairs
+                    )
+
+                compact_rows = refined_pairs.selection.compact_rowset(
+                    surface="vibespatial.spatial.query.query_spatial_index",
+                    strict_disallowed=False,
+                )
+                compact_relation = refined_pairs.relation.filter_pairs(compact_rows)
+                from vibespatial.cuda._runtime import get_cuda_runtime
+
+                runtime = get_cuda_runtime()
+                left_idx = runtime.copy_device_to_host(
+                    compact_relation.left_indices,
+                    reason="dwithin fallback left-index terminal host export",
+                )
+                right_idx = runtime.copy_device_to_host(
+                    compact_relation.right_indices,
+                    reason="dwithin fallback right-index terminal host export",
+                )
+            else:
+                left_idx, right_idx = refined_pairs
             if (
                 return_device
                 and not used_shapely_fallback
                 and hasattr(left_idx, "__cuda_array_interface__")
             ):
-                import cupy as _cp_dw
-
                 execution = SpatialQueryExecution(
                     requested=ExecutionMode.AUTO,
                     selected=ExecutionMode.GPU,
                     implementation="owned_gpu_spatial_query",
                     reason="repo-owned GPU bbox candidate generation with GPU exact predicate refinement",
                 )
-                d_left = left_idx.astype(_cp_dw.int32, copy=False)
-                d_right = right_idx.astype(_cp_dw.int32, copy=False)
-                if sort and d_left.size > 0:
-                    order = _cp_dw.lexsort(
-                        _cp_dw.stack([d_right.astype(_cp_dw.int64), d_left.astype(_cp_dw.int64)])
-                    )
-                    d_left = d_left[order]
-                    d_right = d_right[order]
-                device_result = DeviceSpatialJoinResult(
-                    d_left_idx=d_left,
-                    d_right_idx=d_right,
-                    sorted_by_left=True,
+                return _indices_to_device_result(
+                    left_idx,
+                    right_idx,
+                    sort=sort,
+                    execution=execution,
+                    return_metadata=return_metadata,
+                    grouped_by_left=True,
                 )
-                return (device_result, execution) if return_metadata else device_result
         else:
             if gpu_candidate_gen:
                 record_shapely_fallback_event(

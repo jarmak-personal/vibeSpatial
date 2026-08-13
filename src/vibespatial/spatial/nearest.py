@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -61,7 +62,13 @@ from vibespatial.kernels.core.spatial_query_kernels import (  # noqa: E402
 from vibespatial.runtime import has_gpu_runtime  # noqa: E402
 from vibespatial.runtime.config import SPATIAL_EPSILON  # noqa: E402
 from vibespatial.runtime.crossover import PhysicalWorkEstimate  # noqa: E402
-from vibespatial.runtime.precision import KernelClass  # noqa: E402
+from vibespatial.runtime.precision import (  # noqa: E402
+    CoordinateStats,
+    KernelClass,
+    PrecisionMode,
+    PrecisionPlan,
+    select_precision_plan,
+)
 from vibespatial.runtime.residency import Residency, TransferTrigger  # noqa: E402
 
 from .query_candidates import (  # noqa: E402
@@ -94,6 +101,298 @@ from .query_utils import (  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
+_FP32_DISTANCE_ERROR_FACTOR = 16.0
+
+
+@dataclass(frozen=True)
+class _NearestMetricPrecisionContext:
+    """Resolved plans and fp32 decision envelope for nearest metrics."""
+
+    coarse_plan: PrecisionPlan
+    refinement_plan: PrecisionPlan | None
+    fp32_error_bound: Any
+
+    def refinement_context(self) -> _NearestMetricPrecisionContext:
+        if self.refinement_plan is None:
+            return self
+        return type(self)(
+            coarse_plan=self.refinement_plan,
+            refinement_plan=None,
+            fp32_error_bound=0.0,
+        )
+
+
+def _nearest_coordinate_stats_device(
+    query_owned: OwnedGeometryArray,
+    tree_owned: OwnedGeometryArray,
+) -> CoordinateStats:
+    """Reduce cached device bounds to the compact stats PrecisionPlan needs.
+
+    Bounds are native metadata under ADR-0044.  Reducing those four values per
+    row avoids scanning authoritative host coordinate buffers.  Only the five
+    planning scalars cross to the host, in one observable transfer.
+    """
+    import cupy as cp
+
+    max_abs_parts = []
+    min_x_parts = []
+    max_x_parts = []
+    min_y_parts = []
+    max_y_parts = []
+    for owned in (query_owned, tree_owned):
+        owned.move_to(
+            Residency.DEVICE,
+            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+            reason="nearest precision planning consumes device geometry metadata",
+        )
+        bounds = cp.asarray(compute_geometry_bounds_device(owned)).reshape(-1, 4)
+        finite = cp.isfinite(bounds)
+        max_abs_parts.append(cp.max(cp.where(finite, cp.abs(bounds), 0.0)))
+        min_x_parts.append(cp.min(cp.where(finite[:, 0], bounds[:, 0], cp.inf)))
+        max_x_parts.append(cp.max(cp.where(finite[:, 2], bounds[:, 2], -cp.inf)))
+        min_y_parts.append(cp.min(cp.where(finite[:, 1], bounds[:, 1], cp.inf)))
+        max_y_parts.append(cp.max(cp.where(finite[:, 3], bounds[:, 3], -cp.inf)))
+
+    packed = cp.stack(
+        (
+            cp.max(cp.stack(max_abs_parts)),
+            cp.min(cp.stack(min_x_parts)),
+            cp.max(cp.stack(max_x_parts)),
+            cp.min(cp.stack(min_y_parts)),
+            cp.max(cp.stack(max_y_parts)),
+        )
+    )
+    host_stats = get_cuda_runtime().copy_device_to_host(
+        packed,
+        reason="nearest precision device-coordinate-stats planning export",
+    )
+    max_abs, min_x, max_x, min_y, max_y = (float(value) for value in host_stats)
+    if not all(np.isfinite(value) for value in (min_x, max_x, min_y, max_y)):
+        return CoordinateStats()
+    return CoordinateStats(
+        max_abs_coord=max_abs,
+        span=max(0.0, max_x - min_x, max_y - min_y),
+    )
+
+
+def _plan_nearest_metric_precision(
+    query_owned: OwnedGeometryArray,
+    tree_owned: OwnedGeometryArray,
+    pair_count: int,
+) -> _NearestMetricPrecisionContext:
+    """Resolve coarse and selective-refinement plans for candidate distances."""
+    coordinate_stats = _nearest_coordinate_stats_device(query_owned, tree_owned)
+    adaptive_plan = plan_dispatch_selection(
+        kernel_name="nearest_point_family_distance",
+        kernel_class=KernelClass.METRIC,
+        row_count=query_owned.row_count,
+        requested_mode=ExecutionMode.GPU,
+        current_residency=combined_residency(query_owned, tree_owned),
+        coordinate_stats=coordinate_stats,
+        gpu_available=True,
+        work_estimate=PhysicalWorkEstimate.for_candidate_pairs(
+            row_count=query_owned.row_count,
+            candidate_pair_count=pair_count,
+            primary_unit_name="nearest-distance-candidate-pair",
+        ),
+    )
+    coarse_plan = adaptive_plan.precision_plan
+    if coarse_plan.compute_precision is not PrecisionMode.FP32:
+        return _NearestMetricPrecisionContext(coarse_plan, None, 0.0)
+
+    refinement_plan = select_precision_plan(
+        runtime_selection=adaptive_plan.runtime_selection,
+        kernel_class=KernelClass.METRIC,
+        requested=PrecisionMode.FP64,
+        coordinate_stats=coordinate_stats,
+        device_profile=adaptive_plan.device_profile,
+    )
+    # Centered fp32 perturbs each coordinate by at most roughly one fp32 ulp.
+    # Distance is Lipschitz in both operands; the factor also covers the
+    # projection arithmetic in point-to-segment kernels.  Candidates within
+    # twice this bound of the coarse minimum are refined below.
+    error_bound = (
+        _FP32_DISTANCE_ERROR_FACTOR
+        * float(np.finfo(np.float32).eps)
+        * max(coordinate_stats.span, 1.0)
+    )
+    return _NearestMetricPrecisionContext(coarse_plan, refinement_plan, error_bound)
+
+
+def _plan_device_resident_metric_precision(
+    query_owned: OwnedGeometryArray,
+    tree_owned: OwnedGeometryArray,
+    pair_count: int,
+) -> _NearestMetricPrecisionContext:
+    """Resolve metric compute precision without crossing the device boundary.
+
+    This is for strict device-return pipelines whose ordering or threshold
+    decisions must remain device-resident.  Point-distance kernels center fp32
+    coordinates unconditionally, so host-visible coordinate statistics are not
+    needed to execute the selected plan safely; the decision envelope below is
+    itself a device scalar.
+    """
+    adaptive_plan = plan_dispatch_selection(
+        kernel_name="device_resident_point_family_distance",
+        kernel_class=KernelClass.METRIC,
+        row_count=query_owned.row_count,
+        requested_mode=ExecutionMode.GPU,
+        current_residency=combined_residency(query_owned, tree_owned),
+        gpu_available=True,
+        work_estimate=PhysicalWorkEstimate.for_candidate_pairs(
+            row_count=query_owned.row_count,
+            candidate_pair_count=pair_count,
+            primary_unit_name="device-distance-candidate-pair",
+        ),
+    )
+    coarse_plan = adaptive_plan.precision_plan
+    if coarse_plan.compute_precision is not PrecisionMode.FP32:
+        return _NearestMetricPrecisionContext(coarse_plan, None, 0.0)
+
+    refinement_plan = select_precision_plan(
+        runtime_selection=adaptive_plan.runtime_selection,
+        kernel_class=KernelClass.METRIC,
+        requested=PrecisionMode.FP64,
+        device_profile=adaptive_plan.device_profile,
+    )
+    return _NearestMetricPrecisionContext(
+        coarse_plan=coarse_plan,
+        refinement_plan=refinement_plan,
+        fp32_error_bound=_nearest_fp32_error_bound_device(query_owned, tree_owned),
+    )
+
+
+def _nearest_fp32_error_bound_device(
+    query_owned: OwnedGeometryArray,
+    tree_owned: OwnedGeometryArray,
+):
+    """Return the centered-fp32 distance envelope as a device scalar."""
+    import cupy as cp
+
+    min_x_parts = []
+    max_x_parts = []
+    min_y_parts = []
+    max_y_parts = []
+    for owned in (query_owned, tree_owned):
+        bounds = cp.asarray(compute_geometry_bounds_device(owned)).reshape(-1, 4)
+        finite = cp.isfinite(bounds)
+        min_x_parts.append(cp.min(cp.where(finite[:, 0], bounds[:, 0], cp.inf)))
+        max_x_parts.append(cp.max(cp.where(finite[:, 2], bounds[:, 2], -cp.inf)))
+        min_y_parts.append(cp.min(cp.where(finite[:, 1], bounds[:, 1], cp.inf)))
+        max_y_parts.append(cp.max(cp.where(finite[:, 3], bounds[:, 3], -cp.inf)))
+    span_x = cp.max(cp.stack(max_x_parts)) - cp.min(cp.stack(min_x_parts))
+    span_y = cp.max(cp.stack(max_y_parts)) - cp.min(cp.stack(min_y_parts))
+    span = cp.maximum(cp.maximum(span_x, span_y), 1.0)
+    return _FP32_DISTANCE_ERROR_FACTOR * float(np.finfo(np.float32).eps) * span
+
+
+def _nearest_ambiguity_mask_host(
+    left_idx: np.ndarray,
+    distances: np.ndarray,
+    n_queries: int,
+    *,
+    max_distance: float,
+    error_bound: float,
+) -> np.ndarray:
+    """Select coarse pairs that can alter nearest ordering, ties, or bounds."""
+    finite = np.isfinite(distances)
+    min_distance = np.full(n_queries, np.inf, dtype=np.float64)
+    np.minimum.at(min_distance, left_idx, np.where(finite, distances, np.inf))
+    pair_min = min_distance[left_idx]
+    tie_tolerance = 1e-8 + 1e-5 * np.abs(pair_min)
+    ordering_ambiguous = distances <= pair_min + (2.0 * error_bound) + tie_tolerance
+    threshold_ambiguous = (
+        np.abs(distances - max_distance) <= error_bound
+        if np.isfinite(max_distance)
+        else np.zeros(distances.shape, dtype=np.bool_)
+    )
+    return ~finite | ordering_ambiguous | threshold_ambiguous
+
+
+def _refine_ambiguous_point_family_distances(
+    query_owned: OwnedGeometryArray,
+    tree_owned: OwnedGeometryArray,
+    d_left,
+    d_right,
+    d_distances,
+    pair_count: int,
+    n_queries: int,
+    strategy: DistanceStrategy,
+    precision_context: _NearestMetricPrecisionContext,
+    *,
+    max_distance: float,
+    exclusive: bool,
+    center_device=None,
+) -> None:
+    """Recompute an ambiguity prefix at source-pair capacity without a count fence."""
+    if precision_context.refinement_plan is None or pair_count == 0:
+        return
+
+    import cupy as cp
+
+    seg_starts = lower_bound_counting(d_left, 0, n_queries, dtype=np.int32).astype(
+        cp.int32, copy=False
+    )
+    seg_ends = upper_bound_counting(d_left, 0, n_queries, dtype=np.int32).astype(
+        cp.int32, copy=False
+    )
+    d_finite_distances = cp.where(cp.isfinite(d_distances), d_distances, cp.inf)
+    coarse_min = segmented_reduce_min(
+        d_finite_distances,
+        seg_starts,
+        seg_ends,
+        num_segments=n_queries,
+    ).values
+    pair_min = coarse_min[d_left]
+    tie_tolerance = 1e-8 + 1e-5 * cp.abs(pair_min)
+    error_bound = precision_context.fp32_error_bound
+    ordering_ambiguous = d_distances <= pair_min + (2.0 * error_bound) + tie_tolerance
+    threshold_ambiguous = (
+        cp.abs(d_distances - max_distance) <= error_bound
+        if np.isfinite(max_distance)
+        else cp.zeros(pair_count, dtype=cp.bool_)
+    )
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+
+    ambiguity_selection = NativeDeviceSelection.from_mask(
+        ~cp.isfinite(d_distances) | ordering_ambiguous | threshold_ambiguous,
+        source_row_count=pair_count,
+    )
+    d_refine_left = ambiguity_selection.gather_capacity(d_left, fill_value=0).astype(
+        cp.int32,
+        copy=False,
+    )
+    d_refine_right = ambiguity_selection.gather_capacity(d_right, fill_value=0).astype(
+        cp.int32,
+        copy=False,
+    )
+
+    runtime = get_cuda_runtime()
+    d_refined = runtime.allocate((ambiguity_selection.capacity,), np.float64)
+    try:
+        ok = strategy.compute(
+            query_owned,
+            tree_owned,
+            d_refine_left,
+            d_refine_right,
+            d_refined,
+            ambiguity_selection.capacity,
+            exclusive=exclusive,
+            precision_plan=precision_context.refinement_plan,
+            logical_count=ambiguity_selection.logical_count,
+            center_device=center_device,
+        )
+        if ok:
+            d_partition = ambiguity_selection.partition_capacity_positions()
+            d_distances[d_partition] = cp.where(
+                ambiguity_selection.active_capacity_mask(),
+                cp.asarray(d_refined),
+                d_distances[d_partition],
+            )
+    finally:
+        runtime.free(d_refined)
+
+
 def _empty_nearest_result(return_distance: bool):
     """Return a canonical empty nearest result."""
     empty = np.empty((2, 0), dtype=np.intp)
@@ -113,6 +412,8 @@ def _empty_nearest_result_device(return_distance: bool):
 
 
 def _points_only(owned: OwnedGeometryArray) -> bool:
+    if owned._validity is None or owned._tags is None:
+        return frozenset(owned.families) <= {GeometryFamily.POINT}
     point_tag = FAMILY_TAGS[GeometryFamily.POINT]
     valid = owned.validity
     return bool((not valid.any()) or np.all(owned.tags[valid] == point_tag))
@@ -214,6 +515,9 @@ def _detect_regular_grid_point_index(owned: OwnedGeometryArray) -> RegularGridPo
 
 def _single_family(owned: OwnedGeometryArray) -> GeometryFamily | None:
     """Return the single geometry family if all valid rows share one, else None."""
+    if owned._validity is None or owned._tags is None:
+        families = tuple(owned.families)
+        return families[0] if len(families) == 1 else None
     valid = owned.validity
     if not valid.any():
         return None
@@ -547,6 +851,9 @@ class DistanceStrategy(ABC):
         pair_count: int,
         *,
         exclusive: bool = False,
+        precision_plan: PrecisionPlan | None = None,
+        logical_count=None,
+        center_device=None,
     ) -> bool:
         """Compute distances for candidate pairs on GPU.
 
@@ -589,6 +896,9 @@ class PointPointDistanceStrategy(DistanceStrategy):
         pair_count: int,
         *,
         exclusive: bool = False,
+        precision_plan: PrecisionPlan | None = None,
+        logical_count=None,
+        center_device=None,
     ) -> bool:
         self.move_to_device(
             query_owned,
@@ -624,6 +934,9 @@ class PointFamilyDistanceStrategy(DistanceStrategy):
         pair_count: int,
         *,
         exclusive: bool = False,
+        precision_plan: PrecisionPlan | None = None,
+        logical_count=None,
+        center_device=None,
     ) -> bool:
         from .point_distance import compute_point_distance_gpu
 
@@ -633,6 +946,12 @@ class PointFamilyDistanceStrategy(DistanceStrategy):
             query_reason="nearest: GPU point-distance refinement for query points",
             tree_reason=f"nearest: GPU point-distance refinement for tree {self.tree_family.name}",
         )
+        if precision_plan is None:
+            precision_plan = _plan_nearest_metric_precision(
+                query_owned,
+                tree_owned,
+                pair_count,
+            ).coarse_plan
         return compute_point_distance_gpu(
             query_owned,
             tree_owned,
@@ -642,6 +961,9 @@ class PointFamilyDistanceStrategy(DistanceStrategy):
             pair_count,
             tree_family=self.tree_family,
             exclusive=exclusive,
+            compute_precision=precision_plan.compute_precision,
+            logical_count=logical_count,
+            center_device=center_device,
         )
 
 
@@ -662,6 +984,9 @@ class SegmentFamilyDistanceStrategy(DistanceStrategy):
         pair_count: int,
         *,
         exclusive: bool = False,
+        precision_plan: PrecisionPlan | None = None,
+        logical_count=None,
+        center_device=None,
     ) -> bool:
         from .segment_distance import compute_segment_distance_gpu
 
@@ -722,7 +1047,26 @@ def _nearest_refine_gpu_typed(
         d_left = sorted_result.keys
         d_right = sorted_result.values
 
-        # Compute distances using the strategy.
+        precision_context = (
+            (
+                _plan_device_resident_metric_precision(
+                    query_owned,
+                    tree_owned,
+                    pair_count,
+                )
+                if return_device
+                else _plan_nearest_metric_precision(query_owned, tree_owned, pair_count)
+            )
+            if isinstance(strategy, PointFamilyDistanceStrategy)
+            else None
+        )
+        center_device = None
+        if isinstance(strategy, PointFamilyDistanceStrategy):
+            from vibespatial.spatial.point_distance import compute_distance_center_device
+
+            center_device = compute_distance_center_device(query_owned, tree_owned)
+
+        # Compute distances using the strategy and resolved PrecisionPlan.
         ok = strategy.compute(
             query_owned,
             tree_owned,
@@ -731,9 +1075,29 @@ def _nearest_refine_gpu_typed(
             d_distances,
             pair_count,
             exclusive=exclusive,
+            precision_plan=(
+                precision_context.coarse_plan if precision_context is not None else None
+            ),
+            center_device=center_device,
         )
         if not ok:
             return None
+
+        if precision_context is not None:
+            _refine_ambiguous_point_family_distances(
+                query_owned,
+                tree_owned,
+                d_left,
+                d_right,
+                d_distances,
+                pair_count,
+                n_queries,
+                strategy,
+                precision_context,
+                max_distance=max_distance,
+                exclusive=exclusive,
+                center_device=center_device,
+            )
 
         # Run shared refinement pipeline.
         return _refine_nearest_from_device_distances(
@@ -1904,6 +2268,11 @@ def _compute_pair_distances_gpu(
     if query_family == point_family:
         from .point_distance import compute_point_distance_gpu
 
+        precision_context = _plan_nearest_metric_precision(
+            query_owned,
+            tree_owned,
+            pair_count,
+        )
         return compute_point_distance_gpu(
             query_owned,
             tree_owned,
@@ -1912,11 +2281,17 @@ def _compute_pair_distances_gpu(
             d_distances,
             pair_count,
             tree_family=tree_family,
+            compute_precision=precision_context.coarse_plan.compute_precision,
         )
 
     if tree_family == point_family:
         from .point_distance import compute_point_distance_gpu
 
+        precision_context = _plan_nearest_metric_precision(
+            query_owned,
+            tree_owned,
+            pair_count,
+        )
         return compute_point_distance_gpu(
             tree_owned,
             query_owned,
@@ -1925,6 +2300,7 @@ def _compute_pair_distances_gpu(
             d_distances,
             pair_count,
             tree_family=query_family,
+            compute_precision=precision_context.coarse_plan.compute_precision,
         )
 
     # Non-point x non-point
@@ -1955,6 +2331,7 @@ def _compute_multipoint_distances_gpu(
     *,
     target_family: GeometryFamily,
     exclusive: bool = False,
+    precision_plan: PrecisionPlan | None = None,
 ) -> np.ndarray | None:
     """Compute multipoint->geometry distances via coord expansion + segmented min.
 
@@ -2006,6 +2383,13 @@ def _compute_multipoint_distances_gpu(
     # Create a temporary point OwnedGeometryArray from the MP's coord arrays.
     temp_point_owned = _make_point_owned_from_coords(mp_buffer.x, mp_buffer.y)
 
+    if precision_plan is None:
+        precision_plan = _plan_nearest_metric_precision(
+            mp_owned,
+            target_owned,
+            total_expanded,
+        ).coarse_plan
+
     runtime = get_cuda_runtime()
     d_exp_left = runtime.from_host(np.ascontiguousarray(expanded_point_idx))
     d_exp_right = runtime.from_host(np.ascontiguousarray(expanded_target_idx))
@@ -2047,6 +2431,7 @@ def _compute_multipoint_distances_gpu(
                 total_expanded,
                 tree_family=target_family,
                 exclusive=exclusive,
+                compute_precision=precision_plan.compute_precision,
             )
 
         if not ok:
@@ -2099,6 +2484,7 @@ def _compute_mixed_distances_gpu(
     device_candidates: object | None = None,
     *,
     record_fallback_event: bool = True,
+    precision_context: _NearestMetricPrecisionContext | None = None,
 ) -> tuple[np.ndarray, bool] | None:
     """Compute distances for candidate pairs with mixed geometry families.
 
@@ -2124,6 +2510,12 @@ def _compute_mixed_distances_gpu(
     runtime = get_cuda_runtime()
     distances = np.full(pair_count, np.inf, dtype=np.float64)
     used_shapely_fallback = False
+    if precision_context is None:
+        precision_context = _plan_nearest_metric_precision(
+            query_owned,
+            tree_owned,
+            pair_count,
+        )
 
     _dc = device_candidates
     _use_device_idx = _dc is not None and hasattr(_dc, "d_left")
@@ -2210,6 +2602,7 @@ def _compute_mixed_distances_gpu(
                     sub_right,
                     target_family=rf,
                     exclusive=exclusive,
+                    precision_plan=precision_context.coarse_plan,
                 )
             else:
                 mp_result = _compute_multipoint_distances_gpu(
@@ -2219,6 +2612,7 @@ def _compute_mixed_distances_gpu(
                     sub_left,
                     target_family=lf,
                     exclusive=exclusive,
+                    precision_plan=precision_context.coarse_plan,
                 )
             if mp_result is not None:
                 distances[sub_idx] = mp_result
@@ -2238,6 +2632,7 @@ def _compute_mixed_distances_gpu(
                         sub_count,
                         tree_family=rf,
                         exclusive=exclusive,
+                        compute_precision=precision_context.coarse_plan.compute_precision,
                     )
                 else:
                     ok = compute_point_distance_gpu(
@@ -2249,6 +2644,7 @@ def _compute_mixed_distances_gpu(
                         sub_count,
                         tree_family=lf,
                         exclusive=exclusive,
+                        compute_precision=precision_context.coarse_plan.compute_precision,
                     )
                 if ok:
                     sub_distances = np.empty(sub_count, dtype=np.float64)
@@ -2331,23 +2727,21 @@ def _dwithin_refine_gpu(
     device_candidates: _DeviceCandidates | None = None,
     *,
     return_device: bool = False,
-) -> tuple[tuple[np.ndarray, np.ndarray], bool] | None:
+) -> tuple[object, bool] | None:
     """GPU dwithin refinement: distance <= threshold filter.
 
-    Device-side pipeline (ADR-0033 Tier 2 CuPy for threshold + compact):
+    Device-side pipeline (ADR-0033 Tier 2 CuPy for threshold + selection):
       1. Compute distances on device via mixed-distance kernels (Tier 1)
       2. Build per-pair thresholds on device (Tier 2 CuPy)
       3. Apply distance <= threshold filter on device (Tier 2 CuPy)
-      4. Compact surviving indices on device (Tier 2 CuPy flatnonzero)
-      5. Single D->H transfer of filtered index arrays (unless return_device)
+      4. Represent surviving indices as a capacity-backed native relation
+      5. Compact only at the terminal host export when return_device is false
 
-    When *return_device* is True, the surviving index arrays are returned as
-    CuPy device arrays, avoiding a D->H round-trip when the caller will
-    immediately re-upload them (e.g. the ``return_device`` path in
-    ``query_spatial_index``).
+    When *return_device* is True, a ``NativeRelationSelection`` preserves the
+    source-pair capacity and device logical count for downstream native work.
 
-    Returns ``(left_idx, right_idx)`` on success, or ``None``
-    when the GPU runtime is unavailable.
+    Returns a ``NativeRelationSelection`` for strict device output, compact
+    host index arrays otherwise, or ``None`` when GPU refinement is unavailable.
     """
     if not has_gpu_runtime():
         return None
@@ -2365,19 +2759,49 @@ def _dwithin_refine_gpu(
     if pair_count == 0:
         empty = np.empty(0, dtype=np.int32)
         if return_device:
-            return (cp.asarray(empty, dtype=cp.int32), cp.asarray(empty, dtype=cp.int32)), False
+            from vibespatial.api._native_relation import NativeRelation
+            from vibespatial.api._native_rowset import NativeDeviceSelection
+
+            relation = NativeRelation(
+                left_indices=cp.asarray(empty, dtype=cp.int32),
+                right_indices=cp.asarray(empty, dtype=cp.int32),
+                predicate="dwithin",
+                left_row_count=query_owned.row_count,
+                right_row_count=tree_owned.row_count,
+            )
+            return relation.filter_pairs_selection(
+                NativeDeviceSelection.from_mask(
+                    cp.empty(0, dtype=cp.bool_),
+                    source_row_count=0,
+                )
+            ), False
         return (empty, empty), False
 
     # --- Device-side distance computation ---
     # Accumulate distances in a device CuPy array instead of host numpy.
+    precision_context = _plan_device_resident_metric_precision(
+        query_owned,
+        tree_owned,
+        pair_count,
+    )
+    pointset_families = {GeometryFamily.POINT, GeometryFamily.MULTIPOINT}
+    distance_center_device = None
+    if (set(query_owned.families) | set(tree_owned.families)) & pointset_families:
+        from vibespatial.spatial.point_distance import compute_distance_center_device
+
+        distance_center_device = compute_distance_center_device(query_owned, tree_owned)
     d_distances_result = _compute_mixed_distances_gpu_device(
         query_owned,
         tree_owned,
         left_idx,
         right_idx,
         device_candidates=device_candidates,
+        precision_context=precision_context,
+        center_device=distance_center_device,
     )
     if d_distances_result is None:
+        if return_device:
+            return None
         # Fall back to host-side path.
         if left_idx is None or right_idx is None:
             if not _use_device_idx:
@@ -2409,30 +2833,90 @@ def _dwithin_refine_gpu(
         d_left_all = cp.asarray(left_idx, dtype=cp.int32)
         d_right_all = cp.asarray(right_idx, dtype=cp.int32)
     d_thresholds = d_thresholds_all[d_left_all]
+
+    # Distances close enough to a threshold that centered fp32 rounding could
+    # change the boolean decision are selected at source-pair capacity.  Each
+    # point-family launch consumes a device logical count, so inactive lanes
+    # return before fp64 work and no exact cardinality crosses to Python.
+    if precision_context.refinement_plan is not None and distance_center_device is not None:
+        from vibespatial.api._native_rowset import NativeDeviceSelection
+
+        query_tags = cp.asarray(query_owned._ensure_device_state().tags, dtype=cp.int8)[
+            d_left_all
+        ]
+        tree_tags = cp.asarray(tree_owned._ensure_device_state().tags, dtype=cp.int8)[
+            d_right_all
+        ]
+        point_tag = FAMILY_TAGS[GeometryFamily.POINT]
+        multipoint_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
+        pointset_pair = (
+            (query_tags == point_tag)
+            | (query_tags == multipoint_tag)
+            | (tree_tags == point_tag)
+            | (tree_tags == multipoint_tag)
+        )
+        ambiguity_selection = NativeDeviceSelection.from_mask(
+            pointset_pair
+            & (
+                ~cp.isfinite(d_distances)
+                | (
+                    cp.abs(d_distances - d_thresholds)
+                    <= precision_context.fp32_error_bound
+                )
+            ),
+            source_row_count=pair_count,
+        )
+        d_ambiguous_left = ambiguity_selection.gather_capacity(
+            d_left_all,
+            fill_value=0,
+        ).astype(cp.int32, copy=False)
+        d_ambiguous_right = ambiguity_selection.gather_capacity(
+            d_right_all,
+            fill_value=0,
+        ).astype(cp.int32, copy=False)
+        d_ambiguity_active = ambiguity_selection.active_capacity_mask()
+        d_ambiguity_partition = ambiguity_selection.partition_capacity_positions()
+        refined = _compute_mixed_distances_gpu_device(
+            query_owned,
+            tree_owned,
+            d_ambiguous_left,
+            d_ambiguous_right,
+            precision_context=precision_context.refinement_context(),
+            pair_active=d_ambiguity_active,
+            source_positions=d_ambiguity_partition,
+            output_distances=d_distances,
+            center_device=distance_center_device,
+        )
+        if refined is None:
+            return None
+        d_distances, _ = refined
+
     d_keep = d_distances <= d_thresholds
 
-    # --- Device-side compaction (Tier 2 CuPy flatnonzero) ---
-    d_keep_idx = cp.flatnonzero(d_keep)
+    if return_device:
+        from vibespatial.api._native_relation import NativeRelation
+        from vibespatial.api._native_rowset import NativeDeviceSelection
 
-    if d_keep_idx.size == 0:
-        empty = np.empty(0, dtype=np.int32 if left_idx is None else left_idx.dtype)
-        if return_device:
-            return (
-                cp.asarray(empty, dtype=cp.int32),
-                cp.asarray(empty, dtype=cp.int32),
-            ), used_shapely_fallback
-        return (empty, empty), used_shapely_fallback
+        relation = NativeRelation(
+            left_indices=d_left_all.astype(cp.int32, copy=False),
+            right_indices=d_right_all.astype(cp.int32, copy=False),
+            predicate="dwithin",
+            left_row_count=query_owned.row_count,
+            right_row_count=tree_owned.row_count,
+        )
+        return relation.filter_pairs_selection(
+            NativeDeviceSelection.from_mask(
+                d_keep,
+                source_row_count=pair_count,
+            )
+        ), used_shapely_fallback
+
+    # Public/host output is an explicit terminal compaction boundary.
+    d_keep_idx = cp.flatnonzero(d_keep)
 
     # Gather surviving indices on device.
     d_left_result = d_left_all[d_keep_idx]
     d_right_result = d_right_all[d_keep_idx]
-
-    if return_device:
-        # Keep results on device -- caller will consume them directly.
-        return (
-            d_left_result.astype(cp.int32, copy=False),
-            d_right_result.astype(cp.int32, copy=False),
-        ), used_shapely_fallback
 
     # --- Single D->H transfer of filtered results ---
     runtime = get_cuda_runtime()
@@ -2454,13 +2938,14 @@ def _compute_mixed_distances_gpu_device(
     left_idx: np.ndarray | None,
     right_idx: np.ndarray | None,
     device_candidates: object | None = None,
+    *,
+    precision_context: _NearestMetricPrecisionContext | None = None,
+    pair_active=None,
+    source_positions=None,
+    output_distances=None,
+    center_device=None,
 ):
-    """Compute distances on device, accumulating into a CuPy device array.
-
-    Same dispatch logic as _compute_mixed_distances_gpu but keeps all
-    distance results device-resident.  Returns a CuPy float64 array of
-    distances, or None if the device pipeline cannot handle all groups.
-    """
+    """Compute one device relation through one all-family grouped partition."""
     try:
         import cupy as cp
     except ImportError:
@@ -2474,221 +2959,140 @@ def _compute_mixed_distances_gpu_device(
     if pair_count == 0:
         return cp.empty(0, dtype=cp.float64), False
 
-    if _use_device_idx:
-        _q_ds = query_owned.device_state
-        _t_ds = tree_owned.device_state
-        d_query_tags = (
-            _q_ds.tags
-            if _q_ds is not None and _q_ds.tags is not None
-            else cp.asarray(query_owned.tags)
+    all_families = frozenset(FAMILY_TAGS)
+    query_families = frozenset(query_owned.families)
+    tree_families = frozenset(tree_owned.families)
+    if not query_families <= all_families or not tree_families <= all_families:
+        return None
+
+    query_owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="mixed distance partition consumes device query metadata",
+    )
+    tree_owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="mixed distance partition consumes device tree metadata",
+    )
+    query_state = query_owned._ensure_device_state()
+    tree_state = tree_owned._ensure_device_state()
+    d_left = (
+        cp.asarray(_dc.d_left, dtype=cp.int32)
+        if _use_device_idx
+        else cp.asarray(left_idx, dtype=cp.int32)
+    )
+    d_right = (
+        cp.asarray(_dc.d_right, dtype=cp.int32)
+        if _use_device_idx
+        else cp.asarray(right_idx, dtype=cp.int32)
+    )
+    d_pair_active = (
+        cp.ones(pair_count, dtype=cp.bool_)
+        if pair_active is None
+        else cp.asarray(pair_active, dtype=cp.bool_)
+    )
+    d_source_positions = (
+        cp.arange(pair_count, dtype=cp.int32)
+        if source_positions is None
+        else cp.asarray(source_positions, dtype=cp.int32)
+    )
+    d_distances = (
+        cp.full(pair_count, cp.inf, dtype=cp.float64)
+        if output_distances is None
+        else cp.asarray(output_distances, dtype=cp.float64)
+    )
+    if precision_context is None:
+        precision_context = _plan_device_resident_metric_precision(
+            query_owned,
+            tree_owned,
+            pair_count,
         )
-        d_tree_tags = (
-            _t_ds.tags
-            if _t_ds is not None and _t_ds.tags is not None
-            else cp.asarray(tree_owned.tags)
-        )
-        left_tags = d_query_tags[_dc.d_left]
-        right_tags = d_tree_tags[_dc.d_right]
-    else:
-        left_tags = query_owned.tags[left_idx]
-        right_tags = tree_owned.tags[right_idx]
 
-    runtime = get_cuda_runtime()
-    d_distances = cp.full(pair_count, cp.inf, dtype=cp.float64)
-    used_shapely_fallback = False
+    from vibespatial.api._native_relation import NativeRelationFamilyPartition
+    from vibespatial.spatial.point_distance import (
+        compute_distance_center_device,
+        compute_pointset_distance_gpu,
+    )
+    from vibespatial.spatial.segment_distance import (
+        compute_segment_distance_partition_gpu,
+    )
 
-    point_family = GeometryFamily.POINT
+    family_count = len(FAMILY_TAGS)
+    partition = NativeRelationFamilyPartition.from_pair_capacity(
+        d_left,
+        d_right,
+        d_pair_active,
+        cp.asarray(query_state.tags, dtype=cp.int8),
+        cp.asarray(tree_state.tags, dtype=cp.int8),
+        family_count=family_count,
+        source_positions=d_source_positions,
+    )
+    group_count = family_count**2
+    launch_capacity = max(1, (pair_count + group_count - 1) // group_count)
+    pointset_families = {GeometryFamily.POINT, GeometryFamily.MULTIPOINT}
+    if center_device is None and (query_families | tree_families) & pointset_families:
+        center_device = compute_distance_center_device(query_owned, tree_owned)
 
-    if hasattr(left_tags, "__cuda_array_interface__") and hasattr(
-        right_tags, "__cuda_array_interface__"
-    ):
-        # Device-return paths must not summarize tags via host copies.  The
-        # family domain is tiny, so probe every possible pair on device and
-        # skip empty masks below.
-        tag_pairs = ((lt, rt) for lt in range(len(FAMILY_TAGS)) for rt in range(len(FAMILY_TAGS)))
-    else:
-        tag_pairs = unique_tag_pairs(left_tags, right_tags)
-
-    for lt, rt in tag_pairs:
-        lf = TAG_FAMILIES.get(lt)
-        rf = TAG_FAMILIES.get(rt)
-
-        sub_mask = (left_tags == lt) & (right_tags == rt)
-        if _use_device_idx:
-            d_sub_idx = cp.flatnonzero(sub_mask).astype(cp.int32, copy=False)
-            sub_count = d_sub_idx.size
-            if sub_count == 0:
-                continue
-            d_sub_left = _dc.d_left[d_sub_idx]
-            d_sub_right = _dc.d_right[d_sub_idx]
-            sub_left = None
-            sub_right = None
-            _own_sub_device = False
-        else:
-            sub_idx = np.flatnonzero(sub_mask)
-            sub_left = left_idx[sub_idx]
-            sub_right = right_idx[sub_idx]
-            sub_count = sub_idx.size
-            d_sub_idx = cp.asarray(sub_idx.astype(np.int32))
-            d_sub_left = runtime.from_host(np.ascontiguousarray(sub_left, dtype=np.int32))
-            d_sub_right = runtime.from_host(np.ascontiguousarray(sub_right, dtype=np.int32))
-            _own_sub_device = True
-
-        ok = False
-        if lf is None or rf is None:
-            pass
-        elif lf == point_family and rf == point_family:
-            d_sub_dist = runtime.allocate((sub_count,), np.float64)
-            try:
-                query_owned.move_to(
-                    Residency.DEVICE,
-                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                    reason="dwithin device: point-point distance",
-                )
-                tree_owned.move_to(
-                    Residency.DEVICE,
-                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                    reason="dwithin device: point-point distance",
-                )
-                _launch_point_point_distance_kernel(
+    for left_family in query_families:
+        for right_family in tree_families:
+            group = partition.family_pair(
+                left_family=left_family,
+                right_family=right_family,
+                left_family_tag=FAMILY_TAGS[left_family],
+                right_family_tag=FAMILY_TAGS[right_family],
+                launch_capacity=launch_capacity,
+            )
+            if left_family in pointset_families:
+                ok = compute_pointset_distance_gpu(
                     query_owned,
                     tree_owned,
-                    d_sub_left,
-                    d_sub_right,
-                    d_sub_dist,
-                    sub_count,
+                    group.left_indices,
+                    group.right_indices,
+                    d_distances,
+                    group.capacity,
+                    query_family=left_family,
+                    tree_family=right_family,
+                    source_offset=group.source_offset,
+                    logical_count=group.logical_count,
+                    source_positions=group.source_positions,
+                    center_device=center_device,
+                    compute_precision=precision_context.coarse_plan.compute_precision,
                 )
-                # Scatter into device result array (Tier 2 CuPy).
-                d_distances[d_sub_idx] = cp.asarray(d_sub_dist)
-                ok = True
-            finally:
-                if _own_sub_device:
-                    runtime.free(d_sub_left)
-                    runtime.free(d_sub_right)
-                runtime.free(d_sub_dist)
-        elif (lf == GeometryFamily.MULTIPOINT) != (rf == GeometryFamily.MULTIPOINT):
-            if _own_sub_device:
-                runtime.free(d_sub_left)
-                runtime.free(d_sub_right)
-            _own_sub_device = False
-            if sub_left is None or sub_right is None:
-                sub_left = runtime.copy_device_to_host(
-                    d_sub_left,
-                    reason="nearest device multipoint left-index host export",
-                ).astype(np.int32, copy=False)
-                sub_right = runtime.copy_device_to_host(
-                    d_sub_right,
-                    reason="nearest device multipoint right-index host export",
-                ).astype(np.int32, copy=False)
-            if lf == GeometryFamily.MULTIPOINT:
-                mp_result = _compute_multipoint_distances_gpu(
-                    query_owned,
+            elif right_family in pointset_families:
+                ok = compute_pointset_distance_gpu(
                     tree_owned,
-                    sub_left,
-                    sub_right,
-                    target_family=rf,
+                    query_owned,
+                    group.right_indices,
+                    group.left_indices,
+                    d_distances,
+                    group.capacity,
+                    query_family=right_family,
+                    tree_family=left_family,
+                    source_offset=group.source_offset,
+                    logical_count=group.logical_count,
+                    source_positions=group.source_positions,
+                    center_device=center_device,
+                    compute_precision=precision_context.coarse_plan.compute_precision,
                 )
             else:
-                mp_result = _compute_multipoint_distances_gpu(
-                    tree_owned,
-                    query_owned,
-                    sub_right,
-                    sub_left,
-                    target_family=lf,
-                )
-            if mp_result is not None:
-                d_distances[d_sub_idx] = cp.asarray(mp_result)
-                ok = True
-        elif lf == point_family or rf == point_family:
-            d_sub_dist = runtime.allocate((sub_count,), np.float64)
-            try:
-                from .point_distance import compute_point_distance_gpu
-
-                if lf == point_family:
-                    ok = compute_point_distance_gpu(
-                        query_owned,
-                        tree_owned,
-                        d_sub_left,
-                        d_sub_right,
-                        d_sub_dist,
-                        sub_count,
-                        tree_family=rf,
-                    )
-                else:
-                    ok = compute_point_distance_gpu(
-                        tree_owned,
-                        query_owned,
-                        d_sub_right,
-                        d_sub_left,
-                        d_sub_dist,
-                        sub_count,
-                        tree_family=lf,
-                    )
-                if ok:
-                    d_distances[d_sub_idx] = cp.asarray(d_sub_dist)
-            finally:
-                if _own_sub_device:
-                    runtime.free(d_sub_left)
-                    runtime.free(d_sub_right)
-                runtime.free(d_sub_dist)
-        else:
-            d_sub_dist = runtime.allocate((sub_count,), np.float64)
-            try:
-                from .segment_distance import compute_segment_distance_gpu
-
-                ok = compute_segment_distance_gpu(
+                ok = compute_segment_distance_partition_gpu(
                     query_owned,
                     tree_owned,
-                    d_sub_left,
-                    d_sub_right,
-                    d_sub_dist,
-                    sub_count,
-                    query_family=lf,
-                    tree_family=rf,
+                    group.left_indices,
+                    group.right_indices,
+                    d_distances,
+                    group.capacity,
+                    query_family=left_family,
+                    tree_family=right_family,
+                    source_offset=group.source_offset,
+                    logical_count=group.logical_count,
+                    source_positions=group.source_positions,
                 )
-                if ok:
-                    d_distances[d_sub_idx] = cp.asarray(d_sub_dist)
-            finally:
-                if _own_sub_device:
-                    runtime.free(d_sub_left)
-                    runtime.free(d_sub_right)
-                runtime.free(d_sub_dist)
+            if not ok:
+                return None
 
-        if not ok:
-            # Unsupported family pair — fall back to Shapely for this group,
-            # then upload the sub-group result to device.
-            # to_shapely() is cached on OwnedGeometryArray, so repeated
-            # calls for multiple unsupported groups are cheap.
-            if not used_shapely_fallback:
-                record_shapely_fallback_event(
-                    surface="vibespatial.spatial.nearest",
-                    reason="GPU nearest refinement required Shapely fallback for unsupported geometry families",
-                    detail=f"pair={lf.name if lf is not None else 'unknown'}/{rf.name if rf is not None else 'unknown'}",
-                    pipeline="gpu_candidates -> shapely_refine",
-                    d2h_transfer=True,
-                )
-                used_shapely_fallback = True
-            if _own_sub_device:
-                runtime.free(d_sub_left)
-                runtime.free(d_sub_right)
-                _own_sub_device = False
-            if sub_left is None or sub_right is None:
-                sub_left = runtime.copy_device_to_host(
-                    d_sub_left,
-                    reason="nearest device fallback left-index host export",
-                ).astype(np.int32, copy=False)
-                sub_right = runtime.copy_device_to_host(
-                    d_sub_right,
-                    reason="nearest device fallback right-index host export",
-                ).astype(np.int32, copy=False)
-            query_shapely = np.asarray(query_owned.to_shapely(), dtype=object)
-            tree_shapely = np.asarray(tree_owned.to_shapely(), dtype=object)
-            sub_dists = shapely.distance(query_shapely[sub_left], tree_shapely[sub_right])
-            d_distances[d_sub_idx] = cp.asarray(
-                np.asarray(sub_dists, dtype=np.float64),
-            )
-
-    return d_distances, used_shapely_fallback
+    return d_distances, False
 
 
 # ---------------------------------------------------------------------------
@@ -2830,15 +3234,43 @@ def _nearest_refine_gpu(
     if use_mixed:
         if return_device:
             return None
+        precision_context = _plan_nearest_metric_precision(
+            query_owned,
+            tree_owned,
+            left_idx.size,
+        )
         mixed_distances_result = _compute_mixed_distances_gpu(
             query_owned,
             tree_owned,
             left_idx,
             right_idx,
             exclusive=exclusive,
+            precision_context=precision_context,
         )
         if mixed_distances_result is not None:
             mixed_distances, used_shapely_fallback = mixed_distances_result
+            if precision_context.refinement_plan is not None:
+                ambiguous = _nearest_ambiguity_mask_host(
+                    left_idx,
+                    mixed_distances,
+                    n_queries,
+                    max_distance=max_distance,
+                    error_bound=precision_context.fp32_error_bound,
+                )
+                if ambiguous.any():
+                    refined_result = _compute_mixed_distances_gpu(
+                        query_owned,
+                        tree_owned,
+                        left_idx[ambiguous],
+                        right_idx[ambiguous],
+                        exclusive=exclusive,
+                        record_fallback_event=False,
+                        precision_context=precision_context.refinement_context(),
+                    )
+                    if refined_result is not None:
+                        refined_distances, refined_used_fallback = refined_result
+                        mixed_distances[ambiguous] = refined_distances
+                        used_shapely_fallback |= refined_used_fallback
             return _nearest_from_distances(
                 left_idx,
                 right_idx,

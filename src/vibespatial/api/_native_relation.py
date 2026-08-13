@@ -164,6 +164,220 @@ def _resolve_row_count(
 
 
 @dataclass(frozen=True)
+class _NativeRelationFamilySelection:
+    """Device-counted span into one shared grouped relation."""
+
+    source_offset: Any
+    logical_count: Any
+    launch_capacity: int
+
+    def __post_init__(self) -> None:
+        if not _is_device_array(self.source_offset) or not _is_device_array(
+            self.logical_count
+        ):
+            raise TypeError("relation family span metadata must be device-resident")
+        if tuple(getattr(self.source_offset, "shape", ())) != (1,) or tuple(
+            getattr(self.logical_count, "shape", ())
+        ) != (1,):
+            raise ValueError("relation family span metadata must be one-dimensional")
+        if int(self.launch_capacity) <= 0:
+            raise ValueError("relation family launch capacity must be positive")
+
+
+@dataclass(frozen=True)
+class _NativeRelationFamilyGroup:
+    """One homogeneous family span selected from a grouped relation tile."""
+
+    left_indices: Any
+    right_indices: Any
+    source_positions: Any
+    selection: _NativeRelationFamilySelection
+    left_family: Any
+    right_family: Any
+
+    @property
+    def capacity(self) -> int:
+        return self.selection.launch_capacity
+
+    @property
+    def source_offset(self):
+        return self.selection.source_offset
+
+    @property
+    def logical_count(self):
+        return self.selection.logical_count
+
+@dataclass(frozen=True)
+class NativeRelationFamilyPartition:
+    """All-family grouped partition of one device relation capacity.
+
+    Active relation lanes are classified by packed ``(left_tag, right_tag)``
+    code and radix-partitioned once. Dense device counts and offsets describe
+    every possible family-pair span. Specialized predicate kernels consume
+    capacity-backed family views without a host cardinality read or another
+    mask scan/scatter partition.
+    """
+
+    left_indices: Any
+    right_indices: Any
+    source_positions: Any
+    group_offsets: Any
+    group_counts: Any
+    family_count: int
+
+    def __post_init__(self) -> None:
+        if not all(
+            _is_device_array(values)
+            for values in (
+                self.left_indices,
+                self.right_indices,
+                self.source_positions,
+                self.group_offsets,
+                self.group_counts,
+            )
+        ):
+            raise TypeError("relation family partition requires device arrays")
+        capacity = _array_size(self.left_indices)
+        if _array_size(self.right_indices) != capacity:
+            raise ValueError("relation family partition indices must align")
+        if _array_size(self.source_positions) != capacity:
+            raise ValueError("relation family partition source positions must align")
+        group_count = int(self.family_count) ** 2
+        if _array_size(self.group_counts) != group_count:
+            raise ValueError("relation family partition counts must match family domain")
+        if _array_size(self.group_offsets) != group_count + 1:
+            raise ValueError("relation family partition offsets must delimit every group")
+
+    @classmethod
+    def from_pair_capacity(
+        cls,
+        left_indices: Any,
+        right_indices: Any,
+        pair_active: Any,
+        left_tags: Any,
+        right_tags: Any,
+        *,
+        family_count: int,
+        source_positions: Any | None = None,
+    ) -> NativeRelationFamilyPartition:
+        """Classify and partition all family pairs in one device pass."""
+        if not all(
+            _is_device_array(values)
+            for values in (
+                left_indices,
+                right_indices,
+                pair_active,
+                left_tags,
+                right_tags,
+            )
+        ):
+            raise TypeError("relation family partitions require device arrays")
+        family_count = int(family_count)
+        if family_count <= 0:
+            raise ValueError("relation family partition requires a positive family count")
+
+        import cupy as cp
+
+        from vibespatial.cuda.cccl_primitives import PairSortStrategy, sort_pairs
+
+        d_left = cp.asarray(left_indices, dtype=cp.int32)
+        d_right = cp.asarray(right_indices, dtype=cp.int32)
+        d_pair_active = cp.asarray(pair_active, dtype=cp.bool_)
+        if d_left.ndim != 1 or d_right.shape != d_left.shape:
+            raise ValueError("relation family partition indices must align")
+        if d_pair_active.shape != d_left.shape:
+            raise ValueError("relation family partition activity must align")
+        d_source_positions = (
+            cp.arange(d_left.size, dtype=cp.int32)
+            if source_positions is None
+            else cp.asarray(source_positions, dtype=cp.int32)
+        )
+        if d_source_positions.shape != d_left.shape:
+            raise ValueError("relation family source positions must align")
+
+        d_left_tags = cp.asarray(left_tags, dtype=cp.int8)
+        d_right_tags = cp.asarray(right_tags, dtype=cp.int8)
+        if d_left_tags.ndim != 1 or d_right_tags.ndim != 1:
+            raise ValueError("relation family partition tags must be one-dimensional")
+
+        d_pair_left_tags = d_left_tags[d_left].astype(cp.int32, copy=False)
+        d_pair_right_tags = d_right_tags[d_right].astype(cp.int32, copy=False)
+        d_valid_family = (
+            d_pair_active
+            & (d_pair_left_tags >= 0)
+            & (d_pair_left_tags < family_count)
+            & (d_pair_right_tags >= 0)
+            & (d_pair_right_tags < family_count)
+        )
+        group_count = family_count**2
+        d_family_pair_codes = cp.where(
+            d_valid_family,
+            d_pair_left_tags * cp.int32(family_count) + d_pair_right_tags,
+            cp.int32(group_count),
+        ).astype(cp.int32, copy=False)
+        capacity = int(d_left.size)
+        partitioned = sort_pairs(
+            d_family_pair_codes,
+            cp.arange(capacity, dtype=cp.int32),
+            strategy=PairSortStrategy.RADIX,
+            synchronize=False,
+        )
+        d_order = cp.asarray(partitioned.values, dtype=cp.int32)
+        d_group_counts = cp.bincount(
+            d_family_pair_codes,
+            minlength=group_count + 1,
+        )[:group_count].astype(cp.int64, copy=False)
+        d_group_offsets = cp.empty(group_count + 1, dtype=cp.int64)
+        d_group_offsets[0] = 0
+        d_group_offsets[1:] = cp.cumsum(d_group_counts, dtype=cp.int64)
+        return cls(
+            left_indices=d_left[d_order].astype(cp.int32, copy=False),
+            right_indices=d_right[d_order].astype(cp.int32, copy=False),
+            source_positions=d_source_positions[d_order].astype(cp.int32, copy=False),
+            group_offsets=d_group_offsets,
+            group_counts=d_group_counts,
+            family_count=family_count,
+        )
+
+    @property
+    def capacity(self) -> int:
+        return _array_size(self.left_indices)
+
+    def family_pair(
+        self,
+        *,
+        left_family: Any,
+        right_family: Any,
+        left_family_tag: int,
+        right_family_tag: int,
+        launch_capacity: int,
+    ) -> _NativeRelationFamilyGroup:
+        """Return metadata for one span of the shared grouped relation."""
+        left_family_tag = int(left_family_tag)
+        right_family_tag = int(right_family_tag)
+        family_count = int(self.family_count)
+        if not 0 <= left_family_tag < family_count:
+            raise ValueError("left family tag is outside the partition domain")
+        if not 0 <= right_family_tag < family_count:
+            raise ValueError("right family tag is outside the partition domain")
+
+        group_code = left_family_tag * family_count + right_family_tag
+        selection = _NativeRelationFamilySelection(
+            source_offset=self.group_offsets[group_code : group_code + 1],
+            logical_count=self.group_counts[group_code : group_code + 1],
+            launch_capacity=launch_capacity,
+        )
+        return _NativeRelationFamilyGroup(
+            left_indices=self.left_indices,
+            right_indices=self.right_indices,
+            source_positions=self.source_positions,
+            selection=selection,
+            left_family=left_family,
+            right_family=right_family,
+        )
+
+
+@dataclass(frozen=True)
 class NativeRelation:
     """Private relation-pair carrier for join-style row flow."""
 

@@ -104,6 +104,7 @@ extern "C" __device__ inline unsigned char multipolygon_point_location(
 _POINT_KERNEL_GLOBALS = r"""
 extern "C" __global__ void point_equals_compacted(
     const int* candidate_rows,
+    const int* candidate_rows_right,
     const int* left_row_offsets,
     const int* left_geometry_offsets,
     const unsigned char* left_empty_mask,
@@ -115,19 +116,21 @@ extern "C" __global__ void point_equals_compacted(
     const double* right_x,
     const double* right_y,
     unsigned char* out,
+    const long long* source_offset,
     const int* logical_count,
     int candidate_count
 ) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) {
-    return;
-  }
-  const int row = candidate_rows[index];
-  const int left_row = left_row_offsets[row];
-  const int right_row = right_row_offsets[row];
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
+  const int count = logical_count != 0 ? logical_count[0] : candidate_count;
+  const int offset = source_offset != 0 ? (int)source_offset[0] : 0;
+  for (int local_index = lane; local_index < count; local_index += stride) {
+  const int index = offset + local_index;
+  const int left_row = left_row_offsets[candidate_rows[index]];
+  const int right_row = right_row_offsets[candidate_rows_right[index]];
   if (left_row < 0 || right_row < 0 || left_empty_mask[left_row] || right_empty_mask[right_row]) {
     out[index] = 0;
-    return;
+    continue;
   }
   const int left_coord = left_geometry_offsets[left_row];
   const int right_coord = right_geometry_offsets[right_row];
@@ -135,10 +138,12 @@ extern "C" __global__ void point_equals_compacted(
       vibespatial_abs(left_x[left_coord] - right_x[right_coord]) <= POINT_RELATION_TOLERANCE &&
       vibespatial_abs(left_y[left_coord] - right_y[right_coord]) <= POINT_RELATION_TOLERANCE;
   out[index] = same ? 2 : 0;
+  }
 }
 
 extern "C" __global__ void point_on_linestring_compacted(
     const int* candidate_rows,
+    const int* candidate_rows_right,
     const int* point_row_offsets,
     const int* point_geometry_offsets,
     const unsigned char* point_empty_mask,
@@ -150,19 +155,21 @@ extern "C" __global__ void point_on_linestring_compacted(
     const double* line_x,
     const double* line_y,
     unsigned char* out,
+    const long long* source_offset,
     const int* logical_count,
     int candidate_count
 ) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) {
-    return;
-  }
-  const int row = candidate_rows[index];
-  const int point_row = point_row_offsets[row];
-  const int line_row = line_row_offsets[row];
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
+  const int count = logical_count != 0 ? logical_count[0] : candidate_count;
+  const int offset = source_offset != 0 ? (int)source_offset[0] : 0;
+  for (int local_index = lane; local_index < count; local_index += stride) {
+  const int index = offset + local_index;
+  const int point_row = point_row_offsets[candidate_rows[index]];
+  const int line_row = line_row_offsets[candidate_rows_right[index]];
   if (point_row < 0 || line_row < 0 || point_empty_mask[point_row] || line_empty_mask[line_row]) {
     out[index] = 0;
-    return;
+    continue;
   }
   const int point_coord = point_geometry_offsets[point_row];
   const double px = point_x[point_coord];
@@ -181,18 +188,20 @@ extern "C" __global__ void point_on_linestring_compacted(
         POINT_RELATION_TOLERANCE
     );
     if (kind == 2) {
-      out[index] = 2;
-      return;
+      best = 2;
+      break;
     }
     if (kind == 1) {
       best = 1;
     }
   }
   out[index] = best;
+  }
 }
 
 extern "C" __global__ void point_on_multilinestring_compacted(
     const int* candidate_rows,
+    const int* candidate_rows_right,
     const int* point_row_offsets,
     const int* point_geometry_offsets,
     const unsigned char* point_empty_mask,
@@ -205,19 +214,21 @@ extern "C" __global__ void point_on_multilinestring_compacted(
     const double* line_x,
     const double* line_y,
     unsigned char* out,
+    const long long* source_offset,
     const int* logical_count,
     int candidate_count
 ) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) {
-    return;
-  }
-  const int row = candidate_rows[index];
-  const int point_row = point_row_offsets[row];
-  const int line_row = line_row_offsets[row];
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
+  const int count = logical_count != 0 ? logical_count[0] : candidate_count;
+  const int offset = source_offset != 0 ? (int)source_offset[0] : 0;
+  for (int local_index = lane; local_index < count; local_index += stride) {
+  const int index = offset + local_index;
+  const int point_row = point_row_offsets[candidate_rows[index]];
+  const int line_row = line_row_offsets[candidate_rows_right[index]];
   if (point_row < 0 || line_row < 0 || point_empty_mask[point_row] || line_empty_mask[line_row]) {
     out[index] = 0;
-    return;
+    continue;
   }
   const int point_coord = point_geometry_offsets[point_row];
   const double px = point_x[point_coord];
@@ -239,19 +250,22 @@ extern "C" __global__ void point_on_multilinestring_compacted(
           POINT_RELATION_TOLERANCE
       );
       if (kind == 2) {
-        out[index] = 2;
-        return;
+        best = 2;
+        break;
       }
       if (kind == 1) {
         best = 1;
       }
     }
+    if (best == 2) break;
   }
   out[index] = best;
+  }
 }
 
 extern "C" __global__ void point_in_polygon_polygon_compacted_state(
     const int* candidate_rows,
+    const int* candidate_rows_right,
     const int* point_row_offsets,
     const int* point_geometry_offsets,
     const unsigned char* point_empty_mask,
@@ -264,19 +278,21 @@ extern "C" __global__ void point_in_polygon_polygon_compacted_state(
     const double* polygon_x,
     const double* polygon_y,
     unsigned char* out,
+    const long long* source_offset,
     const int* logical_count,
     int candidate_count
 ) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) {
-    return;
-  }
-  const int row = candidate_rows[index];
-  const int point_row = point_row_offsets[row];
-  const int polygon_row = polygon_row_offsets[row];
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
+  const int count = logical_count != 0 ? logical_count[0] : candidate_count;
+  const int offset = source_offset != 0 ? (int)source_offset[0] : 0;
+  for (int local_index = lane; local_index < count; local_index += stride) {
+  const int index = offset + local_index;
+  const int point_row = point_row_offsets[candidate_rows[index]];
+  const int polygon_row = polygon_row_offsets[candidate_rows_right[index]];
   if (point_row < 0 || polygon_row < 0 || point_empty_mask[point_row] || polygon_empty_mask[polygon_row]) {
     out[index] = 0;
-    return;
+    continue;
   }
   const int point_coord = point_geometry_offsets[point_row];
   out[index] = polygon_point_location(
@@ -288,10 +304,12 @@ extern "C" __global__ void point_in_polygon_polygon_compacted_state(
       polygon_ring_offsets,
       polygon_row
   );
+  }
 }
 
 extern "C" __global__ void point_in_polygon_multipolygon_compacted_state(
     const int* candidate_rows,
+    const int* candidate_rows_right,
     const int* point_row_offsets,
     const int* point_geometry_offsets,
     const unsigned char* point_empty_mask,
@@ -305,19 +323,21 @@ extern "C" __global__ void point_in_polygon_multipolygon_compacted_state(
     const double* polygon_x,
     const double* polygon_y,
     unsigned char* out,
+    const long long* source_offset,
     const int* logical_count,
     int candidate_count
 ) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) {
-    return;
-  }
-  const int row = candidate_rows[index];
-  const int point_row = point_row_offsets[row];
-  const int polygon_row = polygon_row_offsets[row];
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
+  const int count = logical_count != 0 ? logical_count[0] : candidate_count;
+  const int offset = source_offset != 0 ? (int)source_offset[0] : 0;
+  for (int local_index = lane; local_index < count; local_index += stride) {
+  const int index = offset + local_index;
+  const int point_row = point_row_offsets[candidate_rows[index]];
+  const int polygon_row = polygon_row_offsets[candidate_rows_right[index]];
   if (point_row < 0 || polygon_row < 0 || point_empty_mask[point_row] || polygon_empty_mask[polygon_row]) {
     out[index] = 0;
-    return;
+    continue;
   }
   const int point_coord = point_geometry_offsets[point_row];
   out[index] = multipolygon_point_location(
@@ -330,6 +350,7 @@ extern "C" __global__ void point_in_polygon_multipolygon_compacted_state(
       polygon_ring_offsets,
       polygon_row
   );
+  }
 }
 """
 
@@ -353,6 +374,7 @@ extern "C" __device__ inline unsigned char loc_to_bit(unsigned char loc) {
 /* MULTIPOINT x POINT -- check if any MP coordinate equals the target point. */
 extern "C" __global__ void multipoint_point_relation_compacted(
     const int* candidate_rows,
+    const int* candidate_rows_right,
     const int* mp_row_offsets,
     const int* mp_geometry_offsets,
     const unsigned char* mp_empty_mask,
@@ -364,16 +386,20 @@ extern "C" __global__ void multipoint_point_relation_compacted(
     const double* pt_x,
     const double* pt_y,
     unsigned char* out,
+    const long long* source_offset,
     const int* logical_count,
     int candidate_count
 ) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) return;
-  const int row = candidate_rows[index];
-  const int mp_row = mp_row_offsets[row];
-  const int pt_row = pt_row_offsets[row];
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
+  const int count = logical_count != 0 ? logical_count[0] : candidate_count;
+  const int offset = source_offset != 0 ? (int)source_offset[0] : 0;
+  for (int local_index = lane; local_index < count; local_index += stride) {
+  const int index = offset + local_index;
+  const int mp_row = mp_row_offsets[candidate_rows[index]];
+  const int pt_row = pt_row_offsets[candidate_rows_right[index]];
   if (mp_row < 0 || pt_row < 0 || mp_empty_mask[mp_row] || pt_empty_mask[pt_row]) {
-    out[index] = 0; return;
+    out[index] = 0; continue;
   }
   const int pt_coord = pt_geometry_offsets[pt_row];
   const double px = pt_x[pt_coord];
@@ -387,11 +413,13 @@ extern "C" __global__ void multipoint_point_relation_compacted(
     bits |= same ? 4 : 1;
   }
   out[index] = bits;
+  }
 }
 
 /* MULTIPOINT x LINESTRING */
 extern "C" __global__ void multipoint_linestring_relation_compacted(
     const int* candidate_rows,
+    const int* candidate_rows_right,
     const int* mp_row_offsets,
     const int* mp_geometry_offsets,
     const unsigned char* mp_empty_mask,
@@ -403,16 +431,20 @@ extern "C" __global__ void multipoint_linestring_relation_compacted(
     const double* line_x,
     const double* line_y,
     unsigned char* out,
+    const long long* source_offset,
     const int* logical_count,
     int candidate_count
 ) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) return;
-  const int row = candidate_rows[index];
-  const int mp_row = mp_row_offsets[row];
-  const int line_row = line_row_offsets[row];
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
+  const int count = logical_count != 0 ? logical_count[0] : candidate_count;
+  const int offset = source_offset != 0 ? (int)source_offset[0] : 0;
+  for (int local_index = lane; local_index < count; local_index += stride) {
+  const int index = offset + local_index;
+  const int mp_row = mp_row_offsets[candidate_rows[index]];
+  const int line_row = line_row_offsets[candidate_rows_right[index]];
   if (mp_row < 0 || line_row < 0 || mp_empty_mask[mp_row] || line_empty_mask[line_row]) {
-    out[index] = 0; return;
+    out[index] = 0; continue;
   }
   const int mp_start = mp_geometry_offsets[mp_row];
   const int mp_end = mp_geometry_offsets[mp_row + 1];
@@ -431,11 +463,13 @@ extern "C" __global__ void multipoint_linestring_relation_compacted(
     bits |= loc_to_bit(best);
   }
   out[index] = bits;
+  }
 }
 
 /* MULTIPOINT x MULTILINESTRING */
 extern "C" __global__ void multipoint_multilinestring_relation_compacted(
     const int* candidate_rows,
+    const int* candidate_rows_right,
     const int* mp_row_offsets,
     const int* mp_geometry_offsets,
     const unsigned char* mp_empty_mask,
@@ -448,16 +482,20 @@ extern "C" __global__ void multipoint_multilinestring_relation_compacted(
     const double* mls_x,
     const double* mls_y,
     unsigned char* out,
+    const long long* source_offset,
     const int* logical_count,
     int candidate_count
 ) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) return;
-  const int row = candidate_rows[index];
-  const int mp_row = mp_row_offsets[row];
-  const int mls_row = mls_row_offsets[row];
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
+  const int count = logical_count != 0 ? logical_count[0] : candidate_count;
+  const int offset = source_offset != 0 ? (int)source_offset[0] : 0;
+  for (int local_index = lane; local_index < count; local_index += stride) {
+  const int index = offset + local_index;
+  const int mp_row = mp_row_offsets[candidate_rows[index]];
+  const int mls_row = mls_row_offsets[candidate_rows_right[index]];
   if (mp_row < 0 || mls_row < 0 || mp_empty_mask[mp_row] || mls_empty_mask[mls_row]) {
-    out[index] = 0; return;
+    out[index] = 0; continue;
   }
   const int mp_start = mp_geometry_offsets[mp_row];
   const int mp_end = mp_geometry_offsets[mp_row + 1];
@@ -481,11 +519,13 @@ extern "C" __global__ void multipoint_multilinestring_relation_compacted(
     bits |= loc_to_bit(best);
   }
   out[index] = bits;
+  }
 }
 
 /* MULTIPOINT x POLYGON */
 extern "C" __global__ void multipoint_polygon_relation_compacted(
     const int* candidate_rows,
+    const int* candidate_rows_right,
     const int* mp_row_offsets,
     const int* mp_geometry_offsets,
     const unsigned char* mp_empty_mask,
@@ -498,16 +538,20 @@ extern "C" __global__ void multipoint_polygon_relation_compacted(
     const double* pg_x,
     const double* pg_y,
     unsigned char* out,
+    const long long* source_offset,
     const int* logical_count,
     int candidate_count
 ) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) return;
-  const int row = candidate_rows[index];
-  const int mp_row = mp_row_offsets[row];
-  const int pg_row = pg_row_offsets[row];
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
+  const int count = logical_count != 0 ? logical_count[0] : candidate_count;
+  const int offset = source_offset != 0 ? (int)source_offset[0] : 0;
+  for (int local_index = lane; local_index < count; local_index += stride) {
+  const int index = offset + local_index;
+  const int mp_row = mp_row_offsets[candidate_rows[index]];
+  const int pg_row = pg_row_offsets[candidate_rows_right[index]];
   if (mp_row < 0 || pg_row < 0 || mp_empty_mask[mp_row] || pg_empty_mask[pg_row]) {
-    out[index] = 0; return;
+    out[index] = 0; continue;
   }
   const int mp_start = mp_geometry_offsets[mp_row];
   const int mp_end = mp_geometry_offsets[mp_row + 1];
@@ -516,11 +560,13 @@ extern "C" __global__ void multipoint_polygon_relation_compacted(
     bits |= loc_to_bit(polygon_point_location(mp_x[c], mp_y[c], pg_x, pg_y, pg_geometry_offsets, pg_ring_offsets, pg_row));
   }
   out[index] = bits;
+  }
 }
 
 /* MULTIPOINT x MULTIPOLYGON */
 extern "C" __global__ void multipoint_multipolygon_relation_compacted(
     const int* candidate_rows,
+    const int* candidate_rows_right,
     const int* mp_row_offsets,
     const int* mp_geometry_offsets,
     const unsigned char* mp_empty_mask,
@@ -534,16 +580,20 @@ extern "C" __global__ void multipoint_multipolygon_relation_compacted(
     const double* mpg_x,
     const double* mpg_y,
     unsigned char* out,
+    const long long* source_offset,
     const int* logical_count,
     int candidate_count
 ) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) return;
-  const int row = candidate_rows[index];
-  const int mp_row = mp_row_offsets[row];
-  const int mpg_row = mpg_row_offsets[row];
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
+  const int count = logical_count != 0 ? logical_count[0] : candidate_count;
+  const int offset = source_offset != 0 ? (int)source_offset[0] : 0;
+  for (int local_index = lane; local_index < count; local_index += stride) {
+  const int index = offset + local_index;
+  const int mp_row = mp_row_offsets[candidate_rows[index]];
+  const int mpg_row = mpg_row_offsets[candidate_rows_right[index]];
   if (mp_row < 0 || mpg_row < 0 || mp_empty_mask[mp_row] || mpg_empty_mask[mpg_row]) {
-    out[index] = 0; return;
+    out[index] = 0; continue;
   }
   const int mp_start = mp_geometry_offsets[mp_row];
   const int mp_end = mp_geometry_offsets[mp_row + 1];
@@ -552,11 +602,13 @@ extern "C" __global__ void multipoint_multipolygon_relation_compacted(
     bits |= loc_to_bit(multipolygon_point_location(mp_x[c], mp_y[c], mpg_x, mpg_y, mpg_geometry_offsets, mpg_part_offsets, mpg_ring_offsets, mpg_row));
   }
   out[index] = bits;
+  }
 }
 
 /* MULTIPOINT x MULTIPOINT -- check pairwise coordinate matches. */
 extern "C" __global__ void multipoint_multipoint_relation_compacted(
     const int* candidate_rows,
+    const int* candidate_rows_right,
     const int* left_row_offsets,
     const int* left_geometry_offsets,
     const unsigned char* left_empty_mask,
@@ -568,16 +620,20 @@ extern "C" __global__ void multipoint_multipoint_relation_compacted(
     const double* right_x,
     const double* right_y,
     unsigned char* out,
+    const long long* source_offset,
     const int* logical_count,
     int candidate_count
 ) {
-  const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count || (logical_count != 0 && index >= logical_count[0])) return;
-  const int row = candidate_rows[index];
-  const int lr = left_row_offsets[row];
-  const int rr = right_row_offsets[row];
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
+  const int count = logical_count != 0 ? logical_count[0] : candidate_count;
+  const int offset = source_offset != 0 ? (int)source_offset[0] : 0;
+  for (int local_index = lane; local_index < count; local_index += stride) {
+  const int index = offset + local_index;
+  const int lr = left_row_offsets[candidate_rows[index]];
+  const int rr = right_row_offsets[candidate_rows_right[index]];
   if (lr < 0 || rr < 0 || left_empty_mask[lr] || right_empty_mask[rr]) {
-    out[index] = 0; return;
+    out[index] = 0; continue;
   }
   const int l_start = left_geometry_offsets[lr];
   const int l_end = left_geometry_offsets[lr + 1];
@@ -599,6 +655,7 @@ extern "C" __global__ void multipoint_multipoint_relation_compacted(
     bits |= matched ? 4 : 1;  /* interior (matched) or outside */
   }
   out[index] = bits;
+  }
 }
 """
 

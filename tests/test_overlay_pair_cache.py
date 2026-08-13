@@ -18,6 +18,7 @@ from vibespatial.api.geodataframe import _public_frame_from_native_state
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.tools._pair_cache import (
     _INTERSECTION_PAIR_CACHE,
+    _intersection_pair_cache_bytes,
     cache_intersection_pairs,
     get_cached_intersection_pairs,
 )
@@ -114,6 +115,25 @@ def test_intersection_pair_cache_can_physicalize_subset_rows_to_device() -> None
     assert isinstance(result, DeviceSpatialJoinResult)
     np.testing.assert_array_equal(cp.asnumpy(result.d_left_idx), [0, 1])
     np.testing.assert_array_equal(cp.asnumpy(result.d_right_idx), [1, 0])
+
+
+def test_intersection_pair_cache_evicts_relations_over_byte_budget(monkeypatch) -> None:
+    import vibespatial.api.tools._pair_cache as pair_cache
+
+    _INTERSECTION_PAIR_CACHE.clear()
+    left = _frame([10, 11, 12])
+    right = _frame([100, 101])
+    monkeypatch.setattr(pair_cache, "_MAX_INTERSECTION_PAIR_CACHE_BYTES", 8)
+
+    cache_intersection_pairs(
+        left,
+        right,
+        np.asarray([0, 2, 1], dtype=np.int32),
+        np.asarray([1, 0, 1], dtype=np.int32),
+    )
+
+    assert _INTERSECTION_PAIR_CACHE == {}
+    assert _intersection_pair_cache_bytes() == 0
 
 
 def test_intersection_pair_cache_remaps_native_subset_without_index_export() -> None:

@@ -617,11 +617,20 @@ def make_valid_owned(
     """
     row_count = owned.row_count if owned is not None else (len(values) if values is not None else 0)
 
+    trusted_deferred_valid = (
+        owned is not None
+        and getattr(owned, "trusted_all_valid", None) is True
+        and getattr(owned, "trusted_all_ogc_valid", None) is True
+    )
+
     # Use "make_valid_repair" kernel name to match the crossover override
     # (2,000 rows) instead of the generic CONSTRUCTIVE default (50,000).
     # When owned has device_state the data is already on GPU, so the
     # transfer-free repair path is profitable at very low row counts.
     work_estimate = (
+        PhysicalWorkEstimate.from_rows(row_count)
+        if trusted_deferred_valid
+        else
         estimate_segment_pair_work_from_owned(
             owned,
             output_row_count=row_count,
@@ -639,6 +648,30 @@ def make_valid_owned(
         requested_mode=dispatch_mode,
         current_residency=combined_residency(owned),
     )
+
+    if trusted_deferred_valid:
+        record_dispatch_event(
+            surface="geopandas.array.make_valid",
+            operation="make_valid",
+            implementation="trusted_deferred_ogc_valid_no_repair",
+            reason=(
+                "Deferred native geometry carrier guarantees non-null OGC-valid "
+                "output; make_valid preserves the carrier without physicalization"
+            ),
+            detail=f"rows={row_count}, method={method}, repaired=0",
+            requested=dispatch_mode,
+            selected=selection.selected,
+        )
+        return MakeValidResult(
+            row_count=row_count,
+            valid_rows=np.arange(row_count, dtype=np.int32),
+            repaired_rows=np.asarray([], dtype=np.int32),
+            null_rows=np.asarray([], dtype=np.int32),
+            method=method,
+            keep_collapsed=keep_collapsed,
+            owned=owned,
+            selected=selection.selected,
+        )
 
     # Defer Shapely materialization: when owned is provided, we may not need
     # values at all (zero-transfer fast path).  Materialize lazily.

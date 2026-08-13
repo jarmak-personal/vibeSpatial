@@ -733,6 +733,13 @@ class OwnedGeometryArray:
         """Transfer device metadata arrays to host if not already present."""
         if self._validity is not None:
             return  # already materialised
+        if (
+            self.device_state is None
+            and self.is_indexed_view
+            and self._base is not None
+            and self._base.device_state is not None
+        ):
+            self._ensure_device_state(preserve_indexed_view=True)
         if self.device_state is None:
             raise RuntimeError(
                 "Host metadata is None and no device metadata available for lazy materialisation"
@@ -2120,6 +2127,16 @@ class OwnedGeometryArray:
                 cp.concatenate(activities) if len(activities) > 1 else activities[0],
                 assume_active_indices_unique=(roots_are_disjoint and all(active_uniqueness)),
             )
+        if roots_are_disjoint and all(
+            array._ensure_device_state(
+                preserve_indexed_view=True,
+            ).trusted_unique_family_rows
+            is True
+            for array in arrays
+        ):
+            view._ensure_device_state(
+                preserve_indexed_view=True,
+            ).trusted_unique_family_rows = True
         cached_validity = _concat_validity_caches(arrays)
         if cached_validity is not None:
             view._cached_is_valid_mask = cached_validity

@@ -702,6 +702,41 @@ def _clip_collective_grouped_mask_prefers_relation(
     )
 
 
+def _clip_collective_rectangle_strip_admissible_device(mask_source_owned):
+    """Prove that rectangle mask members reduce to one connected strip."""
+    import cupy as cp
+
+    from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        device_trusted_rectangle_bounds_matrix,
+    )
+
+    d_mask_bounds = device_trusted_rectangle_bounds_matrix(mask_source_owned)
+    if d_mask_bounds is None:
+        return cp.asarray(False, dtype=cp.bool_)
+    d_mask_bounds = cp.asarray(d_mask_bounds, dtype=cp.float64)
+    if int(d_mask_bounds.shape[0]) == 0:
+        return cp.asarray(False, dtype=cp.bool_)
+    d_scale = cp.maximum(cp.max(cp.abs(d_mask_bounds)), cp.float64(1.0))
+    tolerance = d_scale * cp.float64(1.0e-12)
+    d_same_y = cp.all(
+        cp.abs(d_mask_bounds[:, 1] - d_mask_bounds[0, 1]) <= tolerance
+    ) & cp.all(cp.abs(d_mask_bounds[:, 3] - d_mask_bounds[0, 3]) <= tolerance)
+    d_same_x = cp.all(
+        cp.abs(d_mask_bounds[:, 0] - d_mask_bounds[0, 0]) <= tolerance
+    ) & cp.all(cp.abs(d_mask_bounds[:, 2] - d_mask_bounds[0, 2]) <= tolerance)
+    d_lower = cp.where(d_same_y, d_mask_bounds[:, 0], d_mask_bounds[:, 1])
+    d_upper = cp.where(d_same_y, d_mask_bounds[:, 2], d_mask_bounds[:, 3])
+    d_interval_order = cp.argsort(d_lower)
+    d_sorted_lower = d_lower[d_interval_order]
+    d_sorted_upper = d_upper[d_interval_order]
+    d_connected = (
+        cp.asarray(True, dtype=cp.bool_)
+        if int(d_sorted_lower.size) <= 1
+        else cp.all(d_sorted_lower[1:] < d_sorted_upper[:-1])
+    )
+    return (d_same_y | d_same_x) & d_connected
+
+
 def _clip_available_device_bytes() -> int | None:
     """Return bytes available to the active device allocator without a sync."""
     if not has_gpu_runtime():
@@ -2595,6 +2630,9 @@ def _clip_polygon_area_intersection_owned(
         _dispatch_polygon_intersection_overlay_broadcast_right_gpu,
         broadcast_right_polygon_intersection_capacity_gpu,
     )
+    from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        device_trusted_rectangle_bounds_matrix,
+    )
     from vibespatial.runtime.dispatch import record_dispatch_event
     from vibespatial.runtime.residency import Residency
 
@@ -2612,17 +2650,18 @@ def _clip_polygon_area_intersection_owned(
         if cell_mask_result is not None:
             return cell_mask_result
 
+    rectangle_mask = device_trusted_rectangle_bounds_matrix(mask_owned) is not None
     result = (
-        _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
-            left_owned,
-            mask_owned,
-            dispatch_mode=ExecutionMode.GPU,
-        )
-        if preserve_lower_dimensional
-        else broadcast_right_polygon_intersection_capacity_gpu(
+        broadcast_right_polygon_intersection_capacity_gpu(
             left_owned,
             mask_owned,
             right_row=0,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+        if not preserve_lower_dimensional or rectangle_mask
+        else _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
+            left_owned,
+            mask_owned,
             dispatch_mode=ExecutionMode.GPU,
         )
     )
@@ -2636,8 +2675,8 @@ def _clip_polygon_area_intersection_owned(
         operation="intersection",
         implementation="polygon_mask_broadcast_right_capacity_gpu",
         reason=(
-            "polygon-mask intersection consumed exact broadcast-right topology "
-            "for mixed-dimensional output"
+            "polygon-mask intersection partitioned exact area before native "
+            "lower-dimensional boundary assembly"
             if preserve_lower_dimensional
             else "polygon-mask intersection consumed the canonical rectangle, SH, "
             "swapped-SH, and exact device-capacity partitioner"
@@ -5620,6 +5659,14 @@ def _clip_homogeneous_polygon_device_candidates_native(
             _ensure_candidate_owned(),
             exact_selection,
         )
+        from vibespatial.kernels.constructive.polygon_rect_intersection import (
+            device_trusted_rectangle_bounds_matrix,
+        )
+
+        rectangle_pair_boundary = (
+            device_trusted_rectangle_bounds_matrix(exact_candidate_owned) is not None
+            and device_trusted_rectangle_bounds_matrix(mask_owned) is not None
+        )
         exact_area_owned = _clip_polygon_area_intersection_owned(
             exact_candidate_owned,
             mask_owned,
@@ -5686,6 +5733,8 @@ def _clip_homogeneous_polygon_device_candidates_native(
                 physical_boundary_parts = boundary_capacity_parts
             else:
                 d_boundary_active = d_exact_active
+                if rectangle_pair_boundary:
+                    d_boundary_active &= ~d_positive_mask
                 topology_remnants = getattr(
                     exact_area_owned,
                     "_polygon_intersection_lower_dimensional_remnant",
@@ -5751,7 +5800,7 @@ def _clip_homogeneous_polygon_device_candidates_native(
                         boundary_part,
                         [(sliver_owned, d_sliver_mask & d_exact_active)],
                     )
-                if not direct_topology_parts:
+                if not direct_topology_parts and not rectangle_pair_boundary:
                     boundary_remainder = binary_constructive_owned(
                         "difference",
                         boundary_part,
@@ -6430,13 +6479,23 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
     mask_source_owned = getattr(lazy_mask_owned, "_source_owned", None)
     if mask_source_owned is None or mask_source_owned.residency is not Residency.DEVICE:
         return None
+    relation_mask_owned = mask_source_owned
+    materialize_coverage = getattr(
+        lazy_mask_owned,
+        "_materialize_collective_coverage",
+        None,
+    )
+    if callable(materialize_coverage):
+        collective_coverage = materialize_coverage()
+        if collective_coverage is not None:
+            relation_mask_owned = collective_coverage
 
     from vibespatial.geometry.buffers import GeometryFamily
 
     polygonal = {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
     if not _owned_active_family_subset(owned, polygonal):
         return None
-    if not _owned_active_family_subset(mask_source_owned, polygonal):
+    if not _owned_active_family_subset(relation_mask_owned, polygonal):
         return None
 
     geometry_name = (
@@ -6464,11 +6523,11 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
         return None
 
     relation, _execution = gdf.sindex.query_relation(
-        mask_source_owned,
+        relation_mask_owned,
         predicate="intersects",
         sort=False,
         source_token=source_state.lineage_token,
-        query_row_count=mask_source_owned.row_count,
+        query_row_count=relation_mask_owned.row_count,
         return_device=True,
     )
 
@@ -6576,11 +6635,44 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
         coarse_union_estimate,
     ) = _clip_collective_grouped_mask_prefers_relation(
         owned,
-        mask_source_owned,
+        relation_mask_owned,
         relation_pair_count=pair_count,
         collective_source_count=coarse_source_count,
         available_device_bytes=available_device_bytes,
     )
+    if (
+        coarse_relation_selected
+        and available_device_bytes is not None
+        and not coarse_relation_estimate.is_device_memory_admissible(
+            available_device_bytes
+        )
+    ):
+        coarse_mask_rectangle_strip_admissible = bool(
+            np.asarray(
+                get_cuda_runtime().copy_device_to_host(
+                    cp.asarray(
+                        _clip_collective_rectangle_strip_admissible_device(
+                            relation_mask_owned
+                        ),
+                        dtype=cp.bool_,
+                    ).reshape(1),
+                    reason="clip grouped-mask constrained-memory shape packet",
+                ),
+                dtype=np.bool_,
+            )[0]
+        )
+        (
+            coarse_relation_selected,
+            coarse_relation_estimate,
+            coarse_union_estimate,
+        ) = _clip_collective_grouped_mask_prefers_relation(
+            owned,
+            relation_mask_owned,
+            relation_pair_count=pair_count,
+            collective_source_count=coarse_source_count,
+            mask_rectangle_strip_admissible=coarse_mask_rectangle_strip_admissible,
+            available_device_bytes=available_device_bytes,
+        )
     if not coarse_relation_selected:
         record_dispatch_event(
             surface="geopandas.clip",
@@ -6615,7 +6707,7 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
 
     coverage = _clip_lazy_grouped_union_coverage_rows_device(
         owned=owned,
-        mask_source_owned=mask_source_owned,
+        mask_source_owned=relation_mask_owned,
         source_state=source_state,
         d_mask_rows=d_mask_rows,
         d_source_rows=d_source_rows,
@@ -6638,7 +6730,10 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
     )
 
     d_source_rectangle_bounds = device_trusted_rectangle_bounds_matrix(owned)
-    d_mask_rectangle_bounds = device_trusted_rectangle_bounds_matrix(mask_source_owned)
+    d_mask_rectangle_bounds = device_trusted_rectangle_bounds_matrix(relation_mask_owned)
+    d_mask_rectangle_strip = _clip_collective_rectangle_strip_admissible_device(
+        relation_mask_owned
+    )
     if d_source_rectangle_bounds is not None and d_mask_rectangle_bounds is not None:
         d_source_pair_bounds = cp.asarray(d_source_rectangle_bounds, dtype=cp.float64)[
             d_source_rows
@@ -6653,30 +6748,11 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
         )
         d_positive_area_pair_count = cp.count_nonzero(d_positive_area_pairs).astype(cp.int64)
 
-        d_mask_bounds = cp.asarray(d_mask_rectangle_bounds, dtype=cp.float64)
-        d_scale = cp.maximum(cp.max(cp.abs(d_mask_bounds)), cp.float64(1.0))
-        tolerance = d_scale * cp.float64(1.0e-12)
-        d_same_y = cp.all(cp.abs(d_mask_bounds[:, 1] - d_mask_bounds[0, 1]) <= tolerance) & cp.all(
-            cp.abs(d_mask_bounds[:, 3] - d_mask_bounds[0, 3]) <= tolerance
-        )
-        d_same_x = cp.all(cp.abs(d_mask_bounds[:, 0] - d_mask_bounds[0, 0]) <= tolerance) & cp.all(
-            cp.abs(d_mask_bounds[:, 2] - d_mask_bounds[0, 2]) <= tolerance
-        )
-        d_lower = cp.where(d_same_y, d_mask_bounds[:, 0], d_mask_bounds[:, 1])
-        d_upper = cp.where(d_same_y, d_mask_bounds[:, 2], d_mask_bounds[:, 3])
-        d_interval_order = cp.argsort(d_lower)
-        d_sorted_lower = d_lower[d_interval_order]
-        d_sorted_upper = d_upper[d_interval_order]
-        # Adjacent overlap is a conservative strip proof. Nested intervals
-        # may decline this planner optimization and remain relation-shaped.
-        d_connected = cp.all(d_sorted_lower[1:] < d_sorted_upper[:-1])
-        d_mask_rectangle_strip = (d_same_y | d_same_x) & d_connected
     else:
         d_positive_area_pair_count = cp.asarray(
             relation_pair_selection.logical_count,
             dtype=cp.int64,
         )[0]
-        d_mask_rectangle_strip = cp.asarray(False, dtype=cp.bool_)
 
     d_plan_counts = cp.concatenate(
         [
@@ -6714,7 +6790,7 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
         union_estimate,
     ) = _clip_collective_grouped_mask_prefers_relation(
         owned,
-        mask_source_owned,
+        relation_mask_owned,
         relation_pair_count=unresolved_pair_count,
         collective_source_count=unresolved_source_count,
         positive_area_pair_count=positive_area_pair_count,
@@ -6764,32 +6840,42 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
     from vibespatial.cuda.cccl_primitives import PairSortStrategy, sort_pairs
     from vibespatial.overlay.gpu import _compact_bounded_device_work_spans
 
-    d_unresolved_pair_positions = cp.flatnonzero(d_unresolved_pair_active).astype(
-        cp.int64,
-        copy=False,
+    d_capacity_active = relation_pair_selection.active_capacity_mask()
+    d_capacity_source_rows = relation_pair_selection.gather_capacity(
+        d_source_rows,
+        fill_value=0,
     )
-    compact_pair_count = int(d_unresolved_pair_positions.size)
-    d_compact_source_rows = d_source_rows[d_unresolved_pair_positions]
-    d_compact_mask_rows = d_mask_rows[d_unresolved_pair_positions]
+    d_capacity_mask_rows = relation_pair_selection.gather_capacity(
+        d_mask_rows,
+        fill_value=0,
+    )
+    pair_capacity = relation_pair_selection.capacity
     d_sort_keys = (
-        d_compact_source_rows.astype(cp.uint64, copy=False) << cp.uint64(32)
-    ) | cp.arange(compact_pair_count, dtype=cp.uint64)
+        cp.where(
+            d_capacity_active,
+            d_capacity_source_rows,
+            cp.int64(source_state.row_count),
+        ).astype(cp.uint64, copy=False)
+        << cp.uint64(32)
+    ) | cp.arange(pair_capacity, dtype=cp.uint64)
     d_pair_order = sort_pairs(
         d_sort_keys,
-        cp.arange(compact_pair_count, dtype=cp.int32),
+        cp.arange(pair_capacity, dtype=cp.int32),
         strategy=PairSortStrategy.RADIX,
         synchronize=False,
     ).values.astype(cp.int64, copy=False)
-    d_sorted_source_rows = d_compact_source_rows[d_pair_order]
-    d_sorted_mask_rows = d_compact_mask_rows[d_pair_order]
+    d_sorted_source_rows = d_capacity_source_rows[d_pair_order]
+    d_sorted_mask_rows = d_capacity_mask_rows[d_pair_order]
+    d_sorted_active = d_capacity_active[d_pair_order]
     d_source_pair_counts = cp.bincount(
         d_sorted_source_rows,
+        weights=d_sorted_active.astype(cp.int64, copy=False),
         minlength=source_state.row_count,
     ).astype(cp.int64, copy=False)
     relation_live_bytes = max(int(relation_estimate.live_device_byte_count()), 1)
     estimated_bytes_per_pair = max(
-        (relation_live_bytes + max(compact_pair_count, 1) - 1)
-        // max(compact_pair_count, 1),
+        (relation_live_bytes + max(unresolved_pair_count, 1) - 1)
+        // max(unresolved_pair_count, 1),
         256,
     )
     page_available_bytes = max(int(available_device_bytes or relation_live_bytes) // 5, 1)
@@ -6824,13 +6910,16 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
         page_source_count = source_end - source_start
         d_page_source_rows = d_sorted_source_rows[pair_start:pair_end]
         d_page_mask_rows = d_sorted_mask_rows[pair_start:pair_end]
+        d_page_active = d_sorted_active[pair_start:pair_end]
         d_page_group_rows = (d_page_source_rows - np.int64(source_start)).astype(
             cp.int64,
             copy=False,
         )
-        d_page_active = cp.ones(pair_end - pair_start, dtype=cp.bool_)
-        source_pairs = owned.device_take(d_page_source_rows)
-        mask_pairs = mask_source_owned.device_take(d_page_mask_rows)
+        source_pairs = owned.device_take_capacity(d_page_source_rows, d_page_active)
+        mask_pairs = relation_mask_owned.device_take_capacity(
+            d_page_mask_rows,
+            d_page_active,
+        )
         pair_intersections = _binary_constructive_gpu(
             "intersection",
             source_pairs,
@@ -6933,8 +7022,8 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
             "reduced by source row without materializing the dissolved mask"
         ),
         detail=(
-            f"source_rows={owned.row_count}, mask_rows={mask_source_owned.row_count}, "
-            f"pairs={compact_pair_count}, pages={len(source_spans)}, "
+            f"source_rows={owned.row_count}, mask_rows={relation_mask_owned.row_count}, "
+            f"pairs={unresolved_pair_count}, pages={len(source_spans)}, "
             f"pair_budget={page_pair_budget}, output_rows=device-resident"
         ),
         requested=ExecutionMode.AUTO,

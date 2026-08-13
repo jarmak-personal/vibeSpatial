@@ -4312,11 +4312,7 @@ def test_execute_native_grouped_union_all_invalid_capacity_stays_device_native()
     assert bool(cp.all(state.validity))
     assert not bool(cp.any(device_valid_nonempty_mask(result.owned)))
     assert get_materialization_events(clear=True) == []
-    assert {event.reason for event in d2h_events} == {
-        "constructive indexed polygon-part size planning packet",
-        "overlay compact topology page-weight planning packet",
-        "overlay compact topology work-summary planning packet",
-    }
+    assert d2h_events == []
     assert sum(event.bytes_transferred for event in d2h_events) <= 2040
 
 
@@ -5038,11 +5034,7 @@ def test_execute_native_grouped_union_rectangle_strips_use_direct_carrier() -> N
     assert result is not None
     assert result.owned is not None
     assert result.owned.residency is Residency.DEVICE
-    assert {event.reason for event in d2h_events} == {
-        "constructive indexed polygon-part size planning packet",
-        "overlay compact topology page-weight planning packet",
-        "overlay compact topology work-summary planning packet",
-    }
+    assert d2h_events == []
     assert sum(event.bytes_transferred for event in d2h_events) <= 2040
     assert any(
         event.implementation
@@ -5385,7 +5377,27 @@ def test_public_dissolve_defers_grouped_union_until_exact_geometry_consumer() ->
         for event in dissolve_events
     )
 
-    actual_area = np.asarray(dissolved.geometry.area, dtype=np.float64)
+    lazy_owned = dissolved.geometry.values.cached_owned()
+    assert getattr(lazy_owned, "_is_lazy_grouped_union_owned", False)
+    assert lazy_owned._materialized_owned is None
+    valid_geometry = dissolved.geometry.make_valid()
+    make_valid_events = geopandas.get_dispatch_events(clear=True)
+    valid_owned = valid_geometry.values.cached_owned()
+    assert getattr(valid_owned, "_is_lazy_grouped_union_owned", False)
+    assert valid_owned._materialized_owned is None
+    assert lazy_owned._materialized_owned is None
+    assert any(
+        event.surface == "geopandas.array.make_valid"
+        and event.implementation == "trusted_deferred_ogc_valid_no_repair"
+        for event in make_valid_events
+    )
+    assert not any(
+        event.surface == "vibespatial.overlay.dissolve.LazyGroupedUnionOwned"
+        and event.operation == "materialize_grouped_union"
+        for event in make_valid_events
+    )
+
+    actual_area = np.asarray(valid_geometry.area, dtype=np.float64)
     materialize_events = geopandas.get_dispatch_events(clear=True)
     expected_area = np.asarray(
         [
@@ -5826,12 +5838,13 @@ def test_buffered_two_point_line_rewrite_has_bounded_device_grouped_union_shape(
     assert "_build_topology_tile_candidate_relation" in tiled_source
     assert "NativeRelation(" in tiled_source
     assert "_clip_topology_tile_candidate_batch" in tiled_source
-    assert "_TOPOLOGY_CONSTRUCTIVE_BATCH_TILES" in tiled_source
+    assert "_TOPOLOGY_CONSTRUCTIVE_BATCH_TILES = 32" in tiled_source
     assert "_reduce_topology_tile_coverage" in tiled_source
     assert "_TOPOLOGY_SEAM_FAN_IN" in tiled_source
     assert "_physicalize_topology_coverage_output" in tiled_source
     assert "device_physicalize_owned_row_selections_exact" in tiled_source
     assert "collective union emitted topology exact-allocation packet" in tiled_source
+    assert "else:\n            coverage_parts.append(batch_result)" in tiled_source
     assert "_regroup_native_grouped_parts_with_grouped_union_gpu" in tiled_source
     assert "cp.tile(" not in tiled_source
     assert "cp.repeat(" not in tiled_source
@@ -5877,6 +5890,46 @@ def test_lazy_grouped_union_propagates_admitted_exact_materializer_failure(
 
     with pytest.raises(RuntimeError, match="admitted grouped topology failed"):
         lazy.to_owned()
+
+
+def test_lazy_grouped_union_make_valid_consumes_semantic_proof_without_materializing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.constructive.make_valid_pipeline import make_valid_owned
+
+    source_owned = from_shapely_geometries(
+        [box(0.0, 0.0, 1.0, 1.0), box(1.0, 0.0, 2.0, 1.0)]
+    )
+    grouped = NativeGrouped.from_dense_codes(
+        np.asarray([0, 0], dtype=np.int32),
+        group_count=1,
+    )
+
+    lazy = dissolve_module.LazyGroupedUnionOwned(
+        source_owned=source_owned,
+        grouped=grouped,
+        geometries=np.asarray(source_owned.to_shapely(), dtype=object),
+        method=DissolveUnionMethod.UNARY,
+        grid_size=None,
+        geometry_name="geometry",
+        crs=None,
+        exact_materializer=lambda: pytest.fail(
+            "make_valid must consume the grouped-union validity proof"
+        ),
+    )
+    monkeypatch.setattr(
+        dissolve_module,
+        "execute_native_grouped_union",
+        lambda *_args, **_kwargs: pytest.fail(
+            "make_valid must not execute deferred grouped topology"
+        ),
+    )
+
+    result = make_valid_owned(owned=lazy)
+
+    assert result.owned is lazy
+    assert result.repaired_rows.size == 0
+    assert lazy._materialized_owned is None
 
 
 def test_device_grouped_union_repair_uses_atomic_native_carrier() -> None:

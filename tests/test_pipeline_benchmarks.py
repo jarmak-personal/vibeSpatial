@@ -281,13 +281,8 @@ def test_small_grouped_constructive_reduce_pipeline_smoke() -> None:
         "runtime_d2h_transfer_events",
         (),
     )
-    assert len(native_grouped_events) == 3
+    assert len(native_grouped_events) == 0
     assert sum(event["bytes_transferred"] for event in native_grouped_events) <= 2040
-    assert {event["reason"] for event in native_grouped_events} == {
-        "constructive indexed polygon-part size planning packet",
-        "overlay compact topology page-weight planning packet",
-        "overlay compact topology work-summary planning packet",
-    }
     removed_overlay_fences = {
         "overlay assemble boundary total-coords allocation fence",
         "overlay assemble compact-hole total-coords allocation fence",
@@ -357,6 +352,12 @@ def test_grouped_capacity_partitions_pipeline_smoke() -> None:
         stage_by_name["positive_degenerate_union"]["metadata"]["remainder_implementation"]
         == "native_grouped_overlay_union_plan_mixed_degenerate_pairwise"
     )
+    assert stage_by_name["mixed_strip_exact_union"]["metadata"][
+        "result_unique_family_rows"
+    ] is True
+    assert stage_by_name["positive_degenerate_union"]["metadata"][
+        "result_unique_family_rows"
+    ] is True
     assert stage_by_name["native_reference_check"]["metadata"]["results_match"] is True
     assert (
         stage_by_name["native_reference_check"]["metadata"]["mixed_residual_admission_count"] == 0
@@ -376,6 +377,10 @@ def test_grouped_capacity_partitions_pipeline_smoke() -> None:
             if "residual repair admission scalar fence" in event["reason"]
         ]
         assert residual_admissions == []
+        assert not any(
+            event["reason"] == "constructive device geometry row-size planning packet"
+            for event in transfer_events
+        )
     assert trace["metadata"]["fallback_events"] == 0
     assert result.peak_device_memory_bytes is not None
     assert result.peak_device_memory_bytes < 64 * 1024 * 1024
@@ -490,12 +495,8 @@ def test_grouped_difference_constructive_pipeline_smoke() -> None:
         "runtime_d2h_transfer_events",
         (),
     )
-    assert len(native_events) == 2
+    assert len(native_events) == 0
     assert sum(event["bytes_transferred"] for event in native_events) <= 2016
-    assert {event["reason"] for event in native_events} == {
-        "overlay compact topology page-weight planning packet",
-        "overlay compact topology work-summary planning packet",
-    }
     assert not any(event["reason"] in _GENERIC_RUNTIME_D2H_REASONS for event in native_events)
     assert not any("grouped difference" in event["reason"] for event in native_events)
     assert stage_by_name["native_reference_check"]["metadata"]["results_match"] is True

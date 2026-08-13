@@ -25,7 +25,11 @@ from vibespatial.api import GeoDataFrame, GeoSeries
 from vibespatial.api._native_expression import NativeExpression
 from vibespatial.api._native_grouped import NativeGrouped, NativeGroupedSelection
 from vibespatial.api._native_metadata import NativeGeometryMetadata, NativeSpatialIndex
-from vibespatial.api._native_relation import NativeRelation, NativeRelationSelection
+from vibespatial.api._native_relation import (
+    NativeRelation,
+    NativeRelationFamilyPartition,
+    NativeRelationSelection,
+)
 from vibespatial.api._native_result_core import (
     GeometryNativeResult,
     NativeAttributeTable,
@@ -5495,6 +5499,151 @@ def test_native_spatial_index_left_reductions_bypass_dense_relation_on_device() 
     reset_d2h_transfer_count()
 
 
+def test_native_spatial_index_mixed_family_reductions_partition_pair_capacity(
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for mixed-family native reduction probe")
+    cp = pytest.importorskip("cupy")
+
+    tree = from_shapely_geometries(
+        [
+            box(0.0, 0.0, 2.0, 2.0),
+            LineString([(10.0, 0.0), (10.0, 2.0)]),
+            Point(20.0, 1.0),
+        ]
+    )
+    tree.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test mixed-family direct reduction tree",
+    )
+    flat_index = build_flat_spatial_index(
+        tree,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="unit test mixed-family direct reduction index",
+        ),
+    )
+    query = from_shapely_geometries(
+        [
+            Point(1.0, 1.0),
+            LineString([(9.0, 1.0), (11.0, 1.0)]),
+            box(19.0, 0.0, 21.0, 2.0),
+            Point(100.0, 100.0),
+        ]
+    )
+    query.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test mixed-family direct reduction query",
+    )
+    native_index = flat_index.to_native_spatial_index(source_token="tree")
+    from vibespatial.spatial import spatial_index_device as spatial_index_device_module
+
+    classified_capacities = []
+    classify_tile = spatial_index_device_module._classify_homogeneous_reduction_tile
+
+    def classify_group_span(*args, **kwargs):
+        if kwargs.get("source_offset") is not None:
+            classified_capacities.append(
+                (kwargs["pair_capacity"], kwargs["launch_capacity"])
+            )
+        return classify_tile(*args, **kwargs)
+
+    monkeypatch.setattr(
+        spatial_index_device_module,
+        "_classify_homogeneous_reduction_tile",
+        classify_group_span,
+    )
+
+    matched, matched_execution = native_index.query_left_semijoin(
+        query,
+        predicate="intersects",
+        query_token="query",
+        return_metadata=True,
+    )
+    unmatched, unmatched_execution = native_index.query_left_antijoin(
+        query,
+        predicate="intersects",
+        query_token="query",
+        return_metadata=True,
+    )
+    counts, count_execution = native_index.query_left_match_count_expression(
+        query,
+        predicate="intersects",
+        query_token="query",
+        return_metadata=True,
+    )
+    indexed, indexed_execution = native_index.query_right_semijoin(
+        query,
+        predicate="intersects",
+        return_metadata=True,
+    )
+
+    assert isinstance(matched, NativeDeviceSelection)
+    assert NativeRelationFamilyPartition.__name__ in Path(
+        "src/vibespatial/spatial/spatial_index_device.py"
+    ).read_text()
+    assert "one all-family grouped partition pass per mixed tile" in matched_execution.reason
+    assert unmatched_execution.implementation == "owned_gpu_spatial_semijoin"
+    assert count_execution.implementation == "owned_gpu_spatial_match_count"
+    assert indexed_execution.implementation == "owned_gpu_spatial_right_semijoin"
+    matched_count = int(cp.asnumpy(matched.logical_count)[0])
+    unmatched_count = int(cp.asnumpy(unmatched.logical_count)[0])
+    indexed_count = int(cp.asnumpy(indexed.logical_count)[0])
+    assert cp.asnumpy(matched.positions[:matched_count]).tolist() == [0, 1, 2]
+    assert cp.asnumpy(unmatched.positions[:unmatched_count]).tolist() == [3]
+    assert cp.asnumpy(counts.values).tolist() == [1, 1, 1, 0]
+    assert cp.asnumpy(indexed.positions[:indexed_count]).tolist() == [0, 1, 2]
+    family_pair_count = 9
+    assert classified_capacities
+    assert len(classified_capacities) % family_pair_count == 0
+    for chunk_start in range(0, len(classified_capacities), family_pair_count):
+        chunk = classified_capacities[chunk_start : chunk_start + family_pair_count]
+        tile_capacity = chunk[0][0]
+        assert all(pair_capacity == tile_capacity for pair_capacity, _ in chunk)
+        assert sum(launch_capacity for _, launch_capacity in chunk) <= (
+            tile_capacity + family_pair_count
+        )
+
+
+def test_relation_family_partition_preserves_source_positions() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for relation family source-position probe")
+    cp = pytest.importorskip("cupy")
+    left = cp.asarray([0, 1, 2, 3], dtype=cp.int32)
+    right = cp.asarray([3, 2, 1, 0], dtype=cp.int32)
+    source_positions = cp.asarray([13, 11, 17, 19], dtype=cp.int32)
+    partition = NativeRelationFamilyPartition.from_pair_capacity(
+        left,
+        right,
+        cp.asarray([True, True, False, True], dtype=cp.bool_),
+        cp.asarray([0, 1, 2, 0], dtype=cp.int8),
+        cp.asarray([0, 1, 2, 1], dtype=cp.int8),
+        family_count=3,
+        source_positions=source_positions,
+    )
+
+    packed = sorted(
+        zip(
+            cp.asnumpy(partition.left_indices).tolist(),
+            cp.asnumpy(partition.right_indices).tolist(),
+            cp.asnumpy(partition.source_positions).tolist(),
+        )
+    )
+    assert packed == sorted([(0, 3, 13), (1, 2, 11), (2, 1, 17), (3, 0, 19)])
+    group = partition.family_pair(
+        left_family=GeometryFamily.POINT,
+        right_family=GeometryFamily.LINESTRING,
+        left_family_tag=0,
+        right_family_tag=1,
+        launch_capacity=1,
+    )
+    assert group.source_positions is partition.source_positions
+
+
 def test_sjoin_native_spatial_index_device_relation_uses_bounded_fences() -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device native sjoin query probe")
@@ -8762,6 +8911,90 @@ def test_singular_device_composition_physicalizes_only_selected_spans() -> None:
     assert get_d2h_transfer_events(clear=True) == []
 
 
+@pytest.mark.gpu
+def test_singular_device_composition_keeps_partition_capacity_until_export() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device composition partitioning")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.geometry.owned import device_mask_owned_capacity
+
+    polygons = from_shapely_geometries(
+        [box(0, 0, 1, 1), box(2, 0, 3, 1), Polygon(), box(6, 0, 7, 1)],
+        residency=Residency.DEVICE,
+    )
+    points = from_shapely_geometries(
+        [Point(10, 10), Point(1, 1), Point(12, 12), Point(13, 13)],
+        residency=Residency.DEVICE,
+    )
+    rows = cp.arange(4, dtype=cp.int64)
+    composition = NativeGeometryComposition(
+        parts=(
+            NativeGeometryCompositionPart(
+                GeometryNativeResult.from_owned(
+                    device_mask_owned_capacity(
+                        polygons,
+                        cp.asarray([True, False, True, False]),
+                    ),
+                    crs=None,
+                ),
+                rows,
+            ),
+            NativeGeometryCompositionPart(
+                GeometryNativeResult.from_owned(
+                    device_mask_owned_capacity(
+                        points,
+                        cp.asarray([False, True, False, False]),
+                    ),
+                    crs=None,
+                ),
+                rows,
+            ),
+        ),
+        row_count=4,
+        crs=None,
+    )
+
+    partitioned = composition._singular_partitioned_device()
+
+    assert partitioned is not None
+    assert partitioned.trusted_singular_rows
+    assert [part.geometry.row_count for part in partitioned.parts] == [4, 4]
+    assert all(not part.geometry.owned.is_indexed_view for part in partitioned.parts)
+    exported = GeometryNativeResult.from_composition(
+        partitioned,
+        crs=None,
+    ).to_geoseries(index=pd.RangeIndex(4), name="geometry")
+    assert exported.geom_type.iloc[:3].tolist() == ["Polygon", "Point", "Polygon"]
+    assert pd.isna(exported.geom_type.iloc[3])
+    assert exported.is_empty.tolist() == [False, False, True, False]
+    np.testing.assert_allclose(
+        exported.bounds.to_numpy(),
+        np.asarray(
+            [
+                [0.0, 0.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0, 1.0],
+                [np.nan, np.nan, np.nan, np.nan],
+                [np.nan, np.nan, np.nan, np.nan],
+            ]
+        ),
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(exported.total_bounds, [0.0, 0.0, 1.0, 1.0])
+    assert exported.iloc[0].equals(box(0, 0, 1, 1))
+    assert exported.iloc[1].equals(Point(1, 1))
+    assert exported.iloc[2].is_empty
+    assert exported.iloc[3] is None
+
+    method_source = Path(
+        "src/vibespatial/api/_native_result_core.py"
+    ).read_text().split("    def _singular_partitioned_device", 1)[1].split(
+        "\n    def _singular_owned_device",
+        1,
+    )[0]
+    assert "flatnonzero" not in method_source
+    assert "_device_indexed_take" not in method_source
+
+
 def test_native_geometry_composition_take_preserves_duplicates_and_part_order() -> None:
     polygons = GeometryNativeResult.from_owned(
         from_shapely_geometries([box(0, 0, 1, 1), box(2, 0, 3, 1)]),
@@ -8883,6 +9116,7 @@ def test_singular_device_composition_certifies_ordered_contiguous_parts_once() -
     reset_d2h_transfer_count()
     assert composition.ordered_contiguous_device_parts() == spans
     assert get_d2h_transfer_events(clear=True) == []
+    assert composition._singular_partitioned_device() is composition
 
 
 @pytest.mark.gpu

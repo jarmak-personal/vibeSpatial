@@ -732,7 +732,10 @@ class NativeSpatialIndex:
         if resolved_query_row_count is None:
             raise ValueError("NativeSpatialIndex.query_relation requires query row count")
 
-        from vibespatial.api._native_relation import NativeRelation
+        from vibespatial.api._native_relation import (
+            NativeRelation,
+            NativeRelationSelection,
+        )
         from vibespatial.spatial.query import query_spatial_index
 
         query_result, execution = query_spatial_index(
@@ -749,6 +752,30 @@ class NativeSpatialIndex:
             query_shapely=query_shapely,
             precomputed_query_bounds=precomputed_query_bounds,
         )
+        if isinstance(query_result, NativeRelationSelection):
+            query_relation = query_result.relation
+            relation = NativeRelation(
+                left_indices=query_relation.left_indices,
+                right_indices=query_relation.right_indices,
+                left_token=resolved_query_token,
+                right_token=self.source_token,
+                predicate=predicate,
+                distances=query_relation.distances,
+                left_row_count=int(resolved_query_row_count),
+                right_row_count=int(self.row_count),
+                sorted_by_left=query_relation.sorted_by_left,
+                duplicate_policy=query_relation.duplicate_policy,
+            )
+            selected_relation = NativeRelationSelection(
+                relation=relation,
+                selection=query_result.selection,
+            )
+            return (
+                (selected_relation, execution)
+                if return_metadata
+                else selected_relation
+            )
+
         left_indices, right_indices = _relation_pair_arrays_from_query_result(
             query_result,
             query_row_count=int(resolved_query_row_count),
@@ -859,6 +886,8 @@ class NativeSpatialIndex:
             )
 
         if direct_rows is None:
+            from vibespatial.api._native_relation import NativeRelationSelection
+
             relation, execution = self.query_relation(
                 query_geometry,
                 predicate=predicate,
@@ -869,7 +898,12 @@ class NativeSpatialIndex:
                 return_metadata=True,
                 precomputed_query_bounds=precomputed_query_bounds,
             )
-            rowset = relation.left_semijoin_rowset(order="sorted")
+            if isinstance(relation, NativeRelationSelection):
+                rowset = relation.left_match_count_expression(
+                    source_row_count=int(resolved_query_row_count),
+                ).compare_scalar_selection(">", 0)
+            else:
+                rowset = relation.left_semijoin_rowset(order="sorted")
         else:
             if not isinstance(direct_rows, NativeDeviceSelection):
                 raise TypeError("native device semijoin must return a device selection")
@@ -948,6 +982,8 @@ class NativeSpatialIndex:
             )
 
         if direct_rows is None:
+            from vibespatial.api._native_relation import NativeRelationSelection
+
             relation, execution = self.query_relation(
                 query_geometry,
                 predicate=predicate,
@@ -957,7 +993,12 @@ class NativeSpatialIndex:
                 return_metadata=True,
                 precomputed_query_bounds=precomputed_query_bounds,
             )
-            rowset = relation.right_semijoin_rowset(order="sorted")
+            if isinstance(relation, NativeRelationSelection):
+                rowset = relation.right_match_count_expression(
+                    source_row_count=int(self.row_count),
+                ).compare_scalar_selection(">", 0)
+            else:
+                rowset = relation.right_semijoin_rowset(order="sorted")
         else:
             if not isinstance(direct_rows, NativeDeviceSelection):
                 raise TypeError("native device semijoin must return a device selection")

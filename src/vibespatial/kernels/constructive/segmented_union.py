@@ -2049,6 +2049,17 @@ def segmented_union_all_device_grouped(
         geometries._active_family_row_segment_capacity_bound = int(
             _source_segment_span_max
         )
+
+    def _publish_grouped_output_shape(
+        result: OwnedGeometryArray,
+    ) -> OwnedGeometryArray:
+        # Every valid result row owns one disjoint input group. Group-local
+        # assembly may retain inactive capacity aliases, but no physical family
+        # row is referenced by two valid output rows.
+        result._ensure_device_state(
+            preserve_indexed_view=True,
+        ).trusted_unique_family_rows = True
+        return result
     all_input_rows_present = _capacity_all_valid_noops or _all_rows_present_from_existing_proof(
         geometries
     )
@@ -2195,7 +2206,7 @@ def segmented_union_all_device_grouped(
                 requested=ExecutionMode.GPU,
                 selected=ExecutionMode.GPU,
             )
-            return combined
+            return _publish_grouped_output_shape(combined)
 
     rectangle_strip = (
         None
@@ -2312,7 +2323,7 @@ def segmented_union_all_device_grouped(
             combined._native_grouped_union_implementation = (
                 "native_grouped_disjoint_pack_partition_union"
             )
-            return combined
+            return _publish_grouped_output_shape(combined)
 
     if rectangle_strip is not None:
         d_strip_group_mask = cp.asarray(
@@ -2389,7 +2400,7 @@ def segmented_union_all_device_grouped(
             requested=ExecutionMode.GPU,
             selected=ExecutionMode.GPU,
         )
-        return combined
+        return _publish_grouped_output_shape(combined)
 
     from vibespatial.geometry.owned import (
         build_empty_polygon_rows_device,
@@ -2500,6 +2511,8 @@ def segmented_union_all_device_grouped(
         empty_output=empty_output,
         group_size_max=group_size_max,
     )
+    if safe_overlay is not None:
+        _publish_grouped_output_shape(safe_overlay)
 
     if _capacity_all_valid_noops and safe_overlay is None:
         safe_overlay = empty_output
@@ -2538,6 +2551,8 @@ def segmented_union_all_device_grouped(
         allow_singleton_identity=False,
         group_size_max=group_size_max,
     )
+    if degenerate_tree is not None:
+        _publish_grouped_output_shape(degenerate_tree)
     if (
         safe_overlay is not None
         and safe_overlay.row_count == output_row_count
@@ -2566,6 +2581,6 @@ def segmented_union_all_device_grouped(
         merged._native_grouped_union_implementation = (
             "native_grouped_overlay_union_plan_mixed_degenerate_pairwise"
         )
-        return _apply_group_validity(merged)
+        return _publish_grouped_output_shape(_apply_group_validity(merged))
 
     raise RuntimeError("admitted grouped overlay union did not produce a complete native result")

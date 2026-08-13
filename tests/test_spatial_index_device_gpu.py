@@ -14,7 +14,7 @@ import inspect
 
 import numpy as np
 import pytest
-from shapely.geometry import Point, box
+from shapely.geometry import MultiPolygon, Point, box
 
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.kernels.core.geometry_analysis import (
@@ -38,6 +38,7 @@ from vibespatial.spatial.query_types import (
 from vibespatial.spatial.spatial_index_device import (
     _MORTON_SPAN_BUCKET_UPPER_BOUNDS,
     _classify_homogeneous_reduction_tile,
+    _family_group_launch_capacities,
     _morton_range_query,
     _morton_reduction_span_schedule,
     _spatial_index_device_relation_reduction,
@@ -177,6 +178,110 @@ def test_spatial_reduction_uses_structural_tiles_without_active_row_rounds() -> 
     assert "logical_count=d_candidate_count_i32" in source
     assert "candidate_selection.active_capacity_mask()" in source
     assert "NativeDeviceSelection.from_mask(d_reduced != 0)" in source
+    assert source.count("family_partition_type.from_pair_capacity(") == 1
+    assert "pair_capacity=family_launch_capacity" in source
+    assert "launch_capacity=family_launch_capacity" in source
+    assert "pair_capacity=family_partition.capacity" not in source
+    assert "launch_capacity=partition.capacity" not in source
+
+
+@requires_gpu
+def test_relation_family_partition_groups_mixed_capacity_correctly() -> None:
+    cp = pytest.importorskip("cupy")
+    from vibespatial.api._native_relation import NativeRelationFamilyPartition
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    partition = NativeRelationFamilyPartition.from_pair_capacity(
+        cp.asarray([0, 1, 2, 1, 0, 2], dtype=cp.int32),
+        cp.asarray([2, 1, 0, 0, 2, 1], dtype=cp.int32),
+        cp.asarray([True, True, True, False, True, False]),
+        cp.asarray([0, 1, 2], dtype=cp.int8),
+        cp.asarray([0, 1, 2], dtype=cp.int8),
+        family_count=3,
+    )
+
+    point_polygon = partition.family_pair(
+        left_family=GeometryFamily.POINT,
+        right_family=GeometryFamily.POLYGON,
+        left_family_tag=0,
+        right_family_tag=2,
+        launch_capacity=2,
+    )
+    logical_count = int(cp.asnumpy(point_polygon.logical_count)[0])
+    source_offset = int(cp.asnumpy(point_polygon.source_offset)[0])
+
+    assert partition.capacity == 6
+    assert cp.asnumpy(partition.group_counts).tolist() == [0, 0, 2, 0, 1, 0, 1, 0, 0]
+    assert logical_count == 2
+    assert point_polygon.left_indices is partition.left_indices
+    assert point_polygon.right_indices is partition.right_indices
+    assert cp.asnumpy(
+        point_polygon.left_indices[source_offset : source_offset + logical_count]
+    ).tolist() == [0, 0]
+    assert cp.asnumpy(
+        point_polygon.right_indices[source_offset : source_offset + logical_count]
+    ).tolist() == [2, 2]
+
+
+def test_relation_family_pair_is_metadata_only_and_launches_are_tile_bounded() -> None:
+    from vibespatial.api._native_relation import NativeRelationFamilyPartition
+
+    source = inspect.getsource(NativeRelationFamilyPartition.family_pair)
+    capacities = _family_group_launch_capacities(1_000_000, 36)
+
+    assert "cp.arange(self.capacity)" not in source
+    assert "cp.where" not in source
+    assert "active_capacity_mask" not in source
+    assert len(capacities) == 36
+    assert all(capacity > 0 for capacity in capacities)
+    assert sum(capacities) <= 1_000_000 + 36
+    assert sum(capacities) < 36 * 1_000_000
+
+
+@requires_gpu
+def test_relation_family_partition_uses_one_pass_at_1m_capacity(monkeypatch) -> None:
+    cp = pytest.importorskip("cupy")
+    from vibespatial.api._native_relation import NativeRelationFamilyPartition
+    from vibespatial.cuda import cccl_primitives
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    sort_calls = 0
+    sort_pairs = cccl_primitives.sort_pairs
+
+    def counted_sort_pairs(*args, **kwargs):
+        nonlocal sort_calls
+        sort_calls += 1
+        return sort_pairs(*args, **kwargs)
+
+    monkeypatch.setattr(cccl_primitives, "sort_pairs", counted_sort_pairs)
+    capacity = 1_000_000
+    d_lanes = cp.arange(capacity, dtype=cp.int32)
+    d_left = d_lanes % cp.int32(6)
+    d_right = (d_lanes // cp.int32(6)) % cp.int32(6)
+    d_active = d_lanes < cp.int32(capacity - 17)
+    d_tags = cp.arange(6, dtype=cp.int8)
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    partition = NativeRelationFamilyPartition.from_pair_capacity(
+        d_left,
+        d_right,
+        d_active,
+        d_tags,
+        d_tags,
+        family_count=6,
+    )
+    events = get_d2h_transfer_events(clear=True)
+
+    assert partition.capacity == capacity
+    assert partition.group_offsets.shape == (37,)
+    assert partition.group_counts.shape == (36,)
+    assert sort_calls == 1
+    assert events == []
+    assert int(cp.asnumpy(cp.sum(partition.group_counts))) == capacity - 17
 
 
 @requires_gpu
@@ -612,6 +717,59 @@ def test_native_spatial_index_reductions_do_not_context_synchronize(monkeypatch)
         for plan in observed_precision_plans
     )
     guarded_runtime.synchronize.assert_not_called()
+
+
+@requires_gpu
+def test_mixed_polygon_reduction_checks_every_multipolygon_component():
+    cp = pytest.importorskip("cupy")
+
+    components = [box(10.0 * i, 0.0, 10.0 * i + 1.0, 1.0) for i in range(34)]
+    tree_owned = from_shapely_geometries(
+        [MultiPolygon(components), Point(-100.0, -100.0)],
+        residency=Residency.DEVICE,
+    )
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="test unbounded multipolygon component traversal",
+        ),
+    )
+    query_owned = from_shapely_geometries(
+        [box(330.25, 0.25, 330.75, 0.75), box(500.0, 0.0, 501.0, 1.0)],
+        residency=Residency.DEVICE,
+    )
+    query_bounds = compute_geometry_bounds_device(query_owned)
+    native_index = flat_index.to_native_spatial_index(source_token="tree")
+    query_kwargs = {
+        "predicate": "intersects",
+        "query_token": "query",
+        "precomputed_query_bounds": query_bounds,
+        "return_metadata": True,
+    }
+
+    semijoin, semijoin_execution = native_index.query_left_semijoin(
+        query_owned,
+        **query_kwargs,
+    )
+    antijoin, antijoin_execution = native_index.query_left_antijoin(
+        query_owned,
+        **query_kwargs,
+    )
+    counts, count_execution = native_index.query_left_match_count_expression(
+        query_owned,
+        **query_kwargs,
+    )
+
+    assert semijoin_execution.implementation == "owned_gpu_spatial_semijoin"
+    assert antijoin_execution.implementation == "owned_gpu_spatial_semijoin"
+    assert count_execution.implementation == "owned_gpu_spatial_match_count"
+    semijoin_count = int(cp.asnumpy(semijoin.logical_count)[0])
+    antijoin_count = int(cp.asnumpy(antijoin.logical_count)[0])
+    assert cp.asnumpy(semijoin.positions[:semijoin_count]).tolist() == [0]
+    assert cp.asnumpy(antijoin.positions[:antijoin_count]).tolist() == [1]
+    assert cp.asnumpy(counts.values).tolist() == [1, 0]
 
 
 @requires_gpu

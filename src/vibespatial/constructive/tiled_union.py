@@ -59,7 +59,10 @@ _DIRECT_COLLECTIVE_SEGMENT_PEER_PRESSURE = 64 * 1024 * 1024
 _TARGET_TILE_SEGMENT_PEER_PRESSURE = 8 * 1024 * 1024
 _MIN_TOPOLOGY_TILE_COUNT = 8
 _TOPOLOGY_SEAM_FAN_IN = 4
-_TOPOLOGY_CONSTRUCTIVE_BATCH_TILES = 1
+# Aggregate segment-peer pressure bounds topology work. This second bound keeps
+# grouped output slots to one compact planning page even when active tiles are
+# individually sparse.
+_TOPOLOGY_CONSTRUCTIVE_BATCH_TILES = 32
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,7 @@ class _TopologyTilePlan:
     source_bounds: object
     relation: object
     host_offsets: np.ndarray
+    host_segment_peer_pressure: np.ndarray
     full_tile_mask: object
     cols: int
     rows: int
@@ -455,22 +459,21 @@ def _build_topology_tile_candidate_relation(
     d_offsets = cp.empty(tile_count + 1, dtype=cp.int64)
     d_offsets[0] = 0
     d_offsets[1:] = cp.cumsum(d_counts, dtype=cp.int64)
-    host_offsets = get_cuda_runtime().copy_device_to_host(
-        d_offsets,
-        reason="collective union segment-tile relation offset planning packet",
-    )
     d_segment_counts = cp.bincount(
         d_raw_tile_ids,
         minlength=tile_count,
     ).astype(cp.int64, copy=False)
     d_segment_peer_pressure = d_segment_counts * d_counts
-    d_max_pressure = cp.max(d_segment_peer_pressure).reshape(1)
-    max_pressure = int(
+    host_plan = np.asarray(
         get_cuda_runtime().copy_device_to_host(
-            d_max_pressure,
-            reason="collective union segment-tile pressure planning packet",
-        )[0]
+            cp.concatenate((d_offsets, d_segment_peer_pressure)),
+            reason="collective union segment-tile grouped planning packet",
+        ),
+        dtype=np.int64,
     )
+    host_offsets = host_plan[: tile_count + 1]
+    host_segment_peer_pressure = host_plan[tile_count + 1 :]
+    max_pressure = int(np.max(host_segment_peer_pressure, initial=0))
     relation = NativeRelation(
         left_indices=d_tile_ids.astype(cp.int64, copy=False),
         right_indices=d_source_rows.astype(cp.int64, copy=False),
@@ -480,7 +483,55 @@ def _build_topology_tile_candidate_relation(
         sorted_by_left=True,
         left_group_offsets=d_offsets,
     )
-    return relation, host_offsets, d_full_tile_mask, max_pressure
+    return (
+        relation,
+        host_offsets,
+        host_segment_peer_pressure,
+        d_full_tile_mask,
+        max_pressure,
+    )
+
+
+def _topology_constructive_batch_spans(
+    host_offsets: np.ndarray,
+    host_segment_peer_pressure: np.ndarray,
+    *,
+    max_tiles_per_batch: int,
+) -> tuple[tuple[int, int], ...]:
+    """Pack active contiguous tile ranges under one aggregate topology budget."""
+    offsets = np.asarray(host_offsets, dtype=np.int64)
+    pressure = np.asarray(host_segment_peer_pressure, dtype=np.int64)
+    tile_count = int(pressure.size)
+    if offsets.shape != (tile_count + 1,):
+        raise ValueError("topology batch offsets and pressure must align")
+    if max_tiles_per_batch <= 0:
+        raise ValueError("topology batch tile capacity must be positive")
+    active_tile_ids = np.flatnonzero(np.diff(offsets) > 0)
+    batches: list[tuple[int, int]] = []
+    active_index = 0
+    while active_index < int(active_tile_ids.size):
+        tile_start = int(active_tile_ids[active_index])
+        tile_end = tile_start + 1
+        batch_pressure = int(pressure[tile_start])
+        active_index += 1
+        while active_index < int(active_tile_ids.size):
+            next_tile = int(active_tile_ids[active_index])
+            next_end = next_tile + 1
+            if next_end - tile_start > max_tiles_per_batch:
+                break
+            next_pressure = int(pressure[next_tile])
+            if (
+                batch_pressure > 0
+                and next_pressure > 0
+                and batch_pressure + next_pressure
+                > _TARGET_TILE_SEGMENT_PEER_PRESSURE
+            ):
+                break
+            tile_end = next_end
+            batch_pressure += next_pressure
+            active_index += 1
+        batches.append((tile_start, tile_end))
+    return tuple(batches)
 
 
 def _clip_topology_tile_candidate_batch(
@@ -677,7 +728,13 @@ def _plan_topology_tiles(
                 tile_count=tile_count,
                 source_bounds=d_source_bounds,
             )
-            relation, host_offsets, d_full_tile_mask, max_pressure = (
+            (
+                relation,
+                host_offsets,
+                host_segment_peer_pressure,
+                d_full_tile_mask,
+                max_pressure,
+            ) = (
                 _build_topology_tile_candidate_relation(
                     owned,
                     segments,
@@ -691,12 +748,19 @@ def _plan_topology_tiles(
                     source_bounds=d_source_bounds,
                     relation=relation,
                     host_offsets=host_offsets,
+                    host_segment_peer_pressure=host_segment_peer_pressure,
                     full_tile_mask=d_full_tile_mask,
                     cols=metadata.cols,
                     rows=metadata.rows,
                     max_segment_peer_pressure=max_pressure,
                 )
-            del relation, host_offsets, d_full_tile_mask, d_tile_bounds
+            del (
+                relation,
+                host_offsets,
+                host_segment_peer_pressure,
+                d_full_tile_mask,
+                d_tile_bounds,
+            )
             tile_count *= 2
             if tile_count >= 1 << 31:
                 raise RuntimeError(
@@ -792,7 +856,8 @@ def _tiled_single_group_collective_union_gpu(
     *,
     tile_count: int,
     force_tile_count: bool,
-) -> tuple[OwnedGeometryArray, int, int]:
+    assemble_union: bool = True,
+) -> tuple[OwnedGeometryArray | None, OwnedGeometryArray, int, int]:
     from vibespatial.constructive.binary_constructive import (
         _regroup_native_grouped_parts_with_grouped_union_gpu,
     )
@@ -806,9 +871,11 @@ def _tiled_single_group_collective_union_gpu(
     d_tile_bounds = topology_plan.tile_bounds
     tile_relation = topology_plan.relation
     host_offsets = topology_plan.host_offsets
+    host_segment_peer_pressure = topology_plan.host_segment_peer_pressure
     tile_count = int(topology_plan.cols * topology_plan.rows)
     max_segment_peer_pressure = topology_plan.max_segment_peer_pressure
     coverage_levels: list[list[OwnedGeometryArray]] = []
+    coverage_parts: list[OwnedGeometryArray] = []
     full_tile_coverage = _assemble_full_topology_tiles(
         d_tile_bounds,
         topology_plan.full_tile_mask,
@@ -816,28 +883,21 @@ def _tiled_single_group_collective_union_gpu(
         rows=topology_plan.rows,
     )
     if full_tile_coverage is not None:
-        _append_topology_coverage_row(coverage_levels, full_tile_coverage)
+        if assemble_union:
+            _append_topology_coverage_row(coverage_levels, full_tile_coverage)
+        else:
+            coverage_parts.append(full_tile_coverage)
 
-    active_tile_ids = np.flatnonzero(np.diff(host_offsets) > 0)
-    active_tile_batches: list[tuple[int, int]] = []
-    active_index = 0
-    while active_index < int(active_tile_ids.size):
-        tile_start = int(active_tile_ids[active_index])
-        tile_end = tile_start + 1
-        active_index += 1
-        while (
-            active_index < int(active_tile_ids.size)
-            and int(active_tile_ids[active_index]) < tile_start + _TOPOLOGY_CONSTRUCTIVE_BATCH_TILES
-        ):
-            tile_end = int(active_tile_ids[active_index]) + 1
-            active_index += 1
-        active_tile_batches.append((tile_start, tile_end))
+    active_tile_batches = _topology_constructive_batch_spans(
+        host_offsets,
+        host_segment_peer_pressure,
+        max_tiles_per_batch=_TOPOLOGY_CONSTRUCTIVE_BATCH_TILES,
+    )
     for tile_start, tile_end in active_tile_batches:
         batch_tile_count = tile_end - tile_start
         row_start = int(host_offsets[tile_start])
         row_end = int(host_offsets[tile_end])
         batch_candidate_count = row_end - row_start
-        batch_full_mask = cp.asarray(topology_plan.full_tile_mask)[tile_start:tile_end]
         if batch_candidate_count <= 0:
             batch_result = build_empty_polygon_rows_device(batch_tile_count)
         else:
@@ -877,9 +937,19 @@ def _tiled_single_group_collective_union_gpu(
                 )
                 d_batch_counts = cp.zeros(batch_tile_count, dtype=cp.int32)
                 cp.add.at(d_batch_counts, d_live_group_ids, np.int32(1))
-                d_batch_offsets = cp.empty(batch_tile_count + 1, dtype=cp.int64)
-                d_batch_offsets[0] = 0
-                d_batch_offsets[1:] = cp.cumsum(d_batch_counts, dtype=cp.int64)
+                d_observed_group_ids = cp.flatnonzero(d_batch_counts > 0).astype(
+                    cp.int64,
+                    copy=False,
+                )
+                d_observed_offsets = cp.empty(
+                    int(d_observed_group_ids.size) + 1,
+                    dtype=cp.int64,
+                )
+                d_observed_offsets[0] = 0
+                d_observed_offsets[1:] = cp.cumsum(
+                    d_batch_counts[d_observed_group_ids],
+                    dtype=cp.int64,
+                )
                 _sync_hotpath()
                 with hotpath_stage(
                     "constructive.union.tile_topology",
@@ -888,53 +958,116 @@ def _tiled_single_group_collective_union_gpu(
                     batch_result = _regroup_native_grouped_parts_with_grouped_union_gpu(
                         clipped_batch,
                         cp.arange(live_count, dtype=cp.int64),
-                        d_batch_offsets,
-                        cp.arange(batch_tile_count, dtype=cp.int64),
+                        d_observed_offsets,
+                        d_observed_group_ids,
                         output_row_count=batch_tile_count,
                         dispatch_mode=ExecutionMode.GPU,
                         allow_direct_disjoint_pack=False,
                         use_same_row_fast_path=True,
                         group_size_max=group_size_max,
+                        empty_output=build_empty_polygon_rows_device(batch_tile_count),
                     )
                 _sync_hotpath()
-        from vibespatial.constructive.envelope import _build_device_boxes_from_bounds
-        from vibespatial.geometry.owned import device_select_owned_capacity_partitions
-
-        full_boxes = _build_device_boxes_from_bounds(
-            d_tile_bounds[tile_start:tile_end],
-            row_count=batch_tile_count,
-        )
-        batch_result = device_select_owned_capacity_partitions(
-            batch_result,
-            [(full_boxes, batch_full_mask)],
-        )
         if batch_result is None or batch_result.row_count != batch_tile_count:
             raise RuntimeError("grouped topology batch violated tile-row capacity")
         batch_result = _physicalize_topology_coverage_output(batch_result)
-        if batch_tile_count == _TOPOLOGY_SEAM_FAN_IN:
-            _append_topology_coverage_row(
-                coverage_levels,
-                _stitch_topology_coverage_rows(batch_result),
-                level_index=1,
-            )
-        else:
-            for local_tile in range(batch_tile_count):
+        if assemble_union:
+            if batch_tile_count == _TOPOLOGY_SEAM_FAN_IN:
                 _append_topology_coverage_row(
                     coverage_levels,
-                    batch_result._device_indexed_take(
-                        cp.asarray([local_tile], dtype=cp.int64),
-                        assume_unique_indices=True,
-                    ),
+                    _stitch_topology_coverage_rows(batch_result),
+                    level_index=1,
                 )
+            else:
+                for local_tile in range(batch_tile_count):
+                    _append_topology_coverage_row(
+                        coverage_levels,
+                        batch_result._device_indexed_take(
+                            cp.asarray([local_tile], dtype=cp.int64),
+                            assume_unique_indices=True,
+                        ),
+                    )
+        else:
+            coverage_parts.append(batch_result)
         if batch_candidate_count > 0:
             del clipped_batch
     del tile_relation, host_offsets, topology_plan
 
-    _sync_hotpath()
-    with hotpath_stage("constructive.union.tile_seam_stitch", category="assemble"):
-        result = _finish_topology_coverage_levels(coverage_levels)
-    _sync_hotpath()
-    return result, tile_count, max_segment_peer_pressure
+    from vibespatial.geometry.owned import OwnedGeometryArray
+
+    result = None
+    if assemble_union:
+        _sync_hotpath()
+        with hotpath_stage("constructive.union.tile_seam_stitch", category="assemble"):
+            result = _finish_topology_coverage_levels(coverage_levels)
+        _sync_hotpath()
+        coverage = result
+    else:
+        if not coverage_parts:
+            raise RuntimeError("collective topology produced no coverage rows")
+        coverage = OwnedGeometryArray.concat(coverage_parts)
+    return result, coverage, tile_count, max_segment_peer_pressure
+
+
+def single_group_polygon_collective_coverage_gpu(
+    owned: OwnedGeometryArray,
+    *,
+    force_tile_count: int | None = None,
+) -> OwnedGeometryArray | None:
+    """Return exact interior-disjoint tile coverage for a large polygon union.
+
+    The carrier is intended for downstream relation/grouped consumers. Its row
+    union is the exact logical union, but shared tile seams remain until the
+    consumer's grouped constructive reduction or final seam stitch.
+    """
+    if cp is None or owned.residency is not Residency.DEVICE:
+        return None
+    if owned.row_count <= 1 or not set(owned.families).issubset(
+        {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
+    ):
+        return None
+    state = owned._ensure_device_state(preserve_indexed_view=True)
+    if state.trusted_all_valid is not True or state.trusted_all_non_empty is not True:
+        return None
+    normalized = _normalize_collective_polygon_parts(owned)
+    work = estimate_physical_work_from_owned(normalized)
+    segment_capacity = max(int(work.segment_count), int(work.coordinate_count), 1)
+    segment_peer_pressure = segment_capacity * max(int(normalized.row_count) - 1, 1)
+    if (
+        force_tile_count is None
+        and segment_peer_pressure <= _DIRECT_COLLECTIVE_SEGMENT_PEER_PRESSURE
+    ):
+        return None
+    tile_count = (
+        int(force_tile_count)
+        if force_tile_count is not None
+        else _topology_tile_count(segment_peer_pressure)
+    )
+    _result, coverage, resolved_tile_count, max_tile_pressure = (
+        _tiled_single_group_collective_union_gpu(
+            normalized,
+            tile_count=tile_count,
+            force_tile_count=force_tile_count is not None,
+            assemble_union=False,
+        )
+    )
+    record_dispatch_event(
+        surface="vibespatial.constructive.collective_union",
+        operation="union_coverage",
+        implementation="gpu_single_group_tiled_collective_coverage",
+        reason=(
+            "large logical polygon union retained exact tile coverage for a "
+            "downstream relation-grouped consumer"
+        ),
+        detail=(
+            f"rows={normalized.row_count}; coverage_rows={coverage.row_count}; "
+            f"tiles={resolved_tile_count}; "
+            f"max_tile_segment_peer_pressure={max_tile_pressure}"
+        ),
+        requested=ExecutionMode.GPU,
+        selected=ExecutionMode.GPU,
+    )
+    return coverage
 
 
 def single_group_polygon_collective_union_gpu(
@@ -983,11 +1116,15 @@ def single_group_polygon_collective_union_gpu(
             f"segment_peer_pressure={segment_peer_pressure}; tiles=1"
         )
     else:
-        result, tile_count, max_tile_pressure = _tiled_single_group_collective_union_gpu(
-            owned,
-            tile_count=tile_count,
-            force_tile_count=force_tile_count is not None,
+        result, _coverage, tile_count, max_tile_pressure = (
+            _tiled_single_group_collective_union_gpu(
+                owned,
+                tile_count=tile_count,
+                force_tile_count=force_tile_count is not None,
+            )
         )
+        if result is None:
+            raise RuntimeError("collective topology did not assemble its union row")
         implementation = "gpu_single_group_tiled_collective_topology"
         detail = (
             f"rows={owned.row_count}; segment_capacity={segment_capacity}; "
