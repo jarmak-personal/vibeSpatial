@@ -574,6 +574,74 @@ def test_device_query_uses_morton_range_for_large_input():
 
 
 @requires_gpu
+def test_device_query_hydrates_host_index_for_morton_range():
+    """A reusable host-built index keeps indexed query shape on the GPU."""
+    tree_geoms = _make_random_boxes(1000, seed=110, extent=200.0, size=2.0)
+    query_geoms = _make_random_boxes(1000, seed=111, extent=200.0, size=2.0)
+    tree_owned = from_shapely_geometries(tree_geoms)
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.CPU,
+            selected=ExecutionMode.CPU,
+            reason="test host-built reusable spatial index",
+        ),
+    )
+    query_owned = from_shapely_geometries(query_geoms, residency=Residency.DEVICE)
+    query_bounds = compute_geometry_bounds_device(query_owned)
+
+    assert flat_index.device_morton_keys is None
+    candidates, execution = spatial_index_device_query(flat_index, query_bounds)
+
+    assert candidates is not None
+    assert "Morton range" in execution.reason
+    assert flat_index.device_bounds is not None
+    assert flat_index.device_morton_keys is not None
+    assert flat_index.device_order is not None
+    gpu_left, gpu_right = candidates.to_host()
+    cpu_left, cpu_right = _cpu_bbox_pairs(query_bounds.get(), flat_index.bounds)
+    assert set(zip(cpu_left.tolist(), cpu_right.tolist())).issubset(
+        set(zip(gpu_left.tolist(), gpu_right.tolist()))
+    )
+
+
+@requires_gpu
+def test_device_morton_dwithin_refines_with_expanded_bounds():
+    """Morton dwithin retains near rows whose original bboxes do not overlap."""
+    tree_geoms = np.asarray(
+        [box(float(i), 0.0, float(i) + 0.1, 0.1) for i in range(1000)],
+        dtype=object,
+    )
+    query_geoms = np.asarray(
+        [box(float(i) + 0.15, 0.0, float(i) + 0.2, 0.1) for i in range(1000)],
+        dtype=object,
+    )
+    tree_owned = from_shapely_geometries(tree_geoms)
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.CPU,
+            selected=ExecutionMode.CPU,
+            reason="test host-built Morton dwithin index",
+        ),
+    )
+    query_owned = from_shapely_geometries(query_geoms, residency=Residency.DEVICE)
+    query_bounds = compute_geometry_bounds_device(query_owned)
+
+    candidates, execution = spatial_index_device_query(
+        flat_index,
+        query_bounds,
+        distance=0.1,
+    )
+
+    assert candidates is not None
+    assert "Morton range" in execution.reason
+    left, right = candidates.to_host()
+    pairs = set(zip(left.tolist(), right.tolist()))
+    assert {(index, index) for index in range(1000)} <= pairs
+
+
+@requires_gpu
 def test_empty_morton_query_cleanup_does_not_context_synchronize(monkeypatch):
     """Morton temporaries retire on-stream when no candidate pairs are emitted."""
     from unittest.mock import Mock

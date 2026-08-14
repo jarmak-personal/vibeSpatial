@@ -30,6 +30,35 @@ from vibespatial import (
 from vibespatial.geometry.buffers import GeometryFamily
 
 
+def test_vectorized_shapely_owned_builder_supports_mixed_multipolygons() -> None:
+    geometries = [
+        Polygon(
+            [(0, 0), (6, 0), (6, 6), (0, 6), (0, 0)],
+            [[(2, 2), (4, 2), (4, 4), (2, 4), (2, 2)]],
+        ),
+        MultiPolygon(
+            [
+                Polygon([(10, 0), (12, 0), (12, 2), (10, 2), (10, 0)]),
+                Polygon(
+                    [(14, 0), (20, 0), (20, 6), (14, 6), (14, 0)],
+                    [[(16, 2), (18, 2), (18, 4), (16, 4), (16, 2)]],
+                ),
+            ]
+        ),
+        MultiPolygon(),
+        None,
+    ]
+
+    owned = from_shapely_geometries(geometries)
+    restored = owned.to_shapely()
+
+    assert any("vectorized fast path" in event.detail for event in owned.diagnostics)
+    assert restored[0].equals(geometries[0])
+    assert restored[1].equals(geometries[1])
+    assert restored[2].is_empty
+    assert restored[3] is None
+
+
 @pytest.mark.gpu
 def test_device_geometry_composition_requires_explicit_owned_physicalization() -> None:
     if not has_gpu_runtime():

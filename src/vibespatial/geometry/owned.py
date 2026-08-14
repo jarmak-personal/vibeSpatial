@@ -6473,7 +6473,8 @@ def _from_shapely_vectorized(
     - Point (type_id 0)
     - LineString (type_id 1)
     - Polygon (type_id 3)
-    - Mixed arrays containing only the above three types
+    - MultiPolygon (type_id 6)
+    - Mixed arrays containing only the above four types
     """
     n = len(geom_arr)
     if n == 0:
@@ -6490,8 +6491,8 @@ def _from_shapely_vectorized(
     type_ids = shapely.get_type_id(valid_geoms)
     unique_types = np.unique(type_ids)
 
-    # Only handle Point(0), LineString(1), Polygon(3)
-    _SUPPORTED_TYPE_IDS = np.array([0, 1, 3])
+    # Only handle Point(0), LineString(1), Polygon(3), MultiPolygon(6).
+    _SUPPORTED_TYPE_IDS = np.array([0, 1, 3, 6])
     if not np.isin(unique_types, _SUPPORTED_TYPE_IDS).all():
         return None
 
@@ -6505,6 +6506,7 @@ def _from_shapely_vectorized(
         0: GeometryFamily.POINT,
         1: GeometryFamily.LINESTRING,
         3: GeometryFamily.POLYGON,
+        6: GeometryFamily.MULTIPOLYGON,
     }
 
     valid_indices = np.flatnonzero(valid_mask)
@@ -6606,6 +6608,58 @@ def _from_shapely_vectorized(
                 y=y,
                 geometry_offsets=go,
                 empty_mask=fam_empty.copy(),
+                ring_offsets=ro,
+            )
+
+        elif family is GeometryFamily.MULTIPOLYGON:
+            if len(fam_non_empty) > 0:
+                polygons, polygon_parents = shapely.get_parts(
+                    fam_non_empty,
+                    return_index=True,
+                )
+                rings, ring_parents = shapely.get_rings(
+                    polygons,
+                    return_index=True,
+                )
+                ring_coords = shapely.get_coordinates(rings)
+                x = ring_coords[:, 0].astype(np.float64, copy=True)
+                y = ring_coords[:, 1].astype(np.float64, copy=True)
+
+                ring_num_coords = shapely.get_num_coordinates(rings)
+                ro = np.zeros(len(rings) + 1, dtype=np.int32)
+                np.cumsum(ring_num_coords, out=ro[1:])
+
+                rings_per_polygon = np.bincount(
+                    ring_parents,
+                    minlength=len(polygons),
+                ).astype(np.int32)
+                po = np.zeros(len(polygons) + 1, dtype=np.int32)
+                np.cumsum(rings_per_polygon, out=po[1:])
+
+                polygons_per_ne = np.bincount(
+                    polygon_parents,
+                    minlength=len(fam_non_empty),
+                ).astype(np.int32)
+            else:
+                x = np.empty(0, dtype=np.float64)
+                y = np.empty(0, dtype=np.float64)
+                ro = np.zeros(1, dtype=np.int32)
+                po = np.zeros(1, dtype=np.int32)
+                polygons_per_ne = np.empty(0, dtype=np.int32)
+
+            all_polygons_per = np.zeros(fam_count, dtype=np.int32)
+            all_polygons_per[~fam_empty] = polygons_per_ne
+            go = np.zeros(fam_count + 1, dtype=np.int32)
+            np.cumsum(all_polygons_per, out=go[1:])
+            families[family] = FamilyGeometryBuffer(
+                family=family,
+                schema=get_geometry_buffer_schema(family),
+                row_count=fam_count,
+                x=x,
+                y=y,
+                geometry_offsets=go,
+                empty_mask=fam_empty.copy(),
+                part_offsets=po,
                 ring_offsets=ro,
             )
 

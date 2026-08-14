@@ -1973,7 +1973,11 @@ def _read_geoparquet_table_with_pylibcudf(
     builder.use_pandas_metadata(False)
     options = builder.build()
     if columns is not None:
-        options.set_columns(list(columns))
+        set_column_names = getattr(options, "set_column_names", None)
+        if set_column_names is not None:
+            set_column_names(list(columns))
+        else:  # pragma: no cover - compatibility with older pylibcudf
+            options.set_columns(list(columns))
     if row_groups is not None:
         if len(scan_sources) == 1 and (not row_groups or isinstance(row_groups[0], int)):
             grouped_row_groups = [list(row_groups)]

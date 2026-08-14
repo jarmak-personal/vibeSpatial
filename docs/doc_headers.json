@@ -57,6 +57,13 @@
       "sourceOfTruth": "Program plan for implementing ADR-0044 without reviving a broad public lazy planner.",
       "maxBodyLines": 860
     },
+    "docs/dev/pylibcudf-sf100-execution-plan.md": {
+      "scope": "Execution plan for using pylibcudf and unified RMM memory management to make public vibeSpatial APIs exceed optimized GeoPandas by 10x on SpatialBench SF100.",
+      "readIf": "You are changing native attribute execution, relational primitives, GeoParquet scans, GPU memory policy, or the SpatialBench public-API engines.",
+      "stopIf": "You only need an operation-local geometry kernel detail already routed by intake.",
+      "sourceOfTruth": "Program plan for the pylibcudf-backed SF100 performance push.",
+      "maxBodyLines": 280
+    },
     "docs/dev/native-100ms-physical-shape-plan.md": {
       "scope": "Tracking plan for generalized native performance work after the ADR0044 rich baseline.",
       "readIf": "You are planning native substrate performance work, interpreting 10k shootouts, or deciding whether a change improves generalized execution.",

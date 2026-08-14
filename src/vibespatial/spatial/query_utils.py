@@ -59,19 +59,19 @@ def supports_owned_spatial_input(geometry: Any) -> bool:
     values, _ = _as_geometry_array(geometry)
     if values is None:
         return True
-    for value in values:
-        if value is None:
-            continue
-        if not hasattr(value, "geom_type") or not hasattr(value, "is_empty"):
-            return False
-        if value.geom_type not in SUPPORTED_GEOM_TYPES:
-            return False
-        # GeometryCollection passes the type check but cannot be serialized
-        # into owned geometry buffers — reject it so the caller falls back
-        # to the STRtree host path.
-        if value.geom_type == "GeometryCollection":
-            return False
-    return True
+    # Shapely exposes its geometry family tags as one vectorized ufunc.  This
+    # admission check is on every public sindex/sjoin call, so a Python loop
+    # over geometry objects turns a constant-size dispatch decision into an
+    # O(rows) object walk (11s for 3M points in SpatialBench SF1).
+    try:
+        type_ids = np.asarray(shapely.get_type_id(values), dtype=np.int8)
+    except TypeError:
+        return False
+
+    # -1 is Shapely's missing-value tag. LinearRing (2) is not an owned family,
+    # and GeometryCollection (7) cannot be serialized into the 2D owned model.
+    supported_type_ids = np.asarray([-1, 0, 1, 3, 4, 5, 6], dtype=np.int8)
+    return bool(np.isin(type_ids, supported_type_ids).all())
 
 
 def _to_owned_points_fast(values: np.ndarray) -> OwnedGeometryArray | None:

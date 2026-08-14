@@ -196,7 +196,13 @@ def _prepare_tree_bounds_device(
     flat_index,
     runtime,
 ):
-    """Return `(device_bounds_flat, temp_allocation)` for indexed tree bounds."""
+    """Return cached device bounds for indexed tree rows.
+
+    Public ``GeometryArray.sindex`` construction deliberately permits a cheap
+    host build.  A later GPU query must not interpret that host residency as a
+    reason to discard the index shape and scan ``N * M`` pairs.  Hydrate the
+    compact fp64 bounds once and retain them on the reusable flat index.
+    """
     device_bounds = getattr(flat_index, "device_bounds", None)
     if device_bounds is not None:
         if cp is None:  # pragma: no cover - exercised on CPU-only installs
@@ -209,8 +215,11 @@ def _prepare_tree_bounds_device(
             prepared = cp.ascontiguousarray(prepared)
         return prepared.ravel(), None if prepared is base else prepared
 
-    d_bounds = runtime.from_host(np.ascontiguousarray(flat_index.bounds, dtype=np.float64).ravel())
-    return d_bounds, d_bounds
+    d_bounds = runtime.from_host(
+        np.ascontiguousarray(flat_index.bounds, dtype=np.float64)
+    )
+    object.__setattr__(flat_index, "device_bounds", d_bounds)
+    return d_bounds.ravel(), None
 
 
 def spatial_index_device_query(
@@ -304,7 +313,13 @@ def spatial_index_device_query(
     has_morton = (
         total_bounds is not None
         and not np.isnan(total_bounds[0])
-        and getattr(flat_index, "device_morton_keys", None) is not None
+        and (
+            getattr(flat_index, "device_morton_keys", None) is not None
+            or (
+                getattr(flat_index, "_host_morton_keys", None) is not None
+                and getattr(flat_index, "_host_order", None) is not None
+            )
+        )
     )
 
     if has_morton and n_product >= _MORTON_RANGE_CROSSOVER:
@@ -756,12 +771,21 @@ def _prepare_morton_range_query(
     expanded_bounds[:, 2] += float(extent_summary[1])
     expanded_bounds[:, 3] += float(extent_summary[2])
 
-    d_order = cp.asarray(flat_index.device_order, dtype=cp.int32)
-    d_unsorted_keys = cp.asarray(flat_index.device_morton_keys, dtype=cp.uint64)
+    device_order = getattr(flat_index, "device_order", None)
+    if device_order is None:
+        device_order = cp.asarray(flat_index.order, dtype=cp.int32)
+        object.__setattr__(flat_index, "device_order", device_order)
+    d_order = cp.asarray(device_order, dtype=cp.int32)
+
+    device_morton_keys = getattr(flat_index, "device_morton_keys", None)
+    if device_morton_keys is None:
+        device_morton_keys = cp.asarray(flat_index.morton_keys, dtype=cp.uint64)
+        object.__setattr__(flat_index, "device_morton_keys", device_morton_keys)
+    d_unsorted_keys = cp.asarray(device_morton_keys, dtype=cp.uint64)
     d_sorted_keys = cp.ascontiguousarray(d_unsorted_keys[d_order])
     d_sorted_tree_bounds = cp.ascontiguousarray(d_tree_bounds[d_order]).ravel()
     d_query_bounds, temp_query_bounds = _prepare_query_bounds_device(
-        original_bounds,
+        effective_bounds,
         runtime,
     )
     d_expanded_bounds, temp_expanded_bounds = _prepare_query_bounds_device(

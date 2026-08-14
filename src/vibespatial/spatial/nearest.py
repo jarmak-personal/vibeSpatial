@@ -621,8 +621,12 @@ def _launch_point_point_distance_kernel(
     ptr = runtime.pointer
     kernels = _spatial_query_kernels()
 
-    qs = query_owned._ensure_device_state()
-    ts = tree_owned._ensure_device_state()
+    # Pair kernels consume row indirection through family_row_offsets. Keep
+    # repeated point candidates as compact indexed views; resolving them here
+    # gives a logical_rows * source_coordinates allocation shape (multi-TiB for
+    # a few million repeated SpatialBench representatives).
+    qs = query_owned._ensure_device_state(preserve_indexed_view=True)
+    ts = tree_owned._ensure_device_state(preserve_indexed_view=True)
     qp = qs.families[point_family]
     tp = ts.families[point_family]
 

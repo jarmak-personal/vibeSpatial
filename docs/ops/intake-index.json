@@ -4417,6 +4417,177 @@
     },
     {
       "metadata": {
+        "maxBodyLines": 280,
+        "readIf": "You are changing native attribute execution, relational primitives, GeoParquet scans, GPU memory policy, or the SpatialBench public-API engines.",
+        "scope": "Execution plan for using pylibcudf and unified RMM memory management to make public vibeSpatial APIs exceed optimized GeoPandas by 10x on SpatialBench SF100.",
+        "sourceOfTruth": "Program plan for the pylibcudf-backed SF100 performance push.",
+        "stopIf": "You only need an operation-local geometry kernel detail already routed by intake."
+      },
+      "open_first": [
+        "docs/decisions/0042-device-native-result-boundary.md",
+        "docs/decisions/0044-private-native-execution-substrate.md",
+        "docs/dev/private-native-execution-substrate-plan.md",
+        "docs/dev/native-format-library-plan.md",
+        "docs/architecture/pylibcudf-capabilities.md",
+        "src/vibespatial/cuda/_runtime.py",
+        "src/vibespatial/api/_native_result_core.py",
+        "src/vibespatial/api/_native_relation.py",
+        "src/vibespatial/io/geoparquet.py",
+        "src/vibespatial/io/pylibcudf.py",
+        "../sedona-spatialbench/spatialbench-queries/geopandas_optimized_queries.py",
+        "../sedona-spatialbench/spatialbench-queries/vibespatial_queries.py"
+      ],
+      "path": "docs/dev/pylibcudf-sf100-execution-plan.md",
+      "request_signals": [
+        "pylibcudf execution",
+        "unified RMM allocator",
+        "SF100 or SpatialBench",
+        "device attributes and relational primitives",
+        "GPU memory budget, contention, or fragmentation",
+        "public-API performance"
+      ],
+      "risks": [
+        "A second allocator pool can strand free VRAM and turn fragmentation into OOM.",
+        "Immediate gather can multiply geometry and attributes before selectivity is known.",
+        "A broad cuDF frame layer can repeat the rejected public-planner architecture.",
+        "Arrow or pandas intermediates can conceal bulk D2H and synchronization.",
+        "Suite totals can hide a failed or severely regressed individual query.",
+        "Benchmark-specific branches do not generalize and are forbidden."
+      ],
+      "sections": [
+        "Backend Policy",
+        "Constraints",
+        "Intent",
+        "M0: Freeze Semantics And Measurement",
+        "M1: Make Allocation A Query Contract",
+        "M2: Preserve Device Tables From Scan",
+        "M3: Complete Rowset And Relation Consumption",
+        "M4: Complete Tabular Analytics",
+        "M5: Bound Large Physical Shapes",
+        "M6: Close The SF100 Gap",
+        "Memory And Stream Contract",
+        "Mission And Success Contract",
+        "Open First",
+        "Request Signals",
+        "Required Evidence Ledger",
+        "Risks",
+        "Target Architecture",
+        "Verify"
+      ],
+      "title": "pylibcudf SF100 Execution Plan",
+      "tokens": [
+        "10x",
+        "allocation",
+        "allocator",
+        "already",
+        "analytics",
+        "api",
+        "apis",
+        "architecture",
+        "are",
+        "attribute",
+        "attributes",
+        "backed",
+        "backend",
+        "bound",
+        "budget",
+        "changing",
+        "close",
+        "complete",
+        "constraints",
+        "consumption",
+        "contention",
+        "contract",
+        "detail",
+        "device",
+        "engines",
+        "evidence",
+        "exceed",
+        "execution",
+        "first",
+        "fragmentation",
+        "freeze",
+        "gap",
+        "geometry",
+        "geopandas",
+        "geoparquet",
+        "gpu",
+        "intake",
+        "intent",
+        "kernel",
+        "large",
+        "ledger",
+        "local",
+        "m0",
+        "m1",
+        "m2",
+        "m3",
+        "m4",
+        "m5",
+        "m6",
+        "make",
+        "management",
+        "measurement",
+        "memory",
+        "mission",
+        "native",
+        "need",
+        "only",
+        "open",
+        "operation",
+        "optimized",
+        "performance",
+        "physical",
+        "plan",
+        "policy",
+        "preserve",
+        "primitives",
+        "program",
+        "public",
+        "push",
+        "pylibcudf",
+        "query",
+        "relation",
+        "relational",
+        "request",
+        "required",
+        "risks",
+        "rmm",
+        "routed",
+        "rowset",
+        "scan",
+        "scans",
+        "semantics",
+        "sf100",
+        "shapes",
+        "signals",
+        "spatialbench",
+        "stream",
+        "success",
+        "tables",
+        "tabular",
+        "target",
+        "unified",
+        "using",
+        "verify",
+        "vibespatial",
+        "you"
+      ],
+      "verify": [
+        "uv run ruff check",
+        "uv run pytest tests/test_gpu_memory_pool.py -q",
+        "uv run pytest tests/test_pylibcudf_capabilities.py -q",
+        "uv run pytest tests/test_private_native_substrate.py -q",
+        "uv run pytest tests/test_strict_native_mode.py -q",
+        "uv run pytest tests/test_pipeline_benchmarks.py -k \"native or relation or grouped\" -q",
+        "uv run python scripts/benchmark_pipelines.py --suite full --repeat 1 --gpu-sparkline",
+        "uv run python scripts/check_docs.py --check",
+        "python ../sedona-spatialbench/benchmark/run_benchmark.py --data-dir <sf100-geoparquet> --engines geopandas_optimized,vibespatial --scale-factor 100 --runs 3 --timeout 3600 --result-dir <results>",
+        "python ../sedona-spatialbench/benchmark/verify_results.py --help"
+      ]
+    },
+    {
+      "metadata": {
         "maxBodyLines": 220,
         "readIf": "You are wiring, editing, or validating repo-specific Codex subagents.",
         "scope": "Repo-managed Codex custom-agent source files and validation workflow.",
@@ -8322,7 +8493,8 @@
       "kind": "doc",
       "path": "docs/architecture/pylibcudf-capabilities.md",
       "referenced_by": [
-        "docs/architecture/pylibcudf-capabilities.md"
+        "docs/architecture/pylibcudf-capabilities.md",
+        "docs/dev/pylibcudf-sf100-execution-plan.md"
       ],
       "symbols": [],
       "tokens": [
@@ -9104,7 +9276,8 @@
       "path": "docs/decisions/0042-device-native-result-boundary.md",
       "referenced_by": [
         "docs/dev/constructive-result-unification-execution-plan.md",
-        "docs/dev/private-native-execution-substrate-plan.md"
+        "docs/dev/private-native-execution-substrate-plan.md",
+        "docs/dev/pylibcudf-sf100-execution-plan.md"
       ],
       "symbols": [],
       "tokens": [
@@ -9146,7 +9319,8 @@
         "docs/dev/native-format-library-plan.md",
         "docs/dev/native-full-coverage-prd.md",
         "docs/dev/native-physical-shape-ledger.md",
-        "docs/dev/private-native-execution-substrate-plan.md"
+        "docs/dev/private-native-execution-substrate-plan.md",
+        "docs/dev/pylibcudf-sf100-execution-plan.md"
       ],
       "symbols": [],
       "tokens": [
@@ -9385,7 +9559,8 @@
         "docs/dev/native-format-inventory.md",
         "docs/dev/native-format-library-plan.md",
         "docs/dev/native-full-coverage-prd.md",
-        "docs/dev/native-physical-shape-ledger.md"
+        "docs/dev/native-physical-shape-ledger.md",
+        "docs/dev/pylibcudf-sf100-execution-plan.md"
       ],
       "symbols": [],
       "tokens": [
@@ -9458,6 +9633,7 @@
         "docs/dev/native-full-coverage-prd.md",
         "docs/dev/native-physical-shape-ledger.md",
         "docs/dev/private-native-execution-substrate-plan.md",
+        "docs/dev/pylibcudf-sf100-execution-plan.md",
         "docs/testing/adr0044-rich-baseline-2026-04-25.md"
       ],
       "symbols": [],
@@ -9470,6 +9646,21 @@
         "plan",
         "private",
         "substrate"
+      ]
+    },
+    {
+      "kind": "doc",
+      "path": "docs/dev/pylibcudf-sf100-execution-plan.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "dev",
+        "docs",
+        "execution",
+        "md",
+        "plan",
+        "pylibcudf",
+        "sf100"
       ]
     },
     {
@@ -13348,7 +13539,8 @@
       "kind": "source",
       "path": "src/vibespatial/api/_native_relation.py",
       "referenced_by": [
-        "docs/dev/native-format-library-plan.md"
+        "docs/dev/native-format-library-plan.md",
+        "docs/dev/pylibcudf-sf100-execution-plan.md"
       ],
       "symbols": [
         "NativeRelation",
@@ -13418,7 +13610,8 @@
       "path": "src/vibespatial/api/_native_result_core.py",
       "referenced_by": [
         "docs/dev/native-format-library-plan.md",
-        "docs/dev/private-native-execution-substrate-plan.md"
+        "docs/dev/private-native-execution-substrate-plan.md",
+        "docs/dev/pylibcudf-sf100-execution-plan.md"
       ],
       "symbols": [
         "GeometryNativeResult",
@@ -22138,6 +22331,7 @@
       "kind": "source",
       "path": "src/vibespatial/cuda/_runtime.py",
       "referenced_by": [
+        "docs/dev/pylibcudf-sf100-execution-plan.md",
         "docs/testing/gpu-performance-checklist.md"
       ],
       "symbols": [
@@ -25238,7 +25432,8 @@
       "path": "src/vibespatial/io/geoparquet.py",
       "referenced_by": [
         "docs/architecture/io-arrow.md",
-        "docs/architecture/pylibcudf-capabilities.md"
+        "docs/architecture/pylibcudf-capabilities.md",
+        "docs/dev/pylibcudf-sf100-execution-plan.md"
       ],
       "symbols": [
         "GeoParquetScanPlan",
@@ -27017,7 +27212,9 @@
     {
       "kind": "source",
       "path": "src/vibespatial/io/pylibcudf.py",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/dev/pylibcudf-sf100-execution-plan.md"
+      ],
       "symbols": [
         "_build_lazy_host_family_stub",
         "_pylibcudf_buffer_view",
@@ -44206,6 +44403,7 @@
       "path": "tests/test_owned_geometry.py",
       "referenced_by": [],
       "symbols": [
+        "test_vectorized_shapely_owned_builder_supports_mixed_multipolygons",
         "test_device_geometry_composition_requires_explicit_owned_physicalization",
         "test_geometry_host_bridge_d2h_exports_are_runtime_accounted",
         "test_device_take_nested_sizing_uses_structure_or_capacity",
@@ -44268,8 +44466,7 @@
         "TestDeviceResidentConcat",
         "TestEnsureDeviceStateSafetyCheck",
         "_sample_geometries",
-        "_overallocated_polygon_owned",
-        "_overallocated_polygon_ring_capacity_owned"
+        "_overallocated_polygon_owned"
       ],
       "tokens": [
         "accounted",
@@ -44286,6 +44483,7 @@
         "bounds",
         "bridge",
         "buffers",
+        "builder",
         "cached",
         "capacities",
         "capacity",
@@ -44360,11 +44558,13 @@
         "materializes",
         "metadata",
         "mirrors",
+        "mixed",
         "mode",
         "morton",
         "move",
         "multi",
         "multipolygon",
+        "multipolygons",
         "nested",
         "no",
         "nonpoint",
@@ -44425,6 +44625,7 @@
         "structure",
         "stub",
         "style",
+        "supports",
         "syncs",
         "tag",
         "tail",
@@ -44441,6 +44642,7 @@
         "uses",
         "variable",
         "vector",
+        "vectorized",
         "view",
         "when",
         "width",
@@ -44769,6 +44971,7 @@
       "path": "tests/test_point_distance.py",
       "referenced_by": [],
       "symbols": [
+        "test_repeated_point_point_rows_preserve_indexed_view",
         "test_point_distance_kernel_guards_inactive_capacity_with_device_count",
         "TestPointLinestringDistance",
         "TestPointMultiLinestringDistance",
@@ -44786,16 +44989,21 @@
         "distances",
         "guards",
         "inactive",
+        "indexed",
         "kernel",
         "point",
+        "preserve",
         "py",
+        "repeated",
+        "rows",
         "test",
         "testnearestpipelineintegration",
         "testpointlinestringdistance",
         "testpointmultilinestringdistance",
         "testpointmultipolygondistance",
         "testpointpolygondistance",
-        "tests"
+        "tests",
+        "view"
       ]
     },
     {
@@ -47226,6 +47434,8 @@
         "test_device_query_with_distance_expansion",
         "test_device_query_accepts_device_bounds_without_d2h",
         "test_device_query_uses_morton_range_for_large_input",
+        "test_device_query_hydrates_host_index_for_morton_range",
+        "test_device_morton_dwithin_refines_with_expanded_bounds",
         "test_empty_morton_query_cleanup_does_not_context_synchronize",
         "test_native_spatial_index_reductions_do_not_context_synchronize",
         "test_mixed_polygon_reduction_checks_every_multipolygon_component",
@@ -47279,6 +47489,7 @@
         "end",
         "every",
         "execution",
+        "expanded",
         "expansion",
         "explicit",
         "failure",
@@ -47295,6 +47506,8 @@
         "grid",
         "groups",
         "handles",
+        "host",
+        "hydrates",
         "index",
         "inherent",
         "input",
@@ -47339,6 +47552,7 @@
         "range",
         "reduction",
         "reductions",
+        "refines",
         "relation",
         "reports",
         "returns",
@@ -47570,6 +47784,7 @@
       "path": "tests/test_spatial_query.py",
       "referenced_by": [],
       "symbols": [
+        "test_supports_owned_spatial_input_vectorized_family_admission",
         "test_spatial_query_candidate_d2h_exports_are_runtime_accounted",
         "test_nearest_runtime_d2h_exports_are_operation_named",
         "test_polygon_box_query_scalar_fences_are_operation_named",
@@ -47632,11 +47847,11 @@
         "TestSjoinDispatchVisibility",
         "TestDeviceJoinResult",
         "TestDeviceSpatialJoinResult",
-        "test_device_knn_result_to_host_materialization_is_observable",
-        "test_return_device_false_returns_numpy"
+        "test_device_knn_result_to_host_materialization_is_observable"
       ],
       "tokens": [
         "accounted",
+        "admission",
         "aligned",
         "ambiguity",
         "are",
@@ -47730,7 +47945,6 @@
         "nonfinite",
         "noop",
         "not",
-        "numpy",
         "observable",
         "only",
         "operation",
@@ -47810,6 +48024,7 @@
         "until",
         "uses",
         "validated",
+        "vectorized",
         "when",
         "without",
         "zero"

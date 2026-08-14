@@ -7,6 +7,8 @@ import numpy as np
 import pytest
 import shapely
 from shapely.geometry import (
+    GeometryCollection,
+    LinearRing,
     LineString,
     MultiLineString,
     MultiPoint,
@@ -36,6 +38,29 @@ from vibespatial.spatial.query_box import (
     _extract_box_query_bounds_shapely,
 )
 from vibespatial.spatial.spatial_index_device import spatial_index_device_query
+
+
+def test_supports_owned_spatial_input_vectorized_family_admission() -> None:
+    supported = np.asarray(
+        [
+            None,
+            Point(0.0, 0.0),
+            LineString([(0.0, 0.0), (1.0, 1.0)]),
+            Polygon([(0.0, 0.0), (1.0, 0.0), (0.0, 0.0)]),
+        ],
+        dtype=object,
+    )
+
+    assert spatial_query_utils_module.supports_owned_spatial_input(supported)
+    assert not spatial_query_utils_module.supports_owned_spatial_input(
+        np.asarray([LinearRing([(0.0, 0.0), (1.0, 0.0), (0.0, 0.0)])], dtype=object)
+    )
+    assert not spatial_query_utils_module.supports_owned_spatial_input(
+        np.asarray([GeometryCollection([Point(0.0, 0.0)])], dtype=object)
+    )
+    assert not spatial_query_utils_module.supports_owned_spatial_input(
+        np.asarray(["not-a-geometry"], dtype=object)
+    )
 
 
 def _device_regular_box_owned_for_test(

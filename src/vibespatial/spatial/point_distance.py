@@ -82,9 +82,13 @@ def compute_distance_center_device(
             trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
             reason="point distance centering consumes device bounds metadata",
         )
-        bounds = cp.asarray(compute_geometry_bounds_device(owned), dtype=cp.float64).reshape(
-            -1, 4
-        )
+        bounds = cp.asarray(
+            compute_geometry_bounds_device(
+                owned,
+                preserve_indexed_view=True,
+            ),
+            dtype=cp.float64,
+        ).reshape(-1, 4)
         finite = cp.isfinite(bounds)
         extrema.append(
             cp.stack(
@@ -160,8 +164,12 @@ def compute_point_distance_gpu(
     if center_device is None:
         center_device = compute_distance_center_device(query_owned, tree_owned)
 
-    query_state = query_owned._ensure_device_state()
-    tree_state = tree_owned._ensure_device_state()
+    # The from-owned kernels consume logical validity/tag/family-row metadata,
+    # so repeated candidate rows remain a compact indexed view over shared
+    # coordinate buffers. Physicalizing here gives relation-shaped work a
+    # row_count * source_coordinate_count allocation shape.
+    query_state = query_owned._ensure_device_state(preserve_indexed_view=True)
+    tree_state = tree_owned._ensure_device_state(preserve_indexed_view=True)
     query_points = query_state.families[GeometryFamily.POINT]
     tree_buffer = tree_state.families[tree_family]
 

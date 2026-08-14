@@ -13,6 +13,22 @@ from vibespatial.testing import build_owned as _make_owned
 pytestmark = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
 
 
+def test_repeated_point_point_rows_preserve_indexed_view(make_owned):
+    cp = pytest.importorskip("cupy")
+    row_count = 10_000
+    indices = cp.zeros(row_count, dtype=cp.int64)
+    left = make_owned([Point(0, 0)]).device_take(indices)
+    right = make_owned([Point(3, 4)]).device_take(indices)
+
+    from vibespatial.spatial.distance_owned import distance_owned
+
+    result = distance_owned(left, right)
+
+    np.testing.assert_allclose(result, np.full(row_count, 5.0))
+    assert left.is_indexed_view
+    assert right.is_indexed_view
+
+
 def test_point_distance_kernel_guards_inactive_capacity_with_device_count(make_owned):
     cp = pytest.importorskip("cupy")
     from vibespatial.spatial.point_distance import compute_point_distance_gpu
@@ -165,6 +181,26 @@ class TestPointMultiLinestringDistance:
 
 
 class TestPointPolygonDistance:
+    def test_repeated_candidate_rows_preserve_indexed_view(self, make_owned):
+        cp = pytest.importorskip("cupy")
+        row_count = 10_000
+        point = Point(3, 1)
+        polygon = box(0, 0, 2, 2)
+        indices = cp.zeros(row_count, dtype=cp.int64)
+        query_owned = make_owned([point]).device_take(indices)
+        tree_owned = make_owned([polygon]).device_take(indices)
+
+        assert query_owned.is_indexed_view
+        assert tree_owned.is_indexed_view
+
+        from vibespatial.spatial.distance_owned import distance_owned
+
+        result = distance_owned(query_owned, tree_owned)
+
+        np.testing.assert_allclose(result, np.ones(row_count))
+        assert query_owned.is_indexed_view
+        assert tree_owned.is_indexed_view
+
     def test_point_inside_polygon_distance_zero(self, make_owned):
         points = [Point(1, 1)]
         polygons = [box(0, 0, 2, 2)]
