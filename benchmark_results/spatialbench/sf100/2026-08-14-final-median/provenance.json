@@ -1,27 +1,30 @@
 {
-  "generated_at": "2026-08-15T05:18:12.523741+00:00",
+  "generated_at": "2026-08-15T05:56:04.043879+00:00",
   "objective": "Public-API pylibcudf-backed vibeSpatial and optimized GeoPandas SpatialBench SF100 comparison",
   "repositories": {
     "vibespatial": {
       "path": "/home/picard/repos/vibeSpatial",
       "base_revision": "78115c80e4bd124cf2e0c8e12953a58d4fd5e905",
-      "source_manifest_sha256": "967ec8e89cd3df78d3fb1f20343f0d6b3c96352725a1a4ac715d4d42588ed8c8",
+      "source_manifest_sha256": "98dbe73ce397280837dae406f20bb9439beeeee31fea58d9592059d50dafe06d",
       "changed_file_sha256": {
         "docs/architecture/io-arrow.md": "842c67018ee12ecb21a569521746f3367e97757c35e84f5d98812cf43dcd0836",
         "docs/architecture/spatial-joins.md": "3f48c689617a1ec20edcc4ad3590253302ec4c4fd7f0233255e3e873accab5fe",
-        "docs/dev/pylibcudf-sf100-execution-plan.md": "f5b0b7965fd687d9776106ca98980ff035cd5969e0b223ed74c042f08d0a3b79",
+        "docs/dev/pylibcudf-sf100-execution-plan.md": "219b77bf2609363f8f6b908abef1eeedccd4aefc9f86573cd6847a4691ede992",
         "docs/dev/pylibcudf-sf100-query-ledger.md": "994af26658c014c398160957be206c4739ab9766f9244f9f4a0eb7df32bf0d63",
         "docs/doc_headers.json": "e39abe37db1eb1833115c4ce2514a9b5306c3111d4bf1d1fa1e890b4f4e4fbd1",
-        "docs/ops/intake-index.json": "76e092b9f78bc2c6386374899e9b49263be905fd8797a888e2ad9abd6a15fa40",
+        "docs/ops/intake-index.json": "040749fffbf669254356ae2de8f0f0e13459b7653bbbc287ab071c251945db34",
+        "pyproject.toml": "407f619234e9d50fdff928906f924f9c9ed481a9fbb247659a197bd458e00e3a",
         "src/vibespatial/__init__.py": "995c465df76bc1187dc5e91e46f7f12858ab5f73e0b301331a29dd68b0a3f4da",
         "src/vibespatial/api/__init__.py": "ca3e0c9d5e8138c90938dd8a097f98310e28c65aff58b10ca8f06071ef1b668a",
         "src/vibespatial/api/_native_expression.py": "1f7adec21a6f930c49d47b79f575c470a08fdfc62937b161b719cdff1c381f52",
-        "src/vibespatial/api/_native_public_arrays.py": "d639463b10c4ea028459affae8baaad0b61c087d4efc12c4eb1efa9400c049bf",
+        "src/vibespatial/api/_native_public_arrays.py": "1a3a2508bfa7c6fbc3b8fd482793cc02b0db961987d2798396b45d48cbe3f087",
         "src/vibespatial/api/_native_result_core.py": "d7a92106dcf1f688df0a66b6f0acb27dcd0aa488e84edc20e5f54c2a804bbb1b",
         "src/vibespatial/api/_native_state.py": "967f21adaac39710355bbab06ab81236b2927b661bb29ed112c26f8dd28eaff7",
         "src/vibespatial/api/geo_base.py": "af624586fdd885be1bac4112d79d523834144f7415ac06384d715fa152a1d172",
         "src/vibespatial/api/geodataframe.py": "c6ddbfd2db7270c49cca7d30dfc33edc865ec59c2de25fa2c010e62e726fc990",
         "src/vibespatial/api/geoseries.py": "0359fc0ed06c77a2ec0602f1d626d1c948d3deaa3261a47ec7a3fc298654d5cb",
+        "src/vibespatial/api/io/__init__.py": "582fe1824c3634cc2108af6108a9233740c43c0c887224a92bfdce60f0fa76f4",
+        "src/vibespatial/api/io/file.py": "e21963b652c2c981cb61c0144e1765477dbadb7624fcb596dd084c0bf97ee3de",
         "src/vibespatial/api/sindex.py": "7e857f75c4ba643b19267d5d13f7ddf0ea79048db5cd48a54da19072ec0c560a",
         "src/vibespatial/api/tools/hilbert_curve.py": "9562217f6adf979d1bcb10a95f1f4dd9e855456d26c39350b4213c9c4fa17118",
         "src/vibespatial/constructive/convex_hull.py": "a14c870dec14f98b50d0ac92f74d04fd068eea323c4a07bae361eaf2df771c48",
@@ -31,6 +34,7 @@
         "src/vibespatial/cuda/device_functions/point_on_segment.py": "fcaf4be54da7a09eadedb05276adf6cadfce676232ba9d6a330ffb79d976f99b",
         "src/vibespatial/geometry/owned.py": "36081f3670f28bd2e0e0295424efb73e6fae5e8c99e131b7589ccc299970b434",
         "src/vibespatial/io/arrow.py": "66691f75e8fa874496873972ee2e160b500a5fa80bd364030d4930430195dbf2",
+        "src/vibespatial/io/geoarrow.py": "8533f5ddedced2f6f36adead21d76dd5ec947810936d5bc1c9f897bbda0eb8c4",
         "src/vibespatial/io/geoparquet.py": "adf8a7dc7630bf5d017fe498460ae8dd016a7b26577bf8f925eb73d7ac628ca9",
         "src/vibespatial/io/geoparquet_planner.py": "df9e0d888b00f49ec6b16ca274fc658aa681d49f6c743ef76aa28782f212eb6e",
         "src/vibespatial/io/gpu_parse/indexing.py": "53246e792e37183cf2a58700a73c49248ddd3c124157bcd1866a2d947f1a44c1",
@@ -57,17 +61,18 @@
         "tests/test_binary_predicates.py": "86bfd4efa76525a461f432ca0de68a4fa5d813bae041ebb45a06f773d5d96fec",
         "tests/test_dissolve_pipeline.py": "b8c674e08ef859567dcf0832e2681c747503b7deeb647be2830dad86abcdb5dd",
         "tests/test_gpu_memory_pool.py": "79d9c6d3352f76dd883a6fb0b86eb4e02e068f428fef98aaaf859b4d912bf14f",
-        "tests/test_io_arrow.py": "330d65faa71dc8b20c69d8bae7a78aa44c8a7df58fd14d284992eb9b7b40cc21",
+        "tests/test_io_arrow.py": "5c084304a88e6eec1f489fe0e189c509d63d2ef3cfe70e3167e4cc7ee98c708f",
+        "tests/test_overlay_api.py": "bfb0ad1255d62d3de0153794913320b7e9958017d17c983f262bb968ed069d09",
         "tests/test_overlay_gpu_split.py": "4ea3c27119e5fed51aa348f73a4bff9da41a67cbbdadd7f74aac69699558096b",
         "tests/test_point_in_polygon.py": "204db9bd3ab322faa30460d5b18552a19dd68813c55c8ca244a26977164c9125",
-        "tests/test_private_native_substrate.py": "74a0bd72805ecb809d6406f4fd29139fa1c2dc48a272708bef023d5e2cb1299e",
+        "tests/test_private_native_substrate.py": "909c197dd58bacd2126d9932a788f63fca83a4cc0142d0175a3a03b3d80b4107",
         "tests/test_spatial_index_device_gpu.py": "0102a82614661fde178e3e61add1b8c5dd388bc3926be53e35aeaf51fd0d75cf",
         "tests/test_spatial_query.py": "2e6e984f8d3f7803574c5b52595347fa7eb8c4e11a71cf8b0ea06a36eb0cc5f2"
       }
     },
     "spatialbench": {
       "path": "/home/picard/repos/sedona-spatialbench",
-      "base_revision": "2c88536a24b3c34c13cc93a465e9e7c199128833",
+      "base_revision": "2b5a125",
       "source_manifest_sha256": "2f55b3d9ae5499f4c5d3a20c3a106b0b2939de0ec29995c58615f3f1244e6447",
       "changed_file_sha256": {
         "README.md": "f9407fa0ba0225c3ad3432051119b7b4ec2bc7f7d55dab8e8381571ee13d276e",
@@ -127,7 +132,7 @@
     "telemetry_summary.json": "9294618dbb16c043931cbdbcdb80f0ad9d411828ffa9e3aba4346a7195bfda53",
     "same_data_correctness.json": "bca547bce14685ad8903a9558161a801ff4dea8efab7fbcb0b588e002de40d8a",
     "same_data_correctness.md": "3f7fac51e21783a44e8fa286f0d04ae2755730f864ea31a5b0b049decdc9c2fa",
-    "pipeline_profile_summary.json": "4070be9cfd070804f3a673e9014bd6278349e47c06b4d2fd3a42edd27e676b0a",
+    "pipeline_profile_summary.json": "a7e9b1faea3b2cd445809ba6f0bad66942c9e669ba4d3e545302c83bc8f52a48",
     "vibespatial_post_review.json": "c0a6f41dc36062778526e70ffbc01a12427aa0244573cd5a0911187f5686a62c"
   },
   "result": {
@@ -137,5 +142,34 @@
     "q9_individual_10x_exempt": true,
     "correct_queries": 12,
     "fallback_events": 0
+  },
+  "post_push_gate_fixes": {
+    "reason": "mandatory contract pre-push gate exposed compatibility failures after the locked full-suite run",
+    "changes": [
+      "deterministic local shim precedence and dynamic-version cache keys",
+      "exact pyogrio concrete-type normalization at the explicit CPU writer boundary",
+      "on-device physicalization for indexed GeoArrow export",
+      "compat geopandas.io parent aliases",
+      "NativeNumericExpressionDtype-aware attribute astype",
+      "exact host indexed-GeoArrow reorder/repetition resolution"
+    ],
+    "contract_health": "PASS: version 2/2, shim 3/3, overlay 396/398 (2 skipped), clip 179/179, Arrow/Parquet 240/240, file IO 119/119, GPU dispatch 1/1, fallback observability 29/29, performance rails 44/44",
+    "sf100_q4_validation": {
+      "median_seconds": 8.53,
+      "runs_seconds": [
+        8.53,
+        8.49,
+        8.54
+      ],
+      "row_count": 614,
+      "result_identical_to_locked_csv": true,
+      "reported_version": "0.5.0"
+    },
+    "full_profile": {
+      "artifact": "pipeline_profile_summary.json",
+      "max_stage_seconds": 0.06994799408130348,
+      "fallback_events": 0,
+      "compute_d2h_bytes": 0
+    }
   }
 }

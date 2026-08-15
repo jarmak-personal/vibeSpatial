@@ -1,14 +1,14 @@
 {
-  "source": "/tmp/pylibcudf-final-full-pipeline-profile-v3.json",
+  "source": "/tmp/pylibcudf-final-host-index-profile.json",
   "suite": "full",
   "repeat": 1,
   "scale": 1000000,
   "results": [
     {
       "pipeline": "join-heavy",
-      "elapsed_seconds": 0.031424196902662516,
+      "elapsed_seconds": 0.032308967085555196,
       "max_stage": "write_output",
-      "max_stage_seconds": 0.015694971894845366,
+      "max_stage_seconds": 0.015761165879666805,
       "fallback_event_count": 0,
       "compute_d2h_bytes": 0,
       "compute_materialization_count": 0,
@@ -16,9 +16,9 @@
     },
     {
       "pipeline": "relation-semijoin",
-      "elapsed_seconds": 0.021325221983715892,
+      "elapsed_seconds": 0.020843125181272626,
       "max_stage": "read_inputs",
-      "max_stage_seconds": 0.012412382988259196,
+      "max_stage_seconds": 0.013382703065872192,
       "fallback_event_count": 0,
       "compute_d2h_bytes": 0,
       "compute_materialization_count": 0,
@@ -26,9 +26,9 @@
     },
     {
       "pipeline": "small-grouped-constructive-reduce",
-      "elapsed_seconds": 0.08829039498232305,
+      "elapsed_seconds": 0.08858929993584752,
       "max_stage": "native_grouped_union",
-      "max_stage_seconds": 0.04855567100457847,
+      "max_stage_seconds": 0.04824099410325289,
       "fallback_event_count": 0,
       "compute_d2h_bytes": 0,
       "compute_materialization_count": 0,
@@ -36,9 +36,9 @@
     },
     {
       "pipeline": "grouped-capacity-partitions",
-      "elapsed_seconds": 0.1842972580343485,
+      "elapsed_seconds": 0.18518657586537302,
       "max_stage": "mixed_strip_exact_union",
-      "max_stage_seconds": 0.06960895704105496,
+      "max_stage_seconds": 0.06985998619347811,
       "fallback_event_count": 0,
       "compute_d2h_bytes": 0,
       "compute_materialization_count": 0,
@@ -46,9 +46,9 @@
     },
     {
       "pipeline": "grouped-disjoint-constructive-reduce",
-      "elapsed_seconds": 0.06837705709040165,
+      "elapsed_seconds": 0.06768751493655145,
       "max_stage": "build_device_disjoint_groups",
-      "max_stage_seconds": 0.06626139488071203,
+      "max_stage_seconds": 0.06534208101220429,
       "fallback_event_count": 0,
       "compute_d2h_bytes": 0,
       "compute_materialization_count": 0,
@@ -56,9 +56,9 @@
     },
     {
       "pipeline": "grouped-difference-constructive",
-      "elapsed_seconds": 0.03856480517424643,
+      "elapsed_seconds": 0.037521593971177936,
       "max_stage": "build_device_grouped_difference_inputs",
-      "max_stage_seconds": 0.0270378899294883,
+      "max_stage_seconds": 0.026177752995863557,
       "fallback_event_count": 0,
       "compute_d2h_bytes": 0,
       "compute_materialization_count": 0,
@@ -66,9 +66,9 @@
     },
     {
       "pipeline": "constructive-output-native",
-      "elapsed_seconds": 0.011496724095195532,
+      "elapsed_seconds": 0.010892087128013372,
       "max_stage": "native_constructive_intersection",
-      "max_stage_seconds": 0.0037300249096006155,
+      "max_stage_seconds": 0.0035904350224882364,
       "fallback_event_count": 0,
       "compute_d2h_bytes": 0,
       "compute_materialization_count": 0,
@@ -76,9 +76,9 @@
     },
     {
       "pipeline": "overlay-relation-constructive",
-      "elapsed_seconds": 0.012077465886250138,
+      "elapsed_seconds": 0.012355115031823516,
       "max_stage": "build_native_overlay_inputs",
-      "max_stage_seconds": 0.006017427891492844,
+      "max_stage_seconds": 0.006091528106480837,
       "fallback_event_count": 0,
       "compute_d2h_bytes": 0,
       "compute_materialization_count": 0,
@@ -86,9 +86,9 @@
     },
     {
       "pipeline": "constructive",
-      "elapsed_seconds": 0.024532834999263287,
+      "elapsed_seconds": 0.024093386018648744,
       "max_stage": "write_output",
-      "max_stage_seconds": 0.017561515094712377,
+      "max_stage_seconds": 0.01703583705238998,
       "fallback_event_count": 0,
       "compute_d2h_bytes": 0,
       "compute_materialization_count": 0,
@@ -96,9 +96,9 @@
     },
     {
       "pipeline": "predicate-heavy",
-      "elapsed_seconds": 0.09213162306696177,
+      "elapsed_seconds": 0.09240590804256499,
       "max_stage": "read_geojson",
-      "max_stage_seconds": 0.07017675321549177,
+      "max_stage_seconds": 0.06994799408130348,
       "fallback_event_count": 0,
       "compute_d2h_bytes": 0,
       "compute_materialization_count": 0,
@@ -106,16 +106,27 @@
     },
     {
       "pipeline": "zero-transfer",
-      "elapsed_seconds": 0.013349879067391157,
+      "elapsed_seconds": 0.01403749012388289,
       "max_stage": "read_input",
-      "max_stage_seconds": 0.007127829827368259,
+      "max_stage_seconds": 0.00779742281883955,
       "fallback_event_count": 0,
       "compute_d2h_bytes": 0,
       "compute_materialization_count": 0,
       "selected_runtime": "gpu"
     }
   ],
-  "max_stage_seconds": 0.07017675321549177,
+  "max_stage_seconds": 0.06994799408130348,
   "fallback_event_count": 0,
-  "compute_d2h_bytes": 0
+  "compute_d2h_bytes": 0,
+  "post_push_fix_validation": {
+    "sf100_q4_median_seconds": 8.53,
+    "sf100_q4_runs_seconds": [
+      8.53,
+      8.49,
+      8.54
+    ],
+    "sf100_q4_row_count": 614,
+    "sf100_q4_result_identical_to_locked_csv": true,
+    "host_indexed_geoarrow_reorder_and_repetition": "pass"
+  }
 }

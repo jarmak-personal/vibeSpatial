@@ -1175,8 +1175,16 @@ class NativeAttributeColumnArray(ExtensionArray):
 
     def astype(self, dtype, copy: bool = True):
         """Cast sortable device attributes without exporting through Arrow."""
+        native_numeric_dtype = (
+            dtype if isinstance(dtype, NativeNumericExpressionDtype) else None
+        )
+        cast_dtype = (
+            native_numeric_dtype.numpy_dtype
+            if native_numeric_dtype is not None
+            else dtype
+        )
         try:
-            target_dtype = np.dtype(dtype)
+            target_dtype = np.dtype(cast_dtype)
         except TypeError:
             target_dtype = None
         if target_dtype is not None and (
@@ -1223,7 +1231,13 @@ class NativeAttributeColumnArray(ExtensionArray):
                             )
                 except (ImportError, AttributeError, NotImplementedError):
                     pass
-        values = self._materialize_values().astype(dtype, copy=copy)
+        values = self._materialize_values().astype(cast_dtype, copy=copy)
+        if native_numeric_dtype is not None:
+            return NativeNumericExpressionArray._from_sequence(
+                values,
+                dtype=target_dtype,
+                copy=False,
+            )
         return values
 
     def _cmp_method(self, other, op):

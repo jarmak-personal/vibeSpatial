@@ -14015,7 +14015,29 @@ def test_geodataframe_device_attribute_numeric_assignment_preserves_private_stat
     reset_d2h_transfer_count()
 
 
-def test_device_decimal_attribute_cast_preserves_lineage_without_runtime_d2h() -> None:
+def test_attribute_cast_accepts_native_numeric_expression_dtype() -> None:
+    from vibespatial.api._native_public_arrays import (
+        NativeAttributeColumnArray,
+        NativeNumericExpressionArray,
+        NativeNumericExpressionDtype,
+    )
+
+    source = NativeAttributeColumnArray(
+        NativeAttributeTable(dataframe=pd.DataFrame({"value": [1, 2]})),
+        "value",
+    )
+
+    cast = source.astype(NativeNumericExpressionDtype(np.float64))
+
+    assert isinstance(cast, NativeNumericExpressionArray)
+    assert cast.dtype == np.dtype("float64")
+    assert cast.to_numpy().tolist() == [1.0, 2.0]
+
+
+@pytest.mark.parametrize("use_native_dtype", [False, True])
+def test_device_decimal_attribute_cast_preserves_lineage_without_runtime_d2h(
+    use_native_dtype: bool,
+) -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device attribute cast")
     pytest.importorskip("cupy")
@@ -14023,6 +14045,7 @@ def test_device_decimal_attribute_cast_preserves_lineage_without_runtime_d2h() -
     from vibespatial.api._native_public_arrays import (
         NativeAttributeColumnArray,
         NativeNumericExpressionArray,
+        NativeNumericExpressionDtype,
     )
     from vibespatial.cuda._runtime import (
         assert_zero_d2h_transfers,
@@ -14048,8 +14071,14 @@ def test_device_decimal_attribute_cast_preserves_lineage_without_runtime_d2h() -
     )
     reset_d2h_transfer_count()
 
+    dtype = (
+        NativeNumericExpressionDtype(np.float64)
+        if use_native_dtype
+        else np.float64
+    )
+
     with assert_zero_d2h_transfers():
-        cast = source.astype(np.float64)
+        cast = source.astype(dtype)
 
     assert isinstance(cast, NativeNumericExpressionArray)
     assert cast.expression.source_token == "frame-lineage"

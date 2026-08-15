@@ -4632,19 +4632,11 @@ def test_overlay_intersection_accessibility_redevelopment_fixture_matches_pairwi
         for event in fallback_events
     )
 
-    left_owned, right_owned = overlay_module._extract_owned_pair(left, right)
-    index_result = overlay_module._intersecting_index_pairs(
-        left,
-        right,
-        left_owned=left_owned,
-        right_owned=right_owned,
+    oracle_tree = shapely.STRtree(np.asarray(right.geometry.array, dtype=object))
+    idx1, idx2 = oracle_tree.query(
+        np.asarray(left.geometry.array, dtype=object),
+        predicate="intersects",
     )
-    if isinstance(index_result, overlay_module.DeviceSpatialJoinResult):
-        idx1, idx2 = index_result.to_host()
-    elif isinstance(index_result, np.ndarray) and index_result.ndim == 2:
-        idx1, idx2 = index_result
-    else:
-        idx1, idx2 = index_result
     idx1 = np.asarray(idx1, dtype=np.intp)
     idx2 = np.asarray(idx2, dtype=np.intp)
 

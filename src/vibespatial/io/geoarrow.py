@@ -1033,6 +1033,17 @@ def _construct_geoarrow_array_from_owned(
     include_z: bool | None,
     surface: str = "vibespatial.io.geoarrow",
 ):
+    # GeoArrow children describe one contiguous logical row order.  An indexed
+    # view can reorder or repeat rows while retaining its base buffers, so those
+    # buffers are not directly valid Arrow children.  Resolve every indexed
+    # view at this terminal boundary: device views gather on device, while host
+    # views perform the exact host gather.
+    if owned.is_indexed_view:
+        if owned.residency is Residency.DEVICE or owned.device_state is not None:
+            owned._ensure_device_state()
+        else:
+            owned._resolve()
+
     fast_path_reason = _owned_geoarrow_fast_path_reason_from_owned(
         owned,
         include_z=include_z,

@@ -79,6 +79,7 @@ from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
     DiagnosticKind,
+    OwnedGeometryArray,
     build_device_resident_owned,
     from_shapely_geometries,
 )
@@ -759,6 +760,75 @@ def test_native_tabular_to_arrow_geoarrow_owned_skips_geoseries_materialization(
     assert table.column_names == ["geometry"]
     assert len(table) == 2
     assert table.schema.field("geometry").metadata[b"ARROW:extension:name"] == b"geoarrow.point"
+
+
+def test_native_tabular_geoarrow_physicalizes_mixed_device_indexed_view() -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("pylibcudf and a GPU runtime are required")
+
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    polygons = [
+        Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+        MultiPolygon([Polygon([(10, 0), (11, 0), (11, 1), (10, 0)])]),
+        Polygon([(20, 0), (22, 0), (22, 2), (20, 0)]),
+    ]
+    owned = from_shapely_geometries(polygons, residency=Residency.DEVICE)
+    indexed = owned.device_take(cp.asarray([2, 0], dtype=cp.int64))
+    payload = to_native_tabular_result(
+        GeometryNativeResult.from_owned(indexed, crs="EPSG:4326")
+    )
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    geopandas.clear_fallback_events()
+
+    with assert_zero_d2h_transfers():
+        table = pa.table(payload.to_arrow(geometry_encoding="geoarrow"))
+
+    assert table.schema.field("geometry").metadata[b"ARROW:extension:name"] == b"geoarrow.polygon"
+    assert indexed.is_indexed_view is False
+    assert get_d2h_transfer_events(clear=True) == []
+    assert geopandas.get_fallback_events(clear=True) == []
+    decoded = geopandas.GeoDataFrame.from_arrow(table)
+    assert decoded.geometry.iloc[0].equals(polygons[2])
+    assert decoded.geometry.iloc[1].equals(polygons[0])
+
+
+@pytest.mark.parametrize(
+    ("positions", "expected_rows"),
+    [
+        (np.asarray([1, 0], dtype=np.int64), (1, 0)),
+        (np.asarray([1, 0, 1], dtype=np.int64), (1, 0, 1)),
+    ],
+    ids=("reorder", "repetition"),
+)
+def test_native_tabular_geoarrow_resolves_host_indexed_row_order(
+    positions: np.ndarray,
+    expected_rows: tuple[int, ...],
+) -> None:
+    polygons = [
+        Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+        Polygon([(10, 0), (12, 0), (12, 2), (10, 0)]),
+    ]
+    owned = from_shapely_geometries(polygons)
+    indexed = OwnedGeometryArray._indexed_view(owned, positions)
+    payload = to_native_tabular_result(
+        GeometryNativeResult.from_owned(indexed, crs="EPSG:4326")
+    )
+
+    table = pa.table(payload.to_arrow(geometry_encoding="geoarrow"))
+
+    assert indexed.is_indexed_view is False
+    decoded = geopandas.GeoDataFrame.from_arrow(table)
+    assert len(decoded) == len(expected_rows)
+    for actual, expected_row in zip(decoded.geometry, expected_rows, strict=True):
+        assert actual.equals(polygons[expected_row])
 
 
 def test_native_tabular_to_arrow_owned_records_terminal_export_boundary() -> None:

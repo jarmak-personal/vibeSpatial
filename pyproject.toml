@@ -117,6 +117,7 @@ path = "src/vibespatial/_version.py"
 
 [tool.pytest.ini_options]
 addopts = ["-ra"]
+pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
   "upstream: vendored upstream contract tests",
@@ -176,6 +177,13 @@ known-first-party = ["vibespatial", "geopandas"]
 # vibeproj = { path = "../vibeProj", editable = true }
 
 [tool.uv]
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "setup.py" },
+  { file = "setup.cfg" },
+  { dir = "src" },
+  { file = "src/vibespatial/_version.py" },
+]
 conflicts = [
   [
     { extra = "cu12" },

@@ -9,6 +9,10 @@ def _alias_compat_submodule(name: str) -> None:
     sys.modules[f"geopandas.io.{name}"] = module
     globals()[name] = module
 
+    compat_package = sys.modules.get("geopandas.io")
+    if compat_package is not None:
+        setattr(compat_package, name, module)
+
 
 for _name in ("arrow", "_geoarrow", "file", "sql", "util"):
     _alias_compat_submodule(_name)

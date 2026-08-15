@@ -805,19 +805,41 @@ def _to_file_pyogrio(df, filename, driver, schema, crs, mode, metadata, **kwargs
     if not df.columns.is_unique:
         raise ValueError("GeoDataFrame cannot contain duplicated column names.")
 
-    geometry_columns = df.columns[df.dtypes.map(lambda dtype: dtype.name in ("geometry", "device_geometry"))]
+    geometry_columns = df.columns[
+        df.dtypes.map(lambda dtype: dtype.name in ("geometry", "device_geometry"))
+    ]
     if len(geometry_columns) == 1:
         geometry_column = geometry_columns[0]
         crs_value = getattr(df, "crs", None)
-        geometry_series = GeoSeries(
-            list(df[geometry_column].array),
-            index=df.index,
-            crs=crs_value,
-            name=geometry_column,
-        )
-        normalized = pd.DataFrame(df.drop(columns=[geometry_column]).copy())
-        normalized[geometry_column] = geometry_series
-        df = GeoDataFrame(normalized, geometry=geometry_column, crs=crs_value)
+
+        # pyogrio imports GeoPandas independently and its compatibility writer
+        # requires the exact GeometryArray class cached by that import.  The
+        # vibeSpatial public array intentionally has a different concrete type,
+        # so normalize only at this explicit terminal CPU boundary.  Native and
+        # device-backed writes are handled by the shared write_arrow sink before
+        # reaching this function.
+        from pyogrio import _compat as pyogrio_compat
+
+        from geopandas.array import GeometryArray as pyogrio_geometry_array
+
+        pyogrio_geopandas = pyogrio_compat.geopandas
+        if (
+            not isinstance(df[geometry_column].array, pyogrio_geometry_array)
+            and pyogrio_geopandas is not None
+        ):
+            geometry_series = pyogrio_geopandas.GeoSeries(
+                list(df[geometry_column].array),
+                index=df.index,
+                crs=crs_value,
+                name=geometry_column,
+            )
+            normalized = pd.DataFrame(df.drop(columns=[geometry_column]).copy())
+            normalized[geometry_column] = geometry_series
+            df = pyogrio_geopandas.GeoDataFrame(
+                normalized,
+                geometry=geometry_column,
+                crs=crs_value,
+            )
 
         if driver == "ESRI Shapefile" and "geometry_type" not in kwargs:
             geometry_types = df[geometry_column].geom_type.dropna().unique()
