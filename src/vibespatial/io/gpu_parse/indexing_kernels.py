@@ -83,7 +83,9 @@ compute_hilbert_codes(
     const double               extent_maxx,
     const double               extent_maxy,
     unsigned int*  __restrict__ d_hilbert_codes,
-    const int                  n_features
+    const int                  n_features,
+    const int                  level,
+    const int                  truncate_coords
 ) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_features) return;
@@ -104,19 +106,31 @@ compute_hilbert_codes(
     const double cx = (bx0 + bx1) * 0.5;
     const double cy = (by0 + by1) * 0.5;
 
-    // Normalize to [0, 65535] integer grid
-    const double span_x = fmax(extent_maxx - extent_minx, VS_SPATIAL_EPSILON);
-    const double span_y = fmax(extent_maxy - extent_miny, VS_SPATIAL_EPSILON);
-    unsigned int x = (unsigned int)llround(((cx - extent_minx) / span_x) * 65535.0);
-    unsigned int y = (unsigned int)llround(((cy - extent_miny) / span_y) * 65535.0);
+    // Match GeoPandas' level-specific truncation on [0, 2^level - 1].
+    const double span_x = extent_maxx - extent_minx;
+    const double span_y = extent_maxy - extent_miny;
+    const unsigned int side_length = (1u << level) - 1u;
+    const double x_scaled = span_x == 0.0
+        ? 0.0
+        : fmin(fmax((cx - extent_minx) / span_x, 0.0), 1.0) * side_length;
+    const double y_scaled = span_y == 0.0
+        ? 0.0
+        : fmin(fmax((cy - extent_miny) / span_y, 0.0), 1.0) * side_length;
+    unsigned int x = truncate_coords
+        ? (unsigned int)x_scaled
+        : (unsigned int)llround(x_scaled);
+    unsigned int y = truncate_coords
+        ? (unsigned int)y_scaled
+        : (unsigned int)llround(y_scaled);
 
     // Clamp to valid range
-    x = x > 65535u ? 65535u : x;
-    y = y > 65535u ? 65535u : y;
+    x = x > side_length ? side_length : x;
+    y = y > side_length ? side_length : y;
 
     // Hilbert encoding — threadlocalmutex algorithm (level=16)
-    // Shift to fill 16-bit register (level 16, so no shift needed: 16-16=0)
-    // x = x << 0; y = y << 0;
+    // Shift the requested grid to fill the 16-bit encoder register.
+    x = x << (16 - level);
+    y = y << (16 - level);
 
     // Initial prefix scan round
     unsigned int a = x ^ y;
@@ -157,7 +171,8 @@ compute_hilbert_codes(
     unsigned int i0 = x ^ y;
     unsigned int i1 = b | (0xFFFFu ^ (i0 | a));
 
-    d_hilbert_codes[idx] = ((interleave_bits(i1) << 1) | interleave_bits(i0));
+    d_hilbert_codes[idx] =
+        ((interleave_bits(i1) << 1) | interleave_bits(i0)) >> (32 - 2 * level);
 }
 """
 )

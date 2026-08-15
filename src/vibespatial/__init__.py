@@ -13,6 +13,7 @@ from vibespatial.api import (
     read_feather,
     read_file,
     read_parquet,
+    read_parquet_batches,
 )
 from vibespatial.api._config import options
 from vibespatial.api._shapely_dispatch import install_shapely_make_valid_dispatch
@@ -116,6 +117,7 @@ from .io.arrow import (
     plan_wkb_bridge,
     plan_wkb_partition,
     read_geoparquet,
+    read_geoparquet_batches,
     read_geoparquet_native,
     read_geoparquet_owned,
     write_geoparquet,
@@ -610,6 +612,7 @@ __all__ = [
     "record_materialization_event",
     "record_native_export_boundary",
     "read_geoparquet",
+    "read_geoparquet_batches",
     "read_geoparquet_native",
     "read_geoparquet_owned",
     "read_geojson_native",
@@ -651,6 +654,7 @@ __all__ = [
     "points_from_xy",
     "read_file",
     "read_parquet",
+    "read_parquet_batches",
     "read_feather",
     "list_layers",
     "sjoin",

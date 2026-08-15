@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+from decimal import Decimal
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,7 @@ from shapely.geometry import (
     box,
 )
 
+import vibespatial.api as geopandas
 import vibespatial.api._native_result_core as native_result_core_module
 from vibespatial.api import GeoDataFrame, GeoSeries
 from vibespatial.api._native_expression import NativeExpression
@@ -883,6 +885,81 @@ def test_native_expression_binary_arithmetic_lowers_to_rowset() -> None:
     )
     assert wet_area.binary_arithmetic("/", mismatched) is None
     assert wet_area.compare(">=", mismatched) is None
+
+
+def test_native_expression_integer_scalar_arithmetic_preserves_integer_dtype() -> None:
+    values = np.asarray([2024, 2025, 2026], dtype=np.int32)
+    expression = NativeExpression(
+        operation="datetime.year",
+        values=values,
+        source_token="frame",
+        source_row_count=3,
+        dtype="int32",
+        precision="source",
+    )
+
+    multiplied = expression * 12
+    packed = multiplied + 8
+    divided = expression / 2
+
+    assert np.issubdtype(np.asarray(multiplied.values).dtype, np.integer)
+    assert np.issubdtype(np.asarray(packed.values).dtype, np.integer)
+    assert np.asarray(packed.values).tolist() == [24296, 24308, 24320]
+    assert np.issubdtype(np.asarray(divided.values).dtype, np.floating)
+
+
+def test_native_expression_declines_unrepresentable_integer_scalar() -> None:
+    expression = NativeExpression(
+        operation="attribute.value",
+        values=np.asarray([1, 2, 3], dtype=np.int64),
+        source_token="frame",
+        source_row_count=3,
+    )
+
+    assert expression.binary_arithmetic("+", 1 << 80) is None
+
+
+def test_native_topk_memory_estimate_scales_with_float_sort_keys() -> None:
+    import pyarrow as pa
+
+    from vibespatial.api.geodataframe import _native_topk_required_bytes
+
+    one_key = _native_topk_required_bytes(1_000, (pa.float64(),))
+    three_keys = _native_topk_required_bytes(
+        1_000,
+        (pa.float64(), pa.float64(), pa.int64()),
+    )
+
+    assert one_key is not None and one_key > 1_000 * 64
+    assert three_keys is not None and three_keys > one_key
+    assert _native_topk_required_bytes(1_000, (pa.string(),)) is None
+
+
+def test_datetime_component_host_fallback_is_observable_and_strict_rejects() -> None:
+    from vibespatial.testing import strict_native_environment
+
+    frame = geopandas.GeoDataFrame(
+        {
+            "when": pd.to_datetime(["2024-01-02", "2025-03-04"]),
+            "geometry": [Point(0, 0), Point(1, 1)],
+        },
+        crs="EPSG:4326",
+    )
+    geopandas.clear_fallback_events()
+
+    result = frame.datetime_component("when", "month")
+    events = geopandas.get_fallback_events(clear=True)
+
+    assert result.tolist() == [1, 3]
+    assert any(
+        event.surface == "geopandas.geodataframe.datetime_component"
+        for event in events
+    )
+    with strict_native_environment(), pytest.raises(
+        RuntimeError,
+        match="disallows geopandas fallback",
+    ):
+        frame.datetime_component("when", "year")
 
 
 def test_native_expression_guarded_comparison_exposes_ambiguous_rowset() -> None:
@@ -1883,6 +1960,10 @@ def test_native_attribute_table_moves_string_datetime_device_payload_without_run
                 pd.to_datetime(["2020-01-01", "2020-01-02", "2020-01-03"]),
                 type=pa.timestamp("us"),
             ),
+            "money": pa.array(
+                [Decimal("1.25"), Decimal("3.50"), Decimal("2.00")],
+                type=pa.decimal128(8, 2),
+            ),
             "value": pa.array([1, 2, 3], type=pa.int64()),
         }
     )
@@ -2183,12 +2264,16 @@ def test_native_attribute_table_reports_device_dtype_policies_without_runtime_d2
 
     assert policies["score"].category == "all-valid-numeric-bool"
     assert policies["score"].can_compute_numeric is True
+    assert policies["score"].can_sort is True
     assert policies["flag"].category == "all-valid-numeric-bool"
     assert policies["maybe"].category == "nullable-numeric-bool-movement-only"
     assert policies["maybe"].can_compute_numeric is False
     assert policies["category"].category == "categorical-movement-only"
+    assert policies["category"].can_sort is True
     assert policies["name"].category == "string-movement-only"
+    assert policies["name"].can_sort is True
     assert policies["when"].category == "datetime-movement-only"
+    assert policies["when"].can_sort is True
     assert numeric is not None
     assert nullable_numeric is None
     assert categorical_numeric is None
@@ -4185,6 +4270,88 @@ def test_native_distance_expression_composes_rowsets_without_runtime_d2h() -> No
     np.testing.assert_allclose(cp.asnumpy(expression.values), [0.0, 2.0, 1.0, 1.0])
     assert cp.asnumpy(close_rows.positions).tolist() == [0, 2, 3]
     np.testing.assert_allclose(cp.asnumpy(reduced.values), [2.0, 2.0])
+    reset_d2h_transfer_count()
+
+
+@pytest.mark.gpu
+def test_public_distance_streams_aligned_device_composition_partitions() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native partitioned distance expression")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.api._native_public_arrays import NativeNumericExpressionArray
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    def _composition(parts):
+        offset = 0
+        native_parts = []
+        for geometries in parts:
+            owned = from_shapely_geometries(
+                geometries,
+                residency=Residency.DEVICE,
+            )
+            stop = offset + len(geometries)
+            native_parts.append(
+                NativeGeometryCompositionPart(
+                    GeometryNativeResult.from_owned(owned, crs=None),
+                    cp.arange(offset, stop, dtype=cp.int64),
+                )
+            )
+            offset = stop
+        return GeometryNativeResult.from_composition(
+            NativeGeometryComposition(
+                parts=tuple(native_parts),
+                row_count=offset,
+                crs=None,
+                contiguous_row_partitions=True,
+                trusted_singular_rows=True,
+                trusted_family_domain=(GeometryFamily.POINT,),
+            ),
+            crs=None,
+        )
+
+    left_geometry = _composition(
+        ([Point(0, 0), Point(1, 0)], [Point(2, 0), Point(3, 0)])
+    )
+    right_geometry = _composition(
+        ([Point(0, 0), Point(1, 1)], [Point(2, 2), Point(3, 3)])
+    )
+    attributes = NativeAttributeTable.from_value(pd.DataFrame({"row": range(4)}))
+    left = NativeTabularResult(
+        attributes=attributes,
+        geometry=left_geometry,
+        geometry_name="geometry",
+        column_order=("row", "geometry"),
+    ).to_geodataframe()
+    right = NativeTabularResult(
+        attributes=attributes,
+        geometry=right_geometry,
+        geometry_name="geometry",
+        column_order=("row", "geometry"),
+    ).to_geodataframe()
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        distances = left.geometry.distance(right.geometry, align=False)
+        scalar_distances = left.geometry.distance(Point(0, 0))
+
+    assert isinstance(distances.array, NativeNumericExpressionArray)
+    assert distances.array.expression.is_device
+    assert distances.array.expression.precision in {"fp32", "fp64"}
+    assert isinstance(scalar_distances.array, NativeNumericExpressionArray)
+    assert scalar_distances.array.expression.is_device
+    assert get_materialization_events(clear=True) == []
+    np.testing.assert_allclose(
+        cp.asnumpy(distances.array.expression.values),
+        [0.0, 1.0, 2.0, 3.0],
+    )
+    np.testing.assert_allclose(
+        cp.asnumpy(scalar_distances.array.expression.values),
+        [0.0, 1.0, 2.0, 3.0],
+    )
     reset_d2h_transfer_count()
 
 
@@ -11767,6 +11934,45 @@ def test_geodataframe_iloc_slice_preserves_private_native_state() -> None:
     assert get_materialization_events(clear=True) == []
 
 
+def test_native_attribute_full_slice_copies_without_allocating_row_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibespatial.api._native_public_arrays as native_arrays
+
+    table = NativeAttributeTable(
+        dataframe=pd.DataFrame({"value": [1, 2, 3]}),
+    )
+    values = native_arrays.NativeAttributeColumnArray(table, "value")
+
+    def _fail_arange(*_args, **_kwargs):
+        raise AssertionError("a full extension-array slice must not allocate positions")
+
+    monkeypatch.setattr(native_arrays.np, "arange", _fail_arange)
+    copied = values[:]
+
+    assert type(copied).__name__ == "NativeAttributeColumnArray"
+    assert len(copied) == len(values)
+    assert copied is not values
+
+
+def test_native_iloc_monotonic_positions_skip_global_unique(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibespatial.api.geodataframe as geodataframe_module
+
+    def _fail_unique(*_args, **_kwargs):
+        raise AssertionError("strictly increasing positions already prove uniqueness")
+
+    monkeypatch.setattr(geodataframe_module.np, "unique", _fail_unique)
+    positions, unique = geodataframe_module._native_iloc_row_positions(
+        np.asarray([1, 3, 7], dtype=np.int64),
+        10,
+    )
+
+    assert positions.tolist() == [1, 3, 7]
+    assert unique is True
+
+
 def test_geodataframe_iloc_take_preserves_projected_private_native_state() -> None:
     gdf, _state = _native_backed_geodataframe()
 
@@ -13809,6 +14015,47 @@ def test_geodataframe_device_attribute_numeric_assignment_preserves_private_stat
     reset_d2h_transfer_count()
 
 
+def test_device_decimal_attribute_cast_preserves_lineage_without_runtime_d2h() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device attribute cast")
+    pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+    from vibespatial.api._native_public_arrays import (
+        NativeAttributeColumnArray,
+        NativeNumericExpressionArray,
+    )
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        pylibcudf_column_from_arrow,
+        reset_d2h_transfer_count,
+    )
+
+    values = pa.array(
+        [Decimal("1.25"), Decimal("2.50")],
+        type=pa.decimal128(8, 2),
+    )
+    table = NativeAttributeTable(
+        device_table=pytest.importorskip("pylibcudf").Table(
+            [pylibcudf_column_from_arrow(values)]
+        ),
+        column_override=("distance",),
+        schema_override=pa.schema([pa.field("distance", values.type)]),
+    )
+    source = NativeAttributeColumnArray(
+        table,
+        "distance",
+        source_token="frame-lineage",
+    )
+    reset_d2h_transfer_count()
+
+    with assert_zero_d2h_transfers():
+        cast = source.astype(np.float64)
+
+    assert isinstance(cast, NativeNumericExpressionArray)
+    assert cast.expression.source_token == "frame-lineage"
+    reset_d2h_transfer_count()
+
+
 def test_geodataframe_sort_values_preserves_unique_index_private_native_state() -> None:
     gdf = GeoDataFrame(
         {
@@ -14029,6 +14276,70 @@ def test_geodataframe_sort_values_lazy_native_columns_preserves_device_rowflow()
     assert ratio_values is not None
     assert cp.asnumpy(parcel_values["parcel_id"]).tolist() == [1, 1, 2, 2]
     assert cp.asnumpy(ratio_values["flood_ratio"]).tolist() == [0.7, 0.3, 0.9, 0.1]
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_geodataframe_sort_values_decimal_device_columns_preserves_device_rowflow() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native decimal sort preservation")
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    owned = from_shapely_geometries(
+        [Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3)],
+        residency=Residency.DEVICE,
+    )
+    arrow = pa.table(
+        {
+            "tripkey": pa.array([4, 3, 2, 1], type=pa.int64()),
+            "tip": pa.array(
+                [Decimal("1.00"), Decimal("3.50"), Decimal("3.50"), Decimal("2.00")],
+                type=pa.decimal128(8, 2),
+            ),
+        }
+    )
+    gdf = GeoDataFrame(
+        {
+            "tripkey": [4, 3, 2, 1],
+            "tip": [Decimal("1.00"), Decimal("3.50"), Decimal("3.50"), Decimal("2.00")],
+            "geometry": GeoSeries(DeviceGeometryArray._from_owned(owned), name="geometry"),
+        }
+    )
+    attach_native_state(
+        gdf,
+        NativeFrameState.from_native_tabular_result(
+            NativeTabularResult(
+                attributes=NativeAttributeTable(
+                    device_table=plc.Table.from_arrow(arrow),
+                    index_override=pd.RangeIndex(4),
+                    column_override=tuple(arrow.column_names),
+                    schema_override=arrow.schema,
+                ),
+                geometry=GeometryNativeResult.from_owned(owned, crs=None),
+                geometry_name="geometry",
+                column_order=("tripkey", "tip", "geometry"),
+            )
+        ),
+    )
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        sorted_gdf = gdf.sort_values(
+            ["tip", "tripkey"],
+            ascending=[False, True],
+        )
+        sorted_state = get_native_state(sorted_gdf)
+        positions = cp.asarray(sorted_state.attributes.row_positions)
+
+    assert sorted_state is not None
+    assert cp.asnumpy(positions).tolist() == [2, 1, 3, 0]
     assert get_materialization_events(clear=True) == []
     reset_d2h_transfer_count()
 

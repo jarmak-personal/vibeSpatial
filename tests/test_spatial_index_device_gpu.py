@@ -14,8 +14,10 @@ import inspect
 
 import numpy as np
 import pytest
-from shapely.geometry import MultiPolygon, Point, box
+from shapely.geometry import MultiPolygon, Point, Polygon, box
 
+import vibespatial.spatial.query_types as query_types_module
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.kernels.core.geometry_analysis import (
     compute_geometry_bounds,
@@ -307,12 +309,12 @@ def test_morton_reduction_span_schedule_bounds_total_capacity() -> None:
 
 
 def test_device_memory_probe_propagates_runtime_failure(monkeypatch) -> None:
-    cp = pytest.importorskip("cupy")
+    pytest.importorskip("cupy")
 
-    def fail_device():
+    def fail_runtime():
         raise RuntimeError("driver memory query failed")
 
-    monkeypatch.setattr(cp.cuda, "Device", fail_device)
+    monkeypatch.setattr(query_types_module, "get_cuda_runtime", fail_runtime)
     with pytest.raises(RuntimeError, match="driver memory query failed"):
         available_device_memory_bytes()
 
@@ -400,6 +402,145 @@ def test_device_query_matches_cpu_brute_force_small():
         f"GPU pairs != CPU pairs. GPU-only: {gpu_pairs - cpu_pairs}, "
         f"CPU-only: {cpu_pairs - gpu_pairs}"
     )
+
+
+@requires_gpu
+def test_point_grid_superset_is_exactly_refined_before_public_export(monkeypatch):
+    """Cell false positives stay device-resident and exact GIS semantics win."""
+    import shapely
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.predicates import point_location_index
+    from vibespatial.spatial import point_grid_index
+
+    tree_values = np.asarray(
+        [
+            Point(0.5, 0.5),
+            Point(2.0, 2.0),  # inside the first polygon's hole
+            Point(0.0, 2.0),  # on the first polygon's boundary
+            Point(5.5, 0.5),
+            Point(7.5, 0.5),
+            Point(20.0, 20.0),
+            None,
+        ],
+        dtype=object,
+    )
+    query_values = np.asarray(
+        [
+            Polygon(
+                [(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)],
+                holes=[[(1, 1), (3, 1), (3, 3), (1, 3), (1, 1)]],
+            ),
+            MultiPolygon([box(5, 0, 6, 1), box(7, 0, 8, 1)]),
+            box(-20, -20, -10, -10),
+        ],
+        dtype=object,
+    )
+    tree_owned = from_shapely_geometries(tree_values, residency=Residency.DEVICE)
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.CPU,
+            selected=ExecutionMode.CPU,
+            reason="test host-built point-grid exact-refinement carrier",
+        ),
+    )
+    query_owned = from_shapely_geometries(
+        query_values,
+        residency=Residency.DEVICE,
+    )
+    monkeypatch.setattr(point_grid_index, "_MIN_POINT_GRID_ROWS", 0)
+    monkeypatch.setattr(point_location_index, "_MIN_PREPARED_COORDINATES", 0)
+    assert flat_index.device_bounds is None
+
+    reset_d2h_transfer_count()
+    result = query_spatial_index(
+        tree_owned,
+        flat_index,
+        query_owned,
+        predicate="contains",
+    )
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    expected = {
+        (query_row, tree_row)
+        for query_row, polygon in enumerate(query_values)
+        for tree_row, point in enumerate(tree_values)
+        if point is not None and shapely.contains(polygon, point)
+    }
+    actual = set(zip(result[0].tolist(), result[1].tolist(), strict=True))
+    assert actual == expected
+    assert isinstance(flat_index.point_grid, point_grid_index.PreparedPointGridIndex)
+    assert flat_index.device_bounds is not None
+    assert set(query_owned.device_state.point_location_indexes) == {
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+    }
+    assert not any("candidate" in reason and "host export" in reason for reason in reasons)
+    assert "runtime.synchronize" not in inspect.getsource(
+        point_grid_index.point_grid_superset_query
+    )
+
+
+@requires_gpu
+def test_point_grid_superset_is_not_used_for_bbox_only_queries(monkeypatch):
+    """Public predicate=None queries return exact bbox hits, never cell supersets."""
+    from vibespatial.spatial import point_grid_index
+
+    tree_values = np.asarray(
+        [Point(0.10, 0.10), Point(0.90, 0.90), Point(10.0, 10.0)],
+        dtype=object,
+    )
+    tree_owned = from_shapely_geometries(tree_values, residency=Residency.DEVICE)
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.CPU,
+            selected=ExecutionMode.CPU,
+            reason="test bbox-only point-grid exclusion",
+        ),
+    )
+    query_owned = from_shapely_geometries(
+        np.asarray([box(0.0, 0.0, 0.2, 0.2)], dtype=object),
+        residency=Residency.DEVICE,
+    )
+    monkeypatch.setattr(point_grid_index, "_MIN_POINT_GRID_ROWS", 0)
+
+    result = query_spatial_index(
+        tree_owned,
+        flat_index,
+        query_owned,
+        predicate=None,
+    )
+
+    assert result.tolist() == [[0], [0]]
+    assert flat_index.point_grid is None
+
+
+def test_point_grid_memory_estimate_covers_bounds_and_scales_with_cells() -> None:
+    from vibespatial.spatial.point_grid_index import _point_grid_required_bytes
+
+    with_bounds = _point_grid_required_bytes(
+        100_000,
+        16_384,
+        needs_device_bounds=True,
+    )
+    without_bounds = _point_grid_required_bytes(
+        100_000,
+        16_384,
+        needs_device_bounds=False,
+    )
+
+    assert with_bounds > 100_000 * 65 + 16_384 * 32
+    assert with_bounds > without_bounds
+    assert _point_grid_required_bytes(
+        100_000,
+        65_536,
+        needs_device_bounds=True,
+    ) > with_bounds
 
 
 @requires_gpu

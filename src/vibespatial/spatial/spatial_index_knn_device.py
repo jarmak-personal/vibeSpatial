@@ -608,27 +608,8 @@ def spatial_index_knn_device(
         max_distance=effective_max_distance if max_distance is not None else None,
     )
 
-    # When return_all is False and k=1, keep only the first result per query.
-    if not return_all and total_pairs > 0:
-        # Already sorted by (query, distance); take the first per query.
-        if k == 1:
-            # k=1 already has at most 1 per query, nothing more to do.
-            pass
-        else:
-            # Deduplicate: keep only the first occurrence of each query_idx.
-            unique_mask = cp.zeros(total_pairs, dtype=cp.uint8)
-            if total_pairs > 0:
-                unique_mask[0] = 1
-                unique_mask[1:] = (d_out_query[1:] != d_out_query[:-1]).astype(cp.uint8)
-            compacted = compact_indices(unique_mask)
-            if compacted.count > 0:
-                kept = compacted.values
-                d_out_query = d_out_query[kept]
-                d_out_target = d_out_target[kept]
-                d_out_dist = d_out_dist[kept]
-                total_pairs = compacted.count
-            else:
-                total_pairs = 0
+    # The bounded selector already returns at most k rows per query. For k > 1,
+    # ``return_all=False`` means exactly that bounded set rather than one row.
 
     return DeviceKnnResult(
         d_query_idx=d_out_query,

@@ -13,6 +13,9 @@ from vibespatial.api.tools import clip, overlay, sjoin, sjoin_nearest
 from vibespatial.api.tools._show_versions import show_versions
 from vibespatial.io.arrow import read_geoparquet as read_parquet
 from vibespatial.io.file import read_vector_file as read_file
+from vibespatial.io.geoparquet import (
+    read_geoparquet_batches as read_parquet_batches,
+)
 
 # Re-export vibespatial runtime/dispatch APIs so that code using
 # ``import vibespatial.api as geopandas`` can call

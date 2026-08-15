@@ -285,10 +285,14 @@ def _generate_bounds_pairs_gpu(
     )
     capacity_bytes = pair_capacity * np.dtype(np.int32).itemsize * 2
     try:
-        pool_stats = runtime.memory_pool_stats()
-        free_bytes = int(
-            pool_stats.get("free_bytes", cp.cuda.Device().mem_info[0])
-        )
+        remaining = getattr(runtime, "query_memory_remaining_bytes", None)
+        if callable(remaining):
+            free_bytes = int(remaining())
+        else:
+            pool_stats = runtime.memory_pool_stats()
+            free_bytes = int(
+                pool_stats.get("free_bytes", cp.cuda.Device().mem_info[0])
+            )
     except Exception:
         free_bytes = 0
     input_row_capacity = left_count + (0 if same_input else right_count)
@@ -539,6 +543,7 @@ class FlatSpatialIndex:
     device_morton_keys: object = None  # CuPy device array or None
     device_order: object = None  # CuPy device array or None
     device_bounds: object = None  # CuPy device array or None
+    point_grid: object = None  # PreparedPointGridIndex or None
 
     @property
     def bounds(self) -> np.ndarray:

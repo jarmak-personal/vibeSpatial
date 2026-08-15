@@ -476,6 +476,90 @@ def test_memory_pool_configuration_waits_for_active_context(monkeypatch) -> None
     assert runtime._memory_pool_configured is False
 
 
+def test_rmm_configuration_failure_refuses_split_allocator_fallback(monkeypatch) -> None:
+    import vibespatial.cuda._runtime as rt_mod
+
+    runtime = rt_mod.CudaDriverRuntime()
+    fallback_calls: list[str] = []
+    monkeypatch.setattr(rt_mod, "rmm", object())
+    monkeypatch.setattr(
+        runtime,
+        "_configure_rmm_pool",
+        lambda: (_ for _ in ()).throw(RuntimeError("test RMM failure")),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_configure_cupy_pool",
+        lambda: fallback_calls.append("cupy"),
+    )
+
+    with pytest.raises(RuntimeError, match="refusing a split"):
+        runtime._configure_memory_pool_for_active_context()
+
+    assert fallback_calls == []
+    assert runtime._memory_pool_configured is False
+
+
+def test_missing_rmm_refuses_cupy_pool_when_pylibcudf_is_importable(monkeypatch) -> None:
+    import vibespatial.cuda._runtime as rt_mod
+
+    runtime = rt_mod.CudaDriverRuntime()
+    fallback_calls: list[str] = []
+    monkeypatch.setattr(rt_mod, "rmm", None)
+    monkeypatch.setattr(rt_mod.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(
+        runtime,
+        "_configure_cupy_pool",
+        lambda: fallback_calls.append("cupy"),
+    )
+
+    with pytest.raises(RuntimeError, match="refusing a split"):
+        runtime._configure_memory_pool_for_active_context()
+
+    assert fallback_calls == []
+    assert runtime._memory_pool_configured is False
+
+
+def test_query_memory_admission_returns_deterministic_shard_capacity(monkeypatch) -> None:
+    import vibespatial.cuda._runtime as rt_mod
+
+    runtime = rt_mod.CudaDriverRuntime()
+    budget = rt_mod.QueryDeviceMemoryBudget(
+        total_device_bytes=2_000,
+        allocatable_bytes_at_start=1_500,
+        reserve_bytes=500,
+        budget_bytes=1_000,
+        live_bytes_at_start=100,
+    )
+    monkeypatch.setattr(runtime, "query_memory_budget", lambda: budget)
+    monkeypatch.setattr(runtime, "query_memory_remaining_bytes", lambda: 600)
+
+    decision = runtime.admit_device_memory(
+        stage="candidate-refine",
+        required_bytes=1_000,
+        requested_units=100,
+    )
+
+    assert decision.admitted is False
+    assert decision.bytes_per_unit == 10
+    assert decision.admitted_units == 60
+    assert runtime.memory_admission_events() == (decision,)
+
+
+def test_query_memory_reserve_is_configurable(monkeypatch) -> None:
+    import vibespatial.cuda._runtime as rt_mod
+
+    monkeypatch.setenv("VIBESPATIAL_GPU_MEMORY_RESERVE_BYTES", "123")
+    assert rt_mod._configured_query_memory_reserve(1_000) == 123
+
+    monkeypatch.setenv("VIBESPATIAL_GPU_MEMORY_RESERVE_BYTES", "2000")
+    assert rt_mod._configured_query_memory_reserve(1_000) == 1_000
+
+    monkeypatch.setenv("VIBESPATIAL_GPU_MEMORY_RESERVE_BYTES", "-1")
+    with pytest.raises(ValueError, match="must be non-negative"):
+        rt_mod._configured_query_memory_reserve(1_000)
+
+
 # ---------------------------------------------------------------------------
 # memory_pool_stats returns expected shape
 # ---------------------------------------------------------------------------
@@ -631,3 +715,74 @@ def test_memory_backend_is_set_on_gpu() -> None:
     runtime._ensure_context()
 
     assert runtime._memory_backend in ("cupy", "rmm-pool", "rmm-safe", "rmm-managed")
+
+
+@pytest.mark.gpu
+def test_cupy_and_pylibcudf_share_the_active_rmm_resource() -> None:
+    cp = pytest.importorskip("cupy")
+    pa = pytest.importorskip("pyarrow")
+    plc = pytest.importorskip("pylibcudf")
+    rmm = pytest.importorskip("rmm")
+    from rmm.allocators.cupy import rmm_cupy_allocator
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    runtime = get_cuda_runtime()
+    runtime._ensure_context()
+    if not runtime._memory_backend.startswith("rmm"):
+        pytest.skip("unified RMM allocator is unavailable")
+
+    before = runtime.memory_pool_stats().get("total_allocations", 0)
+    cupy_values = cp.arange(1024, dtype=cp.int64)
+    table = plc.Table.from_arrow(pa.table({"value": np.arange(1024, dtype=np.int64)}))
+    after = runtime.memory_pool_stats()
+
+    assert cp.cuda.get_allocator() is rmm_cupy_allocator
+    assert rmm.mr.get_current_device_resource() is runtime._rmm_mr
+    assert after["total_allocations"] > before
+    assert after["reserved_bytes"] >= after["used_bytes"]
+    assert int(cupy_values.size) == table.num_rows()
+
+
+@pytest.mark.gpu
+def test_unified_rmm_pool_reuses_fragmented_allocations_and_releases_live_bytes() -> None:
+    import gc
+
+    cp = pytest.importorskip("cupy")
+    pa = pytest.importorskip("pyarrow")
+    plc = pytest.importorskip("pylibcudf")
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    runtime = get_cuda_runtime()
+    runtime._ensure_context()
+    if not runtime._memory_backend.startswith("rmm"):
+        pytest.skip("unified RMM allocator is unavailable")
+
+    cp.cuda.get_current_stream().synchronize()
+    baseline = runtime.memory_pool_stats()
+    reserved_high_water = baseline["reserved_bytes"]
+    for _ in range(3):
+        allocations = [
+            cp.empty(size, dtype=cp.uint8)
+            for size in (1 << 20, 7 << 20, 2 << 20, 5 << 20, 3 << 20)
+        ]
+        del allocations[1::2]
+        table = plc.Table.from_arrow(
+            pa.table({"value": np.arange(500_000, dtype=np.int64)})
+        )
+        allocations.extend(
+            cp.empty(size, dtype=cp.uint8) for size in (4 << 20, 6 << 20)
+        )
+        cp.cuda.get_current_stream().synchronize()
+        reserved_high_water = max(
+            reserved_high_water,
+            runtime.memory_pool_stats()["reserved_bytes"],
+        )
+        del table, allocations
+        gc.collect()
+        cp.cuda.get_current_stream().synchronize()
+        after_release = runtime.memory_pool_stats()
+        assert after_release["used_bytes"] <= baseline["used_bytes"] + (1 << 20)
+
+    assert runtime.memory_pool_stats()["reserved_bytes"] <= reserved_high_water

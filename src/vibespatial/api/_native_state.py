@@ -661,18 +661,153 @@ class NativeFrameState:
             operation_prefix="geometry_predicate",
         )
 
-    def geometry_distance_expression(self, other: NativeFrameState):
+    def geometry_distance_expression(self, other):
         """Return private row-aligned distances to another native frame."""
+        from shapely.geometry.base import BaseGeometry
+
+        scalar_geometry = isinstance(other, BaseGeometry)
+        if not isinstance(other, NativeFrameState) and not scalar_geometry:
+            raise TypeError(
+                "NativeFrameState geometry distance expressions require another "
+                "NativeFrameState or one scalar geometry"
+            )
+        if not scalar_geometry and other.row_count != self.row_count:
+            raise ValueError(
+                "NativeFrameState geometry distance expressions require row-aligned frames"
+            )
         owned = getattr(self.geometry, "owned", None)
-        other_owned = getattr(other.geometry, "owned", None)
-        if owned is None or other_owned is None:
-            raise TypeError("NativeFrameState geometry distance expression requires owned geometry")
+        if scalar_geometry:
+            from vibespatial.geometry.owned import from_shapely_geometries
+
+            other_owned = from_shapely_geometries([other])
+        else:
+            other_owned = getattr(other.geometry, "owned", None)
         from vibespatial.spatial.distance_owned import distance_expression_owned
 
-        return distance_expression_owned(
-            owned,
-            other_owned,
+        if owned is not None and other_owned is not None:
+            return distance_expression_owned(
+                owned,
+                other_owned,
+                source_token=self.lineage_token,
+            )
+
+        left_composition = getattr(self.geometry, "composition", None)
+        right_composition = (
+            None if scalar_geometry else getattr(other.geometry, "composition", None)
+        )
+        left_parts = (
+            left_composition.ordered_contiguous_device_parts()
+            if left_composition is not None
+            else None
+        )
+        right_parts = (
+            right_composition.ordered_contiguous_device_parts()
+            if right_composition is not None
+            else None
+        )
+        if owned is not None:
+            left_parts = ((0, self.row_count, owned),)
+        if scalar_geometry and left_parts is not None:
+            right_parts = tuple(
+                (start, stop, other_owned) for start, stop, _part in left_parts
+            )
+        elif other_owned is not None:
+            right_parts = ((0, other.row_count, other_owned),)
+        if left_parts is None or right_parts is None:
+            raise TypeError(
+                "NativeFrameState geometry distance expression requires owned geometry "
+                "or certified contiguous device compositions"
+            )
+
+        import cupy as cp
+
+        from vibespatial.api._native_expression import NativeExpression
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        max_span = max(
+            (stop - start for start, stop, _part in (*left_parts, *right_parts)),
+            default=0,
+        )
+        # One persistent fp64 output plus one partition result.  When partition
+        # boundaries differ, two int64 row-indirection vectors are also live.
+        required_bytes = self.row_count * 8 + max_span * 24
+        admission = get_cuda_runtime().admit_device_memory(
+            stage="geometry-distance-partitioned",
+            required_bytes=required_bytes,
+            requested_units=self.row_count,
+        )
+        if not admission.admitted:
+            raise MemoryError(
+                "partitioned geometry distance requires "
+                f"{required_bytes} device bytes with {admission.remaining_bytes} available"
+            )
+
+        values = cp.empty(self.row_count, dtype=cp.float64)
+        left_index = right_index = 0
+        cursor = 0
+        selected_precisions: set[str] = set()
+        while left_index < len(left_parts) and right_index < len(right_parts):
+            left_start, left_stop, left_part = left_parts[left_index]
+            right_start, right_stop, right_part = right_parts[right_index]
+            start = max(left_start, right_start)
+            stop = min(left_stop, right_stop)
+            if stop <= start:
+                if left_stop <= right_start:
+                    left_index += 1
+                    continue
+                if right_stop <= left_start:
+                    right_index += 1
+                    continue
+                raise ValueError("native geometry partitions do not overlap monotonically")
+
+            if start == left_start and stop == left_stop:
+                left_piece = left_part
+            else:
+                left_piece = left_part._device_indexed_take(
+                    cp.arange(start - left_start, stop - left_start, dtype=cp.int64),
+                    assume_unique_indices=True,
+                    defer_device_metadata=True,
+                )
+            if start == right_start and stop == right_stop:
+                right_piece = right_part
+            else:
+                right_piece = right_part._device_indexed_take(
+                    cp.arange(start - right_start, stop - right_start, dtype=cp.int64),
+                    assume_unique_indices=True,
+                    defer_device_metadata=True,
+                )
+
+            expression = distance_expression_owned(
+                left_piece,
+                right_piece,
+                source_token=self.lineage_token,
+            )
+            if expression is None:
+                return None
+            values[start:stop] = expression.values
+            if expression.precision is not None:
+                selected_precisions.add(expression.precision)
+            cursor = stop
+            if left_stop == stop:
+                left_index += 1
+            if right_stop == stop:
+                right_index += 1
+
+        if cursor != self.row_count:
+            raise ValueError("native geometry partitions do not cover every aligned row")
+        precision = (
+            next(iter(selected_precisions))
+            if len(selected_precisions) == 1
+            else "partitioned"
+        )
+        return NativeExpression(
+            operation="geometry.distance",
+            values=values,
             source_token=self.lineage_token,
+            source_row_count=self.row_count,
+            dtype=str(values.dtype),
+            precision=precision,
+            null_policy="nan-false",
         )
 
     def geometry_centroid_x_expression(self):

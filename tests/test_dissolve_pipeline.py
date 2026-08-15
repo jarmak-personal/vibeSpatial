@@ -17,6 +17,7 @@ from vibespatial import (
     benchmark_dissolve_pipeline,
     fusion_plan_for_dissolve,
     has_gpu_runtime,
+    has_pylibcudf_support,
     plan_dissolve_pipeline,
 )
 from vibespatial.api._native_grouped import NativeGrouped, NativeGroupedAttributeReduction
@@ -5253,6 +5254,21 @@ def test_grouped_convex_hull_uses_polygon_part_capacity_carrier() -> None:
     assert "cp.argsort" not in function_source
 
 
+@pytest.mark.gpu
+def test_grouped_hull_rewrite_rejects_mixed_point_polygon_sources() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    owned = from_shapely_geometries(
+        [Point(0.0, 0.0), box(0.0, 0.0, 1.0, 1.0)],
+        residency=Residency.DEVICE,
+    )
+
+    assert not dissolve_module._owned_supports_grouped_convex_hull_rewrite(
+        owned
+    )
+
+
 def test_segmented_union_residual_relation_uses_polygon_part_capacity() -> None:
     segmented_union_module = importlib.import_module(
         "vibespatial.kernels.constructive.segmented_union"
@@ -5338,6 +5354,97 @@ def test_public_dissolve_then_convex_hull_uses_grouped_hull_rewrite() -> None:
     assert "grouped convex-hull source-row group-domain scalar fence" not in runtime_reasons
     assert shapely.area(shapely.symmetric_difference(actual[0], expected[0])) == 0.0
     assert shapely.area(shapely.symmetric_difference(actual[1], expected[1])) == 0.0
+
+
+@pytest.mark.gpu
+def test_public_grouped_point_dissolve_convex_hull_matches_shapely_oracle() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    values = [
+        Point(10.0, 10.0),
+        Point(0.0, 0.0),
+        Point(3.0, 0.0),
+        Point(2.0, 0.0),
+        Point(4.0, 0.0),
+        Point(0.0, 2.0),
+        Point(1.0, 0.5),
+    ]
+    groups = np.asarray([2, 0, 1, 0, 1, 0, 0], dtype=np.int32)
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": groups,
+            "value": np.arange(len(values), dtype=np.int32),
+        },
+        geometry=geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(
+                from_shapely_geometries(values, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+
+    geopandas.clear_dispatch_events()
+    dissolved = frame.dissolve(
+        by="group",
+        aggfunc={"value": "sum"},
+        method="unary",
+    ).reset_index()
+    result = dissolved.geometry.convex_hull
+    actual = np.asarray(result.array, dtype=object)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    for output_row, group in enumerate((0, 1, 2)):
+        selected = np.asarray(values, dtype=object)[groups == group]
+        expected = shapely.convex_hull(shapely.union_all(selected))
+        assert bool(shapely.equals(actual[output_row], expected))
+    assert dissolved["value"].tolist() == [15, 6, 0]
+    assert any(
+        event.implementation == "grouped_dissolve_convex_hull_gpu"
+        for event in events
+    )
+
+
+@pytest.mark.gpu
+def test_selected_device_attribute_keys_drive_grouped_point_hulls(tmp_path) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    if not has_pylibcudf_support():
+        pytest.skip("pylibcudf GeoParquet reader unavailable")
+
+    source = geopandas.GeoDataFrame(
+        {
+            "group": [9, 1, 8, 2, 7, 1, 6, 2],
+            "value": np.arange(8, dtype=np.int32),
+            "geometry": [Point(float(i), float(i % 3)) for i in range(8)],
+        },
+        crs="EPSG:3857",
+    )
+    path = tmp_path / "selected-group-keys.parquet"
+    source.to_parquet(path, index=False, geometry_encoding="geoarrow")
+    frame = geopandas.read_parquet(path)
+    selected = frame.iloc[[7, 1, 5, 3]]
+
+    dissolved = selected.dissolve(
+        by="group",
+        aggfunc={"value": "sum"},
+        method="unary",
+    ).reset_index()
+    actual = np.asarray(dissolved.geometry.convex_hull.array, dtype=object)
+
+    assert dissolved["group"].tolist() == [1, 2]
+    assert dissolved["value"].tolist() == [6, 10]
+    expected_group_1 = shapely.convex_hull(
+        shapely.union_all(np.asarray([source.geometry[1], source.geometry[5]]))
+    )
+    expected_group_2 = shapely.convex_hull(
+        shapely.union_all(np.asarray([source.geometry[7], source.geometry[3]]))
+    )
+    assert bool(shapely.equals(actual[0], expected_group_1))
+    assert bool(shapely.equals(actual[1], expected_group_2))
 
 
 @pytest.mark.gpu

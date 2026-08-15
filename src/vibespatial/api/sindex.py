@@ -962,6 +962,7 @@ class SpatialIndex:
         max_distance=None,
         return_distance=False,
         exclusive=False,
+        k=1,
         _return_execution_mode=False,
     ):
         """
@@ -1004,6 +1005,11 @@ geometries}
         exclusive : bool, optional
             if True, the nearest geometries that are equal to the input geometry
             will not be returned. By default False.  Requires Shapely >= 2.0.
+        k : int, default 1
+            Number of nearest tree geometries to return per input geometry.
+            Values greater than one require the native device k-NN path and
+            ``return_all=False``; exactly ``k`` rows are returned when enough
+            tree geometries exist.
 
         Returns
         -------
@@ -1043,6 +1049,10 @@ geometries}
         array([[0, 1],
                [8, 9]])
         """
+        if not isinstance(k, int) or isinstance(k, bool) or k <= 0:
+            raise ValueError("k must be a positive integer")
+        if k > 1 and return_all:
+            raise ValueError("k > 1 requires return_all=False")
         raw_geometry = geometry
 
         # Route through the owned nearest engine when inputs support it.
@@ -1097,6 +1107,7 @@ geometries}
                     return_all=return_all,
                     max_distance=max_distance,
                     exclusive=exclusive,
+                    k=k,
                     query_row_count=query_owned.row_count,
                 )
                 if relation is not None:
@@ -1114,7 +1125,7 @@ geometries}
                         ),
                         detail=(
                             f"max_distance={max_distance!r}, return_all={return_all}, "
-                            f"exclusive={exclusive}"
+                            f"exclusive={exclusive}, k={k}"
                         ),
                         selected=selected_mode,
                     )
@@ -1132,6 +1143,11 @@ geometries}
                     if _return_execution_mode:
                         return result, selected_mode
                     return result
+
+            if k > 1:
+                raise NotImplementedError(
+                    "k > 1 nearest queries require owned device geometry inputs"
+                )
 
             result, impl = nearest_spatial_index(
                 tree_geoms,
@@ -1309,6 +1325,7 @@ geometries}
         return_all=True,
         max_distance=None,
         exclusive=False,
+        k=1,
         source_token: str | None = None,
         query_token: str | None = None,
         query_row_count: int | None = None,
@@ -1357,6 +1374,7 @@ geometries}
             max_distance=max_distance,
             return_distance=True,
             exclusive=exclusive,
+            k=k,
             tree_owned=tree_owned,
             query_owned=query_owned,
             return_device=True,
@@ -1386,7 +1404,7 @@ geometries}
             ),
             detail=(
                 f"max_distance={max_distance!r}, return_all={return_all}, "
-                f"exclusive={exclusive}"
+                f"exclusive={exclusive}, k={k}"
             ),
             selected=selected_mode,
         )

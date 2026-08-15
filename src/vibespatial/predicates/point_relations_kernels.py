@@ -1,9 +1,8 @@
 """NVRTC kernel sources for point binary relations and multipoint relations.
 
-The indexed exact-refine launchers currently admit only an ADR-0002 native-fp64
-``PrecisionPlan``. The ``double`` compute below is therefore an enforced kernel
-variant, not an implicit precision choice. Centered fp32 classification must not
-be admitted until selective fp64 refinement exists for ambiguous pairs.
+The indexed exact-refine launchers admit an ADR-0002 native-fp64
+``PrecisionPlan``. Candidate traversal rejects edges that cannot affect the
+horizontal ray before invoking the adaptive exact orientation predicate.
 """
 
 from __future__ import annotations

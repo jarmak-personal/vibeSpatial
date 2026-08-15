@@ -4,6 +4,7 @@ import inspect
 import io
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from os import PathLike
@@ -76,6 +77,8 @@ _VIBESPATIAL_METADATA_KEY = "vibespatial"
 _VIBESPATIAL_SHAPE_PROOF_KEY = "shape_proof"
 _REGULAR_GRID_RECT_PROOF_KIND = "regular_grid_rect"
 _REGULAR_GRID_RECT_PROOF_VERSION = 1
+_GEOPARQUET_SCAN_DECODE_MULTIPLIER = 5
+_GEOPARQUET_SCAN_ROW_SCRATCH_BYTES = 16
 
 
 def _regular_grid_rect_proof_from_column_metadata(
@@ -768,6 +771,7 @@ class GeoParquetChunkPlan:
     chunk_index: int
     row_groups: tuple[int, ...] | None
     estimated_rows: int
+    estimated_uncompressed_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -1032,6 +1036,100 @@ def _merge_column_projection(*column_groups) -> list[str] | None:
                 seen.add(text)
                 merged.append(text)
     return merged or None
+
+
+def _range_index_from_arrow_schema(schema, *, row_count: int) -> pd.RangeIndex:
+    """Recover a metadata-only pandas RangeIndex without exporting columns."""
+    metadata = None if schema is None else schema.metadata
+    pandas_metadata_raw = None if metadata is None else metadata.get(b"pandas")
+    if pandas_metadata_raw is None:
+        return pd.RangeIndex(row_count)
+    try:
+        pandas_metadata = json.loads(pandas_metadata_raw.decode("utf-8"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return pd.RangeIndex(row_count)
+    index_columns = pandas_metadata.get("index_columns") or []
+    if len(index_columns) != 1 or not isinstance(index_columns[0], dict):
+        return pd.RangeIndex(row_count)
+    range_spec = index_columns[0]
+    if range_spec.get("kind") != "range":
+        return pd.RangeIndex(row_count)
+    candidate = pd.RangeIndex(
+        start=int(range_spec.get("start", 0)),
+        stop=int(range_spec.get("stop", row_count)),
+        step=int(range_spec.get("step", 1)),
+        name=range_spec.get("name"),
+    )
+    # Row-group and predicate scans may return only part of the physical file.
+    # Parquet's file-level range metadata cannot describe those selected rows.
+    return candidate if len(candidate) == int(row_count) else pd.RangeIndex(row_count)
+
+
+def _device_attributes_from_pylibcudf_scan(
+    table,
+    *,
+    table_column_names,
+    attribute_columns,
+    hidden_index_fields,
+    schema,
+    to_pandas_kwargs=None,
+) -> NativeAttributeTable:
+    """Attach projected scan columns directly to the native attribute carrier.
+
+    Only physical pandas index columns cross to host, because pandas requires a
+    public Index object at the compatibility boundary. Ordinary attributes stay
+    in their pylibcudf columns until an explicit user export.
+    """
+    import pyarrow as pa
+    import pylibcudf as plc
+
+    names = tuple(table_column_names)
+    positions = {name: index for index, name in enumerate(names)}
+    source_columns = table.columns()
+    row_count = _table_row_count(table)
+
+    missing_attributes = [name for name in attribute_columns if name not in positions]
+    if missing_attributes:
+        raise ValueError(
+            "pylibcudf GeoParquet scan omitted requested attribute columns: "
+            f"{missing_attributes!r}"
+        )
+
+    index_override: pd.Index = _range_index_from_arrow_schema(
+        schema,
+        row_count=row_count,
+    )
+    scanned_index_fields = [name for name in hidden_index_fields if name in positions]
+    if scanned_index_fields:
+        from vibespatial.cuda._runtime import pylibcudf_to_arrow
+
+        index_columns = [source_columns[positions[name]] for name in scanned_index_fields]
+        host_index_table = pylibcudf_to_arrow(plc.Table(index_columns))
+        index_fields = [schema.field(name) for name in scanned_index_fields]
+        host_index_table = pa.Table.from_arrays(
+            [host_index_table.column(index) for index in range(host_index_table.num_columns)],
+            schema=pa.schema(index_fields, metadata=schema.metadata),
+        )
+        index_override = native_attribute_table_from_arrow_table(
+            host_index_table,
+            to_pandas_kwargs=to_pandas_kwargs,
+        ).index
+
+    if not attribute_columns:
+        return NativeAttributeTable(
+            dataframe=pd.DataFrame(index=index_override),
+            to_pandas_kwargs=to_pandas_kwargs,
+        )
+
+    device_columns = [source_columns[positions[name]] for name in attribute_columns]
+    fields = [schema.field(name) for name in attribute_columns]
+    return NativeAttributeTable(
+        device_table=plc.Table(device_columns),
+        index_override=index_override,
+        column_override=tuple(attribute_columns),
+        schema_override=pa.schema(fields, metadata=schema.metadata),
+        to_pandas_kwargs=to_pandas_kwargs,
+    )
 
 
 def _parquet_filter_column_names(
@@ -1324,47 +1422,97 @@ def _plan_geoparquet_chunks(
     metadata_summary: GeoParquetMetadataSummary | None,
     selected_row_groups: tuple[int, ...] | list[int] | None,
     target_chunk_rows: int | None,
+    target_uncompressed_bytes: int | None = None,
 ) -> tuple[GeoParquetChunkPlan, ...]:
     if selected_row_groups is None:
         estimated_rows = metadata_summary.total_rows if metadata_summary is not None else 0
-        return (GeoParquetChunkPlan(chunk_index=0, row_groups=None, estimated_rows=estimated_rows),)
+        estimated_bytes = (
+            int(metadata_summary.row_group_uncompressed_bytes.sum(dtype=np.int64))
+            if metadata_summary is not None
+            and metadata_summary.row_group_uncompressed_bytes is not None
+            else 0
+        )
+        return (
+            GeoParquetChunkPlan(
+                chunk_index=0,
+                row_groups=None,
+                estimated_rows=estimated_rows,
+                estimated_uncompressed_bytes=estimated_bytes,
+            ),
+        )
     if len(selected_row_groups) == 0:
         return (GeoParquetChunkPlan(chunk_index=0, row_groups=tuple(), estimated_rows=0),)
     row_groups = tuple(selected_row_groups)
-    if metadata_summary is None or target_chunk_rows is None or target_chunk_rows <= 0:
+    if metadata_summary is None or (
+        (target_chunk_rows is None or target_chunk_rows <= 0)
+        and (target_uncompressed_bytes is None or target_uncompressed_bytes <= 0)
+    ):
         estimated_rows = (
             int(sum(metadata_summary.row_group_rows[list(row_groups)]))
             if metadata_summary is not None
             else 0
         )
+        estimated_bytes = (
+            int(
+                metadata_summary.row_group_uncompressed_bytes[list(row_groups)].sum(
+                    dtype=np.int64
+                )
+            )
+            if metadata_summary is not None
+            and metadata_summary.row_group_uncompressed_bytes is not None
+            else 0
+        )
         return (
             GeoParquetChunkPlan(
-                chunk_index=0, row_groups=row_groups, estimated_rows=estimated_rows
+                chunk_index=0,
+                row_groups=row_groups,
+                estimated_rows=estimated_rows,
+                estimated_uncompressed_bytes=estimated_bytes,
             ),
         )
     chunks: list[GeoParquetChunkPlan] = []
     current: list[int] = []
     current_rows = 0
+    current_bytes = 0
     for row_group in row_groups:
         group_rows = int(metadata_summary.row_group_rows[row_group])
-        if current and current_rows + group_rows > target_chunk_rows:
+        group_bytes = (
+            int(metadata_summary.row_group_uncompressed_bytes[row_group])
+            if metadata_summary.row_group_uncompressed_bytes is not None
+            else 0
+        )
+        rows_exceeded = (
+            target_chunk_rows is not None
+            and target_chunk_rows > 0
+            and current_rows + group_rows > target_chunk_rows
+        )
+        bytes_exceeded = (
+            target_uncompressed_bytes is not None
+            and target_uncompressed_bytes > 0
+            and current_bytes + group_bytes > target_uncompressed_bytes
+        )
+        if current and (rows_exceeded or bytes_exceeded):
             chunks.append(
                 GeoParquetChunkPlan(
                     chunk_index=len(chunks),
                     row_groups=tuple(current),
                     estimated_rows=current_rows,
+                    estimated_uncompressed_bytes=current_bytes,
                 )
             )
             current = []
             current_rows = 0
+            current_bytes = 0
         current.append(row_group)
         current_rows += group_rows
+        current_bytes += group_bytes
     if current:
         chunks.append(
             GeoParquetChunkPlan(
                 chunk_index=len(chunks),
                 row_groups=tuple(current),
                 estimated_rows=current_rows,
+                estimated_uncompressed_bytes=current_bytes,
             )
         )
     return tuple(chunks)
@@ -1380,6 +1528,38 @@ def _effective_geoparquet_chunk_rows(
     if selected_backend == "pylibcudf":
         return _DEFAULT_GPU_GEOPARQUET_CHUNK_ROWS
     return None
+
+
+def _geoparquet_target_uncompressed_bytes(selected_backend: str) -> int | None:
+    if selected_backend != "pylibcudf" or not has_gpu_runtime():
+        return None
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    remaining = get_cuda_runtime().query_memory_remaining_bytes()
+    return max(remaining // (_GEOPARQUET_SCAN_DECODE_MULTIPLIER + 1), 1)
+
+
+def _admit_geoparquet_chunk(chunk: GeoParquetChunkPlan) -> None:
+    if chunk.estimated_uncompressed_bytes <= 0 or not has_gpu_runtime():
+        return
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    required = (
+        chunk.estimated_uncompressed_bytes * _GEOPARQUET_SCAN_DECODE_MULTIPLIER
+        + chunk.estimated_rows * _GEOPARQUET_SCAN_ROW_SCRATCH_BYTES
+    )
+    admission = get_cuda_runtime().admit_device_memory(
+        stage="geoparquet.scan_decode",
+        required_bytes=required,
+        requested_units=chunk.estimated_rows,
+    )
+    if not admission.admitted:
+        raise MemoryError(
+            "GeoParquet scan chunk exceeded the device query budget after "
+            f"metadata planning: required={required}, "
+            f"remaining={admission.remaining_bytes}, "
+            f"admitted_rows={admission.admitted_units}"
+        )
 
 
 def _geoparquet_scan_sources(path, *, metadata_summary: GeoParquetMetadataSummary | None):
@@ -1565,7 +1745,9 @@ def _geoparquet_table_to_native_tabular_result(
     if scanned_with_pylibcudf is None:
         scanned_with_pylibcudf = _is_pylibcudf_table(table)
 
-    if schema is not None:
+    if schema is not None and requested_columns is not None:
+        result_column_names = [name for name in requested_columns if name in schema.names]
+    elif schema is not None:
         result_column_names = list(schema.names)
     elif hasattr(table, "column_names"):
         result_column_names = list(table.column_names)
@@ -1577,7 +1759,8 @@ def _geoparquet_table_to_native_tabular_result(
     elif hasattr(table, "schema"):
         schema_metadata = table.schema.metadata
     hidden_index_fields = _hidden_index_fields_from_schema_metadata(schema_metadata)
-    hidden_index_fields = [field for field in hidden_index_fields if field in result_column_names]
+    schema_names = set(schema.names) if schema is not None else set(result_column_names)
+    hidden_index_fields = [field for field in hidden_index_fields if field in schema_names]
     if hidden_index_fields:
         hidden_index_field_set = set(hidden_index_fields)
         result_column_names = [
@@ -1627,25 +1810,23 @@ def _geoparquet_table_to_native_tabular_result(
     else:
         table_column_names = list(table_column_names)
 
-    if attrs_arrow is None and not non_geometry_columns and not hidden_index_fields:
+    if scanned_with_pylibcudf and attrs_arrow is None:
+        attributes = _device_attributes_from_pylibcudf_scan(
+            table,
+            table_column_names=table_column_names,
+            attribute_columns=non_geometry_columns,
+            hidden_index_fields=hidden_index_fields,
+            schema=schema,
+            to_pandas_kwargs=to_pandas_kwargs,
+        )
+    elif attrs_arrow is None and not non_geometry_columns and not hidden_index_fields:
         attributes = NativeAttributeTable(
             dataframe=pd.DataFrame(index=pd.RangeIndex(_table_row_count(table))),
             to_pandas_kwargs=to_pandas_kwargs,
         )
     else:
         if attrs_arrow is None:
-            if scanned_with_pylibcudf:
-                attrs_arrow = _read_non_geometry_geoparquet_columns_as_arrow(
-                    path,
-                    columns=_merge_column_projection(non_geometry_columns, hidden_index_fields)
-                    or [],
-                    row_groups=row_groups,
-                    filesystem=filesystem,
-                    filters=filters,
-                    sources=sources,
-                )
-            else:
-                attrs_arrow = table.drop(geometry_columns)
+            attrs_arrow = table.drop(geometry_columns)
 
         attributes = native_attribute_table_from_arrow_table(
             attrs_arrow,
@@ -2056,6 +2237,7 @@ def _build_geoparquet_metadata_summary_from_pyarrow(
         source = "row_group_metadata"
 
     row_group_rows: list[int] = []
+    row_group_uncompressed_bytes: list[int] = []
     xmin: list[float] = []
     ymin: list[float] = []
     xmax: list[float] = []
@@ -2075,6 +2257,7 @@ def _build_geoparquet_metadata_summary_from_pyarrow(
         for row_group_index in range(file_metadata.num_row_groups):
             group = file_metadata.row_group(row_group_index)
             row_group_rows.append(int(group.num_rows))
+            row_group_uncompressed_bytes.append(int(group.total_byte_size))
             if source_index is not None:
                 assert row_group_source_indices is not None
                 assert row_group_source_row_groups is not None
@@ -2152,6 +2335,7 @@ def _build_geoparquet_metadata_summary_from_pyarrow(
         source_paths=source_paths,
         row_group_source_indices=row_group_source_indices,
         row_group_source_row_groups=row_group_source_row_groups,
+        row_group_uncompressed_bytes=row_group_uncompressed_bytes,
     )
 
 
@@ -2424,7 +2608,7 @@ def _geoparquet_native_provenance(
     )
 
 
-def _read_geoparquet_native_impl(
+def _iter_geoparquet_native_impl(
     path,
     *,
     columns=None,
@@ -2436,7 +2620,7 @@ def _read_geoparquet_native_impl(
     surface: str,
     operation: str,
     **kwargs,
-) -> NativeTabularResult:
+) -> Iterator[NativeTabularResult]:
     if not has_pyarrow_support():
         raise ImportError("pyarrow is required for native GeoParquet reads")
 
@@ -2494,6 +2678,9 @@ def _read_geoparquet_native_impl(
         metadata_summary=metadata_summary,
         selected_row_groups=selected_row_groups,
         target_chunk_rows=effective_chunk_rows,
+        target_uncompressed_bytes=_geoparquet_target_uncompressed_bytes(
+            read_plan.selected_backend
+        ),
     )
 
     engine_plan = plan_geoparquet_engine(
@@ -2568,16 +2755,21 @@ def _read_geoparquet_native_impl(
 
         schema, _ = _read_parquet_schema_and_metadata(normalized_path, filesystem)
         available_columns = tuple(schema.names)
-        projected_schema = _project_arrow_schema(schema, columns)
-        schema_metadata = projected_schema.metadata
+        projected_schema = schema
+        schema_metadata = schema.metadata
         df_attrs = None if schema_metadata is None else schema_metadata.get(b"PANDAS_ATTRS")
         filter_columns = _parquet_filter_column_names(
             read_kwargs.get("filters"),
             available_columns=available_columns,
         )
-        scan_projection = _merge_column_projection(geometry_scan_columns, filter_columns)
+        requested_scan_columns = available_columns if columns is None else columns
+        hidden_index_fields = _physical_hidden_index_fields_from_schema(schema)
+        scan_projection = _merge_column_projection(
+            requested_scan_columns,
+            hidden_index_fields,
+            filter_columns,
+        )
 
-    native_results: list[NativeTabularResult] = []
     for chunk in chunk_plans:
         chunk_row_groups = chunk.row_groups
         chunk_scan_row_groups = _geoparquet_scan_row_groups(
@@ -2585,6 +2777,7 @@ def _read_geoparquet_native_impl(
             selected_row_groups=chunk_row_groups,
         )
         if read_plan.selected_backend == "pylibcudf":
+            _admit_geoparquet_chunk(chunk)
             table = _read_geoparquet_table_with_pylibcudf(
                 normalized_path,
                 columns=scan_projection,
@@ -2609,7 +2802,8 @@ def _read_geoparquet_native_impl(
                 filters=read_kwargs.get("filters"),
                 sources=scan_sources,
             )
-            native_results.append(_apply_native_bbox_filter(payload, bbox))
+            payload = _apply_native_bbox_filter(payload, bbox)
+            yield replace(payload, provenance=provenance)
             continue
 
         table, table_geo_metadata, table_df_attrs = _read_geoparquet_table_with_pyarrow(
@@ -2621,7 +2815,7 @@ def _read_geoparquet_native_impl(
             filesystem=filesystem,
             **read_kwargs,
         )
-        native_results.append(
+        yield replace(
             _geoparquet_table_to_native_tabular_result(
                 table,
                 path=normalized_path,
@@ -2633,30 +2827,48 @@ def _read_geoparquet_native_impl(
                 to_pandas_kwargs=to_pandas_kwargs,
                 df_attrs=table_df_attrs,
                 scanned_with_pylibcudf=False,
-            )
+            ),
+            provenance=provenance,
         )
 
-    if len(native_results) == 1:
-        payload = native_results[0]
-        # Native reads must not eagerly mirror device geometry buffers to host.
-        # Public GeoDataFrame compatibility export can wrap the device state
-        # directly; host authoritative views belong to explicit export paths.
-        return NativeTabularResult(
-            attributes=payload.attributes,
-            geometry=payload.geometry,
-            geometry_name=payload.geometry_name,
-            column_order=payload.column_order,
-            attrs=payload.attrs,
-            secondary_geometry=payload.secondary_geometry,
-            provenance=provenance,
-            geometry_metadata=payload.geometry_metadata,
+
+def _read_geoparquet_native_impl(
+    path,
+    *,
+    columns=None,
+    storage_options=None,
+    bbox=None,
+    chunk_rows: int | None = None,
+    backend: str = "auto",
+    to_pandas_kwargs=None,
+    surface: str,
+    operation: str,
+    **kwargs,
+) -> NativeTabularResult:
+    native_results = list(
+        _iter_geoparquet_native_impl(
+            path,
+            columns=columns,
+            storage_options=storage_options,
+            bbox=bbox,
+            chunk_rows=chunk_rows,
+            backend=backend,
+            to_pandas_kwargs=to_pandas_kwargs,
+            surface=surface,
+            operation=operation,
+            **kwargs,
         )
+    )
+    if not native_results:
+        raise ValueError("GeoParquet scan produced no native chunks")
+    if len(native_results) == 1:
+        return native_results[0]
 
     return _concat_native_tabular_results(
         native_results,
         geometry_name=native_results[0].geometry_name,
         crs=native_results[0].geometry.crs,
-        provenance=provenance,
+        provenance=native_results[0].provenance,
         ignore_index=False,
     )
 
@@ -2754,6 +2966,9 @@ def read_geoparquet_owned(
         metadata_summary=metadata_summary,
         selected_row_groups=selected_row_groups,
         target_chunk_rows=effective_chunk_rows,
+        target_uncompressed_bytes=_geoparquet_target_uncompressed_bytes(
+            read_plan.selected_backend
+        ),
     )
     engine_plan = plan_geoparquet_engine(
         geo_metadata=geo_metadata,
@@ -2801,6 +3016,7 @@ def read_geoparquet_owned(
             selected_row_groups=chunk.row_groups,
         )
         if use_pylibcudf:
+            _admit_geoparquet_chunk(chunk)
             table = _read_geoparquet_table_with_pylibcudf(
                 normalized_path,
                 columns=scan_columns,
@@ -3202,6 +3418,51 @@ def read_geoparquet(
     )
 
 
+def read_geoparquet_batches(
+    path,
+    *,
+    batch_rows: int,
+    columns=None,
+    storage_options=None,
+    bbox=None,
+    to_pandas_kwargs=None,
+    **kwargs,
+):
+    """Yield public GeoDataFrames from one budgeted GeoParquet dataset scan.
+
+    Batches follow whole Parquet row groups and may therefore exceed
+    ``batch_rows`` by one row group. Projection, filtering, geometry decode,
+    and attributes use the same backend as :func:`read_geoparquet`; only the
+    bounded public consumption shape differs.
+    """
+    if not isinstance(batch_rows, int) or isinstance(batch_rows, bool) or batch_rows <= 0:
+        raise ValueError("batch_rows must be a positive integer")
+    if not has_pyarrow_support():
+        raise ImportError("pyarrow is required for batched GeoParquet reads")
+    payloads = _iter_geoparquet_native_impl(
+        path,
+        columns=columns,
+        storage_options=storage_options,
+        bbox=bbox,
+        chunk_rows=batch_rows,
+        backend="auto",
+        to_pandas_kwargs=to_pandas_kwargs,
+        surface="geopandas.read_parquet_batches",
+        operation="read_parquet_batches",
+        **kwargs,
+    )
+    payload_iterator = iter(payloads)
+    while True:
+        try:
+            payload = next(payload_iterator)
+        except StopIteration:
+            return
+        frame = payload.to_geodataframe()
+        attach_native_state_from_native_tabular_result(frame, payload)
+        yield frame
+        del frame, payload
+
+
 def benchmark_geoparquet_scan_engine(
     *,
     geometry_type: str = "point",
@@ -3286,6 +3547,9 @@ def benchmark_geoparquet_scan_engine(
                 metadata_summary=metadata_summary,
                 selected_row_groups=selected_row_groups,
                 target_chunk_rows=effective_chunk_rows,
+                target_uncompressed_bytes=_geoparquet_target_uncompressed_bytes(
+                    read_plan.selected_backend
+                ),
             )
             planning_elapsed += perf_counter() - planning_start
 
@@ -3293,6 +3557,7 @@ def benchmark_geoparquet_scan_engine(
             for chunk in chunk_plans:
                 scan_start = perf_counter()
                 if use_pylibcudf:
+                    _admit_geoparquet_chunk(chunk)
                     table = _read_geoparquet_table_with_pylibcudf(
                         normalized_path,
                         columns=scan_columns,

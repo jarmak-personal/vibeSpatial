@@ -329,6 +329,7 @@ class NativeExpression:
     precision: str | None = None
     null_policy: str = "nan-false"
     readiness: Any | None = None
+    certified_position_domain_size: int | None = None
 
     def __post_init__(self) -> None:
         if self.source_row_count is not None and len(self) != int(self.source_row_count):
@@ -337,6 +338,11 @@ class NativeExpression:
             )
         if self.null_policy != "nan-false":
             raise ValueError("NativeExpression currently admits only nan-false null policy")
+        if (
+            self.certified_position_domain_size is not None
+            and int(self.certified_position_domain_size) < 0
+        ):
+            raise ValueError("certified position domain size must be non-negative")
 
     @property
     def is_device(self) -> bool:
@@ -372,13 +378,21 @@ class NativeExpression:
             xp = _array_namespace(self.values)
             source_token = self.source_token
             source_row_count = self.source_row_count
-            scalar = np.float64(other)
-            if not np.isfinite(scalar):
+            if isinstance(other, (int, np.integer, bool, np.bool_)) and op != "/":
+                try:
+                    scalar = np.int64(other)
+                except (OverflowError, TypeError, ValueError):
+                    return None
+            else:
+                scalar = np.float64(other)
+            if np.issubdtype(np.asarray(scalar).dtype, np.floating) and not np.isfinite(
+                scalar
+            ):
                 return None
             left_values, right_values = (
                 (scalar, self.values) if reverse else (self.values, scalar)
             )
-            right_op = repr(float(scalar))
+            right_op = repr(scalar.item())
         else:
             return None
 

@@ -652,6 +652,7 @@ class OwnedGeometryDeviceState:
     trusted_polygonal_only: bool | None = None
     trusted_unique_family_rows: bool | None = None
     trusted_family_domain: tuple[GeometryFamily, ...] | None = None
+    point_location_indexes: dict[GeometryFamily, Any] = field(default_factory=dict)
 
 
 class OwnedGeometryArray:

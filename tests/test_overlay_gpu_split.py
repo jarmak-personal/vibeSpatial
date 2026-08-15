@@ -93,6 +93,26 @@ def test_live_split_event_budget_tracks_free_memory_and_safety_ceiling(
     assert gpu._compute_live_split_event_budget() == gpu._MAX_LIVE_SPLIT_EVENT_BUDGET
 
 
+def test_live_split_event_budget_prefers_query_envelope_over_pool_free_bytes(
+    monkeypatch,
+) -> None:
+    import importlib
+
+    gpu = importlib.import_module("vibespatial.overlay.gpu")
+
+    class _Runtime:
+        @staticmethod
+        def query_memory_remaining_bytes():
+            return 5 * gpu._BYTES_PER_LIVE_SPLIT_EVENT * 1_000_000
+
+        @staticmethod
+        def memory_pool_stats():
+            return {"free_bytes": 1}
+
+    monkeypatch.setattr(gpu, "get_cuda_runtime", lambda: _Runtime())
+    assert gpu._compute_live_split_event_budget() == 1_000_000
+
+
 def test_split_event_consumer_bounds_candidate_pages_by_event_amplification() -> None:
     from vibespatial.overlay import split
     from vibespatial.spatial import segment_primitives

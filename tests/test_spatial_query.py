@@ -3142,6 +3142,123 @@ def test_sindex_nearest_public_export_can_format_native_relation(monkeypatch) ->
     assert events[-1].implementation == "native_relation_export"
 
 
+def test_sindex_nearest_public_k_exports_bounded_native_relation(monkeypatch) -> None:
+    from vibespatial.api import GeoSeries
+    from vibespatial.api._native_relation import NativeRelation
+
+    tree = GeoSeries(
+        GeometryArray.from_owned(
+            from_shapely_geometries([Point(0, 0), Point(2, 0), Point(4, 0)])
+        )
+    )
+    query = GeoSeries(
+        GeometryArray.from_owned(from_shapely_geometries([Point(1, 0), Point(3, 0)]))
+    )
+    received = {}
+
+    def fake_nearest_relation(*args, **kwargs):
+        received.update(kwargs)
+        return (
+            NativeRelation(
+                left_indices=np.asarray([0, 0, 1, 1], dtype=np.int32),
+                right_indices=np.asarray([0, 1, 1, 2], dtype=np.int32),
+                left_row_count=2,
+                right_row_count=3,
+                predicate="nearest",
+                distances=np.asarray([1.0, 1.0, 1.0, 1.0]),
+                sorted_by_left=True,
+            ),
+            ExecutionMode.GPU,
+        )
+
+    sindex = tree.sindex
+    monkeypatch.setattr(sindex, "nearest_relation", fake_nearest_relation)
+
+    indices, distances = sindex.nearest(
+        query,
+        return_all=False,
+        return_distance=True,
+        k=2,
+    )
+
+    assert received["k"] == 2
+    assert indices.tolist() == [[0, 0, 1, 1], [0, 1, 1, 2]]
+    np.testing.assert_allclose(distances, [1.0, 1.0, 1.0, 1.0])
+
+
+@pytest.mark.parametrize("k", [0, -1, True, 1.5])
+def test_sindex_nearest_public_k_rejects_invalid_values(k) -> None:
+    from vibespatial.api import GeoSeries
+
+    tree = GeoSeries([Point(0, 0)])
+    with pytest.raises(ValueError, match="positive integer"):
+        tree.sindex.nearest([Point(1, 0)], k=k)
+
+
+@pytest.mark.gpu
+def test_sindex_nearest_public_k5_point_polygon_matches_shapely(tmp_path) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for public k-nearest execution")
+
+    from vibespatial.api import GeoDataFrame, read_parquet
+
+    tree_geometries = [
+        box(0.0, 0.0, 0.2, 0.2),
+        box(1.0, 0.0, 1.2, 0.2),
+        box(2.0, 0.0, 2.2, 0.2),
+        box(3.0, 0.0, 3.2, 0.2),
+        box(4.0, 0.0, 4.2, 0.2),
+        box(5.0, 0.0, 5.2, 0.2),
+        box(6.0, 0.0, 6.2, 0.2),
+    ]
+    query_geometries = [Point(0.13, 1.03), Point(2.77, 1.41), Point(5.63, 0.77)]
+    tree_path = tmp_path / "knn-tree.parquet"
+    query_path = tmp_path / "knn-query.parquet"
+    GeoDataFrame(
+        {"row": range(len(tree_geometries)), "geometry": tree_geometries},
+        geometry="geometry",
+    ).to_parquet(
+        tree_path,
+        geometry_encoding="geoarrow",
+        index=False,
+    )
+    GeoDataFrame(
+        {"row": range(len(query_geometries)), "geometry": query_geometries},
+        geometry="geometry",
+    ).to_parquet(
+        query_path,
+        geometry_encoding="geoarrow",
+        index=False,
+    )
+    tree = read_parquet(tree_path)
+    query = read_parquet(query_path)
+
+    indices, distances = tree.sindex.nearest(
+        query.geometry,
+        return_all=False,
+        return_distance=True,
+        max_distance=10.0,
+        k=5,
+    )
+
+    for query_row, query_geometry in enumerate(query_geometries):
+        expected = sorted(
+            (
+                (float(query_geometry.distance(tree_geometry)), tree_row)
+                for tree_row, tree_geometry in enumerate(tree_geometries)
+            ),
+        )[:5]
+        selected = indices[0] == query_row
+        actual = sorted(zip(distances[selected], indices[1, selected], strict=True))
+        np.testing.assert_allclose(
+            [distance for distance, _ in actual],
+            [distance for distance, _ in expected],
+            rtol=1.0e-6,
+            atol=1.0e-9,
+        )
+        assert [int(row) for _, row in actual] == [row for _, row in expected]
+
+
 def test_overlay_intersecting_index_pairs_handles_device_result() -> None:
     """_intersecting_index_pairs should accept and unpack DeviceSpatialJoinResult
     when both DataFrames have owned backing."""

@@ -76,8 +76,35 @@ def _pylibcudf_validity_mask(column):
 def _pylibcudf_point_xy_children(column):
     if column.num_children() != 2:
         raise NotImplementedError("GeoArrow point columns must expose x/y children")
+    first_child = column.child(0)
+    try:
+        first_dtype = np.dtype(first_child.type().typestr)
+    except (NotImplementedError, TypeError, ValueError):
+        first_dtype = None
+    if first_dtype is not None and np.issubdtype(first_dtype, np.integer):
+        import cupy as cp
+
+        row_count = int(column.size())
+        offsets = _pylibcudf_buffer_view(first_child, first_dtype).astype(
+            cp.int64,
+            copy=False,
+        )
+        values = _pylibcudf_buffer_view(column.child(1), np.float64)
+        expected_offsets = cp.arange(row_count + 1, dtype=cp.int64) * 2
+        if (
+            int(offsets.size) != row_count + 1
+            or int(values.size) != row_count * 2
+            or not _device_bool_scalar(
+                cp.all(offsets == expected_offsets),
+                reason="pylibcudf GeoArrow point fixed-list width scalar proof",
+            )
+        ):
+            raise NotImplementedError(
+                "GeoArrow point list columns require exactly two coordinates per row"
+            )
+        return values[0::2], values[1::2]
     return (
-        _pylibcudf_buffer_view(column.child(0), np.float64),
+        _pylibcudf_buffer_view(first_child, np.float64),
         _pylibcudf_buffer_view(column.child(1), np.float64),
     )
 

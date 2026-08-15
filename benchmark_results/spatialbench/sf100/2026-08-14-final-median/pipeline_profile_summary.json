@@ -1,0 +1,121 @@
+{
+  "source": "/tmp/pylibcudf-final-full-pipeline-profile-v3.json",
+  "suite": "full",
+  "repeat": 1,
+  "scale": 1000000,
+  "results": [
+    {
+      "pipeline": "join-heavy",
+      "elapsed_seconds": 0.031424196902662516,
+      "max_stage": "write_output",
+      "max_stage_seconds": 0.015694971894845366,
+      "fallback_event_count": 0,
+      "compute_d2h_bytes": 0,
+      "compute_materialization_count": 0,
+      "selected_runtime": "hybrid"
+    },
+    {
+      "pipeline": "relation-semijoin",
+      "elapsed_seconds": 0.021325221983715892,
+      "max_stage": "read_inputs",
+      "max_stage_seconds": 0.012412382988259196,
+      "fallback_event_count": 0,
+      "compute_d2h_bytes": 0,
+      "compute_materialization_count": 0,
+      "selected_runtime": "gpu"
+    },
+    {
+      "pipeline": "small-grouped-constructive-reduce",
+      "elapsed_seconds": 0.08829039498232305,
+      "max_stage": "native_grouped_union",
+      "max_stage_seconds": 0.04855567100457847,
+      "fallback_event_count": 0,
+      "compute_d2h_bytes": 0,
+      "compute_materialization_count": 0,
+      "selected_runtime": "gpu"
+    },
+    {
+      "pipeline": "grouped-capacity-partitions",
+      "elapsed_seconds": 0.1842972580343485,
+      "max_stage": "mixed_strip_exact_union",
+      "max_stage_seconds": 0.06960895704105496,
+      "fallback_event_count": 0,
+      "compute_d2h_bytes": 0,
+      "compute_materialization_count": 0,
+      "selected_runtime": "gpu"
+    },
+    {
+      "pipeline": "grouped-disjoint-constructive-reduce",
+      "elapsed_seconds": 0.06837705709040165,
+      "max_stage": "build_device_disjoint_groups",
+      "max_stage_seconds": 0.06626139488071203,
+      "fallback_event_count": 0,
+      "compute_d2h_bytes": 0,
+      "compute_materialization_count": 0,
+      "selected_runtime": "gpu"
+    },
+    {
+      "pipeline": "grouped-difference-constructive",
+      "elapsed_seconds": 0.03856480517424643,
+      "max_stage": "build_device_grouped_difference_inputs",
+      "max_stage_seconds": 0.0270378899294883,
+      "fallback_event_count": 0,
+      "compute_d2h_bytes": 0,
+      "compute_materialization_count": 0,
+      "selected_runtime": "gpu"
+    },
+    {
+      "pipeline": "constructive-output-native",
+      "elapsed_seconds": 0.011496724095195532,
+      "max_stage": "native_constructive_intersection",
+      "max_stage_seconds": 0.0037300249096006155,
+      "fallback_event_count": 0,
+      "compute_d2h_bytes": 0,
+      "compute_materialization_count": 0,
+      "selected_runtime": "gpu"
+    },
+    {
+      "pipeline": "overlay-relation-constructive",
+      "elapsed_seconds": 0.012077465886250138,
+      "max_stage": "build_native_overlay_inputs",
+      "max_stage_seconds": 0.006017427891492844,
+      "fallback_event_count": 0,
+      "compute_d2h_bytes": 0,
+      "compute_materialization_count": 0,
+      "selected_runtime": "gpu"
+    },
+    {
+      "pipeline": "constructive",
+      "elapsed_seconds": 0.024532834999263287,
+      "max_stage": "write_output",
+      "max_stage_seconds": 0.017561515094712377,
+      "fallback_event_count": 0,
+      "compute_d2h_bytes": 0,
+      "compute_materialization_count": 0,
+      "selected_runtime": "hybrid"
+    },
+    {
+      "pipeline": "predicate-heavy",
+      "elapsed_seconds": 0.09213162306696177,
+      "max_stage": "read_geojson",
+      "max_stage_seconds": 0.07017675321549177,
+      "fallback_event_count": 0,
+      "compute_d2h_bytes": 0,
+      "compute_materialization_count": 0,
+      "selected_runtime": "gpu"
+    },
+    {
+      "pipeline": "zero-transfer",
+      "elapsed_seconds": 0.013349879067391157,
+      "max_stage": "read_input",
+      "max_stage_seconds": 0.007127829827368259,
+      "fallback_event_count": 0,
+      "compute_d2h_bytes": 0,
+      "compute_materialization_count": 0,
+      "selected_runtime": "gpu"
+    }
+  ],
+  "max_stage_seconds": 0.07017675321549177,
+  "fallback_event_count": 0,
+  "compute_d2h_bytes": 0
+}

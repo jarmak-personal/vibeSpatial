@@ -188,7 +188,7 @@ def _launch_kernel(
         ``device_out`` transfers to the caller as a CuPy array.
     """
     if precision_plan is not None:
-        _require_indexed_point_fp64_plan(precision_plan)
+        _require_indexed_point_precision_plan(precision_plan)
     n_items = int(candidate_rows.size)
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
@@ -385,6 +385,7 @@ def classify_point_region_gpu(
     region_state = regions._ensure_device_state(preserve_indexed_view=True)
     point_buffer = point_state.families[GeometryFamily.POINT]
     region_buffer = region_state.families[region_family]
+    prepared = region_state.point_location_indexes.get(region_family)
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
     kernel_name = (
@@ -392,6 +393,7 @@ def classify_point_region_gpu(
         if region_family is GeometryFamily.POLYGON
         else "point_in_polygon_multipolygon_compacted_state"
     )
+    kernel_dict_fn = _point_binary_relation_kernels
     args = [
         ptr(point_state.family_row_offsets),
         ptr(point_buffer.geometry_offsets),
@@ -411,8 +413,40 @@ def classify_point_region_gpu(
             ptr(region_buffer.y),
         ]
     )
+    if prepared is not None:
+        from .point_location_index import point_location_part_y_index_kernels
+
+        kernel_dict_fn = point_location_part_y_index_kernels
+        kernel_name = (
+            "point_in_polygon_prepared_part_y_index"
+            if region_family is GeometryFamily.POLYGON
+            else "point_in_multipolygon_prepared_part_y_index"
+        )
+        args = [
+            ptr(point_state.family_row_offsets),
+            ptr(point_buffer.geometry_offsets),
+            ptr(point_buffer.empty_mask),
+            ptr(point_buffer.x),
+            ptr(point_buffer.y),
+            ptr(region_state.family_row_offsets),
+            ptr(region_buffer.empty_mask),
+        ]
+        if region_family is GeometryFamily.MULTIPOLYGON:
+            args.append(ptr(region_buffer.geometry_offsets))
+        args.extend(
+            [
+                ptr(region_buffer.ring_offsets),
+                ptr(region_buffer.x),
+                ptr(region_buffer.y),
+                ptr(prepared.part_ymin),
+                ptr(prepared.part_ymax),
+                ptr(prepared.counts),
+                ptr(prepared.offsets),
+                ptr(prepared.entries),
+            ]
+        )
     return _launch_kernel(
-        _point_binary_relation_kernels,
+        kernel_dict_fn,
         kernel_name,
         candidate_rows,
         tuple(args),
@@ -439,17 +473,12 @@ def _plan_indexed_point_precision(
     *,
     runtime_selection: RuntimeSelection | None = None,
 ) -> PrecisionPlan:
-    """Resolve requested precision against the indexed point variant set.
-
-    AUTO selects the sole implemented exact-refine variant, native fp64.
-    Forced fp32 remains a forced request and is rejected by the variant guard
-    instead of being silently promoted to fp64.
-    """
+    """Resolve precision for adaptive exact indexed point predicates."""
     requested_mode = normalize_precision_mode(requested)
     selection = runtime_selection or RuntimeSelection(
         requested=ExecutionMode.GPU,
         selected=ExecutionMode.GPU,
-        reason="indexed point-family predicate kernels require authoritative fp64",
+        reason="indexed point-family predicates preserve authoritative fp64 results",
     )
     precision_plan = select_precision_plan(
         runtime_selection=selection,
@@ -464,40 +493,27 @@ def _plan_indexed_point_precision(
         precision_plan = replace(
             precision_plan,
             reason=(
-                "auto precision resolved to native fp64 because indexed "
-                "point-family exact refinement has no centered fp32 plus "
-                "selective-fp64 refinement variant"
+                "auto precision resolved to adaptive native fp64 after measured "
+                "the exact point-in-polygon refinement kernel is implemented in fp64"
             ),
         )
-    return _require_indexed_point_fp64_plan(precision_plan)
+    return _require_indexed_point_precision_plan(precision_plan)
 
 
-def _default_indexed_point_fp64_plan() -> PrecisionPlan:
+def _default_indexed_point_precision_plan() -> PrecisionPlan:
     """Return the AUTO plan for the indexed point predicate shape."""
     return _plan_indexed_point_precision(PrecisionMode.AUTO)
 
 
-def _require_indexed_point_fp64_plan(precision_plan: PrecisionPlan) -> PrecisionPlan:
-    """Enforce the implemented ADR-0002 variant for indexed point predicates.
-
-    These exact candidate-refine kernels currently execute directly in fp64.
-    An fp32 predicate plan is not admissible until the shape has centered
-    coarse computation and selective fp64 refinement for ambiguous pairs.
-    """
+def _require_indexed_point_precision_plan(precision_plan: PrecisionPlan) -> PrecisionPlan:
+    """Validate an authoritative indexed point-predicate precision variant."""
     if not isinstance(precision_plan, PrecisionPlan):
         raise TypeError("indexed point predicates require a PrecisionPlan")
     if precision_plan.kernel_class is not KernelClass.PREDICATE:
         raise ValueError("indexed point predicates require a PREDICATE PrecisionPlan")
-    if (
-        precision_plan.storage_precision is not PrecisionMode.FP64
-        or precision_plan.compute_precision is not PrecisionMode.FP64
-    ):
-        raise NotImplementedError(
-            "indexed point predicates currently require authoritative fp64; "
-            "fp32 is unsupported until centered coarse evaluation and selective "
-            "fp64 refinement are implemented"
-        )
-    if (
+    if precision_plan.storage_precision is not PrecisionMode.FP64:
+        raise NotImplementedError("indexed point predicates require fp64 storage")
+    if precision_plan.compute_precision is PrecisionMode.FP64 and (
         precision_plan.compensation is not CompensationMode.NONE
         or precision_plan.refinement is not RefinementMode.NONE
         or precision_plan.center_coordinates
@@ -506,6 +522,11 @@ def _require_indexed_point_fp64_plan(precision_plan: PrecisionPlan) -> Precision
             "indexed point predicate fp64 plans must be uncentered and require "
             "neither compensation nor refinement"
         )
+    if precision_plan.compute_precision is not PrecisionMode.FP64:
+        raise NotImplementedError(
+            "indexed point predicates require adaptive authoritative fp64; "
+            "the measured interval-fp32 variant is not admitted"
+        )
     return precision_plan
 
 
@@ -513,8 +534,8 @@ def _resolve_indexed_point_precision_plan(
     precision_plan: PrecisionPlan | None,
 ) -> PrecisionPlan:
     if precision_plan is None:
-        precision_plan = _default_indexed_point_fp64_plan()
-    return _require_indexed_point_fp64_plan(precision_plan)
+        precision_plan = _default_indexed_point_precision_plan()
+    return _require_indexed_point_precision_plan(precision_plan)
 
 
 def _prepare_indexed_fro(owned, indices, runtime):
@@ -722,6 +743,7 @@ def _classify_indexed_point_region(
     region_state = region_owned._ensure_device_state(preserve_indexed_view=True)
     point_buffer = point_state.families[GeometryFamily.POINT]
     region_buffer = region_state.families[region_family]
+    prepared = region_state.point_location_indexes.get(region_family)
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
 
@@ -740,6 +762,7 @@ def _classify_indexed_point_region(
         if region_family is GeometryFamily.POLYGON
         else "point_in_polygon_multipolygon_compacted_state"
     )
+    kernel_dict_fn = _point_binary_relation_kernels
     args = [
         ptr(device_point_fro),
         ptr(point_buffer.geometry_offsets),
@@ -759,8 +782,40 @@ def _classify_indexed_point_region(
             ptr(region_buffer.y),
         ]
     )
+    if prepared is not None:
+        from .point_location_index import point_location_part_y_index_kernels
+
+        kernel_dict_fn = point_location_part_y_index_kernels
+        kernel_name = (
+            "point_in_polygon_prepared_part_y_index"
+            if region_family is GeometryFamily.POLYGON
+            else "point_in_multipolygon_prepared_part_y_index"
+        )
+        args = [
+            ptr(device_point_fro),
+            ptr(point_buffer.geometry_offsets),
+            ptr(point_buffer.empty_mask),
+            ptr(point_buffer.x),
+            ptr(point_buffer.y),
+            ptr(device_region_fro),
+            ptr(region_buffer.empty_mask),
+        ]
+        if region_family is GeometryFamily.MULTIPOLYGON:
+            args.append(ptr(region_buffer.geometry_offsets))
+        args.extend(
+            [
+                ptr(region_buffer.ring_offsets),
+                ptr(region_buffer.x),
+                ptr(region_buffer.y),
+                ptr(prepared.part_ymin),
+                ptr(prepared.part_ymax),
+                ptr(prepared.counts),
+                ptr(prepared.offsets),
+                ptr(prepared.entries),
+            ]
+        )
     return _launch_kernel(
-        _point_binary_relation_kernels,
+        kernel_dict_fn,
         kernel_name,
         point_rows,
         tuple(args),
@@ -1081,7 +1136,7 @@ def classify_homogeneous_point_predicates_indexed_device(
     relation_out=None,
 ):
     """Evaluate one point-family pair without relation-row compaction."""
-    precision_plan = _require_indexed_point_fp64_plan(precision_plan)
+    precision_plan = _require_indexed_point_precision_plan(precision_plan)
 
     import cupy as cp
 

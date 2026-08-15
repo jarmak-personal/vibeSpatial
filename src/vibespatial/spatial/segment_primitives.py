@@ -1753,27 +1753,29 @@ class _SegmentCandidateCapacityPlan:
 def _compute_max_batch_pairs() -> int:
     """Return the maximum number of raw candidate pairs per batch.
 
-    Uses actual RMM/CuPy pool free blocks when available, falling back
-    to CUDA mem_info.  Applies a hard cap of 8M pairs to prevent OOM
-    from pool fragmentation and CuPy advanced-indexing temporaries.
+    Uses the stable per-query allocation envelope when available, falling back
+    to allocator or driver statistics. Applies a hard cap of 8M pairs to
+    prevent OOM from fragmentation and CuPy advanced-indexing temporaries.
     """
     import cupy as cp
 
     from vibespatial.cuda._runtime import get_cuda_runtime
 
-    # Try to get actual pool-level free memory (more accurate than CUDA mem_info
-    # because RMM reserves large blocks from CUDA up front).
     try:
         runtime = get_cuda_runtime()
-        stats = runtime.memory_pool_stats()
-        if "free_bytes" in stats:
-            free_bytes = stats["free_bytes"]
+        remaining = getattr(runtime, "query_memory_remaining_bytes", None)
+        if callable(remaining):
+            free_bytes = int(remaining())
         else:
-            free_bytes, _ = cp.cuda.Device().mem_info
+            stats = runtime.memory_pool_stats()
+            if "free_bytes" in stats:
+                free_bytes = int(stats["free_bytes"])
+            else:
+                free_bytes, _ = cp.cuda.Device().mem_info
     except Exception:
         return _MAX_BATCH_PAIRS_CAP
 
-    # Use 25% of available pool memory, capped at _MAX_BATCH_PAIRS_CAP.
+    # Use 25% of the admitted query memory, capped at _MAX_BATCH_PAIRS_CAP.
     usable_bytes = free_bytes // 4
     max_pairs = usable_bytes // _BYTES_PER_RAW_PAIR
 

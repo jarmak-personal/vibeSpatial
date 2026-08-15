@@ -228,6 +228,7 @@ def spatial_index_device_query(
     *,
     distance: np.ndarray | object | None = None,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
+    allow_bbox_superset: bool = False,
 ) -> tuple[_DeviceCandidates | None, SpatialQueryExecution]:
     """GPU-accelerated spatial index query — replaces CPU STRtree traversal.
 
@@ -306,6 +307,21 @@ def spatial_index_device_query(
     effective_bounds = query_bounds
     if distance is not None:
         effective_bounds = _expand_bounds_for_distance(query_bounds, distance)
+
+    if allow_bbox_superset:
+        from .point_grid_index import point_grid_superset_query
+
+        result = point_grid_superset_query(flat_index, effective_bounds)
+        if result is not None:
+            return result, SpatialQueryExecution(
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.GPU,
+                implementation="owned_gpu_spatial_query",
+                reason=(
+                    "cached point-grid cell superset for immediate exact "
+                    f"predicate refinement: N={query_count}, M={tree_count}"
+                ),
+            )
 
     # Strategy selection: Morton range vs brute-force.
     n_product = query_count * tree_count
@@ -1279,8 +1295,8 @@ def _spatial_index_device_relation_reduction(
                 requested=ExecutionMode.GPU,
                 selected=ExecutionMode.GPU,
                 reason=(
-                    "indexed point-family candidate refinement requires "
-                    "authoritative fp64"
+                    "indexed point-family candidate refinement preserves "
+                    "authoritative fp64 results"
                 ),
             ),
         )

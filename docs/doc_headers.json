@@ -62,7 +62,14 @@
       "readIf": "You are changing native attribute execution, relational primitives, GeoParquet scans, GPU memory policy, or the SpatialBench public-API engines.",
       "stopIf": "You only need an operation-local geometry kernel detail already routed by intake.",
       "sourceOfTruth": "Program plan for the pylibcudf-backed SF100 performance push.",
-      "maxBodyLines": 280
+      "maxBodyLines": 420
+    },
+    "docs/dev/pylibcudf-sf100-query-ledger.md": {
+      "scope": "Per-query semantic, physical-shape, memory, correctness, and benchmark evidence for the pylibcudf-backed SpatialBench SF100 program.",
+      "readIf": "You are changing an SF100 query path, native tabular primitive, memory estimate, export boundary, or performance claim.",
+      "stopIf": "You only need the program milestones or architecture; open the execution plan instead.",
+      "sourceOfTruth": "Query-level evidence ledger required by the pylibcudf SF100 execution plan.",
+      "maxBodyLines": 260
     },
     "docs/dev/native-100ms-physical-shape-plan.md": {
       "scope": "Tracking plan for generalized native performance work after the ADR0044 rich baseline.",

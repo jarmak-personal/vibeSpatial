@@ -425,7 +425,10 @@ def _native_iloc_row_positions(key, row_count: int):
 
     positions = values.astype(np.int64, copy=False)
     positions = np.where(positions < 0, positions + row_count, positions)
-    unique = positions.size == np.unique(positions).size
+    strictly_increasing = positions.size < 2 or bool(
+        np.all(positions[1:] > positions[:-1])
+    )
+    unique = strictly_increasing or positions.size == np.unique(positions).size
     return positions, bool(unique)
 
 
@@ -595,6 +598,7 @@ def _native_lazy_public_attribute_frame(native_state):
                 column,
                 export_surface="vibespatial.api.GeoDataFrame.__getitem__",
                 export_operation="native_attribute_column_to_public_series",
+                source_token=native_state.lineage_token,
             )
     if not columns:
         return pd.DataFrame(index=index)
@@ -795,6 +799,41 @@ def _attach_native_state_after_loc(owner, key, result) -> None:
                 )
                 return
     _attach_native_state_from_result_index(owner, result)
+
+
+def _native_loc_from_boolean_mask(owner, key):
+    """Serve an aligned native boolean ``.loc`` without exporting its mask."""
+    row_key = key
+    if isinstance(key, tuple):
+        if not key:
+            return None
+        row_key = key[0]
+        column_key = key[1] if len(key) > 1 else slice(None)
+        if not _is_full_slice(column_key):
+            return None
+
+    try:
+        from vibespatial.api._native_state import get_native_state
+    except Exception:
+        return None
+
+    state = get_native_state(owner)
+    if state is None:
+        return None
+    if isinstance(row_key, Series) and not row_key.index.equals(owner.index):
+        return None
+
+    rowset = _native_boolean_rowset_from_aligned_mask(row_key, state)
+    if rowset is None:
+        return None
+    if rowset.is_device and not _native_state_can_take_device_row_positions(state):
+        return None
+    return _take_public_frame_with_native_state(
+        owner,
+        rowset,
+        source_native_state=state,
+        geometry_column=owner._geometry_column_name,
+    )
 
 
 def _native_loc_from_lazy_unique_index(owner, key):
@@ -1125,7 +1164,7 @@ def _native_sort_values_rowset(
     policies = attributes.device_column_policies(sort_columns)
     if any(
         (policy := policies.get(column)) is None
-        or not policy.can_compute_numeric
+        or not policy.can_sort
         for column in sort_columns
     ):
         return None
@@ -1172,6 +1211,242 @@ def _native_sort_values_rowset(
         sorted_positions,
         source_token=state.lineage_token,
         source_row_count=state.row_count,
+        ordered=True,
+        unique=True,
+        identity=False,
+    )
+
+
+def _native_topk_required_bytes(row_count: int, arrow_types) -> int | None:
+    """Conservatively bound incremental top-k keys, candidates, and workspace."""
+    import pyarrow as pa
+
+    source_width = 0
+    expanded_sort_width = 0
+    for arrow_type in arrow_types:
+        try:
+            width = max((int(arrow_type.bit_width) + 7) // 8, 1)
+        except (AttributeError, ValueError):
+            return None
+        source_width += width
+        expanded_sort_width += width
+        if pa.types.is_floating(arrow_type):
+            # Missing discriminator plus a cleaned value copy.
+            expanded_sort_width += 1 + width
+    # Worst-case candidate copy plus four key-widths of radix/stable-sort
+    # workspace, position/order/mask/rank arrays, and a fixed library reserve.
+    bytes_per_row = 64 + source_width + 5 * expanded_sort_width
+    return int(row_count) * bytes_per_row + (1 << 20)
+
+
+def _native_topk_public_dtype_admitted(arrow_type) -> bool:
+    """Match pandas nlargest/nsmallest fixed-width dtype admission."""
+    import pyarrow as pa
+
+    return bool(
+        pa.types.is_integer(arrow_type)
+        or pa.types.is_floating(arrow_type)
+        or pa.types.is_boolean(arrow_type)
+        or pa.types.is_temporal(arrow_type)
+        or pa.types.is_duration(arrow_type)
+    )
+
+
+def _native_topk_rowset(owner, n: int, columns, *, largest: bool, keep: str):
+    """Return an exact bounded pylibcudf top-k rowset for sortable columns.
+
+    Physical shape: select the primary-key top-k threshold, compact every row
+    tied at that threshold, lexicographically sort only that bounded candidate
+    set, and retain ``n`` source positions. This preserves pandas' stable
+    secondary-key and ``keep='first'`` semantics without a full row order.
+    """
+    if isinstance(n, (bool, np.bool_)) or not isinstance(n, (int, np.integer)):
+        return None
+    n = int(n)
+    if keep != "first" or n <= 0:
+        return None
+    sort_columns = _normalize_sort_columns(columns)
+    if sort_columns is None:
+        return None
+
+    from vibespatial.api._native_result_core import _pylibcudf_numeric_column_view
+    from vibespatial.api._native_rowset import NativeRowSet
+    from vibespatial.api._native_state import get_native_state
+
+    state = get_native_state(owner)
+    if state is None or not _native_state_can_take_device_row_positions(state):
+        return None
+    row_count = int(state.row_count)
+    if row_count == 0 or n >= row_count:
+        return None
+    attributes = getattr(state, "attributes", None)
+    if attributes is None or getattr(attributes, "device_table", None) is None:
+        return None
+    policies = attributes.device_column_policies(sort_columns)
+    if any(
+        (policy := policies.get(column)) is None
+        or not policy.can_sort
+        or (
+            int(policy.null_count) != 0
+            and policy.arrow_type not in {"float", "double", "float32", "float64"}
+        )
+        for column in sort_columns
+    ):
+        return None
+
+    try:
+        import cupy as cp
+        import pyarrow as pa
+        import pylibcudf as plc
+        from pylibcudf.types import NullOrder, Order, TypeId
+        from vibespatial.cuda._runtime import (
+            get_cuda_runtime,
+            pylibcudf_column_from_device,
+            pylibcudf_current_stream,
+        )
+
+        key_columns = attributes.to_pylibcudf_columns(sort_columns)
+        arrow_types = tuple(column.type().to_arrow() for column in key_columns)
+    except ModuleNotFoundError:
+        return None
+    except (AttributeError, KeyError, NotImplementedError, ValueError):
+        return None
+    if not all(_native_topk_public_dtype_admitted(value) for value in arrow_types):
+        return None
+    required_bytes = _native_topk_required_bytes(row_count, arrow_types)
+    if required_bytes is None:
+        return None
+    admission = get_cuda_runtime().admit_device_memory(
+        stage="tabular-topk",
+        required_bytes=required_bytes,
+        requested_units=row_count,
+    )
+    if not admission.admitted:
+        return None
+
+    try:
+        stream = pylibcudf_current_stream(attributes.device_table)
+        direction = Order.DESCENDING if largest else Order.ASCENDING
+        sort_key_columns = []
+        sort_orders = []
+        primary_rank_column = None
+        for column_index, (column, key_column) in enumerate(
+            zip(sort_columns, key_columns, strict=True)
+        ):
+            policy = policies[column]
+            if policy.arrow_type in {"float", "double", "float32", "float64"}:
+                arrow_type = key_column.type().to_arrow()
+                nan_scalar = plc.Scalar.from_arrow(
+                    pa.scalar(np.nan, type=arrow_type),
+                    stream=stream,
+                )
+                if int(policy.null_count):
+                    key_column = plc.replace.replace_nulls(
+                        key_column,
+                        nan_scalar,
+                        stream=stream,
+                    )
+                missing_mask = plc.unary.is_nan(key_column, stream=stream)
+                zero_scalar = plc.Scalar.from_arrow(
+                    pa.scalar(0.0, type=arrow_type),
+                    stream=stream,
+                )
+                clean_key_column = plc.copying.copy_if_else(
+                    zero_scalar,
+                    key_column,
+                    missing_mask,
+                    stream=stream,
+                )
+                sort_key_columns.extend((missing_mask, clean_key_column))
+                sort_orders.extend((Order.ASCENDING, direction))
+                if column_index == 0:
+                    d_values = cp.asarray(
+                        _pylibcudf_numeric_column_view(clean_key_column)
+                    )
+                    d_missing = cp.asarray(
+                        _pylibcudf_numeric_column_view(missing_mask),
+                        dtype=cp.bool_,
+                    )
+                    if d_values.dtype == cp.float32:
+                        d_bits = d_values.view(cp.uint32)
+                        sign_mask = cp.uint32(1 << 31)
+                        missing_rank = cp.uint32(0 if largest else np.iinfo(np.uint32).max)
+                    else:
+                        d_values = d_values.astype(cp.float64, copy=False)
+                        d_bits = d_values.view(cp.uint64)
+                        sign_mask = cp.uint64(1 << 63)
+                        missing_rank = cp.uint64(0 if largest else np.iinfo(np.uint64).max)
+                    d_rank = cp.where(
+                        (d_bits & sign_mask) != 0,
+                        ~d_bits,
+                        d_bits ^ sign_mask,
+                    )
+                    # pandas treats IEEE -0.0 and +0.0 as equal and resolves
+                    # their top-k boundary with stable ``keep='first'`` order.
+                    d_rank = cp.where(d_values == 0.0, sign_mask, d_rank)
+                    d_rank = cp.where(d_missing, missing_rank, d_rank)
+                    primary_rank_column = pylibcudf_column_from_device(d_rank)
+            else:
+                sort_key_columns.append(key_column)
+                sort_orders.append(direction)
+                if column_index == 0:
+                    primary_rank_column = key_column
+        if primary_rank_column is None:
+            return None
+        primary_top = plc.sorting.top_k(
+            primary_rank_column,
+            n,
+            direction,
+            stream=stream,
+        )
+        boundary = plc.copying.get_element(primary_top, n - 1, stream=stream)
+        boundary_operator = (
+            plc.binaryop.BinaryOperator.GREATER_EQUAL
+            if largest
+            else plc.binaryop.BinaryOperator.LESS_EQUAL
+        )
+        candidate_mask = plc.binaryop.binary_operation(
+            primary_rank_column,
+            boundary,
+            boundary_operator,
+            plc.DataType(TypeId.BOOL8),
+            stream=stream,
+        )
+        position_column = pylibcudf_column_from_device(
+            cp.arange(row_count, dtype=cp.int32)
+        )
+        candidates = plc.stream_compaction.apply_boolean_mask(
+            plc.Table([*sort_key_columns, position_column]),
+            candidate_mask,
+            stream=stream,
+        )
+        candidate_columns = candidates.columns()
+        candidate_order = plc.sorting.stable_sorted_order(
+            plc.Table(candidate_columns[:-1]),
+            sort_orders,
+            [NullOrder.AFTER] * len(sort_key_columns),
+            stream=stream,
+        )
+        ordered_positions = plc.copying.gather(
+            plc.Table([candidate_columns[-1]]),
+            candidate_order,
+            plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+            stream=stream,
+        )
+        bounded_positions = plc.copying.slice(
+            ordered_positions,
+            [0, n],
+            stream=stream,
+        )[0].columns()[0]
+        positions = _pylibcudf_numeric_column_view(bounded_positions)
+    except Exception as exc:
+        raise RuntimeError("admitted pylibcudf top-k execution failed") from exc
+    if positions is None or int(positions.size) != n:
+        return None
+    return NativeRowSet.from_positions(
+        cp.asarray(positions, dtype=cp.int64),
+        source_token=state.lineage_token,
+        source_row_count=row_count,
         ordered=True,
         unique=True,
         identity=False,
@@ -2211,10 +2486,17 @@ def _native_state_can_take_device_row_positions(state) -> bool:
     }:
         return False
     geometry = getattr(state, "geometry", None)
-    if getattr(geometry, "owned", None) is None:
+    if (
+        getattr(geometry, "owned", None) is None
+        and getattr(geometry, "composition", None) is None
+    ):
         return False
     for column in getattr(state, "secondary_geometry", ()):
-        if getattr(getattr(column, "geometry", None), "owned", None) is None:
+        column_geometry = getattr(column, "geometry", None)
+        if (
+            getattr(column_geometry, "owned", None) is None
+            and getattr(column_geometry, "composition", None) is None
+        ):
             return False
 
     attributes = getattr(state, "attributes", None)
@@ -2522,6 +2804,9 @@ class _NativeStateInvalidatingIndexer:
 
     def __getitem__(self, key):
         if self._kind == "loc":
+            native_result = _native_loc_from_boolean_mask(self._owner, key)
+            if native_result is not None:
+                return native_result
             native_result = _native_loc_from_lazy_unique_index(self._owner, key)
             if native_result is not None:
                 return native_result
@@ -2890,6 +3175,24 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
         from vibespatial.api._native_state import get_native_state
 
         source_native_state = get_native_state(self)
+        if (
+            source_native_state is not None
+            and isinstance(col, (str, bytes))
+            and col in self.columns
+            and not drop
+            and crs is None
+        ):
+            updated_state = source_native_state.with_active_geometry(
+                col,
+                crs=getattr(pd.DataFrame.__getitem__(self, col), "crs", None),
+            )
+            if updated_state is not None:
+                from vibespatial.api._native_state import attach_native_state
+
+                frame = self if inplace else self.copy(deep=False)
+                frame._geometry_column_name = col
+                attach_native_state(frame, updated_state)
+                return None if inplace else frame
         existing_geometry_name = None
         # Most of the code here is taken from DataFrame.set_index()
         if inplace:
@@ -4895,6 +5198,19 @@ default 'snappy'
             and result.index.equals(self.index)
             and len(result) == source_native_state.row_count
         ):
+            from vibespatial.api._native_public_arrays import (
+                NativeAttributeColumnArray,
+            )
+
+            public_array = getattr(result, "array", None)
+            if isinstance(public_array, NativeAttributeColumnArray):
+                # GeoParquet decimal attributes are exposed lazily because they
+                # cannot be viewed as a numeric CuPy array until a public cast.
+                # Bind that later cast to this frame's lineage so it can compose
+                # with geometry-derived expressions without a full host export.
+                public_array = public_array.copy()
+                public_array.source_token = source_native_state.lineage_token
+                result = Series(public_array, index=result.index, name=result.name)
             expression = source_native_state.attribute_expression(key)
             if expression is not None:
                 _attach_native_expression(result, expression)
@@ -5527,6 +5843,98 @@ default 'snappy'
         )
         return result
 
+    def datetime_component(self, column, component: str) -> Series:
+        """Extract a calendar component from a datetime attribute.
+
+        This additive public API keeps GeoParquet timestamp columns and the
+        resulting integer expression device-resident when a native frame is
+        available. Supported components are ``year``, ``month``, ``day``,
+        ``weekday``, ``hour``, ``minute``, and ``second``.
+        """
+        normalized = str(component).lower()
+        supported = {
+            "year",
+            "month",
+            "day",
+            "weekday",
+            "hour",
+            "minute",
+            "second",
+        }
+        if normalized not in supported:
+            raise ValueError(
+                f"unsupported datetime component {component!r}; "
+                f"expected one of {sorted(supported)}"
+            )
+        if column not in self.columns or column == self._geometry_column_name:
+            raise KeyError(column)
+
+        from vibespatial.api._native_expression import NativeExpression
+        from vibespatial.api._native_state import get_native_state
+
+        native_rejection_reason = "datetime attribute has no admitted native timestamp payload"
+        native_state = get_native_state(self)
+        if native_state is not None:
+            attributes = native_state.attributes
+            policies = attributes.device_column_policies((column,))
+            policy = policies.get(column)
+            arrow_type = "" if policy is None else policy.arrow_type
+            has_timezone = ", tz=" in arrow_type
+            utc_timezone = arrow_type.endswith(", tz=UTC]")
+            if has_timezone and not utc_timezone:
+                native_rejection_reason = (
+                    "non-UTC timezone-aware timestamps require pandas local-calendar semantics"
+                )
+            if (
+                policy is not None
+                and int(policy.null_count) == 0
+                and arrow_type.startswith("timestamp[")
+                and (not has_timezone or utc_timezone)
+            ):
+                try:
+                    import pylibcudf as plc
+
+                    from vibespatial.api._native_result_core import (
+                        _pylibcudf_numeric_column_view,
+                    )
+                    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+                    source = attributes.to_pylibcudf_columns((column,))[0]
+                    extracted = plc.datetime.extract_datetime_component(
+                        source,
+                        getattr(plc.datetime.DatetimeComponent, normalized.upper()),
+                        stream=pylibcudf_current_stream(attributes.device_table),
+                    )
+                    values = _pylibcudf_numeric_column_view(extracted)
+                    if values is not None:
+                        return _native_expression_assignment_public_series(
+                            column,
+                            NativeExpression(
+                                operation=f"datetime.{normalized}",
+                                values=values,
+                                source_token=native_state.lineage_token,
+                                source_row_count=native_state.row_count,
+                                dtype=str(values.dtype),
+                                precision="source",
+                            ),
+                            index=self.index,
+                            surface="GeoDataFrame.datetime_component",
+                        )
+                except (ImportError, AttributeError, NotImplementedError):
+                    pass
+
+        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime.fallbacks import record_fallback_event
+
+        record_fallback_event(
+            surface="geopandas.geodataframe.datetime_component",
+            reason=native_rejection_reason,
+            requested=ExecutionMode.AUTO,
+            selected=ExecutionMode.CPU,
+        )
+        values = pd.to_datetime(pd.DataFrame.__getitem__(self, column))
+        return getattr(values.dt, normalized).rename(column)
+
     @doc(pd.DataFrame)
     def drop_duplicates(
         self,
@@ -5752,6 +6160,52 @@ default 'snappy'
             if result is not None and axis_number == 0 and not ignore_index:
                 _attach_native_state_from_result_index(self, result)
         return result
+
+    @doc(pd.DataFrame)
+    def nlargest(self, n: int, columns, keep: str = "first"):
+        native_rowset = _native_topk_rowset(
+            self,
+            n,
+            columns,
+            largest=True,
+            keep=keep,
+        )
+        if native_rowset is not None:
+            from vibespatial.api._native_state import get_native_state
+
+            result = _take_public_frame_with_native_state(
+                self,
+                native_rowset,
+                source_native_state=get_native_state(self),
+                geometry_column=self._geometry_column_name,
+                preserve_index=True,
+            )
+            if result is not None:
+                return result
+        return super().nlargest(n, columns, keep=keep)
+
+    @doc(pd.DataFrame)
+    def nsmallest(self, n: int, columns, keep: str = "first"):
+        native_rowset = _native_topk_rowset(
+            self,
+            n,
+            columns,
+            largest=False,
+            keep=keep,
+        )
+        if native_rowset is not None:
+            from vibespatial.api._native_state import get_native_state
+
+            result = _take_public_frame_with_native_state(
+                self,
+                native_rowset,
+                source_native_state=get_native_state(self),
+                geometry_column=self._geometry_column_name,
+                preserve_index=True,
+            )
+            if result is not None:
+                return result
+        return super().nsmallest(n, columns, keep=keep)
 
     @doc(pd.DataFrame)
     def sort_index(

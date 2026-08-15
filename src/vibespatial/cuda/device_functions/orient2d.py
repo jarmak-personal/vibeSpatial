@@ -29,9 +29,10 @@ __device__ inline void vs_two_sum(double a, double b, double &s, double &e) {{
     e = ar + br;
 }}
 
-/* Shewchuk orient2d adaptive predicate (stage B).
-   Returns exact sign of det = (bx-ax)*(cy-ay) - (by-ay)*(cx-ax)
-   using error-free arithmetic expansions when the fast filter is ambiguous.
+/* Shewchuk orient2d adaptive predicate.
+   Returns the sign of det = (bx-ax)*(cy-ay) - (by-ay)*(cx-ax).
+   The inexpensive stage-A error bound handles the common non-degenerate case;
+   error-free arithmetic is reserved for determinants inside that bound.
    Returns: +1, 0, or -1  */
 __device__ int vs_orient2d(
     double ax, double ay,
@@ -42,6 +43,20 @@ __device__ int vs_orient2d(
     double bcx = bx - cx;
     double acy = ay - cy;
     double bcy = by - cy;
+
+    const double detleft_fast = acx * bcy;
+    const double detright_fast = acy * bcx;
+    const double det_fast = detleft_fast - detright_fast;
+    const double detsum = fabs(detleft_fast) + fabs(detright_fast);
+
+    /* Shewchuk's IEEE-754 stage-A bound:
+       (3 + 16 * epsilon) * epsilon, epsilon = 2^-53.  A determinant
+       outside this interval has an authoritative sign without expansion
+       arithmetic. */
+    const double ccwerrbound_a = 3.3306690738754716e-16;
+    const double errbound = ccwerrbound_a * detsum;
+    if (det_fast > errbound) return 1;
+    if (det_fast < -errbound) return -1;
 
     double detleft, detleft_err;
     vs_two_product(acx, bcy, detleft, detleft_err);
@@ -67,4 +82,5 @@ __device__ int vs_orient2d(
        orientation is truly zero (collinear). */
     return 0;
 }}
+
 """

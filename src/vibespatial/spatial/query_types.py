@@ -43,15 +43,12 @@ class CandidateRelationCapacityError(MemoryError):
 
 
 def available_device_memory_bytes() -> int | None:
-    """Return bytes currently allocatable by the active device memory stack."""
+    """Return bytes remaining in the active query allocation envelope."""
     try:
-        import cupy as cp
+        __import__("cupy")
     except ModuleNotFoundError:
         return None
-
-    driver_free, driver_total = cp.cuda.Device().mem_info
-    pool_free = int(get_cuda_runtime().memory_pool_stats().get("free_bytes", 0))
-    return min(int(driver_total), int(driver_free) + pool_free)
+    return get_cuda_runtime().query_memory_remaining_bytes()
 
 
 def require_device_candidate_pair_capacity(
@@ -65,19 +62,32 @@ def require_device_candidate_pair_capacity(
     pair_count = int(total_pairs)
     required_bytes = pair_count * 2 * np.dtype(np.int32).itemsize
     live_bytes = required_bytes + max(int(temporary_bytes), 0)
+    runtime = get_cuda_runtime()
     if device_capacity_bytes is None:
-        device_capacity_bytes = available_device_memory_bytes()
-        if device_capacity_bytes is None:
+        try:
+            admission = runtime.admit_device_memory(
+                stage=relation_name,
+                required_bytes=live_bytes,
+                requested_units=pair_count,
+            )
+        except RuntimeError:
             return required_bytes
-    memory_budget = int(device_capacity_bytes) // 2
+        memory_budget = admission.remaining_bytes
+    else:
+        memory_budget = int(device_capacity_bytes) // 2
+        admission = None
     if live_bytes > memory_budget:
         gib = 1024**3
+        admitted_detail = ""
+        if admission is not None:
+            admitted_detail = f"; deterministic shard capacity is {admission.admitted_units:,} pairs"
         raise CandidateRelationCapacityError(
             f"{relation_name} has {pair_count:,} pairs and requires at least "
             f"{required_bytes / gib:.2f} GiB for its two int32 index columns "
             f"and {max(int(temporary_bytes), 0) / gib:.2f} GiB scratch; "
             f"reserved allocation budget is {memory_budget / gib:.2f} GiB "
-            f"from {int(device_capacity_bytes) / gib:.2f} GiB currently available"
+            f"from {(memory_budget if device_capacity_bytes is None else int(device_capacity_bytes)) / gib:.2f} GiB currently available"
+            f"{admitted_detail}"
         )
     return required_bytes
 

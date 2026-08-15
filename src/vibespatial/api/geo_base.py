@@ -585,6 +585,7 @@ def _delegate_binary_method(
 
         other = vibespatial.api.geoseries.GeoSeries(other)
 
+    other_native_owner = None
     if isinstance(other, GeoPandasBase):
         if align and not this.index.equals(other.index):
             if maybe_warn:
@@ -601,6 +602,7 @@ def _delegate_binary_method(
         else:
             other = other.geometry
 
+        other_native_owner = other
         a_this = this.values
         other = other.values
     elif isinstance(other, BaseGeometry):
@@ -610,6 +612,36 @@ def _delegate_binary_method(
 
     native_rowset = None
     native_dwithin = None
+    native_distance = None
+    if op == "distance" and other_native_owner is not None:
+        left_state = _native_state_for_owner(this)
+        right_state = _native_state_for_owner(other_native_owner)
+        if (
+            left_state is not None
+            and right_state is not None
+            and left_state.row_count == right_state.row_count
+        ):
+            left_geometry = left_state.geometry
+            right_geometry = right_state.geometry
+            left_supported = (
+                getattr(left_geometry, "owned", None) is not None
+                or getattr(left_geometry, "composition", None) is not None
+            )
+            right_supported = (
+                getattr(right_geometry, "owned", None) is not None
+                or getattr(right_geometry, "composition", None) is not None
+            )
+            if left_supported and right_supported:
+                native_distance = left_state.geometry_distance_expression(right_state)
+    elif op == "distance" and isinstance(other, BaseGeometry):
+        left_state = _native_state_for_owner(this)
+        if left_state is not None:
+            left_geometry = left_state.geometry
+            if (
+                getattr(left_geometry, "owned", None) is not None
+                or getattr(left_geometry, "composition", None) is not None
+            ):
+                native_distance = left_state.geometry_distance_expression(other)
     if op == "dwithin" and isinstance(other, BaseGeometry):
         try:
             distance = kwargs["distance"] if "distance" in kwargs else args[0]
@@ -641,7 +673,13 @@ def _delegate_binary_method(
                             source_row_count=state.row_count,
                         )
 
-    if native_dwithin is not None:
+    if native_distance is not None:
+        data = NativeNumericExpressionArray(
+            native_distance,
+            export_surface=f"vibespatial.api.{this.__class__.__name__}.distance",
+            export_operation=f"{this.__class__.__name__.lower()}_distance",
+        )
+    elif native_dwithin is not None:
         data, native_rowset = native_dwithin
     else:
         data = getattr(a_this, op)(other, *args, **kwargs)
@@ -671,6 +709,10 @@ def _binary_op(op, this, other, align, *args, **kwargs):
         return_native_rowset=True,
         **kwargs,
     )
+    if isinstance(data, NativeNumericExpressionArray):
+        result = Series(data, index=index)
+        _attach_native_expression(result, data.expression)
+        return result
     surface_owner = this.__class__.__name__
     _record_native_public_export_boundary(
         this,
@@ -7066,7 +7108,32 @@ GeometryCollection
         distances = _hilbert_distance(
             self.geometry.values, total_bounds=total_bounds, level=level
         )
+        if hasattr(distances, "__cuda_array_interface__"):
+            from vibespatial.api._native_expression import NativeExpression
 
+            state = _native_state_for_owner(self)
+            expression = NativeExpression(
+                operation="geometry.hilbert_distance",
+                values=distances,
+                source_token=None if state is None else state.lineage_token,
+                source_row_count=len(self),
+                dtype=str(distances.dtype),
+                precision="coarse-fp64-bounds",
+                certified_position_domain_size=1 << max(2 * int(level), 0),
+            )
+            result = pd.Series(
+                NativeNumericExpressionArray(
+                    expression,
+                    export_surface=(
+                        f"vibespatial.api.{self.__class__.__name__}.hilbert_distance"
+                    ),
+                    export_operation="hilbert_distance",
+                ),
+                index=self.index,
+                name="hilbert_distance",
+            )
+            _attach_native_expression(result, expression)
+            return result
         return pd.Series(distances, index=self.index, name="hilbert_distance")
 
     def sample_points(self, size, method="uniform", rng=None, **kwargs):

@@ -1,0 +1,141 @@
+{
+  "generated_at": "2026-08-15T05:18:12.523741+00:00",
+  "objective": "Public-API pylibcudf-backed vibeSpatial and optimized GeoPandas SpatialBench SF100 comparison",
+  "repositories": {
+    "vibespatial": {
+      "path": "/home/picard/repos/vibeSpatial",
+      "base_revision": "78115c80e4bd124cf2e0c8e12953a58d4fd5e905",
+      "source_manifest_sha256": "967ec8e89cd3df78d3fb1f20343f0d6b3c96352725a1a4ac715d4d42588ed8c8",
+      "changed_file_sha256": {
+        "docs/architecture/io-arrow.md": "842c67018ee12ecb21a569521746f3367e97757c35e84f5d98812cf43dcd0836",
+        "docs/architecture/spatial-joins.md": "3f48c689617a1ec20edcc4ad3590253302ec4c4fd7f0233255e3e873accab5fe",
+        "docs/dev/pylibcudf-sf100-execution-plan.md": "f5b0b7965fd687d9776106ca98980ff035cd5969e0b223ed74c042f08d0a3b79",
+        "docs/dev/pylibcudf-sf100-query-ledger.md": "994af26658c014c398160957be206c4739ab9766f9244f9f4a0eb7df32bf0d63",
+        "docs/doc_headers.json": "e39abe37db1eb1833115c4ce2514a9b5306c3111d4bf1d1fa1e890b4f4e4fbd1",
+        "docs/ops/intake-index.json": "76e092b9f78bc2c6386374899e9b49263be905fd8797a888e2ad9abd6a15fa40",
+        "src/vibespatial/__init__.py": "995c465df76bc1187dc5e91e46f7f12858ab5f73e0b301331a29dd68b0a3f4da",
+        "src/vibespatial/api/__init__.py": "ca3e0c9d5e8138c90938dd8a097f98310e28c65aff58b10ca8f06071ef1b668a",
+        "src/vibespatial/api/_native_expression.py": "1f7adec21a6f930c49d47b79f575c470a08fdfc62937b161b719cdff1c381f52",
+        "src/vibespatial/api/_native_public_arrays.py": "d639463b10c4ea028459affae8baaad0b61c087d4efc12c4eb1efa9400c049bf",
+        "src/vibespatial/api/_native_result_core.py": "d7a92106dcf1f688df0a66b6f0acb27dcd0aa488e84edc20e5f54c2a804bbb1b",
+        "src/vibespatial/api/_native_state.py": "967f21adaac39710355bbab06ab81236b2927b661bb29ed112c26f8dd28eaff7",
+        "src/vibespatial/api/geo_base.py": "af624586fdd885be1bac4112d79d523834144f7415ac06384d715fa152a1d172",
+        "src/vibespatial/api/geodataframe.py": "c6ddbfd2db7270c49cca7d30dfc33edc865ec59c2de25fa2c010e62e726fc990",
+        "src/vibespatial/api/geoseries.py": "0359fc0ed06c77a2ec0602f1d626d1c948d3deaa3261a47ec7a3fc298654d5cb",
+        "src/vibespatial/api/sindex.py": "7e857f75c4ba643b19267d5d13f7ddf0ea79048db5cd48a54da19072ec0c560a",
+        "src/vibespatial/api/tools/hilbert_curve.py": "9562217f6adf979d1bcb10a95f1f4dd9e855456d26c39350b4213c9c4fa17118",
+        "src/vibespatial/constructive/convex_hull.py": "a14c870dec14f98b50d0ac92f74d04fd068eea323c4a07bae361eaf2df771c48",
+        "src/vibespatial/cuda/_runtime.py": "033805c22b673ea817474d192266e3d607dd2e549110d0b5f33eb14446f0cd97",
+        "src/vibespatial/cuda/device_functions/orient2d.py": "b09cb922b9517db21854f0871e76bae3e15f06ea9242a6324bfd9df25dce9605",
+        "src/vibespatial/cuda/device_functions/point_in_ring.py": "60d6e06a6865da87c8466a009f396f8ebaaf5fa0c7ae2f1a146f7bd784999b50",
+        "src/vibespatial/cuda/device_functions/point_on_segment.py": "fcaf4be54da7a09eadedb05276adf6cadfce676232ba9d6a330ffb79d976f99b",
+        "src/vibespatial/geometry/owned.py": "36081f3670f28bd2e0e0295424efb73e6fae5e8c99e131b7589ccc299970b434",
+        "src/vibespatial/io/arrow.py": "66691f75e8fa874496873972ee2e160b500a5fa80bd364030d4930430195dbf2",
+        "src/vibespatial/io/geoparquet.py": "adf8a7dc7630bf5d017fe498460ae8dd016a7b26577bf8f925eb73d7ac628ca9",
+        "src/vibespatial/io/geoparquet_planner.py": "df9e0d888b00f49ec6b16ca274fc658aa681d49f6c743ef76aa28782f212eb6e",
+        "src/vibespatial/io/gpu_parse/indexing.py": "53246e792e37183cf2a58700a73c49248ddd3c124157bcd1866a2d947f1a44c1",
+        "src/vibespatial/io/gpu_parse/indexing_kernels.py": "8a1a8d85e4365f6ec931bd6fe2aa1cb8259eb9dd762bc11ae0e199e419140646",
+        "src/vibespatial/io/pylibcudf.py": "751403dda6cba058092a67338681593035248a8e0b1f6b90dcf82c122c997461",
+        "src/vibespatial/kernels/predicates/point_in_polygon.py": "609ee97e33be06c041f4d8e8f51a5a8919331a60709a2eb44aba7b3225a10ea6",
+        "src/vibespatial/overlay/dissolve.py": "896b5f658d9707fc35d652ffa8bcfe8b921ff88134435c68a778afb417cc3f00",
+        "src/vibespatial/overlay/gpu.py": "711919db040b89e37dbdd36f1ceb43c285adfc8468c63ef5a0c0aa231fec962f",
+        "src/vibespatial/predicates/point_location_index.py": "212518f8ef2f8795e63bb47fbe4df278e6aa3d07b8aeb667f761969cbedeca24",
+        "src/vibespatial/predicates/point_location_index_kernels.py": "98e339f31597187440078a08f41ab68c4b5b26145a1d41d402d8b57d5ca09d54",
+        "src/vibespatial/predicates/point_relations.py": "0fadb809e416943a0bf20a77a796a616abafe88ee81496d16f50dc87ba41b3e5",
+        "src/vibespatial/predicates/point_relations_kernels.py": "ad96d5117686d0b46b89deed9c8d0ac479fa19039755c97184836efb4411091f",
+        "src/vibespatial/spatial/distance_owned.py": "992e6e5d8a5a3431fb2c6c2f337b2eb16069daf3072e4efda2ce266db0dc628f",
+        "src/vibespatial/spatial/indexing.py": "af36a3b1e62354662ad7ff90a4ba4bd0b1790fe185f09837a71d81f53703bc16",
+        "src/vibespatial/spatial/nearest.py": "1ea2f031170482a0d73d59e83bba7659dcb0afd74ddd8afd86834b141aa741ed",
+        "src/vibespatial/spatial/point_grid_index.py": "a2ad8d617f504d6d47ee0c0c0302f58e493bec4638b9d4b6d57d3f331d1d4d6b",
+        "src/vibespatial/spatial/point_grid_index_kernels.py": "50926e999224bd42895c3e5c2e5c486b6d12f78a6b6919f006e0844a54b08d38",
+        "src/vibespatial/spatial/query.py": "dfcea9a9bf491348f8b82796020a80e1e67701900c20740e72268c1954ddface",
+        "src/vibespatial/spatial/query_types.py": "d64da83b55220f87d665285042dab4d4b65eae05a6c903300ce196fcd7006b54",
+        "src/vibespatial/spatial/query_utils.py": "a9b85cadb119e2a5b2c025062c0b520242c7cf9fd1867d7475cd5defae5001e6",
+        "src/vibespatial/spatial/segment_primitives.py": "75f8a0c703d40306885a0df88f29cfecc105c8e5980b47f9df33cfe6af8a8144",
+        "src/vibespatial/spatial/spatial_index_device.py": "8b8163f989ecf5945856fdaf0d190d6060dfafa8f869ea3a5f89f40b92f58e80",
+        "src/vibespatial/spatial/spatial_index_knn_device.py": "2669c3a51ad74b839ad2437b46dcad26a1ea0b0962d52a8cae70e557ff2452d5",
+        "tests/test_binary_predicates.py": "86bfd4efa76525a461f432ca0de68a4fa5d813bae041ebb45a06f773d5d96fec",
+        "tests/test_dissolve_pipeline.py": "b8c674e08ef859567dcf0832e2681c747503b7deeb647be2830dad86abcdb5dd",
+        "tests/test_gpu_memory_pool.py": "79d9c6d3352f76dd883a6fb0b86eb4e02e068f428fef98aaaf859b4d912bf14f",
+        "tests/test_io_arrow.py": "330d65faa71dc8b20c69d8bae7a78aa44c8a7df58fd14d284992eb9b7b40cc21",
+        "tests/test_overlay_gpu_split.py": "4ea3c27119e5fed51aa348f73a4bff9da41a67cbbdadd7f74aac69699558096b",
+        "tests/test_point_in_polygon.py": "204db9bd3ab322faa30460d5b18552a19dd68813c55c8ca244a26977164c9125",
+        "tests/test_private_native_substrate.py": "74a0bd72805ecb809d6406f4fd29139fa1c2dc48a272708bef023d5e2cb1299e",
+        "tests/test_spatial_index_device_gpu.py": "0102a82614661fde178e3e61add1b8c5dd388bc3926be53e35aeaf51fd0d75cf",
+        "tests/test_spatial_query.py": "2e6e984f8d3f7803574c5b52595347fa7eb8c4e11a71cf8b0ea06a36eb0cc5f2"
+      }
+    },
+    "spatialbench": {
+      "path": "/home/picard/repos/sedona-spatialbench",
+      "base_revision": "2c88536a24b3c34c13cc93a465e9e7c199128833",
+      "source_manifest_sha256": "2f55b3d9ae5499f4c5d3a20c3a106b0b2939de0ec29995c58615f3f1244e6447",
+      "changed_file_sha256": {
+        "README.md": "f9407fa0ba0225c3ad3432051119b7b4ec2bc7f7d55dab8e8381571ee13d276e",
+        "benchmark/prepare_geoparquet.py": "594479ee5c960261569ecde3db7363359ba4a07ae43862ee7c7b55405f1f0d7f",
+        "benchmark/run_benchmark.py": "5cc225a8746992f5a930f7cba296f4a9278fa43c64e7ebebc93bc22d37c86114",
+        "benchmark/verify_results.py": "e7911a3c6a4ebd1873621315c0dc0b7fbd63d639434a86a91735cc5591a39455",
+        "spatialbench-queries/geopandas_optimized_queries.py": "f029880a1fbc1fdabb7249c0bc71a0dc00b745b96bc7a2e2af2adcc31292f94f",
+        "spatialbench-queries/geoparquet_public_api_queries.py": "774a2eec68848dd5a02ac5a3a686abbbe9b07680ddf57e8233fba70a1d8531c7",
+        "spatialbench-queries/public_api_queries.py": "a5568232dd89f1343878d1f0e60f577153cb2de67560459278e0f807203a2d49",
+        "spatialbench-queries/vibespatial_queries.py": "b4b0a01a8d77d8f7043fffb620029e69970c3d9b995641c62888571489a49513"
+      }
+    }
+  },
+  "dataset": {
+    "path": "/home/picard/datasets/spatialbench/v0.1.0/sf100-geoparquet",
+    "file_count": 179,
+    "total_bytes": 37940233646,
+    "path_size_sha256": "52da4fe2d753d6b847d0e23461d35762ba966cdbd79e3a26437400cd342555a3"
+  },
+  "hardware": {
+    "nvidia_smi": "NVIDIA GeForce RTX 4090, 580.173.02, 24564"
+  },
+  "software": {
+    "python": "3.13.12",
+    "platform": "Linux-6.8.0-124-generic-x86_64-with-glibc2.35",
+    "packages": {
+      "cupy-cuda12x": "14.0.1",
+      "pylibcudf-cu12": "26.2.1",
+      "libcudf-cu12": "26.2.1",
+      "rmm-cu12": "26.2.0",
+      "pyarrow": "23.0.1",
+      "pandas": "3.0.1",
+      "geopandas": "1.1.4",
+      "cuda-python": "12.9.6",
+      "cuda-cccl": "0.6.0"
+    }
+  },
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "<unset>",
+    "RAPIDS_NO_INITIALIZE": "<unset>",
+    "RMM_LOG_FILE": "<unset>",
+    "VIBESPATIAL_DEVICE_RESERVE_BYTES": "<unset>",
+    "VIBESPATIAL_MEMORY_POOL": "<unset>",
+    "VIBESPATIAL_STRICT_NATIVE": "<unset>",
+    "VIBESPATIAL_PRECISION": "<unset>"
+  },
+  "measurement": {
+    "clean_vibespatial_command": "UV_CACHE_DIR=/tmp/uv-cache uv run python ../sedona-spatialbench/benchmark/run_benchmark.py --data-dir /home/picard/datasets/spatialbench/v0.1.0/sf100-geoparquet --engines vibespatial --queries q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12 --timeout 7200 --runs 3 --warmup-runs 1 --statistic median --scale-factor 100",
+    "optimized_geopandas_source_artifact": "geopandas_optimized.json; unchanged public query implementation and identical dataset/contract",
+    "telemetry_command": "same runner with --runs 1 --warmup-runs 0 --profile-telemetry",
+    "pipeline_command": "UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/benchmark_pipelines.py --suite full --repeat 1 --gpu-sparkline",
+    "correctness": "optimized GeoPandas result CSVs used as independent same-data SQL-derived oracle; rtol=1e-6, atol=1e-9"
+  },
+  "artifact_sha256": {
+    "final_benchmark.json": "42f1bfd301004f12502257d3c968008f8a7d308a9fbec5a0127cc338c0476238",
+    "final_telemetry.json": "0b1a9a83492e832b0a5be86834dc54185fcbba6b8408175a6ea6578cb23fe2e8",
+    "telemetry_summary.json": "9294618dbb16c043931cbdbcdb80f0ad9d411828ffa9e3aba4346a7195bfda53",
+    "same_data_correctness.json": "bca547bce14685ad8903a9558161a801ff4dea8efab7fbcb0b588e002de40d8a",
+    "same_data_correctness.md": "3f7fac51e21783a44e8fa286f0d04ae2755730f864ea31a5b0b049decdc9c2fa",
+    "pipeline_profile_summary.json": "4070be9cfd070804f3a673e9014bd6278349e47c06b4d2fd3a42edd27e676b0a",
+    "vibespatial_post_review.json": "c0a6f41dc36062778526e70ffbc01a12427aa0244573cd5a0911187f5686a62c"
+  },
+  "result": {
+    "optimized_geopandas_seconds": 8177.23,
+    "vibespatial_seconds": 643.77,
+    "suite_speedup": 12.702098575578233,
+    "q9_individual_10x_exempt": true,
+    "correct_queries": 12,
+    "fallback_events": 0
+  }
+}

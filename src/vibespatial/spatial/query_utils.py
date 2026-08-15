@@ -850,7 +850,7 @@ def _filter_predicate_pairs_owned(
     # Fast path: ALL pairs support GPU predicate evaluation.
     # Uses indexed access into original owned arrays — no take() buffer copy.
     if all_gpu and has_gpu_runtime():
-        if _has_device and return_device:
+        if _has_device:
             from vibespatial.predicates.point_relations import (
                 classify_point_predicates_indexed_device,
             )
@@ -864,20 +864,38 @@ def _filter_predicate_pairs_owned(
                 left_tags=d_left_tags,
                 right_tags=d_right_tags,
             )
-            return (
-                _dc.d_left[keep],
-                _dc.d_right[keep],
-                _planned_query_runtime_selection(
-                    kernel_name="predicate_refine",
-                    kernel_class=KernelClass.PREDICATE,
-                    row_count=_total,
-                    requested_mode=ExecutionMode.GPU,
-                    gpu_available=True,
-                    reason=(
-                        f"GPU indexed point-family {predicate} refinement "
-                        "with device-resident pairs"
-                    ),
+            d_left = _dc.d_left[keep]
+            d_right = _dc.d_right[keep]
+            selection = _planned_query_runtime_selection(
+                kernel_name="predicate_refine",
+                kernel_class=KernelClass.PREDICATE,
+                row_count=_total,
+                requested_mode=ExecutionMode.GPU,
+                gpu_available=True,
+                reason=(
+                    f"GPU indexed point-family {predicate} refinement "
+                    "with device-resident pairs"
                 ),
+            )
+            if not return_device:
+                from vibespatial.cuda._runtime import get_cuda_runtime
+
+                runtime = get_cuda_runtime()
+                return (
+                    runtime.copy_device_to_host(
+                        d_left,
+                        reason="exact spatial-query left-index terminal export",
+                    ),
+                    runtime.copy_device_to_host(
+                        d_right,
+                        reason="exact spatial-query right-index terminal export",
+                    ),
+                    selection,
+                )
+            return (
+                d_left,
+                d_right,
+                selection,
             )
         _ensure_host_indices()  # only indices needed — no D→H for tags (hitlist #18)
         from vibespatial.predicates.point_relations import classify_point_predicates_indexed

@@ -112,14 +112,18 @@ class _RowIsolatedTopologyPageShape:
 
 
 def _compute_live_split_event_budget() -> int:
-    """Derive a bounded live-event budget from currently available memory."""
+    """Derive a bounded live-event budget from the active query envelope."""
     try:
         runtime = get_cuda_runtime()
-        stats = runtime.memory_pool_stats()
-        if "free_bytes" in stats:
-            free_bytes = int(stats["free_bytes"])
+        remaining = getattr(runtime, "query_memory_remaining_bytes", None)
+        if callable(remaining):
+            free_bytes = int(remaining())
         else:
-            free_bytes = int(cp.cuda.Device().mem_info[0])
+            stats = runtime.memory_pool_stats()
+            if "free_bytes" in stats:
+                free_bytes = int(stats["free_bytes"])
+            else:
+                free_bytes = int(cp.cuda.Device().mem_info[0])
     except Exception:
         return _MAX_LIVE_SPLIT_EVENT_BUDGET
 

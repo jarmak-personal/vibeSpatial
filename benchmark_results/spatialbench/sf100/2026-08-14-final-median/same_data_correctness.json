@@ -1,0 +1,67 @@
+{
+  "scale_factor": 100,
+  "oracle": "same converted SF100 GeoParquet; optimized GeoPandas result files treated as the independent SQL-derived oracle",
+  "rtol": 1e-06,
+  "atol": 1e-09,
+  "engines": {
+    "geopandas_optimized": {
+      "passed": 12,
+      "failed": 0
+    },
+    "vibespatial": {
+      "passed": 12,
+      "failed": 0
+    }
+  },
+  "queries": {
+    "q1": {
+      "geopandas_optimized": "pass",
+      "vibespatial": "pass"
+    },
+    "q2": {
+      "geopandas_optimized": "pass",
+      "vibespatial": "pass"
+    },
+    "q3": {
+      "geopandas_optimized": "pass",
+      "vibespatial": "pass"
+    },
+    "q4": {
+      "geopandas_optimized": "pass",
+      "vibespatial": "pass"
+    },
+    "q5": {
+      "geopandas_optimized": "pass",
+      "vibespatial": "pass"
+    },
+    "q6": {
+      "geopandas_optimized": "pass",
+      "vibespatial": "pass"
+    },
+    "q7": {
+      "geopandas_optimized": "pass",
+      "vibespatial": "pass"
+    },
+    "q8": {
+      "geopandas_optimized": "pass",
+      "vibespatial": "pass"
+    },
+    "q9": {
+      "geopandas_optimized": "pass",
+      "vibespatial": "pass"
+    },
+    "q10": {
+      "geopandas_optimized": "pass",
+      "vibespatial": "pass"
+    },
+    "q11": {
+      "geopandas_optimized": "pass",
+      "vibespatial": "pass"
+    },
+    "q12": {
+      "geopandas_optimized": "pass",
+      "vibespatial": "pass"
+    }
+  },
+  "report": "same_data_correctness.md"
+}

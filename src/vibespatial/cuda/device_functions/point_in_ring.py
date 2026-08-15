@@ -158,13 +158,27 @@ __device__ inline unsigned char vs_ring_point_classify(
     }
     for (int i = start, j = end - 1; i < end; j = i++) {
         double ax = x[j], ay = y[j], bx = x[i], by = y[i];
+        const bool crosses_ray = (ay > py) != (by > py);
+        const double minx = fmin(ax, bx);
+        const double maxx = fmax(ax, bx);
+        const bool boundary_bbox =
+            py >= fmin(ay, by) && py <= fmax(ay, by)
+            && px >= minx && px <= maxx;
+        if (!crosses_ray && !boundary_bbox) {
+            continue;
+        }
+        if (crosses_ray && px < minx) {
+            inside = !inside;
+            continue;
+        }
+        if (crosses_ray && px > maxx) {
+            continue;
+        }
         const int orientation = vs_orient2d(ax, ay, bx, by, px, py);
-        if (orientation == 0
-            && px >= fmin(ax, bx) && px <= fmax(ax, bx)
-            && py >= fmin(ay, by) && py <= fmax(ay, by)) {
+        if (boundary_bbox && orientation == 0) {
             return 1;
         }
-        if ((ay > py) != (by > py)) {
+        if (crosses_ray) {
             if ((orientation > 0) == (by > ay))
                 inside = !inside;
         }

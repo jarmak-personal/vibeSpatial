@@ -693,9 +693,113 @@ def _convex_hull_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     )
 
 
+def _restore_grouped_point_hull_families(
+    polygon_hulls: OwnedGeometryArray,
+) -> OwnedGeometryArray:
+    """Restore Point/LineString output for exact degenerate point hulls.
+
+    The legacy hull kernel encodes degenerates as closed zero-area polygon
+    rings. Grouped point execution cannot expose that internal allocation
+    shape: GeoPandas/Shapely require a Point for one unique coordinate and a
+    LineString for two unique or collinear coordinates. Keep polygon storage
+    capacity aligned by group and route logical rows with device tags.
+    """
+    state = polygon_hulls._ensure_device_state(preserve_indexed_view=True)
+    polygon_buffer = state.families[GeometryFamily.POLYGON]
+    ring_offsets = cp.asarray(polygon_buffer.ring_offsets, dtype=cp.int32)
+    starts = ring_offsets[:-1]
+    ends = ring_offsets[1:]
+    counts = ends - starts
+    x = cp.asarray(polygon_buffer.x, dtype=cp.float64)
+    y = cp.asarray(polygon_buffer.y, dtype=cp.float64)
+
+    def _at(relative: int):
+        indices = cp.minimum(starts + np.int32(relative), ends - np.int32(1))
+        return x[indices], y[indices]
+
+    x0, y0 = _at(0)
+    x1, y1 = _at(1)
+    x2, y2 = _at(2)
+    x3, y3 = _at(3)
+    same01 = (x0 == x1) & (y0 == y1)
+    same02 = (x0 == x2) & (y0 == y2)
+    point_rows = same01 & same02
+    encoded_two_point_ring = (
+        (counts == 5)
+        & (x1 == x2)
+        & (y1 == y2)
+        & (x0 == x3)
+        & (y0 == y3)
+    )
+    line_rows = ~point_rows & ((counts == 3) | encoded_two_point_ring)
+    polygon_rows = ~point_rows & ~line_rows
+    row_count = polygon_hulls.row_count
+    row_offsets = cp.arange(row_count + 1, dtype=cp.int32)
+    line_offsets = row_offsets * np.int32(2)
+    line_x = cp.stack((x0, x1), axis=1).reshape(-1)
+    line_y = cp.stack((y0, y1), axis=1).reshape(-1)
+    validity = cp.asarray(state.validity, dtype=cp.bool_)
+    tags = cp.where(
+        point_rows,
+        np.int8(FAMILY_TAGS[GeometryFamily.POINT]),
+        cp.where(
+            line_rows,
+            np.int8(FAMILY_TAGS[GeometryFamily.LINESTRING]),
+            np.int8(FAMILY_TAGS[GeometryFamily.POLYGON]),
+        ),
+    ).astype(cp.int8, copy=False)
+    tags = cp.where(validity, tags, np.int8(-1))
+    family_row_offsets = cp.where(
+        validity,
+        cp.arange(row_count, dtype=cp.int32),
+        np.int32(-1),
+    )
+    polygon_capacity = DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.POLYGON,
+        x=polygon_buffer.x,
+        y=polygon_buffer.y,
+        geometry_offsets=polygon_buffer.geometry_offsets,
+        empty_mask=cp.asarray(polygon_buffer.empty_mask, dtype=cp.bool_) | ~polygon_rows,
+        ring_offsets=polygon_buffer.ring_offsets,
+        bounds=None,
+    )
+    result = build_device_resident_owned(
+        device_families={
+            GeometryFamily.POINT: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.POINT,
+                x=x0,
+                y=y0,
+                geometry_offsets=row_offsets,
+                empty_mask=~point_rows,
+                bounds=None,
+            ),
+            GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.LINESTRING,
+                x=line_x,
+                y=line_y,
+                geometry_offsets=line_offsets,
+                empty_mask=~line_rows,
+                bounds=None,
+            ),
+            GeometryFamily.POLYGON: polygon_capacity,
+        },
+        row_count=row_count,
+        tags=tags,
+        validity=validity,
+        family_row_offsets=family_row_offsets,
+        execution_mode="gpu",
+    )
+    result._ensure_device_state(preserve_indexed_view=True).trusted_family_domain = (
+        GeometryFamily.POINT,
+        GeometryFamily.LINESTRING,
+        GeometryFamily.POLYGON,
+    )
+    return result
+
+
 def _grouped_convex_hull_from_source_owned(
     source_owned: OwnedGeometryArray,
-    group_offsets: np.ndarray,
+    group_offsets,
 ) -> OwnedGeometryArray | None:
     """Compute hulls for dissolve groups without materializing group unions.
 
@@ -706,17 +810,30 @@ def _grouped_convex_hull_from_source_owned(
     if cp is None or source_owned.residency is not Residency.DEVICE:
         return None
 
-    offsets = np.asarray(group_offsets, dtype=np.int64)
-    if offsets.ndim != 1 or offsets.size < 2:
-        return None
-    if int(offsets[0]) != 0 or int(offsets[-1]) != int(source_owned.row_count):
-        return None
-    group_count = int(offsets.size - 1)
-    if group_count <= 0 or np.any(offsets[1:] < offsets[:-1]):
-        return None
-    if np.any(offsets[1:] == offsets[:-1]):
+    offsets_are_device = hasattr(group_offsets, "__cuda_array_interface__")
+    if offsets_are_device:
+        offsets = cp.asarray(group_offsets, dtype=cp.int64)
+        if offsets.ndim != 1 or int(offsets.size) < 2:
+            return None
+        group_count = int(offsets.size - 1)
+    else:
+        offsets = np.asarray(group_offsets, dtype=np.int64)
+        if offsets.ndim != 1 or offsets.size < 2:
+            return None
+        if int(offsets[0]) != 0 or int(offsets[-1]) != int(source_owned.row_count):
+            return None
+        group_count = int(offsets.size - 1)
+        if group_count <= 0 or np.any(offsets[1:] < offsets[:-1]):
+            return None
+        if np.any(offsets[1:] == offsets[:-1]):
+            return None
+    if group_count <= 0:
         return None
 
+    source_families = set(
+        source_owned._ensure_device_state(preserve_indexed_view=True).families
+    )
+    point_source = source_families == {GeometryFamily.POINT}
     try:
         from vibespatial.api._native_grouped import NativeGroupedSelection
         from vibespatial.constructive.binary_constructive import (
@@ -730,99 +847,150 @@ def _grouped_convex_hull_from_source_owned(
                 allow_capacity_allocation=True,
             )
 
-        polygon_parts = _explode_polygonal_rows_to_polygon_capacity_gpu(
-            source_for_parts,
-        )
-        if polygon_parts is None or polygon_parts.capacity == 0:
-            return None
-        source_state = source_owned._ensure_device_state(preserve_indexed_view=True)
-        trusted_dense_polygonal_source = (
-            source_state.trusted_all_valid is True
-            and source_state.trusted_all_non_empty is True
-            and source_state.trusted_polygonal_only is True
-        )
-
-        d_offsets = cp.asarray(offsets, dtype=cp.int64)
-        d_part_source_rows = cp.asarray(polygon_parts.source_rows, dtype=cp.int64)
-        d_group_ids = (
-            cp.searchsorted(d_offsets, d_part_source_rows, side="right").astype(
-                cp.int64,
-                copy=False,
+        source_state = source_for_parts._ensure_device_state()
+        if set(source_state.families) == {GeometryFamily.POINT}:
+            point_buffer = source_state.families[GeometryFamily.POINT]
+            dense_points = (
+                source_state.trusted_all_valid is True
+                and source_state.trusted_all_non_empty is True
             )
-            - 1
-        )
-
-        part_capacity = polygon_parts.capacity
-        grouped_parts = NativeGroupedSelection(
-            selection=polygon_parts.selection,
-            group_codes=d_group_ids.astype(cp.int32, copy=False),
-            group_count=group_count,
-        )
-        d_group_counts = grouped_parts.reduce_numeric(
-            cp.ones(part_capacity, dtype=cp.int32),
-            "count",
-        ).values.astype(cp.int32, copy=False)
-        if not trusted_dense_polygonal_source and _convex_hull_device_bool_scalar(
-            cp.any(d_group_counts == 0),
-            reason="grouped convex-hull nonempty-group scalar fence",
-        ):
-            return None
-
-        d_group_offsets = cp.empty(group_count + 1, dtype=cp.int32)
-        d_group_offsets[0] = 0
-        cp.cumsum(d_group_counts, out=d_group_offsets[1:])
-
-        d_active = polygon_parts.selection.active_capacity_mask()
-        d_sort_group_ids = cp.where(
-            d_active,
-            d_group_ids,
-            cp.int64(group_count),
-        ).astype(cp.uint64, copy=False)
-        d_sort_keys = (d_sort_group_ids << cp.uint64(32)) | cp.arange(
-            part_capacity, dtype=cp.uint64
-        )
-        d_order = sort_pairs(
-            d_sort_keys,
-            cp.arange(part_capacity, dtype=cp.int32),
-            strategy=PairSortStrategy.RADIX,
-            synchronize=False,
-        ).values.astype(cp.int64, copy=False)
-        sorted_parts = polygon_parts.geometry._device_indexed_take(d_order)
-        if getattr(sorted_parts, "is_indexed_view", False):
-            sorted_parts = sorted_parts.physicalize_device_rows(
-                allow_capacity_allocation=True,
+            if not dense_points:
+                dense_points = _convex_hull_device_bool_scalar(
+                    cp.all(cp.asarray(source_state.validity, dtype=cp.bool_))
+                    & ~cp.any(cp.asarray(point_buffer.empty_mask, dtype=cp.bool_))
+                    & cp.all(
+                        cp.asarray(point_buffer.geometry_offsets, dtype=cp.int64)
+                        == cp.arange(source_for_parts.row_count + 1, dtype=cp.int64)
+                    ),
+                    reason="grouped point convex-hull dense-source scalar proof",
+                )
+            if not dense_points or int(point_buffer.x.size) != source_for_parts.row_count:
+                return None
+            grouped_buffer = DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.MULTIPOINT,
+                x=point_buffer.x,
+                y=point_buffer.y,
+                geometry_offsets=cp.asarray(offsets, dtype=cp.int32),
+                empty_mask=cp.zeros(group_count, dtype=cp.bool_),
+                bounds=None,
             )
-        sorted_state = sorted_parts._ensure_device_state()
-        polygon_buffer = sorted_state.families.get(GeometryFamily.POLYGON)
-        if polygon_buffer is None:
-            return None
+            grouped_owned = build_device_resident_owned(
+                device_families={GeometryFamily.MULTIPOINT: grouped_buffer},
+                row_count=group_count,
+                tags=cp.full(
+                    group_count,
+                    FAMILY_TAGS[GeometryFamily.MULTIPOINT],
+                    dtype=cp.int8,
+                ),
+                validity=cp.ones(group_count, dtype=cp.bool_),
+                family_row_offsets=cp.arange(group_count, dtype=cp.int32),
+                execution_mode="gpu",
+            )
+            result = _restore_grouped_point_hull_families(
+                _convex_hull_gpu(grouped_owned)
+            )
+            polygon_parts = None
+        else:
+            result = None
 
-        grouped_buffer = DeviceFamilyGeometryBuffer(
-            family=GeometryFamily.MULTIPOLYGON,
-            x=polygon_buffer.x,
-            y=polygon_buffer.y,
-            geometry_offsets=d_group_offsets,
-            empty_mask=cp.zeros(group_count, dtype=cp.bool_),
-            part_offsets=polygon_buffer.geometry_offsets,
-            ring_offsets=polygon_buffer.ring_offsets,
-            bounds=None,
-        )
-        grouped_owned = build_device_resident_owned(
-            device_families={GeometryFamily.MULTIPOLYGON: grouped_buffer},
-            row_count=group_count,
-            tags=cp.full(
-                group_count,
-                FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
-                dtype=cp.int8,
-            ),
-            validity=cp.ones(group_count, dtype=cp.bool_),
-            family_row_offsets=cp.arange(group_count, dtype=cp.int32),
-            execution_mode="gpu",
-        )
-        result = _convex_hull_gpu(grouped_owned)
+        if result is None:
+            polygon_parts = _explode_polygonal_rows_to_polygon_capacity_gpu(
+                source_for_parts,
+            )
+            if polygon_parts is None or polygon_parts.capacity == 0:
+                return None
+            source_state = source_owned._ensure_device_state(preserve_indexed_view=True)
+            trusted_dense_polygonal_source = (
+                source_state.trusted_all_valid is True
+                and source_state.trusted_all_non_empty is True
+                and source_state.trusted_polygonal_only is True
+            )
+
+            d_offsets = cp.asarray(offsets, dtype=cp.int64)
+            d_part_source_rows = cp.asarray(polygon_parts.source_rows, dtype=cp.int64)
+            d_group_ids = (
+                cp.searchsorted(d_offsets, d_part_source_rows, side="right").astype(
+                    cp.int64,
+                    copy=False,
+                )
+                - 1
+            )
+
+            part_capacity = polygon_parts.capacity
+            grouped_parts = NativeGroupedSelection(
+                selection=polygon_parts.selection,
+                group_codes=d_group_ids.astype(cp.int32, copy=False),
+                group_count=group_count,
+            )
+            d_group_counts = grouped_parts.reduce_numeric(
+                cp.ones(part_capacity, dtype=cp.int32),
+                "count",
+            ).values.astype(cp.int32, copy=False)
+            if not trusted_dense_polygonal_source and _convex_hull_device_bool_scalar(
+                cp.any(d_group_counts == 0),
+                reason="grouped convex-hull nonempty-group scalar fence",
+            ):
+                return None
+
+            d_group_offsets = cp.empty(group_count + 1, dtype=cp.int32)
+            d_group_offsets[0] = 0
+            cp.cumsum(d_group_counts, out=d_group_offsets[1:])
+
+            d_active = polygon_parts.selection.active_capacity_mask()
+            d_sort_group_ids = cp.where(
+                d_active,
+                d_group_ids,
+                cp.int64(group_count),
+            ).astype(cp.uint64, copy=False)
+            d_sort_keys = (d_sort_group_ids << cp.uint64(32)) | cp.arange(
+                part_capacity, dtype=cp.uint64
+            )
+            d_order = sort_pairs(
+                d_sort_keys,
+                cp.arange(part_capacity, dtype=cp.int32),
+                strategy=PairSortStrategy.RADIX,
+                synchronize=False,
+            ).values.astype(cp.int64, copy=False)
+            sorted_parts = polygon_parts.geometry._device_indexed_take(d_order)
+            if getattr(sorted_parts, "is_indexed_view", False):
+                sorted_parts = sorted_parts.physicalize_device_rows(
+                    allow_capacity_allocation=True,
+                )
+            sorted_state = sorted_parts._ensure_device_state()
+            polygon_buffer = sorted_state.families.get(GeometryFamily.POLYGON)
+            if polygon_buffer is None:
+                return None
+
+            grouped_buffer = DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.MULTIPOLYGON,
+                x=polygon_buffer.x,
+                y=polygon_buffer.y,
+                geometry_offsets=d_group_offsets,
+                empty_mask=cp.zeros(group_count, dtype=cp.bool_),
+                part_offsets=polygon_buffer.geometry_offsets,
+                ring_offsets=polygon_buffer.ring_offsets,
+                bounds=None,
+            )
+            grouped_owned = build_device_resident_owned(
+                device_families={GeometryFamily.MULTIPOLYGON: grouped_buffer},
+                row_count=group_count,
+                tags=cp.full(
+                    group_count,
+                    FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+                    dtype=cp.int8,
+                ),
+                validity=cp.ones(group_count, dtype=cp.bool_),
+                family_row_offsets=cp.arange(group_count, dtype=cp.int32),
+                execution_mode="gpu",
+            )
+            result = _convex_hull_gpu(grouped_owned)
     except StrictNativeFallbackError:
         raise
-    except Exception:
+    except Exception as exc:
+        if point_source:
+            raise RuntimeError(
+                "admitted grouped point convex-hull execution failed"
+            ) from exc
         logger.debug(
             "grouped dissolve convex-hull rewrite failed; using regular hull",
             exc_info=True,
@@ -849,7 +1017,7 @@ def _grouped_convex_hull_from_source_owned(
         reason="dissolve grouped-union provenance avoided exact-union hull input",
         detail=(
             f"groups={group_count}, source_rows={source_owned.row_count}, "
-            f"polygon_part_capacity={polygon_parts.capacity}"
+            f"source_coordinate_capacity={source_for_parts.row_count if polygon_parts is None else polygon_parts.capacity}"
         ),
     )
     return result

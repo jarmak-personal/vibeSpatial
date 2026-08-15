@@ -5,7 +5,7 @@ Scope: Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and 
 Read If: You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.
 STOP IF: Your task already has the specific IO adapter open and only needs local implementation detail.
 Source Of Truth: IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.
-Body Budget: 260/260 lines
+Body Budget: 258/260 lines
 Document: docs/architecture/io-arrow.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 32-37 | Risks |
 | 38-53 | Decision |
 | 54-75 | Performance Notes |
-| 76-222 | Current Behavior |
-| 223-260 | Measured Local Baseline |
+| 76-220 | Current Behavior |
+| 221-258 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -93,8 +93,8 @@ geometry buffers while keeping GPU-native formats as the design center.
   not construct Shapely objects unless a caller explicitly requests them.
 - GeoParquet scans should decode native GeoArrow family columns directly into
   owned buffers after scan instead of bouncing through Shapely.
-- Chunked GeoParquet scans should concatenate owned-buffer batches, not
-  materialized geometry objects.
+- `read_parquet_batches` should yield whole-row-group public frames while
+  retaining device attributes and owned geometry until explicit export.
 
 ## Current Behavior
 
@@ -189,12 +189,10 @@ geometry buffers while keeping GPU-native formats as the design center.
   non-native compression now record an explicit CPU dispatch at the sink
   boundary instead of a fallback event, so strict-native mode still rejects
   hidden mid-pipeline fallback without forbidding explicit compatibility export.
-- Repo-owned `read_geoparquet_owned(...)` now provides the scan-engine seam for
-  `o17.6.20`:
-  - backend selection: `pylibcudf` or `pyarrow`
-  - row-group chunk planning from metadata summaries
-  - direct GeoArrow-family decode into owned buffers
-  - chunk concatenation at the owned-buffer layer
+- Repo-owned `read_geoparquet_owned(...)` and public `read_parquet_batches(...)`
+  now provide the scan seam: pylibcudf/pyarrow selection, decoded-byte row-group
+  planning, direct GeoArrow decode, device-backed projected attributes, and
+  owned-buffer concatenation or bounded public batch delivery.
 - `read_geoparquet_native(...)` now seeds `NativeGeometryMetadata` on its
   `NativeTabularResult` from decode-time validity/family classification and
   GeoParquet total bounds without forcing eager per-row bounds recomputation;

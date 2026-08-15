@@ -166,6 +166,7 @@ def distance_expression_owned(
         kernel_class=KernelClass.METRIC,
         row_count=n,
         requested_mode=requested_mode,
+        requested_precision=precision,
         current_residency=combined_residency(left, right),
         work_estimate=estimate_pairwise_work_from_owned(
             left,
@@ -189,7 +190,7 @@ def distance_expression_owned(
         source_token=source_token,
         source_row_count=n,
         dtype=str(getattr(values, "dtype", "float64")),
-        precision="fp64",
+        precision=selection.precision_plan.compute_precision.value,
         null_policy="nan-false",
     )
 
@@ -566,6 +567,87 @@ def _distance_gpu_device(
     n = left.row_count
     runtime = get_cuda_runtime()
 
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="distance_owned: left geometry for native distance expression",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="distance_owned: right geometry for native distance expression",
+    )
+
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right._ensure_device_state(preserve_indexed_view=True)
+    left_family = left_state.trusted_homogeneous_family
+    right_family = right_state.trusted_homogeneous_family
+    if (
+        left_state.trusted_all_valid is True
+        and right_state.trusted_all_valid is True
+        and left_family is not None
+        and right_family is not None
+        and left_family is not GeometryFamily.MULTIPOINT
+        and right_family is not GeometryFamily.MULTIPOINT
+    ):
+        d_idx = cp.arange(n, dtype=cp.int32)
+        d_result = cp.empty(n, dtype=cp.float64)
+        ok = False
+        if left_family is GeometryFamily.POINT and right_family is GeometryFamily.POINT:
+            _launch_point_point_distance_kernel(
+                left,
+                right,
+                d_idx,
+                d_idx,
+                d_result,
+                n,
+            )
+            ok = True
+        elif (
+            left_family is GeometryFamily.POINT
+            and right_family in _POINT_DISTANCE_FAMILIES
+        ):
+            ok = compute_point_distance_gpu(
+                left,
+                right,
+                d_idx,
+                d_idx,
+                d_result,
+                n,
+                tree_family=right_family,
+                compute_precision=precision,
+            )
+        elif (
+            right_family is GeometryFamily.POINT
+            and left_family in _POINT_DISTANCE_FAMILIES
+        ):
+            ok = compute_point_distance_gpu(
+                right,
+                left,
+                d_idx,
+                d_idx,
+                d_result,
+                n,
+                tree_family=left_family,
+                compute_precision=precision,
+            )
+        elif (
+            left_family in _SEGMENT_FAMILIES
+            and right_family in _SEGMENT_FAMILIES
+        ):
+            ok = compute_segment_distance_gpu(
+                left,
+                right,
+                d_idx,
+                d_idx,
+                d_result,
+                n,
+                query_family=left_family,
+                tree_family=right_family,
+            )
+        if ok:
+            return d_result
+
     left_tags = left.tags
     right_tags = right.tags
     both_valid = left.validity & right.validity
@@ -582,17 +664,6 @@ def _distance_gpu_device(
         if lf is None or rf is None or lf == MP or rf == MP:
             return None
         groups.append((lt, rt, lf, rf))
-
-    left.move_to(
-        Residency.DEVICE,
-        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-        reason="distance_owned: left geometry for native distance expression",
-    )
-    right.move_to(
-        Residency.DEVICE,
-        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-        reason="distance_owned: right geometry for native distance expression",
-    )
 
     d_result = cp.full(n, cp.nan, dtype=cp.float64)
     if valid_idx.size == 0:

@@ -85,9 +85,9 @@ This means:
 - public `sindex.query` indices, dense, and sparse outputs format
   `NativeRelation` pairs when the owned/native index path is admissible; dense
   and sparse remain public compatibility exports, not native carriers
-- public `sindex.nearest` can also format `NativeRelation` pairs when both
-  sides already have owned geometry and `nearest_relation()` admits the shape;
-  otherwise it keeps the existing nearest engine path
+- public `sindex.nearest(..., k=N, return_all=False)` formats an exact bounded
+  `NativeRelation` for owned device point inputs; `k=1` preserves GeoPandas
+  behavior and unsupported shapes keep the existing explicit fallback path
 - `RelationJoinExportResult -> NativeTabularResult` now builds a native
   attribute payload directly, so terminal Arrow-family and file sinks do not
   need to go back through the joined-frame materializer just to emit join rows

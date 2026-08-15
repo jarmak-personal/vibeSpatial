@@ -1202,10 +1202,13 @@ class GeoSeries(GeoPandasBase, Series):
 
     @doc(pd.Series)
     def take(self, *args, **kwargs):
+        indices = args[0] if args else kwargs.get("indices")
+        native_result = self._take_native_expression_indices(indices)
+        if native_result is not None:
+            return native_result
         result = self._wrapped_pandas_method("take", *args, **kwargs)
         if result is None:
             return result
-        indices = args[0] if args else kwargs.get("indices")
         positions, unique = _geoseries_row_positions(indices, len(self))
         _attach_native_state_after_geoseries_positions(
             self,
@@ -1213,6 +1216,52 @@ class GeoSeries(GeoPandasBase, Series):
             positions,
             unique=unique,
         )
+        return result
+
+    def _take_native_expression_indices(self, indices):
+        """Gather native geometry with a device integer expression."""
+        from vibespatial.api._native_public_arrays import (
+            NativeNumericExpressionArray,
+            native_public_index_from_plan,
+        )
+        from vibespatial.api._native_rowset import NativeRowSet
+        from vibespatial.api._native_state import attach_native_state, get_native_state
+
+        index_array = getattr(indices, "array", None)
+        if not isinstance(index_array, NativeNumericExpressionArray):
+            return None
+        expression = index_array.expression
+        if not expression.is_device or not np.issubdtype(expression.values.dtype, np.integer):
+            return None
+        state = get_native_state(self)
+        if state is None:
+            return None
+        position_domain_size = expression.certified_position_domain_size
+        if (
+            position_domain_size is None
+            or int(position_domain_size) > int(state.row_count)
+        ):
+            # General numeric expressions are values, not certified positions.
+            # Let pandas materialize and enforce negative/OOB ``Series.take``
+            # semantics rather than feeding unchecked values to a device gather.
+            return None
+
+        import cupy as cp
+
+        positions = cp.asarray(expression.values, dtype=cp.int64)
+        rowset = NativeRowSet.from_positions(
+            positions,
+            source_token=state.lineage_token,
+            source_row_count=state.row_count,
+            ordered=True,
+            unique=False,
+        )
+        taken = state.take(rowset, preserve_index=True)
+        result = taken.geometry.to_geoseries(
+            index=native_public_index_from_plan(taken.index_plan),
+            name=self.name,
+        )
+        attach_native_state(result, taken)
         return result
 
     @doc(pd.Series)
@@ -1871,7 +1920,6 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
             show_bbox=show_bbox,
             drop_id=drop_id,
             to_wgs84=to_wgs84,
-            _record_export=False,
             **kwargs,
         )
 

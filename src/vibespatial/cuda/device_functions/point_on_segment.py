@@ -14,9 +14,11 @@ POINT_ON_SEGMENT_DEVICE: str = r"""
    Returns true if the point is on the segment.
 
    The cross-product is scaled by the segment's Manhattan extent
-   (|dx|+|dy|+1) so that the tolerance is dimensionless and does not
-   depend on segment length.  The bounding-box check is padded by
-   tolerance in each direction.
+   (|dx|+|dy|), converting the coordinate-distance tolerance into the
+   area units of the cross product.  Adding a unit floor here would make
+   short GIS edges admit points far beyond the requested tolerance.  The
+   bounding-box check is padded by tolerance in each direction and also
+   handles zero-length segments.
 
    Parameters:
      px, py    -- query point coordinates
@@ -33,7 +35,7 @@ __device__ inline bool vs_point_on_segment(
     const double dx = bx - ax;
     const double dy = by - ay;
     const double cross = (px - ax) * dy - (py - ay) * dx;
-    const double scale = fabs(dx) + fabs(dy) + 1.0;
+    const double scale = fabs(dx) + fabs(dy);
     if (fabs(cross) > tolerance * scale) {{
         return false;
     }}
@@ -74,7 +76,7 @@ __device__ inline unsigned char vs_point_on_segment_kind(
     const double dx = bx - ax;
     const double dy = by - ay;
     const double cross = (px - ax) * dy - (py - ay) * dx;
-    const double scale = fabs(dx) + fabs(dy) + 1.0;
+    const double scale = fabs(dx) + fabs(dy);
     if (fabs(cross) > tolerance * scale) {{
         return 0;
     }}

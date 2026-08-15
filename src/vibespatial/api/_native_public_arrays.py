@@ -49,6 +49,8 @@ def _extension_array_getitem(array: ExtensionArray, item, materialize):
     """Keep vector indexing inside the ExtensionArray contract."""
     if isinstance(item, (int, np.integer)):
         return materialize()[int(item)]
+    if isinstance(item, slice) and item == slice(None):
+        return array.copy()
     positions = np.arange(len(array), dtype=np.intp)[item]
     if np.ndim(positions) == 0:
         return materialize()[int(positions)]
@@ -1002,6 +1004,7 @@ class NativeAttributeColumnArray(ExtensionArray):
     export_surface: str = "vibespatial.api.NativeAttributeTable.public_column"
     export_operation: str = "native_attribute_column_to_public_array"
     selection_positions: Any | None = None
+    source_token: str | None = None
 
     @property
     def dtype(self):
@@ -1014,11 +1017,84 @@ class NativeAttributeColumnArray(ExtensionArray):
             else _array_size(self.selection_positions)
         )
 
+    def _device_selected_table(self):
+        if self.selection_positions is None:
+            return self.table
+        positions = self.selection_positions
+        if not _is_device_array(positions):
+            host_positions = np.asarray(positions, dtype=np.int64)
+            if np.any(host_positions < 0):
+                return None
+            positions = host_positions
+        return self.table.take(positions, preserve_index=False)
+
+    def _materialize_device_temporal_values(self) -> np.ndarray | None:
+        table = self._device_selected_table()
+        if table is None:
+            return None
+        policies = table.device_column_policies((self.column,))
+        policy = policies.get(self.column)
+        if (
+            policy is None
+            or int(policy.null_count) != 0
+            or not (
+                policy.arrow_type.startswith("timestamp[")
+                or policy.arrow_type.startswith("duration[")
+            )
+        ):
+            return None
+        import cupy as cp
+
+        column = table.to_pylibcudf_columns((self.column,))[0]
+        values = cp.asarray(column.data()).view(cp.int64)[: int(column.size())]
+        arrow_type = policy.arrow_type
+        temporal_metadata = arrow_type[
+            arrow_type.find("[") + 1 : arrow_type.rfind("]")
+        ]
+        unit, *metadata = (
+            value.strip() for value in temporal_metadata.split(",")
+        )
+        kind = "datetime64" if arrow_type.startswith("timestamp[") else "timedelta64"
+        record_native_export_boundary(
+            NativeExportBoundary(
+                surface=self.export_surface,
+                operation=self.export_operation,
+                target="series",
+                reason="selected native temporal attribute exported to public array",
+                row_count=len(self),
+                byte_count=int(values.nbytes),
+                d2h_transfer=True,
+            )
+        )
+        host = _copy_device_to_host(
+            values,
+            reason=f"{self.export_surface}::{self.export_operation}_temporal",
+        )
+        host = np.asarray(host, dtype=np.int64)
+        timezone = next(
+            (
+                value.removeprefix("tz=")
+                for value in metadata
+                if value.startswith("tz=")
+            ),
+            None,
+        )
+        if kind == "datetime64" and timezone is not None:
+            return pd.to_datetime(host, unit=unit, utc=True).tz_convert(timezone).to_numpy()
+        return host.view(np.dtype(f"{kind}[{unit}]"))
+
     def _materialize_values(self) -> np.ndarray:
-        frame = self.table.to_pandas(copy=False)
+        temporal = self._materialize_device_temporal_values()
+        if temporal is not None:
+            return temporal
+        table = self._device_selected_table()
+        if table is None:
+            table = self.table
+        projected = table.project_columns((self.column,))
+        frame = (table if projected is None else projected).to_pandas(copy=False)
         values = frame[self.column].to_numpy(copy=False)
         values = np.asarray(values)
-        if self.selection_positions is None:
+        if table is not self.table or self.selection_positions is None:
             return values
         positions = np.asarray(self.selection_positions, dtype=np.int64)
         result = np.empty(positions.size, dtype=object)
@@ -1029,8 +1105,19 @@ class NativeAttributeColumnArray(ExtensionArray):
 
     def to_pandas_series(self, *, index=None, name=None) -> pd.Series:
         """Materialize the selected column while preserving its logical dtype."""
-        source = self.table.to_pandas(copy=False)[self.column]
-        if self.selection_positions is None:
+        temporal = self._materialize_device_temporal_values()
+        if temporal is not None:
+            result = pd.Series(temporal, copy=False)
+            if index is not None and not result.index.equals(index):
+                result.index = index
+            result.name = name
+            return result
+        table = self._device_selected_table()
+        if table is None:
+            table = self.table
+        projected = table.project_columns((self.column,))
+        source = (table if projected is None else projected).to_pandas(copy=False)[self.column]
+        if table is not self.table or self.selection_positions is None:
             result = source.copy(deep=False)
         else:
             positions = np.asarray(self.selection_positions, dtype=np.int64)
@@ -1074,6 +1161,10 @@ class NativeAttributeColumnArray(ExtensionArray):
         return values.copy() if copy else values
 
     def to_numpy(self, dtype=None, copy: bool = False, na_value=None):
+        if dtype is not None:
+            cast = self.astype(dtype, copy=False)
+            if isinstance(cast, NativeNumericExpressionArray):
+                return cast.to_numpy(dtype=dtype, copy=copy, na_value=na_value)
         values = self._materialize_values()
         if dtype is not None:
             values = values.astype(dtype, copy=False)
@@ -1081,6 +1172,59 @@ class NativeAttributeColumnArray(ExtensionArray):
 
     def isna(self) -> np.ndarray:
         return pd.isna(self._materialize_values())
+
+    def astype(self, dtype, copy: bool = True):
+        """Cast sortable device attributes without exporting through Arrow."""
+        try:
+            target_dtype = np.dtype(dtype)
+        except TypeError:
+            target_dtype = None
+        if target_dtype is not None and (
+            np.issubdtype(target_dtype, np.number)
+            or np.issubdtype(target_dtype, np.bool_)
+        ):
+            table = self._device_selected_table()
+            if table is None:
+                table = self.table
+            policies = table.device_column_policies((self.column,))
+            policy = policies.get(self.column)
+            if policy is not None and policy.null_count == 0:
+                try:
+                    import pyarrow as pa
+                    import pylibcudf as plc
+
+                    from vibespatial.api._native_expression import NativeExpression
+                    from vibespatial.api._native_result_core import (
+                        _pylibcudf_numeric_column_view,
+                    )
+                    from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+                    source = table.to_pylibcudf_columns((self.column,))[0]
+                    target_type = plc.DataType.from_arrow(pa.from_numpy_dtype(target_dtype))
+                    if plc.unary.is_supported_cast(source.type(), target_type):
+                        cast = plc.unary.cast(
+                            source,
+                            target_type,
+                            stream=pylibcudf_current_stream(table.device_table),
+                        )
+                        values = _pylibcudf_numeric_column_view(cast)
+                        if values is not None:
+                            return NativeNumericExpressionArray(
+                                NativeExpression(
+                                    operation=f"attribute.{self.column}.astype",
+                                    values=values,
+                                    source_token=self.source_token,
+                                    source_row_count=len(self),
+                                    dtype=str(target_dtype),
+                                    precision="source",
+                                ),
+                                export_surface=self.export_surface,
+                                export_operation=f"{self.export_operation}_astype",
+                            )
+                except (ImportError, AttributeError, NotImplementedError):
+                    pass
+        values = self._materialize_values().astype(dtype, copy=copy)
+        return values
 
     def _cmp_method(self, other, op):
         other_values = (
@@ -1107,6 +1251,7 @@ class NativeAttributeColumnArray(ExtensionArray):
             export_surface=self.export_surface,
             export_operation=self.export_operation,
             selection_positions=self.selection_positions,
+            source_token=self.source_token,
         )
 
     def take(self, indices, allow_fill: bool = False, fill_value=None):
@@ -1123,6 +1268,7 @@ class NativeAttributeColumnArray(ExtensionArray):
                 export_surface=self.export_surface,
                 export_operation=self.export_operation,
                 selection_positions=source_positions[positions],
+                source_token=self.source_token,
             )
         if fill_value is not None and not pd.isna(fill_value):
             from pandas.api.extensions import take
@@ -1143,6 +1289,7 @@ class NativeAttributeColumnArray(ExtensionArray):
             export_surface=self.export_surface,
             export_operation=self.export_operation,
             selection_positions=selected_positions,
+            source_token=self.source_token,
         )
 
     @classmethod

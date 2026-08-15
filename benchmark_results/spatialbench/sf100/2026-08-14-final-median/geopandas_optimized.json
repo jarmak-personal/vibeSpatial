@@ -1,0 +1,196 @@
+{
+  "benchmark": "spatialbench",
+  "version": "0.1.0",
+  "generated_at": "2026-08-15T01:54:40.649976+00:00",
+  "results": [
+    {
+      "engine": "geopandas_optimized",
+      "version": "1.1.4",
+      "scale_factor": 100.0,
+      "timestamp": "2026-08-14T16:48:46.074105+00:00",
+      "total_time": 8177.2300000000005,
+      "results": [
+        {
+          "query": "q1",
+          "time_seconds": 106.03,
+          "row_count": 100,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            106.03,
+            107.21,
+            105.59
+          ],
+          "statistic": "median",
+          "warmup_runs": 1,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q2",
+          "time_seconds": 113.25,
+          "row_count": 1,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            116.38,
+            107.69,
+            113.25
+          ],
+          "statistic": "median",
+          "warmup_runs": 1,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q3",
+          "time_seconds": 405.03,
+          "row_count": 84,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            405.03,
+            405.52,
+            403.78
+          ],
+          "statistic": "median",
+          "warmup_runs": 1,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q4",
+          "time_seconds": 231.98,
+          "row_count": 614,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            230.35,
+            231.98,
+            232.35
+          ],
+          "statistic": "median",
+          "warmup_runs": 1,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q5",
+          "time_seconds": 834.69,
+          "row_count": 100,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            839.03,
+            834.69,
+            831.4
+          ],
+          "statistic": "median",
+          "warmup_runs": 1,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q6",
+          "time_seconds": 371.42,
+          "row_count": 19,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            371.42,
+            372.75,
+            369.09
+          ],
+          "statistic": "median",
+          "warmup_runs": 1,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q7",
+          "time_seconds": 337.44,
+          "row_count": 100,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            337.44,
+            338.08,
+            334.69
+          ],
+          "statistic": "median",
+          "warmup_runs": 1,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q8",
+          "time_seconds": 285.06,
+          "row_count": 100,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            285.63,
+            285.06,
+            284.26
+          ],
+          "statistic": "median",
+          "warmup_runs": 1,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q9",
+          "time_seconds": 0.19,
+          "row_count": 100,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            0.2,
+            0.19,
+            0.19
+          ],
+          "statistic": "median",
+          "warmup_runs": 1,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q10",
+          "time_seconds": 1738.0,
+          "row_count": 100,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            1739.46,
+            1736.7,
+            1738.0
+          ],
+          "statistic": "median",
+          "warmup_runs": 1,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q11",
+          "time_seconds": 3127.5,
+          "row_count": 1,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            3153.31,
+            3127.5,
+            3108.9
+          ],
+          "statistic": "median",
+          "warmup_runs": 1,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q12",
+          "time_seconds": 626.64,
+          "row_count": 100,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            635.27,
+            625.19,
+            626.64
+          ],
+          "statistic": "median",
+          "warmup_runs": 1,
+          "telemetry_runs": []
+        }
+      ]
+    }
+  ]
+}

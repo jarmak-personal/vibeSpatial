@@ -4,6 +4,7 @@ import ast
 import sys
 import time
 import types
+from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
 
@@ -48,6 +49,7 @@ from vibespatial import (
     plan_geoparquet_scan,
     plan_wkb_partition,
     read_geoparquet,
+    read_geoparquet_batches,
     read_geoparquet_native,
     read_geoparquet_owned,
     select_row_groups,
@@ -1371,6 +1373,61 @@ def test_geoparquet_engine_plan_tolerates_missing_primary_geometry_metadata() ->
     assert engine_plan.geometry_encoding is None
 
 
+def test_geoparquet_chunk_planner_bounds_uncompressed_bytes() -> None:
+    summary = build_geoparquet_metadata_summary(
+        source="row_group_metadata",
+        row_group_rows=[100, 100, 100, 100],
+        row_group_uncompressed_bytes=[100, 900, 100, 900],
+    )
+
+    chunks = io_geoparquet._plan_geoparquet_chunks(
+        metadata_summary=summary,
+        selected_row_groups=(0, 1, 2, 3),
+        target_chunk_rows=10_000,
+        target_uncompressed_bytes=1_000,
+    )
+
+    assert [chunk.row_groups for chunk in chunks] == [(0, 1), (2, 3)]
+    assert [chunk.estimated_uncompressed_bytes for chunk in chunks] == [1_000, 1_000]
+
+
+def test_geoparquet_chunk_admission_uses_decoded_byte_estimate(monkeypatch) -> None:
+    from vibespatial.cuda import _runtime as runtime_module
+
+    captured = {}
+
+    class Runtime:
+        def admit_device_memory(self, **kwargs):
+            captured.update(kwargs)
+            return runtime_module.DeviceMemoryAdmission(
+                stage=kwargs["stage"],
+                required_bytes=kwargs["required_bytes"],
+                remaining_bytes=kwargs["required_bytes"],
+                budget_bytes=kwargs["required_bytes"],
+                admitted=True,
+                requested_units=kwargs["requested_units"],
+                admitted_units=kwargs["requested_units"],
+                bytes_per_unit=1,
+            )
+
+    monkeypatch.setattr(io_geoparquet, "has_gpu_runtime", lambda: True)
+    monkeypatch.setattr(runtime_module, "get_cuda_runtime", lambda: Runtime())
+    chunk = io_geoparquet.GeoParquetChunkPlan(
+        chunk_index=0,
+        row_groups=(0,),
+        estimated_rows=10,
+        estimated_uncompressed_bytes=100,
+    )
+
+    io_geoparquet._admit_geoparquet_chunk(chunk)
+
+    assert captured == {
+        "stage": "geoparquet.scan_decode",
+        "required_bytes": 660,
+        "requested_units": 10,
+    }
+
+
 def test_geoparquet_planner_benchmark_reports_all_strategies() -> None:
     summary = build_geoparquet_metadata_summary(
         source="covering_bbox",
@@ -1810,7 +1867,7 @@ def test_read_geoparquet_gpu_path_returns_dga_without_geometry_to_arrow(monkeypa
         column_names = ["geometry"]
 
         def __init__(self) -> None:
-            self._columns = [object()]
+            self._columns = [object(), object(), object()]
 
         def columns(self):
             return self._columns
@@ -1863,8 +1920,10 @@ def test_read_geoparquet_gpu_path_returns_dga_without_geometry_to_arrow(monkeypa
     )
     monkeypatch.setattr(
         io_geoparquet,
-        "_read_non_geometry_geoparquet_columns_as_arrow",
-        lambda *args, **kwargs: pa.table({"value": [10, 20, 30], "name": ["a", "b", "c"]}),
+        "_device_attributes_from_pylibcudf_scan",
+        lambda *args, **kwargs: NativeAttributeTable(
+            arrow_table=pa.table({"value": [10, 20, 30], "name": ["a", "b", "c"]})
+        ),
     )
     monkeypatch.setattr(io_geoparquet, "_decode_pylibcudf_geoparquet_column_to_owned", lambda column, encoding: owned)
     monkeypatch.setattr(
@@ -1892,7 +1951,7 @@ def test_read_geoparquet_gpu_path_returns_dga_without_geometry_to_arrow(monkeypa
     finally:
         monkeypatch.setattr(pq, "read_schema", original_read_schema)
 
-    assert scan_calls == [["geometry"]]
+    assert scan_calls == [["value", "geometry", "name"]]
     assert list(result.columns) == ["value", "geometry", "name"]
     expected_geometry_array_type = DeviceGeometryArray if has_gpu_runtime() else GeometryArray
     assert isinstance(result.geometry.values, expected_geometry_array_type)
@@ -1950,7 +2009,7 @@ def test_read_geoparquet_gpu_decode_miss_falls_back_to_arrow_geometry_decode(mon
         column_names = ["geometry"]
 
         def __init__(self, arrow_table) -> None:
-            self._columns = [object()]
+            self._columns = [object(), object()]
             self._arrow_table = arrow_table
 
         def columns(self):
@@ -1999,8 +2058,10 @@ def test_read_geoparquet_gpu_decode_miss_falls_back_to_arrow_geometry_decode(mon
     )
     monkeypatch.setattr(
         io_geoparquet,
-        "_read_non_geometry_geoparquet_columns_as_arrow",
-        lambda *args, **kwargs: pa.table({"value": [10, 20]}),
+        "_device_attributes_from_pylibcudf_scan",
+        lambda *args, **kwargs: NativeAttributeTable(
+            arrow_table=pa.table({"value": [10, 20]})
+        ),
     )
     monkeypatch.setattr(
         io_geoparquet,
@@ -2030,7 +2091,7 @@ def test_read_geoparquet_gpu_decode_miss_falls_back_to_arrow_geometry_decode(mon
     finally:
         monkeypatch.setattr(pq, "read_schema", original_read_schema)
 
-    assert scan_calls == [["geometry"]]
+    assert scan_calls == [["value", "geometry"]]
     assert list(result["value"]) == [10, 20]
     assert [geom.wkt for geom in result.geometry.to_list()] == ["POINT (0 0)", "POINT (1 2)"]
     fallbacks = geopandas.get_fallback_events(clear=True)
@@ -2046,7 +2107,7 @@ def test_read_geoparquet_gpu_filter_projection_includes_filter_columns_without_l
     import vibespatial.api.io.arrow as api_io_arrow
 
     scan_calls: list[list[str] | None] = []
-    attrs_calls: list[list[str]] = []
+    attribute_scan_calls: list[tuple[str, ...]] = []
 
     class FakeGpuTable:
         column_names = ["geometry", "value"]
@@ -2125,9 +2186,11 @@ def test_read_geoparquet_gpu_filter_projection_includes_filter_columns_without_l
     )
     monkeypatch.setattr(
         io_geoparquet,
-        "_read_non_geometry_geoparquet_columns_as_arrow",
-        lambda *args, **kwargs: attrs_calls.append(list(kwargs["columns"]))
-        or pa.table({"name": ["b", "c"]}),
+        "_device_attributes_from_pylibcudf_scan",
+        lambda *args, **kwargs: attribute_scan_calls.append(
+            tuple(kwargs["attribute_columns"])
+        )
+        or NativeAttributeTable(arrow_table=pa.table({"name": ["b", "c"]})),
     )
     monkeypatch.setattr(io_geoparquet, "_decode_pylibcudf_geoparquet_column_to_owned", lambda column, encoding: owned)
 
@@ -2137,8 +2200,8 @@ def test_read_geoparquet_gpu_filter_projection_includes_filter_columns_without_l
         filters=[("value", ">", 15)],
     )
 
-    assert scan_calls == [["geometry", "value"]]
-    assert attrs_calls == [["name"]]
+    assert scan_calls == [["name", "geometry", "value"]]
+    assert attribute_scan_calls == [("name",)]
     assert list(result.columns) == ["name", "geometry"]
     assert list(result["name"]) == ["b", "c"]
 
@@ -3464,6 +3527,333 @@ def test_read_non_geometry_geoparquet_columns_as_arrow_preserves_hidden_index_co
     assert list(attributes.index) == ["AAA", "BBB", "CCC"]
 
 
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="pylibcudf GeoParquet reader unavailable",
+)
+def test_read_geoparquet_pylibcudf_keeps_projected_attributes_on_device(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gdf = geopandas.GeoDataFrame(
+        {
+            "value": [10, 20, 30],
+            "category": ["keep", "drop", "keep"],
+            "geometry": [Point(0, 0), Point(1, 1), Point(2, 2)],
+        },
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "device-attribute-scan.parquet"
+    gdf.to_parquet(path, index=False, geometry_encoding="geoarrow")
+
+    def _fail_arrow_attribute_reread(*_args, **_kwargs):
+        raise AssertionError("pylibcudf attributes must come from the device scan")
+
+    monkeypatch.setattr(
+        io_geoparquet,
+        "_read_non_geometry_geoparquet_columns_as_arrow",
+        _fail_arrow_attribute_reread,
+    )
+
+    payload = read_geoparquet_native(
+        path,
+        backend="gpu",
+        columns=["value", "geometry"],
+        filters=[("category", "==", "keep")],
+    )
+
+    assert payload.attributes.is_device_backed
+    assert payload.attributes.arrow_table is None
+    assert list(payload.attributes.columns) == ["value"]
+    assert len(payload.attributes) == 2
+    frame = payload.to_geodataframe()
+    assert type(frame["value"].array).__name__ == "NativeNumericExpressionArray"
+    assert list(frame["value"]) == [10, 30]
+    assert list(frame.geometry.astype(str)) == ["POINT (0 0)", "POINT (2 2)"]
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="pylibcudf GeoParquet reader unavailable",
+)
+def test_read_geoparquet_pylibcudf_exports_only_physical_index_columns(
+    tmp_path,
+) -> None:
+    gdf = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2, 3],
+            "geometry": [Point(0, 0), Point(1, 1), Point(2, 2)],
+        },
+        crs="EPSG:4326",
+        index=pd.Index(["AAA", "BBB", "CCC"], name="iso"),
+    )
+    path = tmp_path / "device-attribute-index-scan.parquet"
+    gdf.to_parquet(path, index=True, geometry_encoding="geoarrow")
+
+    payload = read_geoparquet_native(path, backend="gpu")
+
+    assert payload.attributes.is_device_backed
+    assert payload.attributes.arrow_table is None
+    assert list(payload.attributes.columns) == ["value"]
+    assert payload.attributes.index.equals(gdf.index)
+    result = payload.to_geodataframe()
+    assert result.index.equals(gdf.index)
+    assert list(result["value"]) == [1, 2, 3]
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="pylibcudf GeoParquet reader unavailable",
+)
+def test_read_geoparquet_chunked_decimal_topk_stays_device_native(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.api._native_state import get_native_state
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    gdf = geopandas.GeoDataFrame(
+        {
+            "tripkey": [4, 3, 2, 1],
+            "tip": [
+                Decimal("1.00"),
+                Decimal("3.50"),
+                Decimal("3.50"),
+                Decimal("2.00"),
+            ],
+            "geometry": [Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3)],
+        },
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "chunked-decimal-topk.parquet"
+    gdf.to_parquet(
+        path,
+        index=False,
+        row_group_size=2,
+        geometry_encoding="geoarrow",
+    )
+    monkeypatch.setattr(io_geoparquet, "_DEFAULT_GPU_GEOPARQUET_CHUNK_ROWS", 2)
+    frame = geopandas.read_parquet(path)
+    state = get_native_state(frame)
+    assert state is not None
+    assert state.geometry.composition is not None
+    with pytest.raises(TypeError):
+        frame.nlargest(2, "tip")
+
+    reset_d2h_transfer_count()
+    geopandas.clear_materialization_events()
+    with assert_zero_d2h_transfers():
+        cast_tip = frame["tip"].astype(float)
+        ranked = frame.assign(tip_float=cast_tip, tie_desc=0 - frame["tripkey"])
+        selected = ranked.nlargest(2, ["tip_float", "tie_desc"])
+        selected_state = get_native_state(selected)
+
+    assert type(cast_tip.array).__name__ == "NativeNumericExpressionArray"
+    np.testing.assert_allclose(
+        pytest.importorskip("cupy").asnumpy(cast_tip.array.expression.values),
+        [1.0, 3.5, 3.5, 2.0],
+    )
+    assert selected_state is not None
+    assert selected_state.attributes.row_positions is not None
+    assert geopandas.get_materialization_events(clear=True) == []
+    assert list(selected["tripkey"]) == [2, 3]
+    assert list(selected["tip"]) == [Decimal("3.50"), Decimal("3.50")]
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="pylibcudf GeoParquet reader unavailable",
+)
+def test_read_geoparquet_datetime_components_compose_as_device_integers(
+    tmp_path,
+) -> None:
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    source = geopandas.GeoDataFrame(
+        {
+            "when": pd.to_datetime(
+                ["2023-12-31T23:59:58", "2024-02-29T01:02:03"]
+            ),
+            "geometry": [Point(0, 0), Point(1, 1)],
+        },
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "datetime-components.parquet"
+    source.to_parquet(path, index=False, geometry_encoding="geoarrow")
+    frame = geopandas.read_parquet(path)
+    reset_d2h_transfer_count()
+
+    with assert_zero_d2h_transfers():
+        year = frame.datetime_component("when", "year")
+        month = frame.datetime_component("when", "month")
+        packed = year * 12 + month
+
+    assert type(year.array).__name__ == "NativeNumericExpressionArray"
+    assert type(month.array).__name__ == "NativeNumericExpressionArray"
+    assert type(packed.array).__name__ == "NativeNumericExpressionArray"
+    assert np.issubdtype(packed.array.expression.values.dtype, np.integer)
+    cp = pytest.importorskip("cupy")
+    assert cp.asnumpy(year.array.expression.values).tolist() == [2023, 2024]
+    assert cp.asnumpy(month.array.expression.values).tolist() == [12, 2]
+    assert cp.asnumpy(packed.array.expression.values).tolist() == [24288, 24290]
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="pylibcudf GeoParquet reader unavailable",
+)
+def test_read_geoparquet_non_utc_datetime_component_falls_back_observably(
+    tmp_path,
+) -> None:
+    source = geopandas.GeoDataFrame(
+        {
+            "when": pd.Series(
+                pd.to_datetime(
+                    ["2023-12-31 23:30", "2024-03-10 01:30"]
+                ).tz_localize("America/New_York")
+            ),
+            "geometry": [Point(0, 0), Point(1, 1)],
+        },
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "datetime-components-non-utc.parquet"
+    source.to_parquet(path, index=False, geometry_encoding="geoarrow")
+    frame = geopandas.read_parquet(path)
+    geopandas.clear_fallback_events()
+
+    hours = frame.datetime_component("when", "hour")
+    events = geopandas.get_fallback_events(clear=True)
+
+    assert hours.tolist() == [23, 1]
+    assert any(
+        event.surface == "geopandas.geodataframe.datetime_component"
+        and "non-UTC timezone-aware" in event.reason
+        for event in events
+    )
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="pylibcudf GeoParquet reader unavailable",
+)
+def test_read_partitioned_geoarrow_points_accepts_list_physical_layout(
+    tmp_path,
+) -> None:
+    import pyarrow.parquet as pq
+
+    source = geopandas.GeoDataFrame(
+        {
+            "bucket": [0, 1, 0, 1],
+            "value": [10, 11, 12, 13],
+            "geometry": [
+                Point(0.0, 1.0),
+                Point(2.0, 3.0),
+                Point(4.0, 5.0),
+                Point(6.0, 7.0),
+            ],
+        },
+        crs="EPSG:4326",
+    )
+    flat_path = tmp_path / "source.parquet"
+    source.to_parquet(
+        flat_path,
+        index=False,
+        geometry_encoding="geoarrow",
+    )
+    table = pq.read_table(flat_path)
+    root = tmp_path / "partitioned-points"
+    pq.write_to_dataset(table, root_path=root, partition_cols=["bucket"])
+
+    result = geopandas.read_parquet(root, columns=["value", "geometry"])
+    result = result.sort_values("value").reset_index(drop=True)
+
+    assert result["value"].tolist() == [10, 11, 12, 13]
+    np.testing.assert_allclose(result.geometry.x.to_numpy(), [0.0, 2.0, 4.0, 6.0])
+    np.testing.assert_allclose(result.geometry.y.to_numpy(), [1.0, 3.0, 5.0, 7.0])
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="pylibcudf GeoParquet reader unavailable",
+)
+def test_read_geoparquet_float_topk_places_nan_last_for_both_directions(tmp_path) -> None:
+    from vibespatial.api._native_state import get_native_state
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    gdf = geopandas.GeoDataFrame(
+        {
+            "key": [0, 1, 2, 3],
+            "score": [np.nan, -np.inf, 0.0, np.inf],
+            "when": pd.to_datetime(
+                ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
+            ),
+            "geometry": [Point(i, i) for i in range(4)],
+        },
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "float-nan-topk.parquet"
+    gdf.to_parquet(path, index=False, geometry_encoding="geoarrow")
+    frame = geopandas.read_parquet(path)
+    reset_d2h_transfer_count()
+
+    with assert_zero_d2h_transfers():
+        largest = frame.nlargest(3, "score")
+        smallest = frame.nsmallest(3, "score")
+
+    assert get_native_state(largest) is not None
+    assert get_native_state(smallest) is not None
+    assert largest["key"].tolist() == [3, 2, 1]
+    assert smallest["key"].tolist() == [1, 2, 3]
+    assert largest["when"].to_numpy().tolist() == [
+        pd.Timestamp("2024-01-04T00:00:00.000", tz="UTC"),
+        pd.Timestamp("2024-01-03T00:00:00.000", tz="UTC"),
+        pd.Timestamp("2024-01-02T00:00:00.000", tz="UTC"),
+    ]
+    reset_d2h_transfer_count()
+
+
+@pytest.mark.parametrize("invalid_n", [2.5, "2", True])
+def test_native_geoparquet_topk_rejects_non_integer_n(tmp_path, invalid_n) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("pylibcudf and a GPU runtime are required")
+    source = geopandas.GeoDataFrame(
+        {"score": [1.0, 2.0, 3.0], "geometry": [Point(i, i) for i in range(3)]}
+    )
+    path = tmp_path / "topk-invalid-n.parquet"
+    source.to_parquet(path, index=False, geometry_encoding="geoarrow")
+    frame = geopandas.read_parquet(path)
+
+    with pytest.raises(TypeError):
+        frame.nlargest(invalid_n, "score")
+
+
+def test_native_geoparquet_topk_preserves_signed_zero_ties(tmp_path) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("pylibcudf and a GPU runtime are required")
+    source = geopandas.GeoDataFrame(
+        {
+            "key": [0, 1, 2],
+            "score": [-0.0, 0.0, 1.0],
+            "geometry": [Point(i, i) for i in range(3)],
+        }
+    )
+    path = tmp_path / "topk-signed-zero.parquet"
+    source.to_parquet(path, index=False, geometry_encoding="geoarrow")
+    frame = geopandas.read_parquet(path)
+
+    assert frame.nlargest(2, "score")["key"].tolist() == [2, 0]
+    assert frame.nsmallest(2, "score")["key"].tolist() == [0, 1]
+
+
 def test_native_arrow_attributes_preserve_non_index_pandas_dtype_metadata() -> None:
     from pandas import ArrowDtype
 
@@ -3534,6 +3924,165 @@ def test_read_geoparquet_native_chunked_preserves_secondary_geometry_and_index(t
         assert left.equals(right)
     for left, right in zip(materialized["geom2"], gdf["geom2"], strict=True):
         assert left.equals(right)
+
+
+def test_read_geoparquet_batches_yields_bounded_public_native_frames(tmp_path) -> None:
+    gdf = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2, 3, 4, 5],
+            "geometry": [Point(i, i) for i in range(5)],
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "batched-read.parquet"
+    gdf.to_parquet(path, row_group_size=1)
+
+    batches = list(
+        read_geoparquet_batches(
+            path,
+            columns=["value", "geometry"],
+            batch_rows=2,
+        )
+    )
+
+    assert [len(batch) for batch in batches] == [2, 2, 1]
+    assert all(isinstance(batch, geopandas.GeoDataFrame) for batch in batches)
+    assert all(get_native_state(batch) is not None for batch in batches)
+    assert pd.concat(batches, ignore_index=True)["value"].tolist() == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.parametrize("batch_rows", [0, -1, True, 1.5])
+def test_read_geoparquet_batches_rejects_invalid_batch_rows(batch_rows) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        next(read_geoparquet_batches("unused.parquet", batch_rows=batch_rows))
+
+
+@pytest.mark.gpu
+def test_native_distance_mask_loc_stays_device_native(tmp_path) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("pylibcudf and a GPU runtime are required")
+
+    from vibespatial.cuda._runtime import get_d2h_transfer_events
+
+    source = geopandas.GeoDataFrame(
+        {
+            "value": [10, 20, 30, 40],
+            "geometry": [Point(0, 0), Point(1, 0), Point(3, 0), Point(4, 0)],
+        },
+        geometry="geometry",
+    )
+    path = tmp_path / "native-distance-mask-loc.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+
+    frame = read_geoparquet(path)
+    mask = frame.geometry.distance(Point(0, 0)) <= 1.5
+    get_d2h_transfer_events(clear=True)
+    selected = frame.loc[mask]
+
+    assert get_d2h_transfer_events(clear=True) == []
+    state = get_native_state(selected)
+    assert state is not None
+    assert state.row_count == 2
+    assert selected["value"].tolist() == [10, 20]
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("level", [-1, 0, True, 1, 6, 16])
+def test_public_hilbert_distance_matches_cpu_without_transfer(tmp_path, level) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("pylibcudf and a GPU runtime are required")
+
+    from vibespatial.cuda._runtime import get_d2h_transfer_events
+
+    points = [Point(i % 8, i // 8) for i in range(64)]
+    source = geopandas.GeoDataFrame({"geometry": points}, geometry="geometry")
+    expected = source.geometry.hilbert_distance(
+        total_bounds=(0.0, 0.0, 7.0, 7.0),
+        level=level,
+    ).to_numpy()
+    path = tmp_path / f"hilbert-level-{level}.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    frame = read_geoparquet(path)
+
+    get_d2h_transfer_events(clear=True)
+    actual = frame.geometry.hilbert_distance(
+        total_bounds=(0.0, 0.0, 7.0, 7.0),
+        level=level,
+    )
+
+    assert get_d2h_transfer_events(clear=True) == []
+    np.testing.assert_array_equal(actual.to_numpy(), expected)
+
+
+@pytest.mark.gpu
+def test_geoseries_take_consumes_device_hilbert_expression(tmp_path) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("pylibcudf and a GPU runtime are required")
+
+    from vibespatial.cuda._runtime import get_d2h_transfer_events
+
+    points = [Point(i % 8, i // 8) for i in range(64)]
+    source = geopandas.GeoDataFrame({"geometry": points}, geometry="geometry")
+    path = tmp_path / "hilbert-device-take.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    frame = read_geoparquet(path)
+    codes = frame.geometry.hilbert_distance(
+        total_bounds=(0.0, 0.0, 7.0, 7.0),
+        level=3,
+    )
+
+    get_d2h_transfer_events(clear=True)
+    taken = frame.geometry.take(codes)
+
+    assert get_d2h_transfer_events(clear=True) == []
+    assert isinstance(taken.array, DeviceGeometryArray)
+    expected_codes = codes.to_numpy(dtype=np.int64)
+    assert taken.astype(str).tolist() == [str(points[index]) for index in expected_codes]
+
+
+@pytest.mark.gpu
+def test_geoseries_take_rejects_uncertified_out_of_bounds_device_expression(
+    tmp_path,
+) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("pylibcudf and a GPU runtime are required")
+
+    points = [Point(i % 8, i // 8) for i in range(64)]
+    source = geopandas.GeoDataFrame({"geometry": points}, geometry="geometry")
+    path = tmp_path / "hilbert-device-take-oob.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    frame = read_geoparquet(path)
+    codes = frame.geometry.hilbert_distance(
+        total_bounds=(0.0, 0.0, 7.0, 7.0),
+        level=16,
+    )
+
+    with pytest.raises(IndexError):
+        frame.geometry.take(codes)
+
+
+@pytest.mark.gpu
+def test_device_hilbert_strict_native_rejects_nullable_points(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("pylibcudf and a GPU runtime are required")
+
+    from vibespatial.runtime.fallbacks import StrictNativeFallbackError
+
+    source = geopandas.GeoDataFrame(
+        {"geometry": [Point(0, 0), None]},
+        geometry="geometry",
+    )
+    path = tmp_path / "hilbert-nullable.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    frame = read_geoparquet(path)
+    monkeypatch.setenv("VIBESPATIAL_STRICT_NATIVE", "1")
+
+    with pytest.raises(StrictNativeFallbackError, match="Hilbert"):
+        frame.geometry.hilbert_distance()
 
 
 def test_read_geoparquet_native_does_not_eager_authoritative_host_view(

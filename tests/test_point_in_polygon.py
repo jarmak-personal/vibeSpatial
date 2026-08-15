@@ -132,6 +132,64 @@ def test_point_in_polygon_explicit_gpu_matches_cpu_result() -> None:
 
 
 @pytest.mark.gpu
+def test_point_in_polygon_consumer_precision_does_not_admit_unrefined_fp32() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    polygon = Polygon(
+        [
+            (-113.0, 35.0),
+            (-110.0, 37.0),
+            (-110.0, 35.0),
+            (-113.0, 35.0),
+        ]
+    )
+    # The distant points force a global center near zero. An unrefined fp32
+    # ray cast rounds the first point onto the diagonal and returns a false
+    # positive even though it is one microdegree outside the polygon.
+    point = Point(-111.5000005547002, 36.0000008320503)
+    points = [point, Point(-179.0, -80.0), Point(179.0, 80.0)]
+    polygons = [polygon] * len(points)
+
+    gpu_result = point_in_polygon(
+        points,
+        polygons,
+        dispatch_mode=ExecutionMode.GPU,
+        precision="auto",
+    )
+
+    assert gpu_result == [False, False, False]
+
+
+@pytest.mark.gpu
+def test_point_in_polygon_short_edge_boundary_tolerance_is_distance_scaled() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    polygon = Polygon(
+        [
+            (0.0, 0.0),
+            (0.0002, 0.0001),
+            (0.0002, -0.0001),
+            (0.0, 0.0),
+        ]
+    )
+    edge_midpoint = np.asarray([0.0001, 0.00005])
+    outward_normal = np.asarray([-0.0001, 0.0002])
+    outward_normal /= np.linalg.norm(outward_normal)
+    point = Point(*(edge_midpoint + outward_normal * 1e-5))
+
+    gpu_result = point_in_polygon(
+        [point],
+        [polygon],
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert point.intersects(polygon) is False
+    assert gpu_result == [False]
+
+
+@pytest.mark.gpu
 def test_point_in_polygon_auto_uses_gpu_variant_for_large_batches() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")

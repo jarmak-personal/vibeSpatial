@@ -438,7 +438,20 @@ class LazyGroupedUnionOwned:
             or _is_device_array(offsets)
             or _is_device_array(sorted_order)
         ):
-            return None
+            if (
+                not self._grouped.is_device
+                or self._grouped.all_groups_observed is not True
+                or int(group_ids.size) != self.row_count
+                or int(offsets.size) != self.row_count + 1
+                or int(sorted_order.size) != self._source_owned.row_count
+            ):
+                return None
+            ordered_owned = (
+                self._source_owned
+                if getattr(self._grouped, "sorted_order_is_identity", False)
+                else self._source_owned.take(sorted_order)
+            )
+            return ordered_owned, offsets
         host_group_ids = np.asarray(group_ids, dtype=np.int64)
         if host_group_ids.size != self.row_count or not np.array_equal(
             host_group_ids,
@@ -807,12 +820,13 @@ def _maybe_defer_grouped_union_for_native_chain(
         or row_group_codes is None
         or method is not DissolveUnionMethod.UNARY
         or grid_size is not None
-        or not _owned_supports_polygonal_grouped_union(owned)
+        or not _owned_supports_grouped_convex_hull_rewrite(owned)
     ):
         return None
     grouped = NativeGrouped.from_dense_codes(
         row_group_codes,
         group_count=group_count,
+        all_groups_observed=True,
     )
     exact_materializer = None
     if tag is not None:
@@ -1490,10 +1504,17 @@ def _native_device_plain_group_index_and_codes(
         return None
 
     owned = getattr(state.geometry, "owned", None)
+    if owned is None:
+        owned = getattr(frame.geometry.values, "_owned", None)
+    if owned is None:
+        try:
+            owned = frame.geometry.values.to_owned()
+        except (AttributeError, NotImplementedError):
+            owned = None
     if (
         owned is None
         or owned.residency is not Residency.DEVICE
-        or not _owned_supports_polygonal_grouped_union(owned)
+        or not _owned_supports_grouped_convex_hull_rewrite(owned)
     ):
         return None
 
@@ -1650,19 +1671,20 @@ def _device_dissolve_key_columns(
         return None
     if any(column not in positions for column in key_columns):
         return None
-    if not hasattr(attributes.device_table, "columns"):
+    try:
+        source_columns = attributes.to_pylibcudf_columns(key_columns)
+    except (KeyError, NotImplementedError):
         return None
-    source_columns = attributes.device_table.columns()
     payload = []
-    for column in key_columns:
+    for column, source_column in zip(key_columns, source_columns, strict=True):
         try:
             series = frame[column]
-        except Exception:
+        except KeyError:
             return None
         if not isinstance(series, pd.Series):
             return None
         view = _device_dissolve_key_column_view(
-            source_columns[positions[column]],
+            source_column,
             series=series,
         )
         if view is None:
@@ -4819,6 +4841,27 @@ def _scatter_empty_polygon_groups_device(
     return result
 
 
+def _owned_supports_grouped_convex_hull_rewrite(owned: OwnedGeometryArray) -> bool:
+    """Return whether grouped source coordinates can feed the hull rewrite.
+
+    Exact grouped union remains polygon-only, but ``hull(union(points))`` has
+    the same coordinate-set identity and can be lowered directly to grouped
+    MultiPoint hulls.  Keep the admission deliberately narrow so a delayed
+    non-polygonal union is introduced only for the proven point workload.
+    """
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    if owned.device_state is not None:
+        families = set(owned.device_state.families)
+        return families == {GeometryFamily.POINT} or (
+            bool(families)
+            and families.issubset(
+                {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
+            )
+        )
+    return _owned_supports_polygonal_grouped_union(owned)
+
+
 def execute_grouped_coverage_edge_union_gpu_owned_codes(
     row_group_codes,
     *,
@@ -5635,6 +5678,11 @@ def _prepare_grouped_dissolve(
             state_owned = getattr(state.geometry, "owned", None)
             if state_owned is not None and int(state_owned.row_count) == int(len(frame)):
                 owned = state_owned
+            elif int(getattr(state, "row_count", -1)) == int(len(frame)):
+                try:
+                    owned = frame.geometry.values.to_owned()
+                except (AttributeError, NotImplementedError):
+                    owned = None
     if (
         owned is None
         and normalized_method is DissolveUnionMethod.COVERAGE

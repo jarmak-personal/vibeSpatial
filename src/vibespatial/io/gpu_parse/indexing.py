@@ -182,6 +182,10 @@ def _compute_bounds_gpu(
 def _compute_hilbert_codes_gpu(
     d_bounds: cp.ndarray,
     n_features: int,
+    *,
+    total_bounds=None,
+    level: int = 16,
+    truncate_coords: bool = False,
 ) -> cp.ndarray:
     """Compute 32-bit Hilbert codes from feature bounding boxes on the GPU.
 
@@ -202,18 +206,25 @@ def _compute_hilbert_codes_gpu(
     kernel = kernels["compute_hilbert_codes"]
     ptr = runtime.pointer
 
-    # Compute total extent from bounds.  The extent values are passed as
-    # kernel parameters, so the small host fence is explicit and batched.
-    d_bounds_flat = d_bounds.reshape(-1, 4)
-    d_extent = cp.empty(4, dtype=cp.float64)
-    d_extent[0] = cp.nanmin(d_bounds_flat[:, 0])
-    d_extent[1] = cp.nanmin(d_bounds_flat[:, 1])
-    d_extent[2] = cp.nanmax(d_bounds_flat[:, 2])
-    d_extent[3] = cp.nanmax(d_bounds_flat[:, 3])
-    extent = _indexing_device_to_host(
-        d_extent,
-        reason="gpu-parse hilbert extent scalar fence",
-    ).astype(np.float64, copy=False)
+    if not isinstance(level, int) or isinstance(level, bool) or not 1 <= level <= 16:
+        raise ValueError("level must be an integer from 1 to 16")
+    if total_bounds is None:
+        # Compute total extent from bounds.  The extent values are passed as
+        # kernel parameters, so the small host fence is explicit and batched.
+        d_bounds_flat = d_bounds.reshape(-1, 4)
+        d_extent = cp.empty(4, dtype=cp.float64)
+        d_extent[0] = cp.nanmin(d_bounds_flat[:, 0])
+        d_extent[1] = cp.nanmin(d_bounds_flat[:, 1])
+        d_extent[2] = cp.nanmax(d_bounds_flat[:, 2])
+        d_extent[3] = cp.nanmax(d_bounds_flat[:, 3])
+        extent = _indexing_device_to_host(
+            d_extent,
+            reason="gpu-parse hilbert extent scalar fence",
+        ).astype(np.float64, copy=False)
+    else:
+        extent = np.asarray(total_bounds, dtype=np.float64)
+        if extent.shape != (4,):
+            raise ValueError("total_bounds must contain four values")
     extent_minx, extent_miny, extent_maxx, extent_maxy = (float(v) for v in extent)
 
     d_hilbert_codes = cp.empty(n_features, dtype=cp.uint32)
@@ -227,6 +238,8 @@ def _compute_hilbert_codes_gpu(
             extent_maxy,
             ptr(d_hilbert_codes),
             n_features,
+            level,
+            int(bool(truncate_coords)),
         ),
         (
             KERNEL_PARAM_PTR,
@@ -235,6 +248,8 @@ def _compute_hilbert_codes_gpu(
             KERNEL_PARAM_F64,
             KERNEL_PARAM_F64,
             KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_I32,
             KERNEL_PARAM_I32,
         ),
     )

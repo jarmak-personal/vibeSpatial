@@ -1,6 +1,55 @@
 import numpy as np
 
 
+def _hilbert_distance_device(geoms, total_bounds, level):
+    """Return device Hilbert codes for proven all-valid point rows."""
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.device_array import DeviceGeometryArray
+    from vibespatial.runtime import has_gpu_runtime
+
+    if not has_gpu_runtime() or not isinstance(geoms, DeviceGeometryArray):
+        return None
+    if isinstance(level, (bool, np.bool_, int, np.integer)):
+        normalized_level = int(level)
+    else:
+        return None
+    if normalized_level > 16:
+        return None
+    owned = geoms.to_owned()
+    state = owned._ensure_device_state(preserve_indexed_view=True)
+    if (
+        state.trusted_all_valid is not True
+        or state.trusted_all_non_empty is not True
+        or state.trusted_homogeneous_family is not GeometryFamily.POINT
+    ):
+        return None
+
+    import cupy as cp
+
+    if normalized_level <= 0:
+        return cp.zeros(owned.row_count, dtype=cp.uint32)
+
+    from vibespatial.io.gpu_parse.indexing import _compute_hilbert_codes_gpu
+
+    point_buffer = state.families[GeometryFamily.POINT]
+    family_rows = cp.asarray(state.family_row_offsets, dtype=cp.int64)
+    coordinate_rows = point_buffer.geometry_offsets[family_rows]
+    x = point_buffer.x[coordinate_rows]
+    y = point_buffer.y[coordinate_rows]
+    bounds = cp.empty((owned.row_count, 4), dtype=cp.float64)
+    bounds[:, 0] = x
+    bounds[:, 1] = y
+    bounds[:, 2] = x
+    bounds[:, 3] = y
+    return _compute_hilbert_codes_gpu(
+        bounds,
+        owned.row_count,
+        total_bounds=total_bounds,
+        level=normalized_level,
+        truncate_coords=True,
+    )
+
+
 def _hilbert_distance(geoms, total_bounds=None, level=16):
     """
     Calculate the distance along a Hilbert curve.
@@ -23,6 +72,20 @@ def _hilbert_distance(geoms, total_bounds=None, level=16):
         Array containing distances along the Hilbert curve
 
     """
+    device_distances = _hilbert_distance_device(geoms, total_bounds, level)
+    if device_distances is not None:
+        return device_distances
+    from vibespatial.geometry.device_array import DeviceGeometryArray
+
+    if isinstance(geoms, DeviceGeometryArray):
+        from vibespatial.runtime.fallbacks import record_fallback_event
+
+        record_fallback_event(
+            surface="GeoSeries.hilbert_distance",
+            reason="device Hilbert path requires proven all-valid non-empty points",
+            pipeline="hilbert_distance",
+            d2h_transfer=True,
+        )
     if geoms.is_empty.any() | geoms.isna().any():
         raise ValueError(
             "Hilbert distance cannot be computed on a GeoSeries with empty or "

@@ -19,6 +19,7 @@ class GeoParquetMetadataSummary:
     source_paths: tuple[str, ...] | None = None
     row_group_source_indices: np.ndarray | None = None
     row_group_source_row_groups: np.ndarray | None = None
+    row_group_uncompressed_bytes: np.ndarray | None = None
 
     @property
     def row_group_count(self) -> int:
@@ -68,6 +69,7 @@ def build_geoparquet_metadata_summary(
     source_paths: list[str] | tuple[str, ...] | None = None,
     row_group_source_indices: list[int] | tuple[int, ...] | np.ndarray | None = None,
     row_group_source_row_groups: list[int] | tuple[int, ...] | np.ndarray | None = None,
+    row_group_uncompressed_bytes: list[int] | tuple[int, ...] | np.ndarray | None = None,
 ) -> GeoParquetMetadataSummary:
     rows = np.asarray(row_group_rows, dtype=np.int64)
     size = rows.size
@@ -92,6 +94,13 @@ def build_geoparquet_metadata_summary(
     source_indices_arr = None
     source_row_groups_arr = None
     source_paths_tuple = None if source_paths is None else tuple(str(path) for path in source_paths)
+    uncompressed_bytes_arr = None
+    if row_group_uncompressed_bytes is not None:
+        uncompressed_bytes_arr = np.asarray(row_group_uncompressed_bytes, dtype=np.int64)
+        if uncompressed_bytes_arr.size != size:
+            raise ValueError("row_group_uncompressed_bytes must match row_group_rows size")
+        if np.any(uncompressed_bytes_arr < 0):
+            raise ValueError("row_group_uncompressed_bytes must be non-negative")
     if row_group_source_indices is not None:
         source_indices_arr = np.asarray(row_group_source_indices, dtype=np.int64)
         if source_indices_arr.size != size:
@@ -118,6 +127,7 @@ def build_geoparquet_metadata_summary(
         source_paths=source_paths_tuple,
         row_group_source_indices=source_indices_arr,
         row_group_source_row_groups=source_row_groups_arr,
+        row_group_uncompressed_bytes=uncompressed_bytes_arr,
     )
 
 

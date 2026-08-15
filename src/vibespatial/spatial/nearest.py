@@ -3416,6 +3416,7 @@ def nearest_spatial_index(
     max_distance: float | None = None,
     return_distance: bool = False,
     exclusive: bool = False,
+    k: int = 1,
     tree_owned: OwnedGeometryArray | None = None,
     query_owned: OwnedGeometryArray | None = None,
     return_device: bool = False,
@@ -3473,17 +3474,18 @@ def nearest_spatial_index(
 
     # Try the efficient indexed GPU nearest path for all-Point arrays.
     # Works for both bounded (max_distance != None) and unbounded nearest.
-    indexed_result = _nearest_indexed_point_gpu(
-        query_owned,
-        tree_owned,
-        return_all=return_all,
-        return_distance=return_distance,
-        exclusive=exclusive,
-        max_distance=max_distance,
-        return_device=return_device,
-    )
-    if indexed_result is not None:
-        return indexed_result
+    if k == 1:
+        indexed_result = _nearest_indexed_point_gpu(
+            query_owned,
+            tree_owned,
+            return_all=return_all,
+            return_distance=return_distance,
+            exclusive=exclusive,
+            max_distance=max_distance,
+            return_device=return_device,
+        )
+        if indexed_result is not None:
+            return indexed_result
 
     from .spatial_index_knn_device import spatial_index_knn_device
 
@@ -3498,7 +3500,7 @@ def nearest_spatial_index(
             tree_owned,
             query_bounds_device,
             tree_bounds_device,
-            k=1,
+            k=k,
             max_distance=max_distance,
             exclusive=exclusive,
             return_all=return_all,
@@ -3526,7 +3528,7 @@ def nearest_spatial_index(
             tree_owned,
             query_bounds,
             tree_bounds,
-            k=1,
+            k=k,
             max_distance=max_distance,
             exclusive=exclusive,
             return_all=return_all,

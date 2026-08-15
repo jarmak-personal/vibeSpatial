@@ -72,7 +72,12 @@ from vibespatial.predicates.support import (
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode
+from vibespatial.runtime.precision import (
+    KernelClass,
+    PrecisionMode,
+    PrecisionPlan,
+    RefinementMode,
+)
 from vibespatial.runtime.residency import Residency, TransferTrigger
 
 from .point_within_bounds import (
@@ -1232,6 +1237,7 @@ def _evaluate_point_in_polygon_gpu(
     *,
     strategy: str = "auto",
     return_device: bool = False,
+    precision_plan: PrecisionPlan | None = None,
 ):
     global _last_gpu_substage_timings
     timings: dict[str, float] = {}
@@ -1239,12 +1245,22 @@ def _evaluate_point_in_polygon_gpu(
     right_array = right.geometry_array
     assert right_array is not None
 
-    # Determine compute precision from device profile.
-    from vibespatial.runtime.adaptive import get_cached_snapshot
-
-    snapshot = get_cached_snapshot()
-    use_fp32 = not snapshot.device_profile.favors_native_fp64
+    # Predicate fp32 is admissible only when its selective-fp64 refinement is
+    # implemented. Until that stage exists, execute the authoritative fp64
+    # kernel instead of silently returning unrefined ray-parity decisions.
+    use_fp32 = bool(
+        precision_plan is not None
+        and precision_plan.compute_precision is PrecisionMode.FP32
+        and precision_plan.refinement is RefinementMode.NONE
+    )
     compute_type = "float" if use_fp32 else "double"
+    timings["compute_type"] = compute_type
+    if (
+        precision_plan is not None
+        and precision_plan.compute_precision is PrecisionMode.FP32
+        and not use_fp32
+    ):
+        timings["precision_rewrite"] = "fp32-selective-refine->fp64"
 
     # Compute center for coordinate centering.
     center_x, center_y = _compute_pip_center(points, right_array)
@@ -1727,6 +1743,7 @@ def point_in_polygon(
             left,
             right,
             return_device=_return_device,
+            precision_plan=context.precision_plan,
         )
 
         # Merge outer timing into substage report

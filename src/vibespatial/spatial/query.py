@@ -847,9 +847,16 @@ def query_spatial_index(
         # (no buffer copy via .take()).  When device-resident candidates are
         # available, sub-arrays are extracted on-device via CuPy fancy indexing
         # to avoid redundant host→device transfers.
+        if predicate is not None:
+            from vibespatial.predicates.point_location_index import (
+                prepare_point_region_y_indexes,
+            )
+
+            prepare_point_region_y_indexes(query_owned, tree_owned)
         device_cands, _sidq_exec = spatial_index_device_query(
             flat_index,
             query_bounds,
+            allow_bbox_superset=predicate is not None,
         )
         if device_cands is not None:
             gpu_candidate_gen = True

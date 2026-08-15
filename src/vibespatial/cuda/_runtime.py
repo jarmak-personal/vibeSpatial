@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import importlib.util
 import logging
 import os
 import pathlib
@@ -19,6 +20,8 @@ import numpy as np
 logger = logging.getLogger(__name__)
 _PYLIBCUDF_STREAM_ATTRIBUTE = "_vibespatial_pylibcudf_stream"
 _PYLIBCUDF_STREAM_LOCK = threading.Lock()
+_DEFAULT_QUERY_MEMORY_RESERVE_BYTES = 1 << 30
+_DEFAULT_QUERY_MEMORY_RESERVE_FRACTION = 0.10
 
 try:
     import cupy as cp
@@ -579,6 +582,47 @@ def _make_oom_callback(max_retries: int = 3):
 
 
 @dataclass(frozen=True, slots=True)
+class DeviceMemoryAdmission:
+    """One shape-level allocation decision against the active query budget."""
+
+    stage: str
+    required_bytes: int
+    remaining_bytes: int
+    budget_bytes: int
+    admitted: bool
+    requested_units: int
+    admitted_units: int
+    bytes_per_unit: int
+
+
+@dataclass(frozen=True, slots=True)
+class QueryDeviceMemoryBudget:
+    """Stable per-query device allocation envelope captured at runtime init."""
+
+    total_device_bytes: int
+    allocatable_bytes_at_start: int
+    reserve_bytes: int
+    budget_bytes: int
+    live_bytes_at_start: int
+
+
+def _configured_query_memory_reserve(total_device_bytes: int) -> int:
+    reserve_text = os.environ.get("VIBESPATIAL_GPU_MEMORY_RESERVE_BYTES", "").strip()
+    if reserve_text:
+        reserve = int(reserve_text)
+        if reserve < 0:
+            raise ValueError("VIBESPATIAL_GPU_MEMORY_RESERVE_BYTES must be non-negative")
+        return min(reserve, int(total_device_bytes))
+    return min(
+        max(
+            _DEFAULT_QUERY_MEMORY_RESERVE_BYTES,
+            int(total_device_bytes * _DEFAULT_QUERY_MEMORY_RESERVE_FRACTION),
+        ),
+        int(total_device_bytes),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class CudaStream:
     """Lightweight wrapper around a CUDA stream handle."""
 
@@ -1032,7 +1076,12 @@ class CudaDriverRuntime:
         self._memory_pool: Any | None = None
         self._memory_backend: str = "none"
         self._rmm_mr = None
+        self._rmm_pool = None
+        self._rmm_mr_chain: tuple[Any, ...] = ()
         self._memory_pool_configured: bool = False
+        self._query_memory_budget: QueryDeviceMemoryBudget | None = None
+        self._memory_admission_events: deque[DeviceMemoryAdmission] = deque(maxlen=4096)
+        self._largest_admitted_allocation_bytes: int = 0
 
     @staticmethod
     def _free_now(device_array: DeviceArray) -> None:
@@ -1092,6 +1141,8 @@ class CudaDriverRuntime:
         if managed in ("1", "true", "yes"):
             # Tier C: bare managed memory (no pool wrapping)
             mr = rmm.mr.ManagedMemoryResource()
+            pool = None
+            chain = (mr,)
             self._memory_backend = "rmm-managed"
             logger.info("RMM memory backend: managed memory (Tier C)")
         elif oom_safety in ("0", "false", "no"):
@@ -1102,6 +1153,8 @@ class CudaDriverRuntime:
                 initial_pool_size=0,
                 maximum_pool_size=pool_limit if pool_limit else None,
             )
+            pool = mr
+            chain = (base, pool)
             self._memory_backend = "rmm-pool"
             logger.info("RMM memory backend: pool without OOM safety (Tier A)")
         else:
@@ -1114,13 +1167,22 @@ class CudaDriverRuntime:
             )
             callback = _make_oom_callback(max_retries=3)
             mr = rmm.mr.FailureCallbackResourceAdaptor(pool, callback)
+            chain = (base, pool, mr)
             self._memory_backend = "rmm-safe"
             logger.info("RMM memory backend: pool with OOM safety (Tier B, default)")
 
         rmm.mr.set_current_device_resource(mr)
         cp.cuda.set_allocator(rmm_cupy_allocator)
+        from rmm import statistics as rmm_stats
+
+        rmm_stats.enable_statistics()
+        active_mr = rmm.mr.get_current_device_resource()
+        if cp.cuda.get_allocator() is not rmm_cupy_allocator:
+            raise RuntimeError("CuPy rejected the configured RMM allocator")
         self._memory_pool = None  # CuPy pool is not used
-        self._rmm_mr = mr  # prevent GC of resource chain
+        self._rmm_pool = pool
+        self._rmm_mr = active_mr
+        self._rmm_mr_chain = (*chain, active_mr)
 
     def _configure_memory_pool_for_active_context(self) -> None:
         """Install one allocator exactly once after context creation."""
@@ -1129,17 +1191,22 @@ class CudaDriverRuntime:
         if cp is None:  # pragma: no cover - guarded by _ensure_context
             raise RuntimeError("CuPy is required for GPU memory pool configuration")
         if rmm is None:
+            if importlib.util.find_spec("pylibcudf") is not None:
+                raise RuntimeError(
+                    "RMM is required when pylibcudf is installed; refusing a split "
+                    "CuPy/libcudf allocation domain"
+                )
             self._configure_cupy_pool()
         else:
             try:
                 self._configure_rmm_pool()
-            except Exception:
-                logger.warning(
-                    "RMM pool setup failed; falling back to CuPy memory pool",
-                    exc_info=True,
-                )
-                self._configure_cupy_pool()
+            except Exception as exc:
+                raise RuntimeError(
+                    "RMM allocator initialization failed; refusing a split CuPy/pylibcudf "
+                    "allocation domain"
+                ) from exc
         self._memory_pool_configured = True
+        self.reset_query_memory_budget()
 
     def memory_pool_stats(self) -> dict[str, int]:
         """Return current memory pool statistics.
@@ -1179,7 +1246,108 @@ class CudaDriverRuntime:
         except (ImportError, AttributeError):
             pass
 
+        if self._rmm_pool is not None:
+            try:
+                stats["reserved_bytes"] = int(self._rmm_pool.pool_size())
+                stats["free_bytes"] = max(
+                    stats["reserved_bytes"] - stats.get("used_bytes", 0),
+                    0,
+                )
+            except (AttributeError, RuntimeError):
+                pass
+        stats["largest_admitted_allocation_bytes"] = int(
+            self._largest_admitted_allocation_bytes
+        )
+
         return stats
+
+    def reset_query_memory_budget(self) -> QueryDeviceMemoryBudget:
+        """Capture a fresh query budget from driver and allocator state."""
+        if cp is None:
+            raise RuntimeError("CuPy is required for GPU query memory budgeting")
+        driver_free, driver_total = cp.cuda.runtime.memGetInfo()
+        stats = self.memory_pool_stats()
+        live_bytes = int(stats.get("used_bytes", 0))
+        pool_reusable = max(
+            int(stats.get("reserved_bytes", 0)) - live_bytes,
+            0,
+        )
+        allocatable = min(int(driver_total), int(driver_free) + pool_reusable)
+        reserve = _configured_query_memory_reserve(int(driver_total))
+        budget = QueryDeviceMemoryBudget(
+            total_device_bytes=int(driver_total),
+            allocatable_bytes_at_start=allocatable,
+            reserve_bytes=reserve,
+            budget_bytes=max(allocatable - reserve, 0),
+            live_bytes_at_start=live_bytes,
+        )
+        self._query_memory_budget = budget
+        self._memory_admission_events.clear()
+        self._largest_admitted_allocation_bytes = 0
+        return budget
+
+    def query_memory_budget(self) -> QueryDeviceMemoryBudget:
+        """Return the stable budget for this isolated query process."""
+        self._ensure_context()
+        if self._query_memory_budget is None:
+            return self.reset_query_memory_budget()
+        return self._query_memory_budget
+
+    def query_memory_remaining_bytes(self) -> int:
+        """Return additional live bytes available inside the query envelope."""
+        budget = self.query_memory_budget()
+        stats = self.memory_pool_stats()
+        live_growth = max(
+            int(stats.get("used_bytes", 0)) - int(budget.live_bytes_at_start),
+            0,
+        )
+        return max(int(budget.budget_bytes) - live_growth, 0)
+
+    def admit_device_memory(
+        self,
+        *,
+        stage: str,
+        required_bytes: int,
+        requested_units: int = 0,
+    ) -> DeviceMemoryAdmission:
+        """Admit a physical shape or return its deterministic shard capacity."""
+        required = max(int(required_bytes), 0)
+        units = max(int(requested_units), 0)
+        budget = self.query_memory_budget()
+        remaining = self.query_memory_remaining_bytes()
+        admitted = required <= remaining
+        bytes_per_unit = (
+            max((required + units - 1) // units, 1)
+            if units > 0 and required > 0
+            else 0
+        )
+        admitted_units = (
+            units
+            if admitted
+            else (min(units, remaining // bytes_per_unit) if bytes_per_unit else 0)
+        )
+        decision = DeviceMemoryAdmission(
+            stage=str(stage),
+            required_bytes=required,
+            remaining_bytes=remaining,
+            budget_bytes=int(budget.budget_bytes),
+            admitted=admitted,
+            requested_units=units,
+            admitted_units=int(admitted_units),
+            bytes_per_unit=int(bytes_per_unit),
+        )
+        self._memory_admission_events.append(decision)
+        self._largest_admitted_allocation_bytes = max(
+            self._largest_admitted_allocation_bytes,
+            required if admitted else min(required, remaining),
+        )
+        return decision
+
+    def memory_admission_events(self, *, clear: bool = False) -> tuple[DeviceMemoryAdmission, ...]:
+        events = tuple(self._memory_admission_events)
+        if clear:
+            self._memory_admission_events.clear()
+        return events
 
     def free_pool_memory(self) -> None:
         """Release cached memory back to the device.

@@ -730,6 +730,7 @@ class NativeAttributeColumnPolicy:
     null_count: int
     can_project_take: bool
     can_compute_numeric: bool
+    can_sort: bool
 
 
 def _device_attribute_column_policy(arrow_type, *, null_count: int) -> NativeAttributeColumnPolicy:
@@ -743,6 +744,7 @@ def _device_attribute_column_policy(arrow_type, *, null_count: int) -> NativeAtt
                 null_count=int(null_count),
                 can_project_take=True,
                 can_compute_numeric=True,
+                can_sort=True,
             )
         return NativeAttributeColumnPolicy(
             category="nullable-numeric-bool-movement-only",
@@ -750,6 +752,7 @@ def _device_attribute_column_policy(arrow_type, *, null_count: int) -> NativeAtt
             null_count=int(null_count),
             can_project_take=True,
             can_compute_numeric=False,
+            can_sort=True,
         )
     if pa.types.is_dictionary(arrow_type):
         category = "categorical-movement-only"
@@ -761,12 +764,22 @@ def _device_attribute_column_policy(arrow_type, *, null_count: int) -> NativeAtt
         category = "null-movement-only"
     else:
         category = "device-movement-only"
+    can_sort = bool(
+        pa.types.is_decimal(arrow_type)
+        or pa.types.is_dictionary(arrow_type)
+        or pa.types.is_string(arrow_type)
+        or pa.types.is_large_string(arrow_type)
+        or pa.types.is_temporal(arrow_type)
+        or pa.types.is_duration(arrow_type)
+        or pa.types.is_null(arrow_type)
+    )
     return NativeAttributeColumnPolicy(
         category=category,
         arrow_type=str(arrow_type),
         null_count=int(null_count),
         can_project_take=True,
         can_compute_numeric=False,
+        can_sort=can_sort,
     )
 
 
