@@ -1,0 +1,196 @@
+{
+  "generated_at": "2026-08-16T08:03:08Z",
+  "objective": "Public relation aggregation and device-backed shard accumulation for SpatialBench SF100 Q6 and Q10",
+  "status": "milestone_complete_program_in_progress",
+  "repositories": {
+    "vibespatial": {
+      "base_revision": "c74a7738786bf9b56b696b6a29802d8840b4e57f",
+      "candidate_changes": "recorded by the commit containing this checkpoint"
+    },
+    "spatialbench": {
+      "base_revision": "19ed143432311739efea36074387d23fe0339155",
+      "candidate_file": "spatialbench-queries/geoparquet_public_api_queries.py"
+    }
+  },
+  "dataset": {
+    "path": "/home/picard/datasets/spatialbench/v0.1.0/sf100-geoparquet",
+    "file_count": 179,
+    "total_bytes": 37940233646,
+    "path_size_sha256": "52da4fe2d753d6b847d0e23461d35762ba966cdbd79e3a26437400cd342555a3"
+  },
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "580.173.02",
+    "vram_mib": 24564
+  },
+  "software": {
+    "cupy-cuda12x": "14.0.1",
+    "pylibcudf-cu12": "26.2.1",
+    "rmm-cu12": "26.2.0",
+    "pyarrow": "23.0.1",
+    "pandas": "3.0.1",
+    "geopandas": "1.1.4",
+    "cuda-python": "12.9.6",
+    "cuda-cccl": "0.6.0"
+  },
+  "measurement": {
+    "sf100_clean": "UV_CACHE_DIR=/tmp/uv-cache uv run python ../sedona-spatialbench/benchmark/run_benchmark.py --data-dir /home/picard/datasets/spatialbench/v0.1.0/sf100-geoparquet --engines vibespatial --queries q6,q10 --timeout 7200 --runs 3 --warmup-runs 1 --statistic median --scale-factor 100",
+    "sf100_telemetry": "same runner and query set with --runs 1 --warmup-runs 0 --profile-telemetry",
+    "shootout_10k": "UV_CACHE_DIR=/tmp/uv-cache uv run vsbench shootout benchmarks/shootout --scale 10000 --repeat 3 --timeout 900 --json",
+    "shootout_1m": "UV_CACHE_DIR=/tmp/uv-cache uv run vsbench shootout benchmarks/shootout --scale 1000000 --repeat 1 --timeout 900 --json",
+    "pipeline": "UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/benchmark_pipelines.py --suite full --repeat 1 --gpu-sparkline",
+    "correctness": "SF1 committed answers plus independent optimized-GeoPandas same-data SF100 CSVs at rtol=1e-6, atol=1e-9"
+  },
+  "sf100": {
+    "optimized_geopandas_suite_seconds": 8177.23,
+    "prior_vibespatial_suite_seconds": 641.76,
+    "current_recomposed_suite_seconds": 620.42,
+    "current_suite_speedup": 13.1802,
+    "q9_individual_10x_exempt": true,
+    "queries": {
+      "q6": {
+        "optimized_geopandas_seconds": 371.42,
+        "median_seconds": 16.32,
+        "runs_seconds": [16.35, 16.24, 16.32],
+        "speedup": 22.7586,
+        "profile_seconds": 17.07,
+        "peak_vram_bytes": 21030240256,
+        "largest_admitted_allocation_bytes": 2999115696,
+        "d2h_transfer_count": 185,
+        "d2h_transfer_bytes": 15507755,
+        "d2h_transfer_seconds": 0.3129053378943354,
+        "fallback_events": 0,
+        "correctness": {
+          "rows": 19,
+          "exact_columns": ["z_zonekey", "z_name", "total_pickups", "avg_duration"],
+          "avg_distance_max_abs_delta": 4.3e-19
+        }
+      },
+      "q10": {
+        "optimized_geopandas_seconds": 1738.0,
+        "median_seconds": 126.43,
+        "runs_seconds": [126.66, 126.28, 126.43],
+        "speedup": 13.7467,
+        "profile_seconds": 125.93,
+        "peak_vram_bytes": 14168358912,
+        "largest_admitted_allocation_bytes": 6039190530,
+        "d2h_transfer_count": 949,
+        "d2h_transfer_bytes": 33090848,
+        "d2h_transfer_seconds": 0.29494548845104873,
+        "fallback_events": 0,
+        "correctness": {
+          "rows": 100,
+          "exact_columns": ["z_zonekey", "pickup_zone", "avg_duration", "num_trips"],
+          "avg_distance_max_abs_delta": 1.0e-16
+        }
+      }
+    }
+  },
+  "shootout_10k": {
+    "passed": 14,
+    "failed": 0,
+    "exact_fingerprints": 14,
+    "fallback_events": 0,
+    "geopandas_median_sum_seconds": 3.519069,
+    "vibespatial_median_sum_seconds": 2.623846,
+    "worst_vibespatial_delta_pct": 4.42,
+    "worst_vibespatial_delta_workflow": "corridor_flood_priority.py"
+  },
+  "shootout_1m": {
+    "passed": 10,
+    "failed": 4,
+    "matching_fingerprints": 10,
+    "vibespatial_success_subtotal_seconds": 103.66,
+    "prior_vibespatial_success_subtotal_seconds": 104.63,
+    "known_failures": {
+      "redevelopment_screening.py": "same 29.847875 GiB RMM allocation failure",
+      "retail_trade_area_screening.py": "same 6,241,973,507-pair / 46.51 GiB deterministic capacity rejection",
+      "site_suitability.py": "same 24.016010 GiB RMM allocation failure",
+      "transit_service_gap.py": "same later-stage 932.422363 MiB RMM allocation failure"
+    },
+    "newly_comparable": {
+      "vegetation_corridor.py": {
+        "geopandas_seconds": 371.007382,
+        "vibespatial_seconds": 58.615956,
+        "speedup": 6.32946,
+        "fingerprint": "exact"
+      }
+    },
+    "profile_observation": {
+      "workflow": "corridor_flood_priority.py",
+      "fallback": "observable DeviceGeometryArray.buffer CPU path for 1,238 mixed-family rows",
+      "stage_seconds": 0.0553854,
+      "measured_vibespatial_seconds": 1.207242,
+      "classification": "repeatable off-ramp outside changed relation/group/temporal surfaces; prior 1M timing artifact did not capture profiles"
+    }
+  },
+  "pipeline_profile_1m": {
+    "fallback_events": 0,
+    "compute_d2h_bytes": 0,
+    "compute_materializations": 0,
+    "slowest_active_stage": "predicate-heavy.read_geojson",
+    "slowest_active_stage_seconds": 0.07051,
+    "slowest_compute_stage": "grouped-capacity-partitions.mixed_strip_exact_union",
+    "slowest_compute_stage_seconds": 0.06817,
+    "stages_above_one_second": 0
+  },
+  "post_review_final_code_gate": {
+    "query_aggregate_semantics": {
+      "cpu_selected_relation_query_count": 1,
+      "boolean_sum_dtype": "int64",
+      "integer_sum_dtype": "int64",
+      "large_integer_exact_value": 9007199254740995,
+      "spatial_query_tests": "110 passed, 1 optional SciPy skip",
+      "private_native_substrate_tests": "442 passed"
+    },
+    "shootout_10k": {
+      "passed": 14,
+      "failed": 0,
+      "exact_fingerprints": 14,
+      "vibespatial_median_sum_seconds_rounded": 2.62611,
+      "prior_vibespatial_median_sum_seconds": 2.623846,
+      "subtotal_delta_pct": 0.0863,
+      "worst_observed_workflow_delta_pct": 4.1
+    },
+    "shootout_1m": {
+      "successful_current_code_workflows_before_power_interruption": 9,
+      "successful_timing_corridor": "all observed deltas below 5 percent",
+      "redevelopment_failure": "same 29.847875 GiB / 32,048,912,128-byte RMM allocation rejection",
+      "retail_failure": "same 6,241,973,507-pair / 46.51 GiB deterministic capacity rejection",
+      "site_failure": "same 24.016010 GiB / 25,786,994,432-byte RMM allocation rejection",
+      "transit_failure": "same 932.422363 MiB / 977,715,712-byte later-stage RMM allocation rejection",
+      "vegetation": {
+        "geopandas_seconds": 371.36573022200037,
+        "vibespatial_seconds": 58.3530281759995,
+        "speedup": 6.3641209690424,
+        "fingerprint": "exact",
+        "fallback_events": 0
+      },
+      "raw_local_diagnostics": [
+        "current_1m_retail.json",
+        "current_1m_site.json",
+        "current_1m_transit.json",
+        "current_1m_vegetation.json"
+      ]
+    }
+  },
+  "repository_test_gate": {
+    "full_pytest": {
+      "passed": 7235,
+      "failed": 4,
+      "skipped": 430,
+      "xfailed": 7
+    },
+    "failure_audit": {
+      "grouped_capacity_partitions_peak_memory": "passes in a fresh process; full-suite value included prior process-wide GPU pool state",
+      "upstream_arrow_parquet_failures": "three failures reproduce identically in a detached pristine c74a773 worktree with the same interpreter and dependencies"
+    },
+    "changed_surface_gates": "PASS: spatial query 110/110, native relation/group/temporal 66/66, allocator 31/31, pylibcudf capabilities 4/4, strict native 19/19, native pipeline subset 13/13"
+  },
+  "open_work": {
+    "milestones": ["M3", "M4", "M6"],
+    "q5_d2h_bytes": 10340000000,
+    "q11_d2h_bytes": 14100000000,
+    "reason": "Q5 public arithmetic and Q11 relation-result reduction still export bulk intermediates"
+  }
+}

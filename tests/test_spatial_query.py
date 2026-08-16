@@ -3026,6 +3026,215 @@ def test_sindex_query_return_device_false_default() -> None:
     assert isinstance(result, np.ndarray)
 
 
+def test_sindex_query_aggregate_is_eager_public_dataframe() -> None:
+    from vibespatial.api import GeoSeries
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+
+    tree = GeoSeries([Point(0, 0), Point(1, 1), Point(10, 10)])
+    query = GeoSeries(
+        [box(-1, -1, 2, 2), box(9, 9, 11, 11), box(20, 20, 21, 21)],
+        index=["near", "far", "empty"],
+    )
+    values = np.asarray([1.5, 2.5, 4.0], dtype=np.float64)
+    large_values = np.asarray([2**53 + 1, 2, 5], dtype=np.int64)
+    bool_values = np.asarray([True, True, False], dtype=np.bool_)
+    clear_fallback_events()
+
+    result = tree.sindex.query_aggregate(
+        query,
+        {
+            "match_count": "size",
+            "value_sum": (values, "sum"),
+            "large_sum": (large_values, "sum"),
+            "bool_sum": (bool_values, "sum"),
+        },
+        predicate="intersects",
+    )
+    events = get_fallback_events(clear=True)
+
+    assert type(result) is __import__("pandas").DataFrame
+    assert result.index.tolist() == ["near", "far", "empty"]
+    assert result["match_count"].tolist() == [2, 1, 0]
+    assert result["value_sum"].tolist() == [4.0, 4.0, 0.0]
+    assert result["large_sum"].tolist() == [2**53 + 3, 5, 0]
+    assert result["large_sum"].dtype == np.dtype(np.int64)
+    assert result["bool_sum"].tolist() == [2, 0, 0]
+    assert result["bool_sum"].dtype == np.dtype(np.int64)
+    assert any(event.pipeline == "spatial_query_aggregate" for event in events)
+    with pytest.raises(
+        ValueError,
+        match="must align with indexed tree geometries",
+    ):
+        tree.sindex.query_aggregate(
+            query,
+            {"bad": (values[:2], "sum")},
+            predicate="intersects",
+        )
+    with pytest.raises(TypeError, match="sum values must be numeric"):
+        tree.sindex.query_aggregate(
+            query,
+            {"bad": (["a", "b", "c"], "sum")},
+            predicate="intersects",
+        )
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_aggregate_consumes_native_relation_before_export(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pandas as pd
+
+    from vibespatial.api import GeoDataFrame, GeoSeries, points_from_xy, read_parquet
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_stats,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+
+    source = GeoDataFrame(
+        {
+            "value": [1.5, 2.5, 4.0],
+            "large_value": [2**53 + 1, 2, 5],
+            "enabled": [True, True, False],
+            "start": pd.to_datetime(
+                ["2020-01-01", "2020-01-02", "2020-01-03"]
+            ),
+            "stop": pd.to_datetime(
+                [
+                    "2020-01-01 00:00:01",
+                    "2020-01-02 00:00:02",
+                    "2020-01-03 00:00:04",
+                ]
+            ),
+        },
+        geometry=points_from_xy([0, 1, 10], [0, 1, 10], crs="EPSG:4326"),
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "query-aggregate.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    tree = read_parquet(path)
+    query = GeoSeries(
+        [box(-1, -1, 2, 2), box(9, 9, 11, 11), box(20, 20, 21, 21)],
+        index=["near", "far", "empty"],
+        crs=tree.crs,
+    )
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+    clear_dispatch_events()
+    clear_fallback_events()
+    duration_seconds = (
+        tree["stop"].astype("int64") - tree["start"].astype("int64")
+    ) / 1_000_000.0
+
+    result = tree.sindex.query_aggregate(
+        query,
+        {
+            "match_count": "size",
+            "value_sum": (tree["value"], "sum"),
+            "large_sum": (tree["large_value"], "sum"),
+            "bool_sum": (tree["enabled"], "sum"),
+            "duration_sum": (duration_seconds, "sum"),
+        },
+        predicate="intersects",
+    )
+    accumulated = pd.DataFrame(
+        {
+            column: result[column] + result[column]
+            for column in result.columns
+        },
+        index=result.index,
+    )
+    transfer_count, transfer_bytes = get_d2h_transfer_stats()
+    materializations = get_materialization_events(clear=True)
+    dispatch = get_dispatch_events(clear=True)
+
+    pd.testing.assert_frame_equal(
+        result,
+        pd.DataFrame(
+            {
+                "match_count": [2, 1, 0],
+                "value_sum": [4.0, 4.0, 0.0],
+                "large_sum": [2**53 + 3, 5, 0],
+                "bool_sum": [2, 0, 0],
+                "duration_sum": [3.0, 4.0, 0.0],
+            },
+            index=["near", "far", "empty"],
+        ),
+        check_dtype=False,
+    )
+    assert get_fallback_events(clear=True) == []
+    assert all(
+        type(accumulated[column].array).__name__
+        == "NativeNumericExpressionArray"
+        for column in accumulated.columns
+    )
+    assert not any(
+        event.operation == "sindex_query_relation_indices_to_host"
+        for event in materializations
+    )
+    # The eager pandas columns are already computed but remain device-backed;
+    # even public Series addition does not export them. Only planning packets
+    # are allowed before the caller explicitly requests a NumPy value array.
+    assert transfer_count <= 5
+    assert transfer_bytes <= 64
+    assert any(
+        event.surface == "vibespatial.api.SpatialIndex.query_aggregate"
+        and event.selected is ExecutionMode.GPU
+        for event in dispatch
+    )
+    assert accumulated["match_count"].to_numpy().tolist() == [4, 2, 0]
+    assert accumulated["value_sum"].to_numpy().tolist() == [8.0, 8.0, 0.0]
+    assert result["large_sum"].to_numpy().dtype == np.dtype(np.int64)
+    assert result["large_sum"].to_numpy().tolist() == [2**53 + 3, 5, 0]
+    assert result["bool_sum"].to_numpy().dtype == np.dtype(np.int64)
+    assert result["bool_sum"].to_numpy().tolist() == [2, 0, 0]
+    assert accumulated["duration_sum"].to_numpy().tolist() == [6.0, 8.0, 0.0]
+    reset_d2h_transfer_count()
+
+    spatial_index = tree.sindex
+    original_query_relation = spatial_index.query_relation
+    relation_calls = 0
+
+    def _cpu_selected_relation(*args, **kwargs):
+        nonlocal relation_calls
+        relation_calls += 1
+        relation, execution = original_query_relation(*args, **kwargs)
+        return relation, type(execution)(
+            requested=execution.requested,
+            selected=ExecutionMode.CPU,
+            implementation="test_cpu_refinement",
+            reason="exercise reusable CPU-selected relation",
+        )
+
+    def _fail_duplicate_query(*_args, **_kwargs):
+        raise AssertionError("CPU-selected relation must not execute the query twice")
+
+    monkeypatch.setattr(spatial_index, "query_relation", _cpu_selected_relation)
+    monkeypatch.setattr(spatial_index, "query", _fail_duplicate_query)
+    cpu_selected = spatial_index.query_aggregate(
+        query,
+        {
+            "match_count": "size",
+            "large_sum": (tree["large_value"], "sum"),
+            "bool_sum": (tree["enabled"], "sum"),
+        },
+        predicate="intersects",
+    )
+
+    assert relation_calls == 1
+    assert cpu_selected["match_count"].tolist() == [2, 1, 0]
+    assert cpu_selected["large_sum"].tolist() == [2**53 + 3, 5, 0]
+    assert cpu_selected["large_sum"].dtype == np.dtype(np.int64)
+    assert cpu_selected["bool_sum"].tolist() == [2, 0, 0]
+    assert cpu_selected["bool_sum"].dtype == np.dtype(np.int64)
+
+
 def test_sindex_query_return_device_rejects_dense_sparse_exports() -> None:
     """Dense/sparse query outputs are public exports, not native carriers."""
     from vibespatial.api import GeoSeries

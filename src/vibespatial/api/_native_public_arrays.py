@@ -1197,6 +1197,31 @@ class NativeAttributeColumnArray(ExtensionArray):
             policies = table.device_column_policies((self.column,))
             policy = policies.get(self.column)
             if policy is not None and policy.null_count == 0:
+                if target_dtype == np.dtype(np.int64) and (
+                    policy.arrow_type.startswith("timestamp[")
+                    or policy.arrow_type.startswith("duration[")
+                ):
+                    import cupy as cp
+
+                    from vibespatial.api._native_expression import NativeExpression
+
+                    source = table.to_pylibcudf_columns((self.column,))[0]
+                    offset = int(source.offset())
+                    values = cp.asarray(source.data()).view(cp.int64)[
+                        offset : offset + int(source.size())
+                    ]
+                    return NativeNumericExpressionArray(
+                        NativeExpression(
+                            operation=f"attribute.{self.column}.astype",
+                            values=values,
+                            source_token=self.source_token,
+                            source_row_count=len(self),
+                            dtype=str(target_dtype),
+                            precision="source-temporal-unit",
+                        ),
+                        export_surface=self.export_surface,
+                        export_operation=f"{self.export_operation}_astype",
+                    )
                 try:
                     import pyarrow as pa
                     import pylibcudf as plc

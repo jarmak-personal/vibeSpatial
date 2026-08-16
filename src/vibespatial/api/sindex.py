@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import numpy as np
+import pandas as pd
 import shapely
 from shapely.geometry.base import BaseGeometry
 
@@ -501,6 +504,346 @@ class SpatialIndex:
             f"Invalid output_format: '{output_format}'. "
             "Use one of 'indices', 'sparse', 'dense'."
         )
+
+    def query_aggregate(
+        self,
+        geometry,
+        aggregations: Mapping[str, str | tuple[object, str]],
+        *,
+        predicate=None,
+        distance=None,
+    ) -> pd.DataFrame:
+        """Aggregate spatial-index matches without exporting relation pairs.
+
+        Parameters
+        ----------
+        geometry : shapely.Geometry or array-like of geometries
+            Input geometries queried against the indexed tree geometries.
+            Output rows preserve this input order and, for a GeoSeries, index.
+        aggregations : mapping
+            Output-column names mapped either to ``"size"`` for the number of
+            matches or to ``(values, "sum")``. ``values`` must be a numeric
+            one-dimensional public Series or array aligned with the indexed
+            tree geometries.
+        predicate : str, optional
+            Exact spatial predicate with the same meaning as :meth:`query`.
+        distance : number or array-like, optional
+            Distance for the ``"dwithin"`` predicate.
+
+        Returns
+        -------
+        pandas.DataFrame
+            One eager, pandas-compatible row per input geometry. Empty groups
+            have size and sum equal to zero.
+
+        Notes
+        -----
+        This vibeSpatial extension is a public eager reduction API, not a lazy
+        relation or proxy dataframe. Device-backed inputs lower to a
+        ``NativeRelation`` grouped reduction. The computed input-sized columns
+        remain device-backed through ordinary public Series arithmetic and
+        transfer only when a caller explicitly requests host values.
+        Unsupported inputs use the exact observable CPU path.
+        """
+        normalized = self._normalize_query_aggregations(aggregations)
+        self._validate_query_aggregate_values(normalized)
+        query_row_count, scalar = self._query_cardinality(geometry)
+        output_index = self._query_aggregate_output_index(
+            geometry,
+            query_row_count=query_row_count,
+            scalar=scalar,
+        )
+        native, reusable_relation = self._query_aggregate_native(
+            geometry,
+            normalized,
+            predicate=predicate,
+            distance=distance,
+            query_row_count=query_row_count,
+            output_index=output_index,
+        )
+        if native is not None:
+            return native
+
+        record_fallback_event(
+            surface="vibespatial.api.SpatialIndex.query_aggregate",
+            requested=get_requested_mode(),
+            selected=ExecutionMode.CPU,
+            reason=(
+                "query aggregate requires owned geometry and device-backed "
+                "numeric source expressions"
+            ),
+            detail=(
+                f"predicate={predicate!r}, query_rows={query_row_count}, "
+                f"tree_rows={self.size}"
+            ),
+            pipeline="spatial_query_aggregate",
+            d2h_transfer=any(
+                self._query_aggregate_value_is_device(value)
+                for value, reducer in normalized.values()
+                if reducer != "size"
+            ),
+        )
+        return self._query_aggregate_host(
+            geometry,
+            normalized,
+            predicate=predicate,
+            distance=distance,
+            query_row_count=query_row_count,
+            output_index=output_index,
+            scalar=scalar,
+            relation=reusable_relation,
+        )
+
+    @staticmethod
+    def _normalize_query_aggregations(aggregations):
+        if not isinstance(aggregations, Mapping) or not aggregations:
+            raise ValueError("aggregations must be a non-empty mapping")
+        normalized = {}
+        for name, specification in aggregations.items():
+            if not isinstance(name, str):
+                raise TypeError("query aggregate output column names must be strings")
+            if specification == "size":
+                normalized[name] = (None, "size")
+                continue
+            if not (
+                isinstance(specification, tuple)
+                and len(specification) == 2
+                and specification[1] == "sum"
+            ):
+                raise ValueError(
+                    "query aggregate specifications must be 'size' or "
+                    "(values, 'sum')"
+                )
+            values = specification[0]
+            shape = getattr(values, "shape", None)
+            if shape is not None and len(shape) != 1:
+                raise ValueError("query aggregate values must be one-dimensional")
+            normalized[name] = (values, "sum")
+        return normalized
+
+    @staticmethod
+    def _query_aggregate_output_index(geometry, *, query_row_count: int, scalar: bool):
+        if not scalar:
+            index = getattr(geometry, "index", None)
+            if index is not None and len(index) == query_row_count:
+                return index.copy()
+        return pd.RangeIndex(query_row_count)
+
+    def _validate_query_aggregate_values(self, aggregations) -> None:
+        for values, reducer in aggregations.values():
+            if reducer == "size":
+                continue
+            try:
+                value_count = len(values)
+            except TypeError as exc:
+                raise ValueError(
+                    "query aggregate values must be one-dimensional and aligned "
+                    "with indexed tree geometries"
+                ) from exc
+            if value_count != self.size:
+                raise ValueError(
+                    "query aggregate values must align with indexed tree geometries"
+                )
+            dtype = getattr(values, "dtype", None)
+            if dtype is None:
+                dtype = np.asarray(values).dtype
+            if not pd.api.types.is_numeric_dtype(dtype):
+                raise TypeError("query aggregate sum values must be numeric")
+
+    @staticmethod
+    def _query_aggregate_value_is_device(value) -> bool:
+        from vibespatial.api.geo_base import _native_expression_from_public_series
+
+        expression = _native_expression_from_public_series(value)
+        if expression is not None:
+            return expression.is_device
+        return hasattr(value, "__cuda_array_interface__")
+
+    def _query_aggregate_native(
+        self,
+        geometry,
+        aggregations,
+        *,
+        predicate,
+        distance,
+        query_row_count: int,
+        output_index,
+    ):
+        if not self._supports_owned_query_input(geometry):
+            return None, None
+
+        from vibespatial.api._native_expression import NativeExpression
+        from vibespatial.api._native_grouped import (
+            NativeGroupedAttributeReduction,
+            NativeGroupedReduction,
+        )
+        from vibespatial.api._native_public_arrays import (
+            NativeNumericExpressionArray,
+        )
+        from vibespatial.api.geo_base import (
+            _native_expression_from_public_series,
+            _native_state_for_owner,
+        )
+
+        expressions: dict[str, NativeExpression] = {}
+        source_tokens: set[str] = set()
+        for name, (values, reducer) in aggregations.items():
+            if reducer == "size":
+                continue
+            expression = _native_expression_from_public_series(values)
+            if (
+                expression is None
+                or not expression.is_device
+                or len(expression) != self.size
+            ):
+                return None, None
+            expressions[name] = expression
+            if expression.source_token is not None:
+                source_tokens.add(expression.source_token)
+        if len(source_tokens) > 1:
+            return None, None
+        source_token = next(iter(source_tokens), None)
+
+        query_state = _native_state_for_owner(geometry)
+        query_token = None if query_state is None else query_state.lineage_token
+        query_input = self._owned_query_input(geometry)
+        relation, execution = self.query_relation(
+            query_input,
+            predicate=predicate,
+            distance=distance,
+            source_token=source_token,
+            query_token=query_token,
+            query_row_count=query_row_count,
+            return_device=True,
+        )
+        if relation is None:
+            return None, None
+        if execution.selected is not ExecutionMode.GPU:
+            return None, relation
+
+        reductions = {}
+        for name, (_values, reducer) in aggregations.items():
+            if reducer == "size":
+                expression = relation.left_match_count_expression(
+                    source_row_count=query_row_count,
+                )
+                reductions[name] = NativeGroupedReduction(
+                    values=expression.values,
+                    reducer="count",
+                    group_count=query_row_count,
+                )
+            else:
+                reductions[name] = relation.left_reduce_right_numeric(
+                    expressions[name].values,
+                    reducer,
+                    left_row_count=query_row_count,
+                )
+
+        reduced = NativeGroupedAttributeReduction(
+            columns=reductions,
+            group_count=query_row_count,
+        )
+        result_columns = {}
+        for name, reduction in reduced.columns.items():
+            values = reduction.values
+            expression = NativeExpression(
+                operation=f"spatial_query_aggregate.{reduction.reducer}",
+                values=values,
+                source_token=query_token,
+                source_row_count=query_row_count,
+                dtype=str(getattr(values, "dtype", "")) or None,
+                precision="grouped-reduction",
+                null_policy="nan-false",
+            )
+            result_columns[name] = pd.Series(
+                NativeNumericExpressionArray(
+                    expression,
+                    export_surface=(
+                        "vibespatial.api.SpatialIndex.query_aggregate"
+                    ),
+                    export_operation="query_aggregate_column_to_public_array",
+                ),
+                index=output_index,
+                name=name,
+            )
+        result = pd.DataFrame(result_columns, index=output_index)
+        record_dispatch_event(
+            surface="vibespatial.api.SpatialIndex.query_aggregate",
+            operation="query_aggregate",
+            implementation=execution.implementation,
+            reason=(
+                "NativeRelation pairs were consumed by selection-aware grouped "
+                "reductions before public result export"
+            ),
+            detail=(
+                f"predicate={predicate!r}, query_rows={query_row_count}, "
+                f"outputs={len(reductions)}"
+            ),
+            requested=execution.requested,
+            selected=execution.selected,
+        )
+        return result, None
+
+    def _query_aggregate_host(
+        self,
+        geometry,
+        aggregations,
+        *,
+        predicate,
+        distance,
+        query_row_count: int,
+        output_index,
+        scalar: bool,
+        relation=None,
+    ) -> pd.DataFrame:
+        if relation is None:
+            pairs = self.query(
+                geometry,
+                predicate=predicate,
+                distance=distance,
+                sort=False,
+            )
+        else:
+            pairs = self._public_relation_indices_to_host(
+                relation,
+                scalar=scalar,
+            )
+        if pairs.ndim == 1:
+            query_rows = np.zeros(len(pairs), dtype=np.int64)
+            tree_rows = np.asarray(pairs, dtype=np.int64)
+        else:
+            query_rows = np.asarray(pairs[0], dtype=np.int64)
+            tree_rows = np.asarray(pairs[1], dtype=np.int64)
+
+        columns = {}
+        for name, (values, reducer) in aggregations.items():
+            if reducer == "size":
+                columns[name] = np.bincount(
+                    query_rows,
+                    minlength=query_row_count,
+                ).astype(np.int64, copy=False)
+                continue
+            source = np.asarray(values)
+            if source.ndim != 1 or len(source) != self.size:
+                raise ValueError(
+                    "query aggregate values must align with indexed tree geometries"
+                )
+            if not (
+                np.issubdtype(source.dtype, np.number)
+                or np.issubdtype(source.dtype, np.bool_)
+            ):
+                raise TypeError("query aggregate sum values must be numeric")
+            output_dtype = (
+                np.dtype(np.int64) if source.dtype.kind == "b" else source.dtype
+            )
+            reduced = np.zeros(query_row_count, dtype=output_dtype)
+            np.add.at(
+                reduced,
+                query_rows,
+                source[tree_rows].astype(output_dtype, copy=False),
+            )
+            columns[name] = reduced
+        return pd.DataFrame(columns, index=output_index)
 
     def _owned_flat_sindex(self):
         if self._geometry_array is not None and hasattr(self._geometry_array, "owned_flat_sindex"):

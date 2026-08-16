@@ -107,15 +107,42 @@ def _observed_sorted_order(codes: Any, *, group_count: int):
 
 def _bincount_sum(codes: Any, values: Any, *, group_count: int):
     xp = _array_namespace(codes)
+    if np.issubdtype(values.dtype, np.bool_) or np.issubdtype(
+        values.dtype,
+        np.integer,
+    ):
+        if xp is np:
+            output_dtype = np.int64 if values.dtype.kind == "b" else values.dtype
+            result = np.zeros(int(group_count), dtype=output_dtype)
+            np.add.at(
+                result,
+                np.asarray(codes, dtype=np.int64),
+                np.asarray(values).astype(output_dtype, copy=False),
+            )
+            return result
+
+        import cupy as cp
+
+        # CuPy's scatter-add does not admit signed int64. Accumulating the
+        # two's-complement bit patterns as uint64 is exact modulo 2**64, then
+        # viewing/casting back preserves the source integer overflow contract.
+        accumulator = cp.zeros(int(group_count), dtype=cp.uint64)
+        cp.add.at(
+            accumulator,
+            cp.asarray(codes, dtype=cp.int64),
+            cp.asarray(values, dtype=cp.uint64),
+        )
+        if values.dtype.kind == "b":
+            return accumulator.astype(cp.int64, copy=False)
+        if values.dtype.kind == "i":
+            return accumulator.view(cp.int64).astype(values.dtype, copy=False)
+        return accumulator.astype(values.dtype, copy=False)
+
     result = xp.bincount(
         codes,
         weights=values,
         minlength=int(group_count),
     )[: int(group_count)]
-    if np.issubdtype(values.dtype, np.bool_):
-        return result.astype(xp.int64, copy=False)
-    if np.issubdtype(values.dtype, np.integer):
-        result = result.astype(values.dtype, copy=False)
     return result
 
 
@@ -489,18 +516,14 @@ class NativeGroupedSelection:
             reduced = counts
         elif normalized in {"sum", "mean"}:
             if normalized == "sum":
-                out_dtype = (
-                    cp.int64 if np.issubdtype(values_array.dtype, np.bool_) else values_array.dtype
-                )
-                sums_with_sentinel = cp.zeros(group_count + 1, dtype=out_dtype)
-                cp.add.at(
-                    sums_with_sentinel,
+                sums_with_sentinel = _bincount_sum(
                     codes,
                     cp.where(
                         valid,
-                        values_array.astype(out_dtype, copy=False),
-                        cp.zeros((), dtype=out_dtype),
+                        values_array,
+                        cp.zeros((), dtype=values_array.dtype),
                     ),
+                    group_count=group_count + 1,
                 )
                 reduced = sums_with_sentinel[:group_count]
             else:

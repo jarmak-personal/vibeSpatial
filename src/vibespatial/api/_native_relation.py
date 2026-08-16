@@ -1148,6 +1148,80 @@ class NativeRelationSelection:
         )
         return self._reduce_distances("right", reducer, row_count=row_count)
 
+    def left_reduce_right_numeric(
+        self,
+        right_values: Any,
+        reducer: str,
+        *,
+        left_row_count: int | None = None,
+    ) -> NativeGroupedReduction:
+        """Reduce right-source values by selected left relation rows.
+
+        Physical shape: relation-capacity gather followed by a selection-aware
+        grouped reduction. Inactive capacity lanes remain masked by
+        ``NativeGroupedSelection``; no logical-pair count or pair compaction is
+        exported to the host.
+        """
+        row_count = _resolve_row_count(
+            left_row_count,
+            self.relation.left_row_count,
+            side="left",
+        )
+        if self.relation.right_row_count is not None and _array_size(
+            right_values
+        ) != int(self.relation.right_row_count):
+            raise ValueError("right_values length must match right_row_count")
+        import cupy as cp
+
+        active_source = self.selection.source_mask()
+        safe_right_indices = cp.where(
+            active_source,
+            cp.asarray(self.relation.right_indices),
+            cp.int64(0),
+        )
+        pair_values = _gather_values(
+            right_values,
+            safe_right_indices,
+        )
+        return self._grouped("left", row_count=row_count).reduce_numeric(
+            pair_values,
+            reducer,
+        )
+
+    def right_reduce_left_numeric(
+        self,
+        left_values: Any,
+        reducer: str,
+        *,
+        right_row_count: int | None = None,
+    ) -> NativeGroupedReduction:
+        """Reduce left-source values by selected right relation rows."""
+        row_count = _resolve_row_count(
+            right_row_count,
+            self.relation.right_row_count,
+            side="right",
+        )
+        if self.relation.left_row_count is not None and _array_size(
+            left_values
+        ) != int(self.relation.left_row_count):
+            raise ValueError("left_values length must match left_row_count")
+        import cupy as cp
+
+        active_source = self.selection.source_mask()
+        safe_left_indices = cp.where(
+            active_source,
+            cp.asarray(self.relation.left_indices),
+            cp.int64(0),
+        )
+        pair_values = _gather_values(
+            left_values,
+            safe_left_indices,
+        )
+        return self._grouped("right", row_count=row_count).reduce_numeric(
+            pair_values,
+            reducer,
+        )
+
     def physicalize_geometries(
         self,
         left_geometry,

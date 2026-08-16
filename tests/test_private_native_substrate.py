@@ -662,6 +662,8 @@ def test_native_relation_selection_consumes_capacity_without_compaction() -> Non
     assert "compact_rowset(" not in grouped_selection_source
     assert "copy_device_to_host" not in grouped_selection_source
     assert "int(self.logical_count" not in grouped_selection_source
+    assert "def left_reduce_right_numeric(" in relation_selection_source
+    assert "def right_reduce_left_numeric(" in relation_selection_source
     result_adapter_source = Path(
         importlib.import_module("vibespatial.api._native_results").__file__
     ).read_text()
@@ -682,6 +684,64 @@ def test_native_relation_selection_consumes_capacity_without_compaction() -> Non
     )[1].split("\n    def _physical_device_take(", 1)[0]
     assert "copy_device_to_host" not in capacity_take_source
     assert "cp.asnumpy" not in capacity_take_source
+
+
+@pytest.mark.gpu
+def test_native_relation_selection_reduces_source_values_without_d2h() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for selected relation reduction")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    relation = NativeRelation(
+        left_indices=cp.asarray([0, -99, 0, 99], dtype=cp.int32),
+        right_indices=cp.asarray([0, 999_999, 2, -9], dtype=cp.int32),
+        left_token="query",
+        right_token="tree",
+        left_row_count=3,
+        right_row_count=3,
+    )
+    selected = NativeRelationSelection(
+        relation=relation,
+        selection=NativeDeviceSelection.from_mask(
+            cp.asarray([True, False, True, False]),
+            source_token="query",
+            source_row_count=4,
+        ),
+    )
+    values = cp.asarray([1.5, 2.5, 4.0], dtype=cp.float64)
+    large_values = cp.asarray([2**53 + 1, 0, 2], dtype=cp.int64)
+    bool_values = cp.asarray([True, False, True], dtype=cp.bool_)
+    reset_d2h_transfer_count()
+
+    with assert_zero_d2h_transfers():
+        reduced = selected.left_reduce_right_numeric(
+            values,
+            "sum",
+            left_row_count=3,
+        )
+        large_reduced = selected.left_reduce_right_numeric(
+            large_values,
+            "sum",
+            left_row_count=3,
+        )
+        bool_reduced = selected.left_reduce_right_numeric(
+            bool_values,
+            "sum",
+            left_row_count=3,
+        )
+        counts = selected.left_match_count_expression(source_row_count=3)
+
+    assert cp.asnumpy(reduced.values).tolist() == [5.5, 0.0, 0.0]
+    assert cp.asnumpy(large_reduced.values).tolist() == [2**53 + 3, 0, 0]
+    assert large_reduced.values.dtype == cp.dtype(cp.int64)
+    assert cp.asnumpy(bool_reduced.values).tolist() == [2, 0, 0]
+    assert bool_reduced.values.dtype == cp.dtype(cp.int64)
+    assert cp.asnumpy(counts.values).tolist() == [2, 0, 0]
+    reset_d2h_transfer_count()
 
 
 @pytest.mark.gpu

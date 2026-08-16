@@ -5,7 +5,7 @@ Scope: Observable CPU fallback policy for unsupported predicates, geometry mixes
 Read If: You are changing fallback visibility, host-only geospatial paths, or runtime observability.
 STOP IF: You already have the fallback event API open and only need local implementation detail.
 Source Of Truth: Phase-4 explicit fallback policy for predicate and spatial-query surfaces.
-Body Budget: 93/220 lines
+Body Budget: 95/220 lines
 Document: docs/architecture/fallbacks.md
 
 Section Map (Body Lines)
@@ -18,9 +18,9 @@ Section Map (Body Lines)
 | 28-33 | Risks |
 | 34-39 | Intent |
 | 40-53 | Decision |
-| 54-73 | Current Surfaces |
-| 74-85 | Observability Contract |
-| 86-93 | Consequences |
+| 54-75 | Current Surfaces |
+| 76-87 | Observability Contract |
+| 88-95 | Consequences |
 DOC_HEADER:END -->
 
 ## Request Signals
@@ -82,6 +82,8 @@ Fallback events are currently recorded for:
 - `GeometryArray.sindex` and other owned-backed public adapters that must
   materialize a host-side spatial index
 - `sindex.query`
+- `sindex.query_aggregate` when geometry or numeric inputs cannot use the
+  native relation/grouped-reduction path
 - `sindex.nearest`
 - `distance_owned` -- element-wise distance GPU-to-CPU fallback
 - `geometry_array_dwithin` -- dwithin GPU-to-CPU fallback

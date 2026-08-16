@@ -5,7 +5,7 @@ Scope: Per-query semantic, physical-shape, memory, correctness, and benchmark ev
 Read If: You are changing an SF100 query path, native tabular primitive, memory estimate, export boundary, or performance claim.
 STOP IF: You only need the program milestones or architecture; open the execution plan instead.
 Source Of Truth: Query-level evidence ledger required by the pylibcudf SF100 execution plan.
-Body Budget: 195/260 lines
+Body Budget: 201/260 lines
 Document: docs/dev/pylibcudf-sf100-query-ledger.md
 
 Section Map (Body Lines)
@@ -17,10 +17,10 @@ Section Map (Body Lines)
 | 15-21 | Open First |
 | 22-27 | Verify |
 | 28-34 | Risks |
-| 35-62 | Measurement Contract And Shared Evidence |
-| 63-176 | Q1-Q12 Ledger |
-| 177-187 | Rejected Physical Shapes |
-| 188-195 | Artifact Map |
+| 35-67 | Measurement Contract And Shared Evidence |
+| 68-181 | Q1-Q12 Ledger |
+| 182-192 | Rejected Physical Shapes |
+| 193-201 | Artifact Map |
 DOC_HEADER:END -->
 
 ## Intent
@@ -69,6 +69,11 @@ timing. Thus `device pipeline` below is the measured scan/compute/public-result
 aggregate, not an inferred kernel-only time. The earlier stage-attribution
 profile remains the before-state for Q3, Q4, Q7, and Q12.
 
+The completion audit reran all twelve queries at commit `c74a773` with one
+warmup and three measured runs. The 641.76 s VS sum is 12.742x faster than the
+unchanged 8,177.23 s optimized-GPD baseline; all outputs pass the SF100
+same-data oracle and every per-query timing remains within the 5% gate.
+
 All queries pass the SF1 canonical-answer oracle and the same-data SF100
 optimized-GeoPandas comparison at `rtol=1e-6`, `atol=1e-9`. Q10 differs only by
 admitted sub-ULP reduction order. Every final profile has zero library fallback
@@ -91,7 +96,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - Projection/pushdown: trip key, pickup time, pickup geometry; distance predicate is evaluated after row-group scan.
 - Shapes/chain/export: trip rows -> distance `NativeExpression` -> filtered `NativeRowSet` -> bounded top-k -> one terminal pandas frame.
 - Primitive/budget: fused custom distance plus pylibcudf selection; scan decoded bytes + `N * (64 + source_width + 5 * expanded_key_width) + 1 MiB` top-k scratch, shard-local top-k merged to 100.
-- Measured after: profiled pipeline 13.07 s; D2H 0.0045 s / 96,000 B; 12.01 / 11.56 / 11.17 GiB; clean GPD 106.03 s versus VS 12.39 s (8.56x).
+- Measured after: profiled pipeline 13.07 s; D2H 0.0045 s / 96,000 B; 12.01 / 11.56 / 11.17 GiB; clean GPD 106.03 s versus VS 12.51 s (8.48x).
 - Correctness/fallback: finite fp64 distance, datetime/key dtype and exact tie order preserved; SF1 and SF100 pass; no fallback.
 
 ### Q2: Coconino Pickup Count
@@ -100,7 +105,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - Projection/pushdown: trip pickup geometry; zone name and boundary, with `z_name == 'Coconino County'` pushed to the small zone table.
 - Shapes/chain/export: 8M point batches -> cached point grid / polygon refinement -> `NativeRelation` count -> scalar pandas result; measured result is 53,348.
 - Primitive/budget: point-grid candidate generation plus exact fp64 custom predicate; grid build is `192*N + 96*C + 1 MiB`, relation capacity is admitted and batches resize before launch.
-- Measured after: profiled pipeline 8.35 s; D2H 0.4002 s / 389,527 B; 19.57 / 19.13 / 2.79 GiB; clean GPD 113.25 s versus VS 7.84 s (14.45x).
+- Measured after: profiled pipeline 8.35 s; D2H 0.4002 s / 389,527 B; 19.57 / 19.13 / 2.79 GiB; clean GPD 113.25 s versus VS 7.89 s (14.35x).
 - Correctness/fallback: boundary points follow `intersects`, null geometry is false, count is int64; SF1/SF100 pass; no fallback.
 
 ### Q3: Monthly Buffered-Box Statistics
@@ -109,7 +114,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - Projection/pushdown: trip key, pickup/dropoff timestamps, distance, fare, pickup geometry; fixed spatial bounds prune row groups where metadata permits.
 - Shapes/chain/export: rows -> distance rowset -> native datetime/month expressions -> `NativeGrouped` reductions -> terminal pandas frame.
 - Primitive/budget: custom distance, pylibcudf gather/group/reduce; decoded scan bytes plus selected rows and group state, with row-group shards and compact `G`-sized merge state.
-- Measured after: profiled pipeline 13.39 s; D2H 0.0029 s / 70,016 B; 12.62 / 12.18 / 11.17 GiB; clean GPD 405.03 s versus VS 12.86 s (31.50x).
+- Measured after: profiled pipeline 13.39 s; D2H 0.0029 s / 70,016 B; 12.62 / 12.18 / 11.17 GiB; clean GPD 405.03 s versus VS 12.81 s (31.62x).
 - Before/after stages: before read 217.75 s, distance 15.62 s, host take 13.47 s, group 0.43 s; after total 12.79 s, with no intermediate public frame.
 - Correctness/fallback: UTC/naive local-calendar components are native; non-UTC timestamps observably use pandas; decimal/duration/null contracts and month order pass SF1/SF100.
 
@@ -119,7 +124,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - Projection/pushdown: trip key, tip, pickup geometry; zone key, name, boundary; top-k precedes the spatial join.
 - Shapes/chain/export: native numeric-cast expression -> 1,000-row `NativeRowSet` -> point-location `NativeRelation` -> grouped count -> pandas.
 - Primitive/budget: pylibcudf top-k/gather/group plus exact custom point-location; top-k formula above, then bounded 1,000-by-zone candidates.
-- Measured after: profiled pipeline 9.11 s; D2H 1.0529 s / 665,680 B; 9.62 / 9.18 / 11.17 GiB; clean GPD 231.98 s versus VS 8.55 s (27.13x).
+- Measured after: profiled pipeline 9.11 s; D2H 1.0529 s / 665,680 B; 9.62 / 9.18 / 11.17 GiB; clean GPD 231.98 s versus VS 8.53 s (27.20x).
 - Before/after stages: before read 107.03 s, host top-k 30.12 s, take/sort 9.86 s, joins 4.33 s; after total 8.28 s.
 - Correctness/fallback: decimal source is explicitly public-cast to float before public `nlargest`; missing values last and signed-zero/tie order match pandas; SF1/SF100 pass, no fallback.
 
@@ -129,7 +134,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - Projection/pushdown: trip customer key, pickup time, dropoff geometry; customer key/name; HAVING applies after grouping.
 - Shapes/chain/export: packed customer/month codes -> `NativeGrouped` point collections -> grouped convex hull/area -> bounded top-k -> terminal pandas.
 - Primitive/budget: pylibcudf grouping plus custom segmented hull; input coordinates + group codes/offsets + admitted hull output, processed by source shard and merged as compact group/hull state; top-k formula applies to `G`.
-- Measured after: profiled pipeline 135.06 s; D2H 1.4817 s / 10.34 GB at an explicit public arithmetic boundary; 16.21 / 12.83 / 11.17 GiB; clean GPD 834.69 s versus VS 126.18 s (6.62x).
+- Measured after: profiled pipeline 135.06 s; D2H 1.4817 s / 10.34 GB at an explicit public arithmetic boundary; 16.21 / 12.83 / 11.17 GiB; clean GPD 834.69 s versus VS 126.94 s (6.58x).
 - Correctness/fallback: all groups compute hull before ranking, degenerate hulls have exact area semantics, customer/name/month/null/tie contracts pass SF1/SF100; no library fallback.
 
 ### Q6: Sedona-Radius Zone Statistics
@@ -138,7 +143,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - Projection/pushdown: trip key, pickup geometry, distance, pickup/dropoff timestamps; zone key/name/boundary; zone bounds prefilter applies before 8M point batches.
 - Shapes/chain/export: point-grid/location `NativeRelation` -> pylibcudf joined reductions -> terminal pandas.
 - Primitive/budget: point grid `192*N + 96*C + 1 MiB`, exact fp64 refinement, bounded relation and shard-local sum/count state; resize below remaining query budget.
-- Measured after: profiled pipeline 21.75 s; D2H 2.2422 s / 14.42 GB at explicit public reducers; 19.59 / 19.14 / 2.79 GiB; clean GPD 371.42 s versus VS 21.13 s (17.58x).
+- Measured after: public relation reduction plus device-backed Series accumulation profiles at 17.07 s; D2H 0.3129 s / 15.51 MB; peak 19.59 GiB; clean GPD 371.42 s versus VS 16.32 s (22.76x).
 - Correctness/fallback: exact zone/pickup predicate, duration/decimal averages, null exclusion and stable order pass SF1/SF100; no fallback.
 
 ### Q7: Detour Ratio Top 100
@@ -147,7 +152,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - Projection/pushdown: trip key, reported decimal distance, pickup and dropoff geometry; zero geometric distances are excluded.
 - Shapes/chain/export: dual-geometry distance expression + decimal cast/ratio expression -> bounded top-k `NativeRowSet` -> pandas.
 - Primitive/budget: custom point distance and pylibcudf expression/top-k; decoded scan bytes plus the top-k formula, shard-local candidates merged to 100.
-- Measured after: profiled pipeline 4.71 s; D2H 0.0026 s / 64,000 B; 17.78 / 17.34 / 11.17 GiB; clean GPD 337.44 s versus VS 4.23 s (79.77x).
+- Measured after: profiled pipeline 4.71 s; D2H 0.0026 s / 64,000 B; 17.78 / 17.34 / 11.17 GiB; clean GPD 337.44 s versus VS 4.25 s (79.40x).
 - Before/after stages: before read 127.14 s, decimal conversion 27.63 s, distance 6.84 s, host ratio/top-k 5.20 s; after total 4.50 s.
 - Correctness/fallback: decimal-cast lineage, division-by-zero null semantics, fp64 distances and ties pass SF1/SF100; no fallback.
 
@@ -157,7 +162,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - Projection/pushdown: building key/name/boundary and trip pickup geometry; building-expanded bounds constrain candidate generation.
 - Shapes/chain/export: reusable building spatial index -> bounded distance relation -> relation count -> top-k -> pandas.
 - Primitive/budget: custom index/candidate/refinement plus pylibcudf reduction/top-k; `P * (left_index + right_index + optional distance)` is admitted per shard, while only per-building counts persist.
-- Measured after: profiled pipeline 17.49 s; D2H 0.3626 s / 5,853,512 B; 13.21 / 12.77 / 11.17 GiB; clean GPD 285.06 s versus VS 16.94 s (16.83x).
+- Measured after: profiled pipeline 17.49 s; D2H 0.3626 s / 5,853,512 B; 13.21 / 12.77 / 11.17 GiB; clean GPD 285.06 s versus VS 16.98 s (16.79x).
 - Correctness/fallback: distance threshold includes the boundary, null geometry contributes no pair, zero-count buildings are absent; SF1/SF100 and tie order pass; no fallback.
 
 ### Q9: Building Conflation IoU
@@ -175,7 +180,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - Projection/pushdown: zone key/name/boundary; trip key, pickup geometry, distance, pickup/dropoff timestamps; zone partitions bound each 4M-row trip pass.
 - Shapes/chain/export: cached point grid -> per-zone-shard location relation -> streamed sum/count reducers -> top-k -> pandas.
 - Primitive/budget: custom grid/refinement plus pylibcudf reducers; grid formula plus bounded `P`, five zone partitions, and compact per-zone state avoid eager relation consolidation.
-- Measured after: profiled pipeline 143.26 s; D2H 2.1325 s / 21.46 GB at explicit public reducers; 13.20 / 12.76 / 5.62 GiB; clean GPD 1,738.00 s versus VS 143.33 s (12.13x).
+- Measured after: public relation reduction plus five device-backed partition accumulators profiles at 125.93 s; D2H 0.2949 s / 33.09 MB; peak 13.20 GiB; clean GPD 1,738.00 s versus VS 126.43 s (13.75x).
 - Correctness/fallback: exact point-in-polygon, null-aware averages/durations and stable nulls-last order pass SF1/SF100; no fallback.
 
 ### Q11: Cross-Zone Trip Count
@@ -184,7 +189,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - Projection/pushdown: zone key/boundary; trip key, pickup and dropoff geometry; endpoints are processed separately to keep candidate shapes bounded.
 - Shapes/chain/export: cached point grid -> pickup/dropoff location relations -> key inequality/count reduction -> scalar pandas.
 - Primitive/budget: custom grid/refinement plus pylibcudf relation reducer; each endpoint uses the grid/relation budget independently, with compact keyed partial counts merged across shards.
-- Measured after: profiled pipeline 269.22 s; D2H 1.6361 s / 14.10 GB at explicit public reducers; 13.20 / 12.76 / 5.62 GiB; clean GPD 3,127.50 s versus VS 268.90 s (11.63x).
+- Measured after: profiled pipeline 269.22 s; D2H 1.6361 s / 14.10 GB at explicit public reducers; 13.20 / 12.76 / 5.62 GiB; clean GPD 3,127.50 s versus VS 266.42 s (11.74x).
 - Correctness/fallback: rows with an unlocated/null endpoint do not join, multiplicity follows SQL join semantics, int64 count passes SF1/SF100; no fallback.
 
 ### Q12: Five-Nearest-Building Isolation Top 100
@@ -193,7 +198,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - Projection/pushdown: trip key/pickup geometry and building key/boundary; Hilbert ordering supplies public coarse locality, not an approximate answer.
 - Shapes/chain/export: Hilbert `NativeExpression` -> certified public `take` -> exact k=5 KNN `NativeRelation`/distance -> bounded top-k -> pandas.
 - Primitive/budget: custom Hilbert/KNN plus pylibcudf take/reduce/top-k; candidate `P * (indices + fp64 distance)` is admitted per trip shard and only five pairs/row plus 100 global candidates persist.
-- Measured after: profiled pipeline 23.51 s; D2H 0.0065 s / 7,524,656 B; 13.34 / 12.64 / 11.17 GiB; clean GPD 626.64 s versus VS 21.28 s (29.45x).
+- Measured after: profiled pipeline 23.51 s; D2H 0.0065 s / 7,524,656 B; 13.34 / 12.64 / 11.17 GiB; clean GPD 626.64 s versus VS 21.20 s (29.56x).
 - Before/after stages: before ten-shard upper bounds 39.81 s, CPU exact KNN 34.40 s, reads 1.86 s, setup 1.27 s; full before 917.71 s, after 21.48 s.
 - Correctness/fallback: exactly five neighbors, fp64 distance/average, certified Hilbert index domain and stable ties pass SF1/SF100; no fallback.
 
@@ -216,3 +221,4 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - Correctness: `benchmark_results/spatialbench/sf100/2026-08-14-final-median/same_data_correctness.json`.
 - End-to-end profile: `benchmark_results/spatialbench/sf100/2026-08-14-final-median/pipeline_profile_summary.json`.
 - Reproducibility: `benchmark_results/spatialbench/sf100/2026-08-14-final-median/provenance.json`.
+- Public relation reducer checkpoint: `benchmark_results/spatialbench/sf100/2026-08-15-public-relation-reducer/checkpoint.json`.
