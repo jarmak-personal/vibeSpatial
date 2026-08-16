@@ -435,11 +435,17 @@ def query_spatial_index(
         _deferred_to_owned = False
 
     if _deferred_to_owned:
-        # Use Shapely bounds for regular-grid box path.
-        if _shapely_query_bounds is not None:
+        # A predicate-free spatial-index query is defined in terms of bounds,
+        # so any Shapely geometry can use its bbox here.  ``intersects`` may
+        # short-circuit only when the query geometries themselves are proven
+        # axis-aligned boxes; arbitrary polygon bounds are merely candidates
+        # and must continue to exact refinement below.
+        if predicate is None and _shapely_query_bounds is not None:
             regular_grid_box_bounds = _shapely_query_bounds
+        elif predicate == "intersects":
+            regular_grid_box_bounds = _extract_box_query_bounds_shapely(query_values)
         else:
-            regular_grid_box_bounds = shapely_bounds_array(query_values)
+            regular_grid_box_bounds = None
     else:
         regular_grid_box_bounds = None
         if (
@@ -853,11 +859,31 @@ def query_spatial_index(
             )
 
             prepare_point_region_y_indexes(query_owned, tree_owned)
-        device_cands, _sidq_exec = spatial_index_device_query(
-            flat_index,
-            query_bounds,
-            allow_bbox_superset=predicate is not None,
-        )
+        # A certified regular rectangle grid can admit arbitrary intersecting
+        # geometries from their bounding boxes.  Unlike the earlier box-only
+        # fast path, this is candidate generation rather than a terminal
+        # result: exact predicate refinement still runs below.  This keeps
+        # circle/polygon overlay queries O(N + K) without misinterpreting the
+        # grid index's identity placeholders as Morton keys.
+        device_cands = None
+        if getattr(flat_index, "regular_grid", None) is not None and predicate in (
+            None,
+            "intersects",
+        ):
+            regular_grid_candidates = _query_regular_grid_rect_box_index(
+                flat_index,
+                query_bounds,
+                predicate=None,
+            )
+            if isinstance(regular_grid_candidates, _DeviceCandidates):
+                device_cands = regular_grid_candidates
+
+        if device_cands is None:
+            device_cands, _sidq_exec = spatial_index_device_query(
+                flat_index,
+                query_bounds,
+                allow_bbox_superset=predicate is not None,
+            )
         if device_cands is not None:
             gpu_candidate_gen = True
             # Pass None for host indices — _filter_predicate_pairs_owned will

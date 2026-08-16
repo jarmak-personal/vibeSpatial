@@ -23,6 +23,36 @@ from .schema import TimingSummary, timing_from_samples
 _TIMED_START_MARKER = "# --- timed work starts here ---"
 _TIMED_END_MARKER = "# --- timed work ends here ---"
 
+
+def _repo_source_root() -> Path | None:
+    """Return the editable source root that owns the GeoPandas shim."""
+    source_root = Path(__file__).resolve().parents[2]
+    if (
+        source_root.name == "src"
+        and (source_root / "geopandas" / "__init__.py").is_file()
+        and (source_root / "vibespatial" / "__init__.py").is_file()
+    ):
+        return source_root
+    return None
+
+
+def _set_repo_shim_precedence(env: dict[str, str], *, enabled: bool) -> None:
+    """Include or exclude the editable GeoPandas shim for one child process."""
+    source_root = _repo_source_root()
+    if source_root is None:
+        return
+
+    source_path = str(source_root)
+    entries = [entry for entry in env.get("PYTHONPATH", "").split(os.pathsep) if entry]
+    entries = [entry for entry in entries if str(Path(entry).resolve()) != source_path]
+    if enabled:
+        entries.insert(0, source_path)
+
+    if entries:
+        env["PYTHONPATH"] = os.pathsep.join(entries)
+    else:
+        env.pop("PYTHONPATH", None)
+
 # ---------------------------------------------------------------------------
 # Harness script — executed inside the subprocess
 # ---------------------------------------------------------------------------
@@ -1176,6 +1206,7 @@ def run_shootout(
 
     gpd_env = os.environ.copy()
     gpd_env.pop("_VIBESPATIAL_GEOPANDAS_COMPAT", None)
+    _set_repo_shim_precedence(gpd_env, enabled=False)
     if scale is not None:
         gpd_env["VSBENCH_SCALE"] = scale
 
@@ -1192,12 +1223,11 @@ def run_shootout(
     )
 
     # --- vibespatial ---
-    # The repo-local geopandas shim is already imported from src/ without the
-    # compat flag, so keep the vibespatial subprocess environment as close to
-    # the baseline as possible. The compat flag only suppresses a deprecation
-    # warning, and on this machine it also perturbs CUDA visibility in the
-    # shootout subprocess.
+    # The editable source root otherwise follows site-packages on sys.path, so
+    # explicitly select the repo-owned GeoPandas shim for only this leg.  The
+    # isolated baseline above must continue to import real upstream GeoPandas.
     vs_env = os.environ.copy()
+    _set_repo_shim_precedence(vs_env, enabled=True)
     if scale is not None:
         vs_env["VSBENCH_SCALE"] = scale
 

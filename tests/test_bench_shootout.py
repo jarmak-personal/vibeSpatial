@@ -546,6 +546,48 @@ def test_run_shootout_baseline_uses_isolated_uv_env(
     assert "pyarrow" in baseline_cmd
 
 
+def test_run_shootout_isolates_upstream_baseline_from_repo_shim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "probe.py"
+    script.write_text(
+        "print('SHOOTOUT_FINGERPRINT: rows=1')\n",
+        encoding="utf-8",
+    )
+    calls: list[dict[str, object]] = []
+
+    def _fake_run_harness(**kwargs):
+        calls.append(kwargs)
+        return ShootoutRun(
+            label=kwargs["label"],
+            timing=timing_from_samples([1.0]),
+            stdout="SHOOTOUT_FINGERPRINT: rows=1\n",
+        )
+
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    inherited = os.pathsep.join((str(source_root), "/tmp/shootout-extra"))
+    monkeypatch.setenv("PYTHONPATH", inherited)
+    monkeypatch.setattr("vibespatial.bench.shootout._run_harness", _fake_run_harness)
+    monkeypatch.setattr("vibespatial.runtime.has_gpu_runtime", lambda: False)
+
+    result = run_shootout(
+        script,
+        repeat=1,
+        warmup=False,
+        quiet=True,
+        baseline_python=sys.executable,
+    )
+
+    assert result.status == "pass"
+    baseline_paths = calls[0]["env"].get("PYTHONPATH", "").split(os.pathsep)
+    vibespatial_paths = calls[1]["env"]["PYTHONPATH"].split(os.pathsep)
+    assert str(source_root) not in baseline_paths
+    assert baseline_paths == ["/tmp/shootout-extra"]
+    assert vibespatial_paths[0] == str(source_root)
+    assert vibespatial_paths[1:] == ["/tmp/shootout-extra"]
+
+
 def test_run_shootout_metadata_tags_public_physical_shapes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

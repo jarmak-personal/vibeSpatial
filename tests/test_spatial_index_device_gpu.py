@@ -747,6 +747,44 @@ def test_device_query_hydrates_host_index_for_morton_range():
 
 
 @requires_gpu
+def test_device_query_does_not_treat_regular_grid_identity_as_morton_keys():
+    """Regular-grid identity placeholders are not valid Morton codes."""
+    tree_geoms = np.asarray(
+        [
+            box(float(col), float(row), float(col + 1), float(row + 1))
+            for row in range(100)
+            for col in range(100)
+        ],
+        dtype=object,
+    )
+    tree_owned = from_shapely_geometries(tree_geoms)
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.CPU,
+            selected=ExecutionMode.CPU,
+            reason="test host-built regular-grid spatial index",
+        ),
+    )
+    query_bounds = np.repeat(
+        np.asarray([[40.25, 40.25, 47.75, 47.75]], dtype=np.float64),
+        101,
+        axis=0,
+    )
+
+    assert flat_index.regular_grid is not None
+    candidates, execution = spatial_index_device_query(flat_index, query_bounds)
+
+    assert candidates is not None
+    assert "brute-force" in execution.reason
+    gpu_left, gpu_right = candidates.to_host()
+    cpu_left, cpu_right = _cpu_bbox_pairs(query_bounds, flat_index.bounds)
+    assert set(zip(gpu_left.tolist(), gpu_right.tolist())) == set(
+        zip(cpu_left.tolist(), cpu_right.tolist())
+    )
+
+
+@requires_gpu
 def test_device_morton_dwithin_refines_with_expanded_bounds():
     """Morton dwithin retains near rows whose original bboxes do not overlap."""
     tree_geoms = np.asarray(

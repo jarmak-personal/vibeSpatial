@@ -320,8 +320,12 @@ def _query_regular_grid_rect_box_index(
             else 0
         )
         if total_pairs == 0:
-            empty = np.empty(0, dtype=np.int32)
-            return empty, empty
+            empty = cp.empty(0, dtype=cp.int32)
+            return _DeviceCandidates(
+                d_left=empty,
+                d_right=empty,
+                total_pairs=0,
+            )
 
         device_left = runtime.allocate((total_pairs,), np.int32)
         device_right = runtime.allocate((total_pairs,), np.int32)

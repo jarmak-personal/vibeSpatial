@@ -25,13 +25,23 @@ GeometryArray = _geometry_array.GeometryArray
 
 
 def _is_geometry_like_dtype(dtype) -> bool:
-    """Return True for GeometryDtype and DeviceGeometryDtype."""
+    """Return True for public host and device geometry extension dtypes.
+
+    Public compatibility boundaries can receive a ``GeometryDtype`` created
+    by the separately installed upstream GeoPandas package.  That class is not
+    identical to the repo-owned compatibility dtype, but both publish the same
+    extension-dtype name contract.
+    """
     if isinstance(dtype, GeometryDtype):
+        return True
+    if getattr(dtype, "name", None) == "geometry":
         return True
     try:
         from vibespatial.geometry.device_array import DeviceGeometryDtype
 
-        return isinstance(dtype, DeviceGeometryDtype)
+        return isinstance(dtype, DeviceGeometryDtype) or getattr(dtype, "name", None) == (
+            "device_geometry"
+        )
     except ImportError:
         return False
 

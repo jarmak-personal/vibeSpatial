@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import subprocess
 import sys
 import time
 import types
@@ -85,6 +86,41 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.io.wkb import encode_owned_wkb_device
 from vibespatial.runtime.residency import Residency, TransferTrigger
+
+
+def test_upstream_geopandas_geometry_dtype_writes_through_public_arrow_boundary(
+    tmp_path,
+) -> None:
+    """The installed upstream dtype must not depend on repo-shim class identity."""
+    output_path = tmp_path / "upstream-geopandas.parquet"
+    code = f"""
+from pathlib import Path
+
+import geopandas as upstream_geopandas
+from shapely.geometry import Point
+
+assert "/site-packages/geopandas/" in Path(upstream_geopandas.__file__).as_posix()
+
+import vibespatial.api.io  # noqa: F401
+
+frame = upstream_geopandas.GeoDataFrame(
+    {{"geometry": [Point(0, 0), Point(1, 1)], "value": [1, 2]}},
+    geometry="geometry",
+    crs="EPSG:4326",
+)
+frame.to_parquet({str(output_path)!r}, geometry_encoding="WKB")
+assert Path({str(output_path)!r}).is_file()
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.gpu

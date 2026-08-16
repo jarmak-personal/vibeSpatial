@@ -835,6 +835,84 @@ def test_query_spatial_index_handles_regular_grid_rectangle_boundaries() -> None
     assert indices.tolist() == [[0, 0, 0], [0, 1, 2]]
 
 
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+def test_regular_grid_admits_non_box_intersection_candidates(monkeypatch) -> None:
+    """Grid bbox admission remains a superset before exact refinement."""
+    tree = np.asarray(
+        [
+            box(float(col), float(row), float(col + 1), float(row + 1))
+            for row in range(100)
+            for col in range(100)
+        ],
+        dtype=object,
+    )
+    query = np.asarray(
+        [Point(45.0 + (index % 5), 45.0 + (index % 7)).buffer(3.5) for index in range(300)],
+        dtype=object,
+    )
+    owned, flat = build_owned_spatial_index(tree)
+
+    def fail_morton_or_brute_force(*_args, **_kwargs):
+        raise AssertionError("certified grid query should admit bbox candidates directly")
+
+    monkeypatch.setattr(
+        spatial_query_module,
+        "spatial_index_device_query",
+        fail_morton_or_brute_force,
+    )
+    indices = query_spatial_index(
+        owned,
+        flat,
+        query,
+        predicate="intersects",
+        sort=True,
+    )
+
+    expected_left, expected_right = np.nonzero(
+        shapely.intersects(query[:, None], tree[None, :])
+    )
+    assert flat.regular_grid is not None
+    np.testing.assert_array_equal(indices[0], expected_left)
+    np.testing.assert_array_equal(indices[1], expected_right)
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+def test_regular_grid_zero_hit_non_box_query_does_not_fall_back(monkeypatch) -> None:
+    """An empty grid result is terminal instead of triggering brute force."""
+    tree = np.asarray(
+        [
+            box(float(col), float(row), float(col + 1), float(row + 1))
+            for row in range(100)
+            for col in range(100)
+        ],
+        dtype=object,
+    )
+    query = np.asarray(
+        [Point(200.0 + index, 200.0).buffer(0.25) for index in range(300)],
+        dtype=object,
+    )
+    owned, flat = build_owned_spatial_index(tree)
+
+    def fail_morton_or_brute_force(*_args, **_kwargs):
+        raise AssertionError("an admitted empty grid result must be terminal")
+
+    monkeypatch.setattr(
+        spatial_query_module,
+        "spatial_index_device_query",
+        fail_morton_or_brute_force,
+    )
+    indices = query_spatial_index(
+        owned,
+        flat,
+        query,
+        predicate="intersects",
+        sort=True,
+    )
+
+    assert flat.regular_grid is not None
+    assert indices.shape == (2, 0)
+
+
 def test_geometry_array_full_setitem_preserves_owned_for_noop_full_assignment() -> None:
     geometry = GeometryArray.from_owned(
         from_shapely_geometries(

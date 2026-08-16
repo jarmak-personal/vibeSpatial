@@ -329,6 +329,10 @@ def spatial_index_device_query(
     has_morton = (
         total_bounds is not None
         and not np.isnan(total_bounds[0])
+        # Regular-grid indexes deliberately store identity keys/order because
+        # their exact grid metadata is the index.  Those placeholders are not
+        # Morton codes and must never be hydrated into the Morton range path.
+        and getattr(flat_index, "regular_grid", None) is None
         and (
             getattr(flat_index, "device_morton_keys", None) is not None
             or (
