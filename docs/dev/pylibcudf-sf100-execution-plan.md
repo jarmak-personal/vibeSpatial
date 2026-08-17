@@ -61,8 +61,8 @@ reusable physical-shape contract and exercised by an independent canary.
 - `src/vibespatial/api/_native_relation.py`
 - `src/vibespatial/io/geoparquet.py`
 - `src/vibespatial/io/pylibcudf.py`
-- `../sedona-spatialbench/spatialbench-queries/geopandas_optimized_queries.py`
-- `../sedona-spatialbench/spatialbench-queries/vibespatial_queries.py`
+- `benchmarks/spatialbench/geopandas_optimized_queries.py`
+- `benchmarks/spatialbench/vibespatial_queries.py`
 
 ## Risks
 

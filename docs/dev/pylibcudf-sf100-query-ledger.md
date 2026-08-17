@@ -5,7 +5,7 @@ Scope: Per-query semantic, physical-shape, memory, correctness, and benchmark ev
 Read If: You are changing an SF100 query path, native tabular primitive, memory estimate, export boundary, or performance claim.
 STOP IF: You only need the program milestones or architecture; open the execution plan instead.
 Source Of Truth: Query-level evidence ledger required by the pylibcudf SF100 execution plan.
-Body Budget: 204/260 lines
+Body Budget: 205/260 lines
 Document: docs/dev/pylibcudf-sf100-query-ledger.md
 
 Section Map (Body Lines)
@@ -14,13 +14,13 @@ Section Map (Body Lines)
 | 1-2 | Preamble |
 | 3-7 | Intent |
 | 8-14 | Request Signals |
-| 15-21 | Open First |
-| 22-27 | Verify |
-| 28-34 | Risks |
-| 35-68 | Measurement Contract And Shared Evidence |
-| 69-182 | Q1-Q12 Ledger |
-| 183-194 | Rejected Physical Shapes |
-| 195-204 | Artifact Map |
+| 15-22 | Open First |
+| 23-28 | Verify |
+| 29-35 | Risks |
+| 36-69 | Measurement Contract And Shared Evidence |
+| 70-183 | Q1-Q12 Ledger |
+| 184-195 | Rejected Physical Shapes |
+| 196-205 | Artifact Map |
 DOC_HEADER:END -->
 
 ## Intent
@@ -40,7 +40,8 @@ reproducible evidence for the SF100 pylibcudf performance program.
 - `docs/dev/pylibcudf-sf100-execution-plan.md`
 - `benchmark_results/spatialbench/sf100/2026-08-14-final-median/final_benchmark.json`
 - `benchmark_results/spatialbench/sf100/2026-08-14-final-median/telemetry_summary.json`
-- `../sedona-spatialbench/docs/queries.md`
+- `benchmarks/spatialbench/README.md`
+- `../sedona-spatialbench/docs/queries.md` (upstream SQL specification)
 
 ## Verify
 
