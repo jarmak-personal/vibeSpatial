@@ -490,7 +490,80 @@ class NativeNumericExpressionArray(ExtensionArray):
         if _is_device_array(values):
             import cupy as cp
 
-            d_values = cp.asarray(values, dtype=cp.float64)
+            d_source = cp.asarray(values)
+            source_dtype = np.dtype(d_source.dtype)
+            if source_dtype.kind in "iub":
+                if int(d_source.size) == 0:
+                    if name == "sum":
+                        result = 0 if min_count == 0 else np.nan
+                    elif name == "prod":
+                        result = 1 if min_count == 0 else np.nan
+                    elif name in {"mean", "min", "max"}:
+                        result = np.nan
+                    elif name == "any":
+                        result = False
+                    else:
+                        result = True
+                    if keepdims:
+                        return type(self)._from_sequence([result])
+                    return result
+
+                if name == "sum":
+                    if int(d_source.size) < min_count:
+                        reduced = cp.asarray(np.nan, dtype=cp.float64)
+                    else:
+                        reduced = cp.sum(
+                            d_source,
+                            dtype=cp.int64 if source_dtype.kind == "b" else None,
+                        )
+                elif name == "prod":
+                    if int(d_source.size) < min_count:
+                        reduced = cp.asarray(np.nan, dtype=cp.float64)
+                    else:
+                        reduced = cp.prod(
+                            d_source,
+                            dtype=cp.int64 if source_dtype.kind == "b" else None,
+                        )
+                elif name == "mean":
+                    reduced = cp.mean(d_source, dtype=cp.float64)
+                elif name == "min":
+                    reduced = cp.min(d_source)
+                elif name == "max":
+                    reduced = cp.max(d_source)
+                elif name == "any":
+                    reduced = cp.any(d_source != 0)
+                else:
+                    reduced = cp.all(d_source != 0)
+
+                record_native_export_boundary(
+                    NativeExportBoundary(
+                        surface=self.export_surface,
+                        operation=f"{self.export_operation}_{name}",
+                        target="scalar",
+                        reason="native numeric expression reduced to public scalar",
+                        row_count=len(self),
+                        d2h_transfer=True,
+                    )
+                )
+                result = np.asarray(
+                    _copy_device_to_host(
+                        cp.asarray(reduced).reshape(1),
+                        reason=f"{self.export_surface}::{self.export_operation}_{name}",
+                    )
+                )[0]
+                if name in {"any", "all"} or (
+                    source_dtype.kind == "b" and name in {"min", "max"}
+                ):
+                    result = bool(result)
+                elif name == "mean" or isinstance(result, np.floating):
+                    result = float(result)
+                else:
+                    result = int(result)
+                if keepdims:
+                    return type(self)._from_sequence([result])
+                return result
+
+            d_values = d_source.astype(cp.float64, copy=False)
             if int(d_values.size) == 0:
                 if name == "sum":
                     result = 0.0 if min_count == 0 else np.nan
@@ -567,7 +640,71 @@ class NativeNumericExpressionArray(ExtensionArray):
             else:
                 result = float(result)
         else:
-            host_values = np.asarray(values, dtype=np.float64)
+            host_source = np.asarray(values)
+            source_dtype = host_source.dtype
+            if source_dtype.kind in "iub":
+                if host_source.size == 0:
+                    if name == "sum":
+                        result = 0 if min_count == 0 else np.nan
+                    elif name == "prod":
+                        result = 1 if min_count == 0 else np.nan
+                    elif name in {"mean", "min", "max"}:
+                        result = np.nan
+                    elif name == "any":
+                        result = False
+                    else:
+                        result = True
+                elif name == "sum":
+                    result = (
+                        int(
+                            np.sum(
+                                host_source,
+                                dtype=(
+                                    np.int64 if source_dtype.kind == "b" else None
+                                ),
+                            )
+                        )
+                        if host_source.size >= min_count
+                        else np.nan
+                    )
+                elif name == "prod":
+                    result = (
+                        int(
+                            np.prod(
+                                host_source,
+                                dtype=(
+                                    np.int64 if source_dtype.kind == "b" else None
+                                ),
+                            )
+                        )
+                        if host_source.size >= min_count
+                        else np.nan
+                    )
+                elif name == "mean":
+                    result = float(np.mean(host_source, dtype=np.float64))
+                elif name == "min":
+                    reduced = np.min(host_source)
+                    result = (
+                        bool(reduced)
+                        if source_dtype.kind == "b"
+                        else int(reduced)
+                    )
+                elif name == "max":
+                    reduced = np.max(host_source)
+                    result = (
+                        bool(reduced)
+                        if source_dtype.kind == "b"
+                        else int(reduced)
+                    )
+                elif name == "any":
+                    result = bool(np.any(host_source != 0))
+                else:
+                    result = bool(np.all(host_source != 0))
+                if keepdims:
+                    return type(self)._from_sequence([result])
+                return result
+
+            host_values = host_source.astype(np.float64, copy=False)
             if host_values.size == 0:
                 if name == "sum":
                     result = 0.0 if min_count == 0 else np.nan

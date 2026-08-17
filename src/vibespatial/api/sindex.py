@@ -594,6 +594,313 @@ class SpatialIndex:
             relation=reusable_relation,
         )
 
+    def query_pair_aggregate(
+        self,
+        other,
+        geometry,
+        *,
+        predicate=None,
+        distance=None,
+    ) -> pd.DataFrame:
+        """Aggregate common query matches for two aligned spatial indexes.
+
+        ``self`` and ``other`` must index the same number of position-aligned
+        geometries. For every indexed row, the result contains the number of
+        matches from each index and the number of query geometries matched by
+        both indexed geometries at that row position. Query-row duplicates and
+        overlapping query geometries retain their ordinary spatial-join
+        multiplicity.
+
+        The eager pandas result has a ``RangeIndex`` aligned to indexed row
+        positions and columns ``left_count``, ``right_count``, and
+        ``shared_count``. Device-backed inputs consume both native relations
+        without exporting pair arrays; computed columns remain device-backed
+        until an explicit public scalar or array export.
+        """
+        if not isinstance(other, SpatialIndex):
+            raise TypeError("other must be a SpatialIndex")
+        if other.size != self.size:
+            raise ValueError("query pair aggregate indexes must have equal size")
+
+        query_row_count, scalar = self._query_cardinality(geometry)
+        output_index = pd.RangeIndex(self.size)
+        native, fallback_state = self._query_pair_aggregate_native(
+            other,
+            geometry,
+            predicate=predicate,
+            distance=distance,
+            query_row_count=query_row_count,
+            output_index=output_index,
+        )
+        if native is not None:
+            return native
+
+        record_fallback_event(
+            surface="vibespatial.api.SpatialIndex.query_pair_aggregate",
+            requested=get_requested_mode(),
+            selected=ExecutionMode.CPU,
+            reason=(
+                "query pair aggregate requires aligned owned geometry and "
+                "device relation consumption"
+            ),
+            detail=(
+                f"predicate={predicate!r}, query_rows={query_row_count}, "
+                f"tree_rows={self.size}"
+            ),
+            pipeline="spatial_query_pair_aggregate",
+            d2h_transfer=fallback_state is not None,
+        )
+        return self._query_pair_aggregate_host(
+            other,
+            geometry,
+            predicate=predicate,
+            distance=distance,
+            query_row_count=query_row_count,
+            scalar=scalar,
+            output_index=output_index,
+            fallback_state=fallback_state,
+        )
+
+    def _query_pair_aggregate_native(
+        self,
+        other,
+        geometry,
+        *,
+        predicate,
+        distance,
+        query_row_count: int,
+        output_index,
+    ):
+        if get_requested_mode() is ExecutionMode.CPU:
+            return None, None
+        if not (
+            self._supports_owned_query_input(geometry)
+            and other._supports_owned_query_input(geometry)
+        ):
+            return None, None
+        if predicate is None or predicate == "dwithin" or distance is not None:
+            return None, None
+
+        from vibespatial.api._native_expression import NativeExpression
+        from vibespatial.api._native_public_arrays import NativeNumericExpressionArray
+        query_input = self._owned_query_input(geometry)
+        if not isinstance(query_input, OwnedGeometryArray):
+            return None, None
+        other_tree_owned, other_flat_index = other._owned_flat_sindex()
+
+        from vibespatial.kernels.core.geometry_analysis import (
+            compute_geometry_bounds_device,
+        )
+
+        query_bounds = compute_geometry_bounds_device(
+            query_input,
+            preserve_indexed_view=True,
+        )
+        left_native_index = self._native_spatial_index_for_query()
+        pair_expressions, left_execution = (
+            left_native_index.query_right_pair_match_count_expressions(
+                query_input,
+                other_tree_owned,
+                other_flat_index,
+                predicate=predicate,
+                query_row_count=query_row_count,
+                return_metadata=True,
+                precomputed_query_bounds=query_bounds,
+            )
+        )
+        if (
+            pair_expressions is None
+            or left_execution is None
+            or left_execution.selected is not ExecutionMode.GPU
+        ):
+            return None, None
+        if len(pair_expressions) == 3:
+            left_expression, right_expression, shared_expression = pair_expressions
+            right_execution = left_execution
+        else:
+            left_expression, shared_expression = pair_expressions
+            right_native_index = other._native_spatial_index_for_query()
+            right_expression, right_execution = (
+                right_native_index.query_right_match_count_expression(
+                    query_input,
+                    predicate=predicate,
+                    distance=None,
+                    query_row_count=query_row_count,
+                    return_metadata=True,
+                    precomputed_query_bounds=query_bounds,
+                )
+            )
+            if (
+                right_expression is None
+                or right_execution is None
+                or right_execution.selected is not ExecutionMode.GPU
+            ):
+                return None, None
+
+        values_by_name = {
+            "left_count": left_expression.values,
+            "right_count": right_expression.values,
+            "shared_count": shared_expression.values,
+        }
+        columns = {}
+        for name, values in values_by_name.items():
+            expression = NativeExpression(
+                operation=f"spatial_query_pair_aggregate.{name}",
+                values=values,
+                source_token=None,
+                source_row_count=self.size,
+                dtype=str(getattr(values, "dtype", "")) or None,
+                precision="relation-co-membership",
+                null_policy="nan-false",
+            )
+            columns[name] = pd.Series(
+                NativeNumericExpressionArray(
+                    expression,
+                    export_surface=(
+                        "vibespatial.api.SpatialIndex.query_pair_aggregate"
+                    ),
+                    export_operation="query_pair_aggregate_column_to_public_array",
+                ),
+                index=output_index,
+                name=name,
+            )
+        result = pd.DataFrame(columns, index=output_index)
+        record_dispatch_event(
+            surface="vibespatial.api.SpatialIndex.query_pair_aggregate",
+            operation="query_pair_aggregate",
+            implementation=(
+                f"{left_execution.implementation}+{right_execution.implementation}"
+            ),
+            reason=(
+                "bounded Morton candidate tiles reduced first, second, and "
+                "shared aligned predicate matches before public export"
+            ),
+            detail=(
+                f"predicate={predicate!r}, query_rows={query_row_count}, "
+                f"tree_rows={self.size}"
+            ),
+            requested=left_execution.requested,
+            selected=ExecutionMode.GPU,
+        )
+        return result, None
+
+    @staticmethod
+    def _query_pair_host_pairs(index, geometry, *, predicate, distance, scalar, relation):
+        pairs = (
+            index.query(
+                geometry,
+                predicate=predicate,
+                distance=distance,
+                sort=False,
+            )
+            if relation is None
+            else index._public_relation_indices_to_host(relation, scalar=scalar)
+        )
+        if pairs.ndim == 1:
+            return (
+                np.zeros(len(pairs), dtype=np.int64),
+                np.asarray(pairs, dtype=np.int64),
+            )
+        return (
+            np.asarray(pairs[0], dtype=np.int64),
+            np.asarray(pairs[1], dtype=np.int64),
+        )
+
+    @staticmethod
+    def _query_pair_host_structured_keys(query_rows, tree_rows):
+        keys = np.empty(
+            len(query_rows),
+            dtype=[("tree", np.int64), ("query", np.int64)],
+        )
+        keys["tree"] = tree_rows
+        keys["query"] = query_rows
+        return keys
+
+    def _query_pair_aggregate_host(
+        self,
+        other,
+        geometry,
+        *,
+        predicate,
+        distance,
+        query_row_count: int,
+        scalar: bool,
+        output_index,
+        fallback_state,
+    ) -> pd.DataFrame:
+        state = fallback_state or {}
+        left_relation = state.get("left_relation")
+        left_counts = state.get("left_counts")
+        shared_counts = state.get("shared_counts")
+        if left_counts is not None and shared_counts is not None:
+            from vibespatial.cuda._runtime import get_cuda_runtime
+
+            runtime = get_cuda_runtime()
+            left_counts = np.asarray(
+                runtime.copy_device_to_host(
+                    left_counts,
+                    reason="query pair aggregate CPU fallback left counts",
+                ),
+                dtype=np.int64,
+            )
+            shared_counts = np.asarray(
+                runtime.copy_device_to_host(
+                    shared_counts,
+                    reason="query pair aggregate CPU fallback shared counts",
+                ),
+                dtype=np.int64,
+            )
+            left_query_rows = None
+            left_tree_rows = None
+        else:
+            left_query_rows, left_tree_rows = self._query_pair_host_pairs(
+                self,
+                geometry,
+                predicate=predicate,
+                distance=distance,
+                scalar=scalar,
+                relation=left_relation,
+            )
+            left_counts = np.bincount(
+                left_tree_rows,
+                minlength=self.size,
+            ).astype(np.int64, copy=False)
+
+        right_query_rows, right_tree_rows = self._query_pair_host_pairs(
+            other,
+            geometry,
+            predicate=predicate,
+            distance=distance,
+            scalar=scalar,
+            relation=state.get("right_relation"),
+        )
+        right_counts = np.bincount(
+            right_tree_rows,
+            minlength=self.size,
+        ).astype(np.int64, copy=False)
+        if shared_counts is None:
+            left_structured = self._query_pair_host_structured_keys(
+                left_query_rows,
+                left_tree_rows,
+            )
+            right_structured = self._query_pair_host_structured_keys(
+                right_query_rows,
+                right_tree_rows,
+            )
+            shared = np.intersect1d(left_structured, right_structured)
+            shared_counts = np.bincount(
+                shared["tree"],
+                minlength=self.size,
+            ).astype(np.int64, copy=False)
+        return pd.DataFrame(
+            {
+                "left_count": left_counts,
+                "right_count": right_counts,
+                "shared_count": shared_counts,
+            },
+            index=output_index,
+        )
+
     @staticmethod
     def _normalize_query_aggregations(aggregations):
         if not isinstance(aggregations, Mapping) or not aggregations:

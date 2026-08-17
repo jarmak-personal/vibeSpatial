@@ -587,8 +587,181 @@ class LazyGroupedUnionOwned:
             return None
         return materialized._current_cached_validity_mask()
 
-    def take(self, *args, **kwargs):
-        return self._materialize_owned().take(*args, **kwargs)
+    def _take_grouped_hull_source(self, indices):
+        """Subset delayed output groups without materializing their unions."""
+        if self._exact_materializer is not None:
+            return None
+        grouped_hull_source = self._grouped_convex_hull_source
+        if grouped_hull_source is None:
+            return None
+
+        ordered_owned, group_offsets = grouped_hull_source
+        use_device = _is_device_array(group_offsets) or _is_device_array(indices)
+        xp = cp if use_device else np
+        if xp is None:
+            return None
+        selected_groups = xp.asarray(indices)
+        if selected_groups.ndim != 1:
+            return None
+        if selected_groups.dtype.kind == "b":
+            if int(selected_groups.size) != self.row_count:
+                return None
+            selected_groups = xp.nonzero(selected_groups)[0]
+        elif selected_groups.dtype.kind not in {"i", "u"}:
+            return None
+        selected_groups = selected_groups.astype(xp.int64, copy=False)
+        if xp is np:
+            selected_groups = np.where(
+                selected_groups < 0,
+                selected_groups + self.row_count,
+                selected_groups,
+            )
+        else:
+            selected_groups = xp.where(
+                selected_groups < 0,
+                selected_groups + self.row_count,
+                selected_groups,
+            )
+
+        offsets = xp.asarray(group_offsets, dtype=xp.int64)
+        source_starts = offsets[selected_groups]
+        member_counts = offsets[selected_groups + 1] - source_starts
+        selected_offsets = xp.concatenate(
+            [
+                xp.asarray([0], dtype=xp.int64),
+                xp.cumsum(member_counts, dtype=xp.int64),
+            ]
+        )
+        if use_device:
+            if int(selected_groups.size):
+                from vibespatial.cuda._runtime import (
+                    count_scatter_total,
+                    get_cuda_runtime,
+                )
+
+                selected_row_count = count_scatter_total(
+                    get_cuda_runtime(),
+                    member_counts,
+                    selected_offsets[:-1],
+                    reason="lazy grouped-union selected-member allocation fence",
+                )
+            else:
+                selected_row_count = 0
+            output_slots = xp.arange(selected_row_count, dtype=xp.int64)
+            selected_group_rows = xp.searchsorted(
+                selected_offsets[1:],
+                output_slots,
+                side="right",
+            )
+            ordered_member_positions = (
+                source_starts[selected_group_rows]
+                + output_slots
+                - selected_offsets[selected_group_rows]
+            )
+        else:
+            repeated_source_starts = xp.repeat(source_starts, member_counts)
+            repeated_output_starts = xp.repeat(selected_offsets[:-1], member_counts)
+            selected_row_count = int(repeated_source_starts.size)
+            ordered_member_positions = (
+                repeated_source_starts
+                + xp.arange(selected_row_count, dtype=xp.int64)
+                - repeated_output_starts
+            )
+        selected_source = ordered_owned.take(ordered_member_positions)
+        selected_grouped = NativeGrouped.from_sorted_offsets(
+            selected_offsets,
+            row_count=selected_row_count,
+            all_groups_observed=True,
+        )
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+
+        selected_geometries = DeviceGeometryArray._from_owned(
+            selected_source,
+            crs=self._crs,
+        )
+        selected = type(self)(
+            source_owned=selected_source,
+            grouped=selected_grouped,
+            geometries=selected_geometries,
+            method=self._method,
+            grid_size=self._grid_size,
+            geometry_name=self._geometry_name,
+            crs=self._crs,
+            source_provenance=self._source_provenance,
+        )
+        record_dispatch_event(
+            surface="vibespatial.overlay.dissolve.LazyGroupedUnionOwned",
+            operation="take_grouped_union_rows",
+            implementation="native_grouped_member_take",
+            reason=(
+                "selected dissolve groups retained their grouped source members "
+                "without materializing exact unions"
+            ),
+            detail=(
+                f"input_groups={self.row_count}, output_groups={selected.row_count}, "
+                f"source_rows={selected_source.row_count}"
+            ),
+            requested=ExecutionMode.GPU,
+            selected=(
+                ExecutionMode.GPU
+                if selected_source.residency.value == "device"
+                else ExecutionMode.CPU
+            ),
+        )
+        return selected
+
+    def _validate_take_index_domain(self, indices) -> None:
+        indices_on_device = _is_device_array(indices)
+        xp = cp if indices_on_device else np
+        if xp is None:
+            return
+        values = xp.asarray(indices)
+        if values.ndim != 1 or values.dtype.kind not in {"i", "u"}:
+            return
+        invalid = (values < -self.row_count) | (values >= self.row_count)
+        if indices_on_device:
+            invalid_any = int(values.size) and overlay_bool_scalar(
+                xp.any(invalid),
+                reason="lazy grouped-union take index-domain validation fence",
+            )
+        else:
+            invalid_any = bool(np.any(invalid))
+        if invalid_any:
+            raise IndexError("grouped union take index out of bounds")
+
+    def take(self, indices):
+        self._validate_take_index_domain(indices)
+        materialized = self._materialized_owned
+        if materialized is not None:
+            return materialized.take(indices)
+        selected = self._take_grouped_hull_source(indices)
+        if selected is not None:
+            return selected
+        return self._materialize_owned().take(indices)
+
+    def device_take(self, indices, **kwargs):
+        self._validate_take_index_domain(
+            kwargs.get("host_indices_for_sizing", indices)
+        )
+        materialized = self._materialized_owned
+        if materialized is not None:
+            return materialized.device_take(indices, **kwargs)
+        selected = self._take_grouped_hull_source(indices)
+        if selected is not None:
+            return selected
+        return self._materialize_owned().device_take(indices, **kwargs)
+
+    def _device_indexed_take(self, indices, **kwargs):
+        self._validate_take_index_domain(
+            kwargs.get("host_indices_for_metadata", indices)
+        )
+        materialized = self._materialized_owned
+        if materialized is not None:
+            return materialized._device_indexed_take(indices, **kwargs)
+        selected = self._take_grouped_hull_source(indices)
+        if selected is not None:
+            return selected
+        return self._materialize_owned()._device_indexed_take(indices, **kwargs)
 
     def to_owned(self) -> OwnedGeometryArray:
         """Materialize the delayed union through the standard owned protocol."""

@@ -146,6 +146,8 @@ class NativeFrameState:
         )
         if owned is None:
             return
+        if getattr(owned, "_is_lazy_grouped_union_owned", False):
+            return
         state = getattr(owned, "device_state", None)
         if state is None and getattr(owned, "residency", None) is Residency.DEVICE:
             state = owned._ensure_device_state(preserve_indexed_view=True)

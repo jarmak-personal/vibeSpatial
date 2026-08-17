@@ -24,7 +24,12 @@ import vibespatial.spatial.query_utils as spatial_query_utils_module
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
-from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
+from vibespatial.runtime import (
+    ExecutionMode,
+    RuntimeSelection,
+    has_gpu_runtime,
+    set_requested_mode,
+)
 from vibespatial.runtime.precision import PrecisionMode
 from vibespatial.runtime.residency import Residency
 from vibespatial.spatial.indexing import build_flat_spatial_index
@@ -3078,6 +3083,50 @@ def test_sindex_query_aggregate_is_eager_public_dataframe() -> None:
         )
 
 
+def test_sindex_query_pair_aggregate_preserves_overlap_multiplicity() -> None:
+    import pandas as pd
+
+    from vibespatial.api import GeoSeries
+
+    pickup = GeoSeries(
+        [Point(0, 0), Point(1, 1), Point(10, 10), Point(20, 20)]
+    )
+    dropoff = GeoSeries(
+        [Point(1, 1), Point(2.5, 2.5), Point(0, 0), Point(0, 0)]
+    )
+    zones = GeoSeries(
+        [
+            box(-1, -1, 2, 2),
+            box(0.5, 0.5, 3, 3),
+            box(9, 9, 11, 11),
+        ]
+    )
+
+    result = pickup.sindex.query_pair_aggregate(
+        dropoff.sindex,
+        zones,
+        predicate="contains",
+    )
+
+    assert type(result) is pd.DataFrame
+    assert result.index.equals(pd.RangeIndex(4))
+    assert result.to_dict("list") == {
+        "left_count": [1, 2, 1, 0],
+        "right_count": [2, 1, 1, 1],
+        "shared_count": [1, 1, 0, 0],
+    }
+    assert int(
+        (result["left_count"] * result["right_count"]).sum()
+        - result["shared_count"].sum()
+    ) == 3
+    with pytest.raises(ValueError, match="equal size"):
+        pickup.sindex.query_pair_aggregate(
+            GeoSeries([Point(0, 0)]).sindex,
+            zones,
+            predicate="contains",
+        )
+
+
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
 def test_sindex_query_aggregate_consumes_native_relation_before_export(
     tmp_path,
@@ -3235,6 +3284,299 @@ def test_sindex_query_aggregate_consumes_native_relation_before_export(
     assert cpu_selected["bool_sum"].dtype == np.dtype(np.int64)
 
 
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_pair_aggregate_reduces_candidate_tiles_before_export(
+    tmp_path,
+) -> None:
+    from vibespatial.api import GeoDataFrame, GeoSeries, points_from_xy, read_parquet
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        get_d2h_transfer_stats,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+
+    source = GeoDataFrame(
+        {
+            "dropoff": points_from_xy([1, 2.5, 0, 0], [1, 2.5, 0, 0]),
+        },
+        geometry=points_from_xy([0, 1, 10, 20], [0, 1, 10, 20]),
+        crs="EPSG:4326",
+    ).rename_geometry("pickup")
+    source["dropoff"] = source["dropoff"].set_crs(source.crs)
+    path = tmp_path / "query-pair-aggregate.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    source = read_parquet(path)
+    pickup = source.set_geometry("pickup").geometry
+    dropoff = source.set_geometry("dropoff").geometry
+    zones = GeoSeries(
+        [
+            box(-1, -1, 2, 2),
+            box(0.5, 0.5, 3, 3),
+            box(9, 9, 11, 11),
+        ],
+        crs=source.crs,
+    )
+
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+    clear_dispatch_events()
+    clear_fallback_events()
+    result = pickup.sindex.query_pair_aggregate(
+        dropoff.sindex,
+        zones,
+        predicate="contains",
+    )
+    transfer_count, transfer_bytes = get_d2h_transfer_stats()
+    transfer_events = get_d2h_transfer_events()
+    materializations = get_materialization_events(clear=True)
+    dispatch = get_dispatch_events(clear=True)
+
+    assert get_fallback_events(clear=True) == []
+    assert all(
+        type(result[column].array).__name__ == "NativeNumericExpressionArray"
+        for column in result.columns
+    )
+    assert not any(
+        event.operation == "sindex_query_relation_indices_to_host"
+        for event in materializations
+    )
+    assert transfer_count <= 8
+    assert transfer_bytes <= 1024
+    assert max(event.item_count for event in transfer_events) <= 33
+    assert not any(
+        event.reason == "point-grid conservative candidate allocation fence"
+        for event in transfer_events
+    )
+    assert any(
+        event.surface == "vibespatial.api.SpatialIndex.query_pair_aggregate"
+        and event.selected is ExecutionMode.GPU
+        for event in dispatch
+    )
+    cross_count = (
+        (result["left_count"] * result["right_count"]).sum()
+        - result["shared_count"].sum()
+    )
+    assert isinstance(cross_count, int)
+    assert cross_count == 3
+    assert result["left_count"].to_numpy().tolist() == [1, 2, 1, 0]
+    assert result["right_count"].to_numpy().tolist() == [2, 1, 1, 1]
+    assert result["shared_count"].to_numpy().tolist() == [1, 1, 0, 0]
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_pair_aggregate_respects_explicit_cpu_mode(tmp_path) -> None:
+    from vibespatial.api import GeoDataFrame, GeoSeries, points_from_xy, read_parquet
+    from vibespatial.api._native_public_arrays import NativeNumericExpressionArray
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+
+    source = GeoDataFrame(
+        {"dropoff": points_from_xy([0.0, 10.0], [0.0, 0.0])},
+        geometry=points_from_xy([0.0, 10.0], [0.0, 0.0]),
+        crs="EPSG:3857",
+    ).rename_geometry("pickup")
+    source["dropoff"] = source["dropoff"].set_crs(source.crs)
+    path = tmp_path / "query-pair-explicit-cpu.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    source = read_parquet(path)
+    pickup = source.set_geometry("pickup").geometry
+    dropoff = source.set_geometry("dropoff").geometry
+    zones = GeoSeries(
+        [box(-1.0, -1.0, 1.0, 1.0), box(9.0, -1.0, 11.0, 1.0)],
+        crs=source.crs,
+    )
+
+    clear_dispatch_events()
+    clear_fallback_events()
+    with set_requested_mode(ExecutionMode.CPU):
+        result = pickup.sindex.query_pair_aggregate(
+            dropoff.sindex,
+            zones,
+            predicate="contains",
+        )
+    dispatch = get_dispatch_events(clear=True)
+    fallback = get_fallback_events(clear=True)
+
+    assert all(
+        not isinstance(result[column].array, NativeNumericExpressionArray)
+        for column in result.columns
+    )
+    assert result.to_dict("list") == {
+        "left_count": [1, 1],
+        "right_count": [1, 1],
+        "shared_count": [1, 1],
+    }
+    assert not any(
+        event.surface == "vibespatial.api.SpatialIndex.query_pair_aggregate"
+        and event.selected is ExecutionMode.GPU
+        for event in dispatch
+    )
+    pair_fallback = next(
+        event
+        for event in fallback
+        if event.surface == "vibespatial.api.SpatialIndex.query_pair_aggregate"
+    )
+    assert pair_fallback.requested is ExecutionMode.CPU
+    assert pair_fallback.selected is ExecutionMode.CPU
+
+
+def _bounded_pair_aggregate_inputs(tmp_path):
+    from vibespatial.api import GeoDataFrame, points_from_xy, read_parquet
+
+    x = np.asarray([0.0, 10.0, 20.0, 0.0, 10.0, 20.0])
+    y = np.asarray([0.0, 0.0, 0.0, 10.0, 10.0, 10.0])
+    source = GeoDataFrame(
+        {"dropoff": points_from_xy(x, y)},
+        geometry=points_from_xy(x, y),
+        crs="EPSG:3857",
+    ).rename_geometry("pickup")
+    source["dropoff"] = source["dropoff"].set_crs(source.crs)
+    path = tmp_path / "query-pair-bounded-grid.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    source = read_parquet(path)
+    return (
+        source.set_geometry("pickup").geometry,
+        source.set_geometry("dropoff").geometry,
+    )
+
+
+def _record_pair_reduction_tile_sizes(monkeypatch, *, pair_budget: int = 2):
+    import vibespatial.spatial.point_grid_index as point_grid_module
+    import vibespatial.spatial.spatial_index_device as device_module
+
+    capacities = []
+    tile_sizes = []
+    original_superset_query = point_grid_module.point_grid_superset_query
+    original_classifier = device_module._classify_homogeneous_reduction_tile
+
+    def recording_superset_query(*args, **kwargs):
+        capacity = kwargs.get("pair_capacity")
+        if capacity is not None:
+            capacities.append(int(capacity))
+        return original_superset_query(*args, **kwargs)
+
+    def recording_classifier(*args, **kwargs):
+        tile_sizes.append(int(args[3].size))
+        return original_classifier(*args, **kwargs)
+
+    monkeypatch.setattr(
+        point_grid_module,
+        "point_grid_superset_query",
+        recording_superset_query,
+    )
+    monkeypatch.setattr(point_grid_module, "_MIN_POINT_GRID_ROWS", 1)
+    monkeypatch.setattr(
+        device_module,
+        "_classify_homogeneous_reduction_tile",
+        recording_classifier,
+    )
+    monkeypatch.setattr(
+        device_module,
+        "_spatial_reduction_tile_lane_capacity",
+        lambda *_args, **_kwargs: pair_budget,
+    )
+    return capacities, tile_sizes
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_pair_aggregate_consumes_multiple_bounded_grid_partitions(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from vibespatial.api import GeoSeries
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+
+    pickup, dropoff = _bounded_pair_aggregate_inputs(tmp_path)
+    zones = GeoSeries(
+        [
+            box(x - 1.0, y - 1.0, x + 1.0, y + 1.0)
+            for x, y in (
+                (0.0, 0.0),
+                (10.0, 0.0),
+                (20.0, 0.0),
+                (0.0, 10.0),
+                (10.0, 10.0),
+                (20.0, 10.0),
+            )
+        ],
+        crs=pickup.crs,
+    )
+    capacities, tile_sizes = _record_pair_reduction_tile_sizes(monkeypatch)
+
+    clear_fallback_events()
+    clear_materialization_events()
+    result = pickup.sindex.query_pair_aggregate(
+        dropoff.sindex,
+        zones,
+        predicate="contains",
+    )
+    materializations = get_materialization_events(clear=True)
+
+    assert get_fallback_events(clear=True) == []
+    assert result.to_dict("list") == {
+        "left_count": [1] * 6,
+        "right_count": [1] * 6,
+        "shared_count": [1] * 6,
+    }
+    assert len(capacities) > 2
+    assert capacities and max(capacities) <= 2
+    assert tile_sizes and max(tile_sizes) <= 2
+    assert not any(
+        event.operation == "sindex_query_relation_indices_to_host"
+        for event in materializations
+    )
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_pair_aggregate_tiles_single_oversized_grid_row(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from vibespatial.api import GeoSeries
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+
+    pickup, dropoff = _bounded_pair_aggregate_inputs(tmp_path)
+    zones = GeoSeries([box(-1.0, -1.0, 21.0, 11.0)], crs=pickup.crs)
+    capacities, tile_sizes = _record_pair_reduction_tile_sizes(monkeypatch)
+
+    clear_fallback_events()
+    clear_materialization_events()
+    result = pickup.sindex.query_pair_aggregate(
+        dropoff.sindex,
+        zones,
+        predicate="contains",
+    )
+    materializations = get_materialization_events(clear=True)
+
+    assert get_fallback_events(clear=True) == []
+    assert result.to_dict("list") == {
+        "left_count": [1] * 6,
+        "right_count": [1] * 6,
+        "shared_count": [1] * 6,
+    }
+    assert capacities == []
+    assert len(tile_sizes) >= 9
+    assert max(tile_sizes) <= 2
+    assert not any(
+        event.operation == "sindex_query_relation_indices_to_host"
+        for event in materializations
+    )
+
+
 def test_sindex_query_return_device_rejects_dense_sparse_exports() -> None:
     """Dense/sparse query outputs are public exports, not native carriers."""
     from vibespatial.api import GeoSeries
@@ -3252,6 +3594,45 @@ def test_sindex_query_return_device_rejects_dense_sparse_exports() -> None:
             output_format="sparse",
             return_device=True,
         )
+
+
+def test_point_grid_block_partitions_never_exceed_pair_budget() -> None:
+    from vibespatial.spatial.point_grid_index import (
+        _count_bounded_block_partitions,
+    )
+
+    partitions = _count_bounded_block_partitions(
+        np.asarray([6, 6, 6], dtype=np.int64),
+        block_size=2,
+        query_count=5,
+        pair_budget=10,
+    )
+
+    assert partitions == ((0, 2, 6), (2, 4, 6), (4, 5, 6))
+    assert all(capacity <= 10 for _, _, capacity in partitions)
+
+
+def test_point_grid_block_partitions_decline_oversized_block() -> None:
+    from vibespatial.spatial.point_grid_index import (
+        _count_bounded_block_partitions,
+    )
+
+    assert (
+        _count_bounded_block_partitions(
+            np.asarray([11], dtype=np.int64),
+            block_size=2,
+            query_count=2,
+            pair_budget=10,
+        )
+        is None
+    )
+    assert _count_bounded_block_partitions(
+        np.asarray([3, 11, 4], dtype=np.int64),
+        block_size=1,
+        query_count=3,
+        pair_budget=10,
+        admit_oversized=True,
+    ) == ((0, 1, 3), (1, 2, 11), (2, 3, 4))
 
 
 def test_sindex_query_dense_public_export_uses_native_relation() -> None:

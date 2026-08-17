@@ -5,7 +5,7 @@ Scope: Per-query semantic, physical-shape, memory, correctness, and benchmark ev
 Read If: You are changing an SF100 query path, native tabular primitive, memory estimate, export boundary, or performance claim.
 STOP IF: You only need the program milestones or architecture; open the execution plan instead.
 Source Of Truth: Query-level evidence ledger required by the pylibcudf SF100 execution plan.
-Body Budget: 201/260 lines
+Body Budget: 204/260 lines
 Document: docs/dev/pylibcudf-sf100-query-ledger.md
 
 Section Map (Body Lines)
@@ -17,10 +17,10 @@ Section Map (Body Lines)
 | 15-21 | Open First |
 | 22-27 | Verify |
 | 28-34 | Risks |
-| 35-67 | Measurement Contract And Shared Evidence |
-| 68-181 | Q1-Q12 Ledger |
-| 182-192 | Rejected Physical Shapes |
-| 193-201 | Artifact Map |
+| 35-68 | Measurement Contract And Shared Evidence |
+| 69-182 | Q1-Q12 Ledger |
+| 183-194 | Rejected Physical Shapes |
+| 195-204 | Artifact Map |
 DOC_HEADER:END -->
 
 ## Intent
@@ -69,10 +69,11 @@ timing. Thus `device pipeline` below is the measured scan/compute/public-result
 aggregate, not an inferred kernel-only time. The earlier stage-attribution
 profile remains the before-state for Q3, Q4, Q7, and Q12.
 
-The completion audit reran all twelve queries at commit `c74a773` with one
-warmup and three measured runs. The 641.76 s VS sum is 12.742x faster than the
-unchanged 8,177.23 s optimized-GPD baseline; all outputs pass the SF100
-same-data oracle and every per-query timing remains within the 5% gate.
+The completion audit uses one warmup and three measured runs in isolated
+per-engine/query processes. Final medians sum to 555.60 s for VS and 8,086.00 s
+for optimized GPD, or 14.554x. Changed Q5/Q6/Q10/Q11 medians replace only their
+older frozen samples; unchanged query distributions remain the committed
+same-contract measurements.
 
 All queries pass the SF1 canonical-answer oracle and the same-data SF100
 optimized-GeoPandas comparison at `rtol=1e-6`, `atol=1e-9`. Q10 differs only by
@@ -132,9 +133,9 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 
 - Semantics/schema/order: customer/month groups with count >5; `c_custkey, customer_name, pickup_month, monthly_travel_hull_area, dropoff_count`; area descending, key/month ascending; 100 rows.
 - Projection/pushdown: trip customer key, pickup time, dropoff geometry; customer key/name; HAVING applies after grouping.
-- Shapes/chain/export: packed customer/month codes -> `NativeGrouped` point collections -> grouped convex hull/area -> bounded top-k -> terminal pandas.
-- Primitive/budget: pylibcudf grouping plus custom segmented hull; input coordinates + group codes/offsets + admitted hull output, processed by source shard and merged as compact group/hull state; top-k formula applies to `G`.
-- Measured after: profiled pipeline 135.06 s; D2H 1.4817 s / 10.34 GB at an explicit public arithmetic boundary; 16.21 / 12.83 / 11.17 GiB; clean GPD 834.69 s versus VS 126.94 s (6.58x).
+- Shapes/chain/export: two public scans; packed codes -> fixed-domain device count -> eligible-row gather -> bounded GeoParquet partitions -> `NativeGrouped` point collections -> selected grouped hull/area -> top-k -> pandas.
+- Primitive/budget: public device `dense_count`/`numeric_take`, custom segmented hull, and lazy selected-group member gather; the dense count is 384M `uint32` rows (1.536 GB), partitions are sized from eligible `G`, and only 100 hull/count rows export.
+- Measured after: VS median 17.20 s (`17.20, 17.28, 17.16`); D2H 0.5260 s / 738.91 MB at validation and explicit GeoParquet/public boundaries; cold profile 17.40 GB process peak / 13.78 GB reserved / 11.996 GB largest admission. Optimized GPD is 743.46 s (`746.27, 742.66, 743.46`), or 43.22x, with 5.05-GiB four-pass maximum RSS after replacing the geometry-bearing count pass with attribute-only batches.
 - Correctness/fallback: all groups compute hull before ranking, degenerate hulls have exact area semantics, customer/name/month/null/tie contracts pass SF1/SF100; no library fallback.
 
 ### Q6: Sedona-Radius Zone Statistics
@@ -187,9 +188,9 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 
 - Semantics/schema/order: pickup and dropoff each locate to a zone, count rows whose zone keys differ; scalar `cross_zone_trip_count`; one row.
 - Projection/pushdown: zone key/boundary; trip key, pickup and dropoff geometry; endpoints are processed separately to keep candidate shapes bounded.
-- Shapes/chain/export: cached point grid -> pickup/dropoff location relations -> key inequality/count reduction -> scalar pandas.
-- Primitive/budget: custom grid/refinement plus pylibcudf relation reducer; each endpoint uses the grid/relation budget independently, with compact keyed partial counts merged across shards.
-- Measured after: profiled pipeline 269.22 s; D2H 1.6361 s / 14.10 GB at explicit public reducers; 13.20 / 12.76 / 5.62 GiB; clean GPD 3,127.50 s versus VS 266.42 s (11.74x).
+- Shapes/chain/export: cached point grid -> paired aligned-index location-count reduction -> public device count columns -> scalar pandas.
+- Primitive/budget: exact-capacity point-grid tiles reduce left, right, and shared query membership before pair export; device-reduced 32-row planning blocks cross once per input batch, while isolated rows above the candidate budget use bounded dense tree-row tiles. The public result is three indexed-row-sized count columns, not either full endpoint relation.
+- Measured after: VS median 311.34 s (`311.34, 311.64, 311.34`); 2,161 compact planning/public-scalar transfers total 79.60 MB with no candidate-allocation fence; zero fallback, 11.62 GB peak live RMM allocation, and 23.77 GB warm pool reservation. Clean optimized GPD is 3,127.50 s, or 10.05x.
 - Correctness/fallback: rows with an unlocated/null endpoint do not join, multiplicity follows SQL join semantics, int64 count passes SF1/SF100; no fallback.
 
 ### Q12: Five-Nearest-Building Isolation Top 100
@@ -207,6 +208,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - A 32M Q2 relation requested a single 12-GiB block; 8M batches retain exactness and fit the planner.
 - A 16M Q6 batch exceeded remaining budget by 28.3 MiB; deterministic 8M resizing is used.
 - An eager Q5 32M grouped sort estimated 44.44 GiB; segmented grouped hulls replace it.
+- One-pass Q5 externalization wrote every row into 64 partitions: 307.37 s, 17.34 GB peak, and 4.15 GB D2H. A count-first eligible-row scan is the reusable bounded shape.
 - Eager Q10 zone-partition consolidation reserved 20.71 GB; five streamed partitions retain 5.474 GB.
 - Combined Q11 endpoint relations duplicate the largest candidate shape; endpoint relations remain separate.
 - One Morton interval per query bbox scans 14.04B positions for 28.07M pairs; a cached exact point grid replaces it.
@@ -222,3 +224,4 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - End-to-end profile: `benchmark_results/spatialbench/sf100/2026-08-14-final-median/pipeline_profile_summary.json`.
 - Reproducibility: `benchmark_results/spatialbench/sf100/2026-08-14-final-median/provenance.json`.
 - Public relation reducer checkpoint: `benchmark_results/spatialbench/sf100/2026-08-15-public-relation-reducer/checkpoint.json`.
+- Public grouped/pair reducer checkpoint: `benchmark_results/spatialbench/sf100/2026-08-16-public-grouped-pair-reducers/checkpoint.json`.

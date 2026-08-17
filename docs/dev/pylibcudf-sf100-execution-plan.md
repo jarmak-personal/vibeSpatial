@@ -313,26 +313,26 @@ checkpoint to this section containing:
 - largest allocation request, OOM/admission events, and shard cardinalities
 - an explanation for any stage, transfer, memory, or correctness regression
 
-### Active Checkpoint: 2026-08-15
+### Active Checkpoint: 2026-08-17
 
-This is a current-revision audit, not a program-completion checkpoint. M3, M4,
-and M6 remain open until the measured Q5/Q11 bulk exports below are removed.
+This is the final-code audit. The remaining Q5/Q11 bulk relation exports are
+removed and the frozen per-query median, 10K/1M, and full-profile gates pass.
 
 | Shape | Evidence / status |
 |---|---|
 | Allocator / scan | CuPy and pylibcudf share one fail-closed RMM pool; metadata plans decoded bytes. A 3,896,103-row warm scan is 0.57-0.64 s plus 0.034 s public assembly. |
 | Q1 / Q2 | Current-revision medians are 12.51 s / 7.89 s versus GPD 106.03 s / 113.25 s. Q2 is exact at 53,348 after the short-edge tolerance/FP32 fix; an admitted 8M public point-index relation replaces a 4.0-GB predicate-mask export and reaches 14.35x. The rejected 32M relation requested one 12-GiB block. |
 | Q3 / Q4 | Current-revision medians are 12.81 s / 8.53 s versus GPD 405.03 s / 231.98 s, or 31.62x / 27.20x. Native selected gather and exact top-k replace host row materialization/full sort. |
-| Q5 | Current-revision median is 126.94 s versus GPD 834.69 s (6.58x): packed codes, standards-valid external GeoParquet partitions, grouped point hulls, and bounded top-k avoid a 44.44-GiB global sort. Public `to_parquet` supplies GeoParquet metadata because `to_arrow` carries only field-level GeoArrow metadata. |
+| Q5 | Public device `dense_count`/`numeric_take` filter the second public scan before bounded GeoParquet partitions, and lazy grouped-union row selection preserves only retained members for hull/area. The VS median is 17.20 s (`17.20, 17.28, 17.16`) versus optimized GPD 743.46 s (`746.27, 742.66, 743.46`), or 43.22x, down from 126.94 s. The GPD count pass now reads bounded attribute-only Arrow batches: its single-run peak RSS fell from a rejected 95.3-GiB OOM to 4.59 GiB, and the four-pass peak is 5.05 GiB. |
 | Q6 | Public `sindex.query_aggregate` now consumes relation pairs into eager device-backed pandas columns and combines shard results through public Series arithmetic. The clean median is 16.32 s versus GPD 371.42 s (22.76x); total D2H is 15.51 MB instead of 14.42 GB. |
 | Q7 | Preserving decimal-cast lineage and projecting the consumed secondary geometry keeps fused distance/ratio/top-k native. The current-revision median is 4.25 s versus GPD 337.44 s (79.40x), and D2H is only 64,000 terminal bytes. |
 | Q8 / Q9 | Current-revision medians are 16.98 s / 0.14 s versus GPD 285.06 s / 0.19 s. Q9 is explicitly exempt from per-query 10x while retaining correctness, suite-total, and no-regression gates. |
-| Q10 / Q11 | Q10's public device-backed shard accumulation reduces its clean median to 126.43 s versus GPD 1,738.00 s (13.75x) and total D2H to 33.09 MB from 21.46 GB. Q11 remains 266.42 s versus GPD 3,127.50 s (11.74x). Exact per-part y directories and the cached 1024-square point grid replace 14.04B Morton scan lanes; five zone partitions retain 5.474 GB instead of 20.71 GB reserved by eager consolidation. |
+| Q10 / Q11 | Q10 remains 126.43 s versus GPD 1,738.00 s (13.75x). Public `query_pair_aggregate` consumes exact-capacity aligned point-grid tiles into left/right/shared counts; isolated query rows above the candidate budget use bounded dense tree-row tiles. Q11's final median is 311.34 s (`311.34, 311.64, 311.34`) versus GPD 3,127.50 s (10.05x) with 79.60 MB D2H instead of 14.10 GB. |
 | Q12 | Public exact k=5 plus Hilbert bounds has a current-revision 21.20 s median versus GPD 626.64 s (29.56x); keys/order match GPD and metrics pass canonical tolerance. |
-| Full suite / profile | Commit `c74a773` reran the frozen warmup-plus-three contract at VS 641.76 s versus optimized GPD 8,177.23 s, or 12.742x. Replacing only the independently rerun Q6/Q10 medians with 16.32/126.43 s gives a current 620.42 s suite and 13.180x speedup; both outputs pass the same-data SF100 oracle. The final public shootout gate has 14/14 exact 10K workflows, zero fallbacks, summed medians of VS 2.624 s versus GPD 3.519 s, and a worst per-workflow delta of +4.42%. A post-review final-code rerun remains 14/14 exact at a 2.626 s VS subtotal (+0.09%). At 1M, ten workflows pass the fingerprint contract; nine are identical and accessibility retains the established 8,034-versus-8,035 tolerance match. Their VS subtotal is 103.66 s versus 104.63 s previously. The final-code rerun kept every observed successful workflow below a 5% timing delta; after a power interruption, retail, site, and transit reproduced their exact prior allocation-failure sizes, while vegetation again matched exactly at VS 58.35 s versus GPD 371.37 s (6.36x) with zero fallbacks. Redevelopment had already reproduced its exact 29.85 GiB failure before the interruption. A repeatable 55 ms mixed-family corridor buffer off-ramp is observable in the isolated profiler; the changed surfaces do not include buffer/overlay. The mandatory full 1M pipeline profile has zero fallbacks, zero compute D2H/materializations, no active stage above 70.51 ms, and no compute stage above 68.17 ms. |
-| Telemetry | Q1-Q12 process peaks remain within the locked envelope; Q6/Q10 are 19.59/13.20 GiB with zero fallback. Q6 total D2H is 15.51 MB, 99.89% below its original 14.42 GB public-reducer boundary. Q10 total D2H is 33.09 MB, 99.85% below its original 21.46 GB boundary; shard-local eager pandas ExtensionArray columns combine on device and export once per zone partition. Q5/Q11 still explicitly export 10.34/14.10 GB, so M3/M4 remain open. |
+| Full suite / profile | The final isolated per-query medians sum to VS 555.60 s versus optimized GPD 8,086.00 s, or 14.554x. The final-code 10K shootout is 14/14 exact with zero fallback, +0.14% aggregate change, and a +1.66% maximum workflow change. At 1M, all ten capacity-admitted VS workflows preserve their fingerprints and improve 0.81% in aggregate; nine are within 5%, the remaining workflow improves 5.60%, and the worst regression is +1.77%. Four workflows retain byte-identical deterministic 24-GiB capacity failures; GeoPandas times out on all six non-pass suite entries in this rerun. The mandatory full profile reports zero compute materializations, zero compute D2H, and zero fallbacks for every successful 1M pipeline; its slowest stage is `predicate-heavy/read_geojson` at 69.41 ms, so no stage crosses the 1-s CPU-heavy investigation threshold. |
+| Telemetry | Q5's cold profile peaks at 17.40 GB process / 13.78 GB pool-reserved / 11.996 GB largest admission; its 738.91 MB D2H is 92.85% below 10.34 GB and occurs at validation plus explicit GeoParquet/public boundaries. Q11 uses 2,161 compact block-planning/public-scalar transfers totaling 79.60 MB (99.44% below 14.10 GB), with no per-tile candidate-allocation fence. Warm runs peak at 11.62 GB live RMM allocation and 23.77 GB pool reservation, ending at 47.9 MB live; the 169.6 s median transfer timing includes queued GPU predicate work and is not additive copy cost. Both repeat-3 profiles have zero fallback. |
 | Correctness | All twelve pass the committed SF1 oracle and the same-data SF100 GPD comparison at `rtol=1e-6`, `atol=1e-9`; Q10 differs only by admitted sub-ULP reduction order. SpatialBench has no committed SF100 answers. |
-| Rejected shapes | 64M/16M admission failures, eager 32M grouped sort (44.44 GiB), eager zone-partition consolidation (20.71 GB reserved), duplicated polygon `take`, interval-fp32, combined Q11 endpoints, and one Morton interval per query bbox have the wrong shape. The latter scans 14.04B point positions to emit 28.07M pairs. A 0.1-degree zone-membership grid also loses: 14.1M memberships, 34.7M coarse pairs, and 15.82 s for only 2.23M exact pairs. |
+| Rejected shapes | Q5 one-pass all-row externalization took 307.37 s, 17.34 GB peak, and 4.15 GB D2H; count-first eligible filtering replaces it. Other rejected shapes remain 64M/16M admission failures, the 44.44-GiB grouped sort, 20.71-GB eager zone consolidation, combined Q11 endpoint relations, interval-fp32, and 14.04B-position Morton scans. |
 
 Durable evidence is summarized here; raw public-shootout JSON is local, gitignored diagnostic output. Per-query semantics, physical shapes, memory formulas, and measurement evidence are checked in at `docs/dev/pylibcudf-sf100-query-ledger.md`.
 
@@ -376,7 +376,7 @@ SF100 queries return to a stable live-byte baseline without eager trimming.
 Exit: scan canaries report zero bulk D2H and no pandas/Arrow attribute frame
 between file input and the first native consumer.
 
-## M3: Complete Rowset And Relation Consumption (In Progress)
+## M3: Complete Rowset And Relation Consumption (Complete)
 
 - Make pylibcudf projection and gather consume `NativeRowSet` without host row
   positions.
@@ -389,7 +389,7 @@ between file input and the first native consumer.
 Exit: admitted filter/join pipelines have zero intermediate public frame
 assembly and zero bulk D2H before terminal export.
 
-## M4: Complete Tabular Analytics (In Progress)
+## M4: Complete Tabular Analytics (Complete)
 
 - Audit the installed pylibcudf surface and add guarded adapters for stable
   sort, bounded top-k, hash join, groupby, and required reductions.
@@ -419,7 +419,7 @@ dominated by pandas execution or a full intermediate result materialization.
 Exit: every SF100 query completes without allocator thrash, opaque spill, or a
 single allocation capable of exhausting the query budget.
 
-## M6: Close The SF100 Gap (In Progress)
+## M6: Close The SF100 Gap (Complete)
 
 - Work down the evidence ledger in descending wall-time order.
 - Require a reusable shape canary and public correctness test for every change.

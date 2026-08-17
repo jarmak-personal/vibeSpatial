@@ -5,7 +5,7 @@ Scope: Spatial-index query assembly, sjoin result semantics, bounded nearest str
 Read If: You are changing sindex query behavior, spatial join materialization, dwithin, or nearest result assembly.
 STOP IF: You already have the spatial-query engine and vendored join helpers open and only need local implementation detail.
 Source Of Truth: Phase-4 spatial query and join assembly policy before broader API dispatch work.
-Body Budget: 158/220 lines
+Body Budget: 162/220 lines
 Document: docs/architecture/spatial-joins.md
 
 Section Map (Body Lines)
@@ -17,11 +17,11 @@ Section Map (Body Lines)
 | 22-30 | Verify |
 | 31-36 | Risks |
 | 37-42 | Intent |
-| 43-80 | Decision |
-| 81-120 | Query Strategy |
-| 121-138 | Nearest Strategy |
-| 139-150 | Pandas Semantics |
-| 151-158 | Consequences |
+| 43-84 | Decision |
+| 85-124 | Query Strategy |
+| 125-142 | Nearest Strategy |
+| 143-154 | Pandas Semantics |
+| 155-162 | Consequences |
 DOC_HEADER:END -->
 
 ## Request Signals
@@ -88,6 +88,10 @@ This means:
 - public `sindex.query_aggregate` consumes native relation pairs into eager,
   input-sized pandas ExtensionArray columns; public Series arithmetic can
   combine those already-computed device columns before explicit host export
+- public `sindex.query_pair_aggregate` reduces two position-aligned indexes
+  against the same query geometries into left, right, and shared match-count
+  columns; bounded candidate tiles are consumed before public construction, so
+  aligned relation comparison does not export either pair relation
 - public `sindex.nearest(..., k=N, return_all=False)` formats an exact bounded
   `NativeRelation` for owned device point inputs; `k=1` preserves GeoPandas
   behavior and unsupported shapes keep the existing explicit fallback path

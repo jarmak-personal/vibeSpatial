@@ -17,6 +17,8 @@ from vibespatial.api import (
 )
 from vibespatial.api._config import options
 from vibespatial.api._shapely_dispatch import install_shapely_make_valid_dispatch
+from vibespatial.api.tabular import dense_count as dense_count
+from vibespatial.api.tabular import numeric_take as numeric_take
 from vibespatial.api.tools import clip, overlay, sjoin, sjoin_nearest
 
 from ._version import __version__
@@ -661,6 +663,8 @@ __all__ = [
     "sjoin_nearest",
     "overlay",
     "clip",
+    "dense_count",
+    "numeric_take",
     "options",
     "__version__",
 ]

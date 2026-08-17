@@ -1,0 +1,202 @@
+{
+  "schema_version": 1,
+  "checkpoint": "public-grouped-pair-reducers",
+  "date": "2026-08-17",
+  "hardware": "NVIDIA GeForce RTX 4090 24 GiB",
+  "dataset": "SpatialBench SF100 converted to GeoParquet",
+  "measurement_state": "final isolated warmup-plus-three medians and regression gates",
+  "q5": {
+    "optimized_geopandas_seconds": 743.46,
+    "optimized_geopandas_runs_seconds": [746.27, 742.66, 743.46],
+    "optimized_geopandas_four_pass_peak_rss_kib": 5054232,
+    "vibespatial_seconds": 17.20,
+    "vibespatial_runs_seconds": [17.20, 17.28, 17.16],
+    "speedup": 43.22,
+    "previous_vibespatial_seconds": 126.94,
+    "result_rows": 100,
+    "correctness": "same keys, name, month, count, and order; hull area rtol=1e-6",
+    "fallback_events": 0,
+    "d2h_bytes_per_run": 738914248,
+    "median_d2h_seconds": 0.5259615299946745,
+    "cold_process_peak_bytes": 17404264448,
+    "cold_pool_reserved_peak_bytes": 13777240064,
+    "largest_admitted_bytes": 11995510299,
+    "rejected_shapes": [
+      {
+        "description": "one-pass all-row external GeoParquet partitioning",
+        "seconds": 307.37,
+        "d2h_bytes": 4150000000,
+        "process_peak_bytes": 17340000000
+      },
+      {
+        "description": "GeoPandas count pass decoding every dropoff geometry",
+        "outcome": "kernel OOM kill",
+        "anonymous_rss_kib": 95273724
+      }
+    ]
+  },
+  "q11": {
+    "optimized_geopandas_seconds": 3127.50,
+    "vibespatial_seconds": 311.34,
+    "vibespatial_runs_seconds": [311.34, 311.64, 311.34],
+    "speedup": 10.05,
+    "result": 1511054981,
+    "fallback_events": 0,
+    "d2h_count_per_run": 2161,
+    "d2h_bytes_per_run": 79604528,
+    "median_d2h_seconds_including_queued_gpu_wait": 169.51054033319087,
+    "peak_live_rmm_allocation_bytes": 11621397064,
+    "warm_pool_reserved_peak_bytes": 23770820096,
+    "candidate_allocation_fences_per_run": 0
+  },
+  "final_suite": {
+    "optimized_geopandas_seconds": 8086.00,
+    "vibespatial_seconds": 555.60,
+    "speedup": 14.554,
+    "method": "sum of same-contract isolated per-query medians; only changed query medians replace their frozen samples"
+  },
+  "shootout_10k": {
+    "repeat": 3,
+    "passed": 14,
+    "failed": 0,
+    "fallback_events": 0,
+    "previous_subtotal_seconds": 2.628989739,
+    "final_subtotal_seconds": 2.632756175,
+    "change_percent": 0.14,
+    "max_workflow_change_percent": 1.66
+  },
+  "shootout_1m": {
+    "repeat": 1,
+    "capacity_admitted_vibespatial_workflows": 10,
+    "fingerprints_preserved": 10,
+    "unexpected_vibespatial_failures": 0,
+    "within_five_percent_on_first_repeat": 9,
+    "aggregate_change_percent": -0.81,
+    "max_regression_percent": 1.77,
+    "one_outside_five_percent_improvement_percent": -5.60,
+    "insurance_repeat3_change_percent": 0.10,
+    "insurance_vibespatial_median_seconds": 0.7108559680054896,
+    "known_capacity_failures": {
+      "redevelopment_screening": 32048912128,
+      "retail_trade_area_screening_required_gib": 46.51,
+      "site_suitability": 25786994432,
+      "transit_service_gap": 977715712
+    },
+    "geopandas_timeouts": [
+      "habitat_corridor_compliance",
+      "redevelopment_screening",
+      "retail_trade_area_screening",
+      "site_suitability",
+      "transit_service_gap",
+      "vegetation_corridor"
+    ]
+  },
+  "pipeline_profile_1m": {
+    "successful_pipelines": 11,
+    "deferred_pipelines": 1,
+    "compute_materialization_count": 0,
+    "compute_d2h_count": 0,
+    "fallback_event_count": 0,
+    "slowest_stage": "predicate-heavy/read_geojson",
+    "slowest_stage_seconds": 0.06941003299981819,
+    "stages_seconds": {
+      "join-heavy": {
+        "read_points": 0.003606548998504877,
+        "read_polygons": 0.0060812349984189495,
+        "build_index": 0.00025794901011977345,
+        "sjoin_query": 0.0006704230036120862,
+        "assemble_join_rows": 0.0004790940001839772,
+        "dissolve_groups": 0.0025030709948623553,
+        "write_output": 0.015606735993060283
+      },
+      "relation-semijoin": {
+        "read_inputs": 0.011768001990276389,
+        "build_index": 0.0001931329898070544,
+        "sjoin_relation": 0.0005761259963037446,
+        "semijoin_rowset": 0.0004016439925180748,
+        "subset_rows": 0.0009517330036032945,
+        "write_output": 0.003044145996682346
+      },
+      "small-grouped-constructive-reduce": {
+        "build_device_grouped_polygons": 0.03929151898773853,
+        "native_grouped_union": 0.04787132599449251,
+        "native_reference_check": 0.000024704000679776073
+      },
+      "grouped-capacity-partitions": {
+        "build_grouped_partition_fixtures": 0.048317406995920464,
+        "mixed_strip_exact_union": 0.06841587700182572,
+        "positive_degenerate_union": 0.06326108999201097,
+        "native_reference_check": 0.000022531996364705265
+      },
+      "grouped-disjoint-constructive-reduce": {
+        "build_device_disjoint_groups": 0.0647339509887388,
+        "native_grouped_disjoint_subset": 0.0019058439938817173,
+        "native_reference_check": 0.000027326997951604426
+      },
+      "grouped-difference-constructive": {
+        "build_device_grouped_difference_inputs": 0.026641056989319623,
+        "native_grouped_difference": 0.010731071000918746,
+        "native_reference_check": 0.00003111999831162393
+      },
+      "constructive-output-native": {
+        "build_device_pairwise_boxes": 0.003310321000753902,
+        "native_constructive_intersection": 0.003521527993143536,
+        "constructive_area_expression": 0.0011477069929242134,
+        "constructive_expression_consumers": 0.0014920990070095286,
+        "native_reference_check": 0.000024074994144029915
+      },
+      "overlay-relation-constructive": {
+        "build_native_overlay_inputs": 0.006261432994506322,
+        "build_spatial_index": 0.00010229999315924942,
+        "candidate_relation": 0.0007935309986351058,
+        "refine_relation": 0.00022297698887996376,
+        "constructive_intersection": 0.002795214008074254,
+        "native_tabular_projection": 0.0009464729955652729,
+        "native_reference_check": 0.000022464999346993864
+      },
+      "constructive": {
+        "read_points": 0.0033898239926202223,
+        "clip_points": 0.0005695379950338975,
+        "buffer_points": 0.0015031869988888502,
+        "write_output": 0.01578031000099145
+      },
+      "predicate-heavy": {
+        "read_geojson": 0.06941003300016746,
+        "load_polygons": 0.00926439100294374,
+        "point_in_polygon": 0.0003246509877499193,
+        "filter_points": 0.00038632900395896286,
+        "write_output": 0.0013176710053812712
+      },
+      "zero-transfer": {
+        "read_input": 0.006708076994982548,
+        "predicate_filter": 0.0004384219937492162,
+        "subset_rows": 0.001115652994485572,
+        "write_output": 0.0029674589895876125
+      }
+    }
+  },
+  "verification": {
+    "focused_public_q5_q11": "11 passed",
+    "gpu_memory_pool": "31 passed",
+    "pylibcudf_capabilities": "4 passed",
+    "private_native_substrate": "442 passed",
+    "strict_native": "19 passed",
+    "pipeline_native_relation_grouped": "13 passed",
+    "dissolve_and_spatial_query": "278 passed, 1 optional scipy skip",
+    "final_focused_runtime_suite": "832 passed, 1 optional scipy skip",
+    "repository_pytest": "7245 passed, 430 skipped, 7 xfailed; one pool-residency canary passed in a fresh process; three upstream Parquet failures reproduce unchanged at parent revision 528a8d4"
+  },
+  "local_raw_artifacts": [
+    "/tmp/vibespatial-q5-regression/q5-final-vs-repeat3.json",
+    "/tmp/vibespatial-q5-regression/q5-final-gpd-optimized-repeat3.json",
+    "/tmp/vibespatial-q5-regression/q11-final-vs-repeat3.json",
+    "/tmp/vibespatial-q5-regression/q11-post-review-final-repeat3.json",
+    "/tmp/vibespatial-q5-regression/shootout_10k_repeat3.json",
+    "/tmp/vibespatial-q5-regression/shootout_10k_post_review_repeat3.json",
+    "/tmp/vibespatial-q5-regression/shootout_1m_repeat1.json",
+    "/tmp/vibespatial-q5-regression/shootout_1m_post_review_repeat1.json",
+    "/tmp/vibespatial-q5-regression/insurance_1m_repeat3.json",
+    "/tmp/vibespatial-q5-regression/full_pipeline_profile.json",
+    "/tmp/vibespatial-q5-regression/full_pipeline_profile-post-review.json"
+  ]
+}

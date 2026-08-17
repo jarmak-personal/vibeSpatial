@@ -200,7 +200,13 @@ def prepare_point_grid_index(flat_index) -> PreparedPointGridIndex | None:
     return prepared
 
 
-def point_grid_superset_query(flat_index, query_bounds) -> _DeviceCandidates | None:
+def point_grid_superset_query(
+    flat_index,
+    query_bounds,
+    *,
+    precomputed_query_counts=None,
+    pair_capacity: int | None = None,
+) -> _DeviceCandidates | None:
     """Return cell-conservative pairs for immediate exact refinement."""
     prepared = prepare_point_grid_index(flat_index)
     if prepared is None:
@@ -217,7 +223,22 @@ def point_grid_superset_query(flat_index, query_bounds) -> _DeviceCandidates | N
             d_right=cp.empty(0, dtype=cp.int32),
             total_pairs=0,
         )
-    query_counts = cp.empty(query_count, dtype=cp.int64)
+    owns_query_counts = precomputed_query_counts is None
+    query_counts = (
+        cp.empty(query_count, dtype=cp.int64)
+        if owns_query_counts
+        else cp.asarray(precomputed_query_counts, dtype=cp.int64)
+    )
+    if int(query_counts.size) != query_count:
+        raise ValueError("precomputed point-grid counts must align to query rows")
+    if pair_capacity is not None:
+        pair_capacity = int(pair_capacity)
+        if owns_query_counts:
+            raise ValueError(
+                "capacity-backed point-grid query requires precomputed counts"
+            )
+        if pair_capacity < 0:
+            raise ValueError("point-grid pair capacity must be nonnegative")
     query_offsets = None
     query_cursors = None
     out_left = None
@@ -225,56 +246,67 @@ def point_grid_superset_query(flat_index, query_bounds) -> _DeviceCandidates | N
     kernels = point_grid_index_kernels()
     ptr = runtime.pointer
     try:
-        count_kernel = kernels["point_grid_query_counts"]
-        grid, block = runtime.launch_config(count_kernel, query_count)
-        runtime.launch(
-            count_kernel,
-            grid=grid,
-            block=block,
-            params=(
-                (
-                    ptr(bounds),
-                    prepared.xmin,
-                    prepared.ymin,
-                    prepared.xmax,
-                    prepared.ymax,
-                    prepared.grid_size,
-                    ptr(prepared.integral_counts),
-                    ptr(query_counts),
-                    query_count,
+        if owns_query_counts:
+            count_kernel = kernels["point_grid_query_counts"]
+            grid, block = runtime.launch_config(count_kernel, query_count)
+            runtime.launch(
+                count_kernel,
+                grid=grid,
+                block=block,
+                params=(
+                    (
+                        ptr(bounds),
+                        prepared.xmin,
+                        prepared.ymin,
+                        prepared.xmax,
+                        prepared.ymax,
+                        prepared.grid_size,
+                        ptr(prepared.integral_counts),
+                        ptr(query_counts),
+                        query_count,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                    ),
                 ),
-                (
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_F64,
-                    KERNEL_PARAM_F64,
-                    KERNEL_PARAM_F64,
-                    KERNEL_PARAM_F64,
-                    KERNEL_PARAM_I32,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_I32,
-                ),
-            ),
-        )
+            )
         query_offsets = exclusive_sum(query_counts, synchronize=False)
-        total_pairs = count_scatter_total(
-            runtime,
-            query_counts,
-            query_offsets,
-            reason="point-grid conservative candidate allocation fence",
-        )
+        if pair_capacity is not None:
+            require_device_candidate_pair_capacity(
+                pair_capacity,
+                relation_name="capacity-backed point-grid candidate tile",
+            )
+            out_left = cp.zeros(pair_capacity, dtype=cp.int32)
+            out_right = cp.zeros(pair_capacity, dtype=cp.int32)
+            total_pairs = pair_capacity
+        else:
+            total_pairs = count_scatter_total(
+                runtime,
+                query_counts,
+                query_offsets,
+                reason="point-grid conservative candidate allocation fence",
+            )
         if total_pairs == 0:
             return _DeviceCandidates(
                 d_left=cp.empty(0, dtype=cp.int32),
                 d_right=cp.empty(0, dtype=cp.int32),
                 total_pairs=0,
             )
-        require_device_candidate_pair_capacity(
-            total_pairs,
-            relation_name="device point-grid conservative candidate relation",
-        )
-        out_left = cp.empty(total_pairs, dtype=cp.int32)
-        out_right = cp.empty(total_pairs, dtype=cp.int32)
+        if pair_capacity is None:
+            require_device_candidate_pair_capacity(
+                total_pairs,
+                relation_name="device point-grid conservative candidate relation",
+            )
+            out_left = cp.empty(total_pairs, dtype=cp.int32)
+            out_right = cp.empty(total_pairs, dtype=cp.int32)
         query_cursors = query_offsets.astype(cp.uint64, copy=True)
         scatter_kernel = kernels["point_grid_query_scatter"]
         runtime.launch(
@@ -325,8 +357,181 @@ def point_grid_superset_query(flat_index, query_bounds) -> _DeviceCandidates | N
         out_right = None
         return result
     finally:
-        runtime.free(query_counts)
+        if owns_query_counts:
+            runtime.free(query_counts)
         runtime.free(query_offsets)
         runtime.free(query_cursors)
         runtime.free(out_left)
         runtime.free(out_right)
+
+
+def point_grid_query_row_partitions(
+    flat_index,
+    query_bounds,
+    *,
+    pair_budget: int,
+) -> tuple[tuple[tuple[int, int, int], ...], object] | None:
+    """Plan query-row slices whose point-grid supersets fit a pair budget.
+
+    Fixed-size row blocks are reduced on-device and cross once as compact
+    planning metadata. Greedy block slices use exact count sums as capacities,
+    so every admitted tile fits ``pair_budget`` without a per-tile allocation
+    fence, padded launch, or full row-count export. Oversized blocks are refined
+    down to single-row metadata; consumers then scan those rows in bounded
+    dense tree-row tiles.
+    """
+    prepared = prepare_point_grid_index(flat_index)
+    if prepared is None:
+        return None
+    if pair_budget <= 0:
+        raise ValueError("point-grid pair budget must be positive")
+
+    import cupy as cp
+
+    runtime = get_cuda_runtime()
+    bounds = cp.ascontiguousarray(cp.asarray(query_bounds, dtype=cp.float64)).reshape(-1, 4)
+    query_count = int(bounds.shape[0])
+    if query_count == 0:
+        return (), cp.empty(0, dtype=cp.int64)
+    counts = cp.empty(query_count, dtype=cp.int64)
+    kernel = point_grid_index_kernels()["point_grid_query_counts"]
+    grid, block = runtime.launch_config(kernel, query_count)
+    ptr = runtime.pointer
+    runtime.launch(
+        kernel,
+        grid=grid,
+        block=block,
+        params=(
+            (
+                ptr(bounds),
+                prepared.xmin,
+                prepared.ymin,
+                prepared.xmax,
+                prepared.ymax,
+                prepared.grid_size,
+                ptr(prepared.integral_counts),
+                ptr(counts),
+                query_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+    block_size = 32
+    while True:
+        full_row_count = (query_count // block_size) * block_size
+        block_counts_parts = []
+        if full_row_count:
+            block_counts_parts.append(
+                counts[:full_row_count]
+                .reshape(-1, block_size)
+                .sum(axis=1, dtype=cp.int64)
+            )
+        if full_row_count < query_count:
+            block_counts_parts.append(
+                counts[full_row_count:].sum(dtype=cp.int64).reshape(1)
+            )
+        block_counts = (
+            block_counts_parts[0]
+            if len(block_counts_parts) == 1
+            else cp.concatenate(block_counts_parts)
+        )
+        block_counts_host = runtime.copy_device_to_host(
+            block_counts,
+            reason="point-grid reduction block-count planning packet",
+        )
+        partitions = _count_bounded_block_partitions(
+            np.asarray(block_counts_host, dtype=np.int64),
+            block_size=block_size,
+            query_count=query_count,
+            pair_budget=pair_budget,
+        )
+        if partitions is not None:
+            return partitions, counts
+        if block_size == 1:
+            return (
+                _count_bounded_block_partitions(
+                    np.asarray(block_counts_host, dtype=np.int64),
+                    block_size=1,
+                    query_count=query_count,
+                    pair_budget=pair_budget,
+                    admit_oversized=True,
+                ),
+                counts,
+            )
+        block_size //= 2
+
+
+def _count_bounded_block_partitions(
+    block_counts: np.ndarray,
+    *,
+    block_size: int,
+    query_count: int,
+    pair_budget: int,
+    admit_oversized: bool = False,
+) -> tuple[tuple[int, int, int], ...] | None:
+    """Greedily pack exact device-reduced row-block counts under a budget."""
+    block_counts = np.asarray(block_counts, dtype=np.int64)
+    block_size = int(block_size)
+    query_count = int(query_count)
+    pair_budget = int(pair_budget)
+    if (
+        block_counts.ndim != 1
+        or np.any(block_counts < 0)
+        or block_size <= 0
+        or query_count < 0
+        or pair_budget <= 0
+    ):
+        raise ValueError("point-grid block partition dimensions must be nonnegative")
+    if query_count == 0:
+        return ()
+    expected_blocks = (query_count + block_size - 1) // block_size
+    if int(block_counts.size) != expected_blocks:
+        raise ValueError("point-grid block counts must cover every query row")
+    if np.any(block_counts > pair_budget) and not admit_oversized:
+        return None
+    if admit_oversized and block_size != 1:
+        raise ValueError("oversized point-grid blocks require single-row metadata")
+    partitions: list[tuple[int, int, int]] = []
+    block_start = 0
+    capacity = 0
+    for block, count_value in enumerate(block_counts):
+        count = int(count_value)
+        if count > pair_budget:
+            if block > block_start:
+                partitions.append(
+                    (block_start, block, capacity)
+                )
+            partitions.append((block, block + 1, count))
+            block_start = block + 1
+            capacity = 0
+            continue
+        if block > block_start and capacity + count > pair_budget:
+            partitions.append(
+                (
+                    block_start * block_size,
+                    min(block * block_size, query_count),
+                    capacity,
+                )
+            )
+            block_start = block
+            capacity = 0
+        capacity += count
+    if block_start * block_size < query_count:
+        partitions.append(
+            (
+                block_start * block_size,
+                query_count,
+                capacity,
+            )
+        )
+    return tuple(partitions)

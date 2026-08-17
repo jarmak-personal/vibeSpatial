@@ -1184,6 +1184,266 @@ def _morton_reduction_span_schedule(d_starts, d_ends):
     return d_query_order, np.asarray(bucket_counts, dtype=np.int64)
 
 
+def _spatial_index_device_point_grid_right_reduction(
+    flat_index,
+    query_owned,
+    tree_owned,
+    query_bounds,
+    *,
+    predicate: str | None,
+    query_family: GeometryFamily,
+    tree_family: GeometryFamily,
+    precision_plan: PrecisionPlan | None,
+    pair_budget: int,
+):
+    """Reduce bounded point-grid candidate batches into indexed-row counts."""
+    if predicate is None:
+        return None
+
+    from vibespatial.predicates.point_location_index import (
+        prepare_point_region_y_indexes,
+    )
+
+    prepare_point_region_y_indexes(query_owned, tree_owned)
+
+    from vibespatial.spatial.point_grid_index import (
+        point_grid_query_row_partitions,
+        point_grid_superset_query,
+    )
+
+    plan = point_grid_query_row_partitions(
+        flat_index,
+        query_bounds,
+        pair_budget=pair_budget,
+    )
+    if plan is None:
+        return None
+    partitions, query_counts = plan
+
+    import cupy as cp
+
+    tree_count = int(tree_owned.row_count)
+    counts = cp.zeros(tree_count, dtype=cp.uint64)
+    for query_start, query_stop, pair_capacity in partitions:
+        if pair_capacity > pair_budget:
+            if query_stop != query_start + 1:
+                raise ValueError("oversized point-grid partitions must contain one row")
+            for tree_start in range(0, tree_count, pair_budget):
+                tree_stop = min(tree_count, tree_start + pair_budget)
+                d_right = cp.arange(tree_start, tree_stop, dtype=cp.int32)
+                d_left = cp.full(
+                    tree_stop - tree_start,
+                    query_start,
+                    dtype=cp.int32,
+                )
+                d_keep = _classify_homogeneous_reduction_tile(
+                    predicate,
+                    query_owned,
+                    tree_owned,
+                    d_left,
+                    d_right,
+                    query_family=query_family,
+                    tree_family=tree_family,
+                    precision_plan=precision_plan,
+                )
+                if d_keep is None:
+                    return None
+                counts[tree_start:tree_stop] += cp.asarray(
+                    d_keep,
+                    dtype=cp.uint64,
+                )
+                del d_keep, d_left, d_right
+            continue
+        if pair_capacity == 0:
+            continue
+        candidates = point_grid_superset_query(
+            flat_index,
+            query_bounds[query_start:query_stop],
+            precomputed_query_counts=query_counts[query_start:query_stop],
+            pair_capacity=pair_capacity,
+        )
+        if candidates is None:
+            return None
+        d_left = cp.asarray(candidates.d_left, dtype=cp.int32) + cp.int32(
+            query_start
+        )
+        d_right = cp.asarray(candidates.d_right, dtype=cp.int32)
+        d_keep = _classify_homogeneous_reduction_tile(
+            predicate,
+            query_owned,
+            tree_owned,
+            d_left,
+            d_right,
+            query_family=query_family,
+            tree_family=tree_family,
+            precision_plan=precision_plan,
+        )
+        if d_keep is None:
+            return None
+        d_keep = cp.asarray(d_keep, dtype=cp.bool_)
+        cp.add.at(counts, d_right, d_keep.astype(cp.uint64, copy=False))
+        del candidates, d_keep, d_left, d_right
+
+    return counts.astype(cp.int64, copy=False)
+
+
+def _spatial_index_device_point_grid_aligned_pair_reduction(
+    flat_index,
+    aligned_flat_index,
+    query_owned,
+    tree_owned,
+    aligned_tree_owned,
+    query_bounds,
+    *,
+    predicate: str,
+    query_family: GeometryFamily,
+    tree_family: GeometryFamily,
+    aligned_tree_family: GeometryFamily,
+    precision_plan: PrecisionPlan,
+    pair_budget: int,
+):
+    """Reduce two aligned point-grid relations one bounded tile at a time."""
+    import cupy as cp
+
+    from vibespatial.predicates.point_location_index import (
+        prepare_point_region_y_indexes,
+    )
+    from vibespatial.spatial.point_grid_index import (
+        point_grid_query_row_partitions,
+        point_grid_superset_query,
+    )
+
+    tree_count = int(tree_owned.row_count)
+    prepare_point_region_y_indexes(query_owned, tree_owned)
+    prepare_point_region_y_indexes(query_owned, aligned_tree_owned)
+    plan = point_grid_query_row_partitions(
+        flat_index,
+        query_bounds,
+        pair_budget=pair_budget,
+    )
+    if plan is None:
+        return None
+    partitions, query_counts = plan
+    left_counts = cp.zeros(tree_count, dtype=cp.uint64)
+    shared_counts = cp.zeros(tree_count, dtype=cp.uint64)
+    for query_start, query_stop, pair_capacity in partitions:
+        if pair_capacity > pair_budget:
+            if query_stop != query_start + 1:
+                raise ValueError("oversized point-grid partitions must contain one row")
+            for tree_start in range(0, tree_count, pair_budget):
+                tree_stop = min(tree_count, tree_start + pair_budget)
+                d_right = cp.arange(tree_start, tree_stop, dtype=cp.int32)
+                d_left = cp.full(
+                    tree_stop - tree_start,
+                    query_start,
+                    dtype=cp.int32,
+                )
+                d_keep = _classify_homogeneous_reduction_tile(
+                    predicate,
+                    query_owned,
+                    tree_owned,
+                    d_left,
+                    d_right,
+                    query_family=query_family,
+                    tree_family=tree_family,
+                    precision_plan=precision_plan,
+                )
+                if d_keep is None:
+                    return None
+                d_aligned_keep = _classify_homogeneous_reduction_tile(
+                    predicate,
+                    query_owned,
+                    aligned_tree_owned,
+                    d_left,
+                    d_right,
+                    query_family=query_family,
+                    tree_family=aligned_tree_family,
+                    precision_plan=precision_plan,
+                )
+                if d_aligned_keep is None:
+                    return None
+                d_keep = cp.asarray(d_keep, dtype=cp.bool_)
+                left_counts[tree_start:tree_stop] += d_keep.astype(
+                    cp.uint64,
+                    copy=False,
+                )
+                shared_counts[tree_start:tree_stop] += (
+                    d_keep & cp.asarray(d_aligned_keep, dtype=cp.bool_)
+                ).astype(cp.uint64, copy=False)
+                del d_aligned_keep, d_keep, d_left, d_right
+            continue
+        if pair_capacity == 0:
+            continue
+        candidates = point_grid_superset_query(
+            flat_index,
+            query_bounds[query_start:query_stop],
+            precomputed_query_counts=query_counts[query_start:query_stop],
+            pair_capacity=pair_capacity,
+        )
+        if candidates is None:
+            return None
+        d_left = cp.asarray(candidates.d_left, dtype=cp.int32) + cp.int32(
+            query_start
+        )
+        d_right = cp.asarray(candidates.d_right, dtype=cp.int32)
+        d_keep = _classify_homogeneous_reduction_tile(
+            predicate,
+            query_owned,
+            tree_owned,
+            d_left,
+            d_right,
+            query_family=query_family,
+            tree_family=tree_family,
+            precision_plan=precision_plan,
+        )
+        if d_keep is None:
+            return None
+        d_aligned_keep = _classify_homogeneous_reduction_tile(
+            predicate,
+            query_owned,
+            aligned_tree_owned,
+            d_left,
+            d_right,
+            query_family=query_family,
+            tree_family=aligned_tree_family,
+            precision_plan=precision_plan,
+        )
+        if d_aligned_keep is None:
+            return None
+        d_keep = cp.asarray(d_keep, dtype=cp.bool_)
+        d_shared = d_keep & cp.asarray(d_aligned_keep, dtype=cp.bool_)
+        cp.add.at(
+            left_counts,
+            d_right,
+            d_keep.astype(cp.uint64, copy=False),
+        )
+        cp.add.at(
+            shared_counts,
+            d_right,
+            d_shared.astype(cp.uint64, copy=False),
+        )
+        del candidates, d_aligned_keep, d_keep, d_left, d_right, d_shared
+
+    right_counts = _spatial_index_device_point_grid_right_reduction(
+        aligned_flat_index,
+        query_owned,
+        aligned_tree_owned,
+        query_bounds,
+        predicate=predicate,
+        query_family=query_family,
+        tree_family=aligned_tree_family,
+        precision_plan=precision_plan,
+        pair_budget=pair_budget,
+    )
+    if right_counts is None:
+        return None
+    return (
+        left_counts.astype(cp.int64, copy=False),
+        right_counts,
+        shared_counts.astype(cp.int64, copy=False),
+    )
+
+
 def _spatial_index_device_relation_reduction(
     flat_index,
     query_owned,
@@ -1192,6 +1452,8 @@ def _spatial_index_device_relation_reduction(
     *,
     predicate: str | None,
     reduction: str,
+    aligned_tree_owned=None,
+    aligned_flat_index=None,
 ) -> tuple[object | None, SpatialQueryExecution]:
     """Reduce Morton-range candidate slices without materializing a relation.
 
@@ -1209,19 +1471,38 @@ def _spatial_index_device_relation_reduction(
 
     query_count = int(query_owned.row_count)
     tree_count = int(tree_owned.row_count)
-    if reduction not in {"exists", "right_exists", "count"}:
+    if reduction not in {
+        "exists",
+        "right_exists",
+        "count",
+        "right_count",
+        "right_pair_count",
+    }:
         raise ValueError(
-            "spatial reduction must be 'exists', 'right_exists', or 'count'"
+            "unsupported spatial relation reduction"
+        )
+    pair_reduction = reduction == "right_pair_count"
+    if pair_reduction and (
+        predicate is None
+        or aligned_tree_owned is None
+        or int(aligned_tree_owned.row_count) != tree_count
+    ):
+        raise ValueError(
+            "right pair count requires a predicate and an aligned tree geometry"
         )
     implementation = {
         "exists": "owned_gpu_spatial_semijoin",
         "right_exists": "owned_gpu_spatial_right_semijoin",
         "count": "owned_gpu_spatial_match_count",
+        "right_count": "owned_gpu_spatial_right_match_count",
+        "right_pair_count": "owned_gpu_spatial_right_pair_match_count",
     }[reduction]
     reduction_name = {
         "exists": "left existential semijoin",
         "right_exists": "right existential semijoin",
         "count": "left match count",
+        "right_count": "right match count",
+        "right_pair_count": "aligned right pair match counts",
     }[reduction]
     execution = SpatialQueryExecution(
         requested=ExecutionMode.GPU,
@@ -1232,18 +1513,32 @@ def _spatial_index_device_relation_reduction(
     from vibespatial.api._native_rowset import NativeDeviceSelection
 
     if query_count == 0:
-        return (
-            NativeDeviceSelection.identity(0)
-            if reduction != "count"
-            else cp.empty(0, dtype=cp.int64)
-        ), execution
+        if pair_reduction:
+            empty = cp.zeros(tree_count, dtype=cp.int64)
+            return (empty, empty.copy()), execution
+        if reduction in {"exists", "right_exists"}:
+            row_count = tree_count if reduction == "right_exists" else 0
+            return NativeDeviceSelection.from_mask(
+                cp.zeros(row_count, dtype=cp.bool_)
+            ), execution
+        row_count = tree_count if reduction == "right_count" else 0
+        return cp.zeros(row_count, dtype=cp.int64), execution
     if tree_count == 0:
+        if pair_reduction:
+            empty = cp.empty(0, dtype=cp.int64)
+            return (empty, empty.copy()), execution
         values = (
             NativeDeviceSelection.from_mask(
-                cp.zeros(tree_count if reduction == "right_exists" else query_count, dtype=cp.bool_)
+                cp.zeros(
+                    tree_count if reduction == "right_exists" else query_count,
+                    dtype=cp.bool_,
+                )
             )
-            if reduction != "count"
-            else cp.zeros(query_count, dtype=cp.int64)
+            if reduction in {"exists", "right_exists"}
+            else cp.zeros(
+                tree_count if reduction == "right_count" else query_count,
+                dtype=cp.int64,
+            )
         )
         return values, execution
 
@@ -1265,6 +1560,22 @@ def _spatial_index_device_relation_reduction(
             ),
         )
 
+    aligned_admission = None
+    if pair_reduction:
+        aligned_admission = _owned_gpu_predicate_family_admission(
+            query_owned,
+            aligned_tree_owned,
+        )
+        if aligned_admission is None or not aligned_admission[0]:
+            return None, SpatialQueryExecution(
+                requested=ExecutionMode.GPU,
+                selected=ExecutionMode.CPU,
+                implementation="owned_cpu_spatial_query",
+                reason=(
+                    "native aligned right pair match count declined unsupported "
+                    f"exact predicate families for {predicate!r}"
+                ),
+            )
     query_families = tuple(
         family for family in query_owned.families if query_owned.family_has_rows(family)
     )
@@ -1272,6 +1583,27 @@ def _spatial_index_device_relation_reduction(
         family for family in tree_owned.families if tree_owned.family_has_rows(family)
     )
     homogeneous_family_pair = len(query_families) == 1 and len(tree_families) == 1
+    aligned_tree_families = (
+        tuple(
+            family
+            for family in aligned_tree_owned.families
+            if aligned_tree_owned.family_has_rows(family)
+        )
+        if pair_reduction
+        else ()
+    )
+    if pair_reduction and (
+        not homogeneous_family_pair or len(aligned_tree_families) != 1
+    ):
+        return None, SpatialQueryExecution(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.CPU,
+            implementation="owned_cpu_spatial_query",
+            reason=(
+                "native aligned right pair match count currently requires "
+                "homogeneous geometry families"
+            ),
+        )
     family_pairs = tuple(
         (query_family, tree_family)
         for query_family in query_families
@@ -1288,6 +1620,7 @@ def _spatial_index_device_relation_reduction(
     if predicate is not None and (
         any(family in point_families for family in query_families)
         or any(family in point_families for family in tree_families)
+        or any(family in point_families for family in aligned_tree_families)
     ):
         from vibespatial.predicates.point_relations import (
             _plan_indexed_point_precision,
@@ -1305,19 +1638,87 @@ def _spatial_index_device_relation_reduction(
             ),
         )
 
+    if reduction in {"right_count", "right_pair_count"} and homogeneous_family_pair:
+        point_grid_pair_budget = _spatial_reduction_tile_lane_capacity(
+            query_owned,
+            tree_owned,
+            predicate=predicate,
+            family_admission=admission,
+        )
+        if pair_reduction and aligned_flat_index is not None:
+            point_grid_values = (
+                _spatial_index_device_point_grid_aligned_pair_reduction(
+                    flat_index,
+                    aligned_flat_index,
+                    query_owned,
+                    tree_owned,
+                    aligned_tree_owned,
+                    query_bounds,
+                    predicate=predicate,
+                    query_family=query_families[0],
+                    tree_family=tree_families[0],
+                    aligned_tree_family=aligned_tree_families[0],
+                    precision_plan=indexed_point_precision_plan,
+                    pair_budget=point_grid_pair_budget,
+                )
+            )
+        elif reduction == "right_count":
+            point_grid_values = _spatial_index_device_point_grid_right_reduction(
+                flat_index,
+                query_owned,
+                tree_owned,
+                query_bounds,
+                predicate=predicate,
+                query_family=query_families[0],
+                tree_family=tree_families[0],
+                precision_plan=indexed_point_precision_plan,
+                pair_budget=point_grid_pair_budget,
+            )
+        else:
+            point_grid_values = None
+        if point_grid_values is not None:
+            return point_grid_values, SpatialQueryExecution(
+                requested=ExecutionMode.GPU,
+                selected=ExecutionMode.GPU,
+                implementation=implementation,
+                reason=(
+                    "bounded point-grid candidate batches reduced directly to "
+                    f"{reduction_name}"
+                ),
+            )
+
     state = _prepare_morton_range_query(flat_index, query_bounds, query_bounds)
     if state is None:
+        if pair_reduction:
+            empty = cp.zeros(tree_count, dtype=cp.int64)
+            return (empty, empty.copy()), execution
         values = (
             NativeDeviceSelection.from_mask(
-                cp.zeros(tree_count if reduction == "right_exists" else query_count, dtype=cp.bool_)
+                cp.zeros(
+                    tree_count if reduction == "right_exists" else query_count,
+                    dtype=cp.bool_,
+                )
             )
-            if reduction != "count"
-            else cp.zeros(query_count, dtype=cp.int64)
+            if reduction in {"exists", "right_exists"}
+            else cp.zeros(
+                tree_count if reduction == "right_count" else query_count,
+                dtype=cp.int64,
+            )
         )
         return values, execution
 
-    output_count = tree_count if reduction == "right_exists" else query_count
-    d_reduced = cp.zeros(output_count, dtype=cp.uint64)
+    output_count = (
+        tree_count
+        if reduction in {"right_exists", "right_count", "right_pair_count"}
+        else query_count
+    )
+    if pair_reduction:
+        d_reduced = (
+            cp.zeros(output_count, dtype=cp.uint64),
+            cp.zeros(output_count, dtype=cp.uint64),
+        )
+    else:
+        d_reduced = cp.zeros(output_count, dtype=cp.uint64)
     max_tile_lanes = _spatial_reduction_tile_lane_capacity(
         query_owned,
         tree_owned,
@@ -1491,6 +1892,33 @@ def _spatial_index_device_relation_reduction(
                                 reason=f"native {reduction_name} exact refinement declined",
                             )
                         d_keep = d_active & cp.asarray(d_exact, dtype=cp.bool_)
+                        if pair_reduction:
+                            d_aligned_exact = _classify_homogeneous_reduction_tile(
+                                predicate,
+                                query_owned,
+                                aligned_tree_owned,
+                                d_reduce_left,
+                                d_reduce_right,
+                                query_family=query_families[0],
+                                tree_family=aligned_tree_families[0],
+                                precision_plan=indexed_point_precision_plan,
+                                logical_count=d_candidate_count_i32,
+                                pair_capacity=pair_capacity,
+                            )
+                            if d_aligned_exact is None:
+                                return None, SpatialQueryExecution(
+                                    requested=ExecutionMode.GPU,
+                                    selected=ExecutionMode.CPU,
+                                    implementation="owned_cpu_spatial_query",
+                                    reason=(
+                                        "native aligned right pair match count "
+                                        "exact refinement declined"
+                                    ),
+                                )
+                            d_shared_keep = d_keep & cp.asarray(
+                                d_aligned_exact,
+                                dtype=cp.bool_,
+                            )
                     else:
                         family_partition = family_partition_type.from_pair_capacity(
                             d_pair_left,
@@ -1563,6 +1991,23 @@ def _spatial_index_device_relation_reduction(
                             d_reduce_right,
                             d_keep.astype(cp.uint64),
                         )
+                    elif reduction == "right_count":
+                        cp.add.at(
+                            d_reduced,
+                            d_reduce_right,
+                            d_keep.astype(cp.uint64),
+                        )
+                    elif pair_reduction:
+                        cp.add.at(
+                            d_reduced[0],
+                            d_reduce_right,
+                            d_keep.astype(cp.uint64),
+                        )
+                        cp.add.at(
+                            d_reduced[1],
+                            d_reduce_right,
+                            d_shared_keep.astype(cp.uint64),
+                        )
                     elif reduction == "exists":
                         cp.maximum.at(
                             d_reduced,
@@ -1578,11 +2023,15 @@ def _spatial_index_device_relation_reduction(
                     tile_count += 1
             bucket_start = bucket_stop
 
-        values = (
-            NativeDeviceSelection.from_mask(d_reduced != 0)
-            if reduction != "count"
-            else d_reduced.astype(cp.int64)
-        )
+        if pair_reduction:
+            values = tuple(
+                reduced.astype(cp.int64, copy=False)
+                for reduced in d_reduced
+            )
+        elif reduction in {"exists", "right_exists"}:
+            values = NativeDeviceSelection.from_mask(d_reduced != 0)
+        else:
+            values = d_reduced.astype(cp.int64)
         return values, SpatialQueryExecution(
             requested=ExecutionMode.GPU,
             selected=ExecutionMode.GPU,
@@ -1656,4 +2105,46 @@ def spatial_index_device_right_semijoin_rows(
         query_bounds,
         predicate=predicate,
         reduction="right_exists",
+    )
+
+
+def spatial_index_device_right_match_counts(
+    flat_index,
+    query_owned,
+    tree_owned,
+    query_bounds,
+    *,
+    predicate: str | None,
+) -> tuple[object | None, SpatialQueryExecution]:
+    """Reduce a dense Morton candidate stream into indexed-row counts."""
+    return _spatial_index_device_relation_reduction(
+        flat_index,
+        query_owned,
+        tree_owned,
+        query_bounds,
+        predicate=predicate,
+        reduction="right_count",
+    )
+
+
+def spatial_index_device_right_pair_match_counts(
+    flat_index,
+    aligned_flat_index,
+    query_owned,
+    tree_owned,
+    aligned_tree_owned,
+    query_bounds,
+    *,
+    predicate: str,
+) -> tuple[object | None, SpatialQueryExecution]:
+    """Reduce first and aligned shared matches into indexed-row counts."""
+    return _spatial_index_device_relation_reduction(
+        flat_index,
+        query_owned,
+        tree_owned,
+        query_bounds,
+        predicate=predicate,
+        reduction="right_pair_count",
+        aligned_tree_owned=aligned_tree_owned,
+        aligned_flat_index=aligned_flat_index,
     )

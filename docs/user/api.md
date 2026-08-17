@@ -40,6 +40,13 @@ For the complete module-by-module reference, see the
 | {py:func}`~vibespatial.api.tools.clip.clip` | Clip geometries to a mask extent |
 | {py:func}`~vibespatial.api.geometry_array.points_from_xy` | Create point geometries from x, y (and optional z) coordinates |
 
+### Tabular Operations
+
+| Function | Description |
+|----------|-------------|
+| {py:func}`~vibespatial.api.tabular.dense_count` | Count integer codes into a fixed-size, device-preserving pandas Series |
+| {py:func}`~vibespatial.api.tabular.numeric_take` | Gather numeric values by integer positions while preserving device-backed Series |
+
 ### Runtime
 
 | Function | Description |
@@ -271,6 +278,7 @@ docs for parameter details.
 | {py:attr}`~vibespatial.api.geo_base.GeoPandasBase.sindex` | Spatial index (STRtree) |
 | {py:attr}`~vibespatial.api.geo_base.GeoPandasBase.has_sindex` | Whether spatial index is built |
 | {py:meth}`~vibespatial.api.sindex.SpatialIndex.query_aggregate` | Eager count/sum reduction over spatial-index matches without exporting relation pairs |
+| {py:meth}`~vibespatial.api.sindex.SpatialIndex.query_pair_aggregate` | Per-indexed-row counts and shared-match counts for two aligned spatial indexes without exporting relation pairs |
 | `.gpu_spatial_index` | GPU-resident Hilbert R-tree (built via `read_file(..., build_index=True)`) |
 
 ## GPU-Accelerated File Reading

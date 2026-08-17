@@ -5408,6 +5408,72 @@ def test_public_grouped_point_dissolve_convex_hull_matches_shapely_oracle() -> N
 
 
 @pytest.mark.gpu
+def test_public_grouped_point_dissolve_filter_preserves_grouped_hull_source() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    values = [
+        Point(0.0, 0.0),
+        Point(2.0, 0.0),
+        Point(0.0, 2.0),
+        Point(10.0, 10.0),
+        Point(12.0, 10.0),
+        Point(10.0, 12.0),
+        Point(20.0, 20.0),
+    ]
+    groups = np.asarray([0, 0, 0, 1, 1, 1, 2], dtype=np.int32)
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": groups,
+            "count": np.ones(len(values), dtype=np.int32),
+        },
+        geometry=geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(
+                from_shapely_geometries(values, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+
+    geopandas.clear_dispatch_events()
+    dissolved = frame.dissolve(
+        by="group",
+        aggfunc={"count": "sum"},
+        method="unary",
+    )
+    selected = dissolved.loc[dissolved["count"] > 1]
+    lazy_owned = selected.geometry.values.cached_owned()
+    hulls = np.asarray(selected.geometry.convex_hull.array, dtype=object)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert getattr(lazy_owned, "_is_lazy_grouped_union_owned", False)
+    assert lazy_owned._materialized_owned is None
+    assert selected.index.tolist() == [0, 1]
+    assert selected["count"].tolist() == [3, 3]
+    for output_row, group in enumerate((0, 1)):
+        expected = shapely.convex_hull(
+            shapely.union_all(np.asarray(values, dtype=object)[groups == group])
+        )
+        assert bool(shapely.equals(hulls[output_row], expected))
+    assert any(event.implementation == "native_grouped_member_take" for event in events)
+    assert any(
+        event.implementation == "grouped_dissolve_convex_hull_gpu"
+        for event in events
+    )
+    assert not any(
+        event.surface == "vibespatial.overlay.dissolve.LazyGroupedUnionOwned"
+        and event.operation == "materialize_grouped_union"
+        for event in events
+    )
+    with pytest.raises(IndexError, match="out of bounds"):
+        dissolved.geometry.array.take([3])
+    with pytest.raises(IndexError, match="out of bounds"):
+        dissolved.geometry.array.take([-4])
+
+
+@pytest.mark.gpu
 def test_selected_device_attribute_keys_drive_grouped_point_hulls(tmp_path) -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
@@ -5434,6 +5500,9 @@ def test_selected_device_attribute_keys_drive_grouped_point_hulls(tmp_path) -> N
         method="unary",
     ).reset_index()
     actual = np.asarray(dissolved.geometry.convex_hull.array, dtype=object)
+    filtered = dissolved.loc[dissolved["value"] > 7]
+    filtered_lazy_owned = filtered.geometry.values.cached_owned()
+    filtered_actual = np.asarray(filtered.geometry.convex_hull.array, dtype=object)
 
     assert dissolved["group"].tolist() == [1, 2]
     assert dissolved["value"].tolist() == [6, 10]
@@ -5445,6 +5514,11 @@ def test_selected_device_attribute_keys_drive_grouped_point_hulls(tmp_path) -> N
     )
     assert bool(shapely.equals(actual[0], expected_group_1))
     assert bool(shapely.equals(actual[1], expected_group_2))
+    assert filtered["group"].tolist() == [2]
+    assert filtered["value"].tolist() == [10]
+    assert getattr(filtered_lazy_owned, "_is_lazy_grouped_union_owned", False)
+    assert filtered_lazy_owned._materialized_owned is None
+    assert bool(shapely.equals(filtered_actual[0], expected_group_2))
 
 
 @pytest.mark.gpu

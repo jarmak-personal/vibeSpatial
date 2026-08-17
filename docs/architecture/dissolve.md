@@ -5,7 +5,7 @@ Scope: Grouped dissolve pipeline staging, segmented union, and attribute aggrega
 Read If: You are changing dissolve, grouped union, or segmented attribute aggregation.
 STOP IF: Your task already has the dissolve pipeline open and only needs local implementation detail.
 Source Of Truth: Dissolve pipeline architecture for grouped constructive work.
-Body Budget: 101/220 lines
+Body Budget: 106/220 lines
 Document: docs/architecture/dissolve.md
 
 Section Map (Body Lines)
@@ -19,7 +19,7 @@ Section Map (Body Lines)
 | 29-34 | Risks |
 | 35-44 | Decision |
 | 45-53 | Pipeline |
-| 54-101 | Performance Notes |
+| 54-106 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent
@@ -110,6 +110,11 @@ iteration.
   `intersects` without materializing the dissolved geometry, answer exact point
   `contains` the same way, and only materialize the true grouped union when a
   geometry-producing surface is actually requested.
+- Row selection over a lazy grouped union must gather the selected groups'
+  member spans and rebuild compact group offsets without first materializing
+  every exact union. A following grouped `convex_hull` may then consume those
+  retained members directly; arbitrary exact-union consumers still force the
+  ordinary exact materialization boundary.
 - Stable in-group row order matters for deterministic output and debugability.
 - Host performance is acceptable enough to route `GeoDataFrame.dissolve` through
   the grouped pipeline today; future GPU work should replace only the grouped

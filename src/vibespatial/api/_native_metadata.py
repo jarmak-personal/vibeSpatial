@@ -817,6 +817,7 @@ class NativeSpatialIndex:
         from vibespatial.spatial.spatial_index_device import (
             spatial_index_device_left_match_counts,
             spatial_index_device_left_semijoin_rows,
+            spatial_index_device_right_match_counts,
             spatial_index_device_right_semijoin_rows,
         )
 
@@ -832,11 +833,55 @@ class NativeSpatialIndex:
             "exists": spatial_index_device_left_semijoin_rows,
             "right_exists": spatial_index_device_right_semijoin_rows,
             "count": spatial_index_device_left_match_counts,
+            "right_count": spatial_index_device_right_match_counts,
         }[reduction]
         return reducer(
             self.to_flat_index(),
             query_owned,
             self.geometry,
+            query_bounds,
+            predicate=predicate,
+        )
+
+    def _query_device_pair_reduction(
+        self,
+        query_owned: Any,
+        aligned_tree_owned: Any,
+        aligned_flat_index: Any,
+        *,
+        predicate: str,
+        precomputed_query_bounds: Any | None,
+    ):
+        if not (
+            self.is_device
+            and _is_device_array(self.order)
+            and _is_device_array(self.morton_keys)
+            and self.metadata is not None
+            and self.metadata.bounds is not None
+        ):
+            return None, None
+
+        from vibespatial.kernels.core.geometry_analysis import (
+            compute_geometry_bounds_device,
+        )
+        from vibespatial.spatial.spatial_index_device import (
+            spatial_index_device_right_pair_match_counts,
+        )
+
+        query_bounds = (
+            precomputed_query_bounds
+            if precomputed_query_bounds is not None
+            else compute_geometry_bounds_device(
+                query_owned,
+                preserve_indexed_view=True,
+            )
+        )
+        return spatial_index_device_right_pair_match_counts(
+            self.to_flat_index(),
+            aligned_flat_index,
+            query_owned,
+            self.geometry,
+            aligned_tree_owned,
             query_bounds,
             predicate=predicate,
         )
@@ -1071,6 +1116,119 @@ class NativeSpatialIndex:
                 dtype="int64",
             )
         return (expression, execution) if return_metadata else expression
+
+    def query_right_match_count_expression(
+        self,
+        query_geometry: Any,
+        *,
+        predicate: str | None = None,
+        distance: float | np.ndarray | None = None,
+        query_row_count: int | None = None,
+        return_metadata: bool = False,
+        precomputed_query_bounds: Any | None = None,
+    ):
+        """Return exact per-indexed-row match counts without pair export."""
+        from vibespatial.api._native_expression import NativeExpression
+
+        query_owned = _query_owned_geometry(query_geometry)
+        resolved_query_row_count = (
+            getattr(query_owned, "row_count", None)
+            if query_row_count is None
+            else query_row_count
+        )
+        if resolved_query_row_count is None:
+            raise ValueError(
+                "NativeSpatialIndex.query_right_match_count_expression requires "
+                "query row count"
+            )
+
+        direct_counts = None
+        execution = None
+        if distance is None:
+            direct_counts, execution = self._query_device_reduction(
+                query_owned,
+                predicate=predicate,
+                precomputed_query_bounds=precomputed_query_bounds,
+                reduction="right_count",
+            )
+
+        if direct_counts is None:
+            relation, execution = self.query_relation(
+                query_geometry,
+                predicate=predicate,
+                distance=distance,
+                query_row_count=int(resolved_query_row_count),
+                return_device=True,
+                return_metadata=True,
+                precomputed_query_bounds=precomputed_query_bounds,
+            )
+            expression = relation.right_match_count_expression(
+                source_row_count=int(self.row_count),
+            )
+        else:
+            expression = NativeExpression(
+                operation="spatial_index.right_match_count",
+                values=direct_counts,
+                source_token=self.source_token,
+                source_row_count=int(self.row_count),
+                dtype="int64",
+            )
+        return (expression, execution) if return_metadata else expression
+
+    def query_right_pair_match_count_expressions(
+        self,
+        query_geometry: Any,
+        aligned_tree_geometry: Any,
+        aligned_flat_index: Any,
+        *,
+        predicate: str,
+        query_row_count: int | None = None,
+        return_metadata: bool = False,
+        precomputed_query_bounds: Any | None = None,
+    ):
+        """Return first and shared aligned indexed-row match counts."""
+        from vibespatial.api._native_expression import NativeExpression
+
+        query_owned = _query_owned_geometry(query_geometry)
+        aligned_tree_owned = _query_owned_geometry(aligned_tree_geometry)
+        resolved_query_row_count = (
+            getattr(query_owned, "row_count", None)
+            if query_row_count is None
+            else query_row_count
+        )
+        if resolved_query_row_count is None:
+            raise ValueError(
+                "NativeSpatialIndex.query_right_pair_match_count_expressions "
+                "requires query row count"
+            )
+        direct_counts, execution = self._query_device_pair_reduction(
+            query_owned,
+            aligned_tree_owned,
+            aligned_flat_index,
+            predicate=predicate,
+            precomputed_query_bounds=precomputed_query_bounds,
+        )
+        if direct_counts is None:
+            return (None, execution) if return_metadata else None
+
+        operations = (
+            "spatial_index.right_pair_match_count.left",
+            "spatial_index.right_pair_match_count.right",
+            "spatial_index.right_pair_match_count.shared",
+        )
+        if len(direct_counts) == 2:
+            operations = (operations[0], operations[2])
+        expressions = tuple(
+            NativeExpression(
+                operation=operation,
+                values=values,
+                source_token=self.source_token,
+                source_row_count=int(self.row_count),
+                dtype="int64",
+            )
+            for operation, values in zip(operations, direct_counts, strict=True)
+        )
+        return (expressions, execution) if return_metadata else expressions
 
 
 def _query_owned_geometry(value: Any):
