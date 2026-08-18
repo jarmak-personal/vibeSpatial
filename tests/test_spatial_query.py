@@ -400,6 +400,27 @@ class TestDwithinGPU:
         result_set = set(zip(result[0].tolist(), result[1].tolist()))
         assert result_set == expected
 
+    @pytest.mark.parametrize(
+        "distance",
+        [np.asarray(4.0), np.asarray([4.0])],
+        ids=["zero-dimensional", "one-element"],
+    )
+    def test_dwithin_broadcasts_array_distance(self, distance):
+        tree = np.asarray([Point(0, 0), Point(10, 0)], dtype=object)
+        query = np.asarray([Point(3, 0), Point(14, 0)], dtype=object)
+        owned, flat = build_owned_spatial_index(tree)
+
+        result = query_spatial_index(
+            owned,
+            flat,
+            query,
+            predicate="dwithin",
+            distance=distance,
+            sort=True,
+        )
+
+        assert result.tolist() == [[0, 1], [0, 1]]
+
     def test_dwithin_no_matches(self):
         tree = np.asarray([Point(0, 0), Point(100, 100)], dtype=object)
         query = np.asarray([Point(50, 50)], dtype=object)
@@ -3031,6 +3052,296 @@ def test_sindex_query_return_device_false_default() -> None:
     assert isinstance(result, np.ndarray)
 
 
+def test_sindex_query_any_is_eager_index_aligned_and_cpu_fallback_is_observable() -> None:
+    import pandas as pd
+
+    from vibespatial.api import GeoSeries
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+
+    tree = GeoSeries([Point(0, 0), Point(10, 0)])
+    query = GeoSeries(
+        [box(-1, -1, 1, 1), box(4, -1, 5, 1), box(9, -1, 11, 1)],
+        index=pd.Index(["first", "miss", "last"], name="query"),
+    )
+    clear_fallback_events()
+
+    with set_requested_mode(ExecutionMode.CPU):
+        result = tree.sindex.query_any(query, predicate="intersects")
+
+    assert type(result) is pd.Series
+    assert result.name == "has_match"
+    assert result.index.equals(query.index)
+    assert result.tolist() == [True, False, True]
+    fallback = get_fallback_events(clear=True)
+    assert any(
+        event.surface == "vibespatial.api.SpatialIndex.query_any"
+        and event.requested is ExecutionMode.CPU
+        and event.selected is ExecutionMode.CPU
+        for event in fallback
+    )
+
+    with pytest.raises(ValueError, match="must be one of"):
+        tree.sindex.query_any(query, predicate="not-a-predicate")
+    with pytest.raises(ValueError, match="only supported"):
+        tree.sindex.query_any(query, predicate="intersects", distance=1.0)
+    with pytest.raises(ValueError, match="required"):
+        tree.sindex.query_any(query, predicate="dwithin")
+
+
+@pytest.mark.parametrize("quad_segs", [None, 0, -2])
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_any_buffer_point_rewrite_is_bounded_strict_native(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    quad_segs,
+) -> None:
+    import gc
+
+    import cupy as cp
+
+    from vibespatial import GeoDataFrame, GeoSeries, read_parquet
+    from vibespatial.api._native_public_arrays import NativeBooleanMaskArray
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        get_d2h_transfer_stats,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+    from vibespatial.runtime.provenance import clear_rewrite_events, get_rewrite_events
+    from vibespatial.testing import strict_native_environment
+
+    source_points = [Point(0, 0), Point(10, 0), Point(20, 0)]
+    effective_quad_segs = 16 if quad_segs is None else max(int(quad_segs), 1)
+    edge_angle = np.pi / (4 * effective_quad_segs)
+    radial_scale = (1.0 + np.cos(edge_angle)) / 2.0
+    ideal_circle_only_point = Point(
+        3.0 * radial_scale * np.cos(edge_angle),
+        3.0 * radial_scale * np.sin(edge_angle),
+    )
+    query_geometries = [
+        box(-1, -1, 1, 1),
+        box(2.5, -0.5, 3.5, 0.5),
+        box(5, -0.5, 6, 0.5),
+        box(9, -1, 11, 1),
+        ideal_circle_only_point,
+        Polygon(),
+    ]
+    buffer_kwargs = {} if quad_segs is None else {"quad_segs": quad_segs}
+    expected = [
+        any(
+            query.intersects(point.buffer(3.0, **buffer_kwargs))
+            for point in source_points
+        )
+        if not query.is_empty
+        else False
+        for query in query_geometries
+    ]
+    source_path = tmp_path / "query-any-source.parquet"
+    query_path = tmp_path / "query-any-input.parquet"
+    GeoDataFrame(
+        geometry=GeoSeries(source_points, crs="EPSG:3857"),
+        crs="EPSG:3857",
+    ).to_parquet(source_path, geometry_encoding="geoarrow", index=False)
+    GeoDataFrame(
+        {
+            "qid": np.arange(len(query_geometries)),
+            "geometry": GeoSeries(query_geometries, crs="EPSG:3857"),
+        },
+        geometry="geometry",
+        crs="EPSG:3857",
+    ).to_parquet(query_path, geometry_encoding="geoarrow", index=False)
+    source = read_parquet(source_path).geometry
+    query_frame = read_parquet(query_path)
+    buffered = source.buffer(3.0, **buffer_kwargs)
+    spatial_index = buffered.sindex
+
+    spatial_index_type = type(spatial_index)
+    original_semijoin = spatial_index_type.query_left_semijoin
+    semijoin_predicates = []
+
+    def _record_bounded_buffer_semijoin(self, *args, **kwargs):
+        semijoin_predicates.append(kwargs.get("predicate"))
+        return original_semijoin(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        spatial_index_type,
+        "query_left_semijoin",
+        _record_bounded_buffer_semijoin,
+    )
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+    clear_dispatch_events()
+    clear_fallback_events()
+    clear_rewrite_events()
+
+    with strict_native_environment():
+        result = spatial_index.query_any(
+            query_frame.geometry,
+            predicate="intersects",
+        )
+        del buffered, spatial_index, source
+        gc.collect()
+        allocation_churn = [
+            cp.empty(1 << exponent, dtype=cp.uint8)
+            for exponent in range(10, 21)
+        ]
+        selected = query_frame[result]
+        inverted = ~result
+        rejected = query_frame[inverted]
+        del allocation_churn
+
+    transfer_count, transfer_bytes = get_d2h_transfer_stats()
+    transfer_events = get_d2h_transfer_events(clear=True)
+    materializations = get_materialization_events(clear=True)
+    dispatch = get_dispatch_events(clear=True)
+    rewrites = get_rewrite_events(clear=True)
+
+    assert isinstance(result.array, NativeBooleanMaskArray)
+    assert isinstance(inverted.array, NativeBooleanMaskArray)
+    assert inverted.array.selection is not None
+    assert result.index.equals(query_frame.index)
+    assert get_fallback_events(clear=True) == []
+    assert selected["qid"].tolist() == [index for index, keep in enumerate(expected) if keep]
+    assert rejected["qid"].tolist() == [
+        index for index, keep in enumerate(expected) if not keep
+    ]
+    assert semijoin_predicates == ["intersects"]
+    assert not any(
+        event.operation == "query_any_mask_to_public_array"
+        for event in materializations
+    )
+    assert transfer_count <= 10
+    assert transfer_bytes <= 528, [
+        (event.reason, event.item_count, event.bytes_transferred)
+        for event in transfer_events
+    ]
+    assert max((event.item_count for event in transfer_events), default=0) <= 64
+    assert any(
+        event.surface == "vibespatial.api.SpatialIndex.query_any"
+        and event.selected is ExecutionMode.GPU
+        and event.implementation == "owned_gpu_buffer_point_existential"
+        for event in dispatch
+    )
+    assert any(
+        event.rule_name == "R2_query_any_buffer_intersects_to_bounded_refine"
+        for event in rewrites
+    )
+    assert expected[4] is False
+    assert result.to_numpy().tolist() == expected
+    assert inverted.to_numpy().tolist() == [not keep for keep in expected]
+
+
+@pytest.mark.parametrize(
+    ("predicate", "distance"),
+    [
+        ("intersects", None),
+        ("contains", None),
+        ("within", None),
+        ("dwithin", 0.25),
+        ("dwithin", np.asarray(0.25)),
+        ("dwithin", np.asarray([0.25])),
+    ],
+)
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_any_generic_gpu_predicates_preserve_public_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    predicate,
+    distance,
+) -> None:
+    import pandas as pd
+
+    from vibespatial import GeoDataFrame, GeoSeries, read_parquet
+    from vibespatial.api._native_metadata import NativeSpatialIndex
+    from vibespatial.api._native_public_arrays import NativeBooleanMaskArray
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+    from vibespatial.testing import strict_native_environment
+
+    tree_geometries = [Point(0, 0), Point(2, 0), Point(5, 0)]
+    query_geometries = [
+        box(-0.5, -0.5, 0.5, 0.5),
+        Point(2, 0),
+        None,
+        box(8, 8, 9, 9),
+    ]
+    query_index = pd.Index(["duplicate", "duplicate", "null", "miss"])
+    tree_path = tmp_path / "query-any-generic-tree.parquet"
+    query_path = tmp_path / "query-any-generic-input.parquet"
+    GeoDataFrame(
+        geometry=GeoSeries(tree_geometries, crs="EPSG:3857"),
+        crs="EPSG:3857",
+    ).to_parquet(tree_path, geometry_encoding="geoarrow", index=False)
+    GeoDataFrame(
+        geometry=GeoSeries(
+            query_geometries,
+            index=query_index,
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    ).to_parquet(query_path, geometry_encoding="geoarrow", index=True)
+    tree = read_parquet(tree_path).geometry
+    query = read_parquet(query_path).geometry
+    clear_fallback_events()
+
+    def _relation_materialization_is_forbidden(*args, **kwargs):
+        raise AssertionError("query_any must reduce bounded tiles without a relation")
+
+    monkeypatch.setattr(
+        NativeSpatialIndex,
+        "query_relation",
+        _relation_materialization_is_forbidden,
+    )
+
+    kwargs = {"predicate": predicate}
+    if distance is not None:
+        kwargs["distance"] = distance
+    with strict_native_environment():
+        result = tree.sindex.query_any(query, **kwargs)
+
+    expected = []
+    for query_geometry in query_geometries:
+        if query_geometry is None:
+            expected.append(False)
+        elif predicate == "dwithin":
+            expected.append(
+                any(query_geometry.distance(tree_geometry) <= distance for tree_geometry in tree_geometries)
+            )
+        else:
+            operation = getattr(query_geometry, predicate)
+            expected.append(any(operation(tree_geometry) for tree_geometry in tree_geometries))
+
+    assert isinstance(result.array, NativeBooleanMaskArray)
+    assert result.index.equals(query_index)
+    assert result.to_numpy().tolist() == expected
+    assert get_fallback_events(clear=True) == []
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_any_generic_gpu_scalar_returns_one_row() -> None:
+    import pandas as pd
+
+    from vibespatial import GeoSeries
+    from vibespatial.api._native_public_arrays import NativeBooleanMaskArray
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+    from vibespatial.testing import strict_native_environment
+
+    tree = GeoSeries([Point(0, 0), Point(2, 0)])
+    clear_fallback_events()
+
+    with strict_native_environment():
+        result = tree.sindex.query_any(Point(0, 0), predicate="intersects")
+
+    assert isinstance(result.array, NativeBooleanMaskArray)
+    assert result.index.equals(pd.RangeIndex(1))
+    assert result.to_numpy().tolist() == [True]
+    assert get_fallback_events(clear=True) == []
+
+
 def test_sindex_query_aggregate_is_eager_public_dataframe() -> None:
     from vibespatial.api import GeoSeries
     from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
@@ -3245,6 +3556,38 @@ def test_sindex_query_aggregate_consumes_native_relation_before_export(
     assert result["bool_sum"].to_numpy().tolist() == [2, 0, 0]
     assert accumulated["duration_sum"].to_numpy().tolist() == [6.0, 8.0, 0.0]
     reset_d2h_transfer_count()
+
+    clear_dispatch_events()
+    count_only = tree.sindex.query_aggregate(
+        query,
+        {"match_count": "size"},
+        predicate="intersects",
+    )
+    count_dispatch = get_dispatch_events(clear=True)
+    assert count_only["match_count"].to_numpy().tolist() == [2, 1, 0]
+    assert any(
+        event.surface == "vibespatial.api.SpatialIndex.query_aggregate"
+        and "reduced matches directly" in event.reason
+        and "NativeRelation pairs" not in event.reason
+        for event in count_dispatch
+    )
+
+    clear_dispatch_events()
+    dwithin_count = tree.sindex.query_aggregate(
+        query,
+        {"match_count": "size"},
+        predicate="dwithin",
+        distance=0.0,
+    )
+    dwithin_count_dispatch = get_dispatch_events(clear=True)
+    assert dwithin_count["match_count"].to_numpy().tolist() == [2, 1, 0]
+    assert any(
+        event.surface == "vibespatial.api.SpatialIndex.query_aggregate"
+        and event.implementation == "owned_gpu_spatial_match_count"
+        and "reduced matches directly" in event.reason
+        and "NativeRelation pairs" not in event.reason
+        for event in dwithin_count_dispatch
+    )
 
     spatial_index = tree.sindex
     original_query_relation = spatial_index.query_relation

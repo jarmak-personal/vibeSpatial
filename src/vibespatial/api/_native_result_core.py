@@ -269,6 +269,24 @@ def _lazy_public_attribute_frame(
     surface: str,
 ) -> pd.DataFrame | None:
     """Build public attribute columns without exporting device tables eagerly."""
+    if attributes.to_pandas_kwargs:
+        # ``to_pandas_kwargs`` is an explicit public compatibility request.  A
+        # native extension facade would hide the requested pandas dtype mapping.
+        return None
+    try:
+        import pyarrow as pa
+    except ImportError:  # pragma: no cover - pyarrow is present in normal envs
+        pa = None
+    if pa is not None:
+        tables = attributes.parts or (attributes,)
+        if any(
+            table.schema_override is not None
+            and any(pa.types.is_nested(field.type) for field in table.schema_override)
+            for table in tables
+        ):
+            # Preserve Arrow's terminal pandas semantics for nested columns,
+            # including its documented TypeError without a compatible mapper.
+            return None
     try:
         from vibespatial.api._native_expression import NativeExpression
         from vibespatial.api._native_public_arrays import (
@@ -1251,12 +1269,13 @@ class NativeAttributeTable:
             frame = self._materialize_loaded_frame()
             return frame.copy(deep=copy) if copy else frame
         if self.device_table is not None:
-            numeric_frame = self._numeric_device_table_to_pandas()
+            to_pandas_kwargs = {**(self.to_pandas_kwargs or {}), **kwargs}
+            numeric_frame = (
+                None if to_pandas_kwargs else self._numeric_device_table_to_pandas()
+            )
             if numeric_frame is not None:
                 return numeric_frame.copy(deep=copy) if copy else numeric_frame
-            frame = self.to_arrow(index=False).to_pandas(
-                **{**(self.to_pandas_kwargs or {}), **kwargs}
-            )
+            frame = self.to_arrow(index=False).to_pandas(**to_pandas_kwargs)
             frame.index = self.index
             if self.column_override is not None:
                 frame.columns = pd.Index(self.column_override)
@@ -2911,7 +2930,12 @@ class GeometryNativeResult:
         d_logical_keep = d_logical_keep_bits != 0
         return selected, d_logical_keep, d_drop_count[0]
 
-    def mask_capacity(self, active_mask) -> GeometryNativeResult:
+    def mask_capacity(
+        self,
+        active_mask,
+        *,
+        preserve_row_bounds: bool = True,
+    ) -> GeometryNativeResult:
         """Mask logical capacity lanes without compacting native geometry."""
         import cupy as cp
 
@@ -2922,14 +2946,19 @@ class GeometryNativeResult:
             from vibespatial.geometry.owned import device_mask_owned_capacity
 
             return type(self).from_owned(
-                device_mask_owned_capacity(self.owned, d_active),
+                device_mask_owned_capacity(
+                    self.owned,
+                    d_active,
+                    preserve_row_bounds=preserve_row_bounds,
+                ),
                 crs=self.crs,
             )
         if self.composition is not None:
             parts = tuple(
                 NativeGeometryCompositionPart(
                     geometry=part.geometry.mask_capacity(
-                        d_active[cp.asarray(part.output_rows, dtype=cp.int64)]
+                        d_active[cp.asarray(part.output_rows, dtype=cp.int64)],
+                        preserve_row_bounds=preserve_row_bounds,
                     ),
                     output_rows=part.output_rows,
                     collection_position=part.collection_position,
@@ -3572,7 +3601,8 @@ class NativeGeometryComposition:
             selected_parts.append(
                 NativeGeometryCompositionPart(
                     geometry=GeometryNativeResult.from_owned(owned, crs=self.crs).mask_capacity(
-                        d_selected
+                        d_selected,
+                        preserve_row_bounds=False,
                     ),
                     output_rows=d_rows,
                 )

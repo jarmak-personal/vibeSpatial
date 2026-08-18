@@ -14,11 +14,13 @@ from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 # Checks structural validity of polygon rings:
 #   1. Minimum 4 coordinates
 #   2. Ring closure (first == last)
+#   3. At least three non-collinear distinct coordinates
 # Note: orientation is NOT checked (GEOS does not enforce winding in is_valid).
 # ---------------------------------------------------------------------------
 
 _IS_VALID_RINGS_KERNEL_SOURCE = (
     PRECISION_PREAMBLE
+    + ORIENT2D_DEVICE
     + r"""
 extern "C" __global__ void is_valid_rings(
     const double* __restrict__ x,
@@ -43,6 +45,33 @@ extern "C" __global__ void is_valid_rings(
 
     /* Check 2: ring closure (first == last) */
     if (x[start] != x[end - 1] || y[start] != y[end - 1]) {{
+        ring_valid[ring] = 0;
+        return;
+    }}
+
+    /* Check 3: a ring needs three non-collinear distinct coordinates.
+       Consecutive duplicates are valid in GEOS, so choose the first distinct
+       baseline and test every remaining coordinate with exact orient2d. */
+    int second = -1;
+    for (int i = start + 1; i < end - 1; ++i) {{
+        if (x[i] != x[start] || y[i] != y[start]) {{
+            second = i;
+            break;
+        }}
+    }}
+    if (second < 0) {{
+        ring_valid[ring] = 0;
+        return;
+    }}
+    int has_non_collinear = 0;
+    for (int i = second + 1; i < end - 1; ++i) {{
+        if (vs_orient2d(
+                x[start], y[start], x[second], y[second], x[i], y[i]) != 0) {{
+            has_non_collinear = 1;
+            break;
+        }}
+    }}
+    if (!has_non_collinear) {{
         ring_valid[ring] = 0;
         return;
     }}

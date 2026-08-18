@@ -538,6 +538,7 @@ def _compute_geometry_bounds_gpu_impl(
                 and host_buffer is not None
                 and int(host_buffer.row_count) == int(geometry_array.row_count)
                 and device_buffer.bounds is not None
+                and state.trusted_all_valid is True
             ):
                 state.row_bounds = device_buffer.bounds
                 if materialize_host:

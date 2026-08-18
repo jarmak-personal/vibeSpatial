@@ -1926,6 +1926,7 @@ class GeometryArray(ExtensionArray):
             quad_segs = kwargs.pop("resolution")
         if quad_segs is None:
             quad_segs = 16  # note shapely default is 8, 16 is historical choice
+        quad_segs = max(int(quad_segs), 1)
 
         cap_style = kwargs.get("cap_style", "round")
         join_style = kwargs.get("join_style", "round")

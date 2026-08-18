@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from pandas.api.extensions import ExtensionArray, ExtensionDtype
 
-from vibespatial.api._native_rowset import NativeRowSet
+from vibespatial.api._native_rowset import NativeDeviceSelection, NativeRowSet
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import FAMILY_TAGS, NULL_TAG
 from vibespatial.runtime.materialization import (
@@ -1523,6 +1523,7 @@ def native_public_index_from_plan(index_plan) -> pd.Index | None:
 class NativeBooleanMaskArray(ExtensionArray):
     row_count: int
     rowset: NativeRowSet | None = None
+    selection: NativeDeviceSelection | None = None
     mask_values: Any | None = None
     export_surface: str = "vibespatial.api.NativeBooleanMaskArray"
     export_operation: str = "native_boolean_mask_to_public_array"
@@ -1591,8 +1592,27 @@ class NativeBooleanMaskArray(ExtensionArray):
             inverted = ~selected
         else:
             inverted = ~self._materialize_mask()
+        inverted_selection = None
+        if _is_device_array(inverted):
+            source = self.selection if self.selection is not None else self.rowset
+            inverted_selection = NativeDeviceSelection.from_mask(
+                inverted,
+                source_token=getattr(source, "source_token", None),
+                source_row_count=self.row_count,
+                geometry_family_domain=getattr(
+                    source,
+                    "geometry_family_domain",
+                    None,
+                ),
+                trusted_all_valid_rows=getattr(
+                    source,
+                    "trusted_all_valid_rows",
+                    None,
+                ),
+            )
         return type(self)(
             row_count=self.row_count,
+            selection=inverted_selection,
             mask_values=inverted,
             export_surface=self.export_surface,
             export_operation=f"{self.export_operation}_invert",
@@ -1683,6 +1703,7 @@ class NativeBooleanMaskArray(ExtensionArray):
         return type(self)(
             row_count=self.row_count,
             rowset=self.rowset,
+            selection=self.selection,
             mask_values=self.mask_values,
             export_surface=self.export_surface,
             export_operation=self.export_operation,
@@ -1997,6 +2018,11 @@ class NativeGeometryTypeArray(ExtensionArray):
 def native_boolean_rowset_from_mask_array(mask) -> NativeRowSet | None:
     values = getattr(mask, "array", mask)
     if isinstance(values, NativeBooleanMaskArray):
+        if values.rowset is None and values.selection is not None:
+            values.rowset = values.selection.compact_rowset(
+                surface=f"{values.export_surface}.boolean_filter",
+                strict_disallowed=False,
+            )
         return values.rowset
     return None
 

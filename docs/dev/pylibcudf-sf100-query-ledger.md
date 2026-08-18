@@ -5,7 +5,7 @@ Scope: Per-query semantic, physical-shape, memory, correctness, and benchmark ev
 Read If: You are changing an SF100 query path, native tabular primitive, memory estimate, export boundary, or performance claim.
 STOP IF: You only need the program milestones or architecture; open the execution plan instead.
 Source Of Truth: Query-level evidence ledger required by the pylibcudf SF100 execution plan.
-Body Budget: 205/260 lines
+Body Budget: 214/260 lines
 Document: docs/dev/pylibcudf-sf100-query-ledger.md
 
 Section Map (Body Lines)
@@ -19,8 +19,9 @@ Section Map (Body Lines)
 | 29-35 | Risks |
 | 36-69 | Measurement Contract And Shared Evidence |
 | 70-183 | Q1-Q12 Ledger |
-| 184-195 | Rejected Physical Shapes |
-| 196-205 | Artifact Map |
+| 184-191 | Public Shootout Capacity Closure |
+| 192-203 | Rejected Physical Shapes |
+| 204-214 | Artifact Map |
 DOC_HEADER:END -->
 
 ## Intent
@@ -71,8 +72,8 @@ aggregate, not an inferred kernel-only time. The earlier stage-attribution
 profile remains the before-state for Q3, Q4, Q7, and Q12.
 
 The completion audit uses one warmup and three measured runs in isolated
-per-engine/query processes. Final medians sum to 555.60 s for VS and 8,086.00 s
-for optimized GPD, or 14.554x. Changed Q5/Q6/Q10/Q11 medians replace only their
+per-engine/query processes. Final medians sum to 553.63 s for VS and 8,086.00 s
+for optimized GPD, or 14.605x. Changed Q5/Q6/Q10/Q11 medians replace only their
 older frozen samples; unchanged query distributions remain the committed
 same-contract measurements.
 
@@ -204,6 +205,14 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - Before/after stages: before ten-shard upper bounds 39.81 s, CPU exact KNN 34.40 s, reads 1.86 s, setup 1.27 s; full before 917.71 s, after 21.48 s.
 - Correctness/fallback: exactly five neighbors, fp64 distance/average, certified Hilbert index domain and stable ties pass SF1/SF100; no fallback.
 
+## Public Shootout Capacity Closure
+
+- Four additional 1M public workflows formerly failed after requesting unbounded candidate or concatenated indexed-root storage. Capacity scatter and concatenation now compact exact selected rows across physical roots before combining them; pair and grouped reductions retain only admitted shard state.
+- The RMM pool ceiling preserves the explicit query reserve. Its default initial seed is 1 MiB because a 256-byte sub-granularity seed is interpreted as unspecified and eagerly reserves half the ceiling, making an idle runner consume 11.2 GiB instead of 390 MiB. Smaller explicit ceilings cap the seed, and multi-root admission uses remaining pool growth rather than optimistic driver-free bytes.
+- Final-worktree isolated strict-native SF100 results: redevelopment 403.90 s / 4 rows / 279,078.10 hull area; retail 7.06 s / 706 rows / 67,439.00; corrected site suitability 4.13 s / 350,223 rows / 335,170.62; transit 60.54 s / 30,553,577 rows / 29,404,906.86. Site suitability now includes the intended transit-buffer semijoin, is exact at 10K, and completes without fallback/offramps at 1M while GeoPandas remains in `sjoin` at the 895-s timeout; the other three match optimized-GPD fingerprints at 1M. Transit succeeds under the default capped pool; its separate statement-level trace replay retains enough instrumentation state to exceed 24 GiB.
+- The final repeat-3 10K public shootout is 14/14 exact with zero fallback/offramps: VS totals 2.664 s versus GPD 3.537 s. Restoring site suitability's transit-buffer semijoin makes that workflow 4.07x faster than GPD; the other thirteen workflows change +0.50% in aggregate with a +2.05% worst result, and the full suite changes +1.55% despite the added work.
+- The post-fix full 1M pipeline profile has no fallback and no stage above 71.56 ms (`predicate-heavy/read_geojson`). It records zero compute transfers, zero compute materializations, and no CPU-heavy stages.
+
 ## Rejected Physical Shapes
 
 - A 32M Q2 relation requested a single 12-GiB block; 8M batches retain exactness and fit the planner.
@@ -226,3 +235,4 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 - Reproducibility: `benchmark_results/spatialbench/sf100/2026-08-14-final-median/provenance.json`.
 - Public relation reducer checkpoint: `benchmark_results/spatialbench/sf100/2026-08-15-public-relation-reducer/checkpoint.json`.
 - Public grouped/pair reducer checkpoint: `benchmark_results/spatialbench/sf100/2026-08-16-public-grouped-pair-reducers/checkpoint.json`.
+- Public capacity-closure checkpoint: `benchmark_results/spatialbench/sf100/2026-08-18-public-capacity-closure/checkpoint.json`.

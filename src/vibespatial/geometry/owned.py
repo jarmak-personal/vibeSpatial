@@ -428,6 +428,12 @@ def ensure_device_geometry_size_bounds(
         )
 
     for family, buffer in state.families.items():
+        if family is GeometryFamily.POINT:
+            # A point row is intrinsically bounded by one coordinate and has
+            # no nested structural levels.  Do not spend a planning fence to
+            # restate that schema invariant.
+            buffer._device_size_bounds_exact = True
+            continue
         if getattr(buffer, "_device_size_bounds_exact", False):
             continue
         fixed_size = _device_buffer_fixed_size_metadata(family, buffer)
@@ -911,6 +917,7 @@ class OwnedGeometryArray:
         active_mask,
         *,
         assume_active_indices_unique: bool = False,
+        preserve_row_bounds: bool = True,
     ) -> OwnedGeometryArray:
         """Mark inactive capacity lanes null while preserving row layout."""
         if int(active_mask.size) != self.row_count:
@@ -966,10 +973,14 @@ class OwnedGeometryArray:
                 cp.int32(-1),
             )
             if state.row_bounds is not None:
-                state.row_bounds = cp.where(
-                    d_active[:, None],
-                    cp.asarray(state.row_bounds).reshape(self.row_count, 4),
-                    cp.asarray(cp.nan, dtype=cp.float64),
+                state.row_bounds = (
+                    cp.where(
+                        d_active[:, None],
+                        cp.asarray(state.row_bounds).reshape(self.row_count, 4),
+                        cp.asarray(cp.nan, dtype=cp.float64),
+                    )
+                    if preserve_row_bounds
+                    else None
                 )
             state.trusted_all_valid = True if self.row_count == 0 else False
             state.trusted_all_non_empty = None
@@ -2166,6 +2177,38 @@ class OwnedGeometryArray:
             )
         if len(arrays) == 1:
             return arrays[0]
+
+        all_device = cp is not None and all(
+            _device_geometry_has_device_root(array) for array in arrays
+        )
+        if (
+            all_device
+            and any(array.is_indexed_view for array in arrays)
+            and _device_concat_requires_exact_physicalization(arrays)
+        ):
+            physical = device_physicalize_owned_row_selections_exact(
+                [
+                    (array, cp.ones(array.row_count, dtype=cp.bool_))
+                    for array in arrays
+                ],
+                reason="indexed geometry concat exact allocation packet",
+            )
+            compact = [
+                (
+                    physical_array
+                    if physical_array is not None
+                    else build_null_owned_array(
+                        source_array.row_count,
+                        residency=Residency.DEVICE,
+                    )
+                )
+                for source_array, physical_array in zip(
+                    arrays,
+                    physical,
+                    strict=True,
+                )
+            ]
+            return cls.concat(compact)
 
         indexed_device_concat = cls._concat_device_indexed_views(arrays)
         if indexed_device_concat is not None:
@@ -7332,6 +7375,12 @@ def device_scatter_owned_capacity_selection(
             raise ValueError("capacity scatter active mask must match selection capacity")
         d_active &= d_requested
 
+    if _device_concat_requires_exact_physicalization([base, replacement]):
+        return device_scatter_owned_capacity_selections_many(
+            base,
+            [(replacement, selection, active_mask)],
+        )
+
     base._ensure_device_state(preserve_indexed_view=True)
     replacement._ensure_device_state(preserve_indexed_view=True)
     scatter_base = OwnedGeometryArray.concat([base, replacement])
@@ -7359,6 +7408,84 @@ def device_scatter_owned_capacity_selection(
         visible=False,
     )
     return result
+
+
+def _device_concat_requires_exact_physicalization(
+    arrays: list[OwnedGeometryArray],
+) -> bool:
+    """Whether a multi-root concat lacks one guaranteed contiguous allocation.
+
+    RMM's pool can have enough aggregate free bytes while cached blocks cannot
+    satisfy the concat's sequence of output allocations. Only growth admitted
+    by both the pool ceiling and the CUDA driver is guaranteed upstream
+    capacity in that state. Route the scatter through the exact multi-root
+    physicalizer when the complete new carrier exceeds that guarantee; its
+    compact allocation packet avoids copying inactive physical capacity and
+    the fragmented-pool OOM.
+    """
+    if cp is None or len(arrays) < 2:
+        return False
+
+    roots: list[OwnedGeometryArray] = []
+    seen_roots: set[int] = set()
+    for array in arrays:
+        root = array
+        while root.is_indexed_view:
+            if root._base is None:
+                raise RuntimeError("indexed device geometry is missing its physical base")
+            root = root._base
+        if id(root) not in seen_roots:
+            roots.append(root)
+            seen_roots.add(id(root))
+    if len(roots) < 2:
+        return False
+
+    states = [root._ensure_device_state(preserve_indexed_view=True) for root in roots]
+    concat_bytes = sum(
+        sum(int(getattr(state, name).nbytes) for state in states)
+        for name in ("validity", "tags", "family_row_offsets")
+    )
+    row_bounds_bytes = sum(
+        int(state.row_bounds.nbytes)
+        for state in states
+        if state.row_bounds is not None
+    )
+    concat_bytes += row_bounds_bytes
+
+    families = set().union(*(state.families for state in states))
+    for family in families:
+        for name in (
+            "x",
+            "y",
+            "geometry_offsets",
+            "empty_mask",
+            "part_offsets",
+            "ring_offsets",
+            "bounds",
+        ):
+            concat_bytes += sum(
+                int(getattr(state.families[family], name).nbytes)
+                for state in states
+                if family in state.families
+                and getattr(state.families[family], name) is not None
+            )
+
+    upstream_growth_bytes = get_cuda_runtime().pool_upstream_growth_bytes()
+    return concat_bytes > upstream_growth_bytes
+
+
+def _device_geometry_has_device_root(array: OwnedGeometryArray) -> bool:
+    """Whether an owned carrier resolves through device row maps to a device root."""
+    current = array
+    while current.is_indexed_view:
+        if (
+            current._base is None
+            or current._index_map is None
+            or not hasattr(current._index_map, "__cuda_array_interface__")
+        ):
+            return False
+        current = current._base
+    return current.device_state is not None
 
 
 def device_scatter_owned_capacity_selections_many(
@@ -7682,6 +7809,8 @@ def device_physical_select_owned_capacity_partitions(
 def device_mask_owned_capacity(
     owned: OwnedGeometryArray,
     active_mask: DeviceArray,
+    *,
+    preserve_row_bounds: bool = True,
 ) -> OwnedGeometryArray:
     """Create a null-padded row-capacity view over physical device buffers.
 
@@ -7700,7 +7829,10 @@ def device_mask_owned_capacity(
         result = owned._device_indexed_take(
             cp.arange(row_count, dtype=cp.int64),
             assume_unique_indices=True,
-        )._apply_row_activity(d_active)
+        )._apply_row_activity(
+            d_active,
+            preserve_row_bounds=preserve_row_bounds,
+        )
         result._record(
             DiagnosticKind.CREATED,
             f"device capacity mask retained {row_count} indexed row lanes",
@@ -7720,7 +7852,7 @@ def device_mask_owned_capacity(
         cp.int32(-1),
     )
     d_row_bounds = None
-    if state.row_bounds is not None:
+    if preserve_row_bounds and state.row_bounds is not None:
         d_row_bounds = cp.where(
             d_validity[:, None],
             cp.asarray(state.row_bounds, dtype=cp.float64).reshape(row_count, 4),

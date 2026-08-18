@@ -33,15 +33,20 @@ dependency and CuPy's pool as the fallback:
 
 | Tier | Activation | Allocator Stack |
 |------|------------|-----------------|
-| A (default) | RMM installed | `PoolMemoryResource` → `CudaMemoryResource` |
-| B (safe) | `VIBESPATIAL_GPU_OOM_SAFETY=1` | `FailureCallbackResourceAdaptor` → Pool → Cuda |
+| A | `VIBESPATIAL_GPU_OOM_SAFETY=0` | `PoolMemoryResource` → `CudaMemoryResource` |
+| B (default) | RMM installed and OOM safety not disabled | `FailureCallbackResourceAdaptor` → Pool → Cuda |
 | C (oversubscription) | `VIBESPATIAL_GPU_MANAGED_MEMORY=1` | Bare `ManagedMemoryResource` |
 | Fallback | RMM not installed | CuPy `MemoryPool` |
 
 ### Design choices
 
-- **Tier A uses `initial_pool_size=0`** to avoid starving other processes on
-  shared GPUs.  The pool grows on demand.
+- **Tiers A/B use an explicit 1 MiB initial pool** (or the configured ceiling
+  when smaller). Supported RMM releases interpret zero and sub-granularity
+  seeds as unspecified and eagerly reserve half of `maximum_pool_size`; the
+  explicit seed keeps idle orchestration processes small while retaining
+  on-demand growth. The default maximum preserves the larger of 1 GiB or 10%
+  of device memory for query-local allocations; `VIBESPATIAL_GPU_POOL_LIMIT=0`
+  explicitly opts into an unlimited pool.
 - **Tier B's OOM callback** calls `gc.collect()` and retries up to 3 times
   per allocation attempt, with a time-based reset (>1 s gap) so independent
   OOM events each get the full retry budget.
@@ -50,10 +55,11 @@ dependency and CuPy's pool as the fallback:
   demand paging.  `PrefetchResourceAdaptor` was evaluated and rejected:
   vibeSpatial's SoA coordinate layout means each segment access touches 4-8
   separate array pages, making prefetch ineffective under oversubscription.
-- **Deferred initialization**: RMM resources require a CUDA context, but
+- **Deferred, fail-closed initialization**: RMM resources require a CUDA context, but
   `CudaDriverRuntime.__init__` runs at module import time before any CUDA
-  call.  RMM setup is deferred to `_ensure_context()`.  If it fails, the
-  runtime falls back to the CuPy pool with a warning.
+  call. RMM setup is deferred to `_ensure_context()`. If RMM is installed but
+  setup fails, initialization raises instead of creating a split CuPy/libcudf
+  allocation domain. CuPy's pool is used only when RMM is unavailable.
 - **CCCL one-shot `cudaMallocAsync` bypasses RMM**: CCCL primitives without
   `make_*` precompilation allocate temp storage via the CUDA driver's
   internal async pool.  This is a known limitation affecting only cold-start
@@ -61,7 +67,7 @@ dependency and CuPy's pool as the fallback:
 
 ## Consequences
 
-- **Positive**: ~5-15% peak VRAM reduction from coalescing (Tier A); OOM
+- **Positive**: ~5-15% peak VRAM reduction from coalescing (Tiers A/B); OOM
   resilience without overhead (Tier B); ability to process datasets exceeding
   VRAM (Tier C, with documented 2-10× slowdown).
 - **Negative**: New optional dependency (rmm).  `memory_pool_stats()` returns

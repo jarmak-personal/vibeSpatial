@@ -8123,12 +8123,12 @@ def _profile_site_suitability_pipeline(
             rows_in=transit_owned.row_count,
             detail="buffer transit stations by 200m to create catchment areas",
         ) as stage:
-            transit_buffered = point_buffer_owned_array(
+            transit_series = geoseries_from_owned(
                 transit_owned,
-                200.0,
-                quad_segs=4,
+                crs="EPSG:4326",
             )
-            stage.rows_out = transit_buffered.row_count
+            transit_buffered = transit_series.buffer(200.0)
+            stage.rows_out = int(len(transit_buffered))
             stage.device = _selected_runtime_from_history(transit_buffered) or "cpu"
             _record_stage_overheads(stage, audit, memory, transit_buffered)
 
@@ -8141,18 +8141,11 @@ def _profile_site_suitability_pipeline(
             "build_index",
             category="sort",
             device=_index_runtime,
-            rows_in=transit_buffered.row_count,
-            detail="build flat spatial index on buffered transit catchments",
+            rows_in=int(len(transit_buffered)),
+            detail="build the public spatial index on buffered transit catchments",
         ) as stage:
-            flat_index = build_flat_spatial_index(
-                transit_buffered,
-                runtime_selection=RuntimeSelection(
-                    requested=ExecutionMode.AUTO,
-                    selected=_index_runtime,
-                    reason="site-suitability pipeline index build",
-                ),
-            )
-            stage.rows_out = int(flat_index.size)
+            spatial_index = transit_buffered.sindex
+            stage.rows_out = int(spatial_index.size)
             _record_stage_overheads(stage, audit, memory, transit_buffered)
 
         query_runtime = ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.CPU
@@ -8164,34 +8157,25 @@ def _profile_site_suitability_pipeline(
             rows_in=suitable.row_count,
             detail="spatial join: suitable parcels near transit stations",
         ) as stage:
-            try:
-                hit_count = query_spatial_index(
-                    transit_buffered,
-                    flat_index,
-                    suitable,
-                    predicate="intersects",
-                    sort=False,
-                    output_format="count",
-                )
-            except (IndexError, ValueError):
-                hit_count = 0
-            stage.rows_out = hit_count
-            stage.metadata["parcels_near_transit"] = hit_count
-            _record_stage_overheads(stage, audit, memory, suitable, transit_buffered)
-
-        # Release transit buffers and spatial index before output materialization
-        del transit_buffered, flat_index
-        _free_gpu_pool_memory()
-
-        output = (
-            geopandas.GeoDataFrame(
+            suitable_frame = geopandas.GeoDataFrame(
                 {"geometry": geoseries_from_owned(suitable, crs="EPSG:4326")},
                 geometry="geometry",
                 crs="EPSG:4326",
             )
-            if suitable.row_count > 0
-            else geopandas.GeoDataFrame({"geometry": []}, geometry="geometry", crs="EPSG:4326")
-        )
+            has_match = spatial_index.query_any(
+                suitable_frame.geometry,
+                predicate="intersects",
+            )
+            near_transit = suitable_frame[has_match]
+            stage.rows_out = int(len(near_transit))
+            stage.metadata["parcels_near_transit"] = int(len(near_transit))
+            _record_stage_overheads(stage, audit, memory, suitable, transit_buffered)
+
+        # Release transit buffers and spatial index before output materialization
+        del transit_buffered, spatial_index
+        _free_gpu_pool_memory()
+
+        output = near_transit
         output_path = root / "site-suitability-output.parquet"
         with profiler.stage(
             "write_output", category="emit", device=ExecutionMode.CPU, rows_in=int(len(output))
@@ -8324,7 +8308,7 @@ def _profile_site_suitability_geopandas_pipeline(
             device=ExecutionMode.CPU,
             rows_in=int(len(transit_gdf)),
         ) as stage:
-            transit_gdf["geometry"] = transit_gdf.geometry.buffer(200.0, quad_segs=4)
+            transit_gdf["geometry"] = transit_gdf.geometry.buffer(200.0)
             stage.rows_out = int(len(transit_gdf))
 
         with profiler.stage(
@@ -8334,14 +8318,16 @@ def _profile_site_suitability_geopandas_pipeline(
             rows_in=int(len(suitable)),
         ) as stage:
             joined = geopandas.sjoin(suitable, transit_gdf[["geometry"]], predicate="intersects")
-            stage.rows_out = int(len(joined))
+            matched_labels = joined.index.unique()
+            near_transit = suitable.loc[matched_labels].copy()
+            stage.rows_out = int(len(near_transit))
 
         output_path = root / "site-suitability-output.parquet"
         with profiler.stage(
-            "write_output", category="emit", device=ExecutionMode.CPU, rows_in=int(len(suitable))
+            "write_output", category="emit", device=ExecutionMode.CPU, rows_in=int(len(near_transit))
         ) as stage:
-            suitable.to_parquet(output_path, geometry_encoding="geoarrow")
-            stage.rows_out = int(len(suitable))
+            near_transit.to_parquet(output_path, geometry_encoding="geoarrow")
+            stage.rows_out = int(len(near_transit))
 
     trace = profiler.finish(
         metadata={
@@ -8359,7 +8345,7 @@ def _profile_site_suitability_geopandas_pipeline(
         elapsed_seconds=trace.total_elapsed_seconds,
         selected_runtime="cpu",
         planner_selected_runtime="cpu",
-        output_rows=int(len(suitable)),
+        output_rows=int(len(near_transit)),
         transfer_count=0,
         materialization_count=0,
         fallback_event_count=0,

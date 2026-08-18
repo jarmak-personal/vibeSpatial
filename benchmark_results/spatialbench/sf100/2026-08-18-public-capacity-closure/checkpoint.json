@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "checkpoint": "public-capacity-closure",
+  "date": "2026-08-18",
+  "hardware": "NVIDIA GeForce RTX 4090 24 GiB",
+  "dataset": "SpatialBench SF100 converted to GeoParquet",
+  "measurement_state": "final worktree VS-only refresh paired with established optimized-GPD fingerprints",
+  "shootout_10k": {
+    "repeat": 3,
+    "passed": 14,
+    "failed": 0,
+    "geopandas_median_subtotal_seconds": 3.5365026900544763,
+    "vibespatial_median_subtotal_seconds": 2.6644885950372554,
+    "fallback_events": 0,
+    "offramps": 0,
+    "non_site_workflow_change_percent": 0.50,
+    "non_site_max_regression_percent": 2.05,
+    "full_suite_change_percent_including_restored_site_semijoin": 1.55,
+    "site_suitability_speedup": 4.072919338436102
+  },
+  "shootout_1m": {
+    "redevelopment_screening": {
+      "vibespatial_seconds": 403.90467089400045,
+      "result_rows": 4,
+      "bounds": [599.05, 309.85, 850.0, 738.62],
+      "convex_hull_area": 279078.10,
+      "fallback_events": 0,
+      "offramps": 0,
+      "profile_available": true
+    },
+    "retail_trade_area_screening": {
+      "vibespatial_seconds": 7.058501649997197,
+      "result_rows": 706,
+      "bounds": [0.0, 0.0, 998.0, 754.0],
+      "convex_hull_area": 67439.00,
+      "fallback_events": 0,
+      "offramps": 0,
+      "profile_available": true
+    },
+    "site_suitability": {
+      "vibespatial_seconds": 4.1307603789900895,
+      "result_rows": 350223,
+      "bounds": [200.0, 200.0, 800.0, 800.0],
+      "convex_hull_area": 335170.62,
+      "fallback_events": 0,
+      "offramps": 0,
+      "profile_available": true,
+      "geopandas_outcome": "timeout after 895 seconds in sjoin"
+    },
+    "transit_service_gap": {
+      "vibespatial_seconds": 60.53769133100286,
+      "result_rows": 30553577,
+      "bounds": [457.74, 265.0, 673.76, 735.0],
+      "convex_hull_area": 29404906.86,
+      "strict_native": true,
+      "profile_available": false,
+      "profile_outcome": "instrumented replay exceeded 24 GiB after the default-capacity timed pass succeeded"
+    }
+  },
+  "pipeline_profile_1m": {
+    "successful_pipelines": 11,
+    "deferred_pipelines": 1,
+    "compute_materialization_count": 0,
+    "compute_d2h_count": 0,
+    "compute_d2h_bytes": 0,
+    "fallback_event_count": 0,
+    "slowest_stage": "predicate-heavy/read_geojson",
+    "slowest_stage_seconds": 0.07156015798682347
+  },
+  "commands": {
+    "shootout_10k": "uv run vsbench shootout benchmarks/shootout --scale 10K --repeat 3 --timeout 300 --json",
+    "shootout_1m": "uv run vsbench shootout <script> --scale 1M --repeat 1 --no-warmup --baseline-python /bin/true --timeout 900 --json",
+    "pipeline_profile": "uv run python scripts/benchmark_pipelines.py --suite full --repeat 1 --gpu-sparkline"
+  },
+  "local_raw_artifacts": [
+    "/tmp/issues_3_4_shootout_10k_final.json",
+    "/tmp/redevelopment_1m_current_final.json",
+    "/tmp/retail_1m_current_final.json",
+    "/tmp/site_suitability_1m_restored.json",
+    "/tmp/transit_1m_current_final.json",
+    "/tmp/issues_3_4_full_profile_land_final.json"
+  ]
+}

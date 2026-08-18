@@ -669,9 +669,19 @@ def query_spatial_index(
         if np.isscalar(distance):
             per_row_distance = np.full(query_size_for_dist, float(distance), dtype=np.float64)
         else:
-            per_row_distance = np.asarray(distance, dtype=np.float64)
-            if per_row_distance.shape != (query_size_for_dist,):
-                raise ValueError("distance array must be broadcastable to the geometry input")
+            distance_array = np.asarray(distance, dtype=np.float64)
+            if distance_array.ndim > 1:
+                raise ValueError(
+                    "distance array must be broadcastable to the geometry input"
+                )
+            try:
+                per_row_distance = np.ascontiguousarray(
+                    np.broadcast_to(distance_array, (query_size_for_dist,))
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "distance array must be broadcastable to the geometry input"
+                ) from exc
         # Try GPU candidate generation first (device-resident), then GPU refinement.
         device_dist_cands, _dwithin_exec = spatial_index_device_query(
             flat_index,

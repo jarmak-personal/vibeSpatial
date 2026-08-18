@@ -2722,6 +2722,136 @@ def _compute_mixed_distances_gpu(
 # ---------------------------------------------------------------------------
 
 
+def _plan_dwithin_gpu_device(
+    query_owned: OwnedGeometryArray,
+    tree_owned: OwnedGeometryArray,
+    pair_capacity: int,
+):
+    """Plan global metric precision and centering once for tiled dwithin."""
+    if not has_gpu_runtime():
+        return None
+
+    precision_context = _plan_device_resident_metric_precision(
+        query_owned,
+        tree_owned,
+        pair_capacity,
+    )
+    pointset_families = {GeometryFamily.POINT, GeometryFamily.MULTIPOINT}
+    distance_center_device = None
+    if (set(query_owned.families) | set(tree_owned.families)) & pointset_families:
+        from vibespatial.spatial.point_distance import compute_distance_center_device
+
+        distance_center_device = compute_distance_center_device(query_owned, tree_owned)
+    return precision_context, distance_center_device
+
+
+def _dwithin_mask_gpu_device(
+    query_owned: OwnedGeometryArray,
+    tree_owned: OwnedGeometryArray,
+    d_left,
+    d_right,
+    per_row_distance,
+    *,
+    pair_active=None,
+    precision_context: _NearestMetricPrecisionContext,
+    distance_center_device,
+):
+    """Return an exact device dwithin mask for one bounded candidate tile."""
+    if not has_gpu_runtime():
+        return None
+
+    try:
+        import cupy as cp
+    except ImportError:
+        return None
+
+    d_left = cp.asarray(d_left, dtype=cp.int32)
+    d_right = cp.asarray(d_right, dtype=cp.int32)
+    pair_count = int(d_left.size)
+    if pair_count != int(d_right.size):
+        raise ValueError("dwithin candidate indices must align")
+    d_active = (
+        cp.ones(pair_count, dtype=cp.bool_)
+        if pair_active is None
+        else cp.asarray(pair_active, dtype=cp.bool_)
+    )
+    if pair_count == 0:
+        return cp.empty(0, dtype=cp.bool_), False
+
+    distance_result = _compute_mixed_distances_gpu_device(
+        query_owned,
+        tree_owned,
+        d_left,
+        d_right,
+        precision_context=precision_context,
+        pair_active=d_active,
+        center_device=distance_center_device,
+    )
+    if distance_result is None:
+        return None
+    d_distances, used_shapely_fallback = distance_result
+    if used_shapely_fallback:
+        return None
+
+    d_thresholds_all = cp.asarray(per_row_distance, dtype=cp.float64)
+    d_thresholds = d_thresholds_all[d_left]
+    if precision_context.refinement_plan is not None and distance_center_device is not None:
+        from vibespatial.api._native_rowset import NativeDeviceSelection
+
+        query_tags = cp.asarray(query_owned._ensure_device_state().tags, dtype=cp.int8)[
+            d_left
+        ]
+        tree_tags = cp.asarray(tree_owned._ensure_device_state().tags, dtype=cp.int8)[
+            d_right
+        ]
+        point_tag = FAMILY_TAGS[GeometryFamily.POINT]
+        multipoint_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
+        pointset_pair = (
+            (query_tags == point_tag)
+            | (query_tags == multipoint_tag)
+            | (tree_tags == point_tag)
+            | (tree_tags == multipoint_tag)
+        )
+        ambiguity_selection = NativeDeviceSelection.from_mask(
+            d_active
+            & pointset_pair
+            & (
+                ~cp.isfinite(d_distances)
+                | (
+                    cp.abs(d_distances - d_thresholds)
+                    <= precision_context.fp32_error_bound
+                )
+            ),
+            source_row_count=pair_count,
+        )
+        d_ambiguous_left = ambiguity_selection.gather_capacity(
+            d_left,
+            fill_value=0,
+        ).astype(cp.int32, copy=False)
+        d_ambiguous_right = ambiguity_selection.gather_capacity(
+            d_right,
+            fill_value=0,
+        ).astype(cp.int32, copy=False)
+        refined = _compute_mixed_distances_gpu_device(
+            query_owned,
+            tree_owned,
+            d_ambiguous_left,
+            d_ambiguous_right,
+            precision_context=precision_context.refinement_context(),
+            pair_active=ambiguity_selection.active_capacity_mask(),
+            source_positions=ambiguity_selection.partition_capacity_positions(),
+            output_distances=d_distances,
+            center_device=distance_center_device,
+        )
+        if refined is None:
+            return None
+        d_distances, used_shapely_fallback = refined
+        if used_shapely_fallback:
+            return None
+
+    return d_active & (d_distances <= d_thresholds), False
+
+
 def _dwithin_refine_gpu(
     query_owned: OwnedGeometryArray,
     tree_owned: OwnedGeometryArray,

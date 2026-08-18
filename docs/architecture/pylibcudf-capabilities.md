@@ -92,7 +92,7 @@ These are exercised by repo-local probes in
   - normalized `file://` public reads
   - local partitioned directories
   - in-memory `bytes` and `BytesIO`
-- Still explicit repo policy fallback today:
+- Still explicit host compatibility dispatch today:
   - custom filesystems
   - `storage_options`
   - authenticated remote transports

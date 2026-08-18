@@ -79,6 +79,7 @@ _REGULAR_GRID_RECT_PROOF_KIND = "regular_grid_rect"
 _REGULAR_GRID_RECT_PROOF_VERSION = 1
 _GEOPARQUET_SCAN_DECODE_MULTIPLIER = 5
 _GEOPARQUET_SCAN_ROW_SCRATCH_BYTES = 16
+_GEOPARQUET_EAGER_SIZE_PROOF_MIN_BYTES = 1 << 20
 
 
 def _regular_grid_rect_proof_from_column_metadata(
@@ -168,6 +169,50 @@ def _attach_regular_grid_rect_proof_from_column_metadata(
     polygon_buffer.dense_single_ring_width = 5
     polygon_buffer.axis_aligned_rectangles = True
     polygon_buffer.regular_grid_rect = proof
+
+
+def _attach_device_geometry_planning_metadata(
+    owned: OwnedGeometryArray,
+    column_meta: dict[str, Any] | None,
+) -> None:
+    """Attach serialized proofs and bound exceptionally large decoded roots."""
+    _attach_regular_grid_rect_proof_from_column_metadata(owned, column_meta)
+    if owned.residency is not Residency.DEVICE or owned.device_state is None:
+        return
+    if (
+        not isinstance(column_meta, dict)
+        or str(column_meta.get("encoding", "")).upper() != "WKB"
+    ):
+        # GeoArrow keeps its nested physical layout explicit. WKB decode is the
+        # boundary that otherwise loses all host-visible per-row width proof.
+        return
+    polygon_storage_bytes = sum(
+        int(getattr(value, "nbytes", 0))
+        for family, buffer in owned.device_state.families.items()
+        if family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON)
+        for value in (
+            buffer.x,
+            buffer.y,
+            buffer.geometry_offsets,
+            buffer.part_offsets,
+            buffer.ring_offsets,
+        )
+        if value is not None
+    )
+    if polygon_storage_bytes < _GEOPARQUET_EAGER_SIZE_PROOF_MIN_BYTES:
+        return
+
+    # Large variable-width roots can be duplicated into relation-shaped
+    # consumers before any operation-specific stage can bound them. Reduce the
+    # already-resident offsets once at the IO/setup boundary so later compute
+    # stays capacity-safe. The packet contains only three int64 shape scalars
+    # per family; coordinates and row metadata remain device resident.
+    from vibespatial.geometry.owned import ensure_device_geometry_size_bounds
+
+    ensure_device_geometry_size_bounds(
+        owned,
+        reason="GeoParquet IO-time device geometry size-bound planning packet",
+    )
 
 
 def _record_public_geoparquet_dispatch(
@@ -793,6 +838,7 @@ class GeoParquetReadBackendPlan:
     can_use_pylibcudf: bool
     gpu_rejection_reason: str | None
     reason: str
+    explicit_host_compatibility: bool = False
 
 
 @dataclass(frozen=True)
@@ -1208,6 +1254,8 @@ def _supports_pylibcudf_geoparquet_read(
         return False, "pylibcudf is not installed for the GPU GeoParquet reader"
     if not has_gpu_runtime():
         return False, "GPU GeoParquet reader requires an available CUDA runtime"
+    if to_pandas_kwargs:
+        return False, "to_pandas_kwargs require the host pyarrow compatibility reader"
     if storage_options is not None:
         return False, "filesystem-backed GeoParquet reads still route through host pyarrow"
     if filesystem is not None and not _is_local_arrow_filesystem(filesystem):
@@ -1271,6 +1319,11 @@ def plan_geoparquet_read_backend(
         geo_metadata=geo_metadata,
         available_columns=available_columns,
     )
+    explicit_host_compatibility = backend == "auto" and (
+        bool(to_pandas_kwargs)
+        or storage_options is not None
+        or (filesystem is not None and not _is_local_arrow_filesystem(filesystem))
+    )
     if backend == "cpu":
         return GeoParquetReadBackendPlan(
             requested_backend=backend,
@@ -1310,7 +1363,13 @@ def plan_geoparquet_read_backend(
         selected_mode=ExecutionMode.CPU,
         can_use_pylibcudf=False,
         gpu_rejection_reason=reason,
-        reason=f"auto selected the host GeoParquet scan backend because {reason}",
+        reason=(
+            f"explicit filesystem compatibility transport selected the host GeoParquet "
+            f"scan backend because {reason}"
+            if explicit_host_compatibility
+            else f"auto selected the host GeoParquet scan backend because {reason}"
+        ),
+        explicit_host_compatibility=explicit_host_compatibility,
     )
 
 
@@ -1856,7 +1915,7 @@ def _geoparquet_table_to_native_tabular_result(
                     geo_metadata,
                     column_index=scan_column_index,
                 )
-            _attach_regular_grid_rect_proof_from_column_metadata(
+            _attach_device_geometry_planning_metadata(
                 owned,
                 column_meta,
             )
@@ -2212,7 +2271,9 @@ def _build_geoparquet_metadata_summary_from_pyarrow(
     import pyarrow.fs as pafs
     import pyarrow.parquet as parquet
 
-    from vibespatial.api.io.arrow import _coerce_pyarrow_parquet_source
+    from vibespatial.api.io.arrow import _coerce_pyarrow_parquet_source, _ensure_arrow_fs
+
+    filesystem = _ensure_arrow_fs(filesystem)
 
     primary = geo_metadata["primary_column"]
     if primary not in geo_metadata["columns"]:
@@ -2445,9 +2506,21 @@ def _read_geoparquet_table_with_pyarrow(
     else:
         filters = bbox_filter
     kwargs["use_pandas_metadata"] = True
-    is_directory_dataset = (
-        isinstance(normalized_path, (str, PathLike)) and Path(normalized_path).is_dir()
-    )
+    is_directory_dataset = False
+    if isinstance(normalized_path, (str, PathLike)):
+        if filesystem is None:
+            is_directory_dataset = Path(normalized_path).is_dir()
+        else:
+            from vibespatial.api.io.arrow import _ensure_arrow_fs
+
+            arrow_filesystem = _ensure_arrow_fs(filesystem)
+            if hasattr(arrow_filesystem, "get_file_info"):
+                import pyarrow.fs as pafs
+
+                is_directory_dataset = (
+                    arrow_filesystem.get_file_info(normalized_path).type
+                    == pafs.FileType.Directory
+                )
     added_bbox_column = None
     row_group_columns = columns
     if row_group_columns is not None and filters is not None:
@@ -2529,7 +2602,7 @@ def _decode_arrow_geoparquet_table_to_owned(
             raise KeyError(column_name)
     encoding = geo_metadata["columns"][column_name].get("encoding")
     owned = _decode_geoarrow_array_to_owned(field, array, encoding=encoding)
-    _attach_regular_grid_rect_proof_from_column_metadata(
+    _attach_device_geometry_planning_metadata(
         owned,
         geo_metadata["columns"][column_name],
     )
@@ -2567,7 +2640,7 @@ def _decode_geoparquet_table_to_owned(
                 encoding=geo_metadata["columns"][primary].get("encoding"),
                 column_meta=geo_metadata["columns"][primary],
             )
-            _attach_regular_grid_rect_proof_from_column_metadata(
+            _attach_device_geometry_planning_metadata(
                 owned,
                 geo_metadata["columns"][primary],
             )
@@ -2700,6 +2773,7 @@ def _iter_geoparquet_native_impl(
     if (
         read_plan.requested_backend == "auto"
         and read_plan.gpu_rejection_reason is not None
+        and not read_plan.explicit_host_compatibility
         and not _is_geoparquet_scan_ineligible_for_gpu_fallback(geo_metadata)
     ):
         _record_geoparquet_scan_backend_fallback(

@@ -3507,12 +3507,15 @@ def _indexed_polygonal_part_capacities(
     """Expose indexed Polygon parts through logical row/part-slot capacity."""
     from vibespatial.geometry.owned import ensure_device_geometry_size_bounds
 
+    explicit_part_bound = max_parts_per_row is not None
+    explicit_ring_bound = max_rings_per_row is not None
+    explicit_coord_bound = max_coords_per_row is not None
     unique_family_rows = state.trusted_unique_family_rows is True
     carried_segment_bound = (
         None if unique_family_rows else _polygon_segment_span_bound(owned)
     )
     if not unique_family_rows and carried_segment_bound is None:
-        ensure_device_geometry_size_bounds(
+        carried_segment_bound = ensure_device_geometry_size_bounds(
             owned,
             reason="constructive indexed polygon-part size planning packet",
         )
@@ -3551,15 +3554,45 @@ def _indexed_polygonal_part_capacities(
                 "coord_count_per_row",
                 structural_upper_bound=max_coords_per_row,
             )
+            if not unique_family_rows and max_rings_per_row is not None:
+                fixed_ring_count = max(
+                    0 if fixed_ring_count is None else int(fixed_ring_count),
+                    int(max_rings_per_row),
+                )
+            if not unique_family_rows and max_coords_per_row is not None:
+                fixed_coord_count = max(
+                    0 if fixed_coord_count is None else int(fixed_coord_count),
+                    int(max_coords_per_row),
+                )
             if fixed_ring_count is None and polygon.dense_single_ring_width is not None:
                 fixed_ring_count = 1
                 fixed_coord_count = int(polygon.dense_single_ring_width)
-            if unique_family_rows:
+            if (
+                explicit_ring_bound
+                and explicit_coord_bound
+                and fixed_ring_count is not None
+                and fixed_coord_count is not None
+            ):
+                ring_capacity = min(
+                    max(int(polygon.ring_offsets.size) - 1, 0),
+                    owned.row_count * int(fixed_ring_count),
+                )
+                coord_capacity = min(
+                    int(polygon.x.size),
+                    owned.row_count * int(fixed_coord_count),
+                )
+            elif unique_family_rows:
                 ring_capacity = max(int(polygon.ring_offsets.size) - 1, 0)
                 coord_capacity = int(polygon.x.size)
             elif fixed_ring_count is not None and fixed_coord_count is not None:
-                ring_capacity = owned.row_count * int(fixed_ring_count)
-                coord_capacity = owned.row_count * int(fixed_coord_count)
+                ring_capacity = min(
+                    max(int(polygon.ring_offsets.size) - 1, 0),
+                    owned.row_count * int(fixed_ring_count),
+                )
+                coord_capacity = min(
+                    int(polygon.x.size),
+                    owned.row_count * int(fixed_coord_count),
+                )
             else:
                 return None
             d_polygon = d_validity & (d_tags == np.int8(FAMILY_TAGS[GeometryFamily.POLYGON]))
@@ -3602,15 +3635,31 @@ def _indexed_polygonal_part_capacities(
         fixed_size = getattr(multipolygon, "fixed_size", None)
         family_capacity = max(int(multipolygon.geometry_offsets.size) - 1, 0)
         part_capacity = max(int(multipolygon.part_offsets.size) - 1, 0)
-        part_width = _fixed_or_max_structural_count(
-            fixed_size,
-            "first_level_count_per_row",
-            structural_upper_bound=max_parts_per_row,
+        part_width = (
+            _fixed_or_max_structural_count(
+                fixed_size,
+                "first_level_count_per_row",
+                structural_upper_bound=max_parts_per_row,
+            )
+            if explicit_part_bound or not unique_family_rows
+            else None
         )
         if part_width is None and not unique_family_rows:
             return None
+        if not unique_family_rows and max_parts_per_row is not None:
+            part_width = max(
+                0 if part_width is None else int(part_width),
+                int(max_parts_per_row),
+            )
         part_width = part_capacity if part_width is None else int(part_width)
-        logical_capacity = part_capacity if unique_family_rows else owned.row_count * part_width
+        if unique_family_rows:
+            logical_capacity = (
+                min(part_capacity, owned.row_count * part_width)
+                if explicit_part_bound
+                else part_capacity
+            )
+        else:
+            logical_capacity = owned.row_count * part_width
         if family_capacity > 0 and part_capacity > 0 and logical_capacity > 0:
             fixed_ring_count = _fixed_or_max_structural_count(
                 fixed_size,
@@ -3622,12 +3671,42 @@ def _indexed_polygonal_part_capacities(
                 "coord_count_per_row",
                 structural_upper_bound=max_coords_per_row,
             )
-            if unique_family_rows:
+            if not unique_family_rows and max_rings_per_row is not None:
+                fixed_ring_count = max(
+                    0 if fixed_ring_count is None else int(fixed_ring_count),
+                    int(max_rings_per_row),
+                )
+            if not unique_family_rows and max_coords_per_row is not None:
+                fixed_coord_count = max(
+                    0 if fixed_coord_count is None else int(fixed_coord_count),
+                    int(max_coords_per_row),
+                )
+            if (
+                explicit_ring_bound
+                and explicit_coord_bound
+                and fixed_ring_count is not None
+                and fixed_coord_count is not None
+            ):
+                ring_capacity = min(
+                    max(int(multipolygon.ring_offsets.size) - 1, 0),
+                    owned.row_count * int(fixed_ring_count),
+                )
+                coord_capacity = min(
+                    int(multipolygon.x.size),
+                    owned.row_count * int(fixed_coord_count),
+                )
+            elif unique_family_rows:
                 ring_capacity = max(int(multipolygon.ring_offsets.size) - 1, 0)
                 coord_capacity = int(multipolygon.x.size)
             elif fixed_ring_count is not None and fixed_coord_count is not None:
-                ring_capacity = owned.row_count * int(fixed_ring_count)
-                coord_capacity = owned.row_count * int(fixed_coord_count)
+                ring_capacity = min(
+                    max(int(multipolygon.ring_offsets.size) - 1, 0),
+                    owned.row_count * int(fixed_ring_count),
+                )
+                coord_capacity = min(
+                    int(multipolygon.x.size),
+                    owned.row_count * int(fixed_coord_count),
+                )
             else:
                 return None
             if unique_family_rows:
@@ -3651,7 +3730,7 @@ def _indexed_polygonal_part_capacities(
                     d_safe_family_rows,
                     cp.where(d_in_bounds, d_source_rows + 1, cp.int32(0)),
                 )
-                d_part_rows = cp.arange(part_capacity, dtype=cp.int64)
+                d_part_rows = cp.arange(logical_capacity, dtype=cp.int64)
                 d_logical_part_count = cp.asarray(
                     multipolygon.geometry_offsets,
                     dtype=cp.int64,
@@ -3783,6 +3862,314 @@ def _explode_polygonal_rows_to_polygon_capacity_gpu(
         if partition is not None
     ]
     return _polygon_part_selection_from_capacities(partitions)
+
+
+_NESTED_MULTIPOLYGON_REPAIR_MAX_PART_CAPACITY = 512
+_NESTED_MULTIPOLYGON_REPAIR_MAX_RING_CAPACITY = 16 * 1024
+_NESTED_MULTIPOLYGON_REPAIR_MAX_COORD_CAPACITY = 256 * 1024
+
+
+def _drop_nested_multipolygon_parts_gpu(
+    owned: OwnedGeometryArray,
+) -> OwnedGeometryArray | None:
+    """Remove same-row contained Polygon parts from MultiPolygon rows.
+
+    Grouped overlay union can emit otherwise valid polygon parts with a nested
+    exterior shell when one input component is wholly covered by another and
+    their boundaries never cross.  OGC MultiPolygon validity forbids that
+    nesting; union semantics keep only the containing component.  This sparse
+    repair stays device-resident and bounds its dense same-row relation by the
+    invalid output's physical part capacity.
+    """
+    if cp is None or owned.row_count == 0:
+        return None
+    state = owned._ensure_device_state(preserve_indexed_view=True)
+    family_count = sum(
+        family in state.families
+        for family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON)
+    )
+    if family_count == 0:
+        return None
+    family_row_slots = owned.row_count * family_count
+    part_slot_bound = _NESTED_MULTIPOLYGON_REPAIR_MAX_PART_CAPACITY // family_row_slots
+    ring_slot_bound = _NESTED_MULTIPOLYGON_REPAIR_MAX_RING_CAPACITY // family_row_slots
+    coord_slot_bound = _NESTED_MULTIPOLYGON_REPAIR_MAX_COORD_CAPACITY // family_row_slots
+    if min(part_slot_bound, ring_slot_bound, coord_slot_bound) <= 0:
+        return None
+
+    part_bounds: list[int] = []
+    ring_bounds: list[int] = []
+    coord_bounds: list[int] = []
+    d_validity = cp.asarray(state.validity, dtype=cp.bool_)
+    d_tags = cp.asarray(state.tags, dtype=cp.int8)
+    d_family_rows = cp.asarray(state.family_row_offsets, dtype=cp.int64)
+    polygonal_tags = cp.asarray(
+        [
+            FAMILY_TAGS[GeometryFamily.POLYGON],
+            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+        ],
+        dtype=cp.int8,
+    )
+    # The assembled repair carrier contains polygonal rows only.  Rows from
+    # every other family must stay selected from ``owned``; otherwise valid
+    # points and lines are replaced by the repair carrier's null lanes.
+    d_within_repair_capacity = d_validity & cp.isin(d_tags, polygonal_tags)
+    polygon = state.families.get(GeometryFamily.POLYGON)
+    if polygon is not None:
+        fixed_size = getattr(polygon, "fixed_size", None)
+        polygon_rings_bound = _fixed_or_max_structural_count(
+            fixed_size,
+            "first_level_count_per_row",
+        )
+        polygon_coords_bound = _fixed_or_max_structural_count(
+            fixed_size,
+            "coord_count_per_row",
+        )
+        polygon_rings = min(
+            ring_slot_bound,
+            ring_slot_bound if polygon_rings_bound is None else int(polygon_rings_bound),
+        )
+        polygon_coords = min(
+            coord_slot_bound,
+            coord_slot_bound if polygon_coords_bound is None else int(polygon_coords_bound),
+        )
+        part_bounds.append(1)
+        ring_bounds.append(int(polygon_rings))
+        coord_bounds.append(int(polygon_coords))
+
+        family_capacity = max(int(polygon.geometry_offsets.size) - 1, 0)
+        d_is_polygon = d_validity & (
+            d_tags == np.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
+        )
+        d_polygon_in_bounds = (
+            d_is_polygon
+            & (d_family_rows >= 0)
+            & (d_family_rows < family_capacity)
+        )
+        d_safe_polygon_rows = cp.where(
+            d_polygon_in_bounds,
+            d_family_rows,
+            cp.int64(0),
+        )
+        d_polygon_offsets = cp.asarray(polygon.geometry_offsets, dtype=cp.int64)
+        d_polygon_ring_count = (
+            d_polygon_offsets[d_safe_polygon_rows + 1]
+            - d_polygon_offsets[d_safe_polygon_rows]
+        )
+        from vibespatial.geometry.owned import device_family_coordinate_counts
+
+        d_polygon_coord_count = device_family_coordinate_counts(
+            polygon,
+            d_safe_polygon_rows,
+        )
+        d_polygon_within = (
+            d_polygon_in_bounds
+            & (d_polygon_ring_count <= polygon_rings)
+            & (d_polygon_coord_count <= polygon_coords)
+        )
+        d_within_repair_capacity &= ~d_is_polygon | d_polygon_within
+    multipolygon = state.families.get(GeometryFamily.MULTIPOLYGON)
+    if multipolygon is not None:
+        fixed_size = getattr(multipolygon, "fixed_size", None)
+        multipolygon_parts_bound = _fixed_or_max_structural_count(
+            fixed_size,
+            "first_level_count_per_row",
+        )
+        multipolygon_rings_bound = _fixed_or_max_structural_count(
+            fixed_size,
+            "second_level_count_per_row",
+        )
+        multipolygon_coords_bound = _fixed_or_max_structural_count(
+            fixed_size,
+            "coord_count_per_row",
+        )
+        multipolygon_parts = min(
+            part_slot_bound,
+            (
+                part_slot_bound
+                if multipolygon_parts_bound is None
+                else int(multipolygon_parts_bound)
+            ),
+        )
+        multipolygon_rings = min(
+            ring_slot_bound,
+            (
+                ring_slot_bound
+                if multipolygon_rings_bound is None
+                else int(multipolygon_rings_bound)
+            ),
+        )
+        multipolygon_coords = min(
+            coord_slot_bound,
+            (
+                coord_slot_bound
+                if multipolygon_coords_bound is None
+                else int(multipolygon_coords_bound)
+            ),
+        )
+        part_bounds.append(int(multipolygon_parts))
+        ring_bounds.append(int(multipolygon_rings))
+        coord_bounds.append(int(multipolygon_coords))
+
+        if multipolygon.part_offsets is None or multipolygon.ring_offsets is None:
+            return None
+        family_capacity = max(int(multipolygon.geometry_offsets.size) - 1, 0)
+        d_is_multipolygon = d_validity & (
+            d_tags == np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
+        )
+        d_multipolygon_in_bounds = (
+            d_is_multipolygon
+            & (d_family_rows >= 0)
+            & (d_family_rows < family_capacity)
+        )
+        d_safe_multipolygon_rows = cp.where(
+            d_multipolygon_in_bounds,
+            d_family_rows,
+            cp.int64(0),
+        )
+        d_multipolygon_offsets = cp.asarray(
+            multipolygon.geometry_offsets,
+            dtype=cp.int64,
+        )
+        d_multipolygon_part_starts = d_multipolygon_offsets[
+            d_safe_multipolygon_rows
+        ]
+        d_multipolygon_part_ends = d_multipolygon_offsets[
+            d_safe_multipolygon_rows + 1
+        ]
+        d_multipolygon_ring_offsets = cp.asarray(
+            multipolygon.part_offsets,
+            dtype=cp.int64,
+        )
+        d_multipolygon_part_count = (
+            d_multipolygon_part_ends - d_multipolygon_part_starts
+        )
+        d_multipolygon_ring_count = (
+            d_multipolygon_ring_offsets[d_multipolygon_part_ends]
+            - d_multipolygon_ring_offsets[d_multipolygon_part_starts]
+        )
+        from vibespatial.geometry.owned import device_family_coordinate_counts
+
+        d_multipolygon_coord_count = device_family_coordinate_counts(
+            multipolygon,
+            d_safe_multipolygon_rows,
+        )
+        d_multipolygon_within = (
+            d_multipolygon_in_bounds
+            & (d_multipolygon_part_count <= multipolygon_parts)
+            & (d_multipolygon_ring_count <= multipolygon_rings)
+            & (d_multipolygon_coord_count <= multipolygon_coords)
+        )
+        d_within_repair_capacity &= ~d_is_multipolygon | d_multipolygon_within
+
+    indexed = owned._device_indexed_take(
+        cp.arange(owned.row_count, dtype=cp.int64),
+        assume_unique_indices=True,
+    )
+    polygon_parts = _explode_polygonal_rows_to_polygon_capacity_gpu(
+        indexed,
+        max_parts_per_row=max(part_bounds),
+        max_rings_per_row=max(ring_bounds),
+        max_coords_per_row=max(coord_bounds),
+    )
+    if polygon_parts is None or polygon_parts.capacity == 0:
+        return None
+    part_capacity = polygon_parts.capacity
+    if part_capacity > _NESTED_MULTIPOLYGON_REPAIR_MAX_PART_CAPACITY:
+        return None
+
+    from vibespatial.api._native_grouped import NativeGroupedSelection
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+    from vibespatial.constructive.measurement import _area_gpu_device_fp64
+    from vibespatial.cuda.cccl_primitives import PairSortStrategy, sort_pairs
+    from vibespatial.predicates.binary import binary_predicate_expression
+
+    d_active = polygon_parts.selection.active_capacity_mask()
+    d_source_rows = cp.asarray(polygon_parts.source_rows, dtype=cp.int32)
+    d_rows = cp.arange(part_capacity, dtype=cp.int64)
+    d_left_rows = cp.repeat(d_rows, part_capacity)
+    d_right_rows = cp.tile(d_rows, part_capacity)
+    d_pair_active = (
+        d_active[d_left_rows]
+        & d_active[d_right_rows]
+        & (d_left_rows != d_right_rows)
+        & (d_source_rows[d_left_rows] == d_source_rows[d_right_rows])
+    )
+    left_pairs = polygon_parts.geometry._device_indexed_take(
+        d_left_rows,
+    )._apply_row_activity(d_pair_active)
+    right_pairs = polygon_parts.geometry._device_indexed_take(
+        d_right_rows,
+    )._apply_row_activity(d_pair_active)
+    covered = binary_predicate_expression(
+        "covered_by",
+        left_pairs,
+        right_pairs,
+        dispatch_mode=ExecutionMode.GPU,
+        operation="constructive.make_valid.nested_multipolygon_parts",
+    )
+    if covered is None:
+        return None
+
+    d_part_area = cp.abs(
+        cp.asarray(_area_gpu_device_fp64(polygon_parts.geometry), dtype=cp.float64)
+    )
+    d_left_area = d_part_area[d_left_rows]
+    d_right_area = d_part_area[d_right_rows]
+    d_strictly_redundant = cp.asarray(covered.values, dtype=cp.bool_) & (
+        (d_left_area < d_right_area)
+        | ((d_left_area == d_right_area) & (d_left_rows > d_right_rows))
+    )
+    d_drop = cp.any(
+        d_strictly_redundant.reshape(part_capacity, part_capacity),
+        axis=1,
+    )
+    d_keep = d_active & ~d_drop
+
+    grouped_parts = NativeGroupedSelection(
+        selection=NativeDeviceSelection.from_mask(d_keep),
+        group_codes=d_source_rows,
+        group_count=owned.row_count,
+    )
+    d_part_counts = grouped_parts.reduce_numeric(
+        cp.ones(part_capacity, dtype=cp.int32),
+        "count",
+    ).values.astype(cp.int32, copy=False)
+    d_sort_groups = cp.where(
+        d_keep,
+        d_source_rows.astype(cp.int64, copy=False),
+        cp.int64(owned.row_count),
+    ).astype(cp.uint64, copy=False)
+    d_sort_keys = (d_sort_groups << cp.uint64(32)) | cp.arange(
+        part_capacity,
+        dtype=cp.uint64,
+    )
+    d_order = sort_pairs(
+        d_sort_keys,
+        cp.arange(part_capacity, dtype=cp.int32),
+        strategy=PairSortStrategy.RADIX,
+        synchronize=False,
+    ).values.astype(cp.int64, copy=False)
+    sorted_parts = polygon_parts.geometry._device_indexed_take(d_order)
+    result = _assemble_sorted_polygon_part_capacity_gpu(
+        sorted_parts,
+        grouped_parts.selection.logical_count,
+        d_part_counts,
+        cp.arange(owned.row_count, dtype=cp.int32),
+        output_row_count=owned.row_count,
+        runtime_reason="nested multipolygon part canonicalization",
+        ring_capacity=polygon_parts.ring_capacity,
+        coord_capacity=polygon_parts.coord_capacity,
+    )
+    if result is not None:
+        from vibespatial.geometry.owned import device_select_owned_capacity_partitions
+
+        result = device_select_owned_capacity_partitions(
+            owned,
+            [(result, d_within_repair_capacity)],
+        )
+        result._native_nested_multipolygon_parts_canonicalized = True
+    return result
 
 
 @dataclass(frozen=True)

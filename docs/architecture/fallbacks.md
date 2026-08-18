@@ -5,7 +5,7 @@ Scope: Observable CPU fallback policy for unsupported predicates, geometry mixes
 Read If: You are changing fallback visibility, host-only geospatial paths, or runtime observability.
 STOP IF: You already have the fallback event API open and only need local implementation detail.
 Source Of Truth: Phase-4 explicit fallback policy for predicate and spatial-query surfaces.
-Body Budget: 97/220 lines
+Body Budget: 105/220 lines
 Document: docs/architecture/fallbacks.md
 
 Section Map (Body Lines)
@@ -18,9 +18,9 @@ Section Map (Body Lines)
 | 28-33 | Risks |
 | 34-39 | Intent |
 | 40-53 | Decision |
-| 54-77 | Current Surfaces |
-| 78-89 | Observability Contract |
-| 90-97 | Consequences |
+| 54-85 | Current Surfaces |
+| 86-97 | Observability Contract |
+| 98-105 | Consequences |
 DOC_HEADER:END -->
 
 ## Request Signals
@@ -82,6 +82,8 @@ Fallback events are currently recorded for:
 - `GeometryArray.sindex` and other owned-backed public adapters that must
   materialize a host-side spatial index
 - `sindex.query`
+- `sindex.query_any` when the indexed tree or query geometries cannot use the
+  owned input-sized reduction path
 - `sindex.query_aggregate` when geometry or numeric inputs cannot use the
   native relation/grouped-reduction path
 - `sindex.query_pair_aggregate` when aligned owned geometry or paired native
@@ -97,6 +99,12 @@ Fallback events are currently recorded for:
   and constructive operations
 - GeoArrow / WKB / GeoParquet compatibility bridges and staged GPU decode or
   device-writer misses
+
+An explicit `storage_options`, non-local filesystem, or `to_pandas_kwargs`
+request selects the host GeoParquet compatibility transport by contract. That
+choice is recorded as a CPU dispatch, not as an automatic GPU fallback, and is
+therefore permitted in strict-native mode. An automatic host selection for an
+otherwise GPU-eligible read remains an observable fallback.
 
 ## Observability Contract
 

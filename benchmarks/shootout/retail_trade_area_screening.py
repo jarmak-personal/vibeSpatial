@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _data import fingerprint, setup_fixtures
+from _data import fingerprint, setup_fixtures, spatial_antijoin, spatial_semijoin
 
 import geopandas as gpd
 
@@ -51,29 +51,24 @@ frontage = frontage.dissolve(by="frontage_group").reset_index()
 competitors = pois[pois["pole_type"] == 1][["geometry"]].copy()
 competitors["geometry"] = competitors.geometry.buffer(COMPETITOR_EXCLUSION_DISTANCE)
 
-near_transit_rows = gpd.sjoin(
+near_transit = spatial_semijoin(
     candidates,
     transit_access,
     predicate="intersects",
-).index.unique()
-near_transit = candidates.loc[near_transit_rows].copy()
+)
 
-near_road_rows = gpd.sjoin(
+near_roads = spatial_semijoin(
     near_transit,
     frontage[["geometry"]],
     predicate="intersects",
-).index.unique()
-near_roads = near_transit.loc[near_road_rows].copy()
+)
 
 if len(competitors) > 0 and len(near_roads) > 0:
-    competitor_hits = gpd.sjoin(
+    safe_sites = spatial_antijoin(
         near_roads,
         competitors,
         predicate="intersects",
     )
-    safe_sites = near_roads.loc[
-        ~near_roads.index.isin(competitor_hits.index.unique())
-    ].copy()
 else:
     safe_sites = near_roads.copy()
 

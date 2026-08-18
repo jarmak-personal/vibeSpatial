@@ -41,7 +41,14 @@ result_images/
 # Benchmark fixture cache and results
 .benchmark_fixtures/
 benchmarks/results/
-benchmark_results/
+benchmark_results/*
+!benchmark_results/spatialbench/
+benchmark_results/spatialbench/*
+!benchmark_results/spatialbench/sf100/
+benchmark_results/spatialbench/sf100/*
+!benchmark_results/spatialbench/sf100/2026-08-18-public-capacity-closure/
+benchmark_results/spatialbench/sf100/2026-08-18-public-capacity-closure/*
+!benchmark_results/spatialbench/sf100/2026-08-18-public-capacity-closure/checkpoint.json
 /benchmark_results.json
 
 # Example data (large downloads)

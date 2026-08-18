@@ -945,6 +945,7 @@ class DeviceGeometryArray(ExtensionArray):
             quad_segs = kwargs.pop("resolution")
         if quad_segs is None:
             quad_segs = 16
+        quad_segs = max(int(quad_segs), 1)
 
         cap_style = kwargs.pop("cap_style", "round")
         join_style = kwargs.pop("join_style", "round")

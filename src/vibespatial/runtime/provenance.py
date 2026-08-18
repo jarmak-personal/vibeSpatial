@@ -253,10 +253,14 @@ def make_buffer_tag(
     cap_style: str,
     join_style: str,
     single_sided: bool,
-    quad_segs: int,
+    quad_segs: int | None,
 ) -> ProvenanceTag:
     """Create a provenance tag for a buffer operation."""
     geom_types = infer_geom_types(source)
+    # GEOS/Shapely clamp non-positive quadrant segment requests to one.
+    # Record the effective tessellation so downstream geometric bounds describe
+    # the polygon that was actually produced, not the raw user spelling.
+    normalized_quad_segs = max(16 if quad_segs is None else int(quad_segs), 1)
     return ProvenanceTag(
         operation="buffer",
         params=(
@@ -264,7 +268,7 @@ def make_buffer_tag(
             ("cap_style", cap_style),
             ("join_style", join_style),
             ("single_sided", single_sided),
-            ("quad_segs", quad_segs),
+            ("quad_segs", normalized_quad_segs),
         ),
         source_geom_types=geom_types,
         source_array=source,

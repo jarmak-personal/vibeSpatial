@@ -1321,7 +1321,9 @@ def test_geoparquet_prune_strategies_return_same_selection() -> None:
     assert vectorized_result.pruned_row_group_fraction == 0.5
 
 
-def test_geoparquet_read_backend_plan_allows_to_pandas_kwargs_on_gpu_path(monkeypatch) -> None:
+def test_geoparquet_read_backend_plan_routes_to_pandas_kwargs_to_host_compatibility(
+    monkeypatch,
+) -> None:
     metadata = {
         "primary_column": "geometry",
         "columns": {"geometry": {"encoding": "point"}},
@@ -1343,9 +1345,9 @@ def test_geoparquet_read_backend_plan_allows_to_pandas_kwargs_on_gpu_path(monkey
         geo_metadata=metadata,
     )
 
-    assert plan.selected_backend == "pylibcudf"
-    assert plan.selected_mode is ExecutionMode.GPU
-    assert plan.gpu_rejection_reason is None
+    assert plan.selected_backend == "pyarrow"
+    assert plan.selected_mode is ExecutionMode.CPU
+    assert "to_pandas_kwargs require" in plan.gpu_rejection_reason
 
 
 def test_geoparquet_read_backend_plan_allows_local_arrow_filesystem_on_gpu_path(
@@ -1624,9 +1626,10 @@ def test_read_geoparquet_uses_planned_row_groups_when_metadata_summary_exists(mo
     assert events[-1].operation == "row_group_pushdown"
 
 
-def test_read_geoparquet_records_backend_selection_fallback_when_auto_gpu_scan_rejected(
+def test_read_geoparquet_records_explicit_host_dispatch_for_storage_options(
     monkeypatch,
 ) -> None:
+    geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
 
     monkeypatch.setattr(io_geoparquet, "has_pyarrow_support", lambda: True)
@@ -1658,17 +1661,21 @@ def test_read_geoparquet_records_backend_selection_fallback_when_auto_gpu_scan_r
         ),
     )
 
-    result = io_arrow.read_geoparquet("sample.parquet", storage_options={"foo": "bar"})
+    result = io_arrow.read_geoparquet(
+        "sample.parquet", storage_options={"foo": "bar"}
+    )
+    dispatches = geopandas.get_dispatch_events(clear=True)
     fallbacks = geopandas.get_fallback_events(clear=True)
 
     assert len(result) == 1
     assert result.geometry.iloc[0].equals(Point(0, 0))
     assert any(
         event.surface == "geopandas.read_parquet"
-        and event.reason == "explicit CPU fallback for GeoParquet scan backend selection"
-        and "filesystem-backed GeoParquet reads still route through host pyarrow" in event.detail
-        for event in fallbacks
+        and event.selected is ExecutionMode.CPU
+        and "explicit filesystem compatibility transport" in event.reason
+        for event in dispatches
     )
+    assert fallbacks == []
 
 
 def test_arrow_to_geopandas_records_explicit_wkb_decode_fallback(monkeypatch) -> None:
@@ -4030,6 +4037,73 @@ def test_read_geoparquet_native_chunked_preserves_secondary_geometry_and_index(t
         assert left.equals(right)
     for left, right in zip(materialized["geom2"], gdf["geom2"], strict=True):
         assert left.equals(right)
+
+
+def test_public_geoparquet_read_honors_arrow_dtype_mapper_with_explicit_host_dispatch(
+    tmp_path,
+) -> None:
+    from pandas import ArrowDtype
+
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+    from vibespatial.testing import strict_native_environment
+
+    nested_type = ArrowDtype(pa.struct([pa.field("foo", pa.string())]))
+    index = pd.Index([0], dtype=ArrowDtype(pa.int64()))
+    gdf = geopandas.GeoDataFrame(
+        {
+            "geometry": [box(0, 0, 1, 1)],
+            "value": pd.Series(
+                [1], index=index, dtype=ArrowDtype(pa.int64())
+            ),
+            "nested": pd.Series(
+                [{"foo": "bar"}], index=index, dtype=nested_type
+            ),
+        },
+        index=index,
+    )
+    path = tmp_path / "arrow-dtypes.parquet"
+    gdf.to_parquet(path)
+    geopandas.clear_fallback_events()
+    clear_dispatch_events()
+
+    with strict_native_environment():
+        result = geopandas.read_parquet(
+            path,
+            to_pandas_kwargs={"types_mapper": ArrowDtype},
+        )
+
+    assert result["value"].dtype == ArrowDtype(pa.int64())
+    assert result["nested"].dtype == nested_type
+    assert result["nested"].iloc[0] == {"foo": "bar"}
+    assert geopandas.get_fallback_events(clear=True) == []
+    assert any(
+        event.surface == "geopandas.read_parquet"
+        and event.implementation == "repo_owned_geoparquet_engine"
+        and event.selected is ExecutionMode.CPU
+        and "explicit filesystem compatibility transport" in event.reason
+        for event in get_dispatch_events(clear=True)
+    )
+
+
+def test_public_geoparquet_read_preserves_arrow_nested_type_error(tmp_path) -> None:
+    from pandas import ArrowDtype
+
+    nested_type = ArrowDtype(pa.struct([pa.field("foo", pa.string())]))
+    index = pd.Index([0], dtype=ArrowDtype(pa.int64()))
+    gdf = geopandas.GeoDataFrame(
+        {
+            "geometry": [box(0, 0, 1, 1)],
+            "nested": pd.Series(
+                [{"foo": "bar"}], index=index, dtype=nested_type
+            ),
+        },
+        index=index,
+    )
+    path = tmp_path / "nested-default.parquet"
+    gdf.to_parquet(path)
+
+    with pytest.raises(TypeError, match=r"struct<foo: string>\[pyarrow\]"):
+        geopandas.read_parquet(path)
 
 
 def test_read_geoparquet_batches_yields_bounded_public_native_frames(tmp_path) -> None:

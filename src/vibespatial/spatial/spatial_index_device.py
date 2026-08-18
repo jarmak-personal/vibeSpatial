@@ -768,19 +768,37 @@ def _prepare_morton_range_query(
     total_bounds = flat_index.total_bounds
     d_tree_bounds, temp_tree_bounds = _prepare_tree_bounds_device(flat_index, runtime)
     d_tree_bounds = cp.asarray(d_tree_bounds, dtype=cp.float64).reshape(-1, 4)
-    d_width = d_tree_bounds[:, 2] - d_tree_bounds[:, 0]
-    d_height = d_tree_bounds[:, 3] - d_tree_bounds[:, 1]
-    d_extent_summary = cp.stack(
-        (
-            cp.count_nonzero(cp.isfinite(d_tree_bounds).all(axis=1)),
-            cp.max(cp.where(cp.isfinite(d_width), d_width, 0.0)) * 0.5,
-            cp.max(cp.where(cp.isfinite(d_height), d_height, 0.0)) * 0.5,
+    host_tree_bounds = getattr(flat_index, "_host_bounds", None)
+    if host_tree_bounds is not None:
+        host_tree_bounds = np.asarray(host_tree_bounds, dtype=np.float64).reshape(-1, 4)
+        finite_rows = np.isfinite(host_tree_bounds).all(axis=1)
+        finite_bounds = host_tree_bounds[finite_rows]
+        extent_summary = np.asarray(
+            (
+                finite_bounds.shape[0],
+                np.max(finite_bounds[:, 2] - finite_bounds[:, 0]) * 0.5
+                if finite_bounds.size
+                else 0.0,
+                np.max(finite_bounds[:, 3] - finite_bounds[:, 1]) * 0.5
+                if finite_bounds.size
+                else 0.0,
+            ),
+            dtype=np.float64,
         )
-    ).astype(cp.float64, copy=False)
-    extent_summary = runtime.copy_device_to_host(
-        d_extent_summary,
-        reason="device spatial-index tree extent planning fence",
-    )
+    else:
+        d_width = d_tree_bounds[:, 2] - d_tree_bounds[:, 0]
+        d_height = d_tree_bounds[:, 3] - d_tree_bounds[:, 1]
+        d_extent_summary = cp.stack(
+            (
+                cp.count_nonzero(cp.isfinite(d_tree_bounds).all(axis=1)),
+                cp.max(cp.where(cp.isfinite(d_width), d_width, 0.0)) * 0.5,
+                cp.max(cp.where(cp.isfinite(d_height), d_height, 0.0)) * 0.5,
+            )
+        ).astype(cp.float64, copy=False)
+        extent_summary = runtime.copy_device_to_host(
+            d_extent_summary,
+            reason="device spatial-index tree extent planning fence",
+        )
     if int(extent_summary[0]) == 0:
         runtime.free(temp_tree_bounds)
         return None
@@ -1451,6 +1469,7 @@ def _spatial_index_device_relation_reduction(
     query_bounds,
     *,
     predicate: str | None,
+    distance: np.ndarray | object | None = None,
     reduction: str,
     aligned_tree_owned=None,
     aligned_flat_index=None,
@@ -1482,6 +1501,9 @@ def _spatial_index_device_relation_reduction(
             "unsupported spatial relation reduction"
         )
     pair_reduction = reduction == "right_pair_count"
+    dwithin_reduction = predicate == "dwithin"
+    if dwithin_reduction and distance is None:
+        raise ValueError("dwithin reduction requires a distance")
     if pair_reduction and (
         predicate is None
         or aligned_tree_owned is None
@@ -1542,8 +1564,24 @@ def _spatial_index_device_relation_reduction(
         )
         return values, execution
 
+    d_distance_thresholds = None
+    if dwithin_reduction:
+        raw_distance_thresholds = cp.asarray(distance, dtype=cp.float64)
+        if raw_distance_thresholds.ndim > 1:
+            raise ValueError(
+                "distance array must be broadcastable to the geometry input"
+            )
+        try:
+            d_distance_thresholds = cp.ascontiguousarray(
+                cp.broadcast_to(raw_distance_thresholds, (query_count,))
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "distance array must be broadcastable to the geometry input"
+            ) from exc
+
     admission = _owned_gpu_predicate_family_admission(query_owned, tree_owned)
-    if predicate is not None and (
+    if predicate is not None and not dwithin_reduction and (
         admission is None
         or not (
             admission[0]
@@ -1687,7 +1725,16 @@ def _spatial_index_device_relation_reduction(
                 ),
             )
 
-    state = _prepare_morton_range_query(flat_index, query_bounds, query_bounds)
+    effective_query_bounds = (
+        _expand_bounds_for_distance(query_bounds, d_distance_thresholds)
+        if dwithin_reduction
+        else query_bounds
+    )
+    state = _prepare_morton_range_query(
+        flat_index,
+        query_bounds,
+        effective_query_bounds,
+    )
     if state is None:
         if pair_reduction:
             empty = cp.zeros(tree_count, dtype=cp.int64)
@@ -1725,6 +1772,29 @@ def _spatial_index_device_relation_reduction(
         predicate=predicate,
         family_admission=admission,
     )
+    dwithin_refiner = None
+    dwithin_precision_context = None
+    dwithin_distance_center = None
+    if dwithin_reduction:
+        from vibespatial.spatial.nearest import (
+            _dwithin_mask_gpu_device,
+            _plan_dwithin_gpu_device,
+        )
+
+        dwithin_plan = _plan_dwithin_gpu_device(
+            query_owned,
+            tree_owned,
+            max_tile_lanes,
+        )
+        if dwithin_plan is None:
+            return None, SpatialQueryExecution(
+                requested=ExecutionMode.GPU,
+                selected=ExecutionMode.CPU,
+                implementation="owned_cpu_spatial_query",
+                reason=f"native {reduction_name} dwithin planning declined",
+            )
+        dwithin_precision_context, dwithin_distance_center = dwithin_plan
+        dwithin_refiner = _dwithin_mask_gpu_device
     tile_width = min(
         tree_count,
         _SEMIJOIN_MAX_CANDIDATES_PER_ROW,
@@ -1740,22 +1810,38 @@ def _spatial_index_device_relation_reduction(
         tree_state = tree_owned._ensure_device_state(preserve_indexed_view=True)
         d_query_tags = cp.asarray(query_state.tags, dtype=cp.int8)
         d_tree_tags = cp.asarray(tree_state.tags, dtype=cp.int8)
-        d_query_order, bucket_counts = _morton_reduction_span_schedule(
-            state.d_starts,
-            state.d_ends,
-        )
+        if query_count <= 64:
+            d_query_order = cp.arange(query_count, dtype=cp.int32)
+            d_max_span = cp.max(state.d_ends - state.d_starts).reshape(1)
+            max_span = int(
+                runtime.copy_device_to_host(
+                    d_max_span,
+                    reason="spatial reduction maximum-span planning scalar",
+                )[0]
+            )
+            span_batches = ((0, query_count, max_span),)
+        else:
+            d_query_order, bucket_counts = _morton_reduction_span_schedule(
+                state.d_starts,
+                state.d_ends,
+            )
+            span_batches_list = []
+            bucket_start = 0
+            for bucket_index, bucket_count_raw in enumerate(bucket_counts):
+                bucket_count = int(bucket_count_raw)
+                bucket_stop = bucket_start + bucket_count
+                bucket_span = _MORTON_SPAN_BUCKET_UPPER_BOUNDS[bucket_index]
+                if bucket_span != 0 and bucket_count != 0:
+                    span_batches_list.append(
+                        (bucket_start, bucket_stop, bucket_span)
+                    )
+                bucket_start = bucket_stop
+            span_batches = tuple(span_batches_list)
         kernels = _morton_range_kernels()
         count_kernel = kernels["morton_range_tile_count"]
         scatter_kernel = kernels["morton_range_tile_scatter"]
         ptr = runtime.pointer
-        bucket_start = 0
-        for bucket_index, bucket_count_raw in enumerate(bucket_counts):
-            bucket_count = int(bucket_count_raw)
-            bucket_stop = bucket_start + bucket_count
-            bucket_span = _MORTON_SPAN_BUCKET_UPPER_BOUNDS[bucket_index]
-            if bucket_span == 0 or bucket_count == 0:
-                bucket_start = bucket_stop
-                continue
+        for bucket_start, bucket_stop, bucket_span in span_batches:
             for query_order_start in range(
                 bucket_start,
                 bucket_stop,
@@ -1869,6 +1955,30 @@ def _spatial_index_device_relation_reduction(
                         d_reduce_left = d_pair_left
                         d_reduce_right = d_pair_right
                         d_keep = d_active
+                    elif dwithin_reduction:
+                        dwithin_mask = dwithin_refiner(
+                            query_owned,
+                            tree_owned,
+                            d_pair_left,
+                            d_pair_right,
+                            d_distance_thresholds,
+                            pair_active=d_active,
+                            precision_context=dwithin_precision_context,
+                            distance_center_device=dwithin_distance_center,
+                        )
+                        if dwithin_mask is None:
+                            return None, SpatialQueryExecution(
+                                requested=ExecutionMode.GPU,
+                                selected=ExecutionMode.CPU,
+                                implementation="owned_cpu_spatial_query",
+                                reason=(
+                                    f"native {reduction_name} exact dwithin "
+                                    "refinement declined"
+                                ),
+                            )
+                        d_keep, _used_shapely_fallback = dwithin_mask
+                        d_reduce_left = d_pair_left
+                        d_reduce_right = d_pair_right
                     elif homogeneous_family_pair:
                         d_reduce_left = d_pair_left
                         d_reduce_right = d_pair_right
@@ -2021,8 +2131,6 @@ def _spatial_index_device_relation_reduction(
                             d_keep.astype(cp.uint64),
                         )
                     tile_count += 1
-            bucket_start = bucket_stop
-
         if pair_reduction:
             values = tuple(
                 reduced.astype(cp.int64, copy=False)
@@ -2058,6 +2166,7 @@ def spatial_index_device_left_semijoin_rows(
     query_bounds,
     *,
     predicate: str | None,
+    distance: np.ndarray | object | None = None,
 ) -> tuple[object | None, SpatialQueryExecution]:
     """Reduce a dense Morton candidate stream directly into matched rows."""
     return _spatial_index_device_relation_reduction(
@@ -2066,6 +2175,7 @@ def spatial_index_device_left_semijoin_rows(
         tree_owned,
         query_bounds,
         predicate=predicate,
+        distance=distance,
         reduction="exists",
     )
 
@@ -2077,6 +2187,7 @@ def spatial_index_device_left_match_counts(
     query_bounds,
     *,
     predicate: str | None,
+    distance: np.ndarray | object | None = None,
 ) -> tuple[object | None, SpatialQueryExecution]:
     """Reduce a dense Morton candidate stream directly into int64 counts."""
     return _spatial_index_device_relation_reduction(
@@ -2085,6 +2196,7 @@ def spatial_index_device_left_match_counts(
         tree_owned,
         query_bounds,
         predicate=predicate,
+        distance=distance,
         reduction="count",
     )
 
@@ -2096,6 +2208,7 @@ def spatial_index_device_right_semijoin_rows(
     query_bounds,
     *,
     predicate: str | None,
+    distance: np.ndarray | object | None = None,
 ) -> tuple[object | None, SpatialQueryExecution]:
     """Reduce a dense Morton candidate stream into matched indexed rows."""
     return _spatial_index_device_relation_reduction(
@@ -2104,6 +2217,7 @@ def spatial_index_device_right_semijoin_rows(
         tree_owned,
         query_bounds,
         predicate=predicate,
+        distance=distance,
         reduction="right_exists",
     )
 
@@ -2115,6 +2229,7 @@ def spatial_index_device_right_match_counts(
     query_bounds,
     *,
     predicate: str | None,
+    distance: np.ndarray | object | None = None,
 ) -> tuple[object | None, SpatialQueryExecution]:
     """Reduce a dense Morton candidate stream into indexed-row counts."""
     return _spatial_index_device_relation_reduction(
@@ -2123,6 +2238,7 @@ def spatial_index_device_right_match_counts(
         tree_owned,
         query_bounds,
         predicate=predicate,
+        distance=distance,
         reduction="right_count",
     )
 

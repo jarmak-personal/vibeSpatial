@@ -560,6 +560,84 @@ def test_query_memory_reserve_is_configurable(monkeypatch) -> None:
         rt_mod._configured_query_memory_reserve(1_000)
 
 
+def test_default_pool_limit_preserves_query_reserve(monkeypatch) -> None:
+    from vibespatial.cuda import _runtime as rt_mod
+
+    monkeypatch.delenv("VIBESPATIAL_GPU_POOL_LIMIT", raising=False)
+    monkeypatch.setenv("VIBESPATIAL_GPU_MEMORY_RESERVE_BYTES", "123")
+    assert rt_mod._configured_pool_limit(1_000) == 768
+
+    monkeypatch.setenv("VIBESPATIAL_GPU_POOL_LIMIT", "456")
+    assert rt_mod._configured_pool_limit(1_000) == 256
+    assert rt_mod._rmm_pool_allocation_sizes(256) == (256, 256)
+    assert rt_mod._rmm_pool_allocation_sizes(2 << 20) == (1 << 20, 2 << 20)
+
+    monkeypatch.setenv("VIBESPATIAL_GPU_POOL_LIMIT", "0")
+    assert rt_mod._configured_pool_limit(1_000) is None
+    assert rt_mod._rmm_pool_allocation_sizes(None) == (1 << 20, None)
+
+    monkeypatch.delenv("VIBESPATIAL_GPU_POOL_LIMIT", raising=False)
+    monkeypatch.setenv("VIBESPATIAL_GPU_MEMORY_RESERVE_BYTES", "1000")
+    with pytest.raises(ValueError, match="leaves no allocatable"):
+        rt_mod._configured_pool_limit(1_000)
+    with pytest.raises(ValueError, match="must be positive"):
+        rt_mod._rmm_pool_allocation_sizes(0)
+
+    monkeypatch.setenv("VIBESPATIAL_GPU_POOL_LIMIT", "255")
+    with pytest.raises(ValueError, match="zero or at least 256"):
+        rt_mod._configured_pool_limit(1_000)
+
+    monkeypatch.setenv("VIBESPATIAL_GPU_POOL_LIMIT", "-1")
+    with pytest.raises(ValueError, match="must be non-negative"):
+        rt_mod._configured_pool_limit(1_000)
+
+
+def test_pool_upstream_growth_honors_allocator_ceiling(monkeypatch) -> None:
+    from vibespatial.cuda import _runtime as rt_mod
+
+    runtime = rt_mod.CudaDriverRuntime()
+    runtime._memory_backend = "rmm-safe"
+    monkeypatch.setenv("VIBESPATIAL_GPU_POOL_LIMIT", str(8 << 20))
+    monkeypatch.setattr(runtime, "_ensure_context", lambda: None)
+    monkeypatch.setattr(
+        rt_mod.cp.cuda.runtime,
+        "memGetInfo",
+        lambda: (32 << 20, 64 << 20),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "memory_pool_stats",
+        lambda: {"reserved_bytes": 8 << 20},
+    )
+
+    assert runtime.pool_upstream_growth_bytes() == 0
+
+    monkeypatch.setattr(
+        runtime,
+        "memory_pool_stats",
+        lambda: {"reserved_bytes": 6 << 20},
+    )
+    assert runtime.pool_upstream_growth_bytes() == 2 << 20
+
+
+def test_pool_upstream_growth_ignores_pool_limit_for_managed_memory(
+    monkeypatch,
+) -> None:
+    from vibespatial.cuda import _runtime as rt_mod
+
+    runtime = rt_mod.CudaDriverRuntime()
+    runtime._memory_backend = "rmm-managed"
+    monkeypatch.setenv("VIBESPATIAL_GPU_POOL_LIMIT", "128")
+    monkeypatch.setattr(runtime, "_ensure_context", lambda: None)
+    monkeypatch.setattr(
+        rt_mod.cp.cuda.runtime,
+        "memGetInfo",
+        lambda: (32 << 20, 64 << 20),
+    )
+
+    assert runtime.pool_upstream_growth_bytes() == 32 << 20
+
+
 # ---------------------------------------------------------------------------
 # memory_pool_stats returns expected shape
 # ---------------------------------------------------------------------------

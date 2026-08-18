@@ -1067,6 +1067,107 @@ def test_grouped_coverage_edge_union_device_codes_merges_touching_polygons() -> 
 
 
 @pytest.mark.gpu
+def test_grouped_coverage_prefers_edge_union_before_disjoint_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    geoms = [
+        Polygon([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)]),
+        Polygon([(1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0)]),
+        Polygon([(2.0, 0.0), (3.0, 0.0), (2.0, 1.0), (2.0, 0.0)]),
+    ]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+
+    def _fail_disjoint_probe(*_args, **_kwargs):
+        raise AssertionError("coverage edge union must precede disjoint admission")
+
+    monkeypatch.setattr(
+        dissolve_module,
+        "execute_grouped_disjoint_subset_union_gpu_owned_codes",
+        _fail_disjoint_probe,
+    )
+    monkeypatch.setattr(
+        dissolve_module,
+        "_execute_low_fan_in_all_valid_coverage_union_gpu_owned_codes",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        dissolve_module,
+        "execute_grouped_box_union_gpu_owned_codes",
+        lambda *_args, **_kwargs: None,
+    )
+    reset_d2h_transfer_count()
+
+    with assert_zero_d2h_transfers():
+        grouped = dissolve_module.execute_grouped_union_codes(
+            (),
+            cp.asarray([0, 0, 0], dtype=cp.int32),
+            group_count=1,
+            method=DissolveUnionMethod.COVERAGE,
+            owned=owned,
+        )
+
+    assert grouped is not None
+    assert grouped.owned is not None
+    actual = grouped.owned.to_shapely()[0]
+    expected = shapely.coverage_union_all(np.asarray(geoms, dtype=object))
+    assert shapely.equals(actual, expected)
+
+
+@pytest.mark.gpu
+def test_grouped_union_keeps_late_multipolygon_parts_in_nonunique_indexed_view() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.geometry.owned import (
+        build_empty_polygon_rows_device,
+        device_select_owned_capacity_partitions,
+    )
+
+    geoms = [
+        box(0.0, 0.0, 1.0, 1.0),
+        box(3.0, 0.0, 4.0, 1.0),
+        MultiPolygon(
+            [
+                box(6.0, 0.0, 7.0, 1.0),
+                box(9.0, 0.0, 10.0, 1.0),
+            ]
+        ),
+        box(12.0, 0.0, 13.0, 1.0),
+    ]
+    physical = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    current = physical._device_indexed_take(
+        cp.arange(len(geoms), dtype=cp.int64),
+    )
+    seed_all_validity_cache(current)
+    selected = device_select_owned_capacity_partitions(
+        build_empty_polygon_rows_device(len(geoms)),
+        [(current, cp.ones(len(geoms), dtype=cp.bool_))],
+    )
+    assert selected.is_indexed_view
+    assert selected.device_state.trusted_unique_family_rows is False
+
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": [0] * len(geoms),
+            "geometry": GeometryArray.from_owned(selected),
+        }
+    )
+    result = frame.dissolve(by="group")
+
+    assert len(result) == 1
+    assert shapely.equals(result.geometry.iloc[0], shapely.union_all(geoms))
+
+
+@pytest.mark.gpu
 def test_grouped_coverage_edge_union_device_codes_marks_unobserved_groups_empty() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
@@ -1150,6 +1251,43 @@ def test_grouped_coverage_edge_union_host_codes_reuse_group_sizing_mirrors() -> 
     assert grouped.empty_groups == 0
     assert "overlay dissolve grouped coverage-edge valid-row count fence" not in reasons
     assert "overlay dissolve grouped coverage-edge nonempty-group count fence" not in reasons
+
+
+@pytest.mark.gpu
+def test_indexed_coverage_union_declines_rectangle_probe_without_physicalizing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0)]),
+            Polygon([(0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    indexed = owned.take(cp.asarray([1, 0], dtype=cp.int64))
+    seed_all_validity_cache(indexed)
+
+    def _fail_physicalize(*_args, **_kwargs):
+        raise AssertionError("indexed coverage admission must preserve row indirection")
+
+    monkeypatch.setattr(OwnedGeometryArray, "_device_resolve", _fail_physicalize)
+
+    grouped = dissolve_module.execute_grouped_union_codes(
+        indexed,
+        cp.asarray([0, 0], dtype=cp.int32),
+        group_count=1,
+        method=DissolveUnionMethod.COVERAGE,
+        owned=indexed,
+    )
+
+    assert grouped is not None
+    assert grouped.owned is not None
+    actual = grouped.owned.to_shapely()[0]
+    assert shapely.equals(actual, box(0.0, 0.0, 1.0, 1.0))
 
 
 @pytest.mark.gpu

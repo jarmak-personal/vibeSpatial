@@ -1041,8 +1041,11 @@ def _scatter_valid_repaired_batch(
 def _repair_multipolygon_rows_grouped_device(
     owned: OwnedGeometryArray,
     invalid_global_rows,
+    *,
+    method: str,
+    keep_collapsed: bool,
 ) -> OwnedGeometryArray | None:
-    """Repair multipart polygon rows as grouped polygon-part topology."""
+    """Repair multipart polygon rows with the requested GEOS topology model."""
     d_invalid_global_rows = cp.asarray(invalid_global_rows, dtype=cp.int64)
     if int(d_invalid_global_rows.size) == 0:
         return None
@@ -1066,6 +1069,15 @@ def _repair_multipolygon_rows_grouped_device(
     )
 
     selected = owned.device_take(d_invalid_global_rows)
+    if method == "linework":
+        # Linework make-valid polygonizes every noded input ring under the
+        # even/odd interior rule.  In particular, a shell contained by another
+        # shell becomes a hole.  Grouped union is intentionally reserved for
+        # ``structure`` because it would erase that nested boundary.
+        return _repolygonize_owned_rows_via_overlay(selected)
+    if method != "structure":
+        return None
+
     polygon_parts = _explode_polygonal_rows_to_polygon_capacity_gpu(selected)
     if polygon_parts is None or polygon_parts.capacity == 0:
         return None
@@ -1073,11 +1085,19 @@ def _repair_multipolygon_rows_grouped_device(
     part_repair = make_valid_owned(
         owned=polygon_parts.geometry,
         method="structure",
-        keep_collapsed=True,
+        keep_collapsed=keep_collapsed,
         dispatch_mode=ExecutionMode.GPU,
     )
     repaired_parts = part_repair.owned
     if repaired_parts is None or repaired_parts.row_count != polygon_parts.capacity:
+        return None
+    if keep_collapsed and not set(repaired_parts.families).issubset(
+        {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
+    ):
+        # The row-aligned OwnedGeometryArray cannot express the structure
+        # method's GeometryCollection of area plus collapsed linework. Decline
+        # the whole native repair so the public boundary records one exact CPU
+        # compatibility fallback instead of returning an invalid polygon row.
         return None
 
     part_capacity = polygon_parts.capacity
@@ -1137,6 +1157,54 @@ def _repair_multipolygon_rows_grouped_device(
     )
     if grouped_result is None or grouped_result.row_count != selected.row_count:
         return None
+
+    from vibespatial.constructive.binary_constructive import (
+        _drop_nested_multipolygon_parts_gpu,
+    )
+
+    canonical_grouped = _drop_nested_multipolygon_parts_gpu(grouped_result)
+    if canonical_grouped is not None:
+        grouped_result = canonical_grouped
+
+    # Re-unioning individually valid MultiPolygon parts can still leave an
+    # invalid grouped boundary when many parts touch or overlap at shared
+    # edges. Run only those residual rows through the canonical overlay
+    # polygonizer before returning the aligned multipart repair carrier.
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+    from vibespatial.constructive.validity import validity_expression_owned
+    from vibespatial.geometry.owned import device_mask_owned_capacity
+
+    grouped_state = grouped_result._ensure_device_state(preserve_indexed_view=True)
+    d_grouped_invalid = (
+        ~cp.asarray(
+            validity_expression_owned(
+                grouped_result,
+                exact_collinearity=True,
+            ).values,
+            dtype=cp.bool_,
+        )
+    ) & cp.asarray(grouped_state.validity, dtype=cp.bool_)
+    residual_selection = NativeDeviceSelection.from_mask(d_grouped_invalid)
+    residual_count = get_cuda_runtime().copy_device_to_host(
+        residual_selection.logical_count,
+        reason="make-valid multipart residual topology admission scalar fence",
+    )
+    if int(np.asarray(residual_count, dtype=np.int64)[0]) > 0:
+        residual_source = device_mask_owned_capacity(
+            grouped_result,
+            d_grouped_invalid,
+        )
+        residual_repaired = _repolygonize_owned_rows_via_overlay(residual_source)
+        residual_scattered = _scatter_valid_repaired_batch(
+            grouped_result,
+            residual_repaired,
+            GeometryFamily.MULTIPOLYGON.value,
+            cp.arange(grouped_result.row_count, dtype=cp.int32),
+            cp.arange(grouped_result.row_count, dtype=cp.int64),
+        )
+        if residual_scattered is None:
+            return None
+        grouped_result, _ = residual_scattered
     return grouped_result
 
 
@@ -1257,6 +1325,8 @@ def gpu_repair_invalid_polygons(
             batch_result = _repair_multipolygon_rows_grouped_device(
                 merged_owned,
                 d_global_invalid,
+                method=method,
+                keep_collapsed=keep_collapsed,
             )
             scattered = _scatter_valid_repaired_batch(
                 merged_owned,

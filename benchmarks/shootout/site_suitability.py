@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _data import fingerprint, setup_fixtures
+from _data import fingerprint, setup_fixtures, spatial_semijoin
 from shapely.geometry import box
 
 import geopandas as gpd
@@ -46,15 +46,20 @@ clipped_poly = clipped[poly_mask] if not poly_mask.all() else clipped
 # Remove exclusion zones
 suitable = gpd.overlay(clipped_poly, exclusions, how="difference")
 
-# Buffer transit stations
-transit["geometry"] = transit.geometry.buffer(200.0)
-
-# Spatial join: suitable parcels near transit
-joined = gpd.sjoin(suitable, transit[["geometry"]], predicate="intersects")
+# Buffer transit stations and keep each suitable parcel once when any station
+# buffer intersects it. vibeSpatial lowers this public existential join to a
+# bounded device selection; GeoPandas uses the equivalent public spatial join.
+transit_access = transit[["geometry"]].copy()
+transit_access["geometry"] = transit_access.geometry.buffer(200.0)
+joined = spatial_semijoin(
+    suitable,
+    transit_access,
+    predicate="intersects",
+)
 
 # Write result
 output_path = tmpdir / "output.parquet"
-suitable.to_parquet(output_path)
+joined.to_parquet(output_path)
 
 # --- timed work ends here ---
 

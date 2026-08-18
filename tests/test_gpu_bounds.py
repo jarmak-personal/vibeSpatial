@@ -64,6 +64,37 @@ def test_gpu_bounds_runs_from_device_resident_buffers() -> None:
     assert np.isnan(gpu_bounds[2]).all()
 
 
+def test_gpu_bounds_respects_masked_homogeneous_capacity_without_row_cache() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    from vibespatial.geometry.owned import device_mask_owned_capacity
+
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+            Polygon([(20, 20), (21, 20), (21, 21), (20, 20)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    masked = device_mask_owned_capacity(
+        owned,
+        cp.asarray([True, False]),
+        preserve_row_bounds=False,
+    )
+
+    assert masked.device_state is not None
+    assert masked.device_state.row_bounds is None
+    bounds = compute_geometry_bounds(masked, dispatch_mode=ExecutionMode.GPU)
+    assert np.allclose(bounds[0], np.asarray([0.0, 0.0, 1.0, 1.0]))
+    assert np.isnan(bounds[1]).all()
+    assert np.allclose(
+        compute_total_bounds(masked, dispatch_mode=ExecutionMode.GPU),
+        np.asarray([0.0, 0.0, 1.0, 1.0]),
+    )
+
+
 def test_default_compute_geometry_bounds_records_gpu_selection_when_runtime_available(
     tmp_path, monkeypatch
 ) -> None:

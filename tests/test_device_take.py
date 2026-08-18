@@ -936,6 +936,93 @@ class TestDeviceTakeMultiLevel:
             [base_geoms[0], first_geoms[0], second_geoms[0], second_geoms[1]],
         )
 
+    def test_capacity_scatter_uses_exact_path_when_pool_is_fragmented(
+        self,
+        monkeypatch,
+    ):
+        _require_gpu()
+        import cupy as cupy_mod
+
+        from vibespatial.api._native_rowset import NativeDeviceSelection
+        from vibespatial.geometry import owned as owned_module
+        from vibespatial.geometry.owned import device_scatter_owned_capacity_selection
+
+        base_geoms = [Point(float(i), 0.0) for i in range(4)]
+        replacement_geoms = [
+            LineString([(10.0 + i, 0.0), (10.0 + i, 1.0)]) for i in range(4)
+        ]
+        base = from_shapely_geometries(base_geoms, residency=Residency.DEVICE)
+        replacement = from_shapely_geometries(
+            replacement_geoms,
+            residency=Residency.DEVICE,
+        )
+        selection = NativeDeviceSelection.from_mask(
+            cupy_mod.asarray([False, True, False, True]),
+            source_row_count=4,
+        )
+        monkeypatch.setattr(
+            owned_module,
+            "_device_concat_requires_exact_physicalization",
+            lambda _arrays: True,
+        )
+
+        result = device_scatter_owned_capacity_selection(
+            base,
+            replacement,
+            selection,
+        )
+
+        assert result.is_indexed_view
+        assert (
+            result._device_scatter_implementation
+            == "device_exact_capacity_selection_scatter_many"
+        )
+        _assert_geometries_equal(
+            result.to_shapely(),
+            [base_geoms[0], replacement_geoms[0], base_geoms[2], replacement_geoms[1]],
+        )
+
+    def test_exact_physicalization_admission_uses_pool_growth_ceiling(
+        self,
+        monkeypatch,
+    ):
+        _require_gpu()
+        import cupy as cupy_mod
+
+        from vibespatial.cuda._runtime import get_cuda_runtime
+        from vibespatial.geometry.owned import (
+            OwnedGeometryArray,
+            _device_concat_requires_exact_physicalization,
+        )
+
+        first_base = from_shapely_geometries(
+            [Point(0, 0), Point(1, 0)],
+            residency=Residency.DEVICE,
+        )
+        second_base = from_shapely_geometries(
+            [LineString([(2, 0), (2, 1)]), LineString([(3, 0), (3, 1)])],
+            residency=Residency.DEVICE,
+        )
+        first = OwnedGeometryArray._indexed_view(
+            first_base,
+            cupy_mod.asarray([1], dtype=cupy_mod.int64),
+        )
+        second = OwnedGeometryArray._indexed_view(
+            second_base,
+            cupy_mod.asarray([0], dtype=cupy_mod.int64),
+        )
+        runtime = get_cuda_runtime()
+        monkeypatch.setattr(runtime, "pool_upstream_growth_bytes", lambda: 0)
+
+        assert _device_concat_requires_exact_physicalization([first, second])
+
+        monkeypatch.setattr(
+            runtime,
+            "pool_upstream_growth_bytes",
+            lambda: 1 << 30,
+        )
+        assert not _device_concat_requires_exact_physicalization([first, second])
+
     def test_concat_flattens_nested_device_indexed_views_without_take_fence(self):
         _require_gpu()
         import cupy as cupy_mod
@@ -983,6 +1070,50 @@ class TestDeviceTakeMultiLevel:
         assert "owned geometry device-take slice-size allocation fence" not in reasons
         expected = [geoms[0], geoms[4], geoms[1], geoms[3]]
         _assert_geometries_equal(result.to_shapely(), expected)
+
+    def test_concat_exact_compacts_indexed_roots_when_pool_is_fragmented(
+        self,
+        monkeypatch,
+    ):
+        _require_gpu()
+        import cupy as cupy_mod
+
+        from vibespatial.geometry import owned as owned_module
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        first_geoms = [Point(float(i), 0.0) for i in range(4)]
+        second_geoms = [
+            LineString([(10.0 + i, 0.0), (10.0 + i, 1.0)]) for i in range(4)
+        ]
+        first_base = from_shapely_geometries(
+            first_geoms,
+            residency=Residency.DEVICE,
+        )
+        second_base = from_shapely_geometries(
+            second_geoms,
+            residency=Residency.DEVICE,
+        )
+        first = OwnedGeometryArray._indexed_view(
+            first_base,
+            cupy_mod.asarray([3, 1], dtype=cupy_mod.int64),
+        )
+        second = OwnedGeometryArray._indexed_view(
+            second_base,
+            cupy_mod.asarray([2, 0], dtype=cupy_mod.int64),
+        )
+        monkeypatch.setattr(
+            owned_module,
+            "_device_concat_requires_exact_physicalization",
+            lambda _arrays: True,
+        )
+
+        result = OwnedGeometryArray.concat([first, second])
+
+        assert not result.is_indexed_view
+        _assert_geometries_equal(
+            result.to_shapely(),
+            [first_geoms[3], first_geoms[1], second_geoms[2], second_geoms[0]],
+        )
 
     def test_chained_device_take(self):
         """Take from a device_take result (successive compaction)."""

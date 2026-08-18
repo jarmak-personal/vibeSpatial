@@ -174,8 +174,25 @@ def _repair_grouped_union_invalid_subset_device(
     if invalid_count == 0:
         return owned
 
+    from vibespatial.constructive.binary_constructive import (
+        _drop_nested_multipolygon_parts_gpu,
+    )
     from vibespatial.constructive.make_valid_gpu import gpu_repair_invalid_polygons
     from vibespatial.geometry.owned import seed_all_validity_cache
+
+    canonical = _drop_nested_multipolygon_parts_gpu(owned)
+    if canonical is not None:
+        remaining_nested_invalid = _device_grouped_union_invalid_rows(
+            canonical,
+            exact_collinearity=True,
+        )
+        if remaining_nested_invalid is not None and int(remaining_nested_invalid.size) == 0:
+            seed_all_validity_cache(canonical)
+            return canonical
+        if remaining_nested_invalid is not None:
+            owned = canonical
+            d_invalid_rows = cp.asarray(remaining_nested_invalid, dtype=cp.int64)
+            invalid_count = int(d_invalid_rows.size)
 
     repair = gpu_repair_invalid_polygons(
         owned,
@@ -3331,8 +3348,13 @@ def _repair_grouped_union_owned_if_needed(
             invalid_device_rows,
         )
         if repaired_owned is None:
+            device_families = tuple(
+                family.value for family in owned.device_state.families
+            )
             raise RuntimeError(
-                "native grouped-union boundary repair did not produce a complete result"
+                "native grouped-union boundary repair did not produce a complete result "
+                f"(rows={owned.row_count}, invalid_rows={int(invalid_device_rows.size)}, "
+                f"families={device_families})"
             )
         return _GroupedGeometryResult(
             GeometryNativeResult.from_owned(repaired_owned, crs=crs),
@@ -3504,7 +3526,7 @@ def _owned_rectangle_bounds_device(owned: OwnedGeometryArray):
     from vibespatial.geometry.owned import FAMILY_TAGS
     from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
 
-    device_state = owned._ensure_device_state()
+    device_state = owned._ensure_device_state(preserve_indexed_view=True)
     if set(device_state.families) != {GeometryFamily.POLYGON}:
         return None
 
@@ -3519,9 +3541,16 @@ def _owned_rectangle_bounds_device(owned: OwnedGeometryArray):
     if int(getattr(polygon_buffer, "dense_single_ring_width", 0) or 0) == 5 and bool(
         getattr(polygon_buffer, "axis_aligned_rectangles", False)
     ):
-        if polygon_buffer.bounds is not None:
+        if device_state.row_bounds is not None:
+            d_bounds = cp.asarray(device_state.row_bounds, dtype=cp.float64).reshape(
+                owned.row_count,
+                4,
+            )
+        elif polygon_buffer.bounds is not None and not owned.is_indexed_view:
             d_bounds = cp.asarray(polygon_buffer.bounds, dtype=cp.float64)
         else:
+            if owned.is_indexed_view:
+                return None
             compute_geometry_bounds_device(owned)
             d_bounds = cp.asarray(owned.device_state.row_bounds).reshape(
                 owned.row_count,
@@ -3530,6 +3559,14 @@ def _owned_rectangle_bounds_device(owned: OwnedGeometryArray):
             polygon_buffer.bounds = d_bounds
         if tuple(int(dim) for dim in d_bounds.shape) == (int(owned.row_count), 4):
             return d_bounds
+
+    # The remaining structural rectangle proof addresses family buffers by
+    # logical row position. An indexed carrier's family buffers retain base
+    # physical rows, so resolving it here would allocate the entire expanded
+    # geometry only to discover that a later coverage reducer can consume the
+    # row indirection directly.
+    if owned.is_indexed_view:
+        return None
 
     d_geom_starts = cp.asarray(polygon_buffer.geometry_offsets[:-1]).astype(cp.int32, copy=False)
     d_geom_ends = cp.asarray(polygon_buffer.geometry_offsets[1:]).astype(cp.int32, copy=False)
@@ -4085,7 +4122,7 @@ def execute_grouped_disjoint_subset_union_gpu_owned_codes(
         seed_homogeneous_host_metadata,
     )
 
-    device_state = owned._ensure_device_state()
+    device_state = owned._ensure_device_state(preserve_indexed_view=True)
     if set(device_state.families) != {GeometryFamily.POLYGON}:
         return None
     cached_validity = getattr(owned, "_cached_is_valid_mask", None)
@@ -5104,7 +5141,7 @@ def execute_grouped_coverage_edge_union_gpu_owned_codes(
     ) == int(owned.row_count)
     all_valid_all_groups = all_valid_all_rows and host_group_counts[0] == int(group_count)
     total_segments_hint = _host_polygon_segment_count_hint(owned) if all_valid_all_rows else None
-    state = owned._ensure_device_state()
+    state = owned._ensure_device_state(preserve_indexed_view=True)
     d_valid = cp.asarray(state.validity, dtype=cp.bool_)
     d_observed_valid = d_valid & (d_codes >= 0) & (d_codes < np.int32(group_count))
     if observed_in_range_count is not None:
@@ -5317,6 +5354,15 @@ def execute_grouped_union_codes(
         if accelerated is not None:
             return accelerated
 
+    if owned is not None and normalized is DissolveUnionMethod.COVERAGE and grid_size is None:
+        accelerated = execute_grouped_coverage_edge_union_gpu_owned_codes(
+            row_group_codes,
+            group_count=group_count,
+            owned=owned,
+        )
+        if accelerated is not None:
+            return accelerated
+
     if (
         owned is not None
         and normalized
@@ -5332,15 +5378,6 @@ def execute_grouped_union_codes(
             owned=owned,
             method=normalized,
             native_grouped=native_grouped,
-        )
-        if accelerated is not None:
-            return accelerated
-
-    if owned is not None and normalized is DissolveUnionMethod.COVERAGE and grid_size is None:
-        accelerated = execute_grouped_coverage_edge_union_gpu_owned_codes(
-            row_group_codes,
-            group_count=group_count,
-            owned=owned,
         )
         if accelerated is not None:
             return accelerated

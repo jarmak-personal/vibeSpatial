@@ -277,6 +277,7 @@ docs for parameter details.
 |--------|-------------|
 | {py:attr}`~vibespatial.api.geo_base.GeoPandasBase.sindex` | Spatial index (STRtree) |
 | {py:attr}`~vibespatial.api.geo_base.GeoPandasBase.has_sindex` | Whether spatial index is built |
+| {py:meth}`~vibespatial.api.sindex.SpatialIndex.query_any` | Eager input-aligned existence mask without exporting duplicate relation pairs |
 | {py:meth}`~vibespatial.api.sindex.SpatialIndex.query_aggregate` | Eager count/sum reduction over spatial-index matches without exporting relation pairs |
 | {py:meth}`~vibespatial.api.sindex.SpatialIndex.query_pair_aggregate` | Per-indexed-row counts and shared-match counts for two aligned spatial indexes without exporting relation pairs |
 | `.gpu_spatial_index` | GPU-resident Hilbert R-tree (built via `read_file(..., build_index=True)`) |
@@ -386,8 +387,8 @@ set_execution_mode(ExecutionMode.CPU)   # Force CPU
 | `VIBESPATIAL_DETERMINISM` | disabled | Set `1` for deterministic (reproducible) results |
 | `VIBESPATIAL_TRACE_WARNINGS` | disabled | Set `1` to emit warnings from execution traces |
 | `VIBESPATIAL_EVENT_LOG` | disabled | Path to write structured dispatch event log |
-| `VIBESPATIAL_GPU_POOL_LIMIT` | unset | Limit GPU memory pool size (bytes) |
-| `VIBESPATIAL_GPU_OOM_SAFETY` | disabled | Set `1` to enable Tier B: RMM pool with GC retry on OOM. Zero overhead on the happy path; ~5-50ms recovery on OOM. |
+| `VIBESPATIAL_GPU_POOL_LIMIT` | unset | Limit GPU memory pool size in bytes; explicit `0` requests unlimited |
+| `VIBESPATIAL_GPU_OOM_SAFETY` | enabled | Set `0` to select Tier A and disable the RMM pool's GC retry on OOM. Tier B has zero overhead on the happy path; recovery costs ~5-50ms when OOM occurs. |
 | `VIBESPATIAL_GPU_MANAGED_MEMORY` | disabled | Set `1` to enable Tier C: CUDA managed memory. Datasets exceeding VRAM will run to completion (slowly) instead of crashing. Expect 2-10x slowdown when oversubscribed. |
 | `VIBESPATIAL_PROVENANCE_REWRITES` | enabled | Set `0` to disable automatic query rewrites |
 | `VIBESPATIAL_CCCL_CACHE` | enabled | Set `0` to disable CCCL CUBIN disk cache |

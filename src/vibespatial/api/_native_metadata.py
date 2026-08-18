@@ -799,6 +799,7 @@ class NativeSpatialIndex:
         query_owned: Any,
         *,
         predicate: str | None,
+        distance: float | np.ndarray | None = None,
         precomputed_query_bounds: Any | None,
         reduction: str,
     ):
@@ -841,6 +842,7 @@ class NativeSpatialIndex:
             self.geometry,
             query_bounds,
             predicate=predicate,
+            distance=distance,
         )
 
     def _query_device_pair_reduction(
@@ -922,13 +924,13 @@ class NativeSpatialIndex:
 
         direct_rows = None
         execution = None
-        if distance is None:
-            direct_rows, execution = self._query_device_reduction(
-                query_owned,
-                predicate=predicate,
-                precomputed_query_bounds=precomputed_query_bounds,
-                reduction="exists",
-            )
+        direct_rows, execution = self._query_device_reduction(
+            query_owned,
+            predicate=predicate,
+            distance=distance,
+            precomputed_query_bounds=precomputed_query_bounds,
+            reduction="exists",
+        )
 
         if direct_rows is None:
             from vibespatial.api._native_relation import NativeRelationSelection
@@ -1018,13 +1020,13 @@ class NativeSpatialIndex:
 
         direct_rows = None
         execution = None
-        if distance is None:
-            direct_rows, execution = self._query_device_reduction(
-                query_owned,
-                predicate=predicate,
-                precomputed_query_bounds=precomputed_query_bounds,
-                reduction="right_exists",
-            )
+        direct_rows, execution = self._query_device_reduction(
+            query_owned,
+            predicate=predicate,
+            distance=distance,
+            precomputed_query_bounds=precomputed_query_bounds,
+            reduction="right_exists",
+        )
 
         if direct_rows is None:
             from vibespatial.api._native_relation import NativeRelationSelection
@@ -1087,13 +1089,13 @@ class NativeSpatialIndex:
 
         direct_counts = None
         execution = None
-        if distance is None:
-            direct_counts, execution = self._query_device_reduction(
-                query_owned,
-                predicate=predicate,
-                precomputed_query_bounds=precomputed_query_bounds,
-                reduction="count",
-            )
+        direct_counts, execution = self._query_device_reduction(
+            query_owned,
+            predicate=predicate,
+            distance=distance,
+            precomputed_query_bounds=precomputed_query_bounds,
+            reduction="count",
+        )
 
         if direct_counts is None:
             relation, execution = self.query_relation(
@@ -1144,13 +1146,13 @@ class NativeSpatialIndex:
 
         direct_counts = None
         execution = None
-        if distance is None:
-            direct_counts, execution = self._query_device_reduction(
-                query_owned,
-                predicate=predicate,
-                precomputed_query_bounds=precomputed_query_bounds,
-                reduction="right_count",
-            )
+        direct_counts, execution = self._query_device_reduction(
+            query_owned,
+            predicate=predicate,
+            distance=distance,
+            precomputed_query_bounds=precomputed_query_bounds,
+            reduction="right_count",
+        )
 
         if direct_counts is None:
             relation, execution = self.query_relation(

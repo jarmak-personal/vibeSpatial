@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _data import fingerprint, setup_fixtures
+from _data import fingerprint, setup_fixtures, spatial_antijoin
 
 import geopandas as gpd
 
@@ -36,17 +36,10 @@ buildings_in_admin = gpd.clip(buildings, admin)
 transit_buffers = transit.copy()
 transit_buffers["geometry"] = transit_buffers.geometry.buffer(125.0)
 
-served = gpd.sjoin(
+unserved = spatial_antijoin(
     buildings_in_admin,
     transit_buffers[["station_id", "geometry"]],
     predicate="intersects",
-)
-
-served_rows = served.index.unique()
-unserved = (
-    buildings_in_admin.loc[~buildings_in_admin.index.isin(served_rows)].copy()
-    if len(buildings_in_admin) > 0
-    else buildings_in_admin.copy()
 )
 
 if len(unserved) > 0:

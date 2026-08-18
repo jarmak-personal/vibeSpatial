@@ -96,7 +96,7 @@ complete.
 Allowed work:
 
 - Native* completion work from this PRD.
-- Correctness fixes that unblock Native* completion or upstream compatibility.
+- Correctness fixes that unblock Native* completion or upstream compatibility; issues #3/#4 also have a maintainer exception for bounded public spatial-index reductions that expose `NativeRowSet`/`NativeRelation` consumers without capacity-breaking pair materialization.
 - Kernel, runtime, IO, benchmark, docs, and test work required to complete this
   PRD.
 - Tooling fixes needed to run the verification gates.

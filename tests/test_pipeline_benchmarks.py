@@ -1590,6 +1590,10 @@ def test_site_suitability_smoke() -> None:
     assert "overlay_difference" in stage_names
     assert "buffer_transit" in stage_names
     assert "sjoin_proximity" in stage_names
+    proximity = next(stage for stage in trace["stages"] if stage["name"] == "sjoin_proximity")
+    write_output = next(stage for stage in trace["stages"] if stage["name"] == "write_output")
+    assert result.output_rows == proximity["rows_out"]
+    assert write_output["rows_in"] == result.output_rows
 
 
 def test_site_suitability_geopandas_smoke() -> None:
@@ -1599,6 +1603,11 @@ def test_site_suitability_geopandas_smoke() -> None:
     assert result.pipeline == "site-suitability-geopandas"
     assert result.status == "ok"
     assert result.selected_runtime == "cpu"
+    trace = result.stages[0]
+    proximity = next(stage for stage in trace["stages"] if stage["name"] == "sjoin_proximity")
+    write_output = next(stage for stage in trace["stages"] if stage["name"] == "write_output")
+    assert result.output_rows == proximity["rows_out"]
+    assert write_output["rows_in"] == result.output_rows
 
 
 def test_pipeline_regression_check_flags_wall_clock_and_transfers() -> None:

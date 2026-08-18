@@ -18,6 +18,7 @@ from vibespatial.runtime.materialization import (
     NativeExportBoundary,
     record_native_export_boundary,
 )
+from vibespatial.runtime.residency import Residency
 from vibespatial.spatial.query import (
     build_owned_spatial_index,
     nearest_spatial_index,
@@ -117,6 +118,28 @@ class SpatialIndex:
 "crosses", "dwithin", "intersects", "overlaps", "touches", "within"}
         """
         return PREDICATES
+
+    def _query_predicate_kwargs(self, predicate, distance) -> dict[str, object]:
+        """Validate shared public query arguments and return STRtree kwargs."""
+        if predicate not in self.valid_query_predicates:
+            if predicate == "dwithin":
+                raise ValueError("predicate = 'dwithin' requires GEOS >= 3.10.0")
+            raise ValueError(
+                f"Got predicate='{predicate}'; "
+                f"`predicate` must be one of {self.valid_query_predicates}"
+            )
+        if predicate == "dwithin":
+            if distance is None:
+                raise ValueError(
+                    "'distance' parameter is required for 'dwithin' predicate"
+                )
+            return {"distance": distance}
+        if distance is not None:
+            raise ValueError(
+                "'distance' parameter is only supported in combination with "
+                "'dwithin' predicate"
+            )
+        return {}
 
     def query(
         self,
@@ -336,15 +359,6 @@ class SpatialIndex:
         geometries that can be joined based on overlapping bounding boxes or
         optional predicate are returned.
         """
-        if predicate not in self.valid_query_predicates:
-            if predicate == "dwithin":
-                raise ValueError("predicate = 'dwithin' requires GEOS >= 3.10.0")
-
-            raise ValueError(
-                f"Got predicate='{predicate}'; "
-                f"`predicate` must be one of {self.valid_query_predicates}"
-            )
-
         if return_device and output_format != "indices":
             raise ValueError(
                 "return_device=True is only supported with output_format='indices'; "
@@ -352,24 +366,7 @@ class SpatialIndex:
                 "or sparse public exports"
             )
 
-        # distance argument requirement of predicate `dwithin`
-        # and only valid for predicate `dwithin`
-        kwargs = {}
-        if predicate == "dwithin":
-            if distance is None:
-                # the distance parameter is needed
-                raise ValueError(
-                    "'distance' parameter is required for 'dwithin' predicate"
-                )
-            # add distance to kwargs
-            kwargs["distance"] = distance
-
-        elif distance is not None:
-            # distance parameter is invalid
-            raise ValueError(
-                "'distance' parameter is only supported in combination with "
-                "'dwithin' predicate"
-            )
+        kwargs = self._query_predicate_kwargs(predicate, distance)
 
         raw_geometry = geometry
         precomputed_query_bounds = None
@@ -592,6 +589,385 @@ class SpatialIndex:
             output_index=output_index,
             scalar=scalar,
             relation=reusable_relation,
+        )
+
+    def query_any(
+        self,
+        geometry,
+        *,
+        predicate=None,
+        distance=None,
+    ) -> pd.Series:
+        """Return whether each input geometry has any spatial-index match.
+
+        This is an eager, input-sized public reduction. The result preserves
+        the input order and GeoSeries index without exposing or materializing
+        the underlying relation pairs. Device-backed inputs retain a native
+        boolean column until an explicit public host export.
+
+        Parameters
+        ----------
+        geometry : shapely.Geometry or array-like of geometries
+            Input geometries queried against the indexed tree geometries.
+        predicate : str, optional
+            Exact spatial predicate with the same meaning as :meth:`query`.
+        distance : number or array-like, optional
+            Distance for the ``"dwithin"`` predicate.
+
+        Returns
+        -------
+        pandas.Series
+            One eager boolean value per input geometry.
+        """
+        self._query_predicate_kwargs(predicate, distance)
+        query_row_count, scalar = self._query_cardinality(geometry)
+        output_index = self._query_aggregate_output_index(
+            geometry,
+            query_row_count=query_row_count,
+            scalar=scalar,
+        )
+        native = self._query_any_native(
+            geometry,
+            predicate=predicate,
+            distance=distance,
+            query_row_count=query_row_count,
+            output_index=output_index,
+        )
+        if native is not None:
+            return native
+
+        record_fallback_event(
+            surface="vibespatial.api.SpatialIndex.query_any",
+            requested=get_requested_mode(),
+            selected=ExecutionMode.CPU,
+            reason="query-any requires owned geometry for native row reduction",
+            detail=(
+                f"predicate={predicate!r}, query_rows={query_row_count}, "
+                f"tree_rows={self.size}"
+            ),
+            pipeline="spatial_query_any",
+            d2h_transfer=(
+                self._query_any_input_is_device_backed(self._geometry_array)
+                or self._query_any_input_is_device_backed(geometry)
+            ),
+        )
+        pairs = self.query(
+            geometry,
+            predicate=predicate,
+            distance=distance,
+            sort=False,
+        )
+        mask = np.zeros(query_row_count, dtype=bool)
+        if scalar:
+            mask[0] = bool(np.asarray(pairs).size)
+        elif np.asarray(pairs).ndim == 2 and np.asarray(pairs).shape[1]:
+            mask[np.asarray(pairs[0], dtype=np.int64)] = True
+        return pd.Series(mask, index=output_index, name="has_match")
+
+    @staticmethod
+    def _query_any_public_series(
+        mask,
+        *,
+        output_index,
+        rowset=None,
+        selection=None,
+    ) -> pd.Series:
+        from vibespatial.api._native_public_arrays import NativeBooleanMaskArray
+
+        return pd.Series(
+            NativeBooleanMaskArray(
+                row_count=len(output_index),
+                rowset=rowset,
+                selection=selection,
+                mask_values=mask,
+                export_surface="vibespatial.api.SpatialIndex.query_any",
+                export_operation="query_any_mask_to_public_array",
+            ),
+            index=output_index,
+            name="has_match",
+        )
+
+    @staticmethod
+    def _query_any_input_is_device_backed(geometry) -> bool:
+        values = geometry.values if isinstance(geometry, geoseries.GeoSeries) else geometry
+        owned = (
+            values
+            if isinstance(values, OwnedGeometryArray)
+            else getattr(values, "_owned", None) or getattr(values, "owned", None)
+        )
+        return getattr(owned, "residency", None) is Residency.DEVICE
+
+    def _query_any_buffer_point_native(
+        self,
+        geometry,
+        *,
+        predicate,
+        distance,
+        query_row_count: int,
+        output_index,
+        query_token: str | None,
+    ):
+        """Lower intersects against point buffers to bounded exact existence.
+
+        Physical shape: one nearest-point metric bound per query row certifies
+        definite true/false rows. Only the thin threshold-ambiguous row mask is
+        refined by the buffer index's bounded intersects semijoin. No duplicate
+        match pairs are materialized.
+        """
+        if predicate != "intersects" or distance is not None:
+            return None
+        values = self._geometry_array
+        tag = getattr(values, "_provenance", None)
+        if tag is None:
+            return None
+
+        from vibespatial.runtime.provenance import _r1_preconditions_met
+
+        if tag.operation != "buffer" or not _r1_preconditions_met(tag):
+            return None
+        source_values = tag.source_array
+        if not hasattr(source_values, "owned_flat_sindex"):
+            return None
+        source_owned, _source_index = source_values.owned_flat_sindex()
+        query_owned = self._owned_query_input(geometry)
+        if not (
+            isinstance(source_owned, OwnedGeometryArray)
+            and isinstance(query_owned, OwnedGeometryArray)
+        ):
+            return None
+
+        import cupy as cp
+
+        from vibespatial.constructive.centroid import centroid_owned
+        from vibespatial.geometry.owned import device_mask_owned_capacity
+        from vibespatial.kernels.core.geometry_analysis import (
+            compute_geometry_bounds_device,
+        )
+
+        radius = float(tag.get_param("distance"))
+        quad_segs = int(tag.get_param("quad_segs"))
+        buffer_inradius = radius * float(np.cos(np.pi / (4 * quad_segs)))
+        query_centers = centroid_owned(
+            query_owned,
+            dispatch_mode=ExecutionMode.GPU,
+            precision="fp64",
+        )
+        nearest_result, implementation = nearest_spatial_index(
+            None,
+            None,
+            tree_query_nearest=lambda *args, **kwargs: None,
+            return_all=False,
+            return_distance=True,
+            tree_owned=source_owned,
+            query_owned=query_centers,
+            return_device=True,
+        )
+        if nearest_result is None or "gpu" not in implementation:
+            return None
+        (d_query_rows, _d_tree_rows), d_center_distance = nearest_result
+        if not all(
+            hasattr(values, "__cuda_array_interface__")
+            for values in (d_query_rows, d_center_distance)
+        ):
+            return None
+
+        d_bounds = cp.asarray(
+            compute_geometry_bounds_device(
+                query_owned,
+                preserve_indexed_view=True,
+            ),
+            dtype=cp.float64,
+        ).reshape(query_row_count, 4)
+        d_diagonal = cp.hypot(
+            d_bounds[:, 2] - d_bounds[:, 0],
+            d_bounds[:, 3] - d_bounds[:, 1],
+        )
+        d_nearest = cp.full(query_row_count, cp.inf, dtype=cp.float64)
+        d_nearest[cp.asarray(d_query_rows, dtype=cp.int64)] = cp.asarray(
+            d_center_distance,
+            dtype=cp.float64,
+        )
+        d_finite = cp.isfinite(d_nearest) & cp.isfinite(d_diagonal)
+        d_definite_match = d_finite & (
+            d_nearest <= buffer_inradius - d_diagonal
+        )
+        d_ambiguous = (
+            d_finite
+            & (d_nearest > buffer_inradius - d_diagonal)
+            & (d_nearest <= radius + d_diagonal)
+        )
+
+        ambiguous_queries = device_mask_owned_capacity(
+            query_owned,
+            d_ambiguous,
+            preserve_row_bounds=False,
+        )
+        d_ambiguous_bounds = cp.where(
+            d_ambiguous[:, None],
+            d_bounds,
+            cp.nan,
+        )
+        exact_matches, exact_execution = self.query_left_semijoin(
+            ambiguous_queries,
+            predicate="intersects",
+            query_row_count=query_row_count,
+            query_token=query_token,
+            precomputed_query_bounds=d_ambiguous_bounds,
+        )
+        if (
+            exact_matches is None
+            or exact_execution is None
+            or exact_execution.selected is not ExecutionMode.GPU
+        ):
+            return None
+        if not hasattr(exact_matches, "source_mask"):
+            return None
+        d_exact_match = exact_matches.source_mask()
+        d_result = d_definite_match | (d_ambiguous & d_exact_match)
+
+        from vibespatial.runtime.provenance import record_rewrite_event
+
+        record_rewrite_event(
+            rule_name="R2_query_any_buffer_intersects_to_bounded_refine",
+            surface="vibespatial.api.SpatialIndex.query_any",
+            original_operation="query_any(buffer, intersects)",
+            rewritten_operation="nearest bound + ambiguous buffered intersects",
+            reason=(
+                "point-buffer existence is certified by centroid distance bounds "
+                "and exact bounded buffer refinement"
+            ),
+            detail=(
+                f"buffer_distance={radius}, buffer_inradius={buffer_inradius}, "
+                f"quad_segs={quad_segs}, query_rows={query_row_count}"
+            ),
+        )
+        record_dispatch_event(
+            surface="vibespatial.api.SpatialIndex.query_any",
+            operation="query_any",
+            implementation="owned_gpu_buffer_point_existential",
+            reason=(
+                "input-sized nearest bounds plus exact threshold-ambiguous "
+                "buffer semijoin refinement"
+            ),
+            detail=(
+                f"predicate={predicate!r}, query_rows={query_row_count}, "
+                f"tree_rows={source_owned.row_count}"
+            ),
+            requested=get_requested_mode(),
+            selected=ExecutionMode.GPU,
+        )
+        from vibespatial.api._native_rowset import NativeDeviceSelection
+
+        selection = NativeDeviceSelection.from_mask(
+            d_result,
+            source_token=query_token,
+            source_row_count=query_row_count,
+        )
+        # Driver kernels and CuPy expressions above consume raw pointers
+        # asynchronously.  Keep every local producer alive until the active
+        # stream passes the selection scatter; otherwise an immediate public
+        # consumer may recycle an input allocation before its last kernel use.
+        from vibespatial.cuda._runtime import get_cuda_completion_retainer
+
+        get_cuda_completion_retainer().defer(
+            cp.cuda.get_current_stream(),
+            (
+                self,
+                values,
+                self._native_spatial_index,
+                getattr(self._native_spatial_index, "geometry", None),
+                source_owned,
+                _source_index,
+                query_owned,
+                query_centers,
+                d_query_rows,
+                d_center_distance,
+                d_bounds,
+                d_diagonal,
+                d_nearest,
+                d_finite,
+                d_definite_match,
+                d_ambiguous,
+                ambiguous_queries,
+                d_ambiguous_bounds,
+                exact_matches,
+                d_exact_match,
+            ),
+            lambda _owners: None,
+        )
+        return self._query_any_public_series(
+            d_result,
+            output_index=output_index,
+            selection=selection,
+        )
+
+    def _query_any_native(
+        self,
+        geometry,
+        *,
+        predicate,
+        distance,
+        query_row_count: int,
+        output_index,
+    ):
+        if (
+            get_requested_mode() is ExecutionMode.CPU
+            or not self._supports_owned_query_input(geometry)
+        ):
+            return None
+        from vibespatial.api.geo_base import _native_state_for_owner
+
+        query_state = _native_state_for_owner(geometry)
+        query_token = None if query_state is None else query_state.lineage_token
+        rewritten = self._query_any_buffer_point_native(
+            geometry,
+            predicate=predicate,
+            distance=distance,
+            query_row_count=query_row_count,
+            output_index=output_index,
+            query_token=query_token,
+        )
+        if rewritten is not None:
+            return rewritten
+
+        query_input = self._owned_query_input(geometry)
+        matched, execution = self.query_left_semijoin(
+            query_input,
+            predicate=predicate,
+            distance=distance,
+            query_token=query_token,
+            query_row_count=query_row_count,
+        )
+        if execution is None or execution.selected is not ExecutionMode.GPU:
+            return None
+        from vibespatial.api._native_rowset import NativeDeviceSelection, NativeRowSet
+
+        selection = matched if isinstance(matched, NativeDeviceSelection) else None
+        rowset = matched if isinstance(matched, NativeRowSet) else None
+        if hasattr(matched, "source_mask"):
+            mask = matched.source_mask()
+        else:
+            import cupy as cp
+
+            mask = cp.zeros(query_row_count, dtype=cp.bool_)
+            mask[cp.asarray(matched.positions, dtype=cp.int64)] = True
+        record_dispatch_event(
+            surface="vibespatial.api.SpatialIndex.query_any",
+            operation="query_any",
+            implementation=execution.implementation,
+            reason="native spatial relation reduced directly to an input-sized mask",
+            detail=(
+                f"predicate={predicate!r}, query_rows={query_row_count}, "
+                f"tree_rows={self.size}"
+            ),
+            requested=execution.requested,
+            selected=execution.selected,
+        )
+        return self._query_any_public_series(
+            mask,
+            output_index=output_index,
+            rowset=rowset,
+            selection=selection,
         )
 
     def query_pair_aggregate(
@@ -1014,25 +1390,56 @@ class SpatialIndex:
         query_state = _native_state_for_owner(geometry)
         query_token = None if query_state is None else query_state.lineage_token
         query_input = self._owned_query_input(geometry)
-        relation, execution = self.query_relation(
-            query_input,
-            predicate=predicate,
-            distance=distance,
-            source_token=source_token,
-            query_token=query_token,
-            query_row_count=query_row_count,
-            return_device=True,
-        )
-        if relation is None:
-            return None, None
-        if execution.selected is not ExecutionMode.GPU:
-            return None, relation
+        relation = None
+        count_expression = None
+        count_reduction_is_direct = False
+        if all(reducer == "size" for _values, reducer in aggregations.values()):
+            native_index = self._native_spatial_index_for_query(
+                source_token=source_token,
+            )
+            count_expression, execution = (
+                native_index.query_left_match_count_expression(
+                    query_input,
+                    predicate=predicate,
+                    distance=distance,
+                    query_token=query_token,
+                    query_row_count=query_row_count,
+                    return_metadata=True,
+                )
+            )
+            if (
+                count_expression is None
+                or execution is None
+                or execution.selected is not ExecutionMode.GPU
+            ):
+                return None, None
+            count_reduction_is_direct = (
+                execution.implementation == "owned_gpu_spatial_match_count"
+            )
+        else:
+            relation, execution = self.query_relation(
+                query_input,
+                predicate=predicate,
+                distance=distance,
+                source_token=source_token,
+                query_token=query_token,
+                query_row_count=query_row_count,
+                return_device=True,
+            )
+            if relation is None:
+                return None, None
+            if execution.selected is not ExecutionMode.GPU:
+                return None, relation
 
         reductions = {}
         for name, (_values, reducer) in aggregations.items():
             if reducer == "size":
-                expression = relation.left_match_count_expression(
-                    source_row_count=query_row_count,
+                expression = (
+                    count_expression
+                    if count_expression is not None
+                    else relation.left_match_count_expression(
+                        source_row_count=query_row_count,
+                    )
                 )
                 reductions[name] = NativeGroupedReduction(
                     values=expression.values,
@@ -1079,8 +1486,11 @@ class SpatialIndex:
             operation="query_aggregate",
             implementation=execution.implementation,
             reason=(
-                "NativeRelation pairs were consumed by selection-aware grouped "
-                "reductions before public result export"
+                "NativeSpatialIndex reduced matches directly into input-sized "
+                "count columns before public result export"
+                if count_reduction_is_direct
+                else "NativeRelation pairs were consumed by selection-aware "
+                "grouped reductions before public result export"
             ),
             detail=(
                 f"predicate={predicate!r}, query_rows={query_row_count}, "

@@ -591,6 +591,9 @@ def point_buffer_owned_array(
 ) -> OwnedGeometryArray:
     if GeometryFamily.POINT not in points.families or len(points.families) != 1:
         raise ValueError("point_buffer_owned_array requires a point-only OwnedGeometryArray")
+    # Match GEOS/Shapely: non-positive quadrant segment requests use one
+    # segment per quadrant.  Normalize before capacity planning and dispatch.
+    quad_segs = max(int(quad_segs), 1)
 
     radii = (
         np.full(points.row_count, float(distance), dtype=np.float64)

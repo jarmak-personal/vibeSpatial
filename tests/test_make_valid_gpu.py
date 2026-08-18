@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import MultiPolygon, Polygon, box
+from shapely.geometry import MultiPolygon, Point, Polygon, box
 
 from vibespatial import from_shapely_geometries, has_gpu_runtime
 from vibespatial.constructive.make_valid_pipeline import (
@@ -533,6 +533,172 @@ def test_gpu_repair_preserves_duplicate_indexed_logical_rows(strict_device_guard
     assert "make-valid device invalid-global-row compact fence" not in reasons
     assert "make-valid device invalid-family-offset compact fence" not in reasons
     assert "make-valid repaired-batch valid-row compact fence" not in reasons
+
+
+@requires_gpu
+def test_nested_multipolygon_canonicalizer_uses_bounded_device_offsets_without_size_packet():
+    """Unknown-capacity grouped output must repair nested shells without D2H sizing."""
+    from vibespatial.constructive.binary_constructive import (
+        _drop_nested_multipolygon_parts_gpu,
+    )
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.runtime.residency import Residency
+
+    outer = box(0.0, 0.0, 4.0, 4.0)
+    invalid = MultiPolygon([outer, box(1.0, 1.0, 2.0, 2.0)])
+    assert not shapely.is_valid(invalid)
+    owned = from_shapely_geometries([invalid], residency=Residency.DEVICE)
+    for buffer in owned.device_state.families.values():
+        buffer.fixed_size = None
+
+    reset_d2h_transfer_count()
+    repaired = _drop_nested_multipolygon_parts_gpu(owned)
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert repaired is not None
+    assert reasons == []
+    actual = repaired.to_shapely()[0]
+    assert shapely.is_valid(actual)
+    assert shapely.equals(actual, outer)
+
+
+@requires_gpu
+def test_nested_multipolygon_canonicalizer_preserves_overflow_rows(monkeypatch):
+    """A row beyond the bounded envelope must remain exact, never truncated."""
+    import vibespatial.constructive.binary_constructive as binary_module
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.runtime.residency import Residency
+
+    outer = box(0.0, 0.0, 8.0, 8.0)
+    invalid = MultiPolygon(
+        [
+            outer,
+            box(1.0, 1.0, 2.0, 2.0),
+            box(10.0, 0.0, 11.0, 1.0),
+        ]
+    )
+    owned = from_shapely_geometries([invalid], residency=Residency.DEVICE)
+    for buffer in owned.device_state.families.values():
+        buffer.fixed_size = None
+    monkeypatch.setattr(
+        binary_module,
+        "_NESTED_MULTIPOLYGON_REPAIR_MAX_PART_CAPACITY",
+        2,
+    )
+
+    reset_d2h_transfer_count()
+    preserved = binary_module._drop_nested_multipolygon_parts_gpu(owned)
+    reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert preserved is not None
+    assert reasons == []
+    actual = preserved.to_shapely()[0]
+    assert not shapely.is_valid(actual)
+    assert shapely.equals_exact(actual, invalid, tolerance=0.0)
+
+
+@requires_gpu
+def test_nested_multipolygon_canonicalizer_preserves_nonpolygon_rows():
+    """Sparse polygon repair must not replace unrelated family rows."""
+    from vibespatial.constructive.binary_constructive import (
+        _drop_nested_multipolygon_parts_gpu,
+    )
+    from vibespatial.runtime.residency import Residency
+
+    point = Point(20.0, 20.0)
+    outer = box(0.0, 0.0, 4.0, 4.0)
+    invalid = MultiPolygon([outer, box(1.0, 1.0, 2.0, 2.0)])
+    owned = from_shapely_geometries([point, invalid], residency=Residency.DEVICE)
+
+    repaired = _drop_nested_multipolygon_parts_gpu(owned)
+
+    assert repaired is not None
+    actual = repaired.to_shapely()
+    assert shapely.equals_exact(actual[0], point, tolerance=0.0)
+    assert shapely.equals(actual[1], outer)
+
+
+@requires_gpu
+@pytest.mark.parametrize("method", ["linework", "structure"])
+def test_nested_multipolygon_make_valid_preserves_method_semantics(method):
+    """Linework uses ring parity while structure unions contained shells."""
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.residency import Residency
+    from vibespatial.testing import strict_native_environment
+
+    invalid = MultiPolygon(
+        [box(0.0, 0.0, 4.0, 4.0), box(1.0, 1.0, 2.0, 2.0)]
+    )
+    expected = shapely.make_valid(
+        invalid,
+        method=method,
+        keep_collapsed=True,
+    )
+    owned = from_shapely_geometries([invalid], residency=Residency.DEVICE)
+
+    with strict_native_environment():
+        result = make_valid_owned(
+            owned=owned,
+            method=method,
+            keep_collapsed=True,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+        actual = result.geometries[0]
+
+    assert result.selected is ExecutionMode.GPU
+    assert shapely.is_valid(actual)
+    assert shapely.equals(actual, expected)
+
+
+@requires_gpu
+def test_collapsed_multipolygon_linework_is_exact_and_structure_declines_strict_native():
+    """Collapsed multipart components are preserved or declined atomically."""
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.residency import Residency
+    from vibespatial.testing import strict_native_environment
+
+    invalid = MultiPolygon(
+        [
+            box(0.0, 0.0, 4.0, 4.0),
+            Polygon([(5.0, 0.0), (6.0, 0.0), (7.0, 0.0), (5.0, 0.0)]),
+        ]
+    )
+    owned = from_shapely_geometries([invalid], residency=Residency.DEVICE)
+    expected_linework = shapely.make_valid(
+        invalid,
+        method="linework",
+        keep_collapsed=True,
+    )
+
+    with strict_native_environment():
+        linework = make_valid_owned(
+            owned=owned,
+            method="linework",
+            keep_collapsed=True,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+        actual_linework = linework.geometries[0]
+
+    assert linework.selected is ExecutionMode.GPU
+    assert shapely.is_valid(actual_linework)
+    assert shapely.equals(actual_linework, expected_linework)
+
+    with strict_native_environment(), pytest.raises(
+        RuntimeError,
+        match="strict native mode disallows geopandas fallback",
+    ):
+        make_valid_owned(
+            owned=owned,
+            method="structure",
+            keep_collapsed=True,
+            dispatch_mode=ExecutionMode.GPU,
+        )
 
 
 @requires_gpu

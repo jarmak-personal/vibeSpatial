@@ -197,6 +197,42 @@ def _write_geojson(gdf: gpd.GeoDataFrame, path: Path) -> None:
     gdf.to_file(path, driver="GeoJSON")
 
 
+def spatial_semijoin(
+    left: gpd.GeoDataFrame,
+    right: gpd.GeoDataFrame,
+    *,
+    predicate: str = "intersects",
+) -> gpd.GeoDataFrame:
+    """Return left rows with at least one right match through public APIs."""
+    query_any = getattr(right.sindex, "query_any", None)
+    if query_any is not None:
+        has_match = query_any(
+            left.geometry,
+            predicate=predicate,
+        )
+        return left[has_match].copy()
+    matched_labels = gpd.sjoin(left, right, predicate=predicate).index.unique()
+    return left.loc[matched_labels].copy()
+
+
+def spatial_antijoin(
+    left: gpd.GeoDataFrame,
+    right: gpd.GeoDataFrame,
+    *,
+    predicate: str = "intersects",
+) -> gpd.GeoDataFrame:
+    """Return left rows without a right match through public APIs."""
+    query_any = getattr(right.sindex, "query_any", None)
+    if query_any is not None:
+        has_match = query_any(
+            left.geometry,
+            predicate=predicate,
+        )
+        return left[~has_match].copy()
+    matched_labels = gpd.sjoin(left, right, predicate=predicate).index.unique()
+    return left.loc[~left.index.isin(matched_labels)].copy()
+
+
 def setup_fixtures(tmpdir: Path) -> dict[str, Path]:
     """Write all fixture files to tmpdir. Returns name -> path map."""
     scale = get_scale()

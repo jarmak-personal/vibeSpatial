@@ -22,6 +22,11 @@ _PYLIBCUDF_STREAM_ATTRIBUTE = "_vibespatial_pylibcudf_stream"
 _PYLIBCUDF_STREAM_LOCK = threading.Lock()
 _DEFAULT_QUERY_MEMORY_RESERVE_BYTES = 1 << 30
 _DEFAULT_QUERY_MEMORY_RESERVE_FRACTION = 0.10
+# RMM treats sub-granularity initial sizes as its ``None`` default and eagerly
+# reserves half of the maximum pool.  One MiB is the smallest practical seed
+# that remains explicit across supported RMM releases, keeping orchestration
+# processes cheap while allowing the pool to grow to the query ceiling.
+_MINIMUM_RMM_INITIAL_POOL_BYTES = 1 << 20
 
 try:
     import cupy as cp
@@ -622,6 +627,46 @@ def _configured_query_memory_reserve(total_device_bytes: int) -> int:
     )
 
 
+def _configured_pool_limit(total_device_bytes: int) -> int | None:
+    """Return the pool ceiling while preserving non-pool CUDA headroom.
+
+    ``None`` means the user explicitly requested an unlimited pool with
+    ``VIBESPATIAL_GPU_POOL_LIMIT=0``.  A reserve-derived zero ceiling is an
+    invalid configuration instead of silently acquiring the same meaning.
+    """
+    limit_text = os.environ.get("VIBESPATIAL_GPU_POOL_LIMIT", "").strip()
+    if limit_text:
+        limit = int(limit_text)
+        if limit < 0:
+            raise ValueError("VIBESPATIAL_GPU_POOL_LIMIT must be non-negative")
+        if 0 < limit < 256:
+            raise ValueError(
+                "VIBESPATIAL_GPU_POOL_LIMIT must be zero or at least 256 bytes"
+            )
+        if limit == 0:
+            return None
+    else:
+        reserve = _configured_query_memory_reserve(total_device_bytes)
+        limit = max(int(total_device_bytes) - reserve, 0)
+    aligned_limit = limit - (limit % 256)
+    if aligned_limit == 0:
+        raise ValueError(
+            "configured GPU memory reserve leaves no allocatable 256-byte "
+            "pool capacity"
+        )
+    return aligned_limit
+
+
+def _rmm_pool_allocation_sizes(pool_limit: int | None) -> tuple[int, int | None]:
+    """Return a constructible RMM seed and ceiling for an admitted limit."""
+    if pool_limit is None:
+        return _MINIMUM_RMM_INITIAL_POOL_BYTES, None
+    limit = int(pool_limit)
+    if limit <= 0:
+        raise ValueError("RMM pool ceiling must be positive or explicitly unlimited")
+    return min(_MINIMUM_RMM_INITIAL_POOL_BYTES, limit), limit
+
+
 @dataclass(frozen=True, slots=True)
 class CudaStream:
     """Lightweight wrapper around a CUDA stream handle."""
@@ -1112,9 +1157,10 @@ class CudaDriverRuntime:
     def _configure_cupy_pool(self) -> None:
         """Install the CuPy fallback pool after a CUDA context is active."""
         pool = cp.cuda.MemoryPool()
-        pool_limit = os.environ.get("VIBESPATIAL_GPU_POOL_LIMIT")
-        if pool_limit:
-            pool.set_limit(size=int(pool_limit))
+        _driver_free, driver_total = cp.cuda.runtime.memGetInfo()
+        pool_limit = _configured_pool_limit(int(driver_total))
+        if pool_limit is not None:
+            pool.set_limit(size=pool_limit)
         cp.cuda.set_allocator(pool.malloc)
         self._memory_pool = pool
         self._memory_backend = "cupy"
@@ -1133,8 +1179,7 @@ class CudaDriverRuntime:
           a chance to free unreferenced CuPy arrays and return blocks to
           the pool before the OOM propagates.
         """
-        pool_limit_str = os.environ.get("VIBESPATIAL_GPU_POOL_LIMIT")
-        pool_limit = int(pool_limit_str) if pool_limit_str else None
+        _driver_free, driver_total = cp.cuda.runtime.memGetInfo()
         managed = os.environ.get("VIBESPATIAL_GPU_MANAGED_MEMORY", "").strip()
         oom_safety = os.environ.get("VIBESPATIAL_GPU_OOM_SAFETY", "").strip()
 
@@ -1145,31 +1190,36 @@ class CudaDriverRuntime:
             chain = (mr,)
             self._memory_backend = "rmm-managed"
             logger.info("RMM memory backend: managed memory (Tier C)")
-        elif oom_safety in ("0", "false", "no"):
-            # Tier A: raw pool, no OOM callback (opt-in)
-            base = rmm.mr.CudaMemoryResource()
-            mr = rmm.mr.PoolMemoryResource(
-                base,
-                initial_pool_size=0,
-                maximum_pool_size=pool_limit if pool_limit else None,
-            )
-            pool = mr
-            chain = (base, pool)
-            self._memory_backend = "rmm-pool"
-            logger.info("RMM memory backend: pool without OOM safety (Tier A)")
         else:
-            # Tier B: pool + OOM callback (default)
-            base = rmm.mr.CudaMemoryResource()
-            pool = rmm.mr.PoolMemoryResource(
-                base,
-                initial_pool_size=0,
-                maximum_pool_size=pool_limit if pool_limit else None,
+            pool_limit = _configured_pool_limit(int(driver_total))
+            initial_pool_size, maximum_pool_size = _rmm_pool_allocation_sizes(
+                pool_limit
             )
-            callback = _make_oom_callback(max_retries=3)
-            mr = rmm.mr.FailureCallbackResourceAdaptor(pool, callback)
-            chain = (base, pool, mr)
-            self._memory_backend = "rmm-safe"
-            logger.info("RMM memory backend: pool with OOM safety (Tier B, default)")
+            if oom_safety in ("0", "false", "no"):
+                # Tier A: raw pool, no OOM callback (opt-in)
+                base = rmm.mr.CudaMemoryResource()
+                mr = rmm.mr.PoolMemoryResource(
+                    base,
+                    initial_pool_size=initial_pool_size,
+                    maximum_pool_size=maximum_pool_size,
+                )
+                pool = mr
+                chain = (base, pool)
+                self._memory_backend = "rmm-pool"
+                logger.info("RMM memory backend: pool without OOM safety (Tier A)")
+            else:
+                # Tier B: pool + OOM callback (default)
+                base = rmm.mr.CudaMemoryResource()
+                pool = rmm.mr.PoolMemoryResource(
+                    base,
+                    initial_pool_size=initial_pool_size,
+                    maximum_pool_size=maximum_pool_size,
+                )
+                callback = _make_oom_callback(max_retries=3)
+                mr = rmm.mr.FailureCallbackResourceAdaptor(pool, callback)
+                chain = (base, pool, mr)
+                self._memory_backend = "rmm-safe"
+                logger.info("RMM memory backend: pool with OOM safety (Tier B, default)")
 
         rmm.mr.set_current_device_resource(mr)
         cp.cuda.set_allocator(rmm_cupy_allocator)
@@ -1302,6 +1352,36 @@ class CudaDriverRuntime:
             0,
         )
         return max(int(budget.budget_bytes) - live_growth, 0)
+
+    def pool_upstream_growth_bytes(self) -> int:
+        """Return bytes the active capped pool can still reserve upstream.
+
+        Driver-free memory is not automatically allocatable when the pool has
+        already reached ``maximum_pool_size``.  This reports only capacity
+        that satisfies both limits; missing pool accounting is treated as no
+        proven growth rather than optimistic driver capacity.
+        """
+        self._ensure_context()
+        driver_free, driver_total = cp.cuda.runtime.memGetInfo()
+        if self._memory_backend == "rmm-managed":
+            return int(driver_free)
+        pool_limit = _configured_pool_limit(int(driver_total))
+        if pool_limit is None:
+            return int(driver_free)
+
+        stats = self.memory_pool_stats()
+        if self._memory_backend == "cupy":
+            reserved = stats.get("total_bytes")
+        elif self._memory_backend in {"rmm-pool", "rmm-safe"}:
+            reserved = stats.get("reserved_bytes")
+        else:
+            return int(driver_free)
+        if reserved is None:
+            return 0
+        return min(
+            int(driver_free),
+            max(int(pool_limit) - int(reserved), 0),
+        )
 
     def admit_device_memory(
         self,
