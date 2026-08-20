@@ -3828,6 +3828,80 @@ def _record_pair_reduction_tile_sizes(monkeypatch, *, pair_budget: int = 2):
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_pair_aggregate_reuses_only_shared_candidate_superset(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Aligned point columns may have different conservative candidates."""
+    from vibespatial.api import GeoDataFrame, GeoSeries, points_from_xy, read_parquet
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+
+    pickup_x = np.asarray([0.0, 10.0, 0.0, 10.0])
+    pickup_y = np.asarray([0.0, 10.0, 10.0, 0.0])
+    dropoff_x = np.asarray([10.0, 0.0, 0.0, 20.0])
+    dropoff_y = np.asarray([10.0, 0.0, 10.0, 20.0])
+    source = GeoDataFrame(
+        {"dropoff": points_from_xy(dropoff_x, dropoff_y)},
+        geometry=points_from_xy(pickup_x, pickup_y),
+        crs="EPSG:3857",
+    ).rename_geometry("pickup")
+    source["dropoff"] = source["dropoff"].set_crs(source.crs)
+    path = tmp_path / "query-pair-asymmetric-grid.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    source = read_parquet(path)
+    pickup = source.set_geometry("pickup").geometry
+    dropoff = source.set_geometry("dropoff").geometry
+    zones = GeoSeries(
+        [
+            box(x - 0.25, y - 0.25, x + 0.25, y + 0.25)
+            for x, y in (
+                (0.0, 0.0),
+                (10.0, 10.0),
+                (0.0, 10.0),
+                (10.0, 0.0),
+                (20.0, 20.0),
+            )
+        ],
+        crs=source.crs,
+    )
+    clear_fallback_events()
+
+    automatic = pickup.sindex.query_pair_aggregate(
+        dropoff.sindex,
+        zones,
+        predicate="contains",
+    )
+    monkeypatch.setattr(
+        "vibespatial.spatial.point_grid_index._MIN_POINT_GRID_ROWS",
+        1 << 60,
+    )
+    forced_baseline = pickup.sindex.query_pair_aggregate(
+        dropoff.sindex,
+        zones,
+        predicate="contains",
+    )
+    monkeypatch.setattr(
+        "vibespatial.spatial.point_grid_index._MIN_POINT_GRID_ROWS",
+        1,
+    )
+    forced_alternative = pickup.sindex.query_pair_aggregate(
+        dropoff.sindex,
+        zones,
+        predicate="contains",
+    )
+
+    assert get_fallback_events(clear=True) == []
+    expected = {
+        "left_count": [1, 1, 1, 1],
+        "right_count": [1, 1, 1, 1],
+        "shared_count": [0, 0, 1, 0],
+    }
+    assert automatic.to_dict("list") == expected
+    assert forced_baseline.to_dict("list") == expected
+    assert forced_alternative.to_dict("list") == expected
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
 def test_sindex_query_pair_aggregate_consumes_multiple_bounded_grid_partitions(
     tmp_path,
     monkeypatch,

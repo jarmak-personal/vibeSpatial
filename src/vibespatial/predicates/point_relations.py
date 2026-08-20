@@ -152,6 +152,24 @@ def _point_equals_to_predicate_array(predicate: str, relation):
 # ---------------------------------------------------------------------------
 
 
+class _PointRegionLaunchProfile:
+    """Bind one prepared index to the active profiling session."""
+
+    def __init__(self, profile, prepared) -> None:
+        self._profile = profile
+        self._prepared = prepared
+
+    def begin_launch(self, *, logical_count, candidate_count: int) -> None:
+        self._profile.begin_launch(
+            self._prepared,
+            logical_count=logical_count,
+            candidate_count=candidate_count,
+        )
+
+    def end_launch(self) -> None:
+        self._profile.end_launch(self._prepared)
+
+
 def _launch_kernel(
     kernel_dict_fn,
     kernel_name: str,
@@ -167,6 +185,7 @@ def _launch_kernel(
     source_offset=None,
     launch_capacity: int | None = None,
     device_out=None,
+    launch_profile=None,
 ) -> np.ndarray:
     """Launch a point or multipoint binary-relation kernel.
 
@@ -246,7 +265,14 @@ def _launch_kernel(
         )
         launch_items = n_items if launch_capacity is None else int(launch_capacity)
         grid, block = runtime.launch_config(kernel, launch_items)
+        if launch_profile is not None:
+            launch_profile.begin_launch(
+                logical_count=logical_count,
+                candidate_count=n_items,
+            )
         runtime.launch(kernel, grid=grid, block=block, params=params)
+        if launch_profile is not None:
+            launch_profile.end_launch()
         if return_device:
             returning_device = True
             return device_out
@@ -386,6 +412,7 @@ def classify_point_region_gpu(
     point_buffer = point_state.families[GeometryFamily.POINT]
     region_buffer = region_state.families[region_family]
     prepared = region_state.point_location_indexes.get(region_family)
+    launch_profile = None
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
     kernel_name = (
@@ -415,6 +442,7 @@ def classify_point_region_gpu(
     )
     if prepared is not None:
         from .point_location_index import point_location_part_y_index_kernels
+        from .point_region_profile import current_point_region_profile
 
         kernel_dict_fn = point_location_part_y_index_kernels
         kernel_name = (
@@ -445,6 +473,26 @@ def classify_point_region_gpu(
                 ptr(prepared.entries),
             ]
         )
+        profile = current_point_region_profile()
+        if profile is not None:
+            from .point_location_index import (
+                point_location_part_y_index_profile_kernels,
+            )
+
+            summary, parts_histogram, edges_histogram, sample_plan = (
+                profile.launch_arguments(prepared)
+            )
+            kernel_dict_fn = point_location_part_y_index_profile_kernels
+            kernel_name += "_profiled"
+            args.extend(
+                [
+                    ptr(summary),
+                    ptr(parts_histogram),
+                    ptr(edges_histogram),
+                    ptr(sample_plan),
+                ]
+            )
+            launch_profile = _PointRegionLaunchProfile(profile, prepared)
     return _launch_kernel(
         kernel_dict_fn,
         kernel_name,
@@ -452,6 +500,7 @@ def classify_point_region_gpu(
         tuple(args),
         (KERNEL_PARAM_PTR,) * len(args),
         return_device=return_device,
+        launch_profile=launch_profile,
     )
 
 
@@ -744,6 +793,7 @@ def _classify_indexed_point_region(
     point_buffer = point_state.families[GeometryFamily.POINT]
     region_buffer = region_state.families[region_family]
     prepared = region_state.point_location_indexes.get(region_family)
+    launch_profile = None
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
 
@@ -784,6 +834,7 @@ def _classify_indexed_point_region(
     )
     if prepared is not None:
         from .point_location_index import point_location_part_y_index_kernels
+        from .point_region_profile import current_point_region_profile
 
         kernel_dict_fn = point_location_part_y_index_kernels
         kernel_name = (
@@ -814,6 +865,26 @@ def _classify_indexed_point_region(
                 ptr(prepared.entries),
             ]
         )
+        profile = current_point_region_profile()
+        if profile is not None:
+            from .point_location_index import (
+                point_location_part_y_index_profile_kernels,
+            )
+
+            summary, parts_histogram, edges_histogram, sample_plan = (
+                profile.launch_arguments(prepared)
+            )
+            kernel_dict_fn = point_location_part_y_index_profile_kernels
+            kernel_name += "_profiled"
+            args.extend(
+                [
+                    ptr(summary),
+                    ptr(parts_histogram),
+                    ptr(edges_histogram),
+                    ptr(sample_plan),
+                ]
+            )
+            launch_profile = _PointRegionLaunchProfile(profile, prepared)
     return _launch_kernel(
         kernel_dict_fn,
         kernel_name,
@@ -828,6 +899,7 @@ def _classify_indexed_point_region(
         source_offset=source_offset,
         launch_capacity=launch_capacity,
         device_out=relation_out,
+        launch_profile=launch_profile,
     )
 
 

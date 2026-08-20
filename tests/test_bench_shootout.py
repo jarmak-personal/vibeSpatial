@@ -19,6 +19,36 @@ from vibespatial.runtime import has_gpu_runtime
 from vibespatial.testing import strict_native_environment
 
 
+def test_site_fixture_subset_matches_full_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibespatial as gpd
+    from benchmarks.shootout._data import (
+        setup_fixtures,
+        setup_site_suitability_fixtures,
+    )
+    from geopandas.testing import assert_geodataframe_equal
+
+    monkeypatch.setenv("VSBENCH_SCALE", "64")
+    full_dir = tmp_path / "full"
+    subset_dir = tmp_path / "subset"
+    full_dir.mkdir()
+    subset_dir.mkdir()
+    full = setup_fixtures(full_dir)
+    subset = setup_site_suitability_fixtures(subset_dir)
+
+    for name in ("parcels", "exclusion_zones"):
+        assert_geodataframe_equal(
+            gpd.read_parquet(full[name]),
+            gpd.read_parquet(subset[name]),
+        )
+    assert_geodataframe_equal(
+        gpd.read_file(full["transit"]),
+        gpd.read_file(subset["transit"]),
+    )
+
+
 def test_vsbench_shootout_directory_smoke(capsys: pytest.CaptureFixture[str]) -> None:
     if shutil.which("uv") is None:
         pytest.skip("uv not available")

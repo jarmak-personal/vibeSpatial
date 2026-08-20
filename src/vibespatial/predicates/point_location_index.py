@@ -9,6 +9,7 @@ work without duplicating geometry coordinates or changing predicate semantics.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 
 import numpy as np
 
@@ -26,9 +27,11 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
 
 from .point_location_index_kernels import (
+    _POINT_LOCATION_PART_Y_INDEX_PROFILE_SOURCE,
     _POINT_LOCATION_PART_Y_INDEX_SOURCE,
     PART_Y_BIN_COUNT,
     POINT_LOCATION_PART_Y_INDEX_KERNEL_NAMES,
+    POINT_LOCATION_PART_Y_INDEX_PROFILE_KERNEL_NAMES,
 )
 
 _MIN_PREPARED_COORDINATES = 1_000_000
@@ -51,6 +54,7 @@ class PreparedPolygonPartYIndex:
     """Device-resident edge memberships grouped by polygon-part y bin."""
 
     family: GeometryFamily
+    geometry_count: int
     part_count: int
     bin_count: int
     edge_membership_count: int
@@ -82,6 +86,15 @@ def point_location_part_y_index_kernels():
     )
 
 
+def point_location_part_y_index_profile_kernels():
+    """Compile profiler-only entry points outside production warmup."""
+    return compile_kernel_group(
+        "point-location-part-y-index-profile",
+        _POINT_LOCATION_PART_Y_INDEX_PROFILE_SOURCE,
+        POINT_LOCATION_PART_Y_INDEX_PROFILE_KERNEL_NAMES,
+    )
+
+
 def prepare_polygon_part_y_index(owned, family: GeometryFamily):
     """Build or return the cached exact part-y edge directory."""
     if family not in _INDEXABLE_FAMILIES:
@@ -89,14 +102,27 @@ def prepare_polygon_part_y_index(owned, family: GeometryFamily):
     state = owned._ensure_device_state(preserve_indexed_view=True)
     cached = state.point_location_indexes.get(family)
     if cached is not None:
+        from .point_region_profile import current_point_region_profile
+
+        profile = current_point_region_profile()
+        if profile is not None:
+            profile.note_index_cache_hit(cached)
         return cached
     buffer = state.families.get(family)
-    if buffer is None or int(buffer.x.size) < _MIN_PREPARED_COORDINATES:
+    from .point_region_profile import current_point_region_profile
+
+    profile = current_point_region_profile()
+    force_prepared = profile is not None and profile.force_prepared_index
+    if buffer is None or (
+        int(buffer.x.size) < _MIN_PREPARED_COORDINATES and not force_prepared
+    ):
         return None
     if int(buffer.x.size) >= (1 << 31) or int(buffer.ring_offsets.size - 1) >= (1 << 31):
         return None
 
     import cupy as cp
+
+    build_started = perf_counter() if profile is not None else None
 
     part_ring_offsets = (
         buffer.geometry_offsets
@@ -189,6 +215,7 @@ def prepare_polygon_part_y_index(owned, family: GeometryFamily):
     )
     prepared = PreparedPolygonPartYIndex(
         family=family,
+        geometry_count=int(buffer.geometry_offsets.size - 1),
         part_count=part_count,
         bin_count=PART_Y_BIN_COUNT,
         edge_membership_count=membership_count,
@@ -199,6 +226,13 @@ def prepare_polygon_part_y_index(owned, family: GeometryFamily):
         entries=entries,
     )
     state.point_location_indexes[family] = prepared
+    if profile is not None:
+        # Production stays fully asynchronous.  Profiling pays one explicit
+        # completion fence so the reported wall interval includes scatter,
+        # whose entries are part of the completed index.
+        runtime.synchronize()
+        assert build_started is not None
+        profile.note_index_build(prepared, perf_counter() - build_started)
     record_dispatch_event(
         surface="vibespatial.predicates.point_location_index",
         operation="prepare_point_location",

@@ -5,7 +5,7 @@ Scope: Stage-timed profiling entrypoints, NVTX guidance, and trace interpretatio
 Read If: You are profiling join or overlay kernels, adding benchmark rails, or trying to explain where time is going.
 STOP IF: You already have the profiling script open and only need a local implementation detail.
 Source Of Truth: Stage-level profiling workflow for join and overlay kernel development.
-Body Budget: 156/220 lines
+Body Budget: 157/220 lines
 Document: docs/testing/profiling-rails.md
 
 Section Map (Body Lines)
@@ -14,14 +14,14 @@ Section Map (Body Lines)
 | 1-4 | Preamble |
 | 5-10 | Intent |
 | 11-20 | Request Signals |
-| 21-27 | Open First |
-| 28-33 | Verify |
-| 34-41 | Risks |
-| 42-64 | Entry Point |
-| 65-98 | Stage Contracts |
-| 99-109 | Trace Interpretation |
-| 110-124 | NVTX |
-| 125-156 | Shootout Physical Plans |
+| 21-28 | Open First |
+| 29-34 | Verify |
+| 35-42 | Risks |
+| 43-65 | Entry Point |
+| 66-99 | Stage Contracts |
+| 100-110 | Trace Interpretation |
+| 111-125 | NVTX |
+| 126-157 | Shootout Physical Plans |
 DOC_HEADER:END -->
 
 This repo now has a dedicated profiling rail for join and overlay kernel work.
@@ -45,6 +45,7 @@ current join and overlay hot paths.
 ## Open First
 
 - docs/testing/profiling-rails.md
+- docs/testing/spatialbench-nsight.md
 - scripts/profile_kernels.py
 - src/vibespatial/bench/profiling.py
 - src/vibespatial/bench/profile_rails.py

@@ -456,6 +456,63 @@ def setup_fixtures(tmpdir: Path) -> dict[str, Path]:
     return paths
 
 
+def setup_site_suitability_fixtures(tmpdir: Path) -> dict[str, Path]:
+    """Write only the three fixtures consumed by ``site_suitability.py``.
+
+    The full shootout fixture catalog is intentionally convenient at small
+    scales, but generating unrelated workflows dominates a targeted 10M site
+    capacity run. Keep these definitions byte-for-byte equivalent in logical
+    shape to their counterparts in :func:`setup_fixtures`.
+    """
+    scale = get_scale()
+    paths: dict[str, Path] = {}
+
+    parcels = _make_grid_polygons(scale, seed=20)
+    parcels_gdf = gpd.GeoDataFrame(
+        {
+            "parcel_id": np.arange(len(parcels), dtype=np.int64),
+            "geometry": parcels,
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    paths["parcels"] = tmpdir / "parcels.parquet"
+    _write_parquet(parcels_gdf, paths["parcels"])
+
+    excl_count = max(scale // 20, 2)
+    exclusions = _make_convex_polygons(
+        excl_count,
+        seed=50,
+        clusters=6,
+        vertices=8,
+    )
+    exclusions_gdf = gpd.GeoDataFrame(
+        {
+            "exclusion_type": np.arange(len(exclusions), dtype=np.int32) % 3,
+            "geometry": exclusions,
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    paths["exclusion_zones"] = tmpdir / "exclusion_zones.parquet"
+    _write_parquet(exclusions_gdf, paths["exclusion_zones"])
+
+    transit_count = max(scale // 5, 2)
+    transit = _make_clustered_points(transit_count, seed=51, clusters=8)
+    transit_gdf = gpd.GeoDataFrame(
+        {
+            "station_id": np.arange(len(transit), dtype=np.int64),
+            "geometry": transit,
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    paths["transit"] = tmpdir / "transit.geojson"
+    _write_geojson(transit_gdf, paths["transit"])
+
+    return paths
+
+
 def fingerprint(gdf: gpd.GeoDataFrame) -> str:
     """Deterministic summary for correctness comparison across engines."""
     rows = len(gdf)

@@ -100,6 +100,9 @@ _PAIR_MASK_BRUTE_FORCE_MAX_PRODUCT = 262_144
 _SEMIJOIN_MAX_CANDIDATES_PER_ROW = 8 * 1024
 _SEMIJOIN_MAX_TILE_LANES = 16 * 1024 * 1024
 _SEMIJOIN_MAX_SEGMENT_PAIR_LANES = 8 * 1024 * 1024
+# Peak per-lane allowance covers candidate rows, exact/relation output, and the
+# paired point-grid reuse mask, inclusive scan, positions, and gathered rows.
+# Capacity additionally uses at most one quarter of currently available bytes.
 _SEMIJOIN_TILE_BYTES_PER_LANE = 64
 _MORTON_SPAN_BUCKET_UPPER_BOUNDS = (0,) + tuple(1 << exponent for exponent in range(32))
 
@@ -1213,8 +1216,17 @@ def _spatial_index_device_point_grid_right_reduction(
     tree_family: GeometryFamily,
     precision_plan: PrecisionPlan | None,
     pair_budget: int,
+    initial_counts=None,
+    exclude_flat_index=None,
+    exclude_query_counts=None,
 ):
-    """Reduce bounded point-grid candidate batches into indexed-row counts."""
+    """Reduce bounded point-grid candidate batches into indexed-row counts.
+
+    When ``exclude_flat_index`` is present, candidate pairs already visited by
+    that aligned point grid are removed on device before exact classification.
+    This lets a paired reduction reuse prior exact results without assuming
+    that its two aligned point columns have identical candidate supersets.
+    """
     if predicate is None:
         return None
 
@@ -1225,6 +1237,7 @@ def _spatial_index_device_point_grid_right_reduction(
     prepare_point_region_y_indexes(query_owned, tree_owned)
 
     from vibespatial.spatial.point_grid_index import (
+        point_grid_candidate_not_in_other_superset,
         point_grid_query_row_partitions,
         point_grid_superset_query,
     )
@@ -1241,7 +1254,67 @@ def _spatial_index_device_point_grid_right_reduction(
     import cupy as cp
 
     tree_count = int(tree_owned.row_count)
-    counts = cp.zeros(tree_count, dtype=cp.uint64)
+    if initial_counts is None:
+        counts = cp.zeros(tree_count, dtype=cp.uint64)
+    else:
+        counts = cp.asarray(initial_counts, dtype=cp.uint64)
+        if counts.ndim != 1 or int(counts.size) != tree_count:
+            raise ValueError("initial point-grid counts must match indexed rows")
+    if (exclude_flat_index is None) != (exclude_query_counts is None):
+        raise ValueError(
+            "point-grid exclusion requires both an aligned index and query counts"
+        )
+
+    def _classify_tile(d_left, d_right):
+        launch_capacity = int(d_left.size)
+        if exclude_flat_index is None:
+            return _classify_homogeneous_reduction_tile(
+                predicate,
+                query_owned,
+                tree_owned,
+                d_left,
+                d_right,
+                query_family=query_family,
+                tree_family=tree_family,
+                precision_plan=precision_plan,
+            ), d_left, d_right
+
+        d_unseen = point_grid_candidate_not_in_other_superset(
+            exclude_flat_index,
+            query_bounds,
+            exclude_query_counts,
+            d_left,
+            d_right,
+            pair_budget=pair_budget,
+        )
+        if d_unseen is None:
+            return None, d_left, d_right
+        from vibespatial.api._native_rowset import NativeDeviceSelection
+
+        selection = NativeDeviceSelection.from_mask(d_unseen)
+        d_positions = cp.asarray(selection.positions, dtype=cp.int64)
+        d_selected_left = cp.asarray(d_left[d_positions], dtype=cp.int32)
+        d_selected_right = cp.asarray(d_right[d_positions], dtype=cp.int32)
+        d_exact_out = cp.zeros(launch_capacity, dtype=cp.bool_)
+        d_relation_scratch = cp.zeros(launch_capacity, dtype=cp.uint8)
+        d_source_offset = cp.zeros(1, dtype=cp.int64)
+        d_keep = _classify_homogeneous_reduction_tile(
+            predicate,
+            query_owned,
+            tree_owned,
+            d_selected_left,
+            d_selected_right,
+            query_family=query_family,
+            tree_family=tree_family,
+            precision_plan=precision_plan,
+            logical_count=selection.logical_count,
+            source_offset=d_source_offset,
+            launch_capacity=launch_capacity,
+            d_exact_out=d_exact_out,
+            d_relation_scratch=d_relation_scratch,
+        )
+        return d_keep, d_selected_left, d_selected_right
+
     for query_start, query_stop, pair_capacity in partitions:
         if pair_capacity > pair_budget:
             if query_stop != query_start + 1:
@@ -1254,22 +1327,20 @@ def _spatial_index_device_point_grid_right_reduction(
                     query_start,
                     dtype=cp.int32,
                 )
-                d_keep = _classify_homogeneous_reduction_tile(
-                    predicate,
-                    query_owned,
-                    tree_owned,
-                    d_left,
-                    d_right,
-                    query_family=query_family,
-                    tree_family=tree_family,
-                    precision_plan=precision_plan,
-                )
+                d_keep, d_left, d_right = _classify_tile(d_left, d_right)
                 if d_keep is None:
                     return None
-                counts[tree_start:tree_stop] += cp.asarray(
-                    d_keep,
-                    dtype=cp.uint64,
-                )
+                if exclude_flat_index is None:
+                    counts[tree_start:tree_stop] += cp.asarray(
+                        d_keep,
+                        dtype=cp.uint64,
+                    )
+                else:
+                    cp.add.at(
+                        counts,
+                        d_right,
+                        cp.asarray(d_keep, dtype=cp.uint64),
+                    )
                 del d_keep, d_left, d_right
             continue
         if pair_capacity == 0:
@@ -1286,16 +1357,7 @@ def _spatial_index_device_point_grid_right_reduction(
             query_start
         )
         d_right = cp.asarray(candidates.d_right, dtype=cp.int32)
-        d_keep = _classify_homogeneous_reduction_tile(
-            predicate,
-            query_owned,
-            tree_owned,
-            d_left,
-            d_right,
-            query_family=query_family,
-            tree_family=tree_family,
-            precision_plan=precision_plan,
-        )
+        d_keep, d_left, d_right = _classify_tile(d_left, d_right)
         if d_keep is None:
             return None
         d_keep = cp.asarray(d_keep, dtype=cp.bool_)
@@ -1343,6 +1405,7 @@ def _spatial_index_device_point_grid_aligned_pair_reduction(
         return None
     partitions, query_counts = plan
     left_counts = cp.zeros(tree_count, dtype=cp.uint64)
+    right_counts = cp.zeros(tree_count, dtype=cp.uint64)
     shared_counts = cp.zeros(tree_count, dtype=cp.uint64)
     for query_start, query_stop, pair_capacity in partitions:
         if pair_capacity > pair_budget:
@@ -1381,12 +1444,17 @@ def _spatial_index_device_point_grid_aligned_pair_reduction(
                 if d_aligned_keep is None:
                     return None
                 d_keep = cp.asarray(d_keep, dtype=cp.bool_)
+                d_aligned_keep = cp.asarray(d_aligned_keep, dtype=cp.bool_)
                 left_counts[tree_start:tree_stop] += d_keep.astype(
                     cp.uint64,
                     copy=False,
                 )
+                right_counts[tree_start:tree_stop] += d_aligned_keep.astype(
+                    cp.uint64,
+                    copy=False,
+                )
                 shared_counts[tree_start:tree_stop] += (
-                    d_keep & cp.asarray(d_aligned_keep, dtype=cp.bool_)
+                    d_keep & d_aligned_keep
                 ).astype(cp.uint64, copy=False)
                 del d_aligned_keep, d_keep, d_left, d_right
             continue
@@ -1429,11 +1497,17 @@ def _spatial_index_device_point_grid_aligned_pair_reduction(
         if d_aligned_keep is None:
             return None
         d_keep = cp.asarray(d_keep, dtype=cp.bool_)
-        d_shared = d_keep & cp.asarray(d_aligned_keep, dtype=cp.bool_)
+        d_aligned_keep = cp.asarray(d_aligned_keep, dtype=cp.bool_)
+        d_shared = d_keep & d_aligned_keep
         cp.add.at(
             left_counts,
             d_right,
             d_keep.astype(cp.uint64, copy=False),
+        )
+        cp.add.at(
+            right_counts,
+            d_right,
+            d_aligned_keep.astype(cp.uint64, copy=False),
         )
         cp.add.at(
             shared_counts,
@@ -1452,6 +1526,9 @@ def _spatial_index_device_point_grid_aligned_pair_reduction(
         tree_family=aligned_tree_family,
         precision_plan=precision_plan,
         pair_budget=pair_budget,
+        initial_counts=right_counts,
+        exclude_flat_index=flat_index,
+        exclude_query_counts=query_counts,
     )
     if right_counts is None:
         return None
@@ -1715,14 +1792,19 @@ def _spatial_index_device_relation_reduction(
         else:
             point_grid_values = None
         if point_grid_values is not None:
+            point_grid_reason = (
+                "bounded aligned point-grid candidate batches reused prior "
+                "exact classifications and reduced only unseen pairs to "
+                f"{reduction_name}"
+                if pair_reduction
+                else "bounded point-grid candidate batches reduced directly to "
+                f"{reduction_name}"
+            )
             return point_grid_values, SpatialQueryExecution(
                 requested=ExecutionMode.GPU,
                 selected=ExecutionMode.GPU,
                 implementation=implementation,
-                reason=(
-                    "bounded point-grid candidate batches reduced directly to "
-                    f"{reduction_name}"
-                ),
+                reason=point_grid_reason,
             )
 
     effective_query_bounds = (
@@ -2075,7 +2157,7 @@ def _spatial_index_device_relation_reduction(
                                 tree_family=tree_family,
                                 precision_plan=indexed_point_precision_plan,
                                 logical_count=d_partition_count_i32,
-                                pair_capacity=family_launch_capacity,
+                                pair_capacity=pair_capacity,
                                 source_offset=partition.source_offset,
                                 launch_capacity=family_launch_capacity,
                                 d_exact_out=d_exact,

@@ -16,14 +16,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _data import fingerprint, setup_fixtures, spatial_semijoin
+from _data import fingerprint, setup_site_suitability_fixtures, spatial_semijoin
 from shapely.geometry import box
 
 import geopandas as gpd
 
 _tmpdir = tempfile.TemporaryDirectory(prefix="shootout_site_")
 tmpdir = Path(_tmpdir.name)
-fixtures = setup_fixtures(tmpdir)
+fixtures = setup_site_suitability_fixtures(tmpdir)
 
 # --- timed work starts here ---
 

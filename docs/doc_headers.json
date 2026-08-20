@@ -57,6 +57,62 @@
       "sourceOfTruth": "Program plan for implementing ADR-0044 without reviving a broad public lazy planner.",
       "maxBodyLines": 860
     },
+    "docs/dev/evidence-first-point-region-execution-plan.md": {
+      "scope": "Evidence-first plan for proving one exact point-region execution alternative through public APIs before extracting generic device-planning infrastructure.",
+      "readIf": "You are profiling or optimizing point-in-polygon refinement, prepared polygon traversal, Q11's dominant predicate stage, or cross-device point-region execution.",
+      "stopIf": "You only need settled public predicate semantics or unrelated generic runtime behavior.",
+      "sourceOfTruth": "Active execution plan for evidence-driven point-region optimization and the gate for any future reusable device planner.",
+      "maxBodyLines": 500
+    },
+    "docs/dev/libcuspatial-quadtree-pip-benchmark-plan.md": {
+      "scope": "Benchmark plan for comparing pinned libcuSpatial quadtree point-in-polygon CUDA execution with vibeSpatial's public point-region shapes.",
+      "readIf": "You are building, running, interpreting, or reviewing the cuSpatial quadtree PIP comparison, precision variants, or SF100 Q10/Q11 point-region evidence.",
+      "stopIf": "You only need current production point-region behavior or the consolidated cross-device SF100 results.",
+      "sourceOfTruth": "Benchmark contract for the external libcuSpatial CUDA algorithm study; raw run artifacts remain authoritative measurements.",
+      "maxBodyLines": 390
+    },
+    "docs/dev/point-region-execution-evidence.md": {
+      "scope": "Current-revision evidence for the point-region profiler and classification-once paired point-grid reduction.",
+      "readIf": "You are changing prepared point-region refinement, paired spatial aggregation, point-grid candidate reduction, or validating SF100 Q11 performance.",
+      "stopIf": "You only need public predicate semantics or the superseded generic device-planning proposal.",
+      "sourceOfTruth": "Measurement record for docs/dev/evidence-first-point-region-execution-plan.md.",
+      "maxBodyLines": 260
+    },
+    "docs/dev/cross-device-performance-report.md": {
+      "scope": "Consolidated RTX 4090 and H200 performance, correctness, and capacity evidence for the SF100, public shootout, point-region, and vibeProj validation campaign.",
+      "readIf": "You need the complete measurement ledger for the 2026-08-18 local through 2026-08-20 H200 validation runs.",
+      "stopIf": "You need implementation details for point-region refinement or the historical pylibcudf execution plan.",
+      "sourceOfTruth": "Human-readable consolidated report; raw artifacts remain authoritative for exact machine-readable values.",
+      "maxBodyLines": 180
+    },
+    "docs/dev/sf100-cross-device-optimization-audit.md": {
+      "scope": "Per-query RTX 4090 and H200 SF100 diagnosis and reusable public-API optimization paths.",
+      "readIf": "You are selecting, designing, profiling, or reviewing SF100-driven performance work across IO, spatial reductions, point location, grouped geometry, or nearest search.",
+      "stopIf": "You only need the consolidated benchmark numbers or an operation-local implementation detail already routed by intake.",
+      "sourceOfTruth": "Current cross-device interpretation and prioritized optimization audit; raw Nsight and benchmark artifacts remain authoritative measurements.",
+      "maxBodyLines": 460
+    },
+    "docs/testing/spatialbench-nsight.md": {
+      "scope": "Reproducible query-scoped Nsight Systems capture and RTX 4090 versus H200 comparison workflow for SpatialBench SF100.",
+      "readIf": "You are profiling SF100 CPU/GPU balance, collecting datacenter traces, or comparing query execution across NVIDIA devices.",
+      "stopIf": "You only need clean benchmark wall times or an operation-local kernel microbenchmark.",
+      "sourceOfTruth": "Capture contract and operator workflow for scripts/profile_spatialbench_nsight.py.",
+      "maxBodyLines": 180
+    },
+    "docs/archive/2026-08-18-device-planning/device-execution-planning-implementation-plan.md": {
+      "scope": "Archived design exploration for a complete capability-driven private device execution planner.",
+      "readIf": "You are auditing why ADR-0047 was superseded or researching previously proposed calibration and planning contracts.",
+      "stopIf": "You are implementing current point-region or adaptive-runtime work; use the evidence-first plan instead.",
+      "sourceOfTruth": "Historical design record only; not implementation authority.",
+      "maxBodyLines": 730
+    },
+    "docs/archive/2026-08-18-device-planning/adaptive-point-region-refinement-plan.md": {
+      "scope": "Archived design exploration for a multi-variant adaptive exact point-region refinement engine.",
+      "readIf": "You are auditing the superseded ADR-0047 adopter proposal or researching alternatives rejected as premature.",
+      "stopIf": "You are implementing current point-region work; use the evidence-first plan instead.",
+      "sourceOfTruth": "Historical design record only; not implementation authority.",
+      "maxBodyLines": 710
+    },
     "docs/dev/pylibcudf-sf100-execution-plan.md": {
       "scope": "Execution plan for using pylibcudf and unified RMM memory management to make public vibeSpatial APIs exceed optimized GeoPandas by 10x on SpatialBench SF100.",
       "readIf": "You are changing native attribute execution, relational primitives, GeoParquet scans, GPU memory policy, or the SpatialBench public-API engines.",

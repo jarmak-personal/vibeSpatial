@@ -15,6 +15,7 @@ import numpy as np
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
+    KERNEL_PARAM_I64,
     KERNEL_PARAM_PTR,
     compile_kernel_group,
     count_scatter_total,
@@ -535,3 +536,96 @@ def _count_bounded_block_partitions(
             )
         )
     return tuple(partitions)
+
+
+def point_grid_candidate_not_in_other_superset(
+    flat_index,
+    query_bounds,
+    other_query_counts,
+    candidate_query_rows,
+    candidate_tree_rows,
+    *,
+    pair_budget: int,
+):
+    """Mark candidates absent from an aligned point grid's prior superset.
+
+    This is an internal paired-reduction primitive.  Candidate rows refer to
+    two aligned point columns, so ``candidate_tree_rows`` can address the
+    geometry owned by ``flat_index`` directly.  Oversized query rows are marked
+    already seen because their prior reduction scanned every aligned tree row.
+    """
+    prepared = prepare_point_grid_index(flat_index)
+    if prepared is None:
+        return None
+
+    import cupy as cp
+
+    d_left = cp.asarray(candidate_query_rows, dtype=cp.int32)
+    d_right = cp.asarray(candidate_tree_rows, dtype=cp.int32)
+    if d_left.ndim != 1 or d_right.ndim != 1 or d_left.size != d_right.size:
+        raise ValueError("point-grid candidate rows must be aligned vectors")
+    owned = flat_index.geometry_array
+    state = owned._ensure_device_state(preserve_indexed_view=True)
+    point_buffer = state.families.get(GeometryFamily.POINT)
+    if point_buffer is None:
+        return None
+    bounds = cp.ascontiguousarray(cp.asarray(query_bounds, dtype=cp.float64)).reshape(
+        -1,
+        4,
+    )
+    counts = cp.asarray(other_query_counts, dtype=cp.int64)
+    out = cp.empty(d_left.size, dtype=cp.uint8)
+    if d_left.size == 0:
+        return out.astype(cp.bool_, copy=False)
+    runtime = get_cuda_runtime()
+    kernel = point_grid_index_kernels()[
+        "point_grid_candidate_not_in_other_superset"
+    ]
+    grid, block = runtime.launch_config(kernel, int(d_left.size))
+    ptr = runtime.pointer
+    runtime.launch(
+        kernel,
+        grid=grid,
+        block=block,
+        params=(
+            (
+                ptr(d_left),
+                ptr(d_right),
+                ptr(bounds),
+                ptr(counts),
+                ptr(state.family_row_offsets),
+                ptr(point_buffer.geometry_offsets),
+                ptr(point_buffer.empty_mask),
+                ptr(point_buffer.x),
+                ptr(point_buffer.y),
+                prepared.xmin,
+                prepared.ymin,
+                prepared.xmax,
+                prepared.ymax,
+                prepared.grid_size,
+                int(pair_budget),
+                ptr(out),
+                int(d_left.size),
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I64,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+    return out.astype(cp.bool_, copy=False)

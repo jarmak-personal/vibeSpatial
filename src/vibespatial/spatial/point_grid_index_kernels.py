@@ -5,6 +5,7 @@ from __future__ import annotations
 POINT_GRID_INDEX_KERNEL_NAMES = (
     "point_grid_query_counts",
     "point_grid_query_scatter",
+    "point_grid_candidate_not_in_other_superset",
 )
 
 _POINT_GRID_INDEX_SOURCE = r"""
@@ -125,6 +126,66 @@ extern "C" __global__ void point_grid_query_scatter(
             out_left[destination + point] = query;
             out_right[destination + point] = sorted_tree_rows[source + point];
         }
+    }
+}
+
+extern "C" __global__ void point_grid_candidate_not_in_other_superset(
+    const int* candidate_query_rows,
+    const int* candidate_tree_rows,
+    const double* query_bounds,
+    const long long* other_query_counts,
+    const int* point_row_offsets,
+    const int* point_geometry_offsets,
+    const unsigned char* point_empty_mask,
+    const double* point_x,
+    const double* point_y,
+    double xmin,
+    double ymin,
+    double xmax,
+    double ymax,
+    int grid_size,
+    long long pair_budget,
+    unsigned char* out,
+    int candidate_count
+) {
+    const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    const double xscale = (double)grid_size / (xmax - xmin);
+    const double yscale = (double)grid_size / (ymax - ymin);
+    for (int candidate = lane; candidate < candidate_count; candidate += stride) {
+        const int query = candidate_query_rows[candidate];
+        if (other_query_counts[query] > pair_budget) {
+            out[candidate] = 0u;
+            continue;
+        }
+        const int tree_row = candidate_tree_rows[candidate];
+        const int point_row = point_row_offsets[tree_row];
+        if (point_row < 0 || point_empty_mask[point_row]) {
+            out[candidate] = 1u;
+            continue;
+        }
+        const int point_coord = point_geometry_offsets[point_row];
+        const double px = point_x[point_coord];
+        const double py = point_y[point_coord];
+        if (!isfinite(px) || !isfinite(py)) {
+            out[candidate] = 1u;
+            continue;
+        }
+        int x0, y0, x1, y1;
+        if (!vs_point_grid_window(
+                query_bounds + ((long long)query * 4),
+                xmin, ymin, xmax, ymax, grid_size,
+                &x0, &y0, &x1, &y1)) {
+            out[candidate] = 1u;
+            continue;
+        }
+        int cell_x = (int)floor((px - xmin) * xscale);
+        int cell_y = (int)floor((py - ymin) * yscale);
+        cell_x = max(0, min(grid_size - 1, cell_x));
+        cell_y = max(0, min(grid_size - 1, cell_y));
+        const bool seen =
+            cell_x >= x0 && cell_x <= x1 && cell_y >= y0 && cell_y <= y1;
+        out[candidate] = seen ? 0u : 1u;
     }
 }
 """

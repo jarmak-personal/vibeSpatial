@@ -144,6 +144,36 @@ def test_spatial_reduction_tile_capacity_tracks_live_memory(monkeypatch) -> None
     ) == 400
 
 
+@pytest.mark.parametrize(
+    ("profile", "available_bytes", "expected_lanes"),
+    [
+        ("h100_80gb", 80 * 1024**3, 16 * 1024 * 1024),
+        ("a100_40gb", 40 * 1024**3, 16 * 1024 * 1024),
+        ("rtx_3090_24gb", 24 * 1024**3, 16 * 1024 * 1024),
+        ("constrained", 64 * 400 * 4, 400),
+        ("unknown", None, 16 * 1024 * 1024),
+    ],
+)
+def test_spatial_reduction_tile_capacity_safety_profiles(
+    monkeypatch,
+    profile,
+    available_bytes,
+    expected_lanes,
+) -> None:
+    """Named safety profiles affect capacity only through current free bytes."""
+    monkeypatch.setattr(
+        "vibespatial.spatial.spatial_index_device.available_device_memory_bytes",
+        lambda: available_bytes,
+    )
+
+    assert _spatial_reduction_tile_lane_capacity(
+        object(),
+        object(),
+        predicate="intersects",
+        family_admission=(True, False, False),
+    ) == expected_lanes, profile
+
+
 def test_spatial_reduction_tile_capacity_tracks_segment_pair_shape(monkeypatch) -> None:
     monkeypatch.setattr(
         "vibespatial.spatial.spatial_index_device.available_device_memory_bytes",
@@ -173,7 +203,10 @@ def test_spatial_reduction_uses_structural_tiles_without_active_row_rounds() -> 
     assert "for bucket_index" in source
     assert "for query_order_start in range" in source
     assert "for position_start in range" in source
-    assert "cp.broadcast_to" not in source
+    # Broadcasting the public distance input to query-row shape is bounded;
+    # candidate-pair-shaped broadcasting remains forbidden.
+    assert source.count("cp.broadcast_to(") == 1
+    assert "cp.broadcast_to(raw_distance_thresholds, (query_count,))" in source
     assert 'kernels["morton_range_tile_count"]' in source
     assert 'kernels["morton_range_tile_scatter"]' in source
     assert "logical_count=d_candidate_count_i64" in source
@@ -181,7 +214,9 @@ def test_spatial_reduction_uses_structural_tiles_without_active_row_rounds() -> 
     assert "candidate_selection.active_capacity_mask()" in source
     assert "NativeDeviceSelection.from_mask(d_reduced != 0)" in source
     assert source.count("family_partition_type.from_pair_capacity(") == 1
-    assert "pair_capacity=family_launch_capacity" in source
+    # The backing grouped relation and shared output/scratch arrays retain the
+    # full tile capacity; only each family kernel's admitted launch is smaller.
+    assert "pair_capacity=pair_capacity" in source
     assert "launch_capacity=family_launch_capacity" in source
     assert "pair_capacity=family_partition.capacity" not in source
     assert "launch_capacity=partition.capacity" not in source

@@ -5,7 +5,7 @@ Scope: Probe-first adaptive planning, monitoring inputs, and chunk-boundary runt
 Read If: You are changing variant selection, NVML monitoring, adaptive chunking, or runtime planning.
 STOP IF: Your task already has a settled adaptive-runtime contract and only needs implementation detail.
 Source Of Truth: Phase-1 adaptive runtime policy before broader kernel work lands.
-Body Budget: 76/240 lines
+Body Budget: 97/240 lines
 Document: docs/architecture/adaptive-runtime.md
 
 Section Map (Body Lines)
@@ -20,7 +20,8 @@ Section Map (Body Lines)
 | 38-44 | Canonical Rule |
 | 45-51 | Required Layers |
 | 52-66 | Decision Scope |
-| 67-76 | Upgrade Path |
+| 67-77 | Upgrade Path |
+| 78-97 | Evidence-First Device Adaptation |
 DOC_HEADER:END -->
 
 Use a probe-first planner now, and leave room for a fuller controller later.
@@ -97,3 +98,24 @@ This design is intentionally a stepping stone.
 Moving from the planner to a live controller should only replace internal
 policy and telemetry sources. Kernel call sites, registry metadata, and plan
 objects should stay stable.
+
+## Evidence-First Device Adaptation
+
+ADR-0047's proposed second device-planning layer was superseded before
+implementation. `AdaptivePlan`, `PrecisionPlan`, the kernel registry, and the
+CUDA runtime remain the authoritative owners of selection, precision, variant
+metadata, launch validation, and allocation.
+
+New adaptive kernel work starts operation-private and evidence-first. An
+operation may add one proven exact alternative and the minimum physical-work
+field needed to select it. It must not add product-name policy, online
+calibration, or a parallel plan object merely to anticipate later reuse.
+
+Reusable device-planning infrastructure requires evidence from a second kernel
+family with the same decision contract and a new ADR. Any future design must
+model complete multi-stage execution and resource lifetimes, not only one
+kernel launch.
+
+See `docs/dev/evidence-first-point-region-execution-plan.md` for the active
+point-region program. Historical exploration is preserved under
+`docs/archive/2026-08-18-device-planning/`.

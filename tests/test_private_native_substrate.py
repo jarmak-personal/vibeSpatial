@@ -161,6 +161,7 @@ def test_source_device_to_host_boundaries_are_named() -> None:
     unnamed_runtime_copies: dict[str, list[int]] = {}
     raw_device_gets: dict[str, list[int]] = {}
     allowed_get_owners = {
+        "_ACTIVE_SESSION",
         "CCCLPrecompiler",
         "NVRTCPrecompiler",
         "_MATERIALIZATION_CONTEXT",

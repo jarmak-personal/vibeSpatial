@@ -256,6 +256,7 @@ def _run_query_in_process(
     warmup_runs: int = 0,
     statistic: str = "mean",
     profile_telemetry: bool = False,
+    profile_point_region: bool = False,
 ):
     """Worker function to run a query in a separate process.
 
@@ -293,14 +294,38 @@ def _run_query_in_process(
                     if profile_telemetry
                     else None
                 )
-                start_time = time.perf_counter()
-                measured_row_count, measured_result = benchmark.execute_query(
-                    query_name,
-                    query_sql,
+                point_profile = None
+                if profile_point_region and engine_class.__name__ == "VibeSpatialBenchmark":
+                    from vibespatial.predicates.point_region_profile import (
+                        profile_point_region as create_point_region_profile,
+                    )
+
+                    point_profile = create_point_region_profile(
+                        label=f"spatialbench-{query_name}-run-{run_number + 1}"
+                    )
+                    point_profile.__enter__()
+                try:
+                    start_time = time.perf_counter()
+                    measured_row_count, measured_result = benchmark.execute_query(
+                        query_name,
+                        query_sql,
+                    )
+                    run_times.append(time.perf_counter() - start_time)
+                    point_profile_snapshot = (
+                        point_profile.snapshot() if point_profile is not None else None
+                    )
+                finally:
+                    if point_profile is not None:
+                        point_profile.__exit__(None, None, None)
+                telemetry = (
+                    _end_vibespatial_telemetry(telemetry_state)
+                    if profile_telemetry
+                    else {}
                 )
-                run_times.append(time.perf_counter() - start_time)
-                if profile_telemetry:
-                    telemetry_runs.append(_end_vibespatial_telemetry(telemetry_state))
+                if point_profile_snapshot is not None:
+                    telemetry["point_region_profile"] = point_profile_snapshot
+                if telemetry:
+                    telemetry_runs.append(telemetry)
                 if row_count is not None and measured_row_count != row_count:
                     raise RuntimeError(
                         f"{query_name} row count changed across measured runs: "
@@ -688,6 +713,7 @@ def run_query_isolated(
     warmup_runs: int = 0,
     statistic: str = "mean",
     profile_telemetry: bool = False,
+    profile_point_region: bool = False,
 ) -> BenchmarkResult:
     """Run a single query in an isolated subprocess with hard timeout.
 
@@ -704,7 +730,7 @@ def run_query_isolated(
         target=_run_query_in_process,
         args=(result_queue, engine_class, data_paths, query_name, query_sql,
               str(dump_csv) if dump_csv else None, measured_runs, warmup_runs,
-              statistic, profile_telemetry),
+              statistic, profile_telemetry, profile_point_region),
     )
 
     def _kill():
@@ -791,6 +817,7 @@ def run_benchmark(
     warmup_runs: int = 0,
     statistic: str = "mean",
     profile_telemetry: bool = False,
+    profile_point_region: bool = False,
     output_file: str | None = None,
     result_dir: Path | None = None,
 ) -> BenchmarkSuite:
@@ -926,6 +953,7 @@ def run_benchmark(
                 warmup_runs=warmup_runs,
                 statistic=statistic,
                 profile_telemetry=profile_telemetry,
+                profile_point_region=profile_point_region,
             )
 
             if result.status == "success":
@@ -1019,6 +1047,11 @@ def main():
                         help="Summary statistic for measured query times")
     parser.add_argument("--profile-telemetry", action="store_true",
                         help="Collect vibeSpatial VRAM, RMM, D2H, and fallback telemetry")
+    parser.add_argument(
+        "--profile-point-region",
+        action="store_true",
+        help="Collect bounded exact point/region physical-work counters",
+    )
     parser.add_argument("--output", type=str, default="benchmark_results.json",
                         help="Output file for results")
     parser.add_argument("--scale-factor", type=float, default=1,
@@ -1077,6 +1110,7 @@ def main():
             warmup_runs=args.warmup_runs,
             statistic=args.statistic,
             profile_telemetry=args.profile_telemetry,
+            profile_point_region=args.profile_point_region,
             output_file=args.output,
             result_dir=result_dir,
         )
