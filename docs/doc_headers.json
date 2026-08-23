@@ -65,11 +65,25 @@
       "maxBodyLines": 500
     },
     "docs/dev/libcuspatial-quadtree-pip-benchmark-plan.md": {
-      "scope": "Benchmark plan for comparing pinned libcuSpatial quadtree point-in-polygon CUDA execution with vibeSpatial's public point-region shapes.",
-      "readIf": "You are building, running, interpreting, or reviewing the cuSpatial quadtree PIP comparison, precision variants, or SF100 Q10/Q11 point-region evidence.",
+      "scope": "Source-study and benchmark plan for testing libcuSpatial-inspired point-space partitioning ideas inside vibeSpatial's public point-region shapes.",
+      "readIf": "You are studying the archived cuSpatial quadtree PIP algorithm, testing equivalent vS physical shapes, or reviewing SF100 Q10/Q11 point-region evidence.",
       "stopIf": "You only need current production point-region behavior or the consolidated cross-device SF100 results.",
-      "sourceOfTruth": "Benchmark contract for the external libcuSpatial CUDA algorithm study; raw run artifacts remain authoritative measurements.",
-      "maxBodyLines": 390
+      "sourceOfTruth": "Benchmark contract for source-derived vibeSpatial experiments; raw vS run artifacts remain authoritative measurements.",
+      "maxBodyLines": 520
+    },
+    "docs/archive/2026-08-21-quadtree-experiments/adaptive-point-quadtree-production-plan.md": {
+      "scope": "Archived implementation plan and rejection record for the benchmark-gated adaptive point-quadtree provider.",
+      "readIf": "You are reviewing why the experimental quadtree provider was removed from production or reusing its safety findings.",
+      "stopIf": "You need current production point-region behavior or settled public spatial predicate semantics.",
+      "sourceOfTruth": "Historical productionization contract; the active runtime supports grid-to-Morton selection instead.",
+      "maxBodyLines": 350
+    },
+    "docs/archive/2026-08-21-quadtree-experiments/quadtree-scaling-evidence.md": {
+      "scope": "Archived RTX 4090 synthetic scale evidence for the rejected adaptive point-quadtree provider.",
+      "readIf": "You are reviewing the synthetic evidence that preceded the full SF100 physical-shape experiment.",
+      "stopIf": "You need current production selection behavior or current performance claims.",
+      "sourceOfTruth": "Historical measurement summary; immutable raw experiment artifacts remain authoritative.",
+      "maxBodyLines": 130
     },
     "docs/dev/point-region-execution-evidence.md": {
       "scope": "Current-revision evidence for the point-region profiler and classification-once paired point-grid reduction.",

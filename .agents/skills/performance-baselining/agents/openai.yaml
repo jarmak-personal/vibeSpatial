@@ -1,0 +1,4 @@
+interface:
+  display_name: "Performance Baselining"
+  short_description: "Reuse valid baselines; rerun current performance"
+  default_prompt: "Use $performance-baselining to capture or reuse a validated benchmark baseline and measure only the changed implementation."

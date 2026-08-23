@@ -31,12 +31,24 @@ extern "C" __device__ __forceinline__ bool vs_point_grid_window(
         || qymax < ymin || qymin > ymax) {
         return false;
     }
-    const double xscale = (double)grid_size / (xmax - xmin);
-    const double yscale = (double)grid_size / (ymax - ymin);
-    int ix0 = (int)floor((qxmin - xmin) * xscale);
-    int iy0 = (int)floor((qymin - ymin) * yscale);
-    int ix1 = (int)floor((qxmax - xmin) * xscale);
-    int iy1 = (int)floor((qymax - ymin) * yscale);
+    const double xextent = xmax - xmin;
+    const double yextent = ymax - ymin;
+    if (!isfinite(xextent) || !isfinite(yextent)
+        || xextent <= 0.0 || yextent <= 0.0) {
+        return false;
+    }
+    // Clamp before subtraction. A finite query endpoint outside the tree can
+    // otherwise overflow even though its overlap with the tree is nonempty.
+    const double cxmin = fmax(xmin, fmin(xmax, qxmin));
+    const double cymin = fmax(ymin, fmin(ymax, qymin));
+    const double cxmax = fmax(xmin, fmin(xmax, qxmax));
+    const double cymax = fmax(ymin, fmin(ymax, qymax));
+    const double xscale = (double)grid_size / xextent;
+    const double yscale = (double)grid_size / yextent;
+    int ix0 = (int)floor((cxmin - xmin) * xscale);
+    int iy0 = (int)floor((cymin - ymin) * yscale);
+    int ix1 = (int)floor((cxmax - xmin) * xscale);
+    int iy1 = (int)floor((cymax - ymin) * yscale);
     ix0 = max(0, min(grid_size - 1, ix0));
     iy0 = max(0, min(grid_size - 1, iy0));
     ix1 = max(0, min(grid_size - 1, ix1));
@@ -94,9 +106,12 @@ extern "C" __global__ void point_grid_query_scatter(
     const long long* cell_offsets,
     const int* sorted_tree_rows,
     const long long* query_offsets,
+    const long long* query_counts,
     unsigned long long* query_cursors,
     int* out_left,
     int* out_right,
+    long long output_capacity,
+    unsigned int* error_flag,
     int query_count
 ) {
     const int query = blockIdx.x;
@@ -121,6 +136,18 @@ extern "C" __global__ void point_grid_query_scatter(
         const unsigned long long destination = atomicAdd(
             query_cursors + query,
             (unsigned long long)point_count);
+        const unsigned long long segment_start =
+            (unsigned long long)query_offsets[query];
+        const unsigned long long segment_stop =
+            segment_start + (unsigned long long)query_counts[query];
+        if (destination > (unsigned long long)output_capacity
+            || (unsigned long long)point_count
+                > (unsigned long long)output_capacity - destination
+            || destination < segment_start
+            || destination + (unsigned long long)point_count > segment_stop) {
+            atomicOr(error_flag, 1u);
+            continue;
+        }
         const long long source = cell_offsets[cell];
         for (int point = 0; point < point_count; ++point) {
             out_left[destination + point] = query;

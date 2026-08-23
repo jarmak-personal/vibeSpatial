@@ -260,7 +260,7 @@ Edit the "Current Compliance Status" section below:
 The compliance ledger file is at:
 `.agents/skills/precision-compliance/SKILL.md` (this file — the section below).
 
-## Current Compliance Status (as of 2026-03-16, updated during session)
+## Current Compliance Status (as of 2026-08-20, updated during session)
 
 ### Fully compliant (plan computed AND kernel respects it)
 

@@ -92,6 +92,32 @@ def require_device_candidate_pair_capacity(
     return required_bytes
 
 
+def validate_device_candidate_error_flags(
+    error_flags: Any,
+    *,
+    reason: str = "device candidate post-launch fault validation planning packet",
+) -> None:
+    """Fail closed once after all ordered guarded scatters have completed."""
+    flags = tuple(flag for flag in error_flags if flag is not None)
+    if not flags:
+        return
+    import cupy as cp
+
+    combined = cp.max(
+        cp.concatenate([cp.asarray(flag, dtype=cp.uint32).reshape(-1) for flag in flags])
+    ).reshape(1)
+    fault = int(
+        get_cuda_runtime().copy_device_to_host(
+            combined,
+            reason=reason,
+        )[0]
+    )
+    if fault:
+        raise RuntimeError(
+            "guarded device candidate scatter exceeded its sealed capacity"
+        )
+
+
 def _device_array_detail(values: Any, *, side: str) -> str:
     size = int(getattr(values, "size", 0))
     itemsize = int(getattr(getattr(values, "dtype", None), "itemsize", 0))
@@ -143,9 +169,14 @@ class _DeviceCandidates:
     d_left: Any  # CuPy int32 device array
     d_right: Any  # CuPy int32 device array
     total_pairs: int
+    error_flag: Any | None = None  # optional device uint32 async fault carrier
+
+    def validate_error_flag(self) -> None:
+        validate_device_candidate_error_flags((self.error_flag,))
 
     def to_host(self) -> tuple[np.ndarray, np.ndarray]:
         """Copy indices to host as numpy arrays."""
+        self.validate_error_flag()
         runtime = get_cuda_runtime()
         _record_device_join_materialization(
             self.d_left,

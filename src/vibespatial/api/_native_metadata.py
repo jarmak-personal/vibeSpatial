@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from threading import RLock
 from typing import Any
 
 import numpy as np
@@ -32,6 +33,18 @@ def _host_or_device_slots(values: Any) -> tuple[Any | None, Any | None]:
     if values is None:
         return None, None
     return (None, values) if _is_device_array(values) else (values, None)
+
+
+def _record_native_device_readiness(residency: Residency) -> NativeStreamReadiness:
+    """Record all current-stream producers captured by a new native carrier."""
+    if residency is not Residency.DEVICE:
+        return NativeStreamReadiness()
+    import cupy as cp
+
+    stream = cp.cuda.get_current_stream()
+    event = cp.cuda.Event(disable_timing=True)
+    event.record(stream)
+    return NativeStreamReadiness(stream=stream, event=event, ready=False)
 
 
 def _family_names(owned) -> tuple[str, ...]:
@@ -305,10 +318,14 @@ class NativeGeometryMetadata:
         bounds = (
             flat_index.device_bounds
             if getattr(flat_index, "device_bounds", None) is not None
-            else getattr(flat_index, "_host_bounds", None)
+            else None
         )
         owned = flat_index.geometry_array
         state = getattr(owned, "device_state", None)
+        if bounds is None:
+            bounds = getattr(flat_index, "_host_bounds", None)
+        if bounds is None and state is not None:
+            bounds = getattr(state, "row_bounds", None)
         validity = getattr(state, "validity", None)
         family_tags = getattr(state, "tags", None)
         family_row_offsets = getattr(state, "family_row_offsets", None)
@@ -604,6 +621,17 @@ class NativeSpatialIndex:
     index_parameters: dict[str, Any] = field(default_factory=dict)
     residency: Residency = Residency.HOST
     readiness: NativeStreamReadiness = field(default_factory=NativeStreamReadiness)
+    point_partition_cache: dict[Any, Any] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    point_partition_lock: Any = field(
+        default_factory=RLock,
+        repr=False,
+        compare=False,
+    )
+    _flat_index: Any | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.row_count < 0:
@@ -640,6 +668,8 @@ class NativeSpatialIndex:
             source_token=source_token,
         )
         residency = _device_or_host_residency(metadata.bounds, order, morton_keys)
+        readiness = _record_native_device_readiness(residency)
+        metadata = replace(metadata, readiness=readiness)
         return cls(
             kind="flat-morton",
             row_count=int(flat_index.geometry_array.row_count),
@@ -656,6 +686,8 @@ class NativeSpatialIndex:
                 "device_order": getattr(flat_index, "device_order", None) is not None,
             },
             residency=residency,
+            readiness=readiness,
+            _flat_index=flat_index,
         )
 
     @property
@@ -671,6 +703,10 @@ class NativeSpatialIndex:
 
     def to_flat_index(self):
         """Return a transitional flat-index view without rebuilding index state."""
+        if self._flat_index is not None:
+            if int(self._flat_index.geometry_array.row_count) != int(self.row_count):
+                raise ValueError("retained flat spatial index row count mismatch")
+            return self._flat_index
         if self.metadata is None or self.metadata.bounds is None:
             raise ValueError("NativeSpatialIndex query requires metadata bounds")
 
@@ -742,6 +778,7 @@ class NativeSpatialIndex:
             self.geometry,
             self.to_flat_index(),
             query_owned,
+            native_index=self,
             predicate=predicate,
             sort=sort,
             distance=distance,
@@ -843,13 +880,13 @@ class NativeSpatialIndex:
             query_bounds,
             predicate=predicate,
             distance=distance,
+            native_index=self,
         )
 
     def _query_device_pair_reduction(
         self,
         query_owned: Any,
-        aligned_tree_owned: Any,
-        aligned_flat_index: Any,
+        aligned_native_index: NativeSpatialIndex,
         *,
         predicate: str,
         precomputed_query_bounds: Any | None,
@@ -880,12 +917,13 @@ class NativeSpatialIndex:
         )
         return spatial_index_device_right_pair_match_counts(
             self.to_flat_index(),
-            aligned_flat_index,
+            aligned_native_index,
             query_owned,
             self.geometry,
-            aligned_tree_owned,
+            aligned_native_index.geometry,
             query_bounds,
             predicate=predicate,
+            native_index=self,
         )
 
     def query_left_semijoin(
@@ -1180,8 +1218,7 @@ class NativeSpatialIndex:
     def query_right_pair_match_count_expressions(
         self,
         query_geometry: Any,
-        aligned_tree_geometry: Any,
-        aligned_flat_index: Any,
+        aligned_native_index: NativeSpatialIndex,
         *,
         predicate: str,
         query_row_count: int | None = None,
@@ -1192,7 +1229,6 @@ class NativeSpatialIndex:
         from vibespatial.api._native_expression import NativeExpression
 
         query_owned = _query_owned_geometry(query_geometry)
-        aligned_tree_owned = _query_owned_geometry(aligned_tree_geometry)
         resolved_query_row_count = (
             getattr(query_owned, "row_count", None)
             if query_row_count is None
@@ -1205,8 +1241,7 @@ class NativeSpatialIndex:
             )
         direct_counts, execution = self._query_device_pair_reduction(
             query_owned,
-            aligned_tree_owned,
-            aligned_flat_index,
+            aligned_native_index,
             predicate=predicate,
             precomputed_query_bounds=precomputed_query_bounds,
         )

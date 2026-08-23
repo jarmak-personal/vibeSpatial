@@ -27,6 +27,19 @@ uv run python scripts/check_import_guard.py --all
 If any fail, fix the issues before proceeding. The pre-commit hook will
 also enforce these, but catching them here avoids a failed commit attempt.
 
+## Performance Evidence
+
+When the diff touches runtime, kernels, pipeline, IO, predicates, benchmark
+tooling, or performance claims, invoke `$performance-baselining` before the AI
+review. Rerun the changed vibeSpatial implementation and reuse a validated
+static comparator baseline. Do not rerun GeoPandas solely because vibeSpatial
+changed. Refresh the comparator only when its workload/data/environment/host/
+measurement identity changed or the user explicitly requested a refresh.
+
+Include the reused/refreshed baseline identity and current per-workload result
+summary in the review context. A stale, unvalidated, or correctness-mismatched
+baseline is BLOCKING.
+
 ## Tier 2: AI-Powered Review
 
 The pre-commit hook CANNOT do this — it requires AI judgment. The review

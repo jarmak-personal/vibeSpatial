@@ -5,7 +5,7 @@ Scope: Probe-first adaptive planning, monitoring inputs, and chunk-boundary runt
 Read If: You are changing variant selection, NVML monitoring, adaptive chunking, or runtime planning.
 STOP IF: Your task already has a settled adaptive-runtime contract and only needs implementation detail.
 Source Of Truth: Phase-1 adaptive runtime policy before broader kernel work lands.
-Body Budget: 97/240 lines
+Body Budget: 108/240 lines
 Document: docs/architecture/adaptive-runtime.md
 
 Section Map (Body Lines)
@@ -21,7 +21,7 @@ Section Map (Body Lines)
 | 45-51 | Required Layers |
 | 52-66 | Decision Scope |
 | 67-77 | Upgrade Path |
-| 78-97 | Evidence-First Device Adaptation |
+| 78-108 | Evidence-First Device Adaptation |
 DOC_HEADER:END -->
 
 Use a probe-first planner now, and leave room for a fuller controller later.
@@ -115,6 +115,17 @@ Reusable device-planning infrastructure requires evidence from a second kernel
 family with the same decision contract and a new ADR. Any future design must
 model complete multi-stage execution and resource lifetimes, not only one
 kernel launch.
+
+The point-region reduction follows that evidence-first rule. Its operation-
+private selector does not predict a winner: an admitted grid wins and all
+other cases use Morton. It reads no GPU product name, compute capability, SM
+count, timing history, candidate-inflation score, or online telemetry, and it
+never retries a different provider after submission.
+
+Pair-shaped point/predicate queries retain their separate, pre-existing grid
+candidate path. Its Native-owned implementation performs one named allocation
+fence for the admitted complete relation and always runs exact predicate
+refinement. It does not broaden the bounded-reduction selector.
 
 See `docs/dev/evidence-first-point-region-execution-plan.md` for the active
 point-region program. Historical exploration is preserved under

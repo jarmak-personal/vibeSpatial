@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -5133,6 +5134,8 @@ def test_flat_spatial_index_exports_native_carriers_without_lazy_materialization
 
     metadata = flat_index.geometry_metadata(source_token="frame")
     native_index = flat_index.to_native_spatial_index(source_token="frame")
+    prepared_marker = object()
+    native_index.point_partition_cache["prepared-marker"] = prepared_marker
 
     assert isinstance(metadata, NativeGeometryMetadata)
     assert isinstance(native_index, NativeSpatialIndex)
@@ -5142,7 +5145,61 @@ def test_flat_spatial_index_exports_native_carriers_without_lazy_materialization
     assert native_index.order is flat_index._host_order
     assert native_index.morton_keys is flat_index._host_morton_keys
     assert native_index.source_token == "frame"
+    assert native_index.to_flat_index() is flat_index
+    assert native_index.point_partition_cache["prepared-marker"] is prepared_marker
+    assert native_index.to_flat_index().point_grid is None
+    reconstructed = replace(native_index, _flat_index=None).to_flat_index()
+    assert reconstructed.point_grid is None
     native_index.validate_row_count(3)
+
+
+def test_flat_spatial_index_publishes_one_native_owner_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Lock
+    from time import sleep
+
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    flat_index = build_flat_spatial_index(
+        owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.AUTO,
+            selected=ExecutionMode.CPU,
+            reason="unit test concurrent native spatial index owner",
+        ),
+    )
+    original_factory = NativeSpatialIndex.from_flat_index
+    created = 0
+    created_lock = Lock()
+
+    def _slow_factory(cls, source_index, *, source_token=None):
+        nonlocal created
+        with created_lock:
+            created += 1
+        sleep(0.05)
+        return original_factory(source_index, source_token=source_token)
+
+    monkeypatch.setattr(
+        NativeSpatialIndex,
+        "from_flat_index",
+        classmethod(_slow_factory),
+    )
+    start = Barrier(2)
+
+    def _create_owner():
+        start.wait()
+        return flat_index.to_native_spatial_index(source_token="shared-tree")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(_create_owner)
+        second_future = executor.submit(_create_owner)
+        first = first_future.result(timeout=5.0)
+        second = second_future.result(timeout=5.0)
+
+    assert created == 1
+    assert first is second
+    assert flat_index._native_spatial_index is first
 
 
 def test_native_spatial_index_query_relation_reuses_index_state() -> None:

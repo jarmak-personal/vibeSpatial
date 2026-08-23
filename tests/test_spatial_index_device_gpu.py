@@ -11,6 +11,8 @@ Validates that the unified device spatial index query function:
 from __future__ import annotations
 
 import inspect
+from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -459,7 +461,6 @@ def test_point_grid_superset_is_exactly_refined_before_public_export(monkeypatch
             Point(5.5, 0.5),
             Point(7.5, 0.5),
             Point(20.0, 20.0),
-            None,
         ],
         dtype=object,
     )
@@ -478,9 +479,9 @@ def test_point_grid_superset_is_exactly_refined_before_public_export(monkeypatch
     flat_index = build_flat_spatial_index(
         tree_owned,
         runtime_selection=RuntimeSelection(
-            requested=ExecutionMode.CPU,
-            selected=ExecutionMode.CPU,
-            reason="test host-built point-grid exact-refinement carrier",
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="test Native-owned point-grid exact-refinement carrier",
         ),
     )
     query_owned = from_shapely_geometries(
@@ -489,7 +490,7 @@ def test_point_grid_superset_is_exactly_refined_before_public_export(monkeypatch
     )
     monkeypatch.setattr(point_grid_index, "_MIN_POINT_GRID_ROWS", 0)
     monkeypatch.setattr(point_location_index, "_MIN_PREPARED_COORDINATES", 0)
-    assert flat_index.device_bounds is None
+    assert flat_index.device_bounds is not None
 
     reset_d2h_transfer_count()
     result = query_spatial_index(
@@ -508,12 +509,19 @@ def test_point_grid_superset_is_exactly_refined_before_public_export(monkeypatch
     }
     actual = set(zip(result[0].tolist(), result[1].tolist(), strict=True))
     assert actual == expected
-    assert isinstance(flat_index.point_grid, point_grid_index.PreparedPointGridIndex)
-    assert flat_index.device_bounds is not None
+    # Relation-producing public APIs use the Native-owned grid only when the
+    # full pair-shaped output passes memory admission. Exact refinement above
+    # remains the source of GIS truth.
+    assert flat_index.point_grid is None
+    native_index = flat_index.to_native_spatial_index()
+    assert {
+        key.variant for key in native_index.point_partition_cache
+    } == {point_grid_index.PointPartitionVariant.GRID}
     assert set(query_owned.device_state.point_location_indexes) == {
         GeometryFamily.POLYGON,
         GeometryFamily.MULTIPOLYGON,
     }
+    assert "point-grid relation candidate allocation fence" in reasons
     assert not any("candidate" in reason and "host export" in reason for reason in reasons)
     assert "runtime.synchronize" not in inspect.getsource(
         point_grid_index.point_grid_superset_query
@@ -555,8 +563,150 @@ def test_point_grid_superset_is_not_used_for_bbox_only_queries(monkeypatch):
     assert flat_index.point_grid is None
 
 
+@requires_gpu
+def test_native_relation_grid_reuses_original_carrier_and_propagates_scatter_fault(
+    monkeypatch,
+) -> None:
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.spatial import point_grid_index, spatial_index_device
+
+    tree_owned = from_shapely_geometries(
+        np.asarray([Point(0.25, 0.25), Point(0.75, 0.75)], dtype=object),
+        residency=Residency.DEVICE,
+    )
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="native relation carrier ownership test",
+        ),
+    )
+    native_index = flat_index.to_native_spatial_index(source_token="tree-lineage")
+    query_owned = from_shapely_geometries(
+        np.asarray(
+            [Polygon([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)])],
+            dtype=object,
+        ),
+        residency=Residency.DEVICE,
+    )
+    monkeypatch.setattr(point_grid_index, "_MIN_POINT_GRID_ROWS", 0)
+    runtime = get_cuda_runtime()
+    original_admit = runtime.admit_device_memory
+    relation_admissions = []
+
+    def _record_relation_admission(*, stage, required_bytes, requested_units=0):
+        if stage == "spatial.point_grid_relation_complete":
+            relation_admissions.append((required_bytes, requested_units))
+        return original_admit(
+            stage=stage,
+            required_bytes=required_bytes,
+            requested_units=requested_units,
+        )
+
+    monkeypatch.setattr(runtime, "admit_device_memory", _record_relation_admission)
+    original_superset = point_grid_index.point_grid_superset_query
+
+    def _faulted_superset(*args, **kwargs):
+        candidates = original_superset(*args, **kwargs)
+        assert candidates is not None
+        return replace(candidates, error_flag=cp.ones(1, dtype=cp.uint32))
+
+    monkeypatch.setattr(point_grid_index, "point_grid_superset_query", _faulted_superset)
+
+    def _no_morton_retry(*_args, **_kwargs):
+        raise AssertionError("scatter faults must not retry Morton")
+
+    monkeypatch.setattr(
+        spatial_index_device,
+        "_prepare_morton_range_query",
+        _no_morton_retry,
+    )
+    with pytest.raises(RuntimeError, match="sealed capacity"):
+        native_index.query_relation(query_owned, predicate="contains")
+
+    assert flat_index._native_spatial_index is native_index
+    assert native_index.source_token == "tree-lineage"
+    assert len(native_index.point_partition_cache) == 1
+    assert len(relation_admissions) == 1
+    relation_bytes, relation_pairs = relation_admissions[0]
+    assert relation_pairs == 2
+    assert relation_bytes >= relation_pairs * 73
+
+
+@requires_gpu
+def test_native_relation_grid_complete_admission_decline_is_not_retried(
+    monkeypatch,
+) -> None:
+    from vibespatial.cuda._runtime import DeviceMemoryAdmission, get_cuda_runtime
+    from vibespatial.spatial import point_grid_index, spatial_index_device
+    from vibespatial.spatial.query_types import CandidateRelationCapacityError
+
+    tree_owned = from_shapely_geometries(
+        np.asarray([Point(0.25, 0.25), Point(0.75, 0.75)], dtype=object),
+        residency=Residency.DEVICE,
+    )
+    native_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="relation complete-admission no-retry test",
+        ),
+    ).to_native_spatial_index()
+    query_owned = from_shapely_geometries(
+        np.asarray(
+            [Polygon([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)])],
+            dtype=object,
+        ),
+        residency=Residency.DEVICE,
+    )
+    monkeypatch.setattr(point_grid_index, "_MIN_POINT_GRID_ROWS", 0)
+    runtime = get_cuda_runtime()
+    original_admit = runtime.admit_device_memory
+
+    def _decline_complete_relation(*, stage, required_bytes, requested_units=0):
+        if stage == "spatial.point_grid_relation_complete":
+            return DeviceMemoryAdmission(
+                stage=stage,
+                required_bytes=required_bytes,
+                remaining_bytes=0,
+                budget_bytes=0,
+                admitted=False,
+                requested_units=requested_units,
+                admitted_units=0,
+                bytes_per_unit=required_bytes,
+            )
+        return original_admit(
+            stage=stage,
+            required_bytes=required_bytes,
+            requested_units=requested_units,
+        )
+
+    monkeypatch.setattr(runtime, "admit_device_memory", _decline_complete_relation)
+
+    def _no_morton_retry(*_args, **_kwargs):
+        raise AssertionError("complete relation admission must not retry Morton")
+
+    monkeypatch.setattr(
+        spatial_index_device,
+        "_prepare_morton_range_query",
+        _no_morton_retry,
+    )
+    with pytest.raises(
+        CandidateRelationCapacityError,
+        match="refusing a post-submission Morton retry",
+    ):
+        native_index.query_relation(query_owned, predicate="contains")
+
+
 def test_point_grid_memory_estimate_covers_bounds_and_scales_with_cells() -> None:
-    from vibespatial.spatial.point_grid_index import _point_grid_required_bytes
+    from vibespatial.spatial.point_grid_index import (
+        _point_grid_required_bytes,
+        prepare_point_grid_index,
+    )
 
     with_bounds = _point_grid_required_bytes(
         100_000,
@@ -576,6 +726,612 @@ def test_point_grid_memory_estimate_covers_bounds_and_scales_with_cells() -> Non
         65_536,
         needs_device_bounds=True,
     ) > with_bounds
+    assert _point_grid_required_bytes(
+        100_000,
+        16_384,
+        needs_device_bounds=False,
+        query_count=8_192,
+        pair_budget=1_000_000,
+    ) > without_bounds
+    assert "bincount" not in inspect.getsource(prepare_point_grid_index)
+
+
+@requires_gpu
+def test_point_grid_preflight_declines_finite_overflowing_tree_extents(
+    monkeypatch,
+) -> None:
+    import cupy as cp
+
+    from vibespatial.spatial import point_grid_index
+    from vibespatial.spatial.indexing import FlatSpatialIndex
+
+    owned = from_shapely_geometries(
+        np.asarray(
+            [Point(-1.0e308, -1.0e308), Point(1.0e308, 1.0e308)],
+            dtype=object,
+        ),
+        residency=Residency.DEVICE,
+    )
+    flat_index = FlatSpatialIndex(
+        geometry_array=owned,
+        _host_order=None,
+        _host_morton_keys=None,
+        _host_bounds=None,
+        total_bounds=(-1.0e308, -1.0e308, 1.0e308, 1.0e308),
+        device_order=cp.arange(2, dtype=cp.int32),
+        device_morton_keys=cp.arange(2, dtype=cp.uint64),
+        device_bounds=cp.asarray(
+            [
+                [-1.0e308, -1.0e308, -1.0e308, -1.0e308],
+                [1.0e308, 1.0e308, 1.0e308, 1.0e308],
+            ],
+            dtype=cp.float64,
+        ),
+    )
+    native_index = flat_index.to_native_spatial_index()
+    monkeypatch.setattr(point_grid_index, "_MIN_POINT_GRID_ROWS", 0)
+
+    preflight, decline = point_grid_index.point_grid_preflight(
+        native_index,
+        query_count=1,
+        pair_budget=2,
+        force_eligible=True,
+    )
+
+    assert preflight is None
+    assert decline is not None
+    assert "finite positive x and y extents" in decline.reason
+    assert native_index.point_partition_cache == {}
+
+
+@requires_gpu
+def test_point_grid_clamps_extreme_finite_query_before_normalization(
+    monkeypatch,
+) -> None:
+    import cupy as cp
+
+    from vibespatial.spatial import point_grid_index
+    from vibespatial.spatial.indexing import FlatSpatialIndex
+
+    owned = from_shapely_geometries(
+        np.asarray(
+            [Point(-1.0e308, -1.0e308), Point(-9.0e307, -9.0e307)],
+            dtype=object,
+        ),
+        residency=Residency.DEVICE,
+    )
+    flat_index = FlatSpatialIndex(
+        geometry_array=owned,
+        _host_order=None,
+        _host_morton_keys=None,
+        _host_bounds=None,
+        total_bounds=(-1.0e308, -1.0e308, -9.0e307, -9.0e307),
+        device_order=cp.arange(2, dtype=cp.int32),
+        device_morton_keys=cp.arange(2, dtype=cp.uint64),
+        device_bounds=cp.asarray(
+            [
+                [-1.0e308, -1.0e308, -1.0e308, -1.0e308],
+                [-9.0e307, -9.0e307, -9.0e307, -9.0e307],
+            ],
+            dtype=cp.float64,
+        ),
+    )
+    native_index = flat_index.to_native_spatial_index()
+    monkeypatch.setattr(point_grid_index, "_MIN_POINT_GRID_ROWS", 0)
+    query_bounds = cp.asarray(
+        [[-1.0e308, -1.0e308, 1.0e308, 1.0e308]],
+        dtype=cp.float64,
+    )
+
+    plan, decline = point_grid_index.point_grid_query_row_partitions(
+        native_index,
+        query_bounds,
+        pair_budget=2,
+        force_eligible=True,
+    )
+
+    assert decline is None
+    assert plan is not None
+    assert cp.asnumpy(plan.query_counts).tolist() == [2]
+    candidates = point_grid_index.point_grid_superset_query(
+        native_index,
+        next(plan.slices()),
+    )
+    assert candidates is not None
+    candidates.validate_error_flag()
+    assert sorted(cp.asnumpy(candidates.d_right).tolist()) == [0, 1]
+
+
+@requires_gpu
+def test_automatic_point_partition_keeps_fully_admitted_grid(monkeypatch) -> None:
+    import cupy as cp
+
+    from vibespatial.spatial import point_grid_index
+    from vibespatial.spatial.point_partition import PointPartitionVariant
+    from vibespatial.spatial.spatial_index_device import (
+        _point_partition_reduction_plan,
+    )
+
+    tree_owned = from_shapely_geometries(
+        np.asarray([Point(0.0, 0.0), Point(1.0, 1.0)], dtype=object),
+        residency=Residency.DEVICE,
+    )
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="admitted point-grid selector test",
+        ),
+    )
+    native_index = flat_index.to_native_spatial_index()
+    monkeypatch.setattr(point_grid_index, "_MIN_POINT_GRID_ROWS", 0)
+
+    plan, decline = _point_partition_reduction_plan(
+        native_index,
+        cp.asarray([[-1.0, -1.0, 2.0, 2.0]], dtype=cp.float64),
+        predicate="contains",
+        query_family=GeometryFamily.POLYGON,
+        tree_family=GeometryFamily.POINT,
+        reduction="right_pair_count",
+        pair_budget=16,
+    )
+
+    assert decline is None
+    assert plan is not None
+    assert plan.variant is PointPartitionVariant.GRID
+    assert {
+        key.variant for key in native_index.point_partition_cache
+    } == {PointPartitionVariant.GRID}
+
+
+@requires_gpu
+def test_point_partition_admission_rejects_cache_eviction_growth(
+    monkeypatch,
+) -> None:
+    from vibespatial.spatial import point_grid_index
+    from vibespatial.spatial.point_partition import PointPartitionVariant
+    from vibespatial.spatial.spatial_index_device import (
+        _point_partition_preflight_selection,
+    )
+
+    tree_owned = from_shapely_geometries(
+        np.asarray([Point(0.0, 0.0), Point(1.0, 1.0)], dtype=object),
+        residency=Residency.DEVICE,
+    )
+    native_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="cache-eviction admission growth test",
+        ),
+    ).to_native_spatial_index()
+    from vibespatial.spatial.point_grid_index import prepare_point_grid_index
+
+    selected = PointPartitionVariant.GRID
+    monkeypatch.setattr(point_grid_index, "_MIN_POINT_GRID_ROWS", 0)
+
+    def prepare(admission=None):
+        return prepare_point_grid_index(
+            native_index,
+            query_count=1,
+            pair_budget=16,
+            force_eligible=True,
+            admission=admission,
+        )
+
+    prepared, decline = prepare()
+    assert decline is None and prepared is not None
+    selection, decline = _point_partition_preflight_selection(
+        native_index,
+        query_count=1,
+        pair_budget=16,
+        forced=selected,
+    )
+    assert decline is None and selection is not None
+    native_index.point_partition_cache.clear()
+
+    with pytest.raises(ValueError, match="admission token provenance mismatch"):
+        prepare(selection)
+
+
+@requires_gpu
+def test_point_partition_large_query_count_uses_bounded_block_packet() -> None:
+    import cupy as cp
+
+    from vibespatial.spatial.point_grid_index import (
+        point_grid_query_row_partitions,
+    )
+
+    tree_owned = from_shapely_geometries(
+        np.asarray([Point(0.0, 0.0), Point(1.0, 1.0)], dtype=object),
+        residency=Residency.DEVICE,
+    )
+    native_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="large point-partition query-count test",
+        ),
+    ).to_native_spatial_index()
+    query_bounds = cp.tile(
+        cp.asarray([[2.0, 2.0, 3.0, 3.0]], dtype=cp.float64),
+        (9_000, 1),
+    )
+
+    plan, decline = point_grid_query_row_partitions(
+        native_index,
+        query_bounds,
+        pair_budget=16,
+        force_eligible=True,
+    )
+
+    assert decline is None
+    assert plan is not None
+    assert plan.query_counts.shape == (9_000,)
+    assert sum(stop - start for start, stop, _capacity in plan.partitions) == 9_000
+
+
+@pytest.mark.parametrize(
+    ("predicate", "query_family", "tree_family", "reduction"),
+    [
+        (None, GeometryFamily.POLYGON, GeometryFamily.POINT, "right_count"),
+        ("disjoint", GeometryFamily.POLYGON, GeometryFamily.POINT, "right_count"),
+        ("dwithin", GeometryFamily.POLYGON, GeometryFamily.POINT, "right_count"),
+        ("within", GeometryFamily.POLYGON, GeometryFamily.POINT, "right_count"),
+        ("contains", GeometryFamily.LINESTRING, GeometryFamily.POINT, "right_count"),
+        ("contains", GeometryFamily.POLYGON, GeometryFamily.MULTIPOINT, "right_count"),
+        ("contains", GeometryFamily.POLYGON, GeometryFamily.POINT, "right_exists"),
+    ],
+)
+def test_point_partition_selector_declines_every_out_of_scope_shape(
+    predicate,
+    query_family,
+    tree_family,
+    reduction,
+) -> None:
+    from vibespatial.spatial.spatial_index_device import (
+        _point_partition_reduction_plan,
+    )
+
+    plan, decline = _point_partition_reduction_plan(
+        object(),
+        np.empty((0, 4), dtype=np.float64),
+        predicate=predicate,
+        query_family=query_family,
+        tree_family=tree_family,
+        reduction=reduction,
+        pair_budget=16,
+    )
+
+    assert plan is None
+    assert decline is None
+
+
+@requires_gpu
+def test_point_partition_query_slice_seal_rejects_modified_provenance() -> None:
+    import cupy as cp
+
+    from vibespatial.spatial.point_partition import (
+        PointPartitionVariant,
+        query_plan,
+    )
+
+    owner = object()
+    prepared = SimpleNamespace(cache_key=object())
+    plan = query_plan(
+        owner=owner,
+        variant=PointPartitionVariant.GRID,
+        prepared=prepared,
+        query_bounds=cp.zeros((1, 4), dtype=cp.float64),
+        query_counts=cp.ones(1, dtype=cp.int64),
+        partitions=((0, 1, 1),),
+        pair_budget=1,
+    )
+    plan.slices().__next__().validate(owner, PointPartitionVariant.GRID, prepared)
+
+    modified = replace(plan, partitions=((0, 1, 0),))
+    with pytest.raises(ValueError, match="provenance was modified"):
+        modified.slices().__next__().validate(
+            owner,
+            PointPartitionVariant.GRID,
+            prepared,
+        )
+
+
+@requires_gpu
+def test_point_partition_exclusion_rejects_modified_plan(
+    monkeypatch,
+) -> None:
+    import cupy as cp
+
+    from vibespatial.spatial.point_partition import PointPartitionVariant, query_plan
+
+    selected = PointPartitionVariant.GRID
+    tree_owned = from_shapely_geometries(
+        np.asarray([Point(0.0, 0.0), Point(1.0, 1.0)], dtype=object),
+        residency=Residency.DEVICE,
+    )
+    native_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="point-partition exclusion seal test",
+        ),
+    ).to_native_spatial_index()
+    from vibespatial.spatial import point_grid_index as provider_module
+    from vibespatial.spatial.point_grid_index import (
+        point_grid_candidate_not_in_other_superset as exclude,
+    )
+    from vibespatial.spatial.point_grid_index import prepare_point_grid_index
+
+    prepared, decline = prepare_point_grid_index(
+        native_index,
+        query_count=1,
+        pair_budget=2,
+        force_eligible=True,
+    )
+    assert decline is None
+    plan = query_plan(
+        owner=native_index,
+        variant=selected,
+        prepared=prepared,
+        query_bounds=cp.asarray([[-1.0, -1.0, 2.0, 2.0]], dtype=cp.float64),
+        query_counts=cp.asarray([2], dtype=cp.int64),
+        partitions=((0, 1, 2),),
+        pair_budget=2,
+    )
+    def _unexpected_reprepare(*_args, **_kwargs):
+        raise AssertionError("sealed exclusion plans must reuse prepared state")
+
+    monkeypatch.setattr(
+        provider_module,
+        "prepare_point_grid_index",
+        _unexpected_reprepare,
+    )
+    valid = exclude(
+        native_index,
+        plan,
+        cp.asarray([0], dtype=cp.int32),
+        cp.asarray([0], dtype=cp.int32),
+    )
+    assert valid is not None
+    modified = replace(plan, query_counts=plan.query_counts.copy())
+    with pytest.raises(ValueError, match="provenance was modified"):
+        exclude(
+            native_index,
+            modified,
+            cp.asarray([0], dtype=cp.int32),
+            cp.asarray([0], dtype=cp.int32),
+        )
+
+
+@requires_gpu
+def test_paired_provider_decline_happens_before_either_provider_submits(
+    monkeypatch,
+) -> None:
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.spatial import point_grid_index
+    from vibespatial.spatial.point_partition import (
+        PointPartitionDecline,
+        PointPartitionVariant,
+    )
+    from vibespatial.spatial.spatial_index_device import (
+        _paired_point_partition_preflight_selections,
+    )
+
+    def _native(points, reason):
+        owned = from_shapely_geometries(
+            np.asarray(points, dtype=object),
+            residency=Residency.DEVICE,
+        )
+        return build_flat_spatial_index(
+            owned,
+            runtime_selection=RuntimeSelection(
+                requested=ExecutionMode.GPU,
+                selected=ExecutionMode.GPU,
+                reason=reason,
+            ),
+        ).to_native_spatial_index()
+
+    left = _native([Point(0.0, 0.0), Point(1.0, 1.0)], "paired-left")
+    right = _native([Point(0.0, 1.0), Point(1.0, 0.0)], "paired-right")
+    monkeypatch.setattr(point_grid_index, "_MIN_POINT_GRID_ROWS", 0)
+    original_preflight = point_grid_index.point_grid_preflight
+
+    def _decline_aligned(native_index, **kwargs):
+        if native_index is right:
+            return None, PointPartitionDecline(
+                PointPartitionVariant.GRID,
+                "injected aligned structural decline",
+            )
+        return original_preflight(native_index, **kwargs)
+
+    monkeypatch.setattr(point_grid_index, "point_grid_preflight", _decline_aligned)
+    runtime = get_cuda_runtime()
+    original_launch = runtime.launch
+    provider_launches = 0
+
+    def _count_provider_launches(kernel, **kwargs):
+        nonlocal provider_launches
+        if kernel.name.startswith("point_grid"):
+            provider_launches += 1
+        return original_launch(kernel, **kwargs)
+
+    monkeypatch.setattr(runtime, "launch", _count_provider_launches)
+    left_selection, right_selection, decline = (
+        _paired_point_partition_preflight_selections(
+            left,
+            right,
+            query_count=1,
+            pair_budget=16,
+            forced=None,
+        )
+    )
+    assert left_selection is None and right_selection is None
+    assert decline is not None
+    assert provider_launches == 0
+    cp.cuda.get_current_stream().synchronize()
+
+
+def test_same_owner_grid_cache_miss_serializes_concurrent_builders(monkeypatch) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import RLock
+    from time import sleep
+
+    from vibespatial.spatial import point_grid_index
+
+    native_index = SimpleNamespace(point_partition_lock=RLock())
+    active_builders = 0
+    maximum_active_builders = 0
+
+    def _record_locked_build(*_args, **_kwargs):
+        nonlocal active_builders, maximum_active_builders
+        active_builders += 1
+        maximum_active_builders = max(maximum_active_builders, active_builders)
+        sleep(0.01)
+        active_builders -= 1
+        return object(), None
+
+    monkeypatch.setattr(
+        point_grid_index,
+        "_prepare_point_grid_index_locked",
+        _record_locked_build,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(
+            executor.map(
+                lambda _ordinal: point_grid_index.prepare_point_grid_index(
+                    native_index,
+                    query_count=1,
+                    pair_budget=1,
+                    force_eligible=True,
+                ),
+                range(2),
+            )
+        )
+    assert len(results) == 2
+    assert maximum_active_builders == 1
+
+
+@requires_gpu
+def test_point_partition_scatter_capacity_guard_sets_device_fault(
+    monkeypatch,
+) -> None:
+    import cupy as cp
+
+    from vibespatial.spatial.point_partition import (
+        PointPartitionVariant,
+        query_plan,
+    )
+
+    tree_owned = from_shapely_geometries(
+        np.asarray([Point(0.0, 0.0), Point(1.0, 1.0)], dtype=object),
+        residency=Residency.DEVICE,
+    )
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="point-partition capacity-guard test",
+        ),
+    )
+    native_index = flat_index.to_native_spatial_index()
+    bounds = cp.asarray([[-1.0, -1.0, 2.0, 2.0]], dtype=cp.float64)
+    counts = cp.asarray([2], dtype=cp.int64)
+    selected = PointPartitionVariant.GRID
+    from vibespatial.spatial import point_grid_index as provider_module
+    from vibespatial.spatial.point_grid_index import (
+        point_grid_superset_query as superset_query,
+    )
+    from vibespatial.spatial.point_grid_index import prepare_point_grid_index
+
+    prepared, decline = prepare_point_grid_index(
+        native_index,
+        query_count=1,
+        pair_budget=1,
+        force_eligible=True,
+    )
+    assert decline is None
+    plan = query_plan(
+        owner=native_index,
+        variant=selected,
+        prepared=prepared,
+        query_bounds=bounds,
+        query_counts=counts,
+        partitions=((0, 1, 1),),
+        pair_budget=1,
+    )
+
+    def _unexpected_reprepare(*_args, **_kwargs):
+        raise AssertionError("a sealed query slice must reuse its prepared owner")
+
+    monkeypatch.setattr(
+        provider_module,
+        "prepare_point_grid_index",
+        _unexpected_reprepare,
+    )
+
+    candidates = superset_query(native_index, next(plan.slices()))
+
+    assert candidates is not None
+    assert candidates.total_pairs == 1
+    assert int(cp.asnumpy(candidates.error_flag)[0]) == 1
+
+
+@requires_gpu
+def test_point_partition_post_submission_fault_is_not_retried(monkeypatch) -> None:
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.spatial.point_grid_index import (
+        point_grid_query_row_partitions,
+        point_grid_superset_query,
+    )
+
+    tree_owned = from_shapely_geometries(
+        np.asarray([Point(0.0, 0.0), Point(1.0, 1.0)], dtype=object),
+        residency=Residency.DEVICE,
+    )
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="point-partition post-submission fault test",
+        ),
+    )
+    native_index = flat_index.to_native_spatial_index()
+    plan, decline = point_grid_query_row_partitions(
+        native_index,
+        cp.asarray([[-1.0, -1.0, 2.0, 2.0]], dtype=cp.float64),
+        pair_budget=16,
+        force_eligible=True,
+    )
+    assert decline is None
+    assert plan is not None
+    runtime = get_cuda_runtime()
+    original_launch = runtime.launch
+    scatter_submissions = 0
+
+    def fail_after_scatter_submission(kernel, **kwargs):
+        nonlocal scatter_submissions
+        original_launch(kernel, **kwargs)
+        if kernel.name == "point_grid_query_scatter":
+            scatter_submissions += 1
+            raise RuntimeError("injected post-submission point-grid fault")
+
+    monkeypatch.setattr(runtime, "launch", fail_after_scatter_submission)
+
+    with pytest.raises(RuntimeError, match="post-submission point-grid fault"):
+        point_grid_superset_query(native_index, next(plan.slices()))
+    assert scatter_submissions == 1
 
 
 @requires_gpu

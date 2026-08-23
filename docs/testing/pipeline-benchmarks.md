@@ -5,7 +5,7 @@ Scope: End-to-end pipeline benchmark suites, regression thresholds, and CI artif
 Read If: You are changing pipeline benchmarks, regression gates, or CPU/GPU movement profiling in CI.
 STOP IF: You already have the benchmark scripts open and only need a local implementation detail.
 Source Of Truth: Phase-1 pipeline benchmark and regression-gate workflow for end-to-end performance tracking.
-Body Budget: 201/220 lines
+Body Budget: 214/220 lines
 Document: docs/testing/pipeline-benchmarks.md
 
 Section Map (Body Lines)
@@ -17,12 +17,12 @@ Section Map (Body Lines)
 | 30-44 | Open First |
 | 45-54 | Verify |
 | 55-63 | Risks |
-| 64-100 | Entry Points |
-| 101-115 | Pipelines |
-| 116-133 | Suites |
-| 134-142 | Regression Rules |
-| 143-182 | Trace Contract |
-| 183-201 | CI Workflow |
+| 64-113 | Entry Points |
+| 114-128 | Pipelines |
+| 129-146 | Suites |
+| 147-155 | Regression Rules |
+| 156-195 | Trace Contract |
+| 196-214 | CI Workflow |
 DOC_HEADER:END -->
 
 This repo now has a dedicated end-to-end pipeline benchmark rail for regression
@@ -104,6 +104,19 @@ Compare a current run against a baseline artifact:
 ```bash
 uv run vsbench compare baseline.json current.json
 ```
+
+For public shootouts, reuse a static GeoPandas leg while rerunning the current
+vibeSpatial source:
+
+```bash
+uv run vsbench shootout benchmarks/shootout --scale 10k --repeat 3 \
+  --reuse-geopandas baseline.json --json --output current.json
+```
+
+Reuse is fail-closed. The artifact must carry the current workload-tree and
+measurement-contract hashes, scale, repeat/warmup/timeout settings, host
+identity, GeoPandas/Python package identity, and correctness fingerprint.
+Refresh the GeoPandas baseline only when one of those inputs changes.
 
 Discover operation-specific arguments before running a benchmark:
 

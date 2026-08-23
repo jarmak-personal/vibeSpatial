@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from threading import Lock
 from time import perf_counter
 
 import numpy as np
@@ -544,6 +545,16 @@ class FlatSpatialIndex:
     device_order: object = None  # CuPy device array or None
     device_bounds: object = None  # CuPy device array or None
     point_grid: object = None  # PreparedPointGridIndex or None
+    _native_spatial_index: object = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )  # sole prepared point-partition owner
+    _native_spatial_index_lock: object = field(
+        default_factory=Lock,
+        repr=False,
+        compare=False,
+    )
 
     @property
     def bounds(self) -> np.ndarray:
@@ -618,10 +629,19 @@ class FlatSpatialIndex:
         """Wrap this index as reusable private native execution state."""
         from vibespatial.api._native_metadata import NativeSpatialIndex
 
-        return NativeSpatialIndex.from_flat_index(
-            self,
-            source_token=source_token,
-        )
+        cached = self._native_spatial_index
+        if cached is not None and cached.source_token == source_token:
+            return cached
+        with self._native_spatial_index_lock:
+            cached = self._native_spatial_index
+            if cached is not None and cached.source_token == source_token:
+                return cached
+            native_index = NativeSpatialIndex.from_flat_index(
+                self,
+                source_token=source_token,
+            )
+            object.__setattr__(self, "_native_spatial_index", native_index)
+            return native_index
 
     def query_bounds(
         self,

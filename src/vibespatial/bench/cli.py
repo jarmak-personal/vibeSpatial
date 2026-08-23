@@ -146,6 +146,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Python interpreter with real geopandas (skips uv isolation)",
     )
     p_shootout.add_argument(
+        "--reuse-geopandas",
+        type=Path,
+        default=None,
+        help=(
+            "Reuse the GeoPandas leg from a prior JSON shootout artifact after "
+            "validating workload/measurement identity, environment, host, and "
+            "correctness fingerprint"
+        ),
+    )
+    p_shootout.add_argument(
         "--with",
         action="append",
         dest="extra_deps",
@@ -612,7 +622,17 @@ def _cmd_shootout(args: argparse.Namespace) -> int:
     import orjson
 
     from .output import render_shootout
-    from .shootout import run_shootout
+    from .shootout import load_reusable_geopandas_baseline, run_shootout
+
+    if args.reuse_geopandas is not None and (
+        args.baseline_python is not None or args.extra_deps
+    ):
+        print(
+            "Error: --reuse-geopandas cannot be combined with "
+            "--baseline-python or --with",
+            file=sys.stderr,
+        )
+        return 2
 
     target = args.script.resolve()
 
@@ -633,6 +653,20 @@ def _cmd_shootout(args: argparse.Namespace) -> int:
     results = []
 
     for script in scripts:
+        geopandas_baseline = None
+        if args.reuse_geopandas is not None:
+            try:
+                geopandas_baseline = load_reusable_geopandas_baseline(
+                    args.reuse_geopandas,
+                    script=script,
+                    scale=args.scale,
+                    repeat=args.repeat,
+                    warmup=not args.no_warmup,
+                    timeout=args.timeout,
+                )
+            except (OSError, ValueError, orjson.JSONDecodeError) as exc:
+                print(f"Error: cannot reuse GeoPandas baseline: {exc}", file=sys.stderr)
+                return 2
         result = run_shootout(
             script,
             repeat=args.repeat,
@@ -643,6 +677,12 @@ def _cmd_shootout(args: argparse.Namespace) -> int:
             quiet=args.quiet,
             scale=args.scale,
             profile=args.json_output,
+            geopandas_baseline=geopandas_baseline,
+            geopandas_baseline_source=(
+                str(args.reuse_geopandas.resolve())
+                if args.reuse_geopandas is not None
+                else None
+            ),
         )
         results.append(result)
         if result.status != "pass":
@@ -661,6 +701,9 @@ def _cmd_shootout(args: argparse.Namespace) -> int:
                     "script_count": len(results),
                     "passed": len(results) - all_failed,
                     "failed": all_failed,
+                    "geopandas_baseline": (
+                        "reused" if args.reuse_geopandas is not None else "measured"
+                    ),
                 },
                 "results": [result.to_dict() for result in results],
             },

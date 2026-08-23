@@ -21,7 +21,7 @@ ADR-0033 tier classification:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -68,6 +68,7 @@ from .query_types import (
     _DeviceCandidates,
     available_device_memory_bytes,
     require_device_candidate_pair_capacity,
+    validate_device_candidate_error_flags,
 )
 
 # Eagerly request CCCL spec warmup at module import (ADR-0034 Level 1).
@@ -229,6 +230,7 @@ def spatial_index_device_query(
     flat_index,
     query_bounds,
     *,
+    native_index=None,
     distance: np.ndarray | object | None = None,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
     allow_bbox_superset: bool = False,
@@ -256,6 +258,10 @@ def spatial_index_device_query(
         runs and finds no pairs, ``candidates`` is an empty device-resident
         result. ``execution`` carries the dispatch decision metadata.
     """
+    if native_index is not None:
+        from vibespatial.spatial.point_partition import wait_for_point_partition
+
+        wait_for_point_partition(native_index.readiness)
     query_count = int(query_bounds.shape[0])
     tree_count = flat_index.size
 
@@ -311,18 +317,27 @@ def spatial_index_device_query(
     if distance is not None:
         effective_bounds = _expand_bounds_for_distance(query_bounds, distance)
 
-    if allow_bbox_superset:
-        from .point_grid_index import point_grid_superset_query
+    if allow_bbox_superset and distance is None:
+        from .point_grid_index import point_grid_relation_superset_query
 
-        result = point_grid_superset_query(flat_index, effective_bounds)
+        if native_index is None:
+            native_index = getattr(flat_index, "_native_spatial_index", None)
+            if native_index is None:
+                native_index = flat_index.to_native_spatial_index()
+        elif native_index.to_flat_index() is not flat_index:
+            raise ValueError("native spatial index does not own the supplied flat view")
+        result, _decline = point_grid_relation_superset_query(
+            native_index,
+            effective_bounds,
+        )
         if result is not None:
             return result, SpatialQueryExecution(
                 requested=ExecutionMode.AUTO,
                 selected=ExecutionMode.GPU,
-                implementation="owned_gpu_spatial_query",
+                implementation="owned_gpu_spatial_query_grid",
                 reason=(
-                    "cached point-grid cell superset for immediate exact "
-                    f"predicate refinement: N={query_count}, M={tree_count}"
+                    "NativeSpatialIndex-owned dense point grid produced an "
+                    "admitted full relation candidate superset for exact refinement"
                 ),
             )
 
@@ -1205,8 +1220,241 @@ def _morton_reduction_span_schedule(d_starts, d_ends):
     return d_query_order, np.asarray(bucket_counts, dtype=np.int64)
 
 
-def _spatial_index_device_point_grid_right_reduction(
-    flat_index,
+_POINT_PARTITION_PREDICATES = frozenset(
+    {"intersects", "contains", "covers", "contains_properly", "touches"}
+)
+
+
+def _admit_point_partition_preflights(preflights, *, stage: str):
+    from vibespatial.spatial.point_partition import checked_sum
+
+    required = checked_sum(
+        *(preflight.required_bytes for preflight in preflights),
+        name=f"{stage} bytes",
+    )
+    admission = get_cuda_runtime().admit_device_memory(
+        stage=stage,
+        required_bytes=required,
+        requested_units=len(preflights),
+    )
+    return admission
+
+
+def _point_partition_preflight_selection(
+    native_index,
+    *,
+    query_count: int,
+    pair_budget: int,
+    forced,
+):
+    """Admit the dense-grid provider before any point-partition submission."""
+    from vibespatial.spatial.point_grid_index import point_grid_preflight
+    from vibespatial.spatial.point_partition import (
+        PointPartitionDecline,
+        PointPartitionVariant,
+    )
+
+    if forced is PointPartitionVariant.MORTON:
+        return None, None
+
+    grid, grid_decline = point_grid_preflight(
+        native_index,
+        query_count=query_count,
+        pair_budget=pair_budget,
+        force_eligible=forced is PointPartitionVariant.GRID,
+    )
+    if grid is None:
+        return None, grid_decline
+    grid_admission = _admit_point_partition_preflights(
+        (grid,), stage="spatial.point_partition_grid_selection"
+    )
+    if grid_admission.admitted:
+        reason = (
+            "privately forced dense grid"
+            if forced is PointPartitionVariant.GRID
+            else "dense grid passed complete-memory preflight"
+        )
+        return replace(grid, reason=reason, admitted=True), None
+    if forced is PointPartitionVariant.GRID:
+        return None, PointPartitionDecline(
+            PointPartitionVariant.GRID,
+            "forced dense grid complete-memory preflight declined",
+            memory_decline=True,
+        )
+    return None, PointPartitionDecline(
+        PointPartitionVariant.GRID,
+        "dense grid complete-memory preflight declined; use Morton baseline",
+        memory_decline=True,
+    )
+
+
+def _paired_point_partition_preflight_selections(
+    native_index,
+    aligned_native_index,
+    *,
+    query_count: int,
+    pair_budget: int,
+    forced,
+):
+    """Jointly admit paired dense grids before either provider submits."""
+    from vibespatial.spatial.point_grid_index import point_grid_preflight
+    from vibespatial.spatial.point_partition import (
+        PointPartitionDecline,
+        PointPartitionVariant,
+    )
+
+    if forced is PointPartitionVariant.MORTON:
+        return None, None, None
+    variant = PointPartitionVariant.GRID
+    kwargs = {
+        "query_count": query_count,
+        "pair_budget": pair_budget,
+        "force_eligible": forced is PointPartitionVariant.GRID,
+    }
+    left, left_decline = point_grid_preflight(native_index, **kwargs)
+    right, right_decline = point_grid_preflight(aligned_native_index, **kwargs)
+    if left is None or right is None:
+        return None, None, left_decline or right_decline
+    admission = _admit_point_partition_preflights(
+        (left, right), stage=f"spatial.paired_point_partition_{variant.value}_selection"
+    )
+    if admission.admitted:
+        reason = (
+            f"privately forced paired {variant.value} providers"
+            if forced is not None
+            else "paired dense grids passed joint complete-memory preflight"
+        )
+        return (
+            replace(left, reason=reason, admitted=True),
+            replace(right, reason=reason, admitted=True),
+            None,
+        )
+    if forced is not None:
+        return None, None, PointPartitionDecline(
+            variant,
+            f"forced paired {variant.value} complete-memory preflight declined",
+            memory_decline=True,
+        )
+    return None, None, PointPartitionDecline(
+        PointPartitionVariant.GRID,
+        "paired dense grids declined joint complete-memory preflight; use Morton baseline",
+        memory_decline=True,
+    )
+
+
+def _point_partition_reduction_plan(
+    native_index,
+    query_bounds,
+    *,
+    predicate: str | None,
+    query_family: GeometryFamily,
+    tree_family: GeometryFamily,
+    reduction: str,
+    pair_budget: int,
+    selection=None,
+):
+    """Plan the admitted dense grid, otherwise leave execution to Morton."""
+    from vibespatial.spatial.point_partition import (
+        PointPartitionVariant,
+        forced_point_partition_variant_for_testing,
+    )
+
+    forced = forced_point_partition_variant_for_testing()
+    admitted = _point_partition_reduction_admitted(
+        predicate=predicate,
+        query_family=query_family,
+        tree_family=tree_family,
+        reduction=reduction,
+    )
+    if not admitted or forced is PointPartitionVariant.MORTON:
+        return None, None
+    query_finite = cp.isfinite(cp.asarray(query_bounds, dtype=cp.float64)).all().reshape(1)
+    if not bool(
+        get_cuda_runtime().copy_device_to_host(
+            query_finite,
+            reason="point-partition query finite-bounds preflight planning packet",
+        )[0]
+    ):
+        from vibespatial.spatial.point_partition import PointPartitionDecline
+
+        return None, PointPartitionDecline(
+            PointPartitionVariant.GRID,
+            "point-partition providers decline null, empty, or nonfinite query bounds",
+        )
+    if selection is None:
+        selection, decline = _point_partition_preflight_selection(
+            native_index,
+            query_count=int(query_bounds.shape[0]),
+            pair_budget=pair_budget,
+            forced=forced,
+        )
+        if selection is None:
+            return None, decline
+
+    from vibespatial.spatial.point_grid_index import point_grid_query_row_partitions
+
+    plan, decline = point_grid_query_row_partitions(
+        native_index,
+        query_bounds,
+        pair_budget=pair_budget,
+        force_eligible=True,
+        admission=selection,
+    )
+    if plan is None:
+        return None, decline
+    return replace(plan, selection_reason=selection.reason), None
+
+
+def _point_partition_reduction_admitted(
+    *,
+    predicate: str | None,
+    query_family: GeometryFamily,
+    tree_family: GeometryFamily,
+    reduction: str,
+) -> bool:
+    """Return structural eligibility without reading or submitting device work."""
+    return (
+        reduction in {"right_count", "right_pair_count"}
+        and predicate in _POINT_PARTITION_PREDICATES
+        and query_family in {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
+        and tree_family is GeometryFamily.POINT
+    )
+
+
+def _point_partition_superset_query(native_index, query_slice):
+    from vibespatial.spatial.point_partition import PointPartitionVariant
+
+    if query_slice.plan.variant is PointPartitionVariant.GRID:
+        from vibespatial.spatial.point_grid_index import point_grid_superset_query
+
+        return point_grid_superset_query(native_index, query_slice)
+    raise ValueError("Morton does not use a point-partition query token")
+
+
+def _point_partition_candidate_not_in_prior_superset(
+    native_index,
+    prior_plan,
+    candidate_query_rows,
+    candidate_tree_rows,
+):
+    from vibespatial.spatial.point_partition import PointPartitionVariant
+
+    if prior_plan.variant is PointPartitionVariant.GRID:
+        from vibespatial.spatial.point_grid_index import (
+            point_grid_candidate_not_in_other_superset,
+        )
+
+        return point_grid_candidate_not_in_other_superset(
+            native_index,
+            prior_plan,
+            candidate_query_rows,
+            candidate_tree_rows,
+        )
+    raise ValueError("Morton does not use point-partition superset exclusion")
+
+
+def _spatial_index_device_point_partition_right_reduction(
+    native_index,
     query_owned,
     tree_owned,
     query_bounds,
@@ -1216,16 +1464,17 @@ def _spatial_index_device_point_grid_right_reduction(
     tree_family: GeometryFamily,
     precision_plan: PrecisionPlan | None,
     pair_budget: int,
+    reduction: str = "right_count",
+    plan=None,
     initial_counts=None,
-    exclude_flat_index=None,
-    exclude_query_counts=None,
+    exclude_native_index=None,
+    exclude_plan=None,
 ):
-    """Reduce bounded point-grid candidate batches into indexed-row counts.
+    """Reduce bounded point-partition candidates into indexed-row counts.
 
-    When ``exclude_flat_index`` is present, candidate pairs already visited by
-    that aligned point grid are removed on device before exact classification.
-    This lets a paired reduction reuse prior exact results without assuming
-    that its two aligned point columns have identical candidate supersets.
+    When ``exclude_plan`` is present, pairs in that aligned provider's prior
+    superset are removed before exact classification. This implements the
+    formal second-pass ``C_right \\ C_left`` relation for paired counts.
     """
     if predicate is None:
         return None
@@ -1233,23 +1482,22 @@ def _spatial_index_device_point_grid_right_reduction(
     from vibespatial.predicates.point_location_index import (
         prepare_point_region_y_indexes,
     )
+    from vibespatial.spatial.point_partition import retain_point_partition_completion
 
     prepare_point_region_y_indexes(query_owned, tree_owned)
 
-    from vibespatial.spatial.point_grid_index import (
-        point_grid_candidate_not_in_other_superset,
-        point_grid_query_row_partitions,
-        point_grid_superset_query,
-    )
-
-    plan = point_grid_query_row_partitions(
-        flat_index,
-        query_bounds,
-        pair_budget=pair_budget,
-    )
+    if plan is None:
+        plan, _decline = _point_partition_reduction_plan(
+            native_index,
+            query_bounds,
+            predicate=predicate,
+            query_family=query_family,
+            tree_family=tree_family,
+            reduction=reduction,
+            pair_budget=pair_budget,
+        )
     if plan is None:
         return None
-    partitions, query_counts = plan
 
     import cupy as cp
 
@@ -1260,15 +1508,16 @@ def _spatial_index_device_point_grid_right_reduction(
         counts = cp.asarray(initial_counts, dtype=cp.uint64)
         if counts.ndim != 1 or int(counts.size) != tree_count:
             raise ValueError("initial point-grid counts must match indexed rows")
-    if (exclude_flat_index is None) != (exclude_query_counts is None):
+    if (exclude_native_index is None) != (exclude_plan is None):
         raise ValueError(
-            "point-grid exclusion requires both an aligned index and query counts"
+            "point-partition exclusion requires both an index and prior plan"
         )
+    scatter_error_flags = []
 
     def _classify_tile(d_left, d_right):
         launch_capacity = int(d_left.size)
-        if exclude_flat_index is None:
-            return _classify_homogeneous_reduction_tile(
+        if exclude_native_index is None:
+            d_keep = _classify_homogeneous_reduction_tile(
                 predicate,
                 query_owned,
                 tree_owned,
@@ -1277,18 +1526,17 @@ def _spatial_index_device_point_grid_right_reduction(
                 query_family=query_family,
                 tree_family=tree_family,
                 precision_plan=precision_plan,
-            ), d_left, d_right
+            )
+            return d_keep, d_left, d_right, ()
 
-        d_unseen = point_grid_candidate_not_in_other_superset(
-            exclude_flat_index,
-            query_bounds,
-            exclude_query_counts,
+        d_unseen = _point_partition_candidate_not_in_prior_superset(
+            exclude_native_index,
+            exclude_plan,
             d_left,
             d_right,
-            pair_budget=pair_budget,
         )
         if d_unseen is None:
-            return None, d_left, d_right
+            return None, d_left, d_right, ()
         from vibespatial.api._native_rowset import NativeDeviceSelection
 
         selection = NativeDeviceSelection.from_mask(d_unseen)
@@ -1313,12 +1561,24 @@ def _spatial_index_device_point_grid_right_reduction(
             d_exact_out=d_exact_out,
             d_relation_scratch=d_relation_scratch,
         )
-        return d_keep, d_selected_left, d_selected_right
+        return (
+            d_keep,
+            d_selected_left,
+            d_selected_right,
+            (
+                d_unseen,
+                selection,
+                d_positions,
+                d_exact_out,
+                d_relation_scratch,
+                d_source_offset,
+            ),
+        )
 
-    for query_start, query_stop, pair_capacity in partitions:
-        if pair_capacity > pair_budget:
-            if query_stop != query_start + 1:
-                raise ValueError("oversized point-grid partitions must contain one row")
+    for query_slice in plan.slices():
+        query_start = query_slice.query_start
+        pair_capacity = query_slice.capacity
+        if query_slice.oversized:
             for tree_start in range(0, tree_count, pair_budget):
                 tree_stop = min(tree_count, tree_start + pair_budget)
                 d_right = cp.arange(tree_start, tree_stop, dtype=cp.int32)
@@ -1327,10 +1587,15 @@ def _spatial_index_device_point_grid_right_reduction(
                     query_start,
                     dtype=cp.int32,
                 )
-                d_keep, d_left, d_right = _classify_tile(d_left, d_right)
+                d_keep, d_left, d_right, classification_owners = _classify_tile(
+                    d_left, d_right
+                )
                 if d_keep is None:
-                    return None
-                if exclude_flat_index is None:
+                    raise RuntimeError(
+                        "point-partition exact classification declined after "
+                        "provider planning; refusing a Morton retry"
+                    )
+                if exclude_native_index is None:
                     counts[tree_start:tree_stop] += cp.asarray(
                         d_keep,
                         dtype=cp.uint64,
@@ -1341,35 +1606,84 @@ def _spatial_index_device_point_grid_right_reduction(
                         d_right,
                         cp.asarray(d_keep, dtype=cp.uint64),
                     )
+                retain_point_partition_completion(
+                    native_index,
+                    exclude_native_index,
+                    plan,
+                    exclude_plan,
+                    query_owned,
+                    tree_owned,
+                    query_bounds,
+                    counts,
+                    d_keep,
+                    d_left,
+                    d_right,
+                    *classification_owners,
+                )
                 del d_keep, d_left, d_right
             continue
         if pair_capacity == 0:
             continue
-        candidates = point_grid_superset_query(
-            flat_index,
-            query_bounds[query_start:query_stop],
-            precomputed_query_counts=query_counts[query_start:query_stop],
-            pair_capacity=pair_capacity,
-        )
+        candidates = _point_partition_superset_query(native_index, query_slice)
         if candidates is None:
-            return None
+            raise RuntimeError(
+                "point-partition candidate scatter declined after provider "
+                "planning; refusing a Morton retry"
+            )
+        scatter_error_flags.append(candidates.error_flag)
         d_left = cp.asarray(candidates.d_left, dtype=cp.int32) + cp.int32(
             query_start
         )
         d_right = cp.asarray(candidates.d_right, dtype=cp.int32)
-        d_keep, d_left, d_right = _classify_tile(d_left, d_right)
+        d_keep, d_left, d_right, classification_owners = _classify_tile(
+            d_left, d_right
+        )
         if d_keep is None:
-            return None
+            raise RuntimeError(
+                "point-partition exact classification declined after provider "
+                "planning; refusing a Morton retry"
+            )
         d_keep = cp.asarray(d_keep, dtype=cp.bool_)
         cp.add.at(counts, d_right, d_keep.astype(cp.uint64, copy=False))
+        retain_point_partition_completion(
+            native_index,
+            exclude_native_index,
+            plan,
+            exclude_plan,
+            query_owned,
+            tree_owned,
+            query_bounds,
+            counts,
+            candidates,
+            d_keep,
+            d_left,
+            d_right,
+            *classification_owners,
+        )
         del candidates, d_keep, d_left, d_right
 
-    return counts.astype(cp.int64, copy=False)
+    validate_device_candidate_error_flags(
+        scatter_error_flags,
+        reason="point-partition reduction fault validation planning packet",
+    )
+    result = counts.astype(cp.int64, copy=False)
+    retain_point_partition_completion(
+        native_index,
+        exclude_native_index,
+        plan,
+        exclude_plan,
+        query_owned,
+        tree_owned,
+        query_bounds,
+        counts,
+        result,
+    )
+    return result
 
 
-def _spatial_index_device_point_grid_aligned_pair_reduction(
-    flat_index,
-    aligned_flat_index,
+def _spatial_index_device_point_partition_aligned_pair_reduction(
+    native_index,
+    aligned_native_index,
     query_owned,
     tree_owned,
     aligned_tree_owned,
@@ -1381,6 +1695,8 @@ def _spatial_index_device_point_grid_aligned_pair_reduction(
     aligned_tree_family: GeometryFamily,
     precision_plan: PrecisionPlan,
     pair_budget: int,
+    plan=None,
+    aligned_plan=None,
 ):
     """Reduce two aligned point-grid relations one bounded tile at a time."""
     import cupy as cp
@@ -1388,29 +1704,42 @@ def _spatial_index_device_point_grid_aligned_pair_reduction(
     from vibespatial.predicates.point_location_index import (
         prepare_point_region_y_indexes,
     )
-    from vibespatial.spatial.point_grid_index import (
-        point_grid_query_row_partitions,
-        point_grid_superset_query,
-    )
-
+    from vibespatial.spatial.point_partition import retain_point_partition_completion
     tree_count = int(tree_owned.row_count)
     prepare_point_region_y_indexes(query_owned, tree_owned)
     prepare_point_region_y_indexes(query_owned, aligned_tree_owned)
-    plan = point_grid_query_row_partitions(
-        flat_index,
-        query_bounds,
-        pair_budget=pair_budget,
-    )
+    if plan is None:
+        plan, _decline = _point_partition_reduction_plan(
+            native_index,
+            query_bounds,
+            predicate=predicate,
+            query_family=query_family,
+            tree_family=tree_family,
+            reduction="right_pair_count",
+            pair_budget=pair_budget,
+        )
     if plan is None:
         return None
-    partitions, query_counts = plan
+    if aligned_plan is None:
+        aligned_plan, _aligned_decline = _point_partition_reduction_plan(
+            aligned_native_index,
+            query_bounds,
+            predicate=predicate,
+            query_family=query_family,
+            tree_family=aligned_tree_family,
+            reduction="right_pair_count",
+            pair_budget=pair_budget,
+        )
+    if aligned_plan is None:
+        return None
     left_counts = cp.zeros(tree_count, dtype=cp.uint64)
     right_counts = cp.zeros(tree_count, dtype=cp.uint64)
     shared_counts = cp.zeros(tree_count, dtype=cp.uint64)
-    for query_start, query_stop, pair_capacity in partitions:
-        if pair_capacity > pair_budget:
-            if query_stop != query_start + 1:
-                raise ValueError("oversized point-grid partitions must contain one row")
+    scatter_error_flags = []
+    for query_slice in plan.slices():
+        query_start = query_slice.query_start
+        pair_capacity = query_slice.capacity
+        if query_slice.oversized:
             for tree_start in range(0, tree_count, pair_budget):
                 tree_stop = min(tree_count, tree_start + pair_budget)
                 d_right = cp.arange(tree_start, tree_stop, dtype=cp.int32)
@@ -1430,7 +1759,10 @@ def _spatial_index_device_point_grid_aligned_pair_reduction(
                     precision_plan=precision_plan,
                 )
                 if d_keep is None:
-                    return None
+                    raise RuntimeError(
+                        "paired point-partition primary classification declined "
+                        "after provider planning; refusing a Morton retry"
+                    )
                 d_aligned_keep = _classify_homogeneous_reduction_tile(
                     predicate,
                     query_owned,
@@ -1442,7 +1774,10 @@ def _spatial_index_device_point_grid_aligned_pair_reduction(
                     precision_plan=precision_plan,
                 )
                 if d_aligned_keep is None:
-                    return None
+                    raise RuntimeError(
+                        "paired point-partition aligned classification declined "
+                        "after provider planning; refusing a Morton retry"
+                    )
                 d_keep = cp.asarray(d_keep, dtype=cp.bool_)
                 d_aligned_keep = cp.asarray(d_aligned_keep, dtype=cp.bool_)
                 left_counts[tree_start:tree_stop] += d_keep.astype(
@@ -1456,18 +1791,34 @@ def _spatial_index_device_point_grid_aligned_pair_reduction(
                 shared_counts[tree_start:tree_stop] += (
                     d_keep & d_aligned_keep
                 ).astype(cp.uint64, copy=False)
+                retain_point_partition_completion(
+                    native_index,
+                    aligned_native_index,
+                    plan,
+                    aligned_plan,
+                    query_owned,
+                    tree_owned,
+                    aligned_tree_owned,
+                    query_bounds,
+                    left_counts,
+                    right_counts,
+                    shared_counts,
+                    d_keep,
+                    d_aligned_keep,
+                    d_left,
+                    d_right,
+                )
                 del d_aligned_keep, d_keep, d_left, d_right
             continue
         if pair_capacity == 0:
             continue
-        candidates = point_grid_superset_query(
-            flat_index,
-            query_bounds[query_start:query_stop],
-            precomputed_query_counts=query_counts[query_start:query_stop],
-            pair_capacity=pair_capacity,
-        )
+        candidates = _point_partition_superset_query(native_index, query_slice)
         if candidates is None:
-            return None
+            raise RuntimeError(
+                "paired point-partition candidate scatter declined after provider "
+                "planning; refusing a Morton retry"
+            )
+        scatter_error_flags.append(candidates.error_flag)
         d_left = cp.asarray(candidates.d_left, dtype=cp.int32) + cp.int32(
             query_start
         )
@@ -1483,7 +1834,10 @@ def _spatial_index_device_point_grid_aligned_pair_reduction(
             precision_plan=precision_plan,
         )
         if d_keep is None:
-            return None
+            raise RuntimeError(
+                "paired point-partition primary classification declined after "
+                "provider planning; refusing a Morton retry"
+            )
         d_aligned_keep = _classify_homogeneous_reduction_tile(
             predicate,
             query_owned,
@@ -1495,7 +1849,10 @@ def _spatial_index_device_point_grid_aligned_pair_reduction(
             precision_plan=precision_plan,
         )
         if d_aligned_keep is None:
-            return None
+            raise RuntimeError(
+                "paired point-partition aligned classification declined after "
+                "provider planning; refusing a Morton retry"
+            )
         d_keep = cp.asarray(d_keep, dtype=cp.bool_)
         d_aligned_keep = cp.asarray(d_aligned_keep, dtype=cp.bool_)
         d_shared = d_keep & d_aligned_keep
@@ -1514,10 +1871,33 @@ def _spatial_index_device_point_grid_aligned_pair_reduction(
             d_right,
             d_shared.astype(cp.uint64, copy=False),
         )
+        retain_point_partition_completion(
+            native_index,
+            aligned_native_index,
+            plan,
+            aligned_plan,
+            query_owned,
+            tree_owned,
+            aligned_tree_owned,
+            query_bounds,
+            left_counts,
+            right_counts,
+            shared_counts,
+            candidates,
+            d_keep,
+            d_aligned_keep,
+            d_shared,
+            d_left,
+            d_right,
+        )
         del candidates, d_aligned_keep, d_keep, d_left, d_right, d_shared
 
-    right_counts = _spatial_index_device_point_grid_right_reduction(
-        aligned_flat_index,
+    validate_device_candidate_error_flags(
+        scatter_error_flags,
+        reason="point-partition paired reduction fault validation planning packet",
+    )
+    right_counts = _spatial_index_device_point_partition_right_reduction(
+        aligned_native_index,
         query_owned,
         aligned_tree_owned,
         query_bounds,
@@ -1526,16 +1906,38 @@ def _spatial_index_device_point_grid_aligned_pair_reduction(
         tree_family=aligned_tree_family,
         precision_plan=precision_plan,
         pair_budget=pair_budget,
+        reduction="right_pair_count",
+        plan=aligned_plan,
         initial_counts=right_counts,
-        exclude_flat_index=flat_index,
-        exclude_query_counts=query_counts,
+        exclude_native_index=native_index,
+        exclude_plan=plan,
     )
     if right_counts is None:
-        return None
-    return (
-        left_counts.astype(cp.int64, copy=False),
+        raise RuntimeError(
+            "paired point-partition exclusion pass declined after provider "
+            "planning; refusing a Morton retry"
+        )
+    left_result = left_counts.astype(cp.int64, copy=False)
+    shared_result = shared_counts.astype(cp.int64, copy=False)
+    retain_point_partition_completion(
+        native_index,
+        aligned_native_index,
+        plan,
+        aligned_plan,
+        query_owned,
+        tree_owned,
+        aligned_tree_owned,
+        query_bounds,
+        left_counts,
         right_counts,
-        shared_counts.astype(cp.int64, copy=False),
+        shared_counts,
+        left_result,
+        shared_result,
+    )
+    return (
+        left_result,
+        right_counts,
+        shared_result,
     )
 
 
@@ -1550,6 +1952,8 @@ def _spatial_index_device_relation_reduction(
     reduction: str,
     aligned_tree_owned=None,
     aligned_flat_index=None,
+    native_index=None,
+    aligned_native_index=None,
 ) -> tuple[object | None, SpatialQueryExecution]:
     """Reduce Morton-range candidate slices without materializing a relation.
 
@@ -1560,6 +1964,13 @@ def _spatial_index_device_relation_reduction(
     controls Python launch flow or intermediate pair allocation.
     """
     import cupy as cp
+
+    from vibespatial.spatial.point_partition import wait_for_point_partition
+
+    if native_index is not None:
+        wait_for_point_partition(native_index.readiness)
+    if aligned_native_index is not None:
+        wait_for_point_partition(aligned_native_index.readiness)
 
     from vibespatial.spatial.query_utils import (
         _owned_gpu_predicate_family_admission,
@@ -1753,18 +2164,93 @@ def _spatial_index_device_relation_reduction(
             ),
         )
 
-    if reduction in {"right_count", "right_pair_count"} and homogeneous_family_pair:
-        point_grid_pair_budget = _spatial_reduction_tile_lane_capacity(
+    point_partition_admitted = (
+        reduction in {"right_count", "right_pair_count"}
+        and homogeneous_family_pair
+        and _point_partition_reduction_admitted(
+            predicate=predicate,
+            query_family=query_families[0],
+            tree_family=tree_families[0],
+            reduction=reduction,
+        )
+        and (
+            not pair_reduction
+            or aligned_tree_families[0] is GeometryFamily.POINT
+        )
+    )
+    if point_partition_admitted:
+        point_partition_pair_budget = _spatial_reduction_tile_lane_capacity(
             query_owned,
             tree_owned,
             predicate=predicate,
             family_admission=admission,
         )
-        if pair_reduction and aligned_flat_index is not None:
-            point_grid_values = (
-                _spatial_index_device_point_grid_aligned_pair_reduction(
-                    flat_index,
-                    aligned_flat_index,
+        if native_index is None:
+            native_index = getattr(flat_index, "_native_spatial_index", None)
+            if native_index is None:
+                native_index = flat_index.to_native_spatial_index()
+            wait_for_point_partition(native_index.readiness)
+        if aligned_native_index is not None:
+            wait_for_point_partition(aligned_native_index.readiness)
+        aligned_plan = None
+        if pair_reduction and aligned_native_index is not None:
+            from vibespatial.spatial.point_partition import (
+                forced_point_partition_variant_for_testing,
+            )
+
+            point_selection, aligned_selection, _paired_decline = (
+                _paired_point_partition_preflight_selections(
+                    native_index,
+                    aligned_native_index,
+                    query_count=int(query_bounds.shape[0]),
+                    pair_budget=point_partition_pair_budget,
+                    forced=forced_point_partition_variant_for_testing(),
+                )
+            )
+            point_plan = None
+            if point_selection is not None and aligned_selection is not None:
+                point_plan, _point_decline = _point_partition_reduction_plan(
+                    native_index,
+                    query_bounds,
+                    predicate=predicate,
+                    query_family=query_families[0],
+                    tree_family=tree_families[0],
+                    reduction=reduction,
+                    pair_budget=point_partition_pair_budget,
+                    selection=point_selection,
+                )
+        else:
+            point_plan, _point_decline = _point_partition_reduction_plan(
+                native_index,
+                query_bounds,
+                predicate=predicate,
+                query_family=query_families[0],
+                tree_family=tree_families[0],
+                reduction=reduction,
+                pair_budget=point_partition_pair_budget,
+            )
+            aligned_selection = None
+        if pair_reduction and point_plan is not None and aligned_native_index is not None:
+            aligned_plan, _aligned_point_decline = _point_partition_reduction_plan(
+                aligned_native_index,
+                query_bounds,
+                predicate=predicate,
+                query_family=query_families[0],
+                tree_family=aligned_tree_families[0],
+                reduction=reduction,
+                pair_budget=point_partition_pair_budget,
+                selection=aligned_selection,
+            )
+            if aligned_plan is None:
+                raise RuntimeError(
+                    "aligned point-partition planning declined after the primary "
+                    "provider submitted work; refusing a post-submission Morton retry"
+                )
+        if pair_reduction and point_plan is not None and aligned_plan is not None:
+            point_partition_values = (
+                _spatial_index_device_point_partition_aligned_pair_reduction(
+                    native_index,
+                    aligned_native_index,
                     query_owned,
                     tree_owned,
                     aligned_tree_owned,
@@ -1774,12 +2260,14 @@ def _spatial_index_device_relation_reduction(
                     tree_family=tree_families[0],
                     aligned_tree_family=aligned_tree_families[0],
                     precision_plan=indexed_point_precision_plan,
-                    pair_budget=point_grid_pair_budget,
+                    pair_budget=point_partition_pair_budget,
+                    plan=point_plan,
+                    aligned_plan=aligned_plan,
                 )
             )
-        elif reduction == "right_count":
-            point_grid_values = _spatial_index_device_point_grid_right_reduction(
-                flat_index,
+        elif reduction == "right_count" and point_plan is not None:
+            point_partition_values = _spatial_index_device_point_partition_right_reduction(
+                native_index,
                 query_owned,
                 tree_owned,
                 query_bounds,
@@ -1787,24 +2275,26 @@ def _spatial_index_device_relation_reduction(
                 query_family=query_families[0],
                 tree_family=tree_families[0],
                 precision_plan=indexed_point_precision_plan,
-                pair_budget=point_grid_pair_budget,
+                pair_budget=point_partition_pair_budget,
+                plan=point_plan,
             )
         else:
-            point_grid_values = None
-        if point_grid_values is not None:
-            point_grid_reason = (
-                "bounded aligned point-grid candidate batches reused prior "
+            point_partition_values = None
+        if point_partition_values is not None:
+            variant = point_plan.variant.value
+            point_partition_reason = (
+                f"bounded aligned point-{variant} candidate batches reused prior "
                 "exact classifications and reduced only unseen pairs to "
-                f"{reduction_name}"
+                f"{reduction_name}; {point_plan.selection_reason}"
                 if pair_reduction
-                else "bounded point-grid candidate batches reduced directly to "
-                f"{reduction_name}"
+                else f"bounded point-{variant} candidate batches reduced directly to "
+                f"{reduction_name}; {point_plan.selection_reason}"
             )
-            return point_grid_values, SpatialQueryExecution(
+            return point_partition_values, SpatialQueryExecution(
                 requested=ExecutionMode.GPU,
                 selected=ExecutionMode.GPU,
-                implementation=implementation,
-                reason=point_grid_reason,
+                implementation=f"{implementation}_{variant}",
+                reason=point_partition_reason,
             )
 
     effective_query_bounds = (
@@ -2249,6 +2739,7 @@ def spatial_index_device_left_semijoin_rows(
     *,
     predicate: str | None,
     distance: np.ndarray | object | None = None,
+    native_index=None,
 ) -> tuple[object | None, SpatialQueryExecution]:
     """Reduce a dense Morton candidate stream directly into matched rows."""
     return _spatial_index_device_relation_reduction(
@@ -2259,6 +2750,7 @@ def spatial_index_device_left_semijoin_rows(
         predicate=predicate,
         distance=distance,
         reduction="exists",
+        native_index=native_index,
     )
 
 
@@ -2270,6 +2762,7 @@ def spatial_index_device_left_match_counts(
     *,
     predicate: str | None,
     distance: np.ndarray | object | None = None,
+    native_index=None,
 ) -> tuple[object | None, SpatialQueryExecution]:
     """Reduce a dense Morton candidate stream directly into int64 counts."""
     return _spatial_index_device_relation_reduction(
@@ -2280,6 +2773,7 @@ def spatial_index_device_left_match_counts(
         predicate=predicate,
         distance=distance,
         reduction="count",
+        native_index=native_index,
     )
 
 
@@ -2291,6 +2785,7 @@ def spatial_index_device_right_semijoin_rows(
     *,
     predicate: str | None,
     distance: np.ndarray | object | None = None,
+    native_index=None,
 ) -> tuple[object | None, SpatialQueryExecution]:
     """Reduce a dense Morton candidate stream into matched indexed rows."""
     return _spatial_index_device_relation_reduction(
@@ -2301,6 +2796,7 @@ def spatial_index_device_right_semijoin_rows(
         predicate=predicate,
         distance=distance,
         reduction="right_exists",
+        native_index=native_index,
     )
 
 
@@ -2312,6 +2808,7 @@ def spatial_index_device_right_match_counts(
     *,
     predicate: str | None,
     distance: np.ndarray | object | None = None,
+    native_index=None,
 ) -> tuple[object | None, SpatialQueryExecution]:
     """Reduce a dense Morton candidate stream into indexed-row counts."""
     return _spatial_index_device_relation_reduction(
@@ -2322,18 +2819,20 @@ def spatial_index_device_right_match_counts(
         predicate=predicate,
         distance=distance,
         reduction="right_count",
+        native_index=native_index,
     )
 
 
 def spatial_index_device_right_pair_match_counts(
     flat_index,
-    aligned_flat_index,
+    aligned_native_index,
     query_owned,
     tree_owned,
     aligned_tree_owned,
     query_bounds,
     *,
     predicate: str,
+    native_index=None,
 ) -> tuple[object | None, SpatialQueryExecution]:
     """Reduce first and aligned shared matches into indexed-row counts."""
     return _spatial_index_device_relation_reduction(
@@ -2344,5 +2843,7 @@ def spatial_index_device_right_pair_match_counts(
         predicate=predicate,
         reduction="right_pair_count",
         aligned_tree_owned=aligned_tree_owned,
-        aligned_flat_index=aligned_flat_index,
+        aligned_flat_index=aligned_native_index.to_flat_index(),
+        native_index=native_index,
+        aligned_native_index=aligned_native_index,
     )

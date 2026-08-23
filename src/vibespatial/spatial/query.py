@@ -249,6 +249,7 @@ def query_spatial_index(
     flat_index,
     geometry: Any,
     *,
+    native_index=None,
     predicate: str | None = None,
     sort: bool = False,
     distance: float | np.ndarray | None = None,
@@ -892,10 +893,12 @@ def query_spatial_index(
             device_cands, _sidq_exec = spatial_index_device_query(
                 flat_index,
                 query_bounds,
+                native_index=native_index,
                 allow_bbox_superset=predicate is not None,
             )
         if device_cands is not None:
             gpu_candidate_gen = True
+            device_cands.validate_error_flag()
             # Pass None for host indices — _filter_predicate_pairs_owned will
             # lazily materialise them from device_candidates only when needed
             # (tag classification, Shapely fallback).  This avoids a full

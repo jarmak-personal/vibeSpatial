@@ -13,7 +13,17 @@ import pytest
 from vibespatial.bench.cli import main as vsbench_main
 from vibespatial.bench.output import render_shootout
 from vibespatial.bench.schema import timing_from_samples
-from vibespatial.bench.shootout import ShootoutResult, ShootoutRun, _run_harness, run_shootout
+from vibespatial.bench.shootout import (
+    ShootoutResult,
+    ShootoutRun,
+    _baseline_environment_sha256,
+    _baseline_host_identity,
+    _measurement_identity,
+    _run_harness,
+    load_reusable_geopandas_baseline,
+    run_shootout,
+    shootout_workload_identity,
+)
 from vibespatial.cuda.cccl_precompile import SPEC_REGISTRY
 from vibespatial.runtime import has_gpu_runtime
 from vibespatial.testing import strict_native_environment
@@ -536,6 +546,386 @@ def test_shootout_in_process_retry_keeps_full_precompile(
     assert result.status == "pass"
     assert result.metadata["vibespatial_launch"] == "in_process_retry"
     assert seen["pipeline_warm"] is True
+
+
+def test_run_shootout_reuses_geopandas_baseline_without_launching_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    labels: list[str] = []
+
+    def _fake_run_harness(**kwargs):
+        labels.append(kwargs["label"])
+        return ShootoutRun(
+            label="vibespatial",
+            timing=timing_from_samples([0.5]),
+            stdout="SHOOTOUT_FINGERPRINT: rows=1\n",
+        )
+
+    monkeypatch.setattr("vibespatial.bench.shootout._run_harness", _fake_run_harness)
+    monkeypatch.setattr("vibespatial.runtime.has_gpu_runtime", lambda: False)
+    baseline = ShootoutRun(
+        label="geopandas",
+        timing=timing_from_samples([1.0]),
+        stdout="SHOOTOUT_FINGERPRINT: rows=1\n",
+        environment={
+            "python_version": "test",
+            "python_implementation": "cpython",
+            "packages": {
+                "geopandas": "1",
+                "numpy": "1",
+                "pandas": "1",
+                "pyarrow": "1",
+                "pyogrio": "1",
+                "shapely": "1",
+            },
+        },
+    )
+
+    result = run_shootout(
+        Path("benchmarks/shootout/network_service_area.py"),
+        repeat=1,
+        warmup=False,
+        quiet=True,
+        geopandas_baseline=baseline,
+        geopandas_baseline_source="baseline.json",
+    )
+
+    assert labels == ["vibespatial"]
+    assert result.status == "pass"
+    assert result.speedup == 2.0
+    assert result.metadata["geopandas_baseline"] == "reused"
+    assert result.metadata["geopandas_baseline_source"] == "baseline.json"
+
+
+def test_run_shootout_reused_baseline_requires_current_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_run_harness(**kwargs):
+        return ShootoutRun(
+            label="vibespatial",
+            timing=timing_from_samples([0.5]),
+            stdout="",
+        )
+
+    monkeypatch.setattr("vibespatial.bench.shootout._run_harness", _fake_run_harness)
+    monkeypatch.setattr("vibespatial.runtime.has_gpu_runtime", lambda: False)
+    baseline = ShootoutRun(
+        label="geopandas",
+        timing=timing_from_samples([1.0]),
+        stdout="SHOOTOUT_FINGERPRINT: rows=1\n",
+        environment={
+            "python_version": "test",
+            "python_implementation": "cpython",
+            "packages": {
+                "geopandas": "1",
+                "numpy": "1",
+                "pandas": "1",
+                "pyarrow": "1",
+                "pyogrio": "1",
+                "shapely": "1",
+            },
+        },
+    )
+
+    result = run_shootout(
+        Path("benchmarks/shootout/network_service_area.py"),
+        repeat=1,
+        warmup=False,
+        quiet=True,
+        geopandas_baseline=baseline,
+        geopandas_baseline_source="baseline.json",
+    )
+
+    assert result.status == "error"
+    assert result.speedup is None
+    assert result.metadata["fingerprint"] == "missing"
+    assert "current vibeSpatial run has no correctness fingerprint" in (
+        result.status_reason
+    )
+
+
+def test_load_reusable_geopandas_baseline_validates_workload_identity(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "workload.py"
+    script.write_text(
+        "print('SHOOTOUT_FINGERPRINT: rows=1')\n",
+        encoding="utf-8",
+    )
+    identity = shootout_workload_identity(script)
+    baseline_environment = {
+        "python_version": "test",
+        "python_implementation": "cpython",
+        "packages": {
+            "geopandas": "1",
+            "numpy": "1",
+            "pandas": "1",
+            "pyarrow": "1",
+            "pyogrio": "1",
+            "shapely": "1",
+        },
+    }
+    artifact = tmp_path / "baseline.json"
+    artifact.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "type": "shootout",
+                "script": str(script),
+                "geopandas": {
+                    "label": "geopandas",
+                    "timing": timing_from_samples([1.0, 1.0, 1.0]).to_dict(),
+                    "stdout": "SHOOTOUT_FINGERPRINT: rows=1\n",
+                    "environment": baseline_environment,
+                },
+                "vibespatial": {
+                    "label": "vibespatial",
+                    "timing": timing_from_samples([0.5]).to_dict(),
+                },
+                "metadata": {
+                    **identity,
+                    "scale": "1m",
+                    "geopandas_baseline_host": _baseline_host_identity(),
+                    "geopandas_baseline_environment_sha256": (
+                        _baseline_environment_sha256(baseline_environment)
+                    ),
+                    "measurement_sha256": _measurement_identity(),
+                    "repeat": 3,
+                    "warmup": True,
+                    "timeout": 300,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_reusable_geopandas_baseline(
+        artifact,
+        script=script,
+        scale="1M",
+        repeat=3,
+        warmup=True,
+        timeout=300,
+    )
+    assert loaded.timing.median_seconds == 1.0
+
+    tampered_payload = json.loads(artifact.read_text(encoding="utf-8"))
+    tampered_payload["geopandas"]["environment"]["python_version"] = "2.7"
+    artifact.write_text(json.dumps(tampered_payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="environment identity is stale"):
+        load_reusable_geopandas_baseline(
+            artifact,
+            script=script,
+            scale="1m",
+            repeat=3,
+            warmup=True,
+            timeout=300,
+        )
+
+    tampered_payload["geopandas"]["environment"] = baseline_environment
+    artifact.write_text(json.dumps(tampered_payload), encoding="utf-8")
+
+    script.write_text(
+        "print('SHOOTOUT_FINGERPRINT: rows=2')\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="workload hash is stale"):
+        load_reusable_geopandas_baseline(
+            artifact,
+            script=script,
+            scale="1m",
+            repeat=3,
+            warmup=True,
+            timeout=300,
+        )
+
+
+def test_shootout_cli_reuses_geopandas_with_no_warmup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = tmp_path / "workload.py"
+    script.write_text(
+        "print('SHOOTOUT_FINGERPRINT: rows=1')\n",
+        encoding="utf-8",
+    )
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text("{}", encoding="utf-8")
+    baseline = ShootoutRun(
+        label="geopandas",
+        timing=timing_from_samples([1.0]),
+        stdout="SHOOTOUT_FINGERPRINT: rows=1\n",
+    )
+    seen: dict[str, object] = {}
+
+    def _load_baseline(path, **kwargs):
+        seen["path"] = path
+        seen.update(kwargs)
+        return baseline
+
+    def _run_shootout(script_path, **kwargs):
+        seen["run_script"] = script_path
+        seen["run_warmup"] = kwargs["warmup"]
+        return ShootoutResult(
+            script=str(script_path),
+            geopandas=baseline,
+            vibespatial=ShootoutRun(
+                label="vibespatial",
+                timing=timing_from_samples([0.5]),
+                stdout="SHOOTOUT_FINGERPRINT: rows=1\n",
+            ),
+            speedup=2.0,
+            status="pass",
+            status_reason="ok",
+        )
+
+    monkeypatch.setattr(
+        "vibespatial.bench.shootout.load_reusable_geopandas_baseline",
+        _load_baseline,
+    )
+    monkeypatch.setattr("vibespatial.bench.shootout.run_shootout", _run_shootout)
+
+    status = vsbench_main(
+        [
+            "shootout",
+            str(script),
+            "--repeat",
+            "1",
+            "--no-warmup",
+            "--reuse-geopandas",
+            str(baseline_path),
+            "--quiet",
+        ]
+    )
+
+    assert status == 0
+    assert seen["warmup"] is False
+    assert seen["run_warmup"] is False
+
+
+def test_shootout_cli_rejects_structurally_invalid_reuse_artifacts(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = tmp_path / "workload.py"
+    script.write_text(
+        "print('SHOOTOUT_FINGERPRINT: rows=1')\n",
+        encoding="utf-8",
+    )
+    identity = shootout_workload_identity(script)
+    valid_metadata = {
+        **identity,
+        "scale": "1m",
+        "geopandas_baseline_host": _baseline_host_identity(),
+        "measurement_sha256": _measurement_identity(),
+        "repeat": 3,
+        "warmup": True,
+        "timeout": 300,
+    }
+    malformed_payloads = [
+        [],
+        {"type": "shootout", "metadata": None},
+        {
+            "type": "shootout",
+            "metadata": valid_metadata,
+            "geopandas": {
+                "timing": {"median_seconds": "fast"},
+                "stdout": "SHOOTOUT_FINGERPRINT: rows=1\n",
+            },
+        },
+        {
+            "type": "shootout",
+            "metadata": valid_metadata,
+            "geopandas": {
+                "timing": timing_from_samples([1.0]).to_dict(),
+                "stdout": "SHOOTOUT_FINGERPRINT: rows=1\n",
+                "environment": {
+                    "python_version": "test",
+                    "python_implementation": "cpython",
+                    "packages": {
+                        "geopandas": "1",
+                        "numpy": "1",
+                        "pandas": "1",
+                        "pyarrow": "1",
+                        "pyogrio": "1",
+                        "shapely": "1",
+                    },
+                },
+            },
+        },
+    ]
+
+    for index, payload in enumerate(malformed_payloads):
+        artifact = tmp_path / f"malformed-{index}.json"
+        artifact.write_text(json.dumps(payload), encoding="utf-8")
+        status = vsbench_main(
+            [
+                "shootout",
+                str(script),
+                "--scale",
+                "1m",
+                "--reuse-geopandas",
+                str(artifact),
+                "--quiet",
+            ]
+        )
+        captured = capsys.readouterr()
+        assert status == 2
+        assert captured.out == ""
+        assert captured.err.startswith("Error: cannot reuse GeoPandas baseline:")
+        assert "Traceback" not in captured.err
+
+    deeply_nested = tmp_path / "deeply-nested.json"
+    deeply_nested.write_text("[" * 2_000 + "0" + "]" * 2_000, encoding="utf-8")
+    status = vsbench_main(
+        [
+            "shootout",
+            str(script),
+            "--scale",
+            "1m",
+            "--reuse-geopandas",
+            str(deeply_nested),
+            "--quiet",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert status == 2
+    assert captured.out == ""
+    assert captured.err.startswith("Error: cannot reuse GeoPandas baseline:")
+    assert "Traceback" not in captured.err
+
+
+def test_run_shootout_measured_comparison_requires_both_fingerprints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_run_harness(**kwargs):
+        return ShootoutRun(
+            label=kwargs["label"],
+            timing=timing_from_samples([1.0]),
+            stdout=(
+                "SHOOTOUT_FINGERPRINT: rows=1\n"
+                if kwargs["label"] == "geopandas"
+                else ""
+            ),
+        )
+
+    monkeypatch.setattr("vibespatial.bench.shootout._run_harness", _fake_run_harness)
+    monkeypatch.setattr("vibespatial.runtime.has_gpu_runtime", lambda: False)
+
+    result = run_shootout(
+        Path("benchmarks/shootout/network_service_area.py"),
+        repeat=1,
+        warmup=False,
+        quiet=True,
+        baseline_python=sys.executable,
+    )
+
+    assert result.status == "error"
+    assert result.speedup is None
+    assert result.metadata["fingerprint"] == "missing"
+    assert "current vibeSpatial run has no correctness fingerprint" in (
+        result.status_reason
+    )
 
 
 def test_run_shootout_baseline_uses_isolated_uv_env(

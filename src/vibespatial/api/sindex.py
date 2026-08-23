@@ -1062,7 +1062,7 @@ class SpatialIndex:
         query_input = self._owned_query_input(geometry)
         if not isinstance(query_input, OwnedGeometryArray):
             return None, None
-        other_tree_owned, other_flat_index = other._owned_flat_sindex()
+        other_tree_owned, _other_flat_index = other._owned_flat_sindex()
 
         from vibespatial.kernels.core.geometry_analysis import (
             compute_geometry_bounds_device,
@@ -1073,11 +1073,11 @@ class SpatialIndex:
             preserve_indexed_view=True,
         )
         left_native_index = self._native_spatial_index_for_query()
+        right_native_index = other._native_spatial_index_for_query()
         pair_expressions, left_execution = (
             left_native_index.query_right_pair_match_count_expressions(
                 query_input,
-                other_tree_owned,
-                other_flat_index,
+                right_native_index,
                 predicate=predicate,
                 query_row_count=query_row_count,
                 return_metadata=True,
@@ -1095,7 +1095,6 @@ class SpatialIndex:
             right_execution = left_execution
         else:
             left_expression, shared_expression = pair_expressions
-            right_native_index = other._native_spatial_index_for_query()
             right_expression, right_execution = (
                 right_native_index.query_right_match_count_expression(
                     query_input,
@@ -1148,8 +1147,8 @@ class SpatialIndex:
                 f"{left_execution.implementation}+{right_execution.implementation}"
             ),
             reason=(
-                "bounded Morton candidate tiles reduced first, second, and "
-                "shared aligned predicate matches before public export"
+                f"left/shared: {left_execution.reason}; "
+                f"right: {right_execution.reason}"
             ),
             detail=(
                 f"predicate={predicate!r}, query_rows={query_row_count}, "

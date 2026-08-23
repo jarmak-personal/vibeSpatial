@@ -16,6 +16,8 @@ Invoke the `pre-land-review` skill. This runs:
 - AI-powered review (GPU code, zero-copy, performance, maintainability,
   diff shape) via a single consolidated review agent
 - Repo-native learning review when the task exposed reusable lessons
+- Performance baselining when performance-sensitive code or claims changed;
+  validated static comparators are reused while current vibeSpatial is rerun
 
 If the review finds BLOCKING issues, **stop here**. Fix them and re-run
 `$commit`. Do not proceed to Step 2 with blocking findings. NEVER descope

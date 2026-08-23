@@ -5,7 +5,7 @@ Scope: Point-versus-bounds and point-in-polygon pipeline shape, stage boundaries
 Read If: You are changing point predicates, candidate refinement, or the first exact spatial query path.
 STOP IF: Your task already has the staged point-predicate contract open and only needs local implementation detail.
 Source Of Truth: Phase-4 point predicate architecture policy before sindex and join assembly.
-Body Budget: 105/220 lines
+Body Budget: 122/220 lines
 Document: docs/architecture/point-predicates.md
 
 Section Map (Body Lines)
@@ -21,7 +21,8 @@ Section Map (Body Lines)
 | 55-75 | Decision |
 | 76-89 | CCCL Mapping |
 | 90-96 | Semantics |
-| 97-105 | Consequences |
+| 97-106 | Consequences |
+| 107-122 | Bounded Point-Partition Providers |
 DOC_HEADER:END -->
 
 ## Request Signals
@@ -127,3 +128,20 @@ primitives can replace.
 - the planned convergence point with the spatial query/index stack lets
   point-vs-polygon candidates reuse this dedicated predicate path where
   the query surface and semantics line up
+
+## Bounded Point-Partition Providers
+
+Right-count and aligned right-pair-count reductions for homogeneous
+Polygon/MultiPolygon queries against homogeneous Point indexes may consume a
+conservative point partition before exact refinement. The production rule is
+local and static: use a fully pre-admitted dense grid, and use Morton for every
+other shape.
+
+The provider changes candidates only. `intersects`, `contains`, `covers`,
+`contains_properly`, and `touches` retain their exact public boundary semantics.
+Pair-shaped predicate queries may use the same Native-owned grid only after
+the complete relation allocation is admitted and exactly refined. `dwithin`,
+`disjoint`, mixed families, and all other predicates remain on Morton. Prepared
+derivatives and bounded
+query tokens are private `NativeSpatialIndex` state; public APIs expose no
+provider or tuning control.

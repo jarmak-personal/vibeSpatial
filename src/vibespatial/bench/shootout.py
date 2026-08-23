@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
 import io
 import json
+import math
 import os
+import platform
 import re
 import runpy
 import shutil
@@ -22,6 +26,15 @@ from .schema import TimingSummary, timing_from_samples
 
 _TIMED_START_MARKER = "# --- timed work starts here ---"
 _TIMED_END_MARKER = "# --- timed work ends here ---"
+
+_BASELINE_PACKAGES = (
+    "geopandas",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "pyogrio",
+    "shapely",
+)
 
 
 def _repo_source_root() -> Path | None:
@@ -61,6 +74,7 @@ _HARNESS_CODE = """\
 import ast
 import faulthandler
 import gc
+import importlib.metadata
 import io
 import json
 import os
@@ -79,6 +93,29 @@ do_warmup = sys.argv[4] == "1"
 do_pipeline_warm = sys.argv[5] == "1"
 dump_after = int(sys.argv[6])
 do_profile = sys.argv[7] == "1"
+
+BASELINE_PACKAGES = (
+    "geopandas",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "pyogrio",
+    "shapely",
+)
+
+
+def _environment_identity():
+    packages = {}
+    for name in BASELINE_PACKAGES:
+        try:
+            packages[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            packages[name] = None
+    return {
+        "python_version": sys.version,
+        "python_implementation": sys.implementation.name,
+        "packages": packages,
+    }
 
 if dump_after > 0:
     faulthandler.dump_traceback_later(dump_after, repeat=False)
@@ -632,7 +669,12 @@ if do_pipeline_warm and do_profile:
     profile = _profile_timed_sections(script, sections)
 
 with open(result_path, "w") as f:
-    json.dump({"samples": samples, "stdout": captured_stdout, "profile": profile}, f)
+    json.dump({
+        "samples": samples,
+        "stdout": captured_stdout,
+        "profile": profile,
+        "environment": _environment_identity(),
+    }, f)
 """
 
 
@@ -650,6 +692,7 @@ class ShootoutRun:
     error: str | None = None
     stdout: str = ""
     profile: dict[str, Any] | None = None
+    environment: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -662,6 +705,8 @@ class ShootoutRun:
             d["stdout"] = self.stdout
         if self.profile is not None:
             d["profile"] = self.profile
+        if self.environment is not None:
+            d["environment"] = self.environment
         return d
 
 
@@ -705,6 +750,258 @@ def _find_uv() -> str | None:
     return shutil.which("uv")
 
 
+def _shootout_root(script: Path) -> Path | None:
+    script = script.resolve()
+    for parent in script.parents:
+        if parent.name == "shootout" and parent.parent.name == "benchmarks":
+            return parent
+    return None
+
+
+def shootout_workload_identity(script: Path) -> dict[str, Any]:
+    """Return a conservative identity for one shootout and its shared fixtures."""
+    script = script.resolve()
+    root = _shootout_root(script)
+    files = sorted(root.rglob("*.py")) if root is not None else [script]
+    digest = hashlib.sha256()
+    for path in files:
+        relative = path.relative_to(root) if root is not None else Path(path.name)
+        digest.update(str(relative).encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return {
+        "workload_key": (
+            str(script.relative_to(root)) if root is not None else script.name
+        ),
+        "workload_sha256": digest.hexdigest(),
+    }
+
+
+def _baseline_host_identity() -> dict[str, str]:
+    cpu_model = ""
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.is_file():
+        for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.lower().startswith("model name"):
+                cpu_model = line.partition(":")[2].strip()
+                break
+    return {
+        "node": platform.node(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "cpu_model": cpu_model,
+    }
+
+
+def _shootout_run_from_dict(raw: dict[str, Any]) -> ShootoutRun:
+    if not isinstance(raw, dict):
+        raise ValueError("cached GeoPandas baseline result is not an object")
+    timing = raw.get("timing")
+    if not isinstance(timing, dict):
+        raise ValueError("cached GeoPandas baseline has no timing summary")
+    timing_fields = {
+        "mean_seconds",
+        "median_seconds",
+        "min_seconds",
+        "max_seconds",
+        "stddev_seconds",
+        "sample_count",
+    }
+    if set(timing) != timing_fields:
+        raise ValueError("cached GeoPandas baseline has an invalid timing summary")
+    sample_count = timing["sample_count"]
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or sample_count <= 0
+    ):
+        raise ValueError("cached GeoPandas baseline has an invalid sample count")
+    numeric_timing: dict[str, float] = {}
+    for name in timing_fields - {"sample_count"}:
+        value = timing[name]
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError(
+                f"cached GeoPandas baseline timing field {name!r} is not numeric"
+            )
+        numeric_value = float(value)
+        if not math.isfinite(numeric_value) or numeric_value < 0.0:
+            raise ValueError(
+                f"cached GeoPandas baseline timing field {name!r} is invalid"
+            )
+        numeric_timing[name] = numeric_value
+    if not (
+        numeric_timing["min_seconds"]
+        <= numeric_timing["median_seconds"]
+        <= numeric_timing["max_seconds"]
+    ) or not (
+        numeric_timing["min_seconds"]
+        <= numeric_timing["mean_seconds"]
+        <= numeric_timing["max_seconds"]
+    ):
+        raise ValueError("cached GeoPandas baseline timing bounds are inconsistent")
+    error = raw.get("error")
+    if error is not None and not isinstance(error, str):
+        raise ValueError("cached GeoPandas baseline error field is not text")
+    stdout = raw.get("stdout", "")
+    if not isinstance(stdout, str):
+        raise ValueError("cached GeoPandas baseline stdout field is not text")
+    return ShootoutRun(
+        label="geopandas",
+        timing=TimingSummary(sample_count=sample_count, **numeric_timing),
+        error=error,
+        stdout=stdout,
+        profile=raw.get("profile"),
+        environment=raw.get("environment"),
+    )
+
+
+def _measurement_identity() -> str:
+    return hashlib.sha256(_HARNESS_CODE.encode()).hexdigest()
+
+
+def _environment_identity() -> dict[str, Any]:
+    packages: dict[str, str | None] = {}
+    for name in _BASELINE_PACKAGES:
+        try:
+            packages[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            packages[name] = None
+    return {
+        "python_version": sys.version,
+        "python_implementation": sys.implementation.name,
+        "packages": packages,
+    }
+
+
+def _validate_baseline_environment(environment: Any) -> None:
+    if not isinstance(environment, dict):
+        raise ValueError("cached GeoPandas baseline has no environment identity")
+    if not isinstance(environment.get("python_version"), str) or not isinstance(
+        environment.get("python_implementation"), str
+    ):
+        raise ValueError("cached GeoPandas baseline has incomplete Python identity")
+    packages = environment.get("packages")
+    if not isinstance(packages, dict) or any(
+        name not in packages for name in _BASELINE_PACKAGES
+    ):
+        raise ValueError("cached GeoPandas baseline has incomplete package identity")
+    if any(
+        value is not None and not isinstance(value, str)
+        for value in packages.values()
+    ):
+        raise ValueError("cached GeoPandas baseline has invalid package identity")
+
+
+def _baseline_environment_sha256(environment: Any) -> str:
+    _validate_baseline_environment(environment)
+    encoded = json.dumps(
+        environment,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_reusable_geopandas_baseline(
+    path: Path,
+    *,
+    script: Path,
+    scale: str | None,
+    repeat: int,
+    warmup: bool,
+    timeout: int,
+) -> ShootoutRun:
+    """Load a cached GeoPandas run only when its full workload identity matches."""
+    source = Path(path)
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError(f"invalid cached shootout JSON: {source}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"invalid cached shootout artifact: {source}")
+    artifact_type = payload.get("type")
+    if artifact_type == "shootout_suite":
+        raw_results = payload.get("results")
+        if not isinstance(raw_results, list) or not raw_results:
+            raise ValueError(f"invalid cached shootout suite: {source}")
+    elif artifact_type == "shootout":
+        raw_results = [payload]
+    else:
+        raise ValueError(f"invalid cached shootout artifact type: {artifact_type!r}")
+
+    entries: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for index, item in enumerate(raw_results):
+        if not isinstance(item, dict):
+            raise ValueError(f"cached shootout entry {index} is not an object")
+        metadata = item.get("metadata")
+        if not isinstance(metadata, dict):
+            raise ValueError(f"cached shootout entry {index} has invalid metadata")
+        workload_key = metadata.get("workload_key")
+        if not isinstance(workload_key, str) or not workload_key:
+            raise ValueError(f"cached shootout entry {index} has no workload key")
+        entries.append((item, metadata))
+
+    expected = shootout_workload_identity(script)
+    match = next(
+        (
+            (item, metadata)
+            for item, metadata in entries
+            if metadata["workload_key"] == expected["workload_key"]
+        ),
+        None,
+    )
+    if match is None:
+        raise ValueError(
+            f"cached baseline has no workload entry for {expected['workload_key']}"
+        )
+    match_item, metadata = match
+    if metadata.get("workload_sha256") != expected["workload_sha256"]:
+        raise ValueError(
+            f"cached baseline workload hash is stale for {expected['workload_key']}"
+        )
+    cached_scale = metadata.get("scale")
+    if (str(cached_scale).lower() if cached_scale is not None else None) != (
+        str(scale).lower() if scale is not None else None
+    ):
+        raise ValueError(
+            f"cached baseline scale {cached_scale!r} does not match {scale!r}"
+        )
+    if metadata.get("geopandas_baseline_host") != _baseline_host_identity():
+        raise ValueError("cached GeoPandas baseline was measured on a different host")
+    if metadata.get("measurement_sha256") != _measurement_identity():
+        raise ValueError("cached GeoPandas baseline measurement contract is stale")
+    expected_contract = {
+        "repeat": repeat,
+        "warmup": warmup,
+        "timeout": timeout,
+    }
+    actual_contract = {key: metadata.get(key) for key in expected_contract}
+    if actual_contract != expected_contract:
+        raise ValueError(
+            "cached GeoPandas baseline measurement settings do not match: "
+            f"cached={actual_contract!r}, requested={expected_contract!r}"
+        )
+    geopandas_result = match_item.get("geopandas")
+    if not isinstance(geopandas_result, dict):
+        raise ValueError("cached shootout entry has invalid GeoPandas result")
+    run = _shootout_run_from_dict(geopandas_result)
+    if run.timing.sample_count != repeat:
+        raise ValueError(
+            "cached GeoPandas baseline sample count does not match requested "
+            f"repeat: cached={run.timing.sample_count}, requested={repeat}"
+        )
+    if run.error:
+        raise ValueError(f"cached GeoPandas baseline contains an error: {run.error}")
+    if _extract_fingerprint(run.stdout) is None:
+        raise ValueError("cached GeoPandas baseline has no correctness fingerprint")
+    environment_sha256 = _baseline_environment_sha256(run.environment)
+    if metadata.get("geopandas_baseline_environment_sha256") != environment_sha256:
+        raise ValueError("cached GeoPandas baseline environment identity is stale")
+    return run
+
+
 def _fmt_time(seconds: float) -> str:
     if seconds <= 0:
         return "0s"
@@ -727,6 +1024,7 @@ def _build_run_from_result(label: str, raw: dict[str, Any]) -> ShootoutRun:
         error=errors[0] if errors else None,
         stdout=raw.get("stdout", ""),
         profile=raw.get("profile"),
+        environment=raw.get("environment"),
     )
 
 
@@ -932,6 +1230,7 @@ def _run_harness(
             error=timed_run.error,
             stdout=timed_run.stdout,
             profile=profile_result,
+            environment=timed_run.environment,
         )
 
     harness_fd, harness_path = tempfile.mkstemp(suffix=".py", prefix="vsbench_harness_")
@@ -1130,6 +1429,7 @@ def _run_harness_in_process(
                 timing=timing_from_samples(samples),
                 error=errors[0] if errors else None,
                 stdout=captured_stdout,
+                environment=_environment_identity(),
             )
     finally:
         sys.stdout = original_stdout
@@ -1160,6 +1460,8 @@ def run_shootout(
     quiet: bool = False,
     scale: str | None = None,
     profile: bool = False,
+    geopandas_baseline: ShootoutRun | None = None,
+    geopandas_baseline_source: str | None = None,
 ) -> ShootoutResult:
     """Run a user script with geopandas and vibespatial, return comparison."""
     from vibespatial.runtime import has_gpu_runtime
@@ -1176,51 +1478,56 @@ def run_shootout(
         )
 
     # --- geopandas baseline command ---
-    if baseline_python:
-        gpd_cmd: list[str] = [baseline_python]
+    if geopandas_baseline is not None:
+        gpd_run = geopandas_baseline
+        baseline_mode = "reused"
     else:
-        uv = _find_uv()
-        if uv is None:
-            raise RuntimeError(
-                "uv not found. Install uv or use --baseline-python to "
-                "specify a Python interpreter with geopandas installed."
-            )
-        deps = ["geopandas", "pyarrow"]
-        if extra_deps:
-            deps.extend(dep for dep in extra_deps if dep not in deps)
-        with_args: list[str] = []
-        for dep in deps:
-            with_args.extend(["--with", dep])
-        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
-        gpd_cmd = [
-            uv,
-            "run",
-            "--isolated",
-            "--no-project",
-            "--python",
-            py_ver,
-            *with_args,
-            "--",
-            "python",
-        ]
+        if baseline_python:
+            gpd_cmd: list[str] = [baseline_python]
+        else:
+            uv = _find_uv()
+            if uv is None:
+                raise RuntimeError(
+                    "uv not found. Install uv or use --baseline-python to "
+                    "specify a Python interpreter with geopandas installed."
+                )
+            deps = ["geopandas", "pyarrow"]
+            if extra_deps:
+                deps.extend(dep for dep in extra_deps if dep not in deps)
+            with_args: list[str] = []
+            for dep in deps:
+                with_args.extend(["--with", dep])
+            py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+            gpd_cmd = [
+                uv,
+                "run",
+                "--isolated",
+                "--no-project",
+                "--python",
+                py_ver,
+                *with_args,
+                "--",
+                "python",
+            ]
 
-    gpd_env = os.environ.copy()
-    gpd_env.pop("_VIBESPATIAL_GEOPANDAS_COMPAT", None)
-    _set_repo_shim_precedence(gpd_env, enabled=False)
-    if scale is not None:
-        gpd_env["VSBENCH_SCALE"] = scale
+        gpd_env = os.environ.copy()
+        gpd_env.pop("_VIBESPATIAL_GEOPANDAS_COMPAT", None)
+        _set_repo_shim_precedence(gpd_env, enabled=False)
+        if scale is not None:
+            gpd_env["VSBENCH_SCALE"] = scale
 
-    gpd_run = _run_harness(
-        label="geopandas",
-        python_cmd=gpd_cmd,
-        script=script,
-        repeat=repeat,
-        warmup=warmup,
-        env=gpd_env,
-        timeout=timeout,
-        quiet=quiet,
-        profile=False,
-    )
+        gpd_run = _run_harness(
+            label="geopandas",
+            python_cmd=gpd_cmd,
+            script=script,
+            repeat=repeat,
+            warmup=warmup,
+            env=gpd_env,
+            timeout=timeout,
+            quiet=quiet,
+            profile=False,
+        )
+        baseline_mode = "measured"
 
     # --- vibespatial ---
     # The editable source root otherwise follows site-packages on sys.path, so
@@ -1260,11 +1567,6 @@ def run_shootout(
         )
         launch_mode = "in_process_retry"
 
-    # --- comparison ---
-    speedup = None
-    if gpd_run.timing.median_seconds > 0 and vs_run.timing.median_seconds > 0:
-        speedup = gpd_run.timing.median_seconds / vs_run.timing.median_seconds
-
     has_error = bool(gpd_run.error or vs_run.error)
     errors: list[str] = []
     if gpd_run.error:
@@ -1276,7 +1578,14 @@ def run_shootout(
     gpd_fp = _extract_fingerprint(gpd_run.stdout)
     vs_fp = _extract_fingerprint(vs_run.stdout)
     fingerprint_match: str | None = None
-    if gpd_fp and vs_fp:
+    if not gpd_fp or not vs_fp:
+        fingerprint_match = "missing"
+        if not gpd_fp:
+            errors.append("GeoPandas run has no correctness fingerprint")
+        if not vs_fp:
+            errors.append("current vibeSpatial run has no correctness fingerprint")
+        has_error = True
+    elif gpd_fp and vs_fp:
         if _fingerprints_match(gpd_fp, vs_fp):
             fingerprint_match = "match"
         else:
@@ -1285,11 +1594,34 @@ def run_shootout(
                 errors.append(f"fingerprint mismatch: geopandas={gpd_fp} vibespatial={vs_fp}")
                 has_error = True
 
+    # A cached timing is comparable only after the current result matches its
+    # correctness oracle. Never report a speedup for a failed comparison.
+    speedup = None
+    timing_comparable = not has_error and fingerprint_match == "match"
+    if (
+        timing_comparable
+        and gpd_run.timing.median_seconds > 0
+        and vs_run.timing.median_seconds > 0
+    ):
+        speedup = gpd_run.timing.median_seconds / vs_run.timing.median_seconds
+
     meta: dict[str, Any] = {
         "repeat": repeat,
         "warmup": warmup,
+        "timeout": timeout,
+        "measurement_sha256": _measurement_identity(),
         "physical_shapes": _infer_physical_shapes(script),
+        **shootout_workload_identity(script),
+        "geopandas_baseline": baseline_mode,
+        "geopandas_baseline_host": _baseline_host_identity(),
+        "geopandas_baseline_environment_sha256": (
+            _baseline_environment_sha256(gpd_run.environment)
+            if gpd_run.environment is not None
+            else None
+        ),
     }
+    if geopandas_baseline_source is not None:
+        meta["geopandas_baseline_source"] = geopandas_baseline_source
     if not warmup and repeat < 3:
         meta["measurement_mode"] = "cold_start_probe"
         meta["measurement_note"] = (

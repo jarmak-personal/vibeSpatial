@@ -1208,6 +1208,9 @@ def test_query_spatial_index_records_fallback_before_shapely_materialization(
             self.d_right = cp.asarray(np.array([0], dtype=np.int32))
             self.total_pairs = 1
 
+        def validate_error_flag(self) -> None:
+            return None
+
         def to_host(self):
             assert event_state["recorded"], "fallback event must be recorded before D2H candidate materialization"
             return np.array([0], dtype=np.int32), np.array([0], dtype=np.int32)
@@ -3789,19 +3792,24 @@ def _bounded_pair_aggregate_inputs(tmp_path):
     )
 
 
-def _record_pair_reduction_tile_sizes(monkeypatch, *, pair_budget: int = 2):
-    import vibespatial.spatial.point_grid_index as point_grid_module
+def _record_pair_reduction_tile_sizes(
+    monkeypatch,
+    *,
+    pair_budget: int = 2,
+):
+    import vibespatial.spatial.point_grid_index as provider_module
+    import vibespatial.spatial.point_partition as point_partition_module
     import vibespatial.spatial.spatial_index_device as device_module
 
     capacities = []
     tile_sizes = []
-    original_superset_query = point_grid_module.point_grid_superset_query
+    superset_name = "point_grid_superset_query"
+    original_superset_query = getattr(provider_module, superset_name)
     original_classifier = device_module._classify_homogeneous_reduction_tile
 
     def recording_superset_query(*args, **kwargs):
-        capacity = kwargs.get("pair_capacity")
-        if capacity is not None:
-            capacities.append(int(capacity))
+        query_slice = args[1]
+        capacities.append(int(query_slice.capacity))
         return original_superset_query(*args, **kwargs)
 
     def recording_classifier(*args, **kwargs):
@@ -3809,11 +3817,15 @@ def _record_pair_reduction_tile_sizes(monkeypatch, *, pair_budget: int = 2):
         return original_classifier(*args, **kwargs)
 
     monkeypatch.setattr(
-        point_grid_module,
-        "point_grid_superset_query",
+        provider_module,
+        superset_name,
         recording_superset_query,
     )
-    monkeypatch.setattr(point_grid_module, "_MIN_POINT_GRID_ROWS", 1)
+    monkeypatch.setattr(
+        point_partition_module,
+        "forced_point_partition_variant_for_testing",
+        lambda: point_partition_module.PointPartitionVariant.GRID,
+    )
     monkeypatch.setattr(
         device_module,
         "_classify_homogeneous_reduction_tile",
@@ -3828,6 +3840,139 @@ def _record_pair_reduction_tile_sizes(monkeypatch, *, pair_budget: int = 2):
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_pair_aggregate_excluded_predicate_skips_provider_preflight(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from vibespatial.api import GeoSeries
+    from vibespatial.spatial import spatial_index_device
+
+    pickup, dropoff = _bounded_pair_aggregate_inputs(tmp_path)
+    zones = GeoSeries([box(-1.0, -1.0, 21.0, 11.0)], crs=pickup.crs)
+
+    def _unexpected_preflight(*_args, **_kwargs):
+        raise AssertionError("within must route directly to the Morton reducer")
+
+    monkeypatch.setattr(
+        spatial_index_device,
+        "_paired_point_partition_preflight_selections",
+        _unexpected_preflight,
+    )
+    result = pickup.sindex.query_pair_aggregate(
+        dropoff.sindex,
+        zones,
+        predicate="within",
+    )
+
+    assert result.to_dict("list") == {
+        "left_count": [0] * 6,
+        "right_count": [0] * 6,
+        "shared_count": [0] * 6,
+    }
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_pair_aggregate_classifier_decline_cannot_retry_morton(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from vibespatial.api import GeoSeries
+    from vibespatial.spatial import point_partition, spatial_index_device
+
+    pickup, dropoff = _bounded_pair_aggregate_inputs(tmp_path)
+    zones = GeoSeries([box(-1.0, -1.0, 21.0, 11.0)], crs=pickup.crs)
+    monkeypatch.setattr(
+        point_partition,
+        "forced_point_partition_variant_for_testing",
+        lambda: point_partition.PointPartitionVariant.GRID,
+    )
+    monkeypatch.setattr(
+        spatial_index_device,
+        "_classify_homogeneous_reduction_tile",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def _unexpected_morton(*_args, **_kwargs):
+        raise AssertionError("a sealed provider plan must not retry Morton")
+
+    monkeypatch.setattr(
+        spatial_index_device,
+        "_prepare_morton_range_query",
+        _unexpected_morton,
+    )
+    with pytest.raises(RuntimeError, match="refusing a Morton retry"):
+        pickup.sindex.query_pair_aggregate(
+            dropoff.sindex,
+            zones,
+            predicate="contains",
+        )
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_pair_aggregate_waits_for_cross_stream_index_bounds(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import cupy as cp
+
+    from vibespatial.api import GeoSeries
+    from vibespatial.api._native_state import NativeStreamReadiness
+    from vibespatial.spatial import point_partition
+
+    pickup, dropoff = _bounded_pair_aggregate_inputs(tmp_path)
+    zones = GeoSeries([box(-1.0, -1.0, 21.0, 11.0)], crs=pickup.crs)
+    pickup_index = pickup.sindex
+    dropoff_index = dropoff.sindex
+    native_index = pickup_index._native_spatial_index_for_query()
+    pickup_bounds = native_index.metadata.bounds
+    valid_bounds = pickup_bounds.copy()
+    pickup_bounds.fill(cp.nan)
+    cp.cuda.get_current_stream().synchronize()
+
+    delay = cp.RawKernel(
+        r'''
+        extern "C" __global__ void point_partition_test_delay(
+            unsigned long long cycles
+        ) {
+            const unsigned long long start = clock64();
+            while (clock64() - start < cycles) { }
+        }
+        ''',
+        "point_partition_test_delay",
+    )
+    producer = cp.cuda.Stream(non_blocking=True)
+    with producer:
+        delay((1,), (1,), (np.uint64(50_000_000),))
+        cp.copyto(pickup_bounds, valid_bounds)
+        event = cp.cuda.Event(disable_timing=True)
+        event.record(producer)
+    readiness = NativeStreamReadiness(
+        stream=producer,
+        event=event,
+        ready=False,
+    )
+    object.__setattr__(native_index, "readiness", readiness)
+    monkeypatch.setattr(
+        point_partition,
+        "forced_point_partition_variant_for_testing",
+        lambda: point_partition.PointPartitionVariant.GRID,
+    )
+
+    result = pickup_index.query_pair_aggregate(
+        dropoff_index,
+        zones,
+        predicate="contains",
+    )
+    producer.synchronize()
+
+    assert result.to_dict("list") == {
+        "left_count": [1] * 6,
+        "right_count": [1] * 6,
+        "shared_count": [1] * 6,
+    }
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
 def test_sindex_query_pair_aggregate_reuses_only_shared_candidate_superset(
     tmp_path,
     monkeypatch,
@@ -3835,6 +3980,10 @@ def test_sindex_query_pair_aggregate_reuses_only_shared_candidate_superset(
     """Aligned point columns may have different conservative candidates."""
     from vibespatial.api import GeoDataFrame, GeoSeries, points_from_xy, read_parquet
     from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+    from vibespatial.spatial.point_partition import (
+        PointPartitionVariant,
+        force_point_partition_variant_for_testing,
+    )
 
     pickup_x = np.asarray([0.0, 10.0, 0.0, 10.0])
     pickup_y = np.asarray([0.0, 10.0, 10.0, 0.0])
@@ -3871,25 +4020,18 @@ def test_sindex_query_pair_aggregate_reuses_only_shared_candidate_superset(
         zones,
         predicate="contains",
     )
-    monkeypatch.setattr(
-        "vibespatial.spatial.point_grid_index._MIN_POINT_GRID_ROWS",
-        1 << 60,
-    )
-    forced_baseline = pickup.sindex.query_pair_aggregate(
-        dropoff.sindex,
-        zones,
-        predicate="contains",
-    )
-    monkeypatch.setattr(
-        "vibespatial.spatial.point_grid_index._MIN_POINT_GRID_ROWS",
-        1,
-    )
-    forced_alternative = pickup.sindex.query_pair_aggregate(
-        dropoff.sindex,
-        zones,
-        predicate="contains",
-    )
-
+    with force_point_partition_variant_for_testing(PointPartitionVariant.MORTON):
+        forced_baseline = pickup.sindex.query_pair_aggregate(
+            dropoff.sindex,
+            zones,
+            predicate="contains",
+        )
+    with force_point_partition_variant_for_testing(PointPartitionVariant.GRID):
+        forced_alternative = pickup.sindex.query_pair_aggregate(
+            dropoff.sindex,
+            zones,
+            predicate="contains",
+        )
     assert get_fallback_events(clear=True) == []
     expected = {
         "left_count": [1, 1, 1, 1],
@@ -3928,7 +4070,9 @@ def test_sindex_query_pair_aggregate_consumes_multiple_bounded_grid_partitions(
         ],
         crs=pickup.crs,
     )
-    capacities, tile_sizes = _record_pair_reduction_tile_sizes(monkeypatch)
+    capacities, tile_sizes = _record_pair_reduction_tile_sizes(
+        monkeypatch,
+    )
 
     clear_fallback_events()
     clear_materialization_events()
@@ -3946,7 +4090,7 @@ def test_sindex_query_pair_aggregate_consumes_multiple_bounded_grid_partitions(
         "shared_count": [1] * 6,
     }
     assert len(capacities) > 2
-    assert capacities and max(capacities) <= 2
+    assert max(capacities) <= 2
     assert tile_sizes and max(tile_sizes) <= 2
     assert not any(
         event.operation == "sindex_query_relation_indices_to_host"
@@ -3968,7 +4112,9 @@ def test_sindex_query_pair_aggregate_tiles_single_oversized_grid_row(
 
     pickup, dropoff = _bounded_pair_aggregate_inputs(tmp_path)
     zones = GeoSeries([box(-1.0, -1.0, 21.0, 11.0)], crs=pickup.crs)
-    capacities, tile_sizes = _record_pair_reduction_tile_sizes(monkeypatch)
+    capacities, tile_sizes = _record_pair_reduction_tile_sizes(
+        monkeypatch,
+    )
 
     clear_fallback_events()
     clear_materialization_events()

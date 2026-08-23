@@ -74,6 +74,26 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(skip_gpu)
 
 
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Quiesce CUDA compiler workers before pytest's final forced GC.
+
+    Pytest collects unraisable exceptions by forcing a full garbage collection
+    before Python's normal executor shutdown hooks run.  A short GPU test can
+    otherwise tear down CUDA-owned objects while a CCCL/NVRTC compiler worker
+    is still inside native code.
+    """
+    del session, exitstatus
+    from vibespatial.cuda.cccl_precompile import CCCLPrecompiler
+    from vibespatial.cuda.nvrtc_precompile import NVRTCPrecompiler
+
+    if CCCLPrecompiler._instance is not None:
+        CCCLPrecompiler.get().ensure_warm(timeout=120.0)
+    if NVRTCPrecompiler._instance is not None:
+        NVRTCPrecompiler.get().ensure_warm(timeout=120.0)
+    CCCLPrecompiler._reset()
+    NVRTCPrecompiler._reset()
+
+
 @pytest.fixture(scope="session")
 def cuda_available() -> bool:
     return cuda_runtime_available()

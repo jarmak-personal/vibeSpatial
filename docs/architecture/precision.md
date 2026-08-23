@@ -5,7 +5,7 @@ Scope: Dual fp32/fp64 compute strategy, runtime precision dispatch, and canonica
 Read If: You are designing kernel arithmetic, precision selection, or numerical policy.
 STOP IF: Your task already has a settled precision plan and only needs implementation detail.
 Source Of Truth: Phase-1 precision dispatch policy before owned kernel expansion.
-Body Budget: 110/240 lines
+Body Budget: 116/240 lines
 Document: docs/architecture/precision.md
 
 Section Map (Body Lines)
@@ -20,9 +20,9 @@ Section Map (Body Lines)
 | 38-47 | Canonical Rule |
 | 48-55 | Precision Modes |
 | 56-67 | Kernel Classes |
-| 68-84 | Default Policy |
-| 85-100 | What Staged fp32 Means |
-| 101-110 | Buffer And Signature Implications |
+| 68-90 | Default Policy |
+| 91-106 | What Staged fp32 Means |
+| 107-116 | Buffer And Signature Implications |
 DOC_HEADER:END -->
 
 Use dual compute precision with one canonical storage precision.
@@ -106,6 +106,12 @@ On consumer-style GPUs with weak fp64 throughput:
 - `metric`: staged fp32 with centered coordinates and compensated accumulation
 - `predicate`: staged fp32 for coarse work plus selective fp64 refinement for sensitive cases
 - `constructive`: stay on native fp64 until robustness work proves a cheaper safe path
+
+Conservative point-grid bounds are an explicit `coarse` exception: their
+registered `PrecisionPlan` is fp64 on every device. AUTO must not narrow these
+provider bounds because a rounded-in bbox can remove an exact-true predicate
+pair. The downstream exact predicate retains its own independent
+predicate-class plan.
 
 ## What Staged fp32 Means
 
