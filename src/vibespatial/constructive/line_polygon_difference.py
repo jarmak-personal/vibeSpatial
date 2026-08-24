@@ -8,7 +8,14 @@ except ModuleNotFoundError:  # pragma: no cover - CPU-only installs
     cp = None
 
 from vibespatial.api._native_rowset import NativeDeviceSelection
+from vibespatial.cuda._runtime import (
+    KERNEL_PARAM_I32,
+    KERNEL_PARAM_PTR,
+    compile_kernel_group,
+    get_cuda_runtime,
+)
 from vibespatial.cuda.cccl_primitives import PairSortStrategy, sort_pairs
+from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -18,6 +25,119 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
+
+from .line_polygon_difference_kernels import (
+    _LINE_POLYGON_INTERVAL_KERNEL_NAMES,
+    _LINE_POLYGON_INTERVAL_KERNEL_SOURCE,
+)
+
+request_nvrtc_warmup(
+    [
+        (
+            "line-polygon-interval-boundary",
+            _LINE_POLYGON_INTERVAL_KERNEL_SOURCE,
+            _LINE_POLYGON_INTERVAL_KERNEL_NAMES,
+        )
+    ]
+)
+
+
+def _line_polygon_interval_boundary_kernel():
+    return compile_kernel_group(
+        "line-polygon-interval-boundary",
+        _LINE_POLYGON_INTERVAL_KERNEL_SOURCE,
+        _LINE_POLYGON_INTERVAL_KERNEL_NAMES,
+    )["refine_line_polygon_boundary_intervals"]
+
+
+def _exact_boundary_interval_mask(
+    d_src_x,
+    d_src_y,
+    d_dst_x,
+    d_dst_y,
+    d_active,
+    right: OwnedGeometryArray,
+):
+    """Prove atomic source intervals coincident with one polygon edge."""
+    interval_count = int(d_active.size)
+    runtime = get_cuda_runtime()
+    admission = runtime.admit_device_memory(
+        stage="constructive.line_polygon.boundary_interval_refinement",
+        required_bytes=interval_count,
+        requested_units=interval_count,
+    )
+    if not admission.admitted:
+        raise MemoryError(
+            "line/polygon boundary refinement requires "
+            f"{interval_count} device bytes with {admission.remaining_bytes} available"
+        )
+    d_out = cp.zeros(interval_count, dtype=cp.bool_)
+    if interval_count == 0:
+        return d_out
+
+    state = right._ensure_device_state(preserve_indexed_view=True)
+    ptr = runtime.pointer
+    kernel = _line_polygon_interval_boundary_kernel()
+    grid, block = runtime.launch_config(kernel, interval_count)
+    for family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
+        buffer = state.families.get(family)
+        if buffer is None:
+            continue
+        runtime.launch(
+            kernel,
+            grid=grid,
+            block=block,
+            params=(
+                (
+                    ptr(d_src_x),
+                    ptr(d_src_y),
+                    ptr(d_dst_x),
+                    ptr(d_dst_y),
+                    ptr(d_active),
+                    ptr(state.validity),
+                    ptr(state.tags),
+                    ptr(state.family_row_offsets),
+                    ptr(buffer.geometry_offsets),
+                    ptr(buffer.part_offsets if buffer.part_offsets is not None else buffer.geometry_offsets),
+                    ptr(buffer.ring_offsets),
+                    ptr(buffer.empty_mask),
+                    ptr(buffer.x),
+                    ptr(buffer.y),
+                    ptr(d_out),
+                    interval_count,
+                    int(FAMILY_TAGS[family]),
+                    int(family is GeometryFamily.MULTIPOLYGON),
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_I32,
+                ),
+            ),
+        )
+    from vibespatial.cuda._runtime import get_cuda_completion_retainer
+
+    get_cuda_completion_retainer().defer(
+        cp.cuda.get_current_stream(),
+        (d_src_x, d_src_y, d_dst_x, d_dst_y, d_active, right, state, d_out),
+        lambda _owners: None,
+    )
+    return d_out
 
 
 def _capacity_points(d_x, d_y, d_active) -> OwnedGeometryArray:
@@ -450,6 +570,20 @@ def _lineal_split_constructive_topology_gpu(
                 or int(d_event_covered.size) != interval_capacity
             ):
                 return None
+            if right_shape == "polygonal":
+                # A materialized fp64 midpoint need not be exactly collinear
+                # with its source interval at large coordinate offsets.  Keep
+                # public PIP exact and repair only the constructive sampling
+                # ambiguity by proving that both atomic-interval endpoints lie
+                # on the same polygon edge with adaptive exact orientation.
+                d_interval_covered |= _exact_boundary_interval_mask(
+                    d_src_x,
+                    d_src_y,
+                    d_dst_x,
+                    d_dst_y,
+                    d_interval_active & ~d_interval_covered,
+                    interval_right,
+                )
             keep_inside = operation == "intersection"
             result = _assemble_lineal_capacity(
                 d_keep=(

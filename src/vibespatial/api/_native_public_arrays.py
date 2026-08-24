@@ -1393,7 +1393,12 @@ class NativeAttributeColumnArray(ExtensionArray):
                             )
                 except (ImportError, AttributeError, NotImplementedError):
                     pass
-        values = self._materialize_values().astype(cast_dtype, copy=copy)
+        materialized = self._materialize_values()
+        values = (
+            materialized.astype(cast_dtype, copy=copy)
+            if target_dtype is not None
+            else pd.array(materialized).astype(cast_dtype, copy=copy)
+        )
         if native_numeric_dtype is not None:
             return NativeNumericExpressionArray._from_sequence(
                 values,

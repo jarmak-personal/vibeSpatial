@@ -70,6 +70,7 @@ from vibespatial.runtime.precision import (  # noqa: E402
     select_precision_plan,
 )
 from vibespatial.runtime.residency import Residency, TransferTrigger  # noqa: E402
+from vibespatial.runtime.robustness import NumericalErrorEnvelope  # noqa: E402
 
 from .query_candidates import (  # noqa: E402
     _generate_candidates_gpu,
@@ -110,7 +111,12 @@ class _NearestMetricPrecisionContext:
 
     coarse_plan: PrecisionPlan
     refinement_plan: PrecisionPlan | None
-    fp32_error_bound: Any
+    error_envelope: NumericalErrorEnvelope
+
+    @property
+    def fp32_error_bound(self) -> Any:
+        """Compatibility alias for distance consumers during carrier rollout."""
+        return self.error_envelope.bound
 
     def refinement_context(self) -> _NearestMetricPrecisionContext:
         if self.refinement_plan is None:
@@ -118,7 +124,7 @@ class _NearestMetricPrecisionContext:
         return type(self)(
             coarse_plan=self.refinement_plan,
             refinement_plan=None,
-            fp32_error_bound=0.0,
+            error_envelope=NumericalErrorEnvelope.exact(quantity="distance"),
         )
 
 
@@ -198,7 +204,11 @@ def _plan_nearest_metric_precision(
     )
     coarse_plan = adaptive_plan.precision_plan
     if coarse_plan.compute_precision is not PrecisionMode.FP32:
-        return _NearestMetricPrecisionContext(coarse_plan, None, 0.0)
+        return _NearestMetricPrecisionContext(
+            coarse_plan,
+            None,
+            NumericalErrorEnvelope.exact(quantity="distance"),
+        )
 
     refinement_plan = select_precision_plan(
         runtime_selection=adaptive_plan.runtime_selection,
@@ -216,7 +226,16 @@ def _plan_nearest_metric_precision(
         * float(np.finfo(np.float32).eps)
         * max(coordinate_stats.span, 1.0)
     )
-    return _NearestMetricPrecisionContext(coarse_plan, refinement_plan, error_bound)
+    return _NearestMetricPrecisionContext(
+        coarse_plan,
+        refinement_plan,
+        NumericalErrorEnvelope(
+            bound=error_bound,
+            quantity="distance",
+            arithmetic_precision=PrecisionMode.FP32,
+            derivation="centered fp32 coordinate ulps plus point-segment projection arithmetic",
+        ),
+    )
 
 
 def _plan_device_resident_metric_precision(
@@ -247,7 +266,11 @@ def _plan_device_resident_metric_precision(
     )
     coarse_plan = adaptive_plan.precision_plan
     if coarse_plan.compute_precision is not PrecisionMode.FP32:
-        return _NearestMetricPrecisionContext(coarse_plan, None, 0.0)
+        return _NearestMetricPrecisionContext(
+            coarse_plan,
+            None,
+            NumericalErrorEnvelope.exact(quantity="distance"),
+        )
 
     refinement_plan = select_precision_plan(
         runtime_selection=adaptive_plan.runtime_selection,
@@ -258,7 +281,12 @@ def _plan_device_resident_metric_precision(
     return _NearestMetricPrecisionContext(
         coarse_plan=coarse_plan,
         refinement_plan=refinement_plan,
-        fp32_error_bound=_nearest_fp32_error_bound_device(query_owned, tree_owned),
+        error_envelope=NumericalErrorEnvelope(
+            bound=_nearest_fp32_error_bound_device(query_owned, tree_owned),
+            quantity="distance",
+            arithmetic_precision=PrecisionMode.FP32,
+            derivation="device-resident centered fp32 extent envelope",
+        ),
     )
 
 

@@ -5,7 +5,7 @@ Scope: Dual fp32/fp64 compute strategy, runtime precision dispatch, and canonica
 Read If: You are designing kernel arithmetic, precision selection, or numerical policy.
 STOP IF: Your task already has a settled precision plan and only needs implementation detail.
 Source Of Truth: Phase-1 precision dispatch policy before owned kernel expansion.
-Body Budget: 116/240 lines
+Body Budget: 122/240 lines
 Document: docs/architecture/precision.md
 
 Section Map (Body Lines)
@@ -14,15 +14,15 @@ Section Map (Body Lines)
 | 1-4 | Preamble |
 | 5-9 | Intent |
 | 10-19 | Request Signals |
-| 20-26 | Open First |
-| 27-31 | Verify |
-| 32-37 | Risks |
-| 38-47 | Canonical Rule |
-| 48-55 | Precision Modes |
-| 56-67 | Kernel Classes |
-| 68-90 | Default Policy |
-| 91-106 | What Staged fp32 Means |
-| 107-116 | Buffer And Signature Implications |
+| 20-27 | Open First |
+| 28-32 | Verify |
+| 33-38 | Risks |
+| 39-48 | Canonical Rule |
+| 49-56 | Precision Modes |
+| 57-68 | Kernel Classes |
+| 69-91 | Default Policy |
+| 92-112 | What Staged fp32 Means |
+| 113-122 | Buffer And Signature Implications |
 DOC_HEADER:END -->
 
 Use dual compute precision with one canonical storage precision.
@@ -48,6 +48,7 @@ execution before owned geometry buffers and kernels expand.
 - src/vibespatial/runtime/precision.py
 - docs/architecture/runtime.md
 - docs/decisions/0002-dual-precision-dispatch.md
+- docs/decisions/0048-bounded-accuracy-spatial-execution.md
 
 ## Verify
 
@@ -128,6 +129,11 @@ Rejected as defaults:
 - canonical fp32 coordinate storage
 - permanent dual fp32/fp64 buffer copies
 - pure fp32 constructive kernels without a later robustness proof
+
+Compute precision is not an accuracy authorization. `precision="fp32"` still
+owes the operation's exact robustness contract, including selective refinement.
+A future user-declared spatial error budget is a separate policy described by
+ADR-0048; it cannot be inferred from dtype or device class.
 
 ## Buffer And Signature Implications
 

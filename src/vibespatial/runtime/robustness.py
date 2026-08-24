@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 from .nulls import GeometryPresence
 from .precision import KernelClass, PrecisionMode, PrecisionPlan
@@ -35,6 +36,33 @@ class RobustnessPlan:
     handles_nulls: bool
     handles_empties: bool
     reason: str
+
+
+@dataclass(frozen=True)
+class NumericalErrorEnvelope:
+    """Conservative ambiguity bound carried between GPU planning stages.
+
+    ``bound`` may be a host scalar or a device scalar.  Consumers compare a
+    decision margin with this value and refine only decisions inside the
+    envelope.  The carrier deliberately describes numerical uncertainty, not
+    an accuracy preference: exact-mode consumers must still resolve every
+    ambiguous decision with their declared fallback.
+    """
+
+    bound: Any
+    quantity: str
+    arithmetic_precision: PrecisionMode
+    derivation: str
+    conservative: bool = True
+
+    @classmethod
+    def exact(cls, *, quantity: str) -> NumericalErrorEnvelope:
+        return cls(
+            bound=0.0,
+            quantity=quantity,
+            arithmetic_precision=PrecisionMode.FP64,
+            derivation="exact or already-refined decisions have zero remaining ambiguity",
+        )
 
 
 def select_robustness_plan(

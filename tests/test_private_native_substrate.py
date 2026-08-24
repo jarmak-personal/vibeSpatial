@@ -3120,6 +3120,159 @@ def test_native_grouped_from_device_sorted_offsets_stays_device_without_runtime_
     reset_d2h_transfer_count()
 
 
+def test_native_grouped_bounded_all_handles_dense_and_empty_segments() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for bounded grouped reducer probe")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    offsets = cp.asarray([0, 3, 3, 5, 8], dtype=cp.int64)
+    flags = cp.asarray(
+        [True, True, True, True, False, True, True, True],
+        dtype=cp.bool_,
+    )
+    grouped = NativeGrouped.from_dense_sorted_offsets(
+        offsets,
+        row_count=flags.size,
+        all_groups_observed=False,
+        group_size_min=0,
+        group_size_max=3,
+    )
+    reset_d2h_transfer_count()
+    with assert_zero_d2h_transfers():
+        reduced = grouped.reduce_boolean_all_bounded(flags)
+
+    assert reduced.is_device
+    assert int(reduced.values.nbytes) == grouped.resolved_group_count
+    assert cp.asnumpy(reduced.values).tolist() == [True, True, False, True]
+    reset_d2h_transfer_count()
+
+
+def test_native_grouped_bounded_all_drops_null_key_rows() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for bounded grouped null-key probe")
+    cp = pytest.importorskip("cupy")
+
+    grouped = NativeGrouped.from_dense_codes(
+        cp.asarray([0, -1, 1], dtype=cp.int32),
+        group_count=2,
+    )
+    reduced = grouped.reduce_boolean_all_bounded(
+        cp.asarray([True, False, True], dtype=cp.bool_),
+    )
+
+    reduced.validate_error_flag()
+    assert cp.asnumpy(reduced.values).tolist() == [True, True]
+
+
+def test_native_grouped_bounded_all_saturates_one_skewed_segment() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for bounded grouped skew probe")
+    cp = pytest.importorskip("cupy")
+
+    row_count = 1_000_000
+    offsets = cp.asarray([0, row_count], dtype=cp.int64)
+    flags = cp.ones(row_count, dtype=cp.bool_)
+    flags[-1] = False
+
+    reduced = NativeGrouped.reduce_boolean_all_from_sorted_offsets(
+        flags,
+        offsets,
+        row_count=row_count,
+        group_count=1,
+    )
+
+    assert cp.asnumpy(reduced.values).tolist() == [False]
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    (
+        [-1, 2, 3],
+        [0, 3, 2],
+        [0, 2, 4],
+        [1, 2, 3],
+        [0, 1, 2],
+    ),
+)
+def test_native_grouped_bounded_all_guards_malformed_offsets(offsets) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for guarded grouped-offset probe")
+    cp = pytest.importorskip("cupy")
+
+    reduced = NativeGrouped.reduce_boolean_all_from_sorted_offsets(
+        cp.asarray([True, False, True], dtype=cp.bool_),
+        cp.asarray(offsets, dtype=cp.int64),
+        row_count=3,
+        group_count=2,
+        source_token="malformed-offset-regression",
+    )
+
+    with pytest.raises(ValueError, match="malformed offsets"):
+        reduced.validate_error_flag()
+
+
+def test_native_grouped_bounded_all_rejects_nonempty_rows_with_zero_groups() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for zero-group coverage probe")
+    cp = pytest.importorskip("cupy")
+
+    with pytest.raises(ValueError, match="zero groups require zero source rows"):
+        NativeGrouped.reduce_boolean_all_from_sorted_offsets(
+            cp.asarray([False], dtype=cp.bool_),
+            cp.asarray([0], dtype=cp.int64),
+            row_count=1,
+            group_count=0,
+        )
+
+
+def test_native_grouped_bounded_all_rejects_int32_group_overflow() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for bounded grouped overflow probe")
+    cp = pytest.importorskip("cupy")
+
+    with pytest.raises(OverflowError, match="int32 capacity"):
+        NativeGrouped.reduce_boolean_all_from_sorted_offsets(
+            cp.empty(0, dtype=cp.bool_),
+            cp.asarray([0], dtype=cp.int64),
+            row_count=0,
+            group_count=int(np.iinfo(np.int32).max) + 1,
+        )
+
+
+def test_native_grouped_bounded_all_records_complete_output_admission() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for bounded grouped admission probe")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    runtime = get_cuda_runtime()
+    runtime.memory_admission_events(clear=True)
+    NativeGrouped.reduce_boolean_all_from_sorted_offsets(
+        cp.asarray([True, False, True], dtype=cp.bool_),
+        cp.asarray([0, 2, 3], dtype=cp.int64),
+        row_count=3,
+        group_count=2,
+    )
+    events = runtime.memory_admission_events(clear=True)
+
+    assert any(
+        event.stage == "native_grouped.boolean_all_dense_group_ids"
+        and event.required_bytes == 2 * np.dtype(np.int32).itemsize
+        and event.admitted
+        for event in events
+    )
+    assert any(
+        event.stage == "native_grouped.boolean_all_bounded"
+        and event.required_bytes >= 2
+        and event.admitted
+        for event in events
+    )
+
+
 def test_native_grouped_device_export_reports_runtime_d2h() -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for grouped export D2H accounting")
@@ -14150,6 +14303,32 @@ def test_attribute_cast_accepts_native_numeric_expression_dtype() -> None:
     assert isinstance(cast, NativeNumericExpressionArray)
     assert cast.dtype == np.dtype("float64")
     assert cast.to_numpy().tolist() == [1.0, 2.0]
+
+
+@pytest.mark.parametrize(
+    ("values", "dtype", "expected"),
+    [
+        ([1, None, 3], pd.Int64Dtype(), [1, pd.NA, 3]),
+        ([True, None, False], pd.BooleanDtype(), [True, pd.NA, False]),
+        (["a", None, "c"], pd.StringDtype(), ["a", pd.NA, "c"]),
+    ],
+)
+def test_attribute_cast_accepts_pandas_extension_dtype(
+    values: list[object],
+    dtype: object,
+    expected: list[object],
+) -> None:
+    from vibespatial.api._native_public_arrays import NativeAttributeColumnArray
+
+    source = NativeAttributeColumnArray(
+        NativeAttributeTable(dataframe=pd.DataFrame({"value": values})),
+        "value",
+    )
+
+    cast = source.astype(dtype)
+
+    assert cast.dtype == dtype
+    assert cast.equals(pd.array(expected, dtype=dtype))
 
 
 @pytest.mark.parametrize("use_native_dtype", [False, True])

@@ -1605,11 +1605,14 @@ def run_shootout(
     ):
         speedup = gpd_run.timing.median_seconds / vs_run.timing.median_seconds
 
+    from vibespatial.bench.provenance import source_identity
+
     meta: dict[str, Any] = {
         "repeat": repeat,
         "warmup": warmup,
         "timeout": timeout,
         "measurement_sha256": _measurement_identity(),
+        "vibespatial_source": source_identity(),
         "physical_shapes": _infer_physical_shapes(script),
         **shootout_workload_identity(script),
         "geopandas_baseline": baseline_mode,

@@ -8,10 +8,216 @@ import numpy as np
 import pandas as pd
 
 from vibespatial.api._native_rowset import NativeDeviceSelection, NativeIndexPlan
+from vibespatial.cuda._runtime import (
+    KERNEL_PARAM_I32,
+    KERNEL_PARAM_I64,
+    KERNEL_PARAM_PTR,
+    compile_kernel_group,
+    get_cuda_runtime,
+)
+from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 from vibespatial.runtime.materialization import (
     NativeExportBoundary,
     record_native_export_boundary,
 )
+
+from ._native_grouped_kernels import (
+    _NATIVE_GROUPED_BOUNDED_KERNEL_NAMES,
+    _NATIVE_GROUPED_BOUNDED_KERNEL_SOURCE,
+)
+
+request_nvrtc_warmup(
+    [
+        (
+            "native-grouped-bounded",
+            _NATIVE_GROUPED_BOUNDED_KERNEL_SOURCE,
+            _NATIVE_GROUPED_BOUNDED_KERNEL_NAMES,
+        )
+    ]
+)
+
+
+def _native_grouped_bounded_kernels():
+    return compile_kernel_group(
+        "native-grouped-bounded",
+        _NATIVE_GROUPED_BOUNDED_KERNEL_SOURCE,
+        _NATIVE_GROUPED_BOUNDED_KERNEL_NAMES,
+    )
+
+
+def _bounded_u8_min_from_offsets(
+    values: Any,
+    offsets: Any,
+    group_ids: Any,
+    *,
+    group_count: int,
+    sorted_order: Any | None = None,
+    group_validity: Any | None = None,
+):
+    """Launch the admitted warp-segment byte-min reducer."""
+    import cupy as cp
+
+    int_max = int(np.iinfo(np.int32).max)
+    resolved_group_count = int(group_count)
+    if resolved_group_count < 0 or resolved_group_count > int_max:
+        raise OverflowError("bounded grouped all group_count exceeds int32 capacity")
+    observed_group_count = _array_size(group_ids)
+    if observed_group_count > int_max:
+        raise OverflowError("bounded grouped all observed group count exceeds int32 capacity")
+    if _array_size(offsets) != observed_group_count + 1:
+        raise ValueError("bounded grouped all offsets must match observed groups")
+    if group_validity is not None and _array_size(group_validity) != observed_group_count:
+        raise ValueError("bounded grouped all validity must match observed groups")
+    value_row_count = _array_size(values)
+    ordered_row_count = (
+        value_row_count if sorted_order is None else _array_size(sorted_order)
+    )
+
+    offset_cast_bytes = (
+        0
+        if np.dtype(_normalized_dtype(offsets)) == np.dtype(np.int64)
+        else (observed_group_count + 1) * np.dtype(np.int64).itemsize
+    )
+    group_id_cast_bytes = (
+        0
+        if np.dtype(_normalized_dtype(group_ids)) == np.dtype(np.int32)
+        else observed_group_count * np.dtype(np.int32).itemsize
+    )
+    order_cast_bytes = (
+        0
+        if sorted_order is None
+        or np.dtype(_normalized_dtype(sorted_order)) == np.dtype(np.int64)
+        else _array_size(sorted_order) * np.dtype(np.int64).itemsize
+    )
+    required_bytes = (
+        resolved_group_count
+        + offset_cast_bytes
+        + group_id_cast_bytes
+        + order_cast_bytes
+        + np.dtype(np.uint32).itemsize
+    )
+    runtime = get_cuda_runtime()
+    admission = runtime.admit_device_memory(
+        stage="native_grouped.boolean_all_bounded",
+        required_bytes=required_bytes,
+        requested_units=resolved_group_count,
+    )
+    if not admission.admitted:
+        raise MemoryError(
+            "bounded grouped all requires "
+            f"{required_bytes} device bytes with {admission.remaining_bytes} available"
+        )
+
+    d_values = cp.asarray(values)
+    d_offsets = cp.asarray(offsets, dtype=cp.int64)
+    d_group_ids = cp.asarray(group_ids, dtype=cp.int32)
+    d_order = None if sorted_order is None else cp.asarray(sorted_order, dtype=cp.int64)
+    d_group_validity = (
+        None if group_validity is None else cp.asarray(group_validity, dtype=cp.bool_)
+    )
+    d_out = cp.ones(resolved_group_count, dtype=cp.bool_)
+    d_error = cp.zeros(1, dtype=cp.uint32)
+    if observed_group_count == 0:
+        if ordered_row_count != 0:
+            raise ValueError("bounded grouped all zero groups require zero ordered rows")
+        return d_out, d_error
+    kernel = _native_grouped_bounded_kernels()["segmented_u8_min_bounded_warp"]
+    threads = 256
+    warps_per_block = threads // 32
+    grid = ((observed_group_count + warps_per_block - 1) // warps_per_block, 1, 1)
+    block = (threads, 1, 1)
+    runtime.launch(
+        kernel,
+        grid=grid,
+        block=block,
+        params=(
+            (
+                runtime.pointer(d_values),
+                runtime.pointer(d_offsets),
+                runtime.pointer(d_order),
+                runtime.pointer(d_group_ids),
+                runtime.pointer(d_group_validity),
+                runtime.pointer(d_out),
+                runtime.pointer(d_error),
+                ordered_row_count,
+                value_row_count,
+                observed_group_count,
+                resolved_group_count,
+                1,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I64,
+                KERNEL_PARAM_I64,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+    from vibespatial.cuda._runtime import get_cuda_completion_retainer
+
+    get_cuda_completion_retainer().defer(
+        cp.cuda.get_current_stream(),
+        (d_values, d_offsets, d_order, d_group_ids, d_group_validity, d_out, d_error),
+        lambda _owners: None,
+    )
+    return d_out, d_error
+
+
+def _map_bounded_grouped_boolean_rows(
+    values: Any,
+    left_validity: Any,
+    left_tags: Any,
+    family_rows: Any,
+    right_validity: Any,
+    *,
+    row_count: int,
+    family_tag: int,
+):
+    """Map physical grouped values to logical rows in one bounded launch."""
+    import cupy as cp
+
+    d_out = cp.empty(int(row_count), dtype=cp.bool_)
+    if row_count == 0:
+        return d_out
+    runtime = get_cuda_runtime()
+    kernel = _native_grouped_bounded_kernels()["map_grouped_bool_rows_bounded"]
+    grid, block = runtime.launch_config(kernel, int(row_count))
+    runtime.launch(
+        kernel,
+        grid=grid,
+        block=block,
+        params=(
+            (
+                runtime.pointer(values),
+                runtime.pointer(left_validity),
+                runtime.pointer(left_tags),
+                runtime.pointer(family_rows),
+                runtime.pointer(right_validity),
+                runtime.pointer(d_out),
+                int(row_count),
+                int(family_tag),
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+    return d_out
 
 
 def _is_device_array(values: Any) -> bool:
@@ -273,12 +479,30 @@ class NativeGroupedReduction:
     reducer: str
     group_count: int
     output_index_plan: NativeIndexPlan | None = None
+    error_flag: Any | None = None
+    source_token: str | None = None
 
     @property
     def is_device(self) -> bool:
         return _is_device_array(self.values)
 
+    def validate_error_flag(self) -> None:
+        """Propagate guarded device offset/order faults at a consumer fence."""
+        if self.error_flag is None:
+            return
+        fault = int(
+            get_cuda_runtime().copy_device_to_host(
+                self.error_flag,
+                reason="native grouped guarded-offset fault validation planning packet",
+            )[0]
+        )
+        if fault:
+            raise ValueError(
+                "bounded grouped all received malformed offsets, group IDs, or sorted order"
+            )
+
     def to_pandas(self, *, name: str | None = None) -> pd.Series:
+        self.validate_error_flag()
         if isinstance(self.values, pd.Series):
             from vibespatial.api._native_public_arrays import NativeAttributeColumnArray
 
@@ -1021,6 +1245,103 @@ class NativeGrouped:
             reducer=normalized,
             group_count=self.resolved_group_count,
             output_index_plan=self.output_index_plan,
+        )
+
+    def reduce_boolean_all_bounded(self, values: Any) -> NativeGroupedReduction:
+        """Reduce device booleans with output-sized scratch.
+
+        Physical shape: one segment per observed group and one pass over each
+        source row in sorted group order.  Peak new storage is exactly one byte
+        per output group; unlike histogram/bincount lowering it does not scale
+        scratch with ``row_count * group_count``.  Empty groups use the logical
+        ``all`` identity (True).
+        """
+        if not self.is_device or not _is_device_array(values):
+            raise TypeError("bounded grouped all requires device group state and values")
+        if _array_size(values) != _array_size(self.group_codes):
+            raise ValueError("bounded grouped all values length must match group codes")
+        if not np.issubdtype(_normalized_dtype(values), np.bool_):
+            raise TypeError("bounded grouped all admits only bool values")
+
+        group_count = self.resolved_group_count
+        d_out, d_error = _bounded_u8_min_from_offsets(
+            values,
+            self.group_offsets,
+            self.group_ids,
+            group_count=group_count,
+            sorted_order=None if self.sorted_order_is_identity else self.sorted_order,
+        )
+        return NativeGroupedReduction(
+            values=d_out,
+            reducer="all",
+            group_count=group_count,
+            output_index_plan=self.output_index_plan,
+            error_flag=d_error,
+        )
+
+    @classmethod
+    def reduce_boolean_all_from_sorted_offsets(
+        cls,
+        values: Any,
+        group_offsets: Any,
+        *,
+        row_count: int,
+        group_count: int,
+        source_token: str | None = None,
+        output_index_plan: NativeIndexPlan | None = None,
+        group_validity: Any | None = None,
+    ) -> NativeGroupedReduction:
+        """Reduce identity-sorted device values without materializing codes.
+
+        This is the zero-overhead carrier entry point for geometry layouts that
+        already own authoritative dense offsets.  Validation is structural and
+        host-known; offsets and values remain device-resident.
+        """
+        if not _is_device_array(values) or not _is_device_array(group_offsets):
+            raise TypeError("offset-native bounded grouped all requires device arrays")
+        resolved_group_count = int(group_count)
+        if resolved_group_count < 0 or resolved_group_count > int(np.iinfo(np.int32).max):
+            raise OverflowError("offset-native bounded grouped all exceeds int32 capacity")
+        if int(row_count) < 0 or int(row_count) > int(np.iinfo(np.int64).max):
+            raise OverflowError("offset-native bounded grouped all row_count exceeds int64 capacity")
+        if _array_size(values) != int(row_count):
+            raise ValueError("offset-native bounded grouped all row_count mismatch")
+        if _array_size(group_offsets) != resolved_group_count + 1:
+            raise ValueError("offset-native bounded grouped all offsets mismatch")
+        if resolved_group_count == 0 and int(row_count) != 0:
+            raise ValueError("bounded grouped all zero groups require zero source rows")
+        if group_validity is not None and _array_size(group_validity) != resolved_group_count:
+            raise ValueError("offset-native bounded grouped all validity mismatch")
+        if not np.issubdtype(_normalized_dtype(values), np.bool_):
+            raise TypeError("offset-native bounded grouped all admits only bool values")
+        import cupy as cp
+
+        group_id_bytes = resolved_group_count * np.dtype(np.int32).itemsize
+        admission = get_cuda_runtime().admit_device_memory(
+            stage="native_grouped.boolean_all_dense_group_ids",
+            required_bytes=group_id_bytes,
+            requested_units=resolved_group_count,
+        )
+        if not admission.admitted:
+            raise MemoryError(
+                "offset-native bounded grouped all group IDs require "
+                f"{group_id_bytes} device bytes with {admission.remaining_bytes} available"
+            )
+        d_group_ids = cp.arange(resolved_group_count, dtype=cp.int32)
+        d_out, d_error = _bounded_u8_min_from_offsets(
+            values,
+            group_offsets,
+            d_group_ids,
+            group_count=resolved_group_count,
+            group_validity=group_validity,
+        )
+        return NativeGroupedReduction(
+            values=d_out,
+            reducer="all",
+            group_count=resolved_group_count,
+            output_index_plan=output_index_plan,
+            error_flag=d_error,
+            source_token=source_token,
         )
 
     def reduce_expression(self, expression: Any, reducer: str) -> NativeGroupedReduction:

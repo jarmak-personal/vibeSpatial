@@ -12,7 +12,7 @@ from vibespatial import (
     TopologyPolicy,
     select_precision_plan,
 )
-from vibespatial.runtime.robustness import select_robustness_plan
+from vibespatial.runtime.robustness import NumericalErrorEnvelope, select_robustness_plan
 
 
 def gpu_selection() -> RuntimeSelection:
@@ -78,3 +78,19 @@ def test_all_robustness_plans_keep_null_and_empty_semantics() -> None:
 
     assert plan.handles_nulls is True
     assert plan.handles_empties is True
+
+
+def test_numerical_error_envelope_carries_host_or_device_bounds_without_changing_semantics() -> None:
+    device_bound = object()
+    envelope = NumericalErrorEnvelope(
+        bound=device_bound,
+        quantity="distance",
+        arithmetic_precision=PrecisionMode.FP32,
+        derivation="test conservative device reduction",
+    )
+    exact = NumericalErrorEnvelope.exact(quantity="orientation-sign")
+
+    assert envelope.bound is device_bound
+    assert envelope.conservative is True
+    assert exact.bound == 0.0
+    assert exact.arithmetic_precision is PrecisionMode.FP64

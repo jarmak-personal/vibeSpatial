@@ -664,6 +664,104 @@ def _point_in_polygon_kernels(compute_type: str = "double"):
     )
 
 
+def classify_point_coordinates_single_region_device(
+    point_x,
+    point_y,
+    regions: OwnedGeometryArray,
+    *,
+    region_family: GeometryFamily,
+    region_row: int = 0,
+    compute_type: str = "double",
+):
+    """Classify raw device coordinates against one polygonal family row.
+
+    Physical shape: one coordinate per thread, one reused region, and one byte
+    of output per coordinate.  This avoids constructing point geometries or an
+    N-row broadcast index when a grouped polygon consumer already owns flat
+    coordinate buffers and authoritative offsets.
+    """
+    if region_family not in {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}:
+        raise ValueError("single-region coordinate PIP requires a polygonal family")
+    if compute_type not in {"float", "double"}:
+        raise ValueError("single-region coordinate PIP compute_type must be float or double")
+
+    import cupy as cp
+
+    d_x = cp.asarray(point_x, dtype=cp.float64)
+    d_y = cp.asarray(point_y, dtype=cp.float64)
+    if d_x.ndim != 1 or d_y.ndim != 1 or int(d_x.size) != int(d_y.size):
+        raise ValueError("single-region coordinate PIP requires aligned one-dimensional arrays")
+    point_count = int(d_x.size)
+    runtime = get_cuda_runtime()
+    region_state = regions._ensure_device_state(preserve_indexed_view=True)
+    region_buffer = region_state.families[region_family]
+    if region_buffer.bounds is None:
+        region_buffer.bounds = runtime.allocate(
+            (int(region_buffer.empty_mask.size), 4),
+            cp.float64,
+        )
+        _launch_family_bounds_kernel(
+            region_family,
+            region_buffer,
+            row_count=int(region_buffer.empty_mask.size),
+        )
+    d_out = runtime.allocate((point_count,), cp.bool_)
+    if point_count == 0:
+        return _wrap_device_result_with_keepalive(d_out, d_x, d_y, regions)
+
+    ptr = runtime.pointer
+    args = [
+        ptr(d_x),
+        ptr(d_y),
+        ptr(region_buffer.bounds),
+        ptr(region_buffer.empty_mask),
+        ptr(region_buffer.geometry_offsets),
+    ]
+    types = [KERNEL_PARAM_PTR] * len(args)
+    if region_family is GeometryFamily.MULTIPOLYGON:
+        args.append(ptr(region_buffer.part_offsets))
+        types.append(KERNEL_PARAM_PTR)
+    args.extend(
+        [
+            ptr(region_buffer.ring_offsets),
+            ptr(region_buffer.x),
+            ptr(region_buffer.y),
+            ptr(d_out),
+            point_count,
+            int(region_row),
+            0.0,
+            0.0,
+        ]
+    )
+    types.extend(
+        [
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_F64,
+        ]
+    )
+    kernel_name = (
+        "point_coordinates_in_single_polygon"
+        if region_family is GeometryFamily.POLYGON
+        else "point_coordinates_in_single_multipolygon"
+    )
+    kernel = _point_in_polygon_kernels(compute_type)[kernel_name]
+    grid, block = runtime.launch_config(kernel, point_count)
+    runtime.launch(
+        kernel,
+        grid=grid,
+        block=block,
+        params=(tuple(args), tuple(types)),
+        stream=_current_cuda_stream(),
+    )
+    return _wrap_device_result_with_keepalive(d_out, d_x, d_y, regions)
+
+
 def _to_python_result(values) -> list[bool | None]:
     return _to_python_result_host(values)
 
@@ -1245,13 +1343,14 @@ def _evaluate_point_in_polygon_gpu(
     right_array = right.geometry_array
     assert right_array is not None
 
-    # Predicate fp32 is admissible only when its selective-fp64 refinement is
-    # implemented. Until that stage exists, execute the authoritative fp64
-    # kernel instead of silently returning unrefined ray-parity decisions.
+    # The fp32 variant uses a conservative determinant envelope and invokes
+    # the authoritative adaptive fp64 sign only for ambiguous edges.  Public
+    # topology remains exact; precision selects the fast filtering stage.
     use_fp32 = bool(
         precision_plan is not None
         and precision_plan.compute_precision is PrecisionMode.FP32
-        and precision_plan.refinement is RefinementMode.NONE
+        and precision_plan.refinement
+        in {RefinementMode.SELECTIVE_FP64, RefinementMode.EXACT}
     )
     compute_type = "float" if use_fp32 else "double"
     timings["compute_type"] = compute_type
@@ -1260,7 +1359,7 @@ def _evaluate_point_in_polygon_gpu(
         and precision_plan.compute_precision is PrecisionMode.FP32
         and not use_fp32
     ):
-        timings["precision_rewrite"] = "fp32-selective-refine->fp64"
+        timings["precision_rewrite"] = "fp32-plan-not-selectively-refinable->fp64"
 
     # Compute center for coordinate centering.
     center_x, center_y = _compute_pip_center(points, right_array)

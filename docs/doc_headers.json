@@ -64,6 +64,34 @@
       "sourceOfTruth": "Active execution plan for evidence-driven point-region optimization and the gate for any future reusable device planner.",
       "maxBodyLines": 500
     },
+    "docs/dev/convex-region-predicate-execution-plan.md": {
+      "scope": "Evidence-first plan for certifying convex hole-free polygonal regions and lowering exact containment predicates to grouped point classification through existing public APIs.",
+      "readIf": "You are changing polygon containment predicates, reusable geometry shape metadata, grouped point-in-region execution, or evaluating a quadtree/grid/Morton provider for polygon vertices.",
+      "stopIf": "You are designing approximate arithmetic or user-visible accuracy tolerances; use the bounded-accuracy plan instead.",
+      "sourceOfTruth": "Active implementation and evidence plan for the exact convex-region predicate fast path.",
+      "maxBodyLines": 360
+    },
+    "docs/dev/convex-region-predicate-experiment-review.md": {
+      "scope": "RTX 4090 experiment findings and production recommendation for exact convex containing-region predicate lowering.",
+      "readIf": "You are deciding whether to implement grouped vertex containment, choose a point-partition provider, or reuse convex certification.",
+      "stopIf": "You need the forward implementation sequence; use the convex-region predicate execution plan.",
+      "sourceOfTruth": "Reviewed summary of the 2026-08-23 convex-region experiment capsule.",
+      "maxBodyLines": 210
+    },
+    "docs/dev/bounded-accuracy-execution-plan.md": {
+      "scope": "Research, ADR, API, and implementation plan for explicit user-authorized spatial error budgets that may admit lower-precision GPU execution while preserving exact behavior by default.",
+      "readIf": "You are designing approximate predicates or metrics, user accuracy thresholds, fp32/fp16 execution without exact refinement, or tolerance-aware dispatch.",
+      "stopIf": "You only need exact convex polygon certification or existing exact staged-fp32 behavior.",
+      "sourceOfTruth": "Active plan for defining and proving a public bounded-accuracy execution contract.",
+      "maxBodyLines": 390
+    },
+    "docs/dev/bounded-accuracy-experiment-review.md": {
+      "scope": "RTX 4090 numerical and performance findings for explicit user-authorized point-region predicate and distance error budgets.",
+      "readIf": "You are deciding whether to write the accuracy-budget ADR, expose approximate execution, or implement fp32 refinement envelopes.",
+      "stopIf": "You need exact convex containment design; use the convex-region predicate documents.",
+      "sourceOfTruth": "Reviewed summary of the 2026-08-23 bounded-accuracy experiment capsule.",
+      "maxBodyLines": 210
+    },
     "docs/dev/libcuspatial-quadtree-pip-benchmark-plan.md": {
       "scope": "Source-study and benchmark plan for testing libcuSpatial-inspired point-space partitioning ideas inside vibeSpatial's public point-region shapes.",
       "readIf": "You are studying the archived cuSpatial quadtree PIP algorithm, testing equivalent vS physical shapes, or reviewing SF100 Q10/Q11 point-region evidence.",

@@ -4,11 +4,8 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
-import platform
-import subprocess
 import tempfile
 import time
 from contextlib import nullcontext
@@ -80,77 +77,12 @@ def _device_memory_snapshot() -> dict[str, Any]:
 
 def _source_identity() -> dict[str, Any]:
     """Identify the imported source tree, including PYTHONPATH worktrees."""
-    import vibespatial
+    from vibespatial.bench.provenance import source_identity
 
-    source_file = Path(vibespatial.__file__).resolve()
-    repository = source_file.parents[2]
-
-    def _git(*args: str) -> subprocess.CompletedProcess[str] | None:
-        try:
-            return subprocess.run(
-                ("git", "-C", str(repository), *args),
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-
-    revision_result = _git("rev-parse", "HEAD")
-    status_result = _git("status", "--porcelain", "--untracked-files=no")
-    diff_result = _git(
-        "diff",
-        "--no-ext-diff",
-        "HEAD",
-        "--",
-        "src",
-        "scripts",
-        "benchmarks",
-    )
-    untracked_result = _git(
-        "ls-files",
-        "--others",
-        "--exclude-standard",
-        "--",
-        "src",
-        "scripts",
-        "benchmarks",
-    )
-    untracked_source_files = (
-        sorted(filter(None, untracked_result.stdout.splitlines()))
-        if untracked_result is not None and untracked_result.returncode == 0
-        else []
-    )
-    source_fingerprint = None
-    if diff_result is not None and diff_result.returncode == 0:
-        digest = hashlib.sha256(diff_result.stdout.encode("utf-8"))
-        for relative_path in untracked_source_files:
-            path = repository / relative_path
-            if not path.is_file():
-                continue
-            digest.update(relative_path.encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(path.read_bytes())
-        source_fingerprint = digest.hexdigest()
-    return {
-        "package_version": str(getattr(vibespatial, "__version__", "unknown")),
-        "source_file": str(source_file),
-        "git_revision": (
-            revision_result.stdout.strip()
-            if revision_result is not None and revision_result.returncode == 0
-            else None
-        ),
-        "tracked_worktree_dirty": (
-            bool(status_result.stdout.strip())
-            if status_result is not None and status_result.returncode == 0
-            else None
-        ),
-        "untracked_source_files": untracked_source_files,
-        "worktree_source_sha256": source_fingerprint,
-        "python_version": platform.python_version(),
-        "cupy_version": __import__("cupy").__version__,
-    }
+    identity = source_identity()
+    identity["tracked_worktree_dirty"] = identity["tracked_source_dirty"]
+    identity["cupy_version"] = __import__("cupy").__version__
+    return identity
 
 
 def _circle(vertex_count: int) -> Polygon:

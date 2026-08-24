@@ -5,7 +5,7 @@ Scope: Architecture decision log and index of accepted or superseded ADRs.
 Read If: You are resolving, revisiting, or querying a design decision.
 STOP IF: You already have the specific ADR open and do not need the index.
 Source Of Truth: Decision log for architecture choices.
-Body Budget: 87/220 lines
+Body Budget: 88/220 lines
 Document: docs/decisions/index.md
 
 Section Map (Body Lines)
@@ -17,7 +17,7 @@ Section Map (Body Lines)
 | 17-26 | Open First |
 | 27-31 | Verify |
 | 32-36 | Risks |
-| 37-87 | Decisions |
+| 37-88 | Decisions |
 DOC_HEADER:END -->
 
 Use this index to find accepted architecture decisions.
@@ -105,3 +105,4 @@ Track architecture decisions in a stable, agent-discoverable format.
 | `ADR-0045` | accepted | 2026-04-25 | [Transient Native Work Budget](docs/decisions/0045-transient-native-work-budget.md) |
 | `ADR-0046` | accepted | 2026-04-26 | [GPU Physical Workload Shape Contracts](docs/decisions/0046-gpu-physical-workload-shape-contracts.md) |
 | `ADR-0047` | superseded | 2026-08-18 | [Capability-Driven Device Execution Planning](docs/decisions/0047-device-execution-planning.md) |
+| `ADR-0048` | accepted | 2026-08-23 | [Bounded-Accuracy Spatial Execution](docs/decisions/0048-bounded-accuracy-spatial-execution.md) |

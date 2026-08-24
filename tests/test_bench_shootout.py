@@ -595,6 +595,9 @@ def test_run_shootout_reuses_geopandas_baseline_without_launching_it(
     assert result.speedup == 2.0
     assert result.metadata["geopandas_baseline"] == "reused"
     assert result.metadata["geopandas_baseline_source"] == "baseline.json"
+    source_identity = result.metadata["vibespatial_source"]
+    assert source_identity["git_revision"]
+    assert len(source_identity["worktree_source_sha256"]) == 64
 
 
 def test_run_shootout_reused_baseline_requires_current_fingerprint(

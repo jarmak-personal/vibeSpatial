@@ -9,7 +9,10 @@ Extracted from point_in_polygon.py -- dispatch logic remains there.
 
 from __future__ import annotations
 
-from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
+from vibespatial.cuda.device_functions.numerical_envelope import (
+    ORIENT2D_FP32_ENVELOPE_DEVICE,
+)
+from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
 
 # The device function strings use raw braces and must NOT pass through
 # .format().  They are concatenated in _format_pip_kernel_source() instead.
@@ -18,7 +21,7 @@ typedef {compute_type} compute_t;
 
 #define CX(val) ((compute_t)((val) - center_x))
 #define CY(val) ((compute_t)((val) - center_y))
-#define PIP_BOUNDARY_TOLERANCE 1e-7
+#define PIP_USE_FP32_ENVELOPE {use_fp32_envelope}
 
 extern "C" __device__ inline compute_t vibespatial_abs(compute_t value) {{
   return value < (compute_t)0.0 ? -value : value;
@@ -29,8 +32,6 @@ extern "C" __device__ inline compute_t vibespatial_max(compute_t left, compute_t
 }}
 
 extern "C" __device__ inline bool ring_contains_even_odd(
-    compute_t px,
-    compute_t py,
     double raw_px,
     double raw_py,
     const double* x,
@@ -46,18 +47,34 @@ extern "C" __device__ inline bool ring_contains_even_odd(
   for (int i = coord_start, j = coord_end - 1; i < coord_end; j = i++) {{
     const double raw_ax = x[j], raw_ay = y[j];
     const double raw_bx = x[i], raw_by = y[i];
-    if (vs_point_on_segment(
-            raw_px, raw_py, raw_ax, raw_ay, raw_bx, raw_by,
-            PIP_BOUNDARY_TOLERANCE)) {{
+    const bool crosses_ray = (raw_ay > raw_py) != (raw_by > raw_py);
+    const double minx = fmin(raw_ax, raw_bx);
+    const double maxx = fmax(raw_ax, raw_bx);
+    const bool boundary_bbox =
+        raw_py >= fmin(raw_ay, raw_by) && raw_py <= fmax(raw_ay, raw_by)
+        && raw_px >= minx && raw_px <= maxx;
+    if (!crosses_ray && !boundary_bbox) {{
+      continue;
+    }}
+    if (crosses_ray && raw_px < minx) {{
+      inside = !inside;
+      continue;
+    }}
+    if (crosses_ray && raw_px > maxx) {{
+      continue;
+    }}
+    bool refined = false;
+    const int orientation = PIP_USE_FP32_ENVELOPE
+        ? vs_orient2d_selective_fp32(
+            raw_ax, raw_ay, raw_bx, raw_by, raw_px, raw_py, &refined)
+        : vs_orient2d(raw_ax, raw_ay, raw_bx, raw_by, raw_px, raw_py);
+    (void)refined;
+    if (boundary_bbox && orientation == 0) {{
       *on_boundary = true;
       return true;
     }}
-    const compute_t ax = CX(raw_ax), ay = CY(raw_ay);
-    const compute_t bx = CX(raw_bx), by = CY(raw_by);
-    if ((ay > py) != (by > py)) {{
-      if (px < (bx - ax) * (py - ay) / (by - ay) + ax) {{
-        inside = !inside;
-      }}
+    if (crosses_ray && ((orientation > 0) == (raw_by > raw_ay))) {{
+      inside = !inside;
     }}
   }}
   return inside;
@@ -84,7 +101,7 @@ extern "C" __device__ inline bool polygon_contains_point(
     const int coord_start = ring_offsets[ring];
     const int coord_end = ring_offsets[ring + 1];
     const bool ring_inside = ring_contains_even_odd(
-        px, py, raw_px, raw_py, x, y, center_x, center_y,
+        raw_px, raw_py, x, y, center_x, center_y,
         coord_start, coord_end, &on_boundary);
     if (on_boundary) {{
       return true;
@@ -121,7 +138,7 @@ extern "C" __device__ inline bool multipolygon_contains_point(
       const int coord_start = ring_offsets[ring];
       const int coord_end = ring_offsets[ring + 1];
       const bool ring_inside = ring_contains_even_odd(
-          px, py, raw_px, raw_py, x, y, center_x, center_y,
+          raw_px, raw_py, x, y, center_x, center_y,
           coord_start, coord_end, &on_boundary);
       if (on_boundary) {{
         return true;
@@ -597,16 +614,82 @@ extern "C" __global__ void point_in_polygon_fused(
     ) ? 1 : 0;
   }}
 }}
+
+extern "C" __global__ void point_coordinates_in_single_polygon(
+    const double* __restrict__ point_x,
+    const double* __restrict__ point_y,
+    const double* __restrict__ polygon_bounds,
+    const unsigned char* __restrict__ polygon_empty_mask,
+    const int* __restrict__ polygon_geometry_offsets,
+    const int* __restrict__ polygon_ring_offsets,
+    const double* __restrict__ polygon_x,
+    const double* __restrict__ polygon_y,
+    unsigned char* __restrict__ out,
+    int point_count,
+    int polygon_row,
+    double center_x,
+    double center_y
+) {{
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
+  for (int point = lane; point < point_count; point += stride) {{
+  out[point] = 0;
+  if (polygon_empty_mask[polygon_row]) continue;
+  const double px = point_x[point];
+  const double py = point_y[point];
+  const int base = polygon_row * 4;
+  if (polygon_bounds != nullptr
+      && !(polygon_bounds[base] <= px && px <= polygon_bounds[base + 2]
+           && polygon_bounds[base + 1] <= py && py <= polygon_bounds[base + 3])) continue;
+  out[point] = polygon_contains_point(
+      (compute_t)(px - center_x), (compute_t)(py - center_y), px, py,
+      polygon_x, polygon_y, center_x, center_y,
+      polygon_geometry_offsets, polygon_ring_offsets, polygon_row) ? 1 : 0;
+  }}
+}}
+
+extern "C" __global__ void point_coordinates_in_single_multipolygon(
+    const double* __restrict__ point_x,
+    const double* __restrict__ point_y,
+    const double* __restrict__ polygon_bounds,
+    const unsigned char* __restrict__ polygon_empty_mask,
+    const int* __restrict__ polygon_geometry_offsets,
+    const int* __restrict__ polygon_part_offsets,
+    const int* __restrict__ polygon_ring_offsets,
+    const double* __restrict__ polygon_x,
+    const double* __restrict__ polygon_y,
+    unsigned char* __restrict__ out,
+    int point_count,
+    int polygon_row,
+    double center_x,
+    double center_y
+) {{
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = blockDim.x * gridDim.x;
+  for (int point = lane; point < point_count; point += stride) {{
+  out[point] = 0;
+  if (polygon_empty_mask[polygon_row]) continue;
+  const double px = point_x[point];
+  const double py = point_y[point];
+  const int base = polygon_row * 4;
+  if (polygon_bounds != nullptr
+      && !(polygon_bounds[base] <= px && px <= polygon_bounds[base + 2]
+           && polygon_bounds[base + 1] <= py && py <= polygon_bounds[base + 3])) continue;
+  out[point] = multipolygon_contains_point(
+      (compute_t)(px - center_x), (compute_t)(py - center_y), px, py,
+      polygon_x, polygon_y, center_x, center_y,
+      polygon_geometry_offsets, polygon_part_offsets, polygon_ring_offsets,
+      polygon_row) ? 1 : 0;
+  }}
+}}
 """
 
-_PIP_BLOCK_PER_PAIR_KERNEL_SOURCE_TEMPLATE = (
-    POINT_ON_SEGMENT_DEVICE
-    + """
+_PIP_BLOCK_PER_PAIR_KERNEL_SOURCE_TEMPLATE = """
 typedef {compute_type} compute_t;
 
 #define CX(val) ((compute_t)((val) - center_x))
 #define CY(val) ((compute_t)((val) - center_y))
-#define PIP_BOUNDARY_TOLERANCE 1e-7
+#define PIP_USE_FP32_ENVELOPE {use_fp32_envelope}
 
 extern "C" __global__ void pip_block_per_pair_polygon(
     const int* candidate_left,
@@ -675,16 +758,33 @@ extern "C" __global__ void pip_block_per_pair_polygon(
 
         for (int e = (int)threadIdx.x; e < edge_count; e += (int)blockDim.x) {{
             const int c = cs + 1 + e;
-            const compute_t ax = CX(polygon_x[c - 1]);
-            const compute_t ay = CY(polygon_y[c - 1]);
-            const compute_t bx = CX(polygon_x[c]);
-            const compute_t by = CY(polygon_y[c]);
-
-            if (vs_point_on_segment((double)px, (double)py, (double)ax, (double)ay, (double)bx, (double)by, PIP_BOUNDARY_TOLERANCE)) {{
+            const double ax = polygon_x[c - 1];
+            const double ay = polygon_y[c - 1];
+            const double bx = polygon_x[c];
+            const double by = polygon_y[c];
+            bool refined = false;
+            const int orientation = PIP_USE_FP32_ENVELOPE
+                ? vs_orient2d_selective_fp32(
+                    ax, ay, bx, by,
+                    point_x[point_coord], point_y[point_coord], &refined)
+                : vs_orient2d(
+                    ax, ay, bx, by,
+                    point_x[point_coord], point_y[point_coord]);
+            (void)refined;
+            const bool boundary_bbox =
+                point_y[point_coord] >= fmin(ay, by)
+                && point_y[point_coord] <= fmax(ay, by)
+                && point_x[point_coord] >= fmin(ax, bx)
+                && point_x[point_coord] <= fmax(ax, bx);
+            if (boundary_bbox && orientation == 0) {{
                 my_boundary = 1;
             }}
-            const bool intersects = ((ay > py) != (by > py)) &&
-                (px <= (((bx - ax) * (py - ay)) / ((by - ay) + (compute_t)0.0)) + ax);
+            const bool crosses_ray =
+                (ay > point_y[point_coord]) != (by > point_y[point_coord]);
+            const bool intersects = crosses_ray
+                && (point_x[point_coord] < fmin(ax, bx)
+                    || (point_x[point_coord] <= fmax(ax, bx)
+                        && ((orientation > 0) == (by > ay))));
             if (intersects) {{
                 my_crossings ^= 1;
             }}
@@ -799,16 +899,33 @@ extern "C" __global__ void pip_block_per_pair_multipolygon(
 
         for (int e = (int)threadIdx.x; e < edge_count; e += (int)blockDim.x) {{
             const int c = cs + 1 + e;
-            const compute_t ax = CX(multipolygon_x[c - 1]);
-            const compute_t ay = CY(multipolygon_y[c - 1]);
-            const compute_t bx = CX(multipolygon_x[c]);
-            const compute_t by = CY(multipolygon_y[c]);
-
-            if (vs_point_on_segment((double)px, (double)py, (double)ax, (double)ay, (double)bx, (double)by, PIP_BOUNDARY_TOLERANCE)) {{
+            const double ax = multipolygon_x[c - 1];
+            const double ay = multipolygon_y[c - 1];
+            const double bx = multipolygon_x[c];
+            const double by = multipolygon_y[c];
+            bool refined = false;
+            const int orientation = PIP_USE_FP32_ENVELOPE
+                ? vs_orient2d_selective_fp32(
+                    ax, ay, bx, by,
+                    point_x[point_coord], point_y[point_coord], &refined)
+                : vs_orient2d(
+                    ax, ay, bx, by,
+                    point_x[point_coord], point_y[point_coord]);
+            (void)refined;
+            const bool boundary_bbox =
+                point_y[point_coord] >= fmin(ay, by)
+                && point_y[point_coord] <= fmax(ay, by)
+                && point_x[point_coord] >= fmin(ax, bx)
+                && point_x[point_coord] <= fmax(ax, bx);
+            if (boundary_bbox && orientation == 0) {{
                 my_boundary = 1;
             }}
-            const bool intersects = ((ay > py) != (by > py)) &&
-                (px <= (((bx - ax) * (py - ay)) / ((by - ay) + (compute_t)0.0)) + ax);
+            const bool crosses_ray =
+                (ay > point_y[point_coord]) != (by > point_y[point_coord]);
+            const bool intersects = crosses_ray
+                && (point_x[point_coord] < fmin(ax, bx)
+                    || (point_x[point_coord] <= fmax(ax, bx)
+                        && ((orientation > 0) == (by > ay))));
             if (intersects) {{
                 my_crossings ^= 1;
             }}
@@ -853,7 +970,6 @@ extern "C" __global__ void pip_block_per_pair_multipolygon(
     }}
 }}
 """
-)
 
 _PIP_BLOCK_PER_PAIR_KERNEL_NAMES = (
     "pip_block_per_pair_polygon",
@@ -862,7 +978,14 @@ _PIP_BLOCK_PER_PAIR_KERNEL_NAMES = (
 
 
 def _format_block_per_pair_source(compute_type: str = "double") -> str:
-    return _PIP_BLOCK_PER_PAIR_KERNEL_SOURCE_TEMPLATE.format(compute_type=compute_type)
+    return (
+        ORIENT2D_DEVICE
+        + ORIENT2D_FP32_ENVELOPE_DEVICE
+        + _PIP_BLOCK_PER_PAIR_KERNEL_SOURCE_TEMPLATE.format(
+            compute_type=compute_type,
+            use_fp32_envelope=1 if compute_type == "float" else 0,
+        )
+    )
 
 
 _POINT_IN_POLYGON_KERNEL_NAMES = (
@@ -875,9 +998,14 @@ _POINT_IN_POLYGON_KERNEL_NAMES = (
     "point_in_polygon_multipolygon_compacted_tagged",
     "scatter_compacted_hits",
     "point_in_polygon_fused",
+    "point_coordinates_in_single_polygon",
+    "point_coordinates_in_single_multipolygon",
 )
 
 
 def _format_pip_kernel_source(compute_type: str = "double") -> str:
-    body = _POINT_IN_POLYGON_KERNEL_SOURCE_TEMPLATE.format(compute_type=compute_type)
-    return POINT_ON_SEGMENT_DEVICE + body
+    body = _POINT_IN_POLYGON_KERNEL_SOURCE_TEMPLATE.format(
+        compute_type=compute_type,
+        use_fp32_envelope=1 if compute_type == "float" else 0,
+    )
+    return ORIENT2D_DEVICE + ORIENT2D_FP32_ENVELOPE_DEVICE + body

@@ -5,7 +5,7 @@ Scope: End-to-end pipeline benchmark suites, regression thresholds, and CI artif
 Read If: You are changing pipeline benchmarks, regression gates, or CPU/GPU movement profiling in CI.
 STOP IF: You already have the benchmark scripts open and only need a local implementation detail.
 Source Of Truth: Phase-1 pipeline benchmark and regression-gate workflow for end-to-end performance tracking.
-Body Budget: 214/220 lines
+Body Budget: 220/220 lines
 Document: docs/testing/pipeline-benchmarks.md
 
 Section Map (Body Lines)
@@ -17,12 +17,12 @@ Section Map (Body Lines)
 | 30-44 | Open First |
 | 45-54 | Verify |
 | 55-63 | Risks |
-| 64-113 | Entry Points |
-| 114-128 | Pipelines |
-| 129-146 | Suites |
-| 147-155 | Regression Rules |
-| 156-195 | Trace Contract |
-| 196-214 | CI Workflow |
+| 64-119 | Entry Points |
+| 120-134 | Pipelines |
+| 135-152 | Suites |
+| 153-161 | Regression Rules |
+| 162-201 | Trace Contract |
+| 202-220 | CI Workflow |
 DOC_HEADER:END -->
 
 This repo now has a dedicated end-to-end pipeline benchmark rail for regression
@@ -94,10 +94,10 @@ Run the local smoke suite:
 uv run python scripts/benchmark_pipelines.py --suite smoke --repeat 2
 ```
 
-Pipeline benchmarks default to `--profile-mode lean`, which keeps wall-clock
-stage timing plus runtime D2H count/byte/seconds counters. Use
-`--profile-mode audit` when you need NVML samples and CUDA event stage timing.
-`--gpu-trace` and `--gpu-sparkline` imply audit mode.
+Pipeline benchmarks default to `--profile-mode lean`, retaining wall-clock and
+runtime D2H counters; audit mode adds NVML/CUDA timing. GPU traces imply audit.
+Nested RMM counters scope peak memory to each sample, excluding process-global
+high-water marks left by precompile or earlier pipelines.
 
 Compare a current run against a baseline artifact:
 
@@ -117,6 +117,12 @@ Reuse is fail-closed. The artifact must carry the current workload-tree and
 measurement-contract hashes, scale, repeat/warmup/timeout settings, host
 identity, GeoPandas/Python package identity, and correctness fingerprint.
 Refresh the GeoPandas baseline only when one of those inputs changes.
+
+Current shootout and pipeline artifacts also carry `vibespatial_source`: the
+imported package path, Git revision, source-only dirty state, untracked source
+files, and a SHA-256 over the `src/`, `scripts/`, and `benchmarks/` worktree.
+This binds candidate timing to production code without invalidating evidence
+when only its report documentation changes.
 
 Discover operation-specific arguments before running a benchmark:
 

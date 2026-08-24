@@ -25,6 +25,7 @@ from vibespatial import (
     from_shapely_geometries,
     has_gpu_runtime,
 )
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.predicates.binary import _gpu_candidate_pairs_supported
 from vibespatial.runtime.kernel_registry import get_kernel_variants
 from vibespatial.runtime.residency import Residency
@@ -649,6 +650,329 @@ def test_single_mask_covered_by_gpu_probe_matches_shapely_for_concave_mask() -> 
     assert result is not None
     expected = [bool(geom.covered_by(mask_geom)) for geom in left_geoms]
     assert result.tolist() == expected
+
+
+@pytest.mark.gpu
+def test_single_mask_convex_certificate_rejects_self_intersecting_star() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.predicates.binary import _evaluate_covered_by_single_polygonal_mask_gpu
+
+    mask_geom = Polygon(
+        [(0, 3), (1, -1), (-3, 1), (3, 1), (-1, -1), (0, 3)],
+    )
+    # Every local turn has one sign, but the mask is self-intersecting.  A
+    # turn-only convex certificate would incorrectly admit the vertex theorem.
+    left_geoms = [box(-0.25, 0.0, 0.25, 0.5), box(2.0, 0.9, 2.5, 1.1)]
+    left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+    mask = from_shapely_geometries([mask_geom], residency=Residency.DEVICE)
+
+    result = _evaluate_covered_by_single_polygonal_mask_gpu(left, mask)
+
+    assert result is not None
+    expected = [bool(geom.covered_by(mask_geom)) for geom in left_geoms]
+    assert result.tolist() == expected
+
+
+@pytest.mark.gpu
+def test_public_within_selects_exact_convex_grouped_path_at_measured_scale() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    angles = np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False)
+    target = Polygon(np.column_stack((np.cos(angles), np.sin(angles))))
+    edge_start, edge_end = np.asarray(target.exterior.coords[:2], dtype=np.float64)
+    edge = edge_end - edge_start
+    outward = np.asarray((edge[1], -edge[0]), dtype=np.float64)
+    outward /= np.linalg.norm(outward)
+    edge_midpoint = (edge_start + edge_end) * 0.5
+    outside = edge_midpoint + outward * 5e-8
+    crossing = Polygon(
+        [
+            tuple(edge_midpoint - outward * 1e-4),
+            tuple(edge_midpoint + np.asarray((-edge[1], edge[0])) * 1e-4),
+            tuple(outside),
+        ]
+    )
+    geometries = [box(-0.01, -0.01, 0.01, 0.01)] * 9_999 + [crossing]
+    source = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+    mask = from_shapely_geometries([target], residency=Residency.DEVICE)
+
+    geopandas.clear_dispatch_events()
+    reset_d2h_transfer_count()
+    first = evaluate_binary_predicate(
+        "within",
+        source,
+        mask,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    second = evaluate_binary_predicate(
+        "within",
+        source,
+        mask,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    events = geopandas.get_dispatch_events(clear=True)
+    certification_events = [
+        event
+        for event in get_d2h_transfer_events()
+        if event.reason == "polygon predicate convex-mask certification planning packet"
+    ]
+    source_certification_events = [
+        event
+        for event in get_d2h_transfer_events()
+        if event.reason == "polygon predicate simple-source certification planning packet"
+    ]
+
+    expected = shapely.within(np.asarray(geometries, dtype=object), target)
+    assert np.array_equal(first.values, expected)
+    assert np.array_equal(second.values, expected)
+    assert bool(first.values[-1]) is False
+    assert len(certification_events) == 1
+    assert len(source_certification_events) == 1
+    mask_state = mask._ensure_device_state(preserve_indexed_view=True)
+    source_state = source._ensure_device_state(preserve_indexed_view=True)
+    mask_certificate = mask_state.polygon_certificates[("convex-mask", GeometryFamily.POLYGON, 0)]
+    source_certificate = source_state.polygon_certificates[
+        ("simple-source-no-holes", GeometryFamily.POLYGON, -1)
+    ]
+    assert mask_certificate.source_token == f"owned-device-state:{id(mask_state)}"
+    assert source_certificate.source_token == f"owned-device-state:{id(source_state)}"
+    assert source_certificate.residency is Residency.DEVICE
+    assert source_certificate.values.__cuda_array_interface__
+    assert any(
+        event.implementation == "gpu_convex_grouped_vertex_containment"
+        for event in events
+    )
+
+
+@pytest.mark.gpu
+def test_convex_grouped_selector_declines_invalid_zero_area_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    monkeypatch.setenv("VIBESPATIAL_STRICT_NATIVE", "1")
+    target = box(0.0, 0.0, 10.0, 10.0)
+    degenerate = Polygon([(0.0, 1.0), (0.0, 2.0), (0.0, 3.0), (0.0, 1.0)])
+    geometries = [degenerate] * 10_000
+    source = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+    mask = from_shapely_geometries([target], residency=Residency.DEVICE)
+
+    geopandas.clear_dispatch_events()
+    for predicate in ("covered_by", "within"):
+        result = evaluate_binary_predicate(
+            predicate,
+            source,
+            mask,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+        expected = getattr(shapely, predicate)(
+            np.asarray(geometries, dtype=object),
+            target,
+        )
+        assert np.array_equal(result.values, expected), predicate
+        assert not np.any(result.values), predicate
+    assert all(
+        event.implementation != "gpu_convex_grouped_vertex_containment"
+        for event in geopandas.get_dispatch_events(clear=True)
+    )
+
+
+@pytest.mark.gpu
+def test_convex_grouped_selector_declines_single_skewed_quadratic_ring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import vibespatial.predicates.polygon as polygon_predicates
+
+    angles = np.linspace(0.0, 2.0 * np.pi, 20_000, endpoint=False)
+    skewed = Polygon(np.column_stack((0.5 * np.cos(angles), 0.5 * np.sin(angles))))
+    geometries = [box(-0.01, -0.01, 0.01, 0.01)] * 9_999 + [skewed]
+    source = from_shapely_geometries(geometries, residency=Residency.DEVICE)
+    mask = from_shapely_geometries([box(-1.0, -1.0, 1.0, 1.0)], residency=Residency.DEVICE)
+
+    def fail_if_certification_launches(*_args, **_kwargs):
+        raise AssertionError("quadratic source certification must not launch for skewed rings")
+
+    monkeypatch.setattr(
+        polygon_predicates,
+        "certify_polygonal_sources_simple_no_holes_gpu",
+        fail_if_certification_launches,
+    )
+    result = polygon_predicates.compute_polygonal_covered_by_single_convex_grouped_gpu(
+        source,
+        mask,
+        query_family=GeometryFamily.POLYGON,
+        mask_family=GeometryFamily.POLYGON,
+    )
+
+    source_buffer = source._ensure_device_state(
+        preserve_indexed_view=True
+    ).families[GeometryFamily.POLYGON]
+    assert source_buffer.fixed_size is not None
+    assert source_buffer.fixed_size.max_coord_count_per_row == 20_001
+    assert int(source_buffer.x.size) / 10_000 < 8.0
+    assert result is None
+
+
+@pytest.mark.gpu
+def test_convex_grouped_selector_declines_indexed_nonzero_mask_row() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    sources = [box(10.1, 10.1, 10.2, 10.2)] * 10_000
+    source = from_shapely_geometries(sources, residency=Residency.DEVICE)
+    mask_base = from_shapely_geometries(
+        [box(-1.0, -1.0, 1.0, 1.0), box(10.0, 10.0, 11.0, 11.0)],
+        residency=Residency.DEVICE,
+    )
+    mask = type(mask_base)._indexed_view(
+        mask_base,
+        cp.asarray([1], dtype=cp.int64),
+        assume_unique_indices=True,
+    )
+
+    geopandas.clear_dispatch_events()
+    result = evaluate_binary_predicate(
+        "within",
+        source,
+        mask,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert mask.is_indexed_view
+    assert result.values.tolist() == [True] * 10_000
+    assert all(
+        event.implementation != "gpu_convex_grouped_vertex_containment"
+        for event in geopandas.get_dispatch_events(clear=True)
+    )
+
+
+@pytest.mark.gpu
+def test_convex_grouped_selector_declines_sparse_indexed_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    import vibespatial.predicates.polygon as polygon_predicates
+
+    source_base = from_shapely_geometries(
+        [box(-0.01, -0.01, 0.01, 0.01)] * 20_000,
+        residency=Residency.DEVICE,
+    )
+    source = type(source_base)._indexed_view(
+        source_base,
+        cp.arange(10_000, dtype=cp.int64),
+        assume_unique_indices=True,
+    )
+    mask = from_shapely_geometries(
+        [box(-1.0, -1.0, 1.0, 1.0)],
+        residency=Residency.DEVICE,
+    )
+
+    def fail_if_certification_launches(*_args, **_kwargs):
+        raise AssertionError("indexed source certification must not launch")
+
+    monkeypatch.setattr(
+        polygon_predicates,
+        "certify_polygonal_sources_simple_no_holes_gpu",
+        fail_if_certification_launches,
+    )
+    result = polygon_predicates.compute_polygonal_covered_by_single_convex_grouped_gpu(
+        source,
+        mask,
+        query_family=GeometryFamily.POLYGON,
+        mask_family=GeometryFamily.POLYGON,
+    )
+
+    assert source.is_indexed_view
+    assert source.row_count == 10_000
+    assert source_base.row_count == 20_000
+    assert result is None
+
+
+@pytest.mark.gpu
+def test_gpu_polygon_predicates_preserve_interior_collapsed_ring_semantics() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    target = box(0.0, 0.0, 10.0, 10.0)
+    collapsed = Polygon([(1.0, 1.0), (2.0, 1.0), (3.0, 1.0), (1.0, 1.0)])
+    source = from_shapely_geometries([collapsed], residency=Residency.DEVICE)
+    mask = from_shapely_geometries([target], residency=Residency.DEVICE)
+
+    for predicate in ("covered_by", "within"):
+        result = evaluate_binary_predicate(
+            predicate,
+            source,
+            mask,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+        expected = bool(getattr(shapely, predicate)(collapsed, target))
+        assert result.values.tolist() == [expected]
+        assert expected is True
+
+
+@pytest.mark.gpu
+def test_convex_grouped_lowering_preserves_inverse_public_predicates() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.predicates.binary import _broadcast_right_owned
+
+    target_geometry = box(-1.0, -1.0, 1.0, 1.0)
+    source_geometries = [box(-0.1, -0.1, 0.1, 0.1)] * 9_999 + [
+        box(0.9, -0.1, 1.1, 0.1)
+    ]
+    source = from_shapely_geometries(source_geometries, residency=Residency.DEVICE)
+    mask = from_shapely_geometries([target_geometry], residency=Residency.DEVICE)
+    repeated_mask = _broadcast_right_owned(mask, len(source_geometries))
+
+    for predicate, left, right, expected in (
+        (
+            "covered_by",
+            source,
+            mask,
+            shapely.covered_by(np.asarray(source_geometries, dtype=object), target_geometry),
+        ),
+        (
+            "within",
+            source,
+            mask,
+            shapely.within(np.asarray(source_geometries, dtype=object), target_geometry),
+        ),
+        (
+            "covers",
+            repeated_mask,
+            source,
+            shapely.covers(target_geometry, np.asarray(source_geometries, dtype=object)),
+        ),
+        (
+            "contains",
+            repeated_mask,
+            source,
+            shapely.contains(target_geometry, np.asarray(source_geometries, dtype=object)),
+        ),
+    ):
+        result = evaluate_binary_predicate(
+            predicate,
+            left,
+            right,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+        assert np.array_equal(result.values, expected), predicate
 
 
 def test_binary_predicate_explicit_gpu_request_fails_for_unsupported_candidate_pairs(monkeypatch) -> None:

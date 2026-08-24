@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 import numpy as np
 
+from vibespatial.api._native_state import NativeStreamReadiness
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
     compile_kernel_group,
+    cuda_stream_identity,
     get_cuda_runtime,
 )
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
@@ -15,6 +20,7 @@ from vibespatial.predicates.polygon_kernels import (
     _POLYGON_PREDICATES_KERNEL_NAMES,
     _POLYGON_PREDICATES_KERNEL_SOURCE,
 )
+from vibespatial.runtime.residency import Residency
 
 # ---------------------------------------------------------------------------
 # DE-9IM bitmask layout
@@ -39,6 +45,16 @@ DE9IM_EI = 1 << 6
 DE9IM_EB = 1 << 7
 DE9IM_EE = 1 << 8
 
+# The automatic lowering is intentionally narrower than the primitive.  The
+# complete-stage experiment established wins from 10K source rows through 10M
+# for targets with 4-64 exterior vertices.  Shapes outside that measured region
+# retain the general exact polygon predicate until evidence expands it.
+_CONVEX_GROUPED_MIN_SOURCE_ROWS = 10_000
+_CONVEX_GROUPED_MAX_MASK_COORDINATES = 65  # 64 vertices plus exact closure
+_CONVEX_GROUPED_MAX_AVERAGE_SOURCE_COORDINATES = 8.0
+_CONVEX_GROUPED_MAX_SOURCE_COORDINATES = 65
+_CONVEX_GROUPED_MIN_LOGICAL_DENSITY = 0.5
+
 request_nvrtc_warmup(
     [
         ("polygon-predicates", _POLYGON_PREDICATES_KERNEL_SOURCE, _POLYGON_PREDICATES_KERNEL_NAMES),
@@ -49,6 +65,485 @@ request_nvrtc_warmup(
 def _polygon_predicates_kernels():
     return compile_kernel_group(
         "polygon-predicates", _POLYGON_PREDICATES_KERNEL_SOURCE, _POLYGON_PREDICATES_KERNEL_NAMES
+    )
+
+
+@dataclass(frozen=True)
+class NativeConvexMaskCertificate:
+    """Typed device-capable certificate for one convex polygonal row."""
+
+    source_token: str
+    owner_id: int
+    device_state_id: int
+    row_mapping_id: int
+    family: GeometryFamily
+    family_row: int
+    coordinate_count: int
+    values: Any
+    convex_simple: bool
+    residency: Residency
+    readiness: NativeStreamReadiness
+
+    def validate(
+        self,
+        owner: OwnedGeometryArray,
+        state: Any,
+        buffer: Any,
+        *,
+        family: GeometryFamily,
+        family_row: int,
+    ) -> None:
+        expected_token = f"owned-device-state:{id(state)}"
+        if (
+            self.source_token != expected_token
+            or self.owner_id != id(owner)
+            or self.device_state_id != id(state)
+            or self.row_mapping_id != id(state.family_row_offsets)
+            or self.family is not family
+            or self.family_row != int(family_row)
+            or self.coordinate_count != int(buffer.x.size)
+            or self.residency is not Residency.DEVICE
+        ):
+            raise RuntimeError("stale convex polygon certificate lineage")
+
+
+@dataclass(frozen=True)
+class NativeSimplePolygonalSourceCertificate:
+    """Typed family-row certificate for simple positive-area source rings."""
+
+    source_token: str
+    owner_id: int
+    device_state_id: int
+    row_mapping_id: int
+    family: GeometryFamily
+    family_row_count: int
+    coordinate_count: int
+    values: Any
+    all_certified: bool
+    residency: Residency
+    readiness: NativeStreamReadiness
+
+    def validate(
+        self,
+        owner: OwnedGeometryArray,
+        state: Any,
+        buffer: Any,
+        *,
+        family: GeometryFamily,
+    ) -> None:
+        expected_token = f"owned-device-state:{id(state)}"
+        if (
+            self.source_token != expected_token
+            or self.owner_id != id(owner)
+            or self.device_state_id != id(state)
+            or self.row_mapping_id != id(state.family_row_offsets)
+            or self.family is not family
+            or self.family_row_count != int(buffer.empty_mask.size)
+            or self.coordinate_count != int(buffer.x.size)
+            or self.residency is not Residency.DEVICE
+        ):
+            raise RuntimeError("stale simple polygonal source certificate lineage")
+
+
+def _record_certificate_readiness() -> NativeStreamReadiness:
+    import cupy as cp
+
+    stream = cp.cuda.get_current_stream()
+    event = cp.cuda.Event(disable_timing=True)
+    event.record(stream)
+    return NativeStreamReadiness(stream=stream, event=event, ready=False)
+
+
+def _wait_for_certificate(readiness: NativeStreamReadiness) -> None:
+    if readiness.ready or readiness.event is None:
+        return
+    import cupy as cp
+
+    consumer = cp.cuda.get_current_stream()
+    if readiness.stream is not None and (
+        cuda_stream_identity(readiness.stream) == cuda_stream_identity(consumer)
+    ):
+        return
+    consumer.wait_event(readiness.event)
+
+
+def certify_single_polygonal_convex_no_holes_gpu(
+    mask_owned: OwnedGeometryArray,
+    *,
+    mask_family: GeometryFamily,
+    family_row: int = 0,
+) -> NativeConvexMaskCertificate:
+    """Return a cached exact-sign convex/no-hole certificate.
+
+    The one-byte device result is an explicit planning packet.  It crosses the
+    boundary once per immutable OwnedGeometryArray generation and is then
+    reused by every public predicate consumer of that mask.
+    """
+    state = mask_owned._ensure_device_state(preserve_indexed_view=True)
+    buffer = state.families[mask_family]
+    key = ("convex-mask", mask_family, int(family_row))
+    cached = state.polygon_certificates.get(key)
+    if cached is not None:
+        if not isinstance(cached, NativeConvexMaskCertificate):
+            raise RuntimeError("convex polygon certificate cache type mismatch")
+        cached.validate(
+            mask_owned,
+            state,
+            buffer,
+            family=mask_family,
+            family_row=family_row,
+        )
+        _wait_for_certificate(cached.readiness)
+        return cached
+
+    runtime = get_cuda_runtime()
+    admission = runtime.admit_device_memory(
+        stage="polygon.convex_mask_certificate",
+        required_bytes=1,
+        requested_units=1,
+    )
+    if not admission.admitted:
+        raise MemoryError(
+            "convex mask certificate requires one device byte with "
+            f"{admission.remaining_bytes} available"
+        )
+    ptr = runtime.pointer
+    d_out = runtime.allocate((1,), np.uint8)
+    args = [ptr(buffer.geometry_offsets)]
+    types = [KERNEL_PARAM_PTR]
+    if mask_family is GeometryFamily.MULTIPOLYGON:
+        args.append(ptr(buffer.part_offsets))
+        types.append(KERNEL_PARAM_PTR)
+    args.extend(
+        [
+            ptr(buffer.ring_offsets),
+            ptr(buffer.empty_mask),
+            ptr(buffer.x),
+            ptr(buffer.y),
+            int(family_row),
+            ptr(d_out),
+        ]
+    )
+    types.extend(
+        [
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+        ]
+    )
+    kernel_name = (
+        "certify_single_polygon_convex_no_holes"
+        if mask_family is GeometryFamily.POLYGON
+        else "certify_single_multipolygon_convex_no_holes"
+    )
+    runtime.launch(
+        _polygon_predicates_kernels()[kernel_name],
+        grid=(1, 1, 1),
+        block=(1, 1, 1),
+        params=(tuple(args), tuple(types)),
+    )
+    readiness = _record_certificate_readiness()
+    host = runtime.copy_device_to_host(
+        d_out,
+        reason="polygon predicate convex-mask certification planning packet",
+    )
+    certificate = NativeConvexMaskCertificate(
+        source_token=f"owned-device-state:{id(state)}",
+        owner_id=id(mask_owned),
+        device_state_id=id(state),
+        row_mapping_id=id(state.family_row_offsets),
+        family=mask_family,
+        family_row=int(family_row),
+        coordinate_count=int(buffer.x.size),
+        values=d_out,
+        convex_simple=bool(np.asarray(host, dtype=np.uint8)[0]),
+        residency=Residency.DEVICE,
+        readiness=readiness,
+    )
+    state.polygon_certificates[key] = certificate
+    return certificate
+
+
+def certify_polygonal_sources_simple_no_holes_gpu(
+    source_owned: OwnedGeometryArray,
+    *,
+    source_family: GeometryFamily,
+) -> NativeSimplePolygonalSourceCertificate:
+    """Certify every physical source row for the convex vertex theorem.
+
+    The sufficient source domain is deliberately narrow: one simple,
+    non-empty, positive-area ring (and one part for MultiPolygon).  Anything
+    else declines the complete-batch fast path and retains the general exact
+    predicate.  This makes invalid geometries fail closed without making a
+    vertex-only claim about arbitrary OGC topology.
+    """
+    import cupy as cp
+
+    state = source_owned._ensure_device_state(preserve_indexed_view=True)
+    buffer = state.families[source_family]
+    family_row_count = int(buffer.empty_mask.size)
+    key = ("simple-source-no-holes", source_family, -1)
+    cached = state.polygon_certificates.get(key)
+    if cached is not None:
+        if not isinstance(cached, NativeSimplePolygonalSourceCertificate):
+            raise RuntimeError("simple polygonal source certificate cache type mismatch")
+        cached.validate(source_owned, state, buffer, family=source_family)
+        _wait_for_certificate(cached.readiness)
+        return cached
+
+    required_bytes = family_row_count + np.dtype(np.int32).itemsize
+    runtime = get_cuda_runtime()
+    admission = runtime.admit_device_memory(
+        stage="polygon.simple_source_certificate",
+        required_bytes=required_bytes,
+        requested_units=family_row_count,
+    )
+    if not admission.admitted:
+        raise MemoryError(
+            "simple polygonal source certificate requires "
+            f"{required_bytes} device bytes with {admission.remaining_bytes} available"
+        )
+    d_rows = cp.empty(family_row_count, dtype=cp.bool_)
+    d_all = cp.ones(1, dtype=cp.int32)
+    if family_row_count:
+        ptr = runtime.pointer
+        args = [ptr(buffer.geometry_offsets)]
+        types = [KERNEL_PARAM_PTR]
+        if source_family is GeometryFamily.MULTIPOLYGON:
+            args.append(ptr(buffer.part_offsets))
+            types.append(KERNEL_PARAM_PTR)
+        args.extend(
+            [
+                ptr(buffer.ring_offsets),
+                ptr(buffer.empty_mask),
+                ptr(buffer.x),
+                ptr(buffer.y),
+                family_row_count,
+                ptr(d_rows),
+                ptr(d_all),
+            ]
+        )
+        types.extend(
+            [
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+            ]
+        )
+        kernel_name = (
+            "certify_polygon_sources_simple_no_holes"
+            if source_family is GeometryFamily.POLYGON
+            else "certify_multipolygon_sources_simple_no_holes"
+        )
+        kernel = _polygon_predicates_kernels()[kernel_name]
+        grid, block = runtime.launch_config(kernel, family_row_count)
+        runtime.launch(
+            kernel,
+            grid=grid,
+            block=block,
+            params=(tuple(args), tuple(types)),
+        )
+    readiness = _record_certificate_readiness()
+    host = runtime.copy_device_to_host(
+        d_all,
+        reason="polygon predicate simple-source certification planning packet",
+    )
+    certificate = NativeSimplePolygonalSourceCertificate(
+        source_token=f"owned-device-state:{id(state)}",
+        owner_id=id(source_owned),
+        device_state_id=id(state),
+        row_mapping_id=id(state.family_row_offsets),
+        family=source_family,
+        family_row_count=family_row_count,
+        coordinate_count=int(buffer.x.size),
+        values=d_rows,
+        all_certified=bool(np.asarray(host, dtype=np.int32)[0]),
+        residency=Residency.DEVICE,
+        readiness=readiness,
+    )
+    state.polygon_certificates[key] = certificate
+    return certificate
+
+
+def _polygonal_coordinate_offsets_device(buffer: Any, family: GeometryFamily):
+    """Resolve one authoritative int64 coordinate span per family row."""
+    import cupy as cp
+
+    offset_count = int(buffer.empty_mask.size) + 1
+    d_offsets = cp.empty(offset_count, dtype=cp.int64)
+    if offset_count == 0:
+        return d_offsets
+    runtime = get_cuda_runtime()
+    ptr = runtime.pointer
+    args = [ptr(buffer.geometry_offsets)]
+    types = [KERNEL_PARAM_PTR]
+    if family is GeometryFamily.MULTIPOLYGON:
+        args.append(ptr(buffer.part_offsets))
+        types.append(KERNEL_PARAM_PTR)
+    args.extend([ptr(buffer.ring_offsets), ptr(d_offsets), offset_count])
+    types.extend([KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32])
+    kernel_name = (
+        "polygon_coordinate_offsets_i64"
+        if family is GeometryFamily.POLYGON
+        else "multipolygon_coordinate_offsets_i64"
+    )
+    kernel = _polygon_predicates_kernels()[kernel_name]
+    grid, block = runtime.launch_config(kernel, offset_count)
+    runtime.launch(
+        kernel,
+        grid=grid,
+        block=block,
+        params=(tuple(args), tuple(types)),
+    )
+    return d_offsets
+
+
+def compute_polygonal_covered_by_single_convex_grouped_gpu(
+    query_owned: OwnedGeometryArray,
+    mask_owned: OwnedGeometryArray,
+    *,
+    query_family: GeometryFamily,
+    mask_family: GeometryFamily,
+):
+    """Classify all family coordinates, then reduce by source geometry.
+
+    This is the measured direct/broadcast convex-containment shape.  It emits
+    no candidate relation and constructs no point geometry or dense group-code
+    vector.  The authoritative family coordinate offsets are consumed directly
+    by the bounded segmented ``ALL`` reducer.
+    """
+    import cupy as cp
+
+    # The measured carrier is dense and physical.  Indexed source views may
+    # expose a small logical subset over an arbitrarily larger physical base;
+    # certifying the base would both amplify work and return rows outside the
+    # active logical selection.  The general predicate already handles these
+    # views exactly, so keep them outside this selector until an active-row
+    # certificate/reducer is measured.
+    if query_owned.is_indexed_view or mask_owned.is_indexed_view:
+        return None
+
+    query_state = query_owned._ensure_device_state(preserve_indexed_view=True)
+    query_buffer = query_state.families[query_family]
+    family_row_count = int(query_buffer.empty_mask.size)
+    logical_row_count = int(query_owned.row_count)
+    if logical_row_count < _CONVEX_GROUPED_MIN_SOURCE_ROWS or family_row_count == 0:
+        return None
+
+    physical_density = family_row_count / logical_row_count
+    if physical_density < _CONVEX_GROUPED_MIN_LOGICAL_DENSITY:
+        return None
+
+    coordinate_count = int(query_buffer.x.size)
+    average_source_coordinates = coordinate_count / family_row_count
+    if average_source_coordinates > _CONVEX_GROUPED_MAX_AVERAGE_SOURCE_COORDINATES:
+        return None
+    fixed_size = query_buffer.fixed_size
+    max_source_coordinates = (
+        fixed_size.max_coord_count_per_row
+        if fixed_size is not None
+        else query_buffer.dense_single_ring_width
+    )
+    if (
+        max_source_coordinates is None
+        or int(max_source_coordinates) > _CONVEX_GROUPED_MAX_SOURCE_COORDINATES
+    ):
+        return None
+
+    mask_state = mask_owned._ensure_device_state(preserve_indexed_view=True)
+    mask_buffer = mask_state.families[mask_family]
+    mask_coordinate_count = int(mask_buffer.x.size)
+    if mask_coordinate_count > _CONVEX_GROUPED_MAX_MASK_COORDINATES:
+        return None
+
+    offset_bytes = (family_row_count + 1) * np.dtype(np.int64).itemsize
+    mask_bounds_bytes = (
+        0
+        if mask_buffer.bounds is not None
+        else int(mask_buffer.empty_mask.size) * 4 * np.dtype(np.float64).itemsize
+    )
+    required_bytes = (
+        coordinate_count  # raw coordinate classifications
+        + family_row_count  # simple-source row certificates
+        + np.dtype(np.int32).itemsize  # simple-source aggregate
+        + family_row_count  # grouped boolean output
+        + family_row_count * np.dtype(np.int32).itemsize  # dense group IDs
+        + logical_row_count  # mapped public result
+        + offset_bytes
+        + mask_bounds_bytes
+        + 1  # convex-mask certificate
+    )
+    admission = get_cuda_runtime().admit_device_memory(
+        stage="polygon-convex-grouped-containment",
+        required_bytes=required_bytes,
+        requested_units=family_row_count,
+    )
+    if not admission.admitted:
+        raise MemoryError(
+            "convex grouped containment requires complete-stage admission for "
+            f"{required_bytes} device bytes with {admission.remaining_bytes} available"
+        )
+
+    certificate = certify_single_polygonal_convex_no_holes_gpu(
+        mask_owned,
+        mask_family=mask_family,
+    )
+    if not certificate.convex_simple:
+        return None
+
+    source_certificate = certify_polygonal_sources_simple_no_holes_gpu(
+        query_owned,
+        source_family=query_family,
+    )
+    if not source_certificate.all_certified:
+        return None
+
+    d_offsets = _polygonal_coordinate_offsets_device(query_buffer, query_family)
+    if int(d_offsets.size) != family_row_count + 1:
+        return None
+
+    from vibespatial.kernels.predicates.point_in_polygon import (
+        _wrap_device_result_with_keepalive,
+        classify_point_coordinates_single_region_device,
+    )
+    from vibespatial.runtime.adaptive import get_cached_snapshot
+
+    compute_type = (
+        "double"
+        if get_cached_snapshot().device_profile.favors_native_fp64
+        else "float"
+    )
+    d_vertex_covered = classify_point_coordinates_single_region_device(
+        query_buffer.x,
+        query_buffer.y,
+        mask_owned,
+        region_family=mask_family,
+        compute_type=compute_type,
+    )
+    from vibespatial.api._native_grouped import NativeGrouped
+
+    reduction = NativeGrouped.reduce_boolean_all_from_sorted_offsets(
+        d_vertex_covered,
+        d_offsets,
+        row_count=coordinate_count,
+        group_count=family_row_count,
+        source_token=source_certificate.source_token,
+    )
+    d_result = cp.asarray(reduction.values, dtype=cp.bool_)
+    return _wrap_device_result_with_keepalive(
+        d_result,
+        d_vertex_covered,
+        d_offsets,
+        reduction,
+        source_certificate,
+        certificate,
     )
 
 

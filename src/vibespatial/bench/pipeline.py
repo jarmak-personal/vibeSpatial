@@ -601,7 +601,8 @@ def _stage_profiler(**kwargs) -> StageProfiler:
 class _DeviceMemoryMonitor:
     def __init__(self) -> None:
         self.available = False
-        self.peak_bytes: int | None = None
+        self._peak_bytes: int | None = None
+        self._active = False
         self._statistics = None
         if not has_gpu_runtime():
             return
@@ -610,7 +611,9 @@ class _DeviceMemoryMonitor:
         except ImportError:
             return
         statistics.enable_statistics()
+        statistics.push_statistics()
         self.available = True
+        self._active = True
         self._statistics = statistics
 
     def update(self) -> None:
@@ -620,7 +623,33 @@ class _DeviceMemoryMonitor:
         if stats is None:
             return
         peak = int(stats.peak_bytes)
-        self.peak_bytes = max(self.peak_bytes or 0, peak)
+        self._peak_bytes = max(self._peak_bytes or 0, peak)
+
+    @property
+    def current_peak_bytes(self) -> int | None:
+        """Return this monitor's allocation peak without ending its scope."""
+        self.update()
+        return self._peak_bytes
+
+    @property
+    def peak_bytes(self) -> int | None:
+        """Seal and return the pipeline-local allocation peak."""
+        if not self._active or self._statistics is None:
+            return self._peak_bytes
+        self.update()
+        stats = self._statistics.pop_statistics()
+        if stats is not None:
+            self._peak_bytes = max(self._peak_bytes or 0, int(stats.peak_bytes))
+        self._active = False
+        return self._peak_bytes
+
+    def __del__(self) -> None:
+        if not self._active or self._statistics is None:
+            return
+        try:
+            self._statistics.pop_statistics()
+        except Exception:
+            pass
 
 
 def _free_gpu_pool_memory() -> None:
@@ -937,8 +966,9 @@ def _record_stage_overheads(
     stage.metadata["owned_transfer_bytes_total"] = bytes_after
     stage.metadata["runtime_d2h_transfer_bytes_delta"] = runtime_bytes_after - runtime_bytes_before
     stage.metadata["runtime_d2h_transfer_bytes_total"] = runtime_bytes_after
-    if memory.peak_bytes is not None:
-        stage.metadata["peak_device_memory_bytes"] = memory.peak_bytes
+    current_peak_bytes = memory.current_peak_bytes
+    if current_peak_bytes is not None:
+        stage.metadata["peak_device_memory_bytes"] = current_peak_bytes
 
 
 def _selected_runtime_from_history(*values) -> str | None:
@@ -8977,11 +9007,14 @@ def benchmark_pipeline_suite(
 def suite_to_json(
     results: list[PipelineBenchmarkResult], *, suite: str | None = None, repeat: int = 1
 ) -> str:
+    from vibespatial.bench.provenance import source_identity
+
     profile_modes = {result.profile_mode for result in results}
     payload = {
         "results": [result.to_dict() for result in results],
         "metadata": {
             "repeat": repeat,
+            "vibespatial_source": source_identity(),
             "profile_mode": (
                 next(iter(profile_modes)) if len(profile_modes) == 1 else sorted(profile_modes)
             ),

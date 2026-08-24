@@ -5,7 +5,7 @@ Scope: Exactness guarantees, fallback policy, and topology-preservation strategy
 Read If: You are designing predicate math, intersection logic, or overlay correctness guarantees.
 STOP IF: Your task already has a settled robustness contract and only needs implementation detail.
 Source Of Truth: Phase-1 robustness policy for predicate and constructive kernels.
-Body Budget: 107/240 lines
+Body Budget: 120/240 lines
 Document: docs/architecture/robustness.md
 
 Section Map (Body Lines)
@@ -14,16 +14,16 @@ Section Map (Body Lines)
 | 1-4 | Preamble |
 | 5-9 | Intent |
 | 10-19 | Request Signals |
-| 20-27 | Open First |
-| 28-32 | Verify |
-| 33-38 | Risks |
-| 39-47 | Canonical Rule |
-| 48-53 | Guarantee Levels |
-| 54-60 | Default Kernel-Class Policy |
-| 61-75 | Predicate Strategy |
-| 76-88 | Constructive Strategy |
-| 89-102 | GPU Strategy |
-| 103-107 | Rejected Defaults |
+| 20-28 | Open First |
+| 29-33 | Verify |
+| 34-39 | Risks |
+| 40-48 | Canonical Rule |
+| 49-54 | Guarantee Levels |
+| 55-61 | Default Kernel-Class Policy |
+| 62-88 | Predicate Strategy |
+| 89-101 | Constructive Strategy |
+| 102-115 | GPU Strategy |
+| 116-120 | Rejected Defaults |
 DOC_HEADER:END -->
 
 Predicate correctness and topology preservation require more than choosing fp32 or fp64.
@@ -50,6 +50,7 @@ before exact-kernel work begins.
 - docs/architecture/precision.md
 - docs/architecture/nulls.md
 - docs/decisions/0004-robustness-strategy.md
+- docs/decisions/0048-bounded-accuracy-spatial-execution.md
 
 ## Verify
 
@@ -98,6 +99,18 @@ Chosen fallback policy:
 - fp64 predicate pipelines may use selective fp64 or expansion fallback, but they still owe an exact sign guarantee
 
 Pure epsilon-based sign tests are rejected as the final decision mechanism.
+
+`NumericalErrorEnvelope` is the native carrier for uncertainty between stages.
+Its bound may remain device-resident. Exact consumers accept decisions outside
+the conservative envelope and refine decisions inside it; carrying an envelope
+never authorizes approximation. Point-in-region uses this contract per edge:
+centered fp32 orientation falls back to adaptive exact orientation only when
+its sign is ambiguous. Nonzero differences or products that would become fp32
+subnormals fail closed before certification, including on devices that flush
+subnormals to zero. The exact fallback preserves subtraction tails and routes
+overflow- or underflow-unsafe products to a fixed-limb binary64 determinant
+sign, so every finite input exponent remains covered. Metric nearest refinement
+uses the same carrier for its distance-ordering and threshold envelope.
 
 ## Constructive Strategy
 

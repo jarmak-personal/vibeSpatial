@@ -92,6 +92,10 @@ class TestSpecRegistry:
     def test_prepared_polygon_mask_is_in_complete_nvrtc_inventory(self):
         assert "vibespatial.spatial.prepared_polygon_mask" in _NVRTC_CONSUMER_MODULES
 
+    def test_bounded_grouped_and_line_boundary_consumers_are_in_nvrtc_inventory(self):
+        assert "vibespatial.api._native_grouped" in _NVRTC_CONSUMER_MODULES
+        assert "vibespatial.constructive.line_polygon_difference" in _NVRTC_CONSUMER_MODULES
+
 
 # ---------------------------------------------------------------------------
 # Precompiler logic (no GPU needed)

@@ -538,11 +538,98 @@ def _scatter_de9im_predicate_output_device(
 
 def _single_base_row_owned(owned: OwnedGeometryArray) -> OwnedGeometryArray | None:
     if int(owned.row_count) == 1:
+        # A one-row indexed view can select any physical base row.  The direct
+        # broadcast carrier currently certifies physical row zero, so decline
+        # instead of silently changing the selected mask.
+        if owned.is_indexed_view:
+            return None
         return owned
     base = getattr(owned, "_base", None)
     if base is not None and int(getattr(base, "row_count", -1)) == 1:
         return base
     return None
+
+
+def _direct_single_convex_containment_outputs_device(
+    predicate_names: tuple[str, ...],
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    left_state,
+    right_state,
+) -> dict[str, object] | None:
+    """Lower a measured dense broadcast shape before candidate construction.
+
+    For a convex target, a polygonal source is covered exactly when every
+    source vertex is covered.  The grouped classifier already evaluates the
+    complete source family, so constructing bounds, a candidate rowset, and a
+    scatter plan first would only add row-shaped work around the faster
+    vertex-shaped algorithm.
+    """
+    requested = set(predicate_names)
+    if not requested or not requested.issubset({"covered_by", "within"}):
+        return None
+
+    mask = _single_base_row_owned(right)
+    if mask is None:
+        return None
+
+    tag_pairs = _device_state_family_tag_pairs(left_state, right_state)
+    if tag_pairs is None or len(tag_pairs) != 1:
+        return None
+    left_tag, right_tag = tag_pairs[0]
+    query_family = TAG_FAMILIES.get(left_tag)
+    mask_family = TAG_FAMILIES.get(right_tag)
+    polygonal_families = {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
+    if query_family not in polygonal_families or mask_family not in polygonal_families:
+        return None
+
+    from .polygon import compute_polygonal_covered_by_single_convex_grouped_gpu
+
+    d_family_result = compute_polygonal_covered_by_single_convex_grouped_gpu(
+        left,
+        mask,
+        query_family=query_family,
+        mask_family=mask_family,
+    )
+    if d_family_result is None:
+        return None
+
+    from vibespatial.api._native_grouped import _map_bounded_grouped_boolean_rows
+    from vibespatial.kernels.predicates.point_in_polygon import (
+        _wrap_device_result_with_keepalive,
+    )
+    d_values = _map_bounded_grouped_boolean_rows(
+        d_family_result,
+        left_state.validity,
+        left_state.tags,
+        left_state.family_row_offsets,
+        right_state.validity,
+        row_count=left.row_count,
+        family_tag=left_tag,
+    )
+    d_values = _wrap_device_result_with_keepalive(
+        d_values,
+        d_family_result,
+        left,
+        right,
+        mask,
+    )
+    record_dispatch_event(
+        surface="vibespatial.predicates.binary",
+        operation="/".join(predicate_names),
+        selected=ExecutionMode.GPU,
+        implementation="gpu_convex_grouped_vertex_containment",
+        reason=(
+            "conservative convex certificate selected measured dense broadcast "
+            "vertex classification with bounded grouped reduction"
+        ),
+        detail=(
+            f"source_rows={left.row_count}, source_family={query_family.value}, "
+            f"mask_family={mask_family.value}"
+        ),
+    )
+    return {predicate: d_values for predicate in predicate_names}
 
 
 def _fused_polygonal_single_right_predicates_device(
@@ -570,7 +657,7 @@ def _fused_polygonal_single_right_predicates_device(
     geometry or scattering by source-row cardinality.
     """
     requested = set(predicate_names)
-    if not requested.issubset({"intersects", "covered_by"}):
+    if not requested.issubset({"intersects", "covered_by", "within"}):
         return None
 
     mask = _single_base_row_owned(right)
@@ -598,6 +685,7 @@ def _fused_polygonal_single_right_predicates_device(
             return None
 
     from .polygon import (
+        compute_polygonal_covered_by_single_convex_grouped_gpu,
         compute_polygonal_covered_by_single_mask_no_holes_gpu,
         compute_polygonal_intersects_gpu,
     )
@@ -709,7 +797,10 @@ def _fused_polygonal_single_right_predicates_device(
                 capacity=capacity,
             )
 
-        if "covered_by" in outputs and not right_bounds_are_exact:
+        containment_outputs = tuple(
+            predicate for predicate in ("covered_by", "within") if predicate in outputs
+        )
+        if containment_outputs and not right_bounds_are_exact:
             covered_selection = NativeDeviceSelection.from_mask(
                 d_family & d_bounds_within,
                 source_row_count=capacity,
@@ -720,25 +811,48 @@ def _fused_polygonal_single_right_predicates_device(
                 covered_selection.logical_count,
                 dtype=cp.int32,
             )
-            d_covered_by = compute_polygonal_covered_by_single_mask_no_holes_gpu(
+            d_family_grouped = compute_polygonal_covered_by_single_convex_grouped_gpu(
                 left,
                 mask,
                 query_family=lf,
                 mask_family=mask_family,
-                d_left=d_covered_source,
-                d_pair_count=d_covered_count,
-                pair_capacity=capacity,
-                return_device=True,
             )
+            if d_family_grouped is not None:
+                d_family_rows = cp.asarray(
+                    left_state.family_row_offsets,
+                    dtype=cp.int64,
+                )[d_covered_source]
+                d_covered_by = cp.asarray(d_family_grouped, dtype=cp.bool_)[
+                    cp.maximum(d_family_rows, 0)
+                ]
+            else:
+                d_covered_by = compute_polygonal_covered_by_single_mask_no_holes_gpu(
+                    left,
+                    mask,
+                    query_family=lf,
+                    mask_family=mask_family,
+                    d_left=d_covered_source,
+                    d_pair_count=d_covered_count,
+                    pair_capacity=capacity,
+                    return_device=True,
+                )
             if d_covered_by is None:
                 return None
             _scatter_de9im_predicate_output_device(
                 d_covered_output,
                 d_covered_count,
                 d_covered_by,
-                outputs["covered_by"],
+                outputs[containment_outputs[0]],
                 capacity=capacity,
             )
+            for predicate in containment_outputs[1:]:
+                _scatter_de9im_predicate_output_device(
+                    d_covered_output,
+                    d_covered_count,
+                    d_covered_by,
+                    outputs[predicate],
+                    capacity=capacity,
+                )
 
     return outputs
 
@@ -2197,8 +2311,12 @@ def _evaluate_gpu_point_pair_fast_path(
         reason=f"{predicate} selected GPU execution for right point input",
     )
 
-    left_state = left._ensure_device_state()
-    right_state = right._ensure_device_state()
+    # This probe runs before the point-family domain is known.  Preserve a
+    # broadcast/indexed operand until the family check rejects it; resolving a
+    # one-row polygon mask here would erase reusable native lineage before the
+    # polygon containment planner gets a chance to inspect it.
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right._ensure_device_state(preserve_indexed_view=True)
     if set(left_state.families) != {GeometryFamily.POINT}:
         return None
     if set(right_state.families) != {GeometryFamily.POINT}:
@@ -2737,6 +2855,18 @@ def _fused_gpu_binary_predicates_device(
         reason="fused GPU multi-predicate: right geometry",
     )
 
+    left_state = left._ensure_device_state(preserve_indexed_view=True)
+    right_state = right._ensure_device_state(preserve_indexed_view=True)
+    direct_containment = _direct_single_convex_containment_outputs_device(
+        predicate_names,
+        left,
+        right,
+        left_state=left_state,
+        right_state=right_state,
+    )
+    if direct_containment is not None:
+        return direct_containment
+
     for arr, state_ref in ((left, "left"), (right, "right")):
         state = arr._ensure_device_state(preserve_indexed_view=True)
         if state.row_bounds is None:
@@ -2808,6 +2938,30 @@ def _fused_gpu_binary_predicates_device(
     )
     if single_right_outputs is not None:
         return single_right_outputs
+
+    inverse_single_left = {
+        "covers": "covered_by",
+        "contains": "within",
+    }
+    if set(predicate_names).issubset(inverse_single_left):
+        mapped_names = tuple(inverse_single_left[name] for name in predicate_names)
+        swapped_outputs = _fused_polygonal_single_right_predicates_device(
+            mapped_names,
+            right,
+            left,
+            left_state=right_state,
+            right_state=left_state,
+            d_cand_rows=d_cand_rows,
+            d_cand_count=d_cand_count,
+            d_valid=d_valid,
+            tag_pairs=[(right_tag, left_tag) for left_tag, right_tag in tag_pairs],
+            capacity=n,
+        )
+        if swapped_outputs is not None:
+            return {
+                predicate: swapped_outputs[inverse_single_left[predicate]]
+                for predicate in predicate_names
+            }
 
     from .polygon import compute_polygon_de9im_gpu
 
@@ -3416,7 +3570,14 @@ def evaluate_binary_predicate(
         # only for this check.
         left_gpu_owned = _owned_from_values(left_values, owned=left_owned, scalar=False)
         if _is_broadcast and right_owned is not None:
-            # Build broadcast N-row view from the 1-row right owned array
+            # Preserve broadcast lineage as a device indexed view.  Keeping
+            # the one-row base visible lets reusable metadata (prepared
+            # indexes, convex certificates) amortize across every logical row.
+            right_owned.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason=f"{predicate} selected GPU execution for broadcast-right geometry",
+            )
             right_gpu_owned = _broadcast_right_owned(right_owned, row_count)
         elif not scalar_right:
             right_gpu_owned = _owned_from_values(right_values, owned=right_owned, scalar=False)
@@ -3491,8 +3652,12 @@ def evaluate_binary_predicate(
                         detail=f"workload_shape={workload_shape.value}",
                     )
                     _record_runtime_selection(runtime_selection, (left_gpu_owned, right_gpu_owned))
-                    result_values = np.empty(row_count, dtype=object)
-                    result_values[:] = fused
+                    # A nullable object array is required only when nulls are
+                    # present and PROPAGATE is requested.  The native fused
+                    # path reaches this branch only for an all-valid batch, so
+                    # retain its compact boolean host export instead of paying
+                    # a second row-shaped object conversion.
+                    result_values = np.asarray(fused, dtype=bool)
                     return BinaryPredicateResult(
                         predicate=predicate,
                         values=result_values,

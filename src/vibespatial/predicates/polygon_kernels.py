@@ -92,11 +92,8 @@ extern "C" __device__ inline bool polygonal_mask_is_single_convex_no_holes(
   const int ce = ring_offsets[ring + 1];
   if (ce - cs < 4) return false;
 
-  int last = ce - 1;
-  if (fabs(x[cs] - x[last]) > VS_SPATIAL_EPSILON
-      || fabs(y[cs] - y[last]) > VS_SPATIAL_EPSILON) {
-    last = ce;
-  }
+  const int last = ce - 1;
+  if (x[cs] != x[last] || y[cs] != y[last]) return false;
   const int nverts = last - cs;
   if (nverts < 3) return false;
 
@@ -108,18 +105,140 @@ extern "C" __device__ inline bool polygonal_mask_is_single_convex_no_holes(
     const double x0 = x[i0], y0 = y[i0];
     const double x1 = x[i1], y1 = y[i1];
     const double x2 = x[i2], y2 = y[i2];
-    const double cross = (x1 - x0) * (y2 - y1) - (y1 - y0) * (x2 - x1);
-    const double scale = fabs(x1 - x0) + fabs(y1 - y0)
-                       + fabs(x2 - x1) + fabs(y2 - y1) + 1.0;
-    if (fabs(cross) <= VS_SPATIAL_EPSILON * scale * scale) continue;
-    const int current_sign = cross > 0.0 ? 1 : -1;
+    if (!isfinite(x0) || !isfinite(y0)
+        || !isfinite(x1) || !isfinite(y1)
+        || !isfinite(x2) || !isfinite(y2)) return false;
+    const int current_sign = vs_orient2d(x0, y0, x1, y1, x2, y2);
+    if (current_sign == 0) continue;
     if (sign == 0) {
       sign = current_sign;
     } else if (current_sign != sign) {
       return false;
     }
   }
+  /* A consistent turn sign is not sufficient for self-intersecting stars.
+     Reject every non-adjacent edge contact with exact orientation signs. */
+  for (int first = 0; first < nverts; ++first) {
+    const int first_next = (first + 1) % nverts;
+    const double ax = x[cs + first], ay = y[cs + first];
+    const double bx = x[cs + first_next], by = y[cs + first_next];
+    for (int second = first + 1; second < nverts; ++second) {
+      const int second_next = (second + 1) % nverts;
+      if (second == first_next || second_next == first) continue;
+      const double cx = x[cs + second], cy = y[cs + second];
+      const double dx = x[cs + second_next], dy = y[cs + second_next];
+      if (fmax(ax, bx) < fmin(cx, dx) || fmax(cx, dx) < fmin(ax, bx)
+          || fmax(ay, by) < fmin(cy, dy) || fmax(cy, dy) < fmin(ay, by)) {
+        continue;
+      }
+      const int o1 = vs_orient2d(ax, ay, bx, by, cx, cy);
+      const int o2 = vs_orient2d(ax, ay, bx, by, dx, dy);
+      const int o3 = vs_orient2d(cx, cy, dx, dy, ax, ay);
+      const int o4 = vs_orient2d(cx, cy, dx, dy, bx, by);
+      if ((o1 * o2 < 0 && o3 * o4 < 0)
+          || (o1 == 0 && vs_point_on_segment_collinear(cx, cy, ax, ay, bx, by))
+          || (o2 == 0 && vs_point_on_segment_collinear(dx, dy, ax, ay, bx, by))
+          || (o3 == 0 && vs_point_on_segment_collinear(ax, ay, cx, cy, dx, dy))
+          || (o4 == 0 && vs_point_on_segment_collinear(bx, by, cx, cy, dx, dy))) {
+        return false;
+      }
+    }
+  }
   return sign != 0;
+}
+
+extern "C" __device__ inline bool polygonal_source_ring_is_simple_nonzero(
+    const double* x, const double* y,
+    const int* ring_offsets,
+    int ring_start, int ring_end
+) {
+  if (ring_end - ring_start != 1) return false;
+  const int cs = ring_offsets[ring_start];
+  const int ce = ring_offsets[ring_start + 1];
+  if (ce - cs < 4) return false;
+  const int last = ce - 1;
+  if (x[cs] != x[last] || y[cs] != y[last]) return false;
+  const int nverts = last - cs;
+  bool nonzero = false;
+  for (int local = 0; local < nverts; ++local) {
+    const int i0 = cs + local;
+    const int i1 = cs + ((local + 1) % nverts);
+    const int i2 = cs + ((local + 2) % nverts);
+    const double x0 = x[i0], y0 = y[i0];
+    const double x1 = x[i1], y1 = y[i1];
+    const double x2 = x[i2], y2 = y[i2];
+    if (!isfinite(x0) || !isfinite(y0)
+        || !isfinite(x1) || !isfinite(y1)
+        || !isfinite(x2) || !isfinite(y2)) return false;
+    nonzero = nonzero || vs_orient2d(x0, y0, x1, y1, x2, y2) != 0;
+  }
+  if (!nonzero) return false;
+
+  for (int first = 0; first < nverts; ++first) {
+    const int first_next = (first + 1) % nverts;
+    const double ax = x[cs + first], ay = y[cs + first];
+    const double bx = x[cs + first_next], by = y[cs + first_next];
+    for (int second = first + 1; second < nverts; ++second) {
+      const int second_next = (second + 1) % nverts;
+      if (second == first_next || second_next == first) continue;
+      const double cx = x[cs + second], cy = y[cs + second];
+      const double dx = x[cs + second_next], dy = y[cs + second_next];
+      if (fmax(ax, bx) < fmin(cx, dx) || fmax(cx, dx) < fmin(ax, bx)
+          || fmax(ay, by) < fmin(cy, dy) || fmax(cy, dy) < fmin(ay, by)) {
+        continue;
+      }
+      const int o1 = vs_orient2d(ax, ay, bx, by, cx, cy);
+      const int o2 = vs_orient2d(ax, ay, bx, by, dx, dy);
+      const int o3 = vs_orient2d(cx, cy, dx, dy, ax, ay);
+      const int o4 = vs_orient2d(cx, cy, dx, dy, bx, by);
+      if ((o1 * o2 < 0 && o3 * o4 < 0)
+          || (o1 == 0 && vs_point_on_segment_collinear(cx, cy, ax, ay, bx, by))
+          || (o2 == 0 && vs_point_on_segment_collinear(dx, dy, ax, ay, bx, by))
+          || (o3 == 0 && vs_point_on_segment_collinear(ax, ay, cx, cy, dx, dy))
+          || (o4 == 0 && vs_point_on_segment_collinear(bx, by, cx, cy, dx, dy))) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+extern "C" __device__ inline bool polygonal_source_is_single_simple_no_holes(
+    const double* x, const double* y,
+    const int* ring_offsets,
+    const int* poly_ring_starts,
+    const int* poly_ring_ends,
+    int n_polys
+) {
+  return n_polys == 1 && polygonal_source_ring_is_simple_nonzero(
+      x, y, ring_offsets, poly_ring_starts[0], poly_ring_ends[0]);
+}
+
+extern "C" __device__ inline bool polygonal_source_is_single_collapsed_ring(
+    const double* x, const double* y,
+    const int* ring_offsets,
+    const int* poly_ring_starts,
+    const int* poly_ring_ends,
+    int n_polys
+) {
+  if (n_polys != 1 || poly_ring_ends[0] - poly_ring_starts[0] != 1) return false;
+  const int ring = poly_ring_starts[0];
+  const int cs = ring_offsets[ring];
+  const int ce = ring_offsets[ring + 1];
+  if (ce - cs < 4) return false;
+  const int last = ce - 1;
+  if (x[cs] != x[last] || y[cs] != y[last]) return false;
+  const int nverts = last - cs;
+  for (int local = 0; local < nverts; ++local) {
+    const int i0 = cs + local;
+    const int i1 = cs + ((local + 1) % nverts);
+    const int i2 = cs + ((local + 2) % nverts);
+    if (!isfinite(x[i0]) || !isfinite(y[i0])) return false;
+    if (vs_orient2d(x[i0], y[i0], x[i1], y[i1], x[i2], y[i2]) != 0) {
+      return false;
+    }
+  }
+  return true;
 }
 
 extern "C" __device__ inline unsigned char de9im_mask_is_covered_by(unsigned short mask) {
@@ -840,8 +959,25 @@ extern "C" __device__ inline unsigned char polygonal_covered_by_no_holes_mask(
     const int* b_poly_ring_ends,
     int n_b_polys
 ) {
-  if (!polygonal_mask_is_single_convex_no_holes(
-          bx, by, b_ring_offsets, b_poly_ring_starts, b_poly_ring_ends, n_b_polys)) {
+  const bool convex_mask = polygonal_mask_is_single_convex_no_holes(
+      bx, by, b_ring_offsets, b_poly_ring_starts, b_poly_ring_ends, n_b_polys);
+  const bool simple_source = polygonal_source_is_single_simple_no_holes(
+      ax, ay, a_ring_offsets, a_poly_ring_starts, a_poly_ring_ends, n_a_polys);
+  if (convex_mask && polygonal_source_is_single_collapsed_ring(
+          ax, ay, a_ring_offsets, a_poly_ring_starts, a_poly_ring_ends, n_a_polys)) {
+    const int cs = a_ring_offsets[a_poly_ring_starts[0]];
+    const int ce = a_ring_offsets[a_poly_ring_starts[0] + 1] - 1;
+    bool any_vertex = false;
+    for (int vertex = cs; vertex < ce; ++vertex) {
+      const unsigned char loc = de9im_point_in_polygons(
+          ax[vertex], ay[vertex], bx, by, b_ring_offsets,
+          b_poly_ring_starts, b_poly_ring_ends, n_b_polys);
+      if (loc != 2) return 0;
+      any_vertex = true;
+    }
+    return any_vertex ? 1 : 0;
+  }
+  if (!convex_mask || !simple_source) {
     const unsigned short mask = de9im_polygon_polygon(
         ax, ay, a_ring_offsets, a_poly_ring_starts, a_poly_ring_ends, n_a_polys,
         bx, by, b_ring_offsets, b_poly_ring_starts, b_poly_ring_ends, n_b_polys);
@@ -961,14 +1097,77 @@ extern "C" __device__ inline unsigned char polygonal_covered_by_mask_coop(
 ) {
   __shared__ int fail;
   __shared__ int contact;
+  __shared__ int convex_mask;
+  __shared__ int source_kind;
   if (threadIdx.x == 0) {
     fail = 0;
     contact = 0;
+    convex_mask = polygonal_mask_is_single_convex_no_holes(
+        bx, by, b_ring_offsets,
+        b_poly_ring_starts, b_poly_ring_ends, n_b_polys) ? 1 : 0;
+    source_kind = polygonal_source_is_single_simple_no_holes(
+        ax, ay, a_ring_offsets,
+        a_poly_ring_starts, a_poly_ring_ends, n_a_polys) ? 1 :
+        (polygonal_source_is_single_collapsed_ring(
+            ax, ay, a_ring_offsets,
+            a_poly_ring_starts, a_poly_ring_ends, n_a_polys) ? 2 : 0);
   }
   __syncthreads();
 
   const int tid = threadIdx.x;
   const int stride = blockDim.x;
+
+  /*
+   * For a certified convex mask, containment is exactly vertex shaped: every
+   * straight source edge and polygonal interior lies in the convex hull of
+   * the source vertices.  Classify vertices in parallel and reduce directly
+   * to the pair result.  Concave, holed, multipart, or uncertain masks retain
+   * the complete DE-9IM-compatible path below.
+   */
+  if (convex_mask && source_kind == 2) {
+    int collapsed_vertex_ordinal = 0;
+    for (int ap = 0; ap < n_a_polys; ++ap) {
+      const int ars = a_poly_ring_starts[ap], are = a_poly_ring_ends[ap];
+      for (int ar = ars; ar < are; ++ar) {
+        const int acs = a_ring_offsets[ar], ace = a_ring_offsets[ar + 1];
+        const int vlast = (ace > acs + 1) ? ace - 1 : ace;
+        for (int vi = acs; vi < vlast; ++vi, ++collapsed_vertex_ordinal) {
+          if ((collapsed_vertex_ordinal % stride) != tid) continue;
+          const unsigned char loc = de9im_point_in_polygons(
+              ax[vi], ay[vi], bx, by, b_ring_offsets,
+              b_poly_ring_starts, b_poly_ring_ends, n_b_polys);
+          if (loc != 2) atomicExch(&fail, 1);
+          atomicExch(&contact, 1);
+        }
+      }
+    }
+    __syncthreads();
+    return (contact != 0 && fail == 0) ? 1 : 0;
+  }
+
+  if (convex_mask && source_kind == 1) {
+    int convex_vertex_ordinal = 0;
+    for (int ap = 0; ap < n_a_polys; ++ap) {
+      const int ars = a_poly_ring_starts[ap], are = a_poly_ring_ends[ap];
+      for (int ar = ars; ar < are; ++ar) {
+        const int acs = a_ring_offsets[ar], ace = a_ring_offsets[ar + 1];
+        const int vlast = (ace > acs + 1) ? ace - 1 : ace;
+        for (int vi = acs; vi < vlast; ++vi, ++convex_vertex_ordinal) {
+          if ((convex_vertex_ordinal % stride) != tid) continue;
+          const unsigned char loc = de9im_point_in_polygons(
+              ax[vi], ay[vi], bx, by, b_ring_offsets,
+              b_poly_ring_starts, b_poly_ring_ends, n_b_polys);
+          if (loc == 0) {
+            atomicExch(&fail, 1);
+          } else {
+            atomicExch(&contact, 1);
+          }
+        }
+      }
+    }
+    __syncthreads();
+    return (contact != 0 && fail == 0) ? 1 : 0;
+  }
 
   int vertex_ordinal = 0;
   int segment_ordinal = 0;
@@ -1094,6 +1293,109 @@ extern "C" __device__ inline unsigned char polygonal_covered_by_mask_coop(
 // ===================================================================
 // Global kernels
 // ===================================================================
+
+extern "C" __global__ void certify_single_polygon_convex_no_holes(
+    const int* geometry_offsets,
+    const int* ring_offsets,
+    const unsigned char* empty_mask,
+    const double* x,
+    const double* y,
+    int polygon_row,
+    unsigned char* out
+) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  if (empty_mask[polygon_row]) { out[0] = 0; return; }
+  const int ring_start = geometry_offsets[polygon_row];
+  const int ring_end = geometry_offsets[polygon_row + 1];
+  out[0] = polygonal_mask_is_single_convex_no_holes(
+      x, y, ring_offsets, &ring_start, &ring_end, 1) ? 1 : 0;
+}
+
+extern "C" __global__ void certify_single_multipolygon_convex_no_holes(
+    const int* geometry_offsets,
+    const int* part_offsets,
+    const int* ring_offsets,
+    const unsigned char* empty_mask,
+    const double* x,
+    const double* y,
+    int multipolygon_row,
+    unsigned char* out
+) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  if (empty_mask[multipolygon_row]) { out[0] = 0; return; }
+  const int polygon_start = geometry_offsets[multipolygon_row];
+  const int polygon_end = geometry_offsets[multipolygon_row + 1];
+  out[0] = polygonal_mask_is_single_convex_no_holes(
+      x, y, ring_offsets,
+      part_offsets + polygon_start,
+      part_offsets + polygon_start + 1,
+      polygon_end - polygon_start) ? 1 : 0;
+}
+
+extern "C" __global__ void certify_polygon_sources_simple_no_holes(
+    const int* geometry_offsets,
+    const int* ring_offsets,
+    const unsigned char* empty_mask,
+    const double* x,
+    const double* y,
+    int row_count,
+    unsigned char* row_certificates,
+    int* all_certified
+) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= row_count) return;
+  const bool certified = !empty_mask[row] && polygonal_source_ring_is_simple_nonzero(
+      x, y, ring_offsets, geometry_offsets[row], geometry_offsets[row + 1]);
+  row_certificates[row] = certified ? 1u : 0u;
+  if (!certified) atomicExch(all_certified, 0);
+}
+
+extern "C" __global__ void certify_multipolygon_sources_simple_no_holes(
+    const int* geometry_offsets,
+    const int* part_offsets,
+    const int* ring_offsets,
+    const unsigned char* empty_mask,
+    const double* x,
+    const double* y,
+    int row_count,
+    unsigned char* row_certificates,
+    int* all_certified
+) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= row_count) return;
+  const int polygon_start = geometry_offsets[row];
+  const int polygon_end = geometry_offsets[row + 1];
+  const bool certified = !empty_mask[row]
+      && polygon_end - polygon_start == 1
+      && polygonal_source_ring_is_simple_nonzero(
+          x, y, ring_offsets,
+          part_offsets[polygon_start], part_offsets[polygon_start + 1]);
+  row_certificates[row] = certified ? 1u : 0u;
+  if (!certified) atomicExch(all_certified, 0);
+}
+
+extern "C" __global__ void polygon_coordinate_offsets_i64(
+    const int* geometry_offsets,
+    const int* ring_offsets,
+    long long* coordinate_offsets,
+    int offset_count
+) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= offset_count) return;
+  coordinate_offsets[index] = (long long)ring_offsets[geometry_offsets[index]];
+}
+
+extern "C" __global__ void multipolygon_coordinate_offsets_i64(
+    const int* geometry_offsets,
+    const int* part_offsets,
+    const int* ring_offsets,
+    long long* coordinate_offsets,
+    int offset_count
+) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= offset_count) return;
+  coordinate_offsets[index] = (long long)ring_offsets[part_offsets[geometry_offsets[index]]];
+}
 
 // ---- Polygon × Polygon DE-9IM bitmask ----
 extern "C" __global__ void polygon_polygon_de9im_from_owned(
@@ -2571,6 +2873,12 @@ extern "C" __global__ void mls_mpg_de9im_from_owned(
 
 
 _POLYGON_PREDICATES_KERNEL_NAMES = (
+    "certify_single_polygon_convex_no_holes",
+    "certify_single_multipolygon_convex_no_holes",
+    "certify_polygon_sources_simple_no_holes",
+    "certify_multipolygon_sources_simple_no_holes",
+    "polygon_coordinate_offsets_i64",
+    "multipolygon_coordinate_offsets_i64",
     "polygon_polygon_de9im_from_owned",
     "multipolygon_multipolygon_de9im_from_owned",
     "polygon_multipolygon_de9im_from_owned",

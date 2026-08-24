@@ -16,6 +16,10 @@ from vibespatial import (
     from_shapely_geometries,
     has_gpu_runtime,
 )
+from vibespatial.cuda.device_functions.numerical_envelope import (
+    ORIENT2D_FP32_ENVELOPE_DEVICE,
+)
+from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
 from vibespatial.kernels.predicates.point_in_polygon import (
     point_in_polygon,
     point_in_polygon_expression,
@@ -129,6 +133,80 @@ def test_point_in_polygon_explicit_gpu_matches_cpu_result() -> None:
     gpu_result = point_in_polygon(points, polygons, dispatch_mode=ExecutionMode.GPU)
 
     assert gpu_result == cpu_result
+
+
+@pytest.mark.gpu
+def test_selective_orientation_refines_underflow_and_binary64_subtraction_tails() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    source = ORIENT2D_DEVICE + ORIENT2D_FP32_ENVELOPE_DEVICE + r"""
+extern "C" __global__ void probe_orientation_envelope(
+    const double* coordinates,
+    int* coarse,
+    int* exact,
+    int* selective,
+    unsigned char* refined,
+    int count
+) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    const double* row = coordinates + 6 * index;
+    float absolute_error = 0.0f;
+    coarse[index] = vs_orient2d_fp32_envelope(
+        row[0], row[1], row[2], row[3], row[4], row[5],
+        &absolute_error);
+    exact[index] = vs_orient2d(
+        row[0], row[1], row[2], row[3], row[4], row[5]);
+    bool did_refine = false;
+    selective[index] = vs_orient2d_selective_fp32(
+        row[0], row[1], row[2], row[3], row[4], row[5],
+        &did_refine);
+    refined[index] = did_refine ? 1 : 0;
+}
+"""
+    tail_a = (264711.2822437645, -295408.3160125398)
+    tail_b = (-7522906.329498147, -5148505.703374741)
+    tail_c = (-619060.6401420762, -846158.419752602)
+    tail_permutations = [
+        (*tail_a, *tail_b, *tail_c),
+        (*tail_b, *tail_c, *tail_a),
+        (*tail_c, *tail_a, *tail_b),
+        (*tail_b, *tail_a, *tail_c),
+        (*tail_a, *tail_c, *tail_b),
+        (*tail_c, *tail_b, *tail_a),
+    ]
+    coordinates = cp.asarray(
+        [
+            [1e-45, 1.0, 5e-8, 1e38, 0.0, 0.0],
+            [1e-20, 0.0, 0.0, 1e-20, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            *tail_permutations,
+            [1e200, 0.0, 0.0, 1e200, 0.0, 0.0],
+            [1e-200, 0.0, 0.0, 1e-200, 0.0, 0.0],
+            [np.finfo(np.float64).max, 2.0**-500, 0.0, 0.0, -np.finfo(np.float64).max, 0.0],
+        ],
+        dtype=cp.float64,
+    )
+    coarse = cp.empty(12, dtype=cp.int32)
+    exact = cp.empty(12, dtype=cp.int32)
+    selective = cp.empty(12, dtype=cp.int32)
+    refined = cp.empty(12, dtype=cp.uint8)
+    kernel = cp.RawKernel(source, "probe_orientation_envelope", options=("--std=c++17",))
+
+    kernel(
+        (1,),
+        (32,),
+        (coordinates, coarse, exact, selective, refined, np.int32(12)),
+    )
+
+    assert cp.asnumpy(coarse).tolist() == [2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    expected = [1, 1, 1, -1, -1, -1, 1, 1, 1, 1, 1, -1]
+    assert cp.asnumpy(exact).tolist() == expected
+    assert cp.asnumpy(selective).tolist() == expected
+    assert cp.asnumpy(refined).tolist() == [1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1]
 
 
 @pytest.mark.gpu

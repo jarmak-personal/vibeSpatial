@@ -144,6 +144,10 @@ def test_pipeline_smoke_suite_runs_active_pipelines() -> None:
     assert payload["metadata"]["suite"] == "smoke"
     assert payload["metadata"]["repeat"] == 1
     assert payload["metadata"]["profile_mode"] == "lean"
+    source_identity = payload["metadata"]["vibespatial_source"]
+    assert source_identity["git_revision"]
+    assert len(source_identity["worktree_source_sha256"]) == 64
+    assert source_identity["source_file"].endswith("vibespatial/__init__.py")
     result_payload = {(item["pipeline"], item["scale"]): item for item in payload["results"]}
     join_payload = result_payload[("join-heavy", 1000)]
     assert "owned_transfer_count" in join_payload
@@ -387,6 +391,24 @@ def test_grouped_capacity_partitions_pipeline_smoke() -> None:
     assert trace["metadata"]["admissible_shape"] == (
         "NativeGrouped source-capacity strip/exact and positive/degenerate partitions"
     )
+
+
+def test_device_memory_monitor_isolates_preexisting_process_peak() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime unavailable")
+    rmm = pytest.importorskip("rmm")
+    from rmm import statistics
+
+    statistics.enable_statistics()
+    preexisting = rmm.DeviceBuffer(size=80 * 1024 * 1024)
+    assert statistics.get_statistics().peak_bytes >= preexisting.size
+
+    monitor = pipeline_module._DeviceMemoryMonitor()
+    scoped = rmm.DeviceBuffer(size=1024 * 1024)
+    current_peak = monitor.current_peak_bytes
+    assert current_peak is not None
+    assert scoped.size <= current_peak < 8 * 1024 * 1024
+    assert monitor.peak_bytes == current_peak
 
 
 def test_grouped_disjoint_constructive_reduce_pipeline_smoke() -> None:
