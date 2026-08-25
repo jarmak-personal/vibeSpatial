@@ -5,7 +5,7 @@ Scope: Current measured evidence, reliability decisions, ranked hypotheses, and 
 Read If: You are choosing the next physical-shape performance investigation or validating a work-amplification claim.
 STOP IF: You need the research methodology or an operation-specific implementation contract rather than current results.
 Source Of Truth: Ranked work-amplification evidence and the disposition of measured hypotheses.
-Body Budget: 221/240 lines
+Body Budget: 240/240 lines
 Document: docs/dev/work-amplification-evidence.md
 
 Section Map (Body Lines)
@@ -18,12 +18,12 @@ Section Map (Body Lines)
 | 26-32 | Verify |
 | 33-39 | Risks |
 | 40-53 | Evidence Contract |
-| 54-76 | R0 Capture |
-| 77-103 | R1 Capture And Observer Control |
-| 104-138 | Ranked R1 Map |
-| 139-176 | R2 Counterfactuals |
-| 177-203 | Component-First Follow-Up |
-| 204-221 | Decisions |
+| 54-77 | R0 Capture |
+| 78-104 | R1 Capture And Observer Control |
+| 105-139 | Ranked R1 Map |
+| 140-195 | R2 Counterfactuals |
+| 196-222 | Component-First Follow-Up |
+| 223-240 | Decisions |
 DOC_HEADER:END -->
 
 ## Intent
@@ -91,7 +91,8 @@ Intel i9-13900K, RTX 4090 24 GiB, driver 580.173.02, and local NVMe storage.
 
 The 1M corridor-flood-priority workflow took an explicit observable off-ramp
 because mixed/null/empty buffer input was unsupported in strict-native mode. It
-is not counted as a native success.
+is not counted as a native success in this historical R0 capture. A
+current-source corrective replay is documented below.
 
 The conservative offline R0 analyzer emits 1,424 schema-valid records and zero
 automatic findings. This is intentional: existing artifacts establish wall
@@ -172,6 +173,24 @@ also refreshes the public regression rails on source identity `708b2b41...`:
 the same explicit corridor off-ramp, and SF100 is 464.88s lean versus 464.32s
 with counters. The current full pipeline has 22 successes, 2 deferred, and
 zero compute D2H, materialization, or fallback.
+
+### Corridor Polygonal Buffer Follow-up
+
+The R0/R1/R2 off-ramp was a missing public native orchestration for a
+Polygon/MultiPolygon carrier produced by overlay, not a fundamental buffer
+limitation. Source `3d9dead7...` resolves it generally by expanding polygon
+parts, applying the existing fp64 buffer kernel, and grouped-union reducing the
+parts back to their original public rows. Native admission requires finite
+nonnegative radii, OGC-valid input, and hole-free parts; other topology domains
+decline observably before constructive submission. Nulls propagate, valid
+empties remain empty, and strict-native oracles cover indexed input and radii.
+
+The identified 1M replay is exact and completes in 1.255s versus 10.318s for a
+validated GeoPandas comparator (8.22x). Its counter profile has zero fallbacks
+and all 65 dispatch steps on GPU. The combined buffer/join/filter branch takes
+98.0ms. The 10K homogeneous path remains direct and exact at 0.270s median
+versus the prior 0.253s snapshot, without a physical-path change. Evidence is
+in the `2026-08-25-corridor-buffer-native` follow-up capsule.
 
 | Counterfactual | Baseline | Alternative | Current decision |
 |---|---:|---:|---|

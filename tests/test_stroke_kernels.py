@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import LineString, MultiLineString, Point, Polygon
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon, box
 
 import vibespatial.api as geopandas
 from vibespatial import (
@@ -25,8 +25,11 @@ from vibespatial.constructive.linestring import (
 from vibespatial.constructive.polygon import polygon_buffer_native_tabular_result
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
-from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime, set_requested_mode
+from vibespatial.runtime.fallbacks import StrictNativeFallbackError
 from vibespatial.runtime.fusion import IntermediateDisposition
+from vibespatial.runtime.residency import Residency
+from vibespatial.testing import strict_native_environment
 
 
 def test_stroke_plan_uses_prefix_sum_and_persistent_geometry_buffers() -> None:
@@ -160,6 +163,208 @@ def test_geopandas_buffer_gpu_preserves_null_point_rows() -> None:
         bool(shapely.equals_exact(actual, expected_geom, tolerance=1e-12))
         for actual, expected_geom in zip(result.iloc[1:4], expected, strict=True)
     )
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
+def test_public_polygonal_buffer_strict_native_handles_indexed_polygon_multipolygon() -> None:
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    values = [
+        box(20, 0, 21, 1),
+        MultiPolygon([box(0, 0, 1, 1), box(1.5, 0, 2.5, 1)]),
+        box(10, 0, 11, 1),
+        MultiPolygon([box(30, 0, 31, 1), box(34, 0, 35, 1)]),
+    ]
+    source = from_shapely_geometries(values, residency=Residency.DEVICE)
+    indexed = source._device_indexed_take(
+        cp.asarray([1, 2, 3], dtype=cp.int64),
+        assume_unique_indices=True,
+    )
+    assert indexed.is_indexed_view
+    series = GeoSeries(DeviceGeometryArray._from_owned(indexed))
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    with strict_native_environment():
+        result = series.buffer(0.5, quad_segs=4)
+    transfer_reasons = [
+        event.reason for event in get_d2h_transfer_events(clear=True)
+    ]
+    dispatch_events = geopandas.get_dispatch_events(clear=True)
+    fallback_events = geopandas.get_fallback_events(clear=True)
+
+    expected = shapely.buffer(
+        np.asarray([values[1], values[2], values[3]], dtype=object),
+        0.5,
+        quad_segs=4,
+    )
+    assert isinstance(result.values, DeviceGeometryArray)
+    assert not fallback_events
+    assert dispatch_events[-1].implementation == "polygonal_part_group_buffer_gpu"
+    assert dispatch_events[-1].selected is ExecutionMode.GPU
+    assert not any(
+        "active-part exact allocation" in reason for reason in transfer_reasons
+    )
+    for actual, expected_geom in zip(result, expected, strict=True):
+        assert actual.symmetric_difference(expected_geom).area < 1e-9
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
+def test_public_polygonal_buffer_strict_native_preserves_null_empty_and_row_radii() -> None:
+    values = [
+        box(0, 0, 1, 1),
+        MultiPolygon([box(3, 0, 4, 1), box(4.5, 0, 5.5, 1)]),
+        None,
+        Polygon(),
+        MultiPolygon([box(10, 0, 11, 1), box(13, 0, 14, 1)]),
+    ]
+    distances = np.asarray([0.25, 0.5, 1.0, 2.0, 0.1], dtype=np.float64)
+    source = from_shapely_geometries(values, residency=Residency.DEVICE)
+    series = GeoSeries(DeviceGeometryArray._from_owned(source))
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    with strict_native_environment():
+        result = series.buffer(distances, quad_segs=4)
+    dispatch_events = geopandas.get_dispatch_events(clear=True)
+    fallback_events = geopandas.get_fallback_events(clear=True)
+
+    expected = shapely.buffer(
+        np.asarray(values, dtype=object),
+        distances,
+        quad_segs=4,
+    )
+    assert isinstance(result.values, DeviceGeometryArray)
+    assert not fallback_events
+    assert dispatch_events[-1].implementation == "polygonal_part_group_buffer_gpu"
+    for actual, expected_geom in zip(result, expected, strict=True):
+        if expected_geom is None:
+            assert actual is None
+        else:
+            assert actual.symmetric_difference(expected_geom).area < 1e-9
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
+def test_public_polygonal_buffer_strict_native_propagates_all_null_rows() -> None:
+    source = from_shapely_geometries(
+        [None, None, None],
+        residency=Residency.DEVICE,
+    )
+    series = GeoSeries(DeviceGeometryArray._from_owned(source))
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    with strict_native_environment():
+        result = series.buffer(2.0)
+
+    assert isinstance(result.values, DeviceGeometryArray)
+    assert result.isna().all()
+    assert not geopandas.get_fallback_events(clear=True)
+    assert geopandas.get_dispatch_events(clear=True)[-1].implementation == (
+        "null_buffer_identity"
+    )
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
+@pytest.mark.parametrize(
+    ("geometry", "distance"),
+    [
+        (
+            MultiPolygon([box(0, 0, 1, 1), box(3, 0, 4, 1)]),
+            -0.6,
+        ),
+        (
+            MultiPolygon(
+                [
+                    Polygon(
+                        [(0, 0), (5, 0), (5, 5), (0, 5), (0, 0)],
+                        [[(2, 2), (3, 2), (3, 3), (2, 3), (2, 2)]],
+                    ),
+                    box(10, 0, 11, 1),
+                ]
+            ),
+            0.6,
+        ),
+        (
+            MultiPolygon(
+                [
+                    Polygon([(0, 0), (2, 2), (0, 2), (2, 0), (0, 0)]),
+                    box(4, 0, 5, 1),
+                ]
+            ),
+            0.0,
+        ),
+    ],
+    ids=("negative-collapse", "hole-collapse", "invalid-repair"),
+)
+def test_public_polygonal_buffer_strict_native_declines_unproven_topology(
+    geometry,
+    distance: float,
+) -> None:
+    source = from_shapely_geometries(
+        [geometry],
+        residency=Residency.DEVICE,
+    )
+    series = GeoSeries(DeviceGeometryArray._from_owned(source))
+
+    geopandas.clear_fallback_events()
+    with strict_native_environment(), pytest.raises(StrictNativeFallbackError):
+        series.buffer(distance, quad_segs=4)
+    fallback_events = geopandas.get_fallback_events(clear=True)
+
+    assert len(fallback_events) == 1
+    assert fallback_events[0].surface == "DeviceGeometryArray.buffer"
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
+def test_public_polygonal_buffer_explicit_cpu_request_does_not_launch_gpu() -> None:
+    geometry = MultiPolygon([box(0, 0, 1, 1), box(3, 0, 4, 1)])
+    source = from_shapely_geometries([geometry], residency=Residency.HOST)
+    series = GeoSeries(DeviceGeometryArray._from_owned(source))
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    with set_requested_mode(ExecutionMode.CPU):
+        result = series.buffer(0.25, quad_segs=4)
+    dispatch_events = geopandas.get_dispatch_events(clear=True)
+    fallback_events = geopandas.get_fallback_events(clear=True)
+
+    expected = shapely.buffer(geometry, 0.25, quad_segs=4)
+    assert result.iloc[0].symmetric_difference(expected).area < 1e-9
+    assert result.values.to_owned().residency is Residency.HOST
+    assert len(fallback_events) == 1
+    assert dispatch_events[-1].implementation == "shapely_fallback"
+    assert dispatch_events[-1].selected is ExecutionMode.CPU
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
+def test_public_polygonal_buffer_decline_exports_device_radii_at_cpu_boundary() -> None:
+    import cupy as cp
+
+    geometry = MultiPolygon([box(0, 0, 1, 1), box(3, 0, 4, 1)])
+    source = from_shapely_geometries([geometry], residency=Residency.DEVICE)
+    series = GeoSeries(DeviceGeometryArray._from_owned(source))
+    distance = cp.asarray([-0.6], dtype=cp.float64)
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    result = series.buffer(distance, quad_segs=4)
+    dispatch_events = geopandas.get_dispatch_events(clear=True)
+    fallback_events = geopandas.get_fallback_events(clear=True)
+
+    expected = shapely.buffer(geometry, -0.6, quad_segs=4)
+    assert result.iloc[0].equals(expected)
+    assert result.values.to_owned().residency is Residency.HOST
+    assert len(fallback_events) == 1
+    assert dispatch_events[-1].implementation == "shapely_fallback"
+    assert dispatch_events[-1].selected is ExecutionMode.CPU
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")

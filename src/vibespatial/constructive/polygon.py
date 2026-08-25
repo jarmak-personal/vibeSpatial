@@ -12,6 +12,7 @@ from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
+    DeviceArray,
     compile_kernel_group,
     get_cuda_runtime,
 )
@@ -458,7 +459,7 @@ def _build_device_backed_polygon_output_variable(
 
 def polygon_buffer_owned_array(
     polygons: OwnedGeometryArray,
-    distance: float | np.ndarray,
+    distance: float | np.ndarray | DeviceArray,
     *,
     quad_segs: int = 8,
     join_style: str = "round",
@@ -472,11 +473,14 @@ def polygon_buffer_owned_array(
     if _polygon_device_has_empty_rows(polygons):
         raise ValueError("polygon_buffer_owned_array requires non-empty rows only")
 
-    radii = (
-        np.full(polygons.row_count, float(distance), dtype=np.float64)
-        if np.isscalar(distance)
-        else np.asarray(distance, dtype=np.float64)
-    )
+    if np.isscalar(distance):
+        radii = np.full(polygons.row_count, float(distance), dtype=np.float64)
+    elif hasattr(distance, "__cuda_array_interface__"):
+        import cupy as cp
+
+        radii = cp.asarray(distance, dtype=cp.float64)
+    else:
+        radii = np.asarray(distance, dtype=np.float64)
     if radii.shape != (polygons.row_count,):
         raise ValueError("distance must be a scalar or length-matched vector")
 
@@ -508,6 +512,11 @@ def polygon_buffer_owned_array(
     ).selected
 
     if selected_mode is not ExecutionMode.GPU:
+        if hasattr(radii, "__cuda_array_interface__"):
+            radii = get_cuda_runtime().copy_device_to_host(
+                radii,
+                reason="polygon buffer device radii explicit CPU dispatch boundary",
+            )
         return build_polygon_buffers_cpu(
             polygons,
             radii,
@@ -523,6 +532,233 @@ def polygon_buffer_owned_array(
         join_style=join_int,
         mitre_limit=mitre_limit,
     )
+
+
+def _polygonal_buffer_gpu_admissible(
+    polygonal: OwnedGeometryArray,
+    distance: float | np.ndarray | DeviceArray,
+    *,
+    assume_all_valid_nonempty: bool,
+) -> bool:
+    """Certify the topology domain implemented by the ring-offset kernel.
+
+    The current native kernel is exact for nonnegative buffers of valid,
+    hole-free Polygon parts. Negative erosion, collapsing holes, and invalid
+    input require GEOS topology repair and must decline before constructive
+    submission. Unknown validity is resolved by one device-side predicate and
+    a single aggregate planning packet; coordinates remain device-resident.
+    """
+    import cupy as cp
+
+    if np.isscalar(distance):
+        radius = float(distance)
+        if not np.isfinite(radius) or radius < 0.0:
+            return False
+        d_distance_admissible = cp.asarray(True, dtype=cp.bool_)
+    elif hasattr(distance, "__cuda_array_interface__"):
+        d_radii = cp.asarray(distance, dtype=cp.float64)
+        if d_radii.shape != (polygonal.row_count,):
+            raise ValueError("distance must be a scalar or length-matched vector")
+        d_distance_admissible = cp.all(cp.isfinite(d_radii) & (d_radii >= 0.0))
+    else:
+        radii = np.asarray(distance, dtype=np.float64)
+        if radii.shape != (polygonal.row_count,):
+            raise ValueError("distance must be a scalar or length-matched vector")
+        if not bool(np.all(np.isfinite(radii) & (radii >= 0.0))):
+            return False
+        d_distance_admissible = cp.asarray(True, dtype=cp.bool_)
+
+    state = polygonal._ensure_device_state(preserve_indexed_view=False)
+    if state.trusted_all_ogc_valid is True:
+        d_valid_admissible = cp.asarray(True, dtype=cp.bool_)
+    else:
+        from vibespatial.constructive.validity import validity_expression_owned
+
+        validity = validity_expression_owned(
+            polygonal,
+            exact_collinearity=True,
+        )
+        d_present = cp.asarray(state.validity, dtype=cp.bool_)
+        d_valid_admissible = cp.all(
+            ~d_present | cp.asarray(validity.values, dtype=cp.bool_)
+        )
+
+    ring_count = 0
+    concrete_part_count = 0
+    polygon = state.families.get(GeometryFamily.POLYGON)
+    if polygon is not None:
+        ring_count += max(int(polygon.ring_offsets.size) - 1, 0)
+        polygon_capacity = max(int(polygon.geometry_offsets.size) - 1, 0)
+        if assume_all_valid_nonempty:
+            concrete_part_count += polygon_capacity
+        else:
+            d_empty = cp.asarray(polygon.empty_mask, dtype=cp.bool_)
+            concrete_part_count += cp.count_nonzero(~d_empty)
+
+    multipolygon = state.families.get(GeometryFamily.MULTIPOLYGON)
+    if multipolygon is not None:
+        ring_count += max(int(multipolygon.ring_offsets.size) - 1, 0)
+        concrete_part_count += max(int(multipolygon.part_offsets.size) - 1, 0)
+
+    d_hole_free = cp.asarray(ring_count, dtype=cp.int64) == cp.asarray(
+        concrete_part_count,
+        dtype=cp.int64,
+    )
+    admitted = _device_scalar_bool(
+        d_distance_admissible & d_valid_admissible & d_hole_free,
+        reason="polygonal buffer native admissibility planning packet",
+    )
+    if admitted:
+        state.trusted_all_ogc_valid = True
+    return admitted
+
+
+def polygonal_buffer_owned_array(
+    polygonal: OwnedGeometryArray,
+    distance: float | np.ndarray | DeviceArray,
+    *,
+    quad_segs: int = 8,
+    join_style: str = "round",
+    mitre_limit: float = 5.0,
+    assume_all_valid_nonempty: bool = False,
+) -> OwnedGeometryArray | None:
+    """Buffer Polygon/MultiPolygon rows through native part-group execution.
+
+    Public semantics are row-aligned unary buffer with null propagation and
+    valid-empty preservation. The physical shape is polygon-part expansion,
+    fp64 dynamic-output buffer assembly, then a segmented union keyed by the
+    original public row. Buffering a multipart union distributes over its
+    Polygon components; grouped union merges overlapping positive buffers.
+
+    Clean concrete input stays device-only. Inputs containing null or empty
+    rows cross one aggregate allocation-planning packet to compact the active
+    Polygon-part prefix; geometry coordinates never leave the device. The
+    function returns ``None`` before constructive submission when execution
+    mode or topology lies outside the certified native domain.
+    """
+    try:
+        import cupy as cp
+    except ModuleNotFoundError as exc:  # pragma: no cover - GPU path only
+        raise RuntimeError("CuPy is required for native polygonal buffer") from exc
+
+    polygonal_families = {
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+    }
+    if not set(polygonal.families) <= polygonal_families:
+        raise ValueError(
+            "polygonal_buffer_owned_array requires only Polygon/MultiPolygon families"
+        )
+
+    from vibespatial.runtime import get_requested_mode
+
+    requested_mode = get_requested_mode()
+    if requested_mode is ExecutionMode.CPU:
+        return None
+    if requested_mode is ExecutionMode.AUTO and polygonal.residency is not Residency.DEVICE:
+        return None
+
+    polygonal = polygonal.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="polygonal_buffer_owned_array selected native part-group execution",
+    )
+    if polygonal.is_indexed_view:
+        polygonal = polygonal.physicalize_device_rows(allow_capacity_allocation=True)
+    source_state = polygonal._ensure_device_state(preserve_indexed_view=True)
+
+    if not _polygonal_buffer_gpu_admissible(
+        polygonal,
+        distance,
+        assume_all_valid_nonempty=assume_all_valid_nonempty,
+    ):
+        return None
+
+    from vibespatial.geometry.owned import build_empty_polygon_rows_device
+
+    empty_output = build_empty_polygon_rows_device(
+        polygonal.row_count,
+        validity=cp.asarray(source_state.validity, dtype=cp.bool_),
+    )
+    if polygonal.row_count == 0 or not polygonal.families:
+        return empty_output
+
+    from vibespatial.constructive.binary_constructive import (
+        _explode_polygonal_rows_to_polygon_capacity_gpu,
+        _regroup_native_grouped_parts_with_grouped_union_gpu,
+    )
+
+    parts = _explode_polygonal_rows_to_polygon_capacity_gpu(polygonal)
+    if parts is None or parts.capacity == 0:
+        return empty_output
+
+    d_source_rows = cp.asarray(parts.source_rows, dtype=cp.int32)
+    if assume_all_valid_nonempty:
+        part_geometry = parts.geometry.physicalize_device_rows(
+            allow_capacity_allocation=True,
+        )
+        part_row_count = part_geometry.row_count
+    else:
+        from vibespatial.geometry.owned import (
+            device_physicalize_owned_row_selections_exact,
+        )
+
+        physicalized = device_physicalize_owned_row_selections_exact(
+            [(parts.geometry, parts.selection.active_capacity_mask())],
+            reason="polygonal buffer active-part exact allocation planning packet",
+            compact_concrete_prefix=True,
+        )[0]
+        if physicalized is None or physicalized.row_count == 0:
+            return empty_output
+        part_geometry = physicalized
+        part_row_count = physicalized.row_count
+        d_source_rows = d_source_rows[:part_row_count]
+
+    part_state = part_geometry._ensure_device_state(preserve_indexed_view=True)
+    part_state.trusted_all_valid = True
+    part_state.trusted_homogeneous_family = GeometryFamily.POLYGON
+    part_state.trusted_all_non_empty = True
+    part_state.trusted_unique_family_rows = True
+
+    if np.isscalar(distance):
+        part_distance = float(distance)
+    else:
+        d_parent_distance = cp.asarray(distance, dtype=cp.float64)
+        if d_parent_distance.shape != (polygonal.row_count,):
+            raise ValueError("distance must be a scalar or length-matched vector")
+        part_distance = d_parent_distance[d_source_rows]
+
+    buffered_parts = polygon_buffer_owned_array(
+        part_geometry,
+        part_distance,
+        quad_segs=quad_segs,
+        join_style=join_style,
+        mitre_limit=mitre_limit,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    from vibespatial.api._native_grouped import NativeGrouped
+
+    grouped = NativeGrouped.from_dense_codes(
+        d_source_rows,
+        group_count=polygonal.row_count,
+        all_groups_observed=True if assume_all_valid_nonempty else None,
+        group_size_min=1 if assume_all_valid_nonempty else None,
+    )
+    result = _regroup_native_grouped_parts_with_grouped_union_gpu(
+        buffered_parts,
+        grouped.sorted_order,
+        grouped.group_offsets,
+        grouped.group_ids,
+        output_row_count=polygonal.row_count,
+        dispatch_mode=ExecutionMode.GPU,
+        empty_output=empty_output,
+    )
+    if result is None:
+        raise RuntimeError(
+            "native Polygon/MultiPolygon buffer regroup failed after GPU submission"
+        )
+    return result
 
 
 def polygon_buffer_native_tabular_result(
@@ -563,7 +799,7 @@ def polygon_buffer_native_tabular_result(
 
 def _build_polygon_buffers_gpu(
     polygons: OwnedGeometryArray,
-    radii: np.ndarray,
+    radii: np.ndarray | DeviceArray,
     *,
     quad_segs: int,
     join_style: int = 0,
@@ -636,7 +872,12 @@ def _build_polygon_buffers_gpu(
         params=winding_params,
     )
 
-    device_radii = runtime.from_host(radii)
+    radii_are_device = hasattr(radii, "__cuda_array_interface__")
+    device_radii = (
+        cp.asarray(radii, dtype=cp.float64)
+        if radii_are_device
+        else runtime.from_host(radii)
+    )
     device_ring_counts = runtime.allocate((total_rings,), np.int32)
     device_ring_offsets = None
     device_x = None
@@ -749,16 +990,26 @@ def _build_polygon_buffers_gpu(
             + cp.asarray(device_ring_counts)[:total_rings]
         )
 
-        success = True
-        return _build_device_backed_polygon_output_variable(
+        result = _build_device_backed_polygon_output_variable(
             device_x,
             device_y,
             row_count=polygons.row_count,
             geometry_offsets=input_geo_offsets.copy(),
             ring_offsets=out_ring_offsets,
         )
+        if radii_are_device:
+            from vibespatial.cuda._runtime import get_cuda_completion_retainer
+
+            get_cuda_completion_retainer().defer(
+                cp.cuda.get_current_stream(),
+                device_radii,
+                lambda _owner: None,
+            )
+        success = True
+        return result
     finally:
-        runtime.free(device_radii)
+        if not radii_are_device:
+            runtime.free(device_radii)
         runtime.free(device_ring_to_row)
         runtime.free(device_ring_is_hole)
         runtime.free(device_ring_winding)

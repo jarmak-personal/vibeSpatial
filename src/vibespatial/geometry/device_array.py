@@ -177,7 +177,7 @@ def _buffer_has_empties(
                 cp.any(cp.asarray(state.families[family].empty_mask)),
                 reason=reason,
             )
-            if not has_empties:
+            if not has_empties and len(state.families) == 1:
                 state.trusted_all_non_empty = True
             return has_empties
     return bool(np.any(owned.families[family].empty_mask))
@@ -959,10 +959,13 @@ class DeviceGeometryArray(ExtensionArray):
             single_sided,
             quad_segs,
         )
+        requested_mode = get_requested_mode()
 
         # Route via owned metadata -- no Shapely materialization for classification
         owned = self.to_owned()
         if (
+            requested_mode is not ExecutionMode.CPU
+            and
             owned.residency is Residency.DEVICE
             and owned.device_state is not None
             and owned.is_indexed_view
@@ -973,6 +976,94 @@ class DeviceGeometryArray(ExtensionArray):
             owned = owned.physicalize_device_rows(allow_capacity_allocation=True)
         families = set(owned.families.keys())
         all_valid = _buffer_all_valid(owned, families)
+
+        if not families:
+            result_residency = (
+                Residency.HOST
+                if requested_mode is ExecutionMode.CPU
+                else Residency.DEVICE
+                if requested_mode is ExecutionMode.GPU
+                else owned.residency
+            )
+            result = build_null_owned_array(
+                owned.row_count,
+                residency=result_residency,
+            )
+            record_dispatch_event(
+                surface="DeviceGeometryArray.buffer",
+                operation="buffer",
+                implementation="null_buffer_identity",
+                reason="DGA all-null buffer propagated null rows natively",
+                detail=f"rows={len(self)}",
+                selected=(
+                    ExecutionMode.GPU
+                    if result_residency is Residency.DEVICE
+                    else ExecutionMode.CPU
+                ),
+            )
+            return DeviceGeometryArray._from_owned(
+                result,
+                crs=self._crs,
+                provenance=provenance,
+            )
+
+        polygonal_families = {
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTIPOLYGON,
+        }
+        polygonal_only = families <= polygonal_families
+        polygonal_has_empties = (
+            polygonal_only
+            and any(_buffer_has_empties(owned, family) for family in families)
+        )
+        if (
+            polygonal_only
+            and not single_sided
+            and requested_mode is not ExecutionMode.CPU
+            and (
+                owned.residency is Residency.DEVICE
+                or requested_mode is ExecutionMode.GPU
+            )
+            and (
+                families != {GeometryFamily.POLYGON}
+                or not all_valid
+                or polygonal_has_empties
+            )
+        ):
+            from vibespatial.constructive.polygon import (
+                polygonal_buffer_owned_array,
+            )
+
+            result = polygonal_buffer_owned_array(
+                owned,
+                distance,
+                quad_segs=quad_segs,
+                join_style=join_style,
+                mitre_limit=mitre_limit,
+                assume_all_valid_nonempty=(
+                    all_valid and not polygonal_has_empties
+                ),
+            )
+            if result is not None:
+                record_dispatch_event(
+                    surface="DeviceGeometryArray.buffer",
+                    operation="buffer",
+                    implementation="polygonal_part_group_buffer_gpu",
+                    reason=(
+                        "DGA Polygon/MultiPolygon buffer used native part expansion "
+                        "and row-grouped union"
+                    ),
+                    detail=(
+                        f"rows={len(self)}, families="
+                        f"{','.join(sorted(family.value for family in families))}"
+                    ),
+                    selected=ExecutionMode.GPU,
+                )
+                return DeviceGeometryArray._from_owned(
+                    result,
+                    crs=self._crs,
+                    provenance=provenance,
+                )
 
         if len(families) == 1 and all_valid and not single_sided:
             family = next(iter(families))
@@ -1140,7 +1231,7 @@ class DeviceGeometryArray(ExtensionArray):
             reason="mixed families, nulls, empties, or unsupported params",
             owned=self.to_owned(),
             detail=f"rows={len(self)}",
-            requested=get_requested_mode(),
+            requested=requested_mode,
             pipeline="constructive/buffer",
         )
         owned._record(
@@ -1149,9 +1240,17 @@ class DeviceGeometryArray(ExtensionArray):
             visible=True,
         )
         shapely_geoms = owned_to_shapely(self.to_owned())
+        fallback_distance = distance
+        if hasattr(distance, "__cuda_array_interface__"):
+            from vibespatial.cuda._runtime import get_cuda_runtime
+
+            fallback_distance = get_cuda_runtime().copy_device_to_host(
+                distance,
+                reason="DGA buffer device radii explicit CPU fallback boundary",
+            )
         result = shapely.buffer(
             shapely_geoms,
-            distance,
+            fallback_distance,
             quad_segs=quad_segs,
             cap_style=cap_style,
             join_style=join_style,
