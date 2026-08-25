@@ -3239,6 +3239,81 @@ def test_sindex_query_any_buffer_point_rewrite_is_bounded_strict_native(
     assert inverted.to_numpy().tolist() == [not keep for keep in expected]
 
 
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_any_buffer_rewrite_survives_frame_column_projection(
+    tmp_path,
+) -> None:
+    from vibespatial import GeoDataFrame, GeoSeries, read_parquet
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+    from vibespatial.runtime.provenance import clear_rewrite_events, get_rewrite_events
+    from vibespatial.testing import strict_native_environment
+
+    source_path = tmp_path / "projected-buffer-source.parquet"
+    query_path = tmp_path / "projected-buffer-query.parquet"
+    GeoDataFrame(
+        {
+            "station_id": [1, 2, 3],
+            "geometry": GeoSeries(
+                [Point(0, 0), Point(10, 0), Point(20, 0)],
+                crs="EPSG:3857",
+            ),
+        },
+        geometry="geometry",
+        crs="EPSG:3857",
+    ).to_parquet(source_path, geometry_encoding="geoarrow", index=False)
+    GeoDataFrame(
+        {
+            "query_id": [1, 2],
+            "geometry": GeoSeries(
+                [box(-1, -1, 1, 1), box(30, 30, 31, 31)],
+                crs="EPSG:3857",
+            ),
+        },
+        geometry="geometry",
+        crs="EPSG:3857",
+    ).to_parquet(query_path, geometry_encoding="geoarrow", index=False)
+
+    source = read_parquet(source_path)
+    query = read_parquet(query_path)
+    buffered = source.copy()
+    buffered["geometry"] = buffered.geometry.buffer(3.0)
+    projected = buffered[["station_id", "geometry"]]
+
+    assert getattr(projected.geometry.values, "_provenance", None) is not None
+    clear_dispatch_events()
+    clear_rewrite_events()
+    with strict_native_environment():
+        result = projected.sindex.query_any(
+            query.geometry,
+            predicate="intersects",
+        )
+
+    assert result.to_numpy().tolist() == [True, False]
+    assert any(
+        event.surface == "vibespatial.api.SpatialIndex.query_any"
+        and event.implementation == "owned_gpu_buffer_point_existential"
+        for event in get_dispatch_events(clear=True)
+    )
+    assert any(
+        event.rule_name == "R2_query_any_buffer_intersects_to_bounded_refine"
+        for event in get_rewrite_events(clear=True)
+    )
+
+    filtered = projected.geometry.iloc[[1, 2]]
+    assert getattr(filtered.values, "_provenance", None) is None
+    clear_dispatch_events()
+    with strict_native_environment():
+        filtered_result = filtered.sindex.query_any(
+            query.iloc[[0]].geometry,
+            predicate="intersects",
+        )
+    assert filtered_result.to_numpy().tolist() == [False]
+    assert not any(
+        event.implementation == "owned_gpu_buffer_point_existential"
+        for event in get_dispatch_events(clear=True)
+    )
+
+
 @pytest.mark.parametrize(
     ("predicate", "distance"),
     [

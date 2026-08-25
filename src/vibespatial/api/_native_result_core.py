@@ -2677,6 +2677,7 @@ class GeometryNativeResult:
     owned: Any | None = None
     series: GeoSeries | None = None
     composition: NativeGeometryComposition | None = None
+    operation_provenance: Any | None = None
 
     def __post_init__(self) -> None:
         storage_count = sum(
@@ -2690,8 +2691,18 @@ class GeometryNativeResult:
             raise ValueError("geometry composition CRS must match GeometryNativeResult CRS")
 
     @classmethod
-    def from_owned(cls, owned, *, crs) -> GeometryNativeResult:
-        return cls(crs=crs, owned=owned)
+    def from_owned(
+        cls,
+        owned,
+        *,
+        crs,
+        operation_provenance=None,
+    ) -> GeometryNativeResult:
+        return cls(
+            crs=crs,
+            owned=owned,
+            operation_provenance=operation_provenance,
+        )
 
     @classmethod
     def from_composition(
@@ -2699,8 +2710,13 @@ class GeometryNativeResult:
         composition: NativeGeometryComposition,
         *,
         crs,
+        operation_provenance=None,
     ) -> GeometryNativeResult:
-        return cls(crs=crs, composition=composition.with_crs(crs))
+        return cls(
+            crs=crs,
+            composition=composition.with_crs(crs),
+            operation_provenance=operation_provenance,
+        )
 
     def with_crs(self, crs) -> GeometryNativeResult:
         if self.crs == crs:
@@ -2711,6 +2727,7 @@ class GeometryNativeResult:
             owned=self.owned,
             series=self.series,
             composition=composition,
+            operation_provenance=self.operation_provenance,
         )
 
     def cached_owned(self):
@@ -2752,14 +2769,27 @@ class GeometryNativeResult:
     @classmethod
     def from_geoseries(cls, series: GeoSeries) -> GeometryNativeResult:
         values = series.values
+        operation_provenance = getattr(values, "_provenance", None)
         cached_owned = getattr(values, "cached_owned", None)
         owned = cached_owned() if callable(cached_owned) else getattr(values, "_owned", None)
         if owned is not None:
-            return cls.from_owned(owned, crs=series.crs)
+            return cls.from_owned(
+                owned,
+                crs=series.crs,
+                operation_provenance=operation_provenance,
+            )
         composition = getattr(values, "native_composition", None)
         if composition is not None:
-            return cls.from_composition(composition, crs=series.crs)
-        return cls(crs=series.crs, series=series)
+            return cls.from_composition(
+                composition,
+                crs=series.crs,
+                operation_provenance=operation_provenance,
+            )
+        return cls(
+            crs=series.crs,
+            series=series,
+            operation_provenance=operation_provenance,
+        )
 
     @classmethod
     def from_values(
@@ -2772,13 +2802,22 @@ class GeometryNativeResult:
     ) -> GeometryNativeResult:
         from vibespatial.api.geometry_array import GeometryArray
 
+        operation_provenance = getattr(values, "_provenance", None)
         cached_owned = getattr(values, "cached_owned", None)
         owned = cached_owned() if callable(cached_owned) else getattr(values, "_owned", None)
         if callable(cached_owned) and owned is not None:
-            return cls.from_owned(owned, crs=crs)
+            return cls.from_owned(
+                owned,
+                crs=crs,
+                operation_provenance=operation_provenance,
+            )
         composition = getattr(values, "native_composition", None)
         if composition is not None:
-            return cls.from_composition(composition, crs=crs)
+            return cls.from_composition(
+                composition,
+                crs=crs,
+                operation_provenance=operation_provenance,
+            )
 
         from vibespatial.api.geoseries import GeoSeries
 
@@ -2788,37 +2827,47 @@ class GeometryNativeResult:
             return cls.from_geoseries(GeoSeries(values, index=index, name=name, crs=crs))
 
         if owned is not None:
-            return cls.from_owned(owned, crs=crs)
+            return cls.from_owned(
+                owned,
+                crs=crs,
+                operation_provenance=operation_provenance,
+            )
         if index is None:
             index = pd.RangeIndex(len(values))
         return cls.from_geoseries(GeoSeries(values, index=index, name=name, crs=crs))
 
     def to_geoseries(self, *, index, name: str) -> GeoSeries:
+        result = None
         if self.composition is not None:
-            return self.composition.to_geoseries(index=index, name=name)
-        if self.owned is not None:
+            result = self.composition.to_geoseries(index=index, name=name)
+        elif self.owned is not None:
             from vibespatial.api.geometry_array import GeometryArray
             from vibespatial.api.geoseries import GeoSeries
             from vibespatial.io.geoarrow import geoseries_from_owned
             from vibespatial.runtime.residency import Residency
 
             if self.owned.residency is Residency.DEVICE:
-                return geoseries_from_owned(
+                result = geoseries_from_owned(
                     self.owned,
                     name=name,
                     crs=self.crs,
                     index=index,
                 )
-            return GeoSeries(
-                GeometryArray.from_owned(self.owned, crs=self.crs),
-                index=index,
-                name=name,
-                crs=self.crs,
-            )
-        from vibespatial.api.geoseries import GeoSeries
+            else:
+                result = GeoSeries(
+                    GeometryArray.from_owned(self.owned, crs=self.crs),
+                    index=index,
+                    name=name,
+                    crs=self.crs,
+                )
+        else:
+            from vibespatial.api.geoseries import GeoSeries
 
-        values = self.series.values
-        return GeoSeries(values, index=index, name=name, crs=self.crs)
+            values = self.series.values
+            result = GeoSeries(values, index=index, name=name, crs=self.crs)
+        if self.operation_provenance is not None:
+            result.values._provenance = self.operation_provenance
+        return result
 
     def valid_nonempty_mask_device(self):
         """Return a logical-row device mask for concrete nonempty geometry."""

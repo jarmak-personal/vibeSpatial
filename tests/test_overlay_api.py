@@ -257,6 +257,66 @@ def test_overlay_relation_pair_estimate_expands_source_density_by_pair_count() -
     assert estimate.dispatch_unit_count() == 1_220
 
 
+@pytest.mark.skipif(not vibespatial.has_gpu_runtime(), reason="GPU runtime required")
+def test_grouped_intersection_distributes_over_certified_source_coverage() -> None:
+    """Exercise the reusable reduce-before-constructing exactness law."""
+    left_geometries = [
+        Polygon(
+            shell=[(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)],
+            holes=[[(1, 1), (2, 1), (2, 2), (1, 2), (1, 1)]],
+        ),
+        box(4, 0, 8, 4),
+        Polygon(),
+    ]
+    right_geometries = [
+        box(-1, -1, 5, 3),
+        box(3, 1, 7, 5),
+        box(6, -1, 9, 5),
+    ]
+    left = GeoDataFrame(
+        {"left_id": [10, 11, 12]},
+        geometry=GeoSeries(
+            GeometryArray.from_owned(
+                from_shapely_geometries(
+                    left_geometries,
+                    residency=Residency.DEVICE,
+                )
+            )
+        ),
+    )
+    right = GeoDataFrame(
+        {"zone_type": ["a", "a", "b"]},
+        geometry=GeoSeries(
+            GeometryArray.from_owned(
+                from_shapely_geometries(
+                    right_geometries,
+                    residency=Residency.DEVICE,
+                )
+            )
+        ),
+    )
+
+    with strict_native_environment():
+        fragment_first = overlay(left, right, how="intersection")
+        fragment_first = fragment_first.dissolve(by="zone_type").sort_index()
+
+        source_coverage = left[["geometry"]].dissolve(method="coverage")
+        grouped_zones = right.dissolve(by="zone_type").reset_index()
+        reduce_first = overlay(
+            source_coverage[["geometry"]],
+            grouped_zones[["zone_type", "geometry"]],
+            how="intersection",
+        )
+        reduce_first = reduce_first.dissolve(by="zone_type").sort_index()
+
+    assert reduce_first.index.tolist() == fragment_first.index.tolist() == ["a", "b"]
+    for zone_type in fragment_first.index:
+        assert shapely.equals(
+            reduce_first.geometry.loc[zone_type],
+            fragment_first.geometry.loc[zone_type],
+        )
+
+
 def _attach_owned_overlay_state(
     gdf: GeoDataFrame,
     *,

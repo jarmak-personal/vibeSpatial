@@ -57,6 +57,13 @@
       "sourceOfTruth": "Program plan for implementing ADR-0044 without reviving a broad public lazy planner.",
       "maxBodyLines": 860
     },
+    "docs/dev/grouped-constructive-distributive-execution-plan.md": {
+      "scope": "Exact many-features by few-grouped-coverages execution, provenance continuity, and distributive constructive reduction.",
+      "readIf": "You are changing grouped overlay followed by dissolve, buffer existential queries, or constructive fusion.",
+      "stopIf": "You only need an isolated overlay or dissolve kernel detail.",
+      "sourceOfTruth": "Physical-shape plan and measured evidence for distributive grouped constructive workflows.",
+      "maxBodyLines": 220
+    },
     "docs/dev/evidence-first-point-region-execution-plan.md": {
       "scope": "Evidence-first plan for proving one exact point-region execution alternative through public APIs before extracting generic device-planning infrastructure.",
       "readIf": "You are profiling or optimizing point-in-polygon refinement, prepared polygon traversal, Q11's dominant predicate stage, or cross-device point-region execution.",

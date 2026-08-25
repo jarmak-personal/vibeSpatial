@@ -2241,14 +2241,12 @@ class DeviceGeometryArray(ExtensionArray):
                 return DeviceGeometryArray._from_owned(
                     new_owned,
                     crs=self._crs,
-                    provenance=getattr(self, "_provenance", None),
                 )
 
         if self._composition is not None:
             result = DeviceGeometryArray._from_composition(
                 self._composition.take(indices),
                 crs=self._crs,
-                provenance=getattr(self, "_provenance", None),
             )
             if self._shapely_cache is not None:
                 result._shapely_cache = self._shapely_cache[indices]
@@ -2258,7 +2256,6 @@ class DeviceGeometryArray(ExtensionArray):
         result = DeviceGeometryArray._from_owned(
             new_owned,
             crs=self._crs,
-            provenance=getattr(self, "_provenance", None),
         )
         # Propagate shapely cache subset if available
         if self._shapely_cache is not None:

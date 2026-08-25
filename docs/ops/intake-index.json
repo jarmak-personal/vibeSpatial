@@ -4685,6 +4685,112 @@
     },
     {
       "metadata": {
+        "maxBodyLines": 220,
+        "readIf": "You are changing grouped overlay followed by dissolve, buffer existential queries, or constructive fusion.",
+        "scope": "Exact many-features by few-grouped-coverages execution, provenance continuity, and distributive constructive reduction.",
+        "sourceOfTruth": "Physical-shape plan and measured evidence for distributive grouped constructive workflows.",
+        "stopIf": "You only need an isolated overlay or dissolve kernel detail."
+      },
+      "open_first": [
+        "docs/decisions/0017-dissolve-grouped-union-pipeline.md",
+        "docs/architecture/overlay-reconstruction.md",
+        "src/vibespatial/api/_native_result_core.py",
+        "benchmarks/shootout/redevelopment_screening.py"
+      ],
+      "path": "docs/dev/grouped-constructive-distributive-execution-plan.md",
+      "request_signals": [
+        "grouped overlay",
+        "dissolve after intersection",
+        "repeated constructive pages",
+        "buffer existential query",
+        "reduce before construct"
+      ],
+      "risks": [
+        "Retaining operation provenance across a row-changing transform can certify a",
+        "Coverage union is invalid when source interiors overlap.",
+        "Preserving fragment attributes or counts makes the distributive lowering",
+        "Removing pages without reducing relation cardinality can exhaust GPU memory."
+      ],
+      "sections": [
+        "Correctness Contract",
+        "Deferred Automatic Fusion",
+        "Evidence And Gates",
+        "Implementation",
+        "Intent",
+        "Measured Diagnosis",
+        "Open First",
+        "Physical Shape",
+        "Request Signals",
+        "Risks",
+        "Verify"
+      ],
+      "title": "Grouped Constructive Distributive Execution",
+      "tokens": [
+        "after",
+        "are",
+        "automatic",
+        "before",
+        "buffer",
+        "changing",
+        "construct",
+        "constructive",
+        "continuity",
+        "contract",
+        "correctness",
+        "coverages",
+        "deferred",
+        "detail",
+        "diagnosis",
+        "dissolve",
+        "distributive",
+        "evidence",
+        "exact",
+        "execution",
+        "existential",
+        "features",
+        "few",
+        "first",
+        "followed",
+        "fusion",
+        "gates",
+        "grouped",
+        "implementation",
+        "intent",
+        "intersection",
+        "isolated",
+        "kernel",
+        "many",
+        "measured",
+        "need",
+        "only",
+        "open",
+        "overlay",
+        "pages",
+        "physical",
+        "plan",
+        "provenance",
+        "queries",
+        "query",
+        "reduce",
+        "reduction",
+        "repeated",
+        "request",
+        "risks",
+        "shape",
+        "signals",
+        "verify",
+        "workflows",
+        "you"
+      ],
+      "verify": [
+        "uv run pytest tests/test_spatial_query.py -k buffer_rewrite -q",
+        "uv run pytest tests/test_overlay_api.py -k grouped_intersection_distributes -q",
+        "uv run python scripts/check_docs.py --check",
+        "uv run python scripts/benchmark_pipelines.py --suite full --repeat 1 --gpu-sparkline"
+      ]
+    },
+    {
+      "metadata": {
         "maxBodyLines": 700,
         "readIf": "You are planning or executing the next IO read push, public read_file acceleration work, or GPU-first ingest cleanup.",
         "scope": "Execution plan for removing avoidable host-side churn from public read paths and making GPU-first IO the default shape.",
@@ -10113,7 +10219,9 @@
     {
       "kind": "repo",
       "path": "benchmarks/shootout/redevelopment_screening.py",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/dev/grouped-constructive-distributive-execution-plan.md"
+      ],
       "symbols": [],
       "tokens": [
         "area",
@@ -10966,6 +11074,7 @@
       "referenced_by": [
         "docs/architecture/overlay-reconstruction.md",
         "docs/dev/constructive-result-unification-execution-plan.md",
+        "docs/dev/grouped-constructive-distributive-execution-plan.md",
         "docs/testing/overlay-debugging-playbook.md"
       ],
       "symbols": [],
@@ -11523,7 +11632,9 @@
     {
       "kind": "doc",
       "path": "docs/decisions/0017-dissolve-grouped-union-pipeline.md",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/dev/grouped-constructive-distributive-execution-plan.md"
+      ],
       "symbols": [],
       "tokens": [
         "0017",
@@ -12260,6 +12371,22 @@
         "plan",
         "point",
         "region"
+      ]
+    },
+    {
+      "kind": "doc",
+      "path": "docs/dev/grouped-constructive-distributive-execution-plan.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "dev",
+        "distributive",
+        "docs",
+        "execution",
+        "grouped",
+        "md",
+        "plan"
       ]
     },
     {
@@ -16740,6 +16867,7 @@
       "kind": "source",
       "path": "src/vibespatial/api/_native_result_core.py",
       "referenced_by": [
+        "docs/dev/grouped-constructive-distributive-execution-plan.md",
         "docs/dev/native-format-library-plan.md",
         "docs/dev/private-native-execution-substrate-plan.md",
         "docs/dev/pylibcudf-sf100-execution-plan.md"
@@ -47166,6 +47294,7 @@
         "test_few_right_exact_path_uses_canonical_row_indirected_topology",
         "test_broadcast_right_remainder_gate_uses_physical_geometry_shape",
         "test_overlay_relation_pair_estimate_expands_source_density_by_pair_count",
+        "test_grouped_intersection_distributes_over_certified_source_coverage",
         "test_overlay_runtime_d2h_exports_are_operation_named",
         "test_broadcast_right_intersection_batch_preserves_nonempty_rows",
         "test_dissolve_gpu_certification_has_no_raw_cupy_scalar_syncs",
@@ -47221,8 +47350,7 @@
         "test_grouped_overlay_difference_owned_accepts_device_offsets_without_host_export",
         "test_grouped_overlay_difference_device_metadata_path_has_no_runtime_d2h",
         "test_grouped_overlay_difference_invalid_repair_uses_group_shape_metadata",
-        "test_overlay_difference_device_scatter_avoids_nested_take_fence",
-        "test_grouped_overlay_difference_device_postcheck_uses_native_validity_expression"
+        "test_overlay_difference_device_scatter_avoids_nested_take_fence"
       ],
       "tokens": [
         "accepts",
@@ -47254,6 +47382,7 @@
         "cardinality",
         "carrier",
         "certification",
+        "certified",
         "classifies",
         "clip",
         "collection",
@@ -47263,6 +47392,7 @@
         "consumes",
         "contained",
         "count",
+        "coverage",
         "cupy",
         "d2h",
         "decline",
@@ -47270,6 +47400,7 @@
         "device",
         "difference",
         "dissolve",
+        "distributes",
         "does",
         "domain",
         "driven",
@@ -47283,7 +47414,6 @@
         "expansion",
         "export",
         "exports",
-        "expression",
         "face",
         "fallback",
         "false",
@@ -47345,6 +47475,7 @@
         "operation",
         "order",
         "output",
+        "over",
         "overlay",
         "owned",
         "pair",
@@ -47436,7 +47567,6 @@
         "unused",
         "uses",
         "valid",
-        "validity",
         "vs",
         "when",
         "without"
