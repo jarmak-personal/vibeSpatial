@@ -1,0 +1,171 @@
+{
+  "query": "q12",
+  "lane": "dense_bbox_filter_public_exact_distance",
+  "wall_seconds": 24.205464220955037,
+  "row_count": 100,
+  "result_sha256": "d4ff40cfc1971b702f543264d16f20d013b4aaae08e346e5d0f09dce47e33975",
+  "baseline_result_sha256": "7c16ada8366634347571e2bc5309ee74c0b5bce22639c1eb94f817b70aab260c",
+  "same_ordered_tripkeys": true,
+  "max_abs_distance_delta": 6.51581504484966e-06,
+  "max_rel_distance_delta": 7.904508647706993e-08,
+  "suite_tolerance_match": true,
+  "knn_calls": [
+    {
+      "stages": {
+        "prepare": 0.005779300001449883,
+        "dense_seed_lower_bound": 4.19886555604171,
+        "seed_exact_distance": 0.008975871023721993,
+        "dense_candidate_compaction": 0.5924350819550455,
+        "candidate_exact_distance": 0.0029979438986629248,
+        "segmented_top5": 0.03866760595701635
+      },
+      "counts": {
+        "lower_bound_pairs_first_pass": 3057540000,
+        "seed_exact_pairs": 320000,
+        "lower_bound_pairs_second_pass": 3057540000,
+        "exact_candidate_pairs": 100000,
+        "precision_margin": 0.0006895889528095722
+      }
+    }
+  ],
+  "evidence_identity": {
+    "schema_version": 1,
+    "status": "complete_contemporaneous",
+    "captured_at": "2026-08-25T18:23:42.856193+00:00",
+    "source": {
+      "git_head": "e8e7f2205bfbdbb072f2d6e8e2ed41697a45533b",
+      "git_status": [
+        "M .gitignore",
+        " M benchmarks/spatialbench/run_benchmark.py",
+        " M docs/doc_headers.json",
+        " M docs/ops/intake-index.json",
+        " M docs/testing/profiling-rails.md",
+        " M src/vibespatial/api/tools/overlay.py",
+        " M src/vibespatial/bench/cli.py",
+        " M src/vibespatial/bench/pipeline.py",
+        " M src/vibespatial/bench/shootout.py",
+        " M src/vibespatial/constructive/binary_constructive.py",
+        " M src/vibespatial/constructive/tiled_union.py",
+        " M src/vibespatial/overlay/assemble.py",
+        " M src/vibespatial/overlay/faces.py",
+        " M src/vibespatial/overlay/gpu.py",
+        " M src/vibespatial/overlay/graph.py",
+        " M src/vibespatial/overlay/split.py",
+        " M src/vibespatial/predicates/point_location_index.py",
+        " M src/vibespatial/predicates/point_relations.py",
+        " M src/vibespatial/runtime/hotpath_trace.py",
+        " M src/vibespatial/spatial/point_grid_index.py",
+        " M src/vibespatial/spatial/spatial_index_device.py",
+        " M tests/test_bench_shootout.py",
+        " M tests/test_hotpath_trace.py",
+        " M tests/test_overlay_api.py",
+        " M tests/test_pipeline_benchmarks.py",
+        " M tests/test_point_region_profile.py",
+        " M tests/test_spatial_index_device_gpu.py",
+        "?? benchmark_results/work_amplification/",
+        "?? docs/dev/work-amplification-evidence.md",
+        "?? docs/dev/work-amplification-research-plan.md",
+        "?? scripts/analyze_work_amplification.py",
+        "?? src/vibespatial/bench/amplification.py",
+        "?? src/vibespatial/bench/amplification_analysis.py",
+        "?? tests/test_analyze_work_amplification_script.py",
+        "?? tests/test_work_amplification.py",
+        "?? tests/test_work_amplification_analysis.py"
+      ],
+      "git_diff_binary_sha256": "7c9bdb150493666356a53d1293b99aceab582cb5abff17007a4263d07118f49e",
+      "relevant_source_manifest_sha256": "9b0f2ec8d46fdbdaa5f18716be7171185b2f957afff50f776f25f28f7a1ad22f",
+      "critical_file_sha256": {
+        "benchmarks/spatialbench/run_benchmark.py": "08c86dd9c8361764cd12d4374e7a095d54a93664487aa48f090e1687e524c2be",
+        "benchmarks/spatialbench/vibespatial_queries.py": "3998dc4cf98dfc9ea5b5cdb2dbd2c4ec211a53d66f3909300245b96082e6e0ee",
+        "pyproject.toml": "407f619234e9d50fdff928906f924f9c9ed481a9fbb247659a197bd458e00e3a",
+        "uv.lock": "60942838f44a9792dfc8a49371e8a1367a59e8d858e39ed827dfa735e0d615fe",
+        "benchmark_results/experiments/2026-08-21-q11-q12-physical-shapes/experiment.py": "9886b6a2fcdd766feb347b8c2b1acb93069ffcf7ed0286f834619e4a301830ef",
+        "benchmark_results/work_amplification/2026-08-25-r2/q12_dense_experiment.py": "7866a98a4f47b84590b8d871472459969150c68c129acb936f36e53a67367e1c"
+      }
+    },
+    "dataset": {
+      "path": "/home/picard/datasets/spatialbench/v0.1.0/sf100-geoparquet",
+      "scale_factor": 100,
+      "format": "GeoParquet 1.1",
+      "geometry_encoding": "native GeoArrow",
+      "manifest_sha256": "a970d40adc2f754e781197d9ec9af1f03627351ceb8d01e92e9c09ff6c5080d3",
+      "file_inventory_sha256": "ad526c085c09b50410402945c24a9b6162b4467ceb4daa3c1f24d3db9848a35c",
+      "file_inventory_fingerprint_definition": "sha256 of sorted tab-separated relative path and byte size; not a content digest",
+      "file_count": 179,
+      "total_bytes": 37940233646,
+      "tables": {
+        "building": {
+          "files": 1,
+          "rows": 152877,
+          "geometry_columns": [
+            "b_boundary"
+          ],
+          "elapsed_seconds": 0.2626953620929271
+        },
+        "trip": {
+          "files": 154,
+          "rows": 600000000,
+          "geometry_columns": [
+            "t_pickuploc",
+            "t_dropoffloc"
+          ],
+          "elapsed_seconds": 2845.199984092964
+        },
+        "zone": {
+          "files": 23,
+          "rows": 1033509,
+          "geometry_columns": [
+            "z_boundary"
+          ],
+          "elapsed_seconds": 19.957061080029234
+        }
+      }
+    },
+    "environment": {
+      "hostname": "picard-4090",
+      "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.35",
+      "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K",
+      "memory_total": "98580128 kB",
+      "python": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+      "python_executable": "/home/picard/repos/vibeSpatial/.venv/bin/python3",
+      "package_versions": {
+        "cupy-cuda12x": "14.0.1",
+        "cudf-cu12": null,
+        "geopandas": "1.1.4",
+        "numpy": "2.4.3",
+        "pandas": "3.0.1",
+        "pyarrow": "23.0.1",
+        "pylibcudf-cu12": "26.2.1",
+        "vibespatial": "0.5.1"
+      },
+      "nvidia_smi": "NVIDIA GeForce RTX 4090, GPU-39aa5702-5aec-2729-8fb7-412d84ca1cbe, 580.173.02, 24564, 450.00",
+      "cuda_visible_devices": null,
+      "strict_native": "1",
+      "precompile": null
+    },
+    "measurement": {
+      "query": "SF100 Q12",
+      "lane": "dense_bbox_filter_public_exact_distance",
+      "process_isolation": "one command/process per arm",
+      "warmup_runs": 0,
+      "repeat_runs": 1,
+      "statistic": "single cold observation",
+      "clock": "time.perf_counter wall time",
+      "timed_scope": "queries.q12(paths)",
+      "excluded_scope": "query object and data-path setup",
+      "distance_tolerance": {
+        "rtol": 1e-06,
+        "atol": 1e-09
+      },
+      "command": [
+        "/home/picard/repos/vibeSpatial/.venv/bin/python3",
+        "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/q12_dense_experiment.py",
+        "dense"
+      ],
+      "reference_result": {
+        "path": "benchmark_results/work_amplification/2026-08-25-r2/q12_baseline_result.csv",
+        "sha256": "7c16ada8366634347571e2bc5309ee74c0b5bce22639c1eb94f817b70aab260c"
+      }
+    }
+  }
+}

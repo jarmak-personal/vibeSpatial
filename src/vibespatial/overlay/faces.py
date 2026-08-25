@@ -12,7 +12,7 @@ from vibespatial.cuda._runtime import (
 )
 from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode
-from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
+from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_timing_enabled
 from vibespatial.spatial.segment_primitives import SegmentIntersectionResult
 
 from ._host_boundary import overlay_device_to_host
@@ -37,7 +37,7 @@ _DUAL_FACE_WARP_MIN_AVERAGE_DEGREE = 8
 
 
 def _sync_hotpath(runtime) -> None:
-    if hotpath_trace_enabled():
+    if hotpath_timing_enabled():
         runtime.synchronize()
 
 

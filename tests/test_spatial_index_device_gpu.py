@@ -45,11 +45,42 @@ from vibespatial.spatial.spatial_index_device import (
     _family_group_launch_capacities,
     _morton_range_query,
     _morton_reduction_span_schedule,
+    _point_partition_reduction_metrics,
     _spatial_index_device_relation_reduction,
     _spatial_reduction_tile_lane_capacity,
 )
 
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+
+
+def test_point_partition_level0_packet_uses_only_host_plan_capacities() -> None:
+    plan = SimpleNamespace(
+        partitions=((0, 3, 40), (3, 4, 150)),
+    )
+
+    sums, maxima, unavailable = _point_partition_reduction_metrics(
+        plan,
+        tree_count=120,
+        pair_budget=100,
+        classification_passes=2,
+        reduction_output_buffers=3,
+    )
+
+    assert sums == {
+        "consumer_calls": 1,
+        "query_rows": 4,
+        "indexed_rows": 120,
+        "query_partitions": 2,
+        "planned_pair_capacity_slots": 190,
+        "submitted_pair_capacity_slots": 160,
+        "exact_classification_capacity_lanes": 320,
+        "submitted_tile_count": 3,
+        "oversized_query_partitions": 1,
+        "reduction_output_slots": 360,
+    }
+    assert maxima["submitted_tile_capacity_slots"] == 100
+    assert "logical_candidate_pairs" in unavailable
+    assert "exact_relation_pairs" in unavailable
 
 
 def test_point_reduction_tile_propagates_explicit_precision_plan(monkeypatch) -> None:

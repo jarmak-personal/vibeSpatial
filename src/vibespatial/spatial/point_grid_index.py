@@ -26,6 +26,7 @@ from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.hotpath_trace import attach_work_amplification, hotpath_stage
 
 from .point_grid_index_kernels import (
     _POINT_GRID_INDEX_SOURCE,
@@ -95,6 +96,59 @@ class PreparedPointGridIndex:
                 self.integral_counts,
             )
         )
+
+
+def _point_grid_preparation_metrics(
+    prepared,
+    *,
+    built: bool,
+    cache_hit: bool,
+    declined: bool,
+    query_count: int,
+    pair_budget: int,
+) -> tuple[dict[str, int], dict[str, int], tuple[str, ...]]:
+    """Return cache evidence from host-owned preparation metadata only."""
+    max_metrics = {
+        "pair_budget_slots": int(pair_budget),
+    }
+    if prepared is not None:
+        grid_size = int(prepared.grid_size)
+        max_metrics.update(
+            {
+                "source_rows": int(prepared.cache_key.row_count),
+                "grid_cells": grid_size * grid_size,
+                "persistent_bytes": int(prepared.device_bytes),
+            }
+        )
+    sum_metrics = {
+        "preparation_requests": 1,
+        "build_count": int(built),
+        "declined_preparations": int(declined),
+        "query_rows_requested": int(query_count),
+    }
+    unavailable = [
+        "build_seconds",
+        "avoidable_rebuild_seconds",
+        "invalidation_reason",
+    ]
+    if declined:
+        unavailable.extend(
+            (
+                "cache_hits",
+                "cache_misses",
+                "source_rows",
+                "grid_cells",
+                "persistent_bytes",
+            )
+        )
+    else:
+        sum_metrics.update(
+            {
+                "cache_hits": int(cache_hit),
+                "cache_misses": int(built),
+            }
+        )
+    return sum_metrics, max_metrics, tuple(unavailable)
 
 
 def point_grid_index_kernels():
@@ -252,14 +306,55 @@ def prepare_point_grid_index(
     admission=None,
 ) -> tuple[PreparedPointGridIndex | None, PointPartitionDecline | None]:
     """Build or return the NativeSpatialIndex-owned dense point grid."""
-    with native_index.point_partition_lock:
-        return _prepare_point_grid_index_locked(
-            native_index,
-            query_count=query_count,
-            pair_budget=pair_budget,
-            force_eligible=force_eligible,
-            admission=admission,
-        )
+    with hotpath_stage(
+        "spatial.point_grid_index.prepare",
+        category="setup",
+    ) as stage_metadata:
+        with native_index.point_partition_lock:
+            cache_entries_before = (
+                len(native_index.point_partition_cache)
+                if stage_metadata is not None
+                else None
+            )
+            prepared, decline = _prepare_point_grid_index_locked(
+                native_index,
+                query_count=query_count,
+                pair_budget=pair_budget,
+                force_eligible=force_eligible,
+                admission=admission,
+            )
+            if stage_metadata is not None:
+                assert cache_entries_before is not None
+                cache_entries_after = len(native_index.point_partition_cache)
+                built = prepared is not None and cache_entries_after > cache_entries_before
+                cache_hit = (
+                    prepared is not None
+                    and cache_entries_after == cache_entries_before
+                )
+                sums, maxima, unavailable = _point_grid_preparation_metrics(
+                    prepared,
+                    built=built,
+                    cache_hit=cache_hit,
+                    declined=prepared is None,
+                    query_count=query_count,
+                    pair_budget=pair_budget,
+                )
+                attach_work_amplification(
+                    stage_metadata,
+                    operation="prepare_point_grid_index",
+                    metric_family="rebuild",
+                    sums=sums,
+                    maxima=maxima,
+                    unavailable=unavailable,
+                    physical_shape="reusable_point_partition_index",
+                    consumer_kind="point_partition_query",
+                    semantic_contract={
+                        "cache_scope": "NativeSpatialIndex point-partition cache",
+                        "cache_identity_exported": False,
+                        "device_logical_counts_read": False,
+                    },
+                )
+        return prepared, decline
 
 
 def _prepare_point_grid_index_locked(

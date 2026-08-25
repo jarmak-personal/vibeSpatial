@@ -33,7 +33,7 @@ from vibespatial.cuda.cccl_primitives import (
     exclusive_sum,
 )
 from vibespatial.runtime import ExecutionMode
-from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
+from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_timing_enabled
 from vibespatial.spatial.segment_primitives import (
     DeviceBroadcastSegmentRelation,
     DeviceSegmentTable,
@@ -121,7 +121,7 @@ def _free_atomic_edge_excess(atomic_edges: AtomicEdgeTable) -> None:
 
 
 def _sync_hotpath(runtime) -> None:
-    if hotpath_trace_enabled():
+    if hotpath_timing_enabled():
         cp.cuda.get_current_stream().synchronize()
 
 

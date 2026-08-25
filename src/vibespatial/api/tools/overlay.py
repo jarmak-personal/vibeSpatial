@@ -78,7 +78,11 @@ from vibespatial.runtime.crossover import (
 )
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_mode_enabled
-from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
+from vibespatial.runtime.hotpath_trace import (
+    attach_work_amplification,
+    hotpath_stage,
+    hotpath_timing_enabled,
+)
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.spatial.indexing import generate_bounds_pairs
 from vibespatial.spatial.query_types import DeviceSpatialJoinResult
@@ -1455,7 +1459,7 @@ def _owned_subset_is_known_valid_rectangles(owned) -> bool:
 
 
 def _sync_hotpath() -> None:
-    if hotpath_trace_enabled():
+    if hotpath_timing_enabled():
         from vibespatial.cuda._runtime import get_cuda_runtime
 
         get_cuda_runtime().synchronize()
@@ -2247,10 +2251,31 @@ def _cpu_grouped_difference_owned(
     """Compute explicitly requested CPU grouped difference."""
     from vibespatial.constructive.binary_constructive import binary_constructive_owned
 
-    with hotpath_stage("overlay.diff.group_metadata", category="setup"):
+    with hotpath_stage(
+        "overlay.diff.group_metadata",
+        category="setup",
+    ) as amplification_metadata:
         group_offsets = np.asarray(group_offsets, dtype=np.int64)
         group_lengths = np.diff(group_offsets).astype(np.int64, copy=False)
         max_group_size = int(group_lengths.max(initial=0))
+        if amplification_metadata is not None:
+            attach_work_amplification(
+                amplification_metadata,
+                operation="overlay.diff.group_metadata",
+                metric_family="group_compression",
+                sums={
+                    "input_rows": int(right_batch.row_count),
+                    "output_groups": int(left_batch.row_count),
+                },
+                maxima={"max_group_size": max_group_size},
+                unavailable=(
+                    "input_segments",
+                    "input_coordinates",
+                    "pre_reduction_fragments",
+                    "output_parts",
+                    "output_coordinates",
+                ),
+            )
     if max_group_size <= 0:
         return left_batch
 
@@ -3974,7 +3999,10 @@ def _grouped_overlay_difference_owned(
             dispatch_mode=ExecutionMode.CPU,
         )
 
-    with hotpath_stage("overlay.diff.group_metadata", category="setup"):
+    with hotpath_stage(
+        "overlay.diff.group_metadata",
+        category="setup",
+    ) as amplification_metadata:
         if not _is_device_array(group_offsets):
             host_offsets = np.asarray(group_offsets, dtype=np.int64)
             if host_offsets.ndim != 1 or host_offsets.size == 0:
@@ -4042,6 +4070,31 @@ def _grouped_overlay_difference_owned(
             group_offsets,
             max_group_size=max_group_size,
         )
+        if amplification_metadata is not None:
+            group_unavailable = [
+                "input_segments",
+                "input_coordinates",
+                "pre_reduction_fragments",
+                "output_parts",
+                "output_coordinates",
+            ]
+            group_maxima = {}
+            if max_group_size is None:
+                group_unavailable.append("max_group_size")
+            else:
+                group_maxima["max_group_size"] = int(max_group_size)
+            attach_work_amplification(
+                amplification_metadata,
+                operation="overlay.diff.group_metadata",
+                metric_family="group_compression",
+                sums={
+                    "input_rows": int(right_batch.row_count),
+                    "output_groups": int(n_groups),
+                    "observed_groups": int(observed_group_count),
+                },
+                maxima=group_maxima,
+                unavailable=tuple(group_unavailable),
+            )
 
     def _decline_native(stage: str, exc: Exception | str) -> None:
         detail_error = str(exc) if isinstance(exc, str) else f"{type(exc).__name__}: {exc}"
@@ -4399,14 +4452,44 @@ def _grouped_overlay_difference_owned(
 
     try:
         topology_left_batch, topology_right_batch = _row_indirected_grouped_topology_inputs()
-        with hotpath_stage("overlay.diff.group_rows.expand", category="setup"):
+        with hotpath_stage(
+            "overlay.diff.group_rows.expand",
+            category="setup",
+        ) as amplification_metadata:
             right_group_rows = _native_grouped_source_rows(
                 grouped,
                 total_count=topology_right_batch.row_count,
             )
+            if amplification_metadata is not None:
+                maxima = {}
+                unavailable = [
+                    "input_segments",
+                    "input_coordinates",
+                    "pre_reduction_fragments",
+                    "output_parts",
+                    "output_coordinates",
+                ]
+                if max_group_size is None:
+                    unavailable.append("max_group_size")
+                else:
+                    maxima["max_group_size"] = int(max_group_size)
+                attach_work_amplification(
+                    amplification_metadata,
+                    operation="overlay.diff.group_rows.expand",
+                    metric_family="group_compression",
+                    sums={
+                        "input_rows": int(topology_right_batch.row_count),
+                        "output_groups": int(topology_left_batch.row_count),
+                    },
+                    maxima=maxima,
+                    unavailable=tuple(unavailable),
+                )
         _sync_hotpath()
         try:
-            with hotpath_stage("overlay.diff.grouped_plan.build", category="setup"):
+            with hotpath_stage(
+                "overlay.diff.grouped_plan.build",
+                category="setup",
+            ) as amplification_metadata:
                 plan = _build_overlay_execution_plan(
                     topology_left_batch,
                     topology_right_batch,
@@ -4419,11 +4502,35 @@ def _grouped_overlay_difference_owned(
                     _right_geometry_source_rows=right_group_rows,
                     _right_segment_source_rows=right_group_rows,
                 )
+                if amplification_metadata is not None:
+                    plan_maxima = {}
+                    if hasattr(plan, "page_count"):
+                        plan_maxima["topology_pages"] = int(plan.page_count)
+                    attach_work_amplification(
+                        amplification_metadata,
+                        operation="overlay.diff.grouped_plan.build",
+                        metric_family="group_compression",
+                        sums={
+                            "input_rows": int(topology_right_batch.row_count),
+                            "output_groups": int(topology_left_batch.row_count),
+                        },
+                        maxima=plan_maxima,
+                        unavailable=(
+                            "input_segments",
+                            "input_coordinates",
+                            "pre_reduction_fragments",
+                            "output_parts",
+                            "output_coordinates",
+                        ),
+                    )
         except _GroupedOverlayDifferenceNativeDeclined:
             raise
         _sync_hotpath()
         try:
-            with hotpath_stage("overlay.diff.grouped_plan.materialize", category="refine"):
+            with hotpath_stage(
+                "overlay.diff.grouped_plan.materialize",
+                category="refine",
+            ) as amplification_metadata:
                 diff_owned, _selected = _materialize_overlay_execution_plan(
                     plan,
                     operation="difference",
@@ -4436,6 +4543,24 @@ def _grouped_overlay_difference_owned(
                         dtype=cp.bool_,
                     ),
                 )
+                if amplification_metadata is not None:
+                    attach_work_amplification(
+                        amplification_metadata,
+                        operation="overlay.diff.grouped_plan.materialize",
+                        metric_family="group_compression",
+                        sums={
+                            "input_rows": int(topology_right_batch.row_count),
+                            "output_groups": int(diff_owned.row_count),
+                        },
+                        maxima={"group_capacity": int(left_batch.row_count)},
+                        unavailable=(
+                            "input_segments",
+                            "input_coordinates",
+                            "pre_reduction_fragments",
+                            "output_parts",
+                            "output_coordinates",
+                        ),
+                    )
         except _GroupedOverlayDifferenceNativeDeclined:
             raise
         _sync_hotpath()
@@ -4539,7 +4664,10 @@ def _grouped_overlay_difference_capacity_owned(
             reason="overlay difference grouped right gather",
         )
 
-    with hotpath_stage("overlay.diff.group_index_build", category="setup"):
+    with hotpath_stage(
+        "overlay.diff.group_index_build",
+        category="setup",
+    ) as amplification_metadata:
         if use_device_indices:
             left_pairs = cp.asarray(d_idx1, dtype=cp.int64)
             right_pairs = cp.asarray(d_idx2, dtype=cp.int64)
@@ -4564,9 +4692,31 @@ def _grouped_overlay_difference_capacity_owned(
         group_offsets = xp.empty(row_count + 1, dtype=xp.int64)
         group_offsets[0] = 0
         xp.cumsum(group_counts, out=group_offsets[1:])
+        if amplification_metadata is not None:
+            attach_work_amplification(
+                amplification_metadata,
+                operation="overlay.diff.group_index_build",
+                metric_family="group_compression",
+                sums={
+                    "input_rows": pair_count,
+                    "output_groups": row_count,
+                },
+                maxima={"relation_capacity": pair_count},
+                unavailable=(
+                    "max_group_size",
+                    "input_segments",
+                    "input_coordinates",
+                    "pre_reduction_fragments",
+                    "output_parts",
+                    "output_coordinates",
+                ),
+            )
 
     _sync_hotpath()
-    with hotpath_stage("overlay.diff.right_gather", category="refine"):
+    with hotpath_stage(
+        "overlay.diff.right_gather",
+        category="refine",
+    ) as amplification_metadata:
         if use_device_gather and use_device_indices:
             right_gathered = right_owned.device_take(
                 grouped_right.astype(cp.int64, copy=False),
@@ -4579,6 +4729,25 @@ def _grouped_overlay_difference_capacity_owned(
             )
         else:
             right_gathered = right_owned.take(grouped_right)
+        if amplification_metadata is not None:
+            attach_work_amplification(
+                amplification_metadata,
+                operation="overlay.diff.right_gather",
+                metric_family="group_compression",
+                sums={
+                    "input_rows": pair_count,
+                    "pre_reduction_fragments": int(right_gathered.row_count),
+                    "output_groups": row_count,
+                },
+                maxima={"relation_capacity": pair_count},
+                unavailable=(
+                    "max_group_size",
+                    "input_segments",
+                    "input_coordinates",
+                    "output_parts",
+                    "output_coordinates",
+                ),
+            )
 
     grouped = NativeGrouped.from_dense_sorted_offsets(
         group_offsets,
@@ -4588,7 +4757,10 @@ def _grouped_overlay_difference_capacity_owned(
         group_size_max=None,
     )
     _sync_hotpath()
-    with hotpath_stage("overlay.diff.grouped_difference", category="refine"):
+    with hotpath_stage(
+        "overlay.diff.grouped_difference",
+        category="refine",
+    ) as amplification_metadata:
         diff_owned = _grouped_overlay_difference_owned(
             left_owned,
             right_gathered,
@@ -4599,6 +4771,30 @@ def _grouped_overlay_difference_capacity_owned(
             _group_size_min=0,
             _group_size_max=None,
         )
+        if amplification_metadata is not None:
+            grouped_sums = {
+                "input_rows": pair_count,
+                "pre_reduction_fragments": int(right_gathered.row_count),
+            }
+            grouped_unavailable = [
+                "max_group_size",
+                "input_segments",
+                "input_coordinates",
+                "output_parts",
+                "output_coordinates",
+            ]
+            if diff_owned is None:
+                grouped_unavailable.append("output_groups")
+            else:
+                grouped_sums["output_groups"] = int(diff_owned.row_count)
+            attach_work_amplification(
+                amplification_metadata,
+                operation="overlay.diff.grouped_difference",
+                metric_family="group_compression",
+                sums=grouped_sums,
+                maxima={"group_capacity": row_count},
+                unavailable=tuple(grouped_unavailable),
+            )
     _sync_hotpath()
     record_dispatch_event(
         surface="geopandas.array.difference",

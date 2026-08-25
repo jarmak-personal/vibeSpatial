@@ -1,0 +1,11 @@
+{
+  "query": "q12",
+  "lane": "indexed_public_nearest",
+  "wall_seconds": 23.356598404003307,
+  "knn_stage_seconds": 3.9981299119535834,
+  "knn_calls": 1,
+  "retained_point_count": 20000,
+  "retained_sha256": "7853fc99e52b2c80c8f0b0e2b02340863ff6d75026dee23ba007988c6e94dbc3",
+  "row_count": 100,
+  "result_sha256": "7c16ada8366634347571e2bc5309ee74c0b5bce22639c1eb94f817b70aab260c"
+}

@@ -64,6 +64,20 @@
       "sourceOfTruth": "Physical-shape plan and measured evidence for distributive grouped constructive workflows.",
       "maxBodyLines": 220
     },
+    "docs/dev/work-amplification-research-plan.md": {
+      "scope": "Evidence plan for finding spatial workflows that create substantially more pairs, topology, capacity, or repeated preparation work than their public results retain.",
+      "readIf": "You are profiling broad performance opportunities, adding amplification counters, prioritizing physical-shape work, or deciding whether a local optimization generalizes.",
+      "stopIf": "You already have a measured amplification finding and only need its operation-specific implementation plan.",
+      "sourceOfTruth": "Research methodology, metric contracts, experiment matrix, and graduation gates for work-amplification studies.",
+      "maxBodyLines": 340
+    },
+    "docs/dev/work-amplification-evidence.md": {
+      "scope": "Current measured evidence, reliability decisions, ranked hypotheses, and experiment outcomes for the work-amplification research program.",
+      "readIf": "You are choosing the next physical-shape performance investigation or validating a work-amplification claim.",
+      "stopIf": "You need the research methodology or an operation-specific implementation contract rather than current results.",
+      "sourceOfTruth": "Ranked work-amplification evidence and the disposition of measured hypotheses.",
+      "maxBodyLines": 240
+    },
     "docs/dev/evidence-first-point-region-execution-plan.md": {
       "scope": "Evidence-first plan for proving one exact point-region execution alternative through public APIs before extracting generic device-planning infrastructure.",
       "readIf": "You are profiling or optimizing point-in-polygon refinement, prepared polygon traversal, Q11's dominant predicate stage, or cross-device point-region execution.",

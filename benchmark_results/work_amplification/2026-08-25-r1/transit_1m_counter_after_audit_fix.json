@@ -1,0 +1,3409 @@
+{
+  "schema_version": 2,
+  "type": "shootout",
+  "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/transit_service_gap.py",
+  "status": "error",
+  "status_reason": "geopandas: harness produced no output; GeoPandas run has no correctness fingerprint",
+  "geopandas": {
+    "label": "geopandas",
+    "timing": {
+      "mean_seconds": 0.0,
+      "median_seconds": 0.0,
+      "min_seconds": 0.0,
+      "max_seconds": 0.0,
+      "stddev_seconds": 0.0,
+      "sample_count": 0
+    },
+    "error": "harness produced no output"
+  },
+  "vibespatial": {
+    "label": "vibespatial",
+    "timing": {
+      "mean_seconds": 31.047159265028313,
+      "median_seconds": 31.047159265028313,
+      "min_seconds": 31.047159265028313,
+      "max_seconds": 31.047159265028313,
+      "stddev_seconds": 0.0,
+      "sample_count": 1
+    },
+    "stdout": "SHOOTOUT_FINGERPRINT: rows=30553577 bounds=(457.74, 265.0, 673.76, 735.0) convex_hull_area=29404906.86\n",
+    "profile": {
+      "available": true,
+      "backend": "vibespatial",
+      "mode": "isolated_post_timing_profile",
+      "profile_mode": "counters",
+      "hotpath_timing_enabled": false,
+      "elapsed_seconds": 30.695005499059334,
+      "stdout": "",
+      "fallback_event_count": 0,
+      "fallback_events": [],
+      "trace_summary": {
+        "pipeline": "shootout",
+        "total_steps": 3784,
+        "gpu_steps": 3784,
+        "cpu_steps": 0,
+        "d2h_transfers": 1444,
+        "h2d_transfers": 0,
+        "d2h_transfer_bytes": 1073200597,
+        "h2d_transfer_bytes": 0,
+        "d2h_transfer_seconds": 0.18159120972268283,
+        "h2d_transfer_seconds": 0,
+        "runtime_d2h_transfers": 1444,
+        "runtime_h2d_transfers": 0,
+        "runtime_d2h_transfer_bytes": 1073200597,
+        "runtime_h2d_transfer_bytes": 0,
+        "runtime_d2h_transfer_seconds": 0.18159120972268283,
+        "runtime_h2d_transfer_seconds": 0,
+        "offramps": 0
+      },
+      "trace_steps": [
+        {
+          "surface": "geopandas.read_parquet",
+          "operation": "read_parquet",
+          "selected": "gpu",
+          "implementation": "repo_owned_geoparquet_engine"
+        },
+        {
+          "surface": "geopandas.read_parquet",
+          "operation": "read_parquet",
+          "selected": "gpu",
+          "implementation": "repo_owned_geoparquet_engine"
+        },
+        {
+          "surface": "vibespatial.io.geojson",
+          "operation": "read_owned",
+          "selected": "gpu",
+          "implementation": "geojson_gpu_byte_classify"
+        },
+        {
+          "surface": "geopandas.read_file",
+          "operation": "read_file",
+          "selected": "gpu",
+          "implementation": "geojson_gpu_byte_classify_adapter"
+        },
+        {
+          "surface": "vibespatial.io.geojson",
+          "operation": "read_owned",
+          "selected": "gpu",
+          "implementation": "geojson_gpu_byte_classify"
+        },
+        {
+          "surface": "geopandas.read_file",
+          "operation": "read_file",
+          "selected": "gpu",
+          "implementation": "geojson_gpu_byte_classify_adapter"
+        },
+        {
+          "surface": "geopandas.array.bounds",
+          "operation": "bounds",
+          "selected": "gpu",
+          "implementation": "gpu_nvrtc_bounds_device"
+        },
+        {
+          "surface": "geopandas.array.bounds",
+          "operation": "bounds",
+          "selected": "gpu",
+          "implementation": "gpu_nvrtc_bounds_device"
+        },
+        {
+          "surface": "vibespatial.constructive.binary",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "broadcast_right_virtual_segment_topology_gpu"
+        },
+        {
+          "surface": "geopandas.clip",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "polygon_mask_broadcast_right_capacity_gpu"
+        },
+        {
+          "surface": "geopandas.array.bounds",
+          "operation": "bounds",
+          "selected": "gpu",
+          "implementation": "gpu_nvrtc_bounds_device"
+        },
+        {
+          "surface": "geopandas.clip",
+          "operation": "clip",
+          "selected": "gpu",
+          "implementation": "polygon_device_candidate_direct_rowset_assembly_gpu"
+        },
+        {
+          "surface": "DeviceGeometryArray.buffer",
+          "operation": "buffer",
+          "selected": "gpu",
+          "implementation": "point_buffer_owned_array"
+        },
+        {
+          "surface": "geopandas.array.bounds",
+          "operation": "bounds",
+          "selected": "gpu",
+          "implementation": "gpu_nvrtc_bounds_device"
+        },
+        {
+          "surface": "geopandas.array.centroid",
+          "operation": "centroid",
+          "selected": "gpu",
+          "implementation": "gpu_nvrtc_centroid"
+        },
+        {
+          "surface": "geopandas.array.bounds",
+          "operation": "bounds",
+          "selected": "gpu",
+          "implementation": "gpu_nvrtc_bounds_device"
+        },
+        {
+          "surface": "geopandas.array.bounds",
+          "operation": "bounds",
+          "selected": "gpu",
+          "implementation": "gpu_nvrtc_bounds_device"
+        },
+        {
+          "surface": "vibespatial.api.SpatialIndex.query_any",
+          "operation": "query_any",
+          "selected": "gpu",
+          "implementation": "owned_gpu_buffer_point_existential"
+        },
+        {
+          "surface": "geopandas.array.centroid",
+          "operation": "centroid",
+          "selected": "gpu",
+          "implementation": "gpu_nvrtc_centroid"
+        },
+        {
+          "surface": "DeviceGeometryArray.buffer",
+          "operation": "buffer",
+          "selected": "gpu",
+          "implementation": "point_buffer_owned_array"
+        },
+        {
+          "surface": "geopandas.array.make_valid",
+          "operation": "make_valid",
+          "selected": "gpu",
+          "implementation": "validity_expression_no_repair"
+        },
+        {
+          "surface": "geopandas.array.make_valid",
+          "operation": "make_valid",
+          "selected": "gpu",
+          "implementation": "rectangle_valid_fast_path"
+        },
+        {
+          "surface": "geopandas.overlay",
+          "operation": "extract_owned_pair",
+          "selected": "gpu",
+          "implementation": "owned_pair_device_promotion"
+        },
+        {
+          "surface": "geopandas.array.bounds",
+          "operation": "bounds",
+          "selected": "gpu",
+          "implementation": "gpu_nvrtc_bounds_device"
+        },
+        {
+          "surface": "geopandas.array.bounds",
+          "operation": "bounds",
+          "selected": "gpu",
+          "implementation": "gpu_nvrtc_bounds_device"
+        },
+        {
+          "surface": "geopandas.overlay.sindex",
+          "operation": "intersects",
+          "selected": "gpu",
+          "implementation": "native_spatial_index_relation"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_rect_intersection",
+          "operation": "polygon_rect_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_rect_intersection_row_indirected_bounds_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_rect_intersection",
+          "operation": "polygon_rect_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_rect_intersection_row_indirected_bounds_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_simple_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "validated_simple_polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary_constructive",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "row_isolated_polygon_overlay_row_indirected_exact_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "row_isolated_polygon_capacity_partition_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_partitioned_capacity_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_rect_intersection",
+          "operation": "polygon_rect_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_rect_intersection_row_indirected_bounds_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_rect_intersection",
+          "operation": "polygon_rect_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_rect_intersection_row_indirected_bounds_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_simple_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "validated_simple_polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary_constructive",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "row_isolated_polygon_overlay_row_indirected_exact_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "row_isolated_polygon_capacity_partition_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_partitioned_capacity_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_rect_intersection",
+          "operation": "polygon_rect_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_rect_intersection_row_indirected_bounds_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_rect_intersection",
+          "operation": "polygon_rect_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_rect_intersection_row_indirected_bounds_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_simple_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "validated_simple_polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary_constructive",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "row_isolated_polygon_overlay_row_indirected_exact_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "row_isolated_polygon_capacity_partition_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_partitioned_capacity_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_rect_intersection",
+          "operation": "polygon_rect_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_rect_intersection_row_indirected_bounds_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_rect_intersection",
+          "operation": "polygon_rect_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_rect_intersection_row_indirected_bounds_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_simple_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "validated_simple_polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary_constructive",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "row_isolated_polygon_overlay_row_indirected_exact_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "row_isolated_polygon_capacity_partition_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_partitioned_capacity_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_rect_intersection",
+          "operation": "polygon_rect_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_rect_intersection_row_indirected_bounds_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_rect_intersection",
+          "operation": "polygon_rect_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_rect_intersection_row_indirected_bounds_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_simple_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "validated_simple_polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary_constructive",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "row_isolated_polygon_overlay_row_indirected_exact_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "row_isolated_polygon_capacity_partition_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_partitioned_capacity_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_rect_intersection",
+          "operation": "polygon_rect_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_rect_intersection_row_indirected_bounds_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_rect_intersection",
+          "operation": "polygon_rect_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_rect_intersection_row_indirected_bounds_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_simple_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "validated_simple_polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary_constructive",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "row_isolated_polygon_overlay_row_indirected_exact_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "row_isolated_polygon_capacity_partition_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_partitioned_capacity_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_rect_intersection",
+          "operation": "polygon_rect_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_rect_intersection_row_indirected_bounds_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_rect_intersection",
+          "operation": "polygon_rect_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_rect_intersection_row_indirected_bounds_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.kernels.constructive.polygon_simple_intersection",
+          "operation": "polygon_intersection",
+          "selected": "gpu",
+          "implementation": "validated_simple_polygon_intersection_gpu"
+        },
+        {
+          "surface": "vibespatial.constructive.binary_constructive",
+          "operation": "intersection",
+          "selected": "gpu",
+          "implementation": "row_isolated_polygon_overlay_row_indirected_exact_gpu"
+        }
+      ],
+      "trace_transfers": [
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy-async",
+          "reason": "geojson geometry family-summary scalar fence",
+          "source": "cuda_runtime",
+          "item_count": 2,
+          "bytes_transferred": 16,
+          "elapsed_seconds": 0.0
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy-async",
+          "reason": "geojson point coordinate validity scalar fence",
+          "source": "cuda_runtime",
+          "item_count": 1,
+          "bytes_transferred": 1,
+          "elapsed_seconds": 0.0
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "geojson property object-spans host export",
+          "source": "cuda_runtime",
+          "item_count": 400000,
+          "bytes_transferred": 3200000,
+          "elapsed_seconds": 0.00025115604512393475
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy-async",
+          "reason": "geojson geometry family-summary scalar fence",
+          "source": "cuda_runtime",
+          "item_count": 2,
+          "bytes_transferred": 16,
+          "elapsed_seconds": 0.0
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy-async",
+          "reason": "geojson feature coordinate total scalar export",
+          "source": "cuda_runtime",
+          "item_count": 1,
+          "bytes_transferred": 4,
+          "elapsed_seconds": 0.0
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy-async",
+          "reason": "geojson ring total scalar export",
+          "source": "cuda_runtime",
+          "item_count": 1,
+          "bytes_transferred": 4,
+          "elapsed_seconds": 0.0
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy-async",
+          "reason": "pylibcudf geometry validity-count scalar fence",
+          "source": "cuda_runtime",
+          "item_count": 1,
+          "bytes_transferred": 8,
+          "elapsed_seconds": 0.0
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "geojson property object-spans host export",
+          "source": "cuda_runtime",
+          "item_count": 2,
+          "bytes_transferred": 16,
+          "elapsed_seconds": 0.000025146990083158016
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "polygon predicate convex-mask certification planning packet",
+          "source": "cuda_runtime",
+          "item_count": 1,
+          "bytes_transferred": 1,
+          "elapsed_seconds": 0.000024289940483868122
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "vibespatial.api.NativeTabularSelection.to_geodataframe::device_selection_logical_count_to_host",
+          "source": "cuda_runtime",
+          "item_count": 1,
+          "bytes_transferred": 8,
+          "elapsed_seconds": 0.00003207405097782612
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "vibespatial.api.NativeTabularResult.to_geodataframe::index_plan_to_host",
+          "source": "cuda_runtime",
+          "item_count": 51624,
+          "bytes_transferred": 412992,
+          "elapsed_seconds": 0.00007104407995939255
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "vibespatial.api.NativeGeometryComposition.to_geoseries::singular_partitioned_certification",
+          "source": "cuda_runtime",
+          "item_count": 1,
+          "bytes_transferred": 1,
+          "elapsed_seconds": 0.000028743990696966648
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "flat spatial index device total-bounds scalar fence",
+          "source": "cuda_runtime",
+          "item_count": 5,
+          "bytes_transferred": 40,
+          "elapsed_seconds": 0.000028879032470285892
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "vibespatial.api.NativeGeometryComposition.to_geoseries::singular_owned_certification",
+          "source": "cuda_runtime",
+          "item_count": 2,
+          "bytes_transferred": 2,
+          "elapsed_seconds": 0.000023999018594622612
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "native geometry composition exact physicalization allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 56,
+          "bytes_transferred": 448,
+          "elapsed_seconds": 0.000028981943614780903
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy-async",
+          "reason": "nearest sorted-x tie-pair allocation fence",
+          "source": "cuda_runtime",
+          "item_count": 2,
+          "bytes_transferred": 8,
+          "elapsed_seconds": 0.0
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "spatial index regular-grid summary scalar fence",
+          "source": "cuda_runtime",
+          "item_count": 8,
+          "bytes_transferred": 64,
+          "elapsed_seconds": 0.00018870795611292124
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "flat spatial index device total-bounds scalar fence",
+          "source": "cuda_runtime",
+          "item_count": 5,
+          "bytes_transferred": 40,
+          "elapsed_seconds": 0.00003200408536940813
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "device spatial-index tree extent planning fence",
+          "source": "cuda_runtime",
+          "item_count": 3,
+          "bytes_transferred": 24,
+          "elapsed_seconds": 0.000030262046493589878
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "spatial reduction query segment-span planning packet",
+          "source": "cuda_runtime",
+          "item_count": 6,
+          "bytes_transferred": 48,
+          "elapsed_seconds": 0.000029586022719740868
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "spatial reduction Morton-span bucket planning packet",
+          "source": "cuda_runtime",
+          "item_count": 33,
+          "bytes_transferred": 264,
+          "elapsed_seconds": 0.000022521009668707848
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "vibespatial.api.SpatialIndex.query_any.boolean_filter::device_selection_logical_count_to_host",
+          "source": "cuda_runtime",
+          "item_count": 1,
+          "bytes_transferred": 8,
+          "elapsed_seconds": 0.00003082607872784138
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "vibespatial.api.NativeGeometryComposition.to_geoseries::singular_owned_certification",
+          "source": "cuda_runtime",
+          "item_count": 2,
+          "bytes_transferred": 2,
+          "elapsed_seconds": 0.000025103101506829262
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "native geometry composition exact physicalization allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 28,
+          "bytes_transferred": 224,
+          "elapsed_seconds": 0.000027867034077644348
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "spatial query polygon-box single-ring scalar fence",
+          "source": "cuda_runtime",
+          "item_count": 1,
+          "bytes_transferred": 1,
+          "elapsed_seconds": 0.00003303599078208208
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "spatial query polygon-box coordinate-count scalar fence",
+          "source": "cuda_runtime",
+          "item_count": 1,
+          "bytes_transferred": 1,
+          "elapsed_seconds": 0.00002239900641143322
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "spatial query polygon-box single-ring scalar fence",
+          "source": "cuda_runtime",
+          "item_count": 1,
+          "bytes_transferred": 1,
+          "elapsed_seconds": 0.000017807004041969776
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "spatial query polygon-box coordinate-count scalar fence",
+          "source": "cuda_runtime",
+          "item_count": 1,
+          "bytes_transferred": 1,
+          "elapsed_seconds": 0.000027681933715939522
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy-async",
+          "reason": "spatial query regular-grid box-pair allocation fence",
+          "source": "cuda_runtime",
+          "item_count": 2,
+          "bytes_transferred": 8,
+          "elapsed_seconds": 0.0
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000029803020879626274
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000029280083253979683
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00002970895729959011
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00002993689849972725
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00002844305709004402
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028148991987109184
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00002820196095854044
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000029579969123005867
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000029386021196842194
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000031866948120296
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028564943931996822
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00002949894405901432
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028496957384049892
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028108013793826103
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00003844697494059801
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028404989279806614
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028617912903428078
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000030001974664628506
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00002760603092610836
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00003283005207777023
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00003016204573214054
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000030129915103316307
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00003098510205745697
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028570997528731823
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028993934392929077
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000029477989301085472
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028653070330619812
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028421985916793346
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028474954888224602
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028394977562129498
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00003333308268338442
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028057023882865906
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000032468000426888466
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000033446005545556545
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028669950552284718
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028008013032376766
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000034232973121106625
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00002869800664484501
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028593000024557114
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00003830308560281992
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000029101036489009857
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00003115297295153141
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000029907911084592342
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028186943382024765
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028720940463244915
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000027514994144439697
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.00002816098276525736
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028150971047580242
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028289970941841602
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028621056117117405
+        },
+        {
+          "direction": "d2h",
+          "trigger": "cuda-runtime-copy",
+          "reason": "fused multi-root capacity scatter exact allocation packet",
+          "source": "cuda_runtime",
+          "item_count": 49,
+          "bytes_transferred": 392,
+          "elapsed_seconds": 0.000028201029635965824
+        }
+      ],
+      "hotpath": [
+        {
+          "name": "overlay.assemble.hole_assignment",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.output_grouping",
+          "category": "sort",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.output_materialize",
+          "category": "emit",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.sample_points",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.selected.boundary_cycles",
+          "category": "sort",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.selected.boundary_edges",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.selected.boundary_metrics",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.selected.boundary_scatter",
+          "category": "emit",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.selected.edge_selection",
+          "category": "setup",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.faces.component_containment",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.faces.coverage_finalize",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.faces.coverage_retention",
+          "category": "setup",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.faces.coverage_scratch",
+          "category": "setup",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.faces.dual_winding",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.faces.face_walk",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.graph.face_id_pointer_jump",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.graph.face_metrics_kernel",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.graph.face_offsets",
+          "category": "sort",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.graph.face_span_boundaries",
+          "category": "sort",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.graph.gather_face_edges",
+          "category": "emit",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.graph.group_faces_sort",
+          "category": "sort",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.plan.atomic_edges",
+          "category": "refine",
+          "calls": 470,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {
+            "work_amplification": {
+              "sum": {
+                "split_events": 7802748,
+                "atomic_edges": 7818040
+              },
+              "max": {
+                "atomic_edges_per_plan": 7818040
+              },
+              "unavailable": [
+                "emitted_fragments",
+                "fragment_coordinates",
+                "retained_output_parts",
+                "output_coordinates",
+                "constructive_bytes",
+                "peak_live_bytes"
+              ],
+              "schema_version": 1,
+              "operation": "overlay.plan.atomic_edges",
+              "metric_family": "constructive",
+              "instrumentation_level": 0
+            }
+          }
+        },
+        {
+          "name": "overlay.plan.faces",
+          "category": "refine",
+          "calls": 470,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {
+            "work_amplification": {
+              "sum": {
+                "half_edges": 7818040,
+                "faces": 330876
+              },
+              "max": {
+                "faces_per_plan": 330876
+              },
+              "unavailable": [
+                "retained_output_parts",
+                "output_coordinates",
+                "constructive_bytes",
+                "peak_live_bytes"
+              ],
+              "schema_version": 1,
+              "operation": "overlay.plan.faces",
+              "metric_family": "constructive",
+              "instrumentation_level": 0
+            }
+          }
+        },
+        {
+          "name": "overlay.plan.half_edge_graph",
+          "category": "refine",
+          "calls": 470,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {
+            "work_amplification": {
+              "sum": {
+                "atomic_edges": 7818040,
+                "half_edges": 7818040,
+                "graph_nodes": 0
+              },
+              "max": {
+                "half_edges_per_plan": 7818040
+              },
+              "unavailable": [
+                "emitted_fragments",
+                "retained_output_parts",
+                "output_coordinates",
+                "constructive_bytes",
+                "peak_live_bytes"
+              ],
+              "schema_version": 1,
+              "operation": "overlay.plan.half_edge_graph",
+              "metric_family": "constructive",
+              "instrumentation_level": 0
+            }
+          }
+        },
+        {
+          "name": "overlay.plan.release_atomic_excess",
+          "category": "setup",
+          "calls": 470,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.plan.release_split_events",
+          "category": "setup",
+          "calls": 470,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.plan.split_events",
+          "category": "refine",
+          "calls": 470,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {
+            "work_amplification": {
+              "sum": {
+                "source_segments": 3893728,
+                "split_events": 7802748
+              },
+              "max": {
+                "left_segments": 15232,
+                "right_segments": 3878496
+              },
+              "unavailable": [
+                "emitted_fragments",
+                "fragment_coordinates",
+                "retained_output_parts",
+                "output_coordinates",
+                "constructive_bytes",
+                "peak_live_bytes"
+              ],
+              "schema_version": 1,
+              "operation": "overlay.plan.split_events",
+              "metric_family": "constructive",
+              "instrumentation_level": 0
+            }
+          }
+        },
+        {
+          "name": "overlay.split.canonicalize_source_endpoints",
+          "category": "sort",
+          "calls": 470,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.split.classify_intersections",
+          "category": "refine",
+          "calls": 470,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.split.emit_endpoint_events",
+          "category": "emit",
+          "calls": 470,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.split.emit_pair_event_run",
+          "category": "emit",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.split.external_merge_events",
+          "category": "sort",
+          "calls": 470,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.split.extract_left_segments",
+          "category": "setup",
+          "calls": 470,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.split.extract_right_segments",
+          "category": "setup",
+          "calls": 470,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.split.segment_metadata",
+          "category": "emit",
+          "calls": 470,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "predicate.point_region.point_in_polygon_polygon_compacted_state",
+          "category": "refine",
+          "calls": 80,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {
+            "work_amplification": {
+              "sum": {
+                "candidate_lanes": 304087040,
+                "launch_items": 101362320,
+                "prepared_consumer_count": 0
+              },
+              "max": {
+                "launch_capacity": 2796202
+              },
+              "unavailable": [
+                "exact_evaluations",
+                "ambiguous_lanes",
+                "survivors",
+                "early_terminated"
+              ],
+              "schema_version": 1,
+              "operation": "point_region_predicate",
+              "metric_family": "refinement",
+              "physical_shape": "candidate_lanes",
+              "consumer_kind": "exact_predicate",
+              "instrumentation_level": 0,
+              "semantic_contract": {
+                "kernel_name": "point_in_polygon_polygon_compacted_state",
+                "region_family": "polygon",
+                "prepared_part_y_index": false,
+                "logical_count_state": "device_resident"
+              }
+            }
+          }
+        },
+        {
+          "name": "segment.candidates.assemble_output",
+          "category": "emit",
+          "calls": 3,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "segment.candidates.compute_bounds",
+          "category": "setup",
+          "calls": 3,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "segment.candidates.counted_sweep.count",
+          "category": "filter",
+          "calls": 6,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "segment.candidates.counted_sweep.overflow_rows",
+          "category": "compact",
+          "calls": 4,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        }
+      ],
+      "top_hotpath": [
+        {
+          "name": "overlay.assemble.hole_assignment",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.output_grouping",
+          "category": "sort",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.output_materialize",
+          "category": "emit",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.sample_points",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.selected.boundary_cycles",
+          "category": "sort",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.selected.boundary_edges",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.selected.boundary_metrics",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.selected.boundary_scatter",
+          "category": "emit",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.assemble.selected.edge_selection",
+          "category": "setup",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        },
+        {
+          "name": "overlay.faces.component_containment",
+          "category": "refine",
+          "calls": 1,
+          "elapsed_seconds": 0.0,
+          "timing_mode": "counter",
+          "metadata": {}
+        }
+      ],
+      "transfer_count": 1444,
+      "owned_transfer_count": 0,
+      "materialization_count": 17,
+      "transfer_seconds": 0.18159120972268283,
+      "owned_transfer_seconds": 0.0,
+      "runtime_d2h_transfer_seconds": 0.18159120972268283,
+      "transfer_bytes": 1073200597,
+      "owned_transfer_bytes": 0,
+      "hotpath_total_seconds": null,
+      "composition_overhead_seconds": null,
+      "composition_overhead_ratio": null,
+      "timed_stages": [
+        {
+          "index": 0,
+          "line_start": 29,
+          "line_end": 29,
+          "source": "buildings = gpd.read_parquet(fixtures[\"buildings\"])",
+          "tags": [
+            "io_read"
+          ],
+          "actual_backend": "gpu",
+          "trace_steps": 1,
+          "gpu_steps": 1,
+          "cpu_steps": 0,
+          "d2h_transfers": 0,
+          "h2d_transfers": 0,
+          "d2h_transfer_bytes": 0,
+          "h2d_transfer_bytes": 0,
+          "d2h_transfer_seconds": 0,
+          "h2d_transfer_seconds": 0,
+          "runtime_d2h_transfers": 0,
+          "runtime_h2d_transfers": 0,
+          "runtime_d2h_transfer_bytes": 0,
+          "runtime_h2d_transfer_bytes": 0,
+          "runtime_d2h_transfer_seconds": 0,
+          "runtime_h2d_transfer_seconds": 0,
+          "elapsed_seconds": 0.052497780066914856,
+          "hotpath": [],
+          "fallback_event_count": 0,
+          "materialization_event_count": 1,
+          "materialization_d2h_event_count": 0,
+          "materialization_events": [
+            {
+              "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+              "boundary": "user-export",
+              "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+              "operation": "native_tabular_to_geodataframe",
+              "detail": "native_export_target=geodataframe, rows=1000000, attribute_columns=1, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=0",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_0",
+              "stage_category": "io_read",
+              "d2h_transfer": false,
+              "strict_disallowed": false
+            }
+          ],
+          "d2h_transfer_count_delta": 0,
+          "runtime_d2h_transfer_count_delta": 0,
+          "d2h_transfer_bytes_delta": 0,
+          "runtime_d2h_transfer_bytes_delta": 0,
+          "d2h_transfer_seconds_delta": 0.0,
+          "runtime_d2h_transfer_seconds_delta": 0.0
+        },
+        {
+          "index": 1,
+          "line_start": 30,
+          "line_end": 30,
+          "source": "parcels = gpd.read_parquet(fixtures[\"parcels\"])",
+          "tags": [
+            "io_read"
+          ],
+          "actual_backend": "gpu",
+          "trace_steps": 1,
+          "gpu_steps": 1,
+          "cpu_steps": 0,
+          "d2h_transfers": 0,
+          "h2d_transfers": 0,
+          "d2h_transfer_bytes": 0,
+          "h2d_transfer_bytes": 0,
+          "d2h_transfer_seconds": 0,
+          "h2d_transfer_seconds": 0,
+          "runtime_d2h_transfers": 0,
+          "runtime_h2d_transfers": 0,
+          "runtime_d2h_transfer_bytes": 0,
+          "runtime_h2d_transfer_bytes": 0,
+          "runtime_d2h_transfer_seconds": 0,
+          "runtime_h2d_transfer_seconds": 0,
+          "elapsed_seconds": 0.0170407589757815,
+          "hotpath": [],
+          "fallback_event_count": 0,
+          "materialization_event_count": 1,
+          "materialization_d2h_event_count": 0,
+          "materialization_events": [
+            {
+              "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+              "boundary": "user-export",
+              "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+              "operation": "native_tabular_to_geodataframe",
+              "detail": "native_export_target=geodataframe, rows=1000000, attribute_columns=1, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=0",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_1",
+              "stage_category": "io_read",
+              "d2h_transfer": false,
+              "strict_disallowed": false
+            }
+          ],
+          "d2h_transfer_count_delta": 0,
+          "runtime_d2h_transfer_count_delta": 0,
+          "d2h_transfer_bytes_delta": 0,
+          "runtime_d2h_transfer_bytes_delta": 0,
+          "d2h_transfer_seconds_delta": 0.0,
+          "runtime_d2h_transfer_seconds_delta": 0.0
+        },
+        {
+          "index": 2,
+          "line_start": 31,
+          "line_end": 31,
+          "source": "transit = gpd.read_file(fixtures[\"transit\"])",
+          "tags": [
+            "io_read"
+          ],
+          "actual_backend": "gpu",
+          "trace_steps": 2,
+          "gpu_steps": 2,
+          "cpu_steps": 0,
+          "d2h_transfers": 3,
+          "h2d_transfers": 0,
+          "d2h_transfer_bytes": 3200017,
+          "h2d_transfer_bytes": 0,
+          "d2h_transfer_seconds": 0.00025115604512393475,
+          "h2d_transfer_seconds": 0,
+          "runtime_d2h_transfers": 3,
+          "runtime_h2d_transfers": 0,
+          "runtime_d2h_transfer_bytes": 3200017,
+          "runtime_h2d_transfer_bytes": 0,
+          "runtime_d2h_transfer_seconds": 0.00025115604512393475,
+          "runtime_h2d_transfer_seconds": 0,
+          "elapsed_seconds": 0.10433530202135444,
+          "hotpath": [],
+          "fallback_event_count": 0,
+          "materialization_event_count": 1,
+          "materialization_d2h_event_count": 0,
+          "materialization_events": [
+            {
+              "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+              "boundary": "user-export",
+              "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+              "operation": "native_tabular_to_geodataframe",
+              "detail": "native_export_target=geodataframe, rows=200000, attribute_columns=0, attribute_storage=loader, geometry_storage=owned:device, secondary_geometry=0",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_2",
+              "stage_category": "io_read",
+              "d2h_transfer": false,
+              "strict_disallowed": false
+            }
+          ],
+          "d2h_transfer_count_delta": 3,
+          "runtime_d2h_transfer_count_delta": 3,
+          "d2h_transfer_bytes_delta": 3200017,
+          "runtime_d2h_transfer_bytes_delta": 3200017,
+          "d2h_transfer_seconds_delta": 0.00025115604512393475,
+          "runtime_d2h_transfer_seconds_delta": 0.00025115604512393475
+        },
+        {
+          "index": 3,
+          "line_start": 32,
+          "line_end": 32,
+          "source": "admin = gpd.read_file(fixtures[\"admin_boundary\"])",
+          "tags": [
+            "io_read"
+          ],
+          "actual_backend": "gpu",
+          "trace_steps": 2,
+          "gpu_steps": 2,
+          "cpu_steps": 0,
+          "d2h_transfers": 5,
+          "h2d_transfers": 0,
+          "d2h_transfer_bytes": 48,
+          "h2d_transfer_bytes": 0,
+          "d2h_transfer_seconds": 0.000025146990083158016,
+          "h2d_transfer_seconds": 0,
+          "runtime_d2h_transfers": 5,
+          "runtime_h2d_transfers": 0,
+          "runtime_d2h_transfer_bytes": 48,
+          "runtime_h2d_transfer_bytes": 0,
+          "runtime_d2h_transfer_seconds": 0.000025146990083158016,
+          "runtime_h2d_transfer_seconds": 0,
+          "elapsed_seconds": 0.005051751038990915,
+          "hotpath": [],
+          "fallback_event_count": 0,
+          "materialization_event_count": 1,
+          "materialization_d2h_event_count": 0,
+          "materialization_events": [
+            {
+              "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+              "boundary": "user-export",
+              "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+              "operation": "native_tabular_to_geodataframe",
+              "detail": "native_export_target=geodataframe, rows=1, attribute_columns=0, attribute_storage=loader, geometry_storage=owned:device, secondary_geometry=0",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_3",
+              "stage_category": "io_read",
+              "d2h_transfer": false,
+              "strict_disallowed": false
+            }
+          ],
+          "d2h_transfer_count_delta": 5,
+          "runtime_d2h_transfer_count_delta": 5,
+          "d2h_transfer_bytes_delta": 48,
+          "runtime_d2h_transfer_bytes_delta": 48,
+          "d2h_transfer_seconds_delta": 0.000025146990083158016,
+          "runtime_d2h_transfer_seconds_delta": 0.000025146990083158016
+        },
+        {
+          "index": 4,
+          "line_start": 34,
+          "line_end": 34,
+          "source": "buildings_in_admin = gpd.clip(buildings, admin)",
+          "tags": [
+            "mask_clip"
+          ],
+          "actual_backend": "gpu",
+          "trace_steps": 6,
+          "gpu_steps": 6,
+          "cpu_steps": 0,
+          "d2h_transfers": 4,
+          "h2d_transfers": 0,
+          "d2h_transfer_bytes": 413002,
+          "h2d_transfer_bytes": 0,
+          "d2h_transfer_seconds": 0.00015615206211805344,
+          "h2d_transfer_seconds": 0,
+          "runtime_d2h_transfers": 4,
+          "runtime_h2d_transfers": 0,
+          "runtime_d2h_transfer_bytes": 413002,
+          "runtime_h2d_transfer_bytes": 0,
+          "runtime_d2h_transfer_seconds": 0.00015615206211805344,
+          "runtime_h2d_transfer_seconds": 0,
+          "elapsed_seconds": 2.2167898929910734,
+          "hotpath": [
+            {
+              "name": "overlay.assemble.hole_assignment",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.assemble.output_grouping",
+              "category": "sort",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.assemble.output_materialize",
+              "category": "emit",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.assemble.sample_points",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.assemble.selected.boundary_cycles",
+              "category": "sort",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.assemble.selected.boundary_edges",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.assemble.selected.boundary_metrics",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.assemble.selected.boundary_scatter",
+              "category": "emit",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.assemble.selected.edge_selection",
+              "category": "setup",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.faces.component_containment",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.faces.coverage_finalize",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.faces.coverage_retention",
+              "category": "setup",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.faces.coverage_scratch",
+              "category": "setup",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.faces.dual_winding",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.faces.face_walk",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.graph.face_id_pointer_jump",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.graph.face_metrics_kernel",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.graph.face_offsets",
+              "category": "sort",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.graph.face_span_boundaries",
+              "category": "sort",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.graph.gather_face_edges",
+              "category": "emit",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.graph.group_faces_sort",
+              "category": "sort",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.plan.atomic_edges",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {
+                "work_amplification": {
+                  "sum": {
+                    "split_events": 7802748,
+                    "atomic_edges": 7818040
+                  },
+                  "max": {
+                    "atomic_edges_per_plan": 7818040
+                  },
+                  "unavailable": [
+                    "emitted_fragments",
+                    "fragment_coordinates",
+                    "retained_output_parts",
+                    "output_coordinates",
+                    "constructive_bytes",
+                    "peak_live_bytes"
+                  ],
+                  "schema_version": 1,
+                  "operation": "overlay.plan.atomic_edges",
+                  "metric_family": "constructive",
+                  "instrumentation_level": 0
+                }
+              }
+            },
+            {
+              "name": "overlay.plan.faces",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {
+                "work_amplification": {
+                  "sum": {
+                    "half_edges": 7818040,
+                    "faces": 330876
+                  },
+                  "max": {
+                    "faces_per_plan": 330876
+                  },
+                  "unavailable": [
+                    "retained_output_parts",
+                    "output_coordinates",
+                    "constructive_bytes",
+                    "peak_live_bytes"
+                  ],
+                  "schema_version": 1,
+                  "operation": "overlay.plan.faces",
+                  "metric_family": "constructive",
+                  "instrumentation_level": 0
+                }
+              }
+            },
+            {
+              "name": "overlay.plan.half_edge_graph",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {
+                "work_amplification": {
+                  "sum": {
+                    "atomic_edges": 7818040,
+                    "half_edges": 7818040,
+                    "graph_nodes": 0
+                  },
+                  "max": {
+                    "half_edges_per_plan": 7818040
+                  },
+                  "unavailable": [
+                    "emitted_fragments",
+                    "retained_output_parts",
+                    "output_coordinates",
+                    "constructive_bytes",
+                    "peak_live_bytes"
+                  ],
+                  "schema_version": 1,
+                  "operation": "overlay.plan.half_edge_graph",
+                  "metric_family": "constructive",
+                  "instrumentation_level": 0
+                }
+              }
+            },
+            {
+              "name": "overlay.plan.release_atomic_excess",
+              "category": "setup",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.plan.release_split_events",
+              "category": "setup",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.plan.split_events",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {
+                "work_amplification": {
+                  "sum": {
+                    "source_segments": 3893728,
+                    "split_events": 7802748
+                  },
+                  "max": {
+                    "left_segments": 15232,
+                    "right_segments": 3878496
+                  },
+                  "unavailable": [
+                    "emitted_fragments",
+                    "fragment_coordinates",
+                    "retained_output_parts",
+                    "output_coordinates",
+                    "constructive_bytes",
+                    "peak_live_bytes"
+                  ],
+                  "schema_version": 1,
+                  "operation": "overlay.plan.split_events",
+                  "metric_family": "constructive",
+                  "instrumentation_level": 0
+                }
+              }
+            },
+            {
+              "name": "overlay.split.canonicalize_source_endpoints",
+              "category": "sort",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.split.classify_intersections",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.split.emit_endpoint_events",
+              "category": "emit",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.split.emit_pair_event_run",
+              "category": "emit",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.split.external_merge_events",
+              "category": "sort",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.split.extract_left_segments",
+              "category": "setup",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.split.extract_right_segments",
+              "category": "setup",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.split.segment_metadata",
+              "category": "emit",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.assemble_output",
+              "category": "emit",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.compute_bounds",
+              "category": "setup",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.counted_sweep.count",
+              "category": "filter",
+              "calls": 4,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.counted_sweep.overflow_rows",
+              "category": "compact",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.counted_sweep.physicalize",
+              "category": "compact",
+              "calls": 4,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.counted_sweep.scatter",
+              "category": "emit",
+              "calls": 4,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.device_counted_sweep",
+              "category": "filter",
+              "calls": 4,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.partition_x_axis",
+              "category": "mask",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.partition_y_axis",
+              "category": "mask",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.search_x_ranges",
+              "category": "filter",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.search_y_ranges",
+              "category": "filter",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.sort_x_midpoints",
+              "category": "sort",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.sort_y_midpoints",
+              "category": "sort",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.classify.extract_left_segments",
+              "category": "setup",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.classify.extract_right_segments",
+              "category": "setup",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.classify.generate_candidates",
+              "category": "filter",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.classify.launch_kernel",
+              "category": "refine",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.classify.synchronize",
+              "category": "emit",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            }
+          ],
+          "fallback_event_count": 0,
+          "materialization_event_count": 4,
+          "materialization_d2h_event_count": 3,
+          "materialization_events": [
+            {
+              "surface": "vibespatial.api.NativeTabularSelection.to_geodataframe",
+              "boundary": "internal-host-conversion",
+              "reason": "capacity-backed device selection logical count was materialized for explicit compaction/export",
+              "operation": "device_selection_logical_count_to_host",
+              "detail": "capacity=161604, bytes=8",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_4",
+              "stage_category": "mask_clip",
+              "d2h_transfer": true,
+              "strict_disallowed": false
+            },
+            {
+              "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+              "boundary": "internal-host-conversion",
+              "reason": "device public index labels were materialized for export",
+              "operation": "index_plan_to_host",
+              "detail": "rows=51624, bytes=412992",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_4",
+              "stage_category": "mask_clip",
+              "d2h_transfer": true,
+              "strict_disallowed": false
+            },
+            {
+              "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+              "boundary": "user-export",
+              "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+              "operation": "native_tabular_to_geodataframe",
+              "detail": "native_export_target=geodataframe, rows=51624, attribute_columns=1, attribute_storage=device, geometry_storage=composition:device, secondary_geometry=0",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_4",
+              "stage_category": "mask_clip",
+              "d2h_transfer": false,
+              "strict_disallowed": false
+            },
+            {
+              "surface": "vibespatial.api.NativeGeometryComposition.to_geoseries",
+              "boundary": "internal-host-conversion",
+              "reason": "terminal geometry composition multiplicity certified before partitioned public export",
+              "operation": "singular_partitioned_certification",
+              "detail": "rows=51624, parts=4",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_4",
+              "stage_category": "mask_clip",
+              "d2h_transfer": true,
+              "strict_disallowed": false
+            }
+          ],
+          "d2h_transfer_count_delta": 4,
+          "runtime_d2h_transfer_count_delta": 4,
+          "d2h_transfer_bytes_delta": 413002,
+          "runtime_d2h_transfer_bytes_delta": 413002,
+          "d2h_transfer_seconds_delta": 0.00015615206211805344,
+          "runtime_d2h_transfer_seconds_delta": 0.00015615206211805344
+        },
+        {
+          "index": 5,
+          "line_start": 36,
+          "line_end": 36,
+          "source": "transit_buffers = transit.copy()",
+          "tags": [
+            "copy"
+          ],
+          "actual_backend": "python",
+          "trace_steps": 0,
+          "gpu_steps": 0,
+          "cpu_steps": 0,
+          "d2h_transfers": 0,
+          "h2d_transfers": 0,
+          "d2h_transfer_bytes": 0,
+          "h2d_transfer_bytes": 0,
+          "d2h_transfer_seconds": 0,
+          "h2d_transfer_seconds": 0,
+          "runtime_d2h_transfers": 0,
+          "runtime_h2d_transfers": 0,
+          "runtime_d2h_transfer_bytes": 0,
+          "runtime_h2d_transfer_bytes": 0,
+          "runtime_d2h_transfer_seconds": 0,
+          "runtime_h2d_transfer_seconds": 0,
+          "elapsed_seconds": 0.0004511660663411021,
+          "hotpath": [],
+          "fallback_event_count": 0,
+          "materialization_event_count": 0,
+          "materialization_d2h_event_count": 0,
+          "d2h_transfer_count_delta": 0,
+          "runtime_d2h_transfer_count_delta": 0,
+          "d2h_transfer_bytes_delta": 0,
+          "runtime_d2h_transfer_bytes_delta": 0,
+          "d2h_transfer_seconds_delta": 0.0,
+          "runtime_d2h_transfer_seconds_delta": 0.0
+        },
+        {
+          "index": 6,
+          "line_start": 37,
+          "line_end": 37,
+          "source": "transit_buffers[\"geometry\"] = transit_buffers.geometry.buffer(125.0)",
+          "tags": [
+            "buffer",
+            "mask_construction"
+          ],
+          "actual_backend": "gpu",
+          "trace_steps": 1,
+          "gpu_steps": 1,
+          "cpu_steps": 0,
+          "d2h_transfers": 0,
+          "h2d_transfers": 0,
+          "d2h_transfer_bytes": 0,
+          "h2d_transfer_bytes": 0,
+          "d2h_transfer_seconds": 0,
+          "h2d_transfer_seconds": 0,
+          "runtime_d2h_transfers": 0,
+          "runtime_h2d_transfers": 0,
+          "runtime_d2h_transfer_bytes": 0,
+          "runtime_h2d_transfer_bytes": 0,
+          "runtime_d2h_transfer_seconds": 0,
+          "runtime_h2d_transfer_seconds": 0,
+          "elapsed_seconds": 0.0015541299944743514,
+          "hotpath": [],
+          "fallback_event_count": 0,
+          "materialization_event_count": 0,
+          "materialization_d2h_event_count": 0,
+          "d2h_transfer_count_delta": 0,
+          "runtime_d2h_transfer_count_delta": 0,
+          "d2h_transfer_bytes_delta": 0,
+          "runtime_d2h_transfer_bytes_delta": 0,
+          "d2h_transfer_seconds_delta": 0.0,
+          "runtime_d2h_transfer_seconds_delta": 0.0
+        },
+        {
+          "index": 7,
+          "line_start": 39,
+          "line_end": 43,
+          "source": "unserved = spatial_antijoin(\n    buildings_in_admin,\n    transit_buffers[[\"station_id\", \"geometry\"]],\n    predicate=\"intersects\",\n)",
+          "tags": [
+            "python"
+          ],
+          "actual_backend": "gpu",
+          "trace_steps": 5,
+          "gpu_steps": 5,
+          "cpu_steps": 0,
+          "d2h_transfers": 10,
+          "h2d_transfers": 0,
+          "d2h_transfer_bytes": 946,
+          "h2d_transfer_bytes": 0,
+          "d2h_transfer_seconds": 0.00041576719377189875,
+          "h2d_transfer_seconds": 0,
+          "runtime_d2h_transfers": 10,
+          "runtime_h2d_transfers": 0,
+          "runtime_d2h_transfer_bytes": 946,
+          "runtime_h2d_transfer_bytes": 0,
+          "runtime_d2h_transfer_seconds": 0.00041576719377189875,
+          "runtime_h2d_transfer_seconds": 0,
+          "elapsed_seconds": 1.1842974949395284,
+          "hotpath": [
+            {
+              "name": "predicate.point_region.point_in_polygon_polygon_compacted_state",
+              "category": "refine",
+              "calls": 80,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {
+                "work_amplification": {
+                  "sum": {
+                    "candidate_lanes": 304087040,
+                    "launch_items": 101362320,
+                    "prepared_consumer_count": 0
+                  },
+                  "max": {
+                    "launch_capacity": 2796202
+                  },
+                  "unavailable": [
+                    "exact_evaluations",
+                    "ambiguous_lanes",
+                    "survivors",
+                    "early_terminated"
+                  ],
+                  "schema_version": 1,
+                  "operation": "point_region_predicate",
+                  "metric_family": "refinement",
+                  "physical_shape": "candidate_lanes",
+                  "consumer_kind": "exact_predicate",
+                  "instrumentation_level": 0,
+                  "semantic_contract": {
+                    "kernel_name": "point_in_polygon_polygon_compacted_state",
+                    "region_family": "polygon",
+                    "prepared_part_y_index": false,
+                    "logical_count_state": "device_resident"
+                  }
+                }
+              }
+            }
+          ],
+          "fallback_event_count": 0,
+          "materialization_event_count": 2,
+          "materialization_d2h_event_count": 2,
+          "materialization_events": [
+            {
+              "surface": "vibespatial.api.NativeGeometryComposition.to_geoseries",
+              "boundary": "internal-host-conversion",
+              "reason": "terminal geometry composition multiplicity certified before device owned physicalization",
+              "operation": "singular_owned_certification",
+              "detail": "rows=51624, parts=4",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_7",
+              "stage_category": "python",
+              "d2h_transfer": true,
+              "strict_disallowed": false
+            },
+            {
+              "surface": "vibespatial.api.SpatialIndex.query_any.boolean_filter",
+              "boundary": "internal-host-conversion",
+              "reason": "capacity-backed device selection logical count was materialized for explicit compaction/export",
+              "operation": "device_selection_logical_count_to_host",
+              "detail": "capacity=51624, bytes=8",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_7",
+              "stage_category": "python",
+              "d2h_transfer": true,
+              "strict_disallowed": false
+            }
+          ],
+          "d2h_transfer_count_delta": 10,
+          "runtime_d2h_transfer_count_delta": 10,
+          "d2h_transfer_bytes_delta": 946,
+          "runtime_d2h_transfer_bytes_delta": 946,
+          "d2h_transfer_seconds_delta": 0.00041576719377189875,
+          "runtime_d2h_transfer_seconds_delta": 0.00041576719377189875
+        },
+        {
+          "index": 8,
+          "line_start": 45,
+          "line_end": 54,
+          "source": "if len(unserved) > 0:\n    gap_polygons = unserved.copy()\n    gap_polygons[\"geometry\"] = unserved.geometry.centroid.buffer(35.0)\n    parcel_gaps = gpd.overlay(\n        gap_polygons[[\"geometry\"]],\n        parcels[[\"parcel_id\", \"geometry\"]],\n        how=\"intersection\",\n    )\nelse:\n    parcel_gaps = gpd.GeoDataFrame({\"geometry\": []}, geometry=\"geometry\", crs=buildings.crs)",
+          "tags": [
+            "buffer",
+            "mask_construction",
+            "many_few_overlay",
+            "copy"
+          ],
+          "actual_backend": "gpu",
+          "trace_steps": 3764,
+          "gpu_steps": 3764,
+          "cpu_steps": 0,
+          "d2h_transfers": 1420,
+          "h2d_transfers": 0,
+          "d2h_transfer_bytes": 825131592,
+          "h2d_transfer_bytes": 0,
+          "d2h_transfer_seconds": 0.1666955193504691,
+          "h2d_transfer_seconds": 0,
+          "runtime_d2h_transfers": 1420,
+          "runtime_h2d_transfers": 0,
+          "runtime_d2h_transfer_bytes": 825131592,
+          "runtime_h2d_transfer_bytes": 0,
+          "runtime_d2h_transfer_seconds": 0.1666955193504691,
+          "runtime_h2d_transfer_seconds": 0,
+          "elapsed_seconds": 24.283035198925063,
+          "hotpath": [
+            {
+              "name": "overlay.plan.atomic_edges",
+              "category": "refine",
+              "calls": 469,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {
+                "work_amplification": {
+                  "sum": {
+                    "split_events": 0,
+                    "atomic_edges": 0
+                  },
+                  "max": {
+                    "atomic_edges_per_plan": 0
+                  },
+                  "unavailable": [
+                    "emitted_fragments",
+                    "fragment_coordinates",
+                    "retained_output_parts",
+                    "output_coordinates",
+                    "constructive_bytes",
+                    "peak_live_bytes"
+                  ],
+                  "schema_version": 1,
+                  "operation": "overlay.plan.atomic_edges",
+                  "metric_family": "constructive",
+                  "instrumentation_level": 0
+                }
+              }
+            },
+            {
+              "name": "overlay.plan.faces",
+              "category": "refine",
+              "calls": 469,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {
+                "work_amplification": {
+                  "sum": {
+                    "half_edges": 0,
+                    "faces": 0
+                  },
+                  "max": {
+                    "faces_per_plan": 0
+                  },
+                  "unavailable": [
+                    "retained_output_parts",
+                    "output_coordinates",
+                    "constructive_bytes",
+                    "peak_live_bytes"
+                  ],
+                  "schema_version": 1,
+                  "operation": "overlay.plan.faces",
+                  "metric_family": "constructive",
+                  "instrumentation_level": 0
+                }
+              }
+            },
+            {
+              "name": "overlay.plan.half_edge_graph",
+              "category": "refine",
+              "calls": 469,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {
+                "work_amplification": {
+                  "sum": {
+                    "atomic_edges": 0,
+                    "half_edges": 0,
+                    "graph_nodes": 0
+                  },
+                  "max": {
+                    "half_edges_per_plan": 0
+                  },
+                  "unavailable": [
+                    "emitted_fragments",
+                    "retained_output_parts",
+                    "output_coordinates",
+                    "constructive_bytes",
+                    "peak_live_bytes"
+                  ],
+                  "schema_version": 1,
+                  "operation": "overlay.plan.half_edge_graph",
+                  "metric_family": "constructive",
+                  "instrumentation_level": 0
+                }
+              }
+            },
+            {
+              "name": "overlay.plan.release_atomic_excess",
+              "category": "setup",
+              "calls": 469,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.plan.release_split_events",
+              "category": "setup",
+              "calls": 469,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.plan.split_events",
+              "category": "refine",
+              "calls": 469,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {
+                "work_amplification": {
+                  "sum": {
+                    "source_segments": 0,
+                    "split_events": 0
+                  },
+                  "max": {
+                    "left_segments": 0,
+                    "right_segments": 0
+                  },
+                  "unavailable": [
+                    "emitted_fragments",
+                    "fragment_coordinates",
+                    "retained_output_parts",
+                    "output_coordinates",
+                    "constructive_bytes",
+                    "peak_live_bytes"
+                  ],
+                  "schema_version": 1,
+                  "operation": "overlay.plan.split_events",
+                  "metric_family": "constructive",
+                  "instrumentation_level": 0
+                }
+              }
+            },
+            {
+              "name": "overlay.split.canonicalize_source_endpoints",
+              "category": "sort",
+              "calls": 469,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.split.classify_intersections",
+              "category": "refine",
+              "calls": 469,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.split.emit_endpoint_events",
+              "category": "emit",
+              "calls": 469,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.split.external_merge_events",
+              "category": "sort",
+              "calls": 469,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.split.extract_left_segments",
+              "category": "setup",
+              "calls": 469,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.split.extract_right_segments",
+              "category": "setup",
+              "calls": 469,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "overlay.split.segment_metadata",
+              "category": "emit",
+              "calls": 469,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.assemble_output",
+              "category": "emit",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.compute_bounds",
+              "category": "setup",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.counted_sweep.count",
+              "category": "filter",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.counted_sweep.overflow_rows",
+              "category": "compact",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.counted_sweep.physicalize",
+              "category": "compact",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.counted_sweep.scatter",
+              "category": "emit",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.device_counted_sweep",
+              "category": "filter",
+              "calls": 2,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.partition_x_axis",
+              "category": "mask",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.partition_y_axis",
+              "category": "mask",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.search_x_ranges",
+              "category": "filter",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.search_y_ranges",
+              "category": "filter",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.sort_x_midpoints",
+              "category": "sort",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.candidates.sort_y_midpoints",
+              "category": "sort",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.classify.extract_left_segments",
+              "category": "setup",
+              "calls": 470,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.classify.extract_right_segments",
+              "category": "setup",
+              "calls": 470,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.classify.generate_candidates",
+              "category": "filter",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.classify.launch_kernel",
+              "category": "refine",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            },
+            {
+              "name": "segment.classify.synchronize",
+              "category": "emit",
+              "calls": 1,
+              "elapsed_seconds": 0.0,
+              "timing_mode": "counter",
+              "metadata": {}
+            }
+          ],
+          "fallback_event_count": 0,
+          "materialization_event_count": 4,
+          "materialization_d2h_event_count": 3,
+          "materialization_events": [
+            {
+              "surface": "vibespatial.api.NativeGeometryComposition.to_geoseries",
+              "boundary": "internal-host-conversion",
+              "reason": "terminal geometry composition multiplicity certified before device owned physicalization",
+              "operation": "singular_owned_certification",
+              "detail": "rows=7653, parts=3",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_8",
+              "stage_category": "buffer,mask_construction,many_few_overlay,copy",
+              "d2h_transfer": true,
+              "strict_disallowed": false
+            },
+            {
+              "surface": "vibespatial.api.NativeTabularSelection.to_geodataframe",
+              "boundary": "internal-host-conversion",
+              "reason": "capacity-backed device selection logical count was materialized for explicit compaction/export",
+              "operation": "device_selection_logical_count_to_host",
+              "detail": "capacity=30553611, bytes=8",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_8",
+              "stage_category": "buffer,mask_construction,many_few_overlay,copy",
+              "d2h_transfer": true,
+              "strict_disallowed": false
+            },
+            {
+              "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+              "boundary": "user-export",
+              "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+              "operation": "native_tabular_to_geodataframe",
+              "detail": "native_export_target=geodataframe, rows=30553577, attribute_columns=1, attribute_storage=device, geometry_storage=composition:device, secondary_geometry=0",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_8",
+              "stage_category": "buffer,mask_construction,many_few_overlay,copy",
+              "d2h_transfer": false,
+              "strict_disallowed": false
+            },
+            {
+              "surface": "vibespatial.api.NativeGeometryComposition.to_geoseries",
+              "boundary": "internal-host-conversion",
+              "reason": "terminal geometry composition multiplicity certified before partitioned public export",
+              "operation": "singular_partitioned_certification",
+              "detail": "rows=30553577, parts=471",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_8",
+              "stage_category": "buffer,mask_construction,many_few_overlay,copy",
+              "d2h_transfer": true,
+              "strict_disallowed": false
+            }
+          ],
+          "d2h_transfer_count_delta": 1420,
+          "runtime_d2h_transfer_count_delta": 1420,
+          "d2h_transfer_bytes_delta": 825131592,
+          "runtime_d2h_transfer_bytes_delta": 825131592,
+          "d2h_transfer_seconds_delta": 0.1666955193504691,
+          "runtime_d2h_transfer_seconds_delta": 0.1666955193504691
+        },
+        {
+          "index": 9,
+          "line_start": 56,
+          "line_end": 56,
+          "source": "output_path = tmpdir / \"output.parquet\"",
+          "tags": [
+            "python"
+          ],
+          "actual_backend": "python",
+          "trace_steps": 0,
+          "gpu_steps": 0,
+          "cpu_steps": 0,
+          "d2h_transfers": 0,
+          "h2d_transfers": 0,
+          "d2h_transfer_bytes": 0,
+          "h2d_transfer_bytes": 0,
+          "d2h_transfer_seconds": 0,
+          "h2d_transfer_seconds": 0,
+          "runtime_d2h_transfers": 0,
+          "runtime_h2d_transfers": 0,
+          "runtime_d2h_transfer_bytes": 0,
+          "runtime_h2d_transfer_bytes": 0,
+          "runtime_d2h_transfer_seconds": 0,
+          "runtime_h2d_transfer_seconds": 0,
+          "elapsed_seconds": 0.000017678015865385532,
+          "hotpath": [],
+          "fallback_event_count": 0,
+          "materialization_event_count": 0,
+          "materialization_d2h_event_count": 0,
+          "d2h_transfer_count_delta": 0,
+          "runtime_d2h_transfer_count_delta": 0,
+          "d2h_transfer_bytes_delta": 0,
+          "runtime_d2h_transfer_bytes_delta": 0,
+          "d2h_transfer_seconds_delta": 0.0,
+          "runtime_d2h_transfer_seconds_delta": 0.0
+        },
+        {
+          "index": 10,
+          "line_start": 57,
+          "line_end": 57,
+          "source": "parcel_gaps.to_parquet(output_path)",
+          "tags": [
+            "io_write"
+          ],
+          "actual_backend": "gpu",
+          "trace_steps": 2,
+          "gpu_steps": 2,
+          "cpu_steps": 0,
+          "d2h_transfers": 2,
+          "h2d_transfers": 0,
+          "d2h_transfer_bytes": 244454992,
+          "h2d_transfer_bytes": 0,
+          "d2h_transfer_seconds": 0.014047468081116676,
+          "h2d_transfer_seconds": 0,
+          "runtime_d2h_transfers": 2,
+          "runtime_h2d_transfers": 0,
+          "runtime_d2h_transfer_bytes": 244454992,
+          "runtime_h2d_transfer_bytes": 0,
+          "runtime_d2h_transfer_seconds": 0.014047468081116676,
+          "runtime_h2d_transfer_seconds": 0,
+          "elapsed_seconds": 2.82848940405529,
+          "hotpath": [],
+          "fallback_event_count": 0,
+          "materialization_event_count": 3,
+          "materialization_d2h_event_count": 2,
+          "materialization_events": [
+            {
+              "surface": "vibespatial.api.NativeIndexPlan.to_public_index",
+              "boundary": "user-export",
+              "reason": "device public index labels were materialized for export",
+              "operation": "index_plan_to_host",
+              "detail": "native_export_target=index, rows=30553577, bytes=244428616",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_10",
+              "stage_category": "io_write",
+              "d2h_transfer": true,
+              "strict_disallowed": false
+            },
+            {
+              "surface": "vibespatial.api.NativeAttributeTable.to_arrow",
+              "boundary": "user-export",
+              "reason": "device attribute table exported to host Arrow",
+              "operation": "device_attributes_to_arrow",
+              "detail": "rows=30553577, columns=1, bytes=unknown",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_10",
+              "stage_category": "io_write",
+              "d2h_transfer": true,
+              "strict_disallowed": false
+            },
+            {
+              "surface": "vibespatial.api.GeoDataFrame.to_parquet",
+              "boundary": "user-export",
+              "reason": "native GeoDataFrame exported to GeoParquet writer",
+              "operation": "geodataframe_to_parquet",
+              "detail": "native_export_target=geoparquet, rows=30553577, bytes=3405856774, state_residency=device, state_geometry=geometry, geometry_residency=device",
+              "pipeline": "shootout",
+              "dataset": "transit_service_gap.py",
+              "stage": "statement_10",
+              "stage_category": "io_write",
+              "d2h_transfer": false,
+              "strict_disallowed": false
+            }
+          ],
+          "d2h_transfer_count_delta": 2,
+          "runtime_d2h_transfer_count_delta": 2,
+          "d2h_transfer_bytes_delta": 244454992,
+          "runtime_d2h_transfer_bytes_delta": 244454992,
+          "d2h_transfer_seconds_delta": 0.014047468081116676,
+          "runtime_d2h_transfer_seconds_delta": 0.014047468081116676
+        }
+      ],
+      "stage_total_seconds": 30.693560557090677,
+      "stage_totals_by_tag": {
+        "buffer": 24.284589328919537,
+        "mask_construction": 24.284589328919537,
+        "copy": 24.283486364991404,
+        "many_few_overlay": 24.283035198925063,
+        "io_write": 2.82848940405529,
+        "mask_clip": 2.2167898929910734,
+        "python": 1.1843151729553938,
+        "io_read": 0.1789255921030417
+      },
+      "stage_totals_by_backend": {
+        "gpu": 30.69309171300847,
+        "python": 0.00046884408220648766
+      },
+      "stage_materialization_count": 17,
+      "stage_materialization_d2h_event_count": 10,
+      "stage_materialization_counts_by_boundary": {
+        "user-export": 9,
+        "internal-host-conversion": 8
+      },
+      "stage_materialization_counts_by_surface": {
+        "vibespatial.api.NativeTabularResult.to_geodataframe": 7,
+        "vibespatial.api.NativeGeometryComposition.to_geoseries": 4,
+        "vibespatial.api.NativeTabularSelection.to_geodataframe": 2,
+        "vibespatial.api.GeoDataFrame.to_parquet": 1,
+        "vibespatial.api.NativeAttributeTable.to_arrow": 1,
+        "vibespatial.api.NativeIndexPlan.to_public_index": 1,
+        "vibespatial.api.SpatialIndex.query_any.boolean_filter": 1
+      },
+      "d2h_transfer_count": 1444,
+      "runtime_d2h_transfer_count": 1444,
+      "runtime_d2h_transfer_bytes": 1073200597
+    },
+    "environment": {
+      "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+      "python_implementation": "cpython",
+      "packages": {
+        "geopandas": "1.1.4",
+        "numpy": "2.4.3",
+        "pandas": "3.0.1",
+        "pyarrow": "23.0.1",
+        "pyogrio": "0.12.1",
+        "shapely": "2.1.2"
+      }
+    }
+  },
+  "speedup": null,
+  "metadata": {
+    "repeat": 1,
+    "warmup": false,
+    "timeout": 1200,
+    "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+    "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+    "vibespatial_source": {
+      "package_version": "0.5.1",
+      "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+      "git_revision": "e8e7f2205bfbdbb072f2d6e8e2ed41697a45533b",
+      "tracked_source_dirty": true,
+      "untracked_source_files": [
+        "scripts/analyze_work_amplification.py",
+        "src/vibespatial/bench/amplification.py",
+        "src/vibespatial/bench/amplification_analysis.py"
+      ],
+      "worktree_source_sha256": "9dd35be5a00c69aae610232226f80110ced4f90ff7045c15a4b5990331ef5b39",
+      "python_version": "3.13.12"
+    },
+    "physical_shapes": [
+      "many_few_overlay",
+      "mask_clip"
+    ],
+    "profile_mode": "counters",
+    "workload_key": "transit_service_gap.py",
+    "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+    "geopandas_baseline": "measured",
+    "geopandas_baseline_host": {
+      "node": "picard-4090",
+      "machine": "x86_64",
+      "processor": "x86_64",
+      "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+    },
+    "geopandas_baseline_environment_sha256": null,
+    "measurement_mode": "cold_start_probe",
+    "measurement_note": "repeat<3 with warmup disabled is cold-start sensitive; use warmup or repeat>=3 for steady-state parity comparisons",
+    "scale": "1M",
+    "vibespatial_launch": "subprocess",
+    "fingerprint": "missing",
+    "fingerprint_geopandas": null,
+    "fingerprint_vibespatial": "rows=30553577 bounds=(457.74, 265.0, 673.76, 735.0) convex_hull_area=29404906.86"
+  }
+}

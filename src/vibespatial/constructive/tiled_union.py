@@ -34,7 +34,11 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.crossover import estimate_physical_work_from_owned
 from vibespatial.runtime.dispatch import record_dispatch_event
-from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
+from vibespatial.runtime.hotpath_trace import (
+    attach_work_amplification,
+    hotpath_stage,
+    hotpath_timing_enabled,
+)
 from vibespatial.runtime.residency import Residency
 
 if TYPE_CHECKING:
@@ -79,7 +83,7 @@ class _TopologyTilePlan:
 
 
 def _sync_hotpath() -> None:
-    if hotpath_trace_enabled():
+    if hotpath_timing_enabled():
         cp.cuda.get_current_stream().synchronize()
 
 
@@ -909,13 +913,37 @@ def _tiled_single_group_collective_union_gpu(
                 )
             )
             _sync_hotpath()
-            with hotpath_stage("constructive.union.tile_clip", category="setup"):
+            with hotpath_stage(
+                "constructive.union.tile_clip",
+                category="setup",
+            ) as amplification_metadata:
                 clipped_batch = _clip_topology_tile_candidate_batch(
                     owned,
                     tile_relation.right_indices[row_start:row_end],
                     d_candidate_tile_ids,
                     d_tile_bounds,
                 )
+                if amplification_metadata is not None:
+                    attach_work_amplification(
+                        amplification_metadata,
+                        operation="constructive.union.tile_clip",
+                        metric_family="group_compression",
+                        sums={
+                            "input_rows": int(batch_candidate_count),
+                            "pre_reduction_fragments": int(clipped_batch.row_count),
+                            "output_groups": int(batch_tile_count),
+                        },
+                        maxima={
+                            "max_group_size": int(group_size_max),
+                            "tiles_per_batch": int(batch_tile_count),
+                        },
+                        unavailable=(
+                            "input_segments",
+                            "input_coordinates",
+                            "output_parts",
+                            "output_coordinates",
+                        ),
+                    )
             from vibespatial.geometry.owned import device_valid_nonempty_mask
 
             d_live_positions = cp.flatnonzero(
@@ -954,7 +982,7 @@ def _tiled_single_group_collective_union_gpu(
                 with hotpath_stage(
                     "constructive.union.tile_topology",
                     category="refine",
-                ):
+                ) as amplification_metadata:
                     batch_result = _regroup_native_grouped_parts_with_grouped_union_gpu(
                         clipped_batch,
                         cp.arange(live_count, dtype=cp.int64),
@@ -967,6 +995,33 @@ def _tiled_single_group_collective_union_gpu(
                         group_size_max=group_size_max,
                         empty_output=build_empty_polygon_rows_device(batch_tile_count),
                     )
+                    if amplification_metadata is not None:
+                        topology_sums = {
+                            "input_rows": int(live_count),
+                            "pre_reduction_fragments": int(clipped_batch.row_count),
+                            "observed_groups": int(d_observed_group_ids.size),
+                        }
+                        topology_unavailable = [
+                            "input_segments",
+                            "input_coordinates",
+                            "output_parts",
+                            "output_coordinates",
+                        ]
+                        if batch_result is None:
+                            topology_unavailable.append("output_groups")
+                        else:
+                            topology_sums["output_groups"] = int(batch_result.row_count)
+                        attach_work_amplification(
+                            amplification_metadata,
+                            operation="constructive.union.tile_topology",
+                            metric_family="group_compression",
+                            sums=topology_sums,
+                            maxima={
+                                "max_group_size": int(group_size_max),
+                                "tiles_per_batch": int(batch_tile_count),
+                            },
+                            unavailable=tuple(topology_unavailable),
+                        )
                 _sync_hotpath()
         if batch_result is None or batch_result.row_count != batch_tile_count:
             raise RuntimeError("grouped topology batch violated tile-row capacity")
@@ -998,8 +1053,33 @@ def _tiled_single_group_collective_union_gpu(
     result = None
     if assemble_union:
         _sync_hotpath()
-        with hotpath_stage("constructive.union.tile_seam_stitch", category="assemble"):
+        with hotpath_stage(
+            "constructive.union.tile_seam_stitch",
+            category="assemble",
+        ) as amplification_metadata:
             result = _finish_topology_coverage_levels(coverage_levels)
+            if amplification_metadata is not None:
+                attach_work_amplification(
+                    amplification_metadata,
+                    operation="constructive.union.tile_seam_stitch",
+                    metric_family="group_compression",
+                    sums={
+                        "input_rows": int(tile_count),
+                        "output_groups": int(result.row_count),
+                    },
+                    maxima={
+                        "tile_count": int(tile_count),
+                        "max_segment_peer_pressure": int(max_segment_peer_pressure),
+                    },
+                    unavailable=(
+                        "max_group_size",
+                        "input_segments",
+                        "input_coordinates",
+                        "pre_reduction_fragments",
+                        "output_parts",
+                        "output_coordinates",
+                    ),
+                )
         _sync_hotpath()
         coverage = result
     else:

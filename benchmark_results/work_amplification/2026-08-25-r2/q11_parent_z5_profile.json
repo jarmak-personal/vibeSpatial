@@ -1,0 +1,516 @@
+{
+  "schema_version": 1,
+  "experiment": "q11_component_first",
+  "variant": "parent",
+  "profile_enabled": true,
+  "trip_rows": 3896103,
+  "zone_frames": 5,
+  "parent_zone_rows": 1033509,
+  "component_zone_rows": 1300118,
+  "component_to_parent_ratio": 1.2579648556519585,
+  "wall_seconds": 2.2619408840546384,
+  "stage_timings": {
+    "grid_preflight": {
+      "calls": 20,
+      "gpu_seconds": 0.009956672380154487,
+      "python_wall_seconds": 0.010784796788357198
+    },
+    "grid_prepare": {
+      "calls": 10,
+      "gpu_seconds": 0.01605974405258894,
+      "python_wall_seconds": 0.014802249264903367
+    },
+    "grid_plan": {
+      "calls": 10,
+      "gpu_seconds": 0.021655647784471512,
+      "python_wall_seconds": 0.02166941005270928
+    },
+    "grid_candidates": {
+      "calls": 10,
+      "gpu_seconds": 0.12262227153778076,
+      "python_wall_seconds": 0.0027986589120700955
+    },
+    "exact_classification": {
+      "calls": 15,
+      "gpu_seconds": 1.2408202848434449,
+      "python_wall_seconds": 0.030826604925096035,
+      "work_units": 73150365
+    },
+    "grid_exclusion": {
+      "calls": 5,
+      "gpu_seconds": 0.0060063679814338685,
+      "python_wall_seconds": 0.0003310160245746374
+    }
+  },
+  "left_count_sha256": "641ca39e082689833943d2a9570ec848e62f4b37e8b6f7f07dd33525fb75b212",
+  "right_count_sha256": "a1249919fbebbe32eb1bad44ccb7bc1fd93186f7abba7351b78fedd083789058",
+  "shared_count_sha256": "cd06c16325acb6f19adc01e6d2f14e3d76ef31e16c000ef1e79d1756f497a174",
+  "left_count_sum": 5722118,
+  "right_count_sum": 5721980,
+  "shared_count_sum": 5392133,
+  "point_region_profile": {
+    "schema_version": 2,
+    "label": "r2-q11-parent",
+    "profile_wall_seconds": 2.2576248510740697,
+    "sample_limit": 65536,
+    "samples_per_launch": 128,
+    "forced_prepared_index": false,
+    "groups": [
+      {
+        "family": "multipolygon",
+        "geometry_count": 224676,
+        "part_count": 288955,
+        "mean_parts_per_geometry": 1.2860964232939878,
+        "edge_membership_count": 78341756,
+        "mean_edge_memberships_per_part_bin": 33.890119568790986,
+        "index_device_bytes": 345729984,
+        "launches": 3,
+        "kernel_seconds": 0.24834662437438965,
+        "counters": {
+          "candidates": 12732848,
+          "valid_candidates": 12732848,
+          "parts_considered": 1179033695,
+          "active_parts": 9830415,
+          "edges_visited": 8620060961,
+          "orient2d_calls": 148324,
+          "zero_active_candidates": 4162475,
+          "zero_edge_candidates": 4162475,
+          "boundary_results": 0,
+          "interior_results": 3540472,
+          "exterior_results": 9192376,
+          "max_parts_considered": 2880,
+          "max_active_parts": 23,
+          "max_edges_visited": 57737,
+          "sample_reservations": 384,
+          "sampled_candidates": 384
+        },
+        "parts_considered_percentiles": {
+          "p50": 1,
+          "p95": 854,
+          "p99": 1183
+        },
+        "edges_visited_percentiles": {
+          "p50": 6,
+          "p95": 3670,
+          "p99": 4096
+        },
+        "parts_histogram_ge_4096": 0,
+        "edges_histogram_ge_4096": 18
+      },
+      {
+        "family": "multipolygon",
+        "geometry_count": 224675,
+        "part_count": 295190,
+        "mean_parts_per_geometry": 1.3138533437187048,
+        "edge_membership_count": 78876781,
+        "mean_edge_memberships_per_part_bin": 33.4008524170873,
+        "index_device_bytes": 348568404,
+        "launches": 3,
+        "kernel_seconds": 0.295732837677002,
+        "counters": {
+          "candidates": 10311738,
+          "valid_candidates": 10311738,
+          "parts_considered": 6422974678,
+          "active_parts": 10007468,
+          "edges_visited": 9396984843,
+          "orient2d_calls": 113841,
+          "zero_active_candidates": 3702856,
+          "zero_edge_candidates": 3702856,
+          "boundary_results": 0,
+          "interior_results": 2369909,
+          "exterior_results": 7941829,
+          "max_parts_considered": 18933,
+          "max_active_parts": 50,
+          "max_edges_visited": 37647,
+          "sample_reservations": 384,
+          "sampled_candidates": 384
+        },
+        "parts_considered_percentiles": {
+          "p50": 1,
+          "p95": 104,
+          "p99": 4096
+        },
+        "edges_visited_percentiles": {
+          "p50": 5,
+          "p95": 4096,
+          "p99": 4096
+        },
+        "parts_histogram_ge_4096": 10,
+        "edges_histogram_ge_4096": 24
+      },
+      {
+        "family": "multipolygon",
+        "geometry_count": 224676,
+        "part_count": 277472,
+        "mean_parts_per_geometry": 1.2349872705584932,
+        "edge_membership_count": 78394080,
+        "mean_edge_memberships_per_part_bin": 35.31621208626456,
+        "index_device_bytes": 344653184,
+        "launches": 3,
+        "kernel_seconds": 0.18618899154663085,
+        "counters": {
+          "candidates": 10402087,
+          "valid_candidates": 10402087,
+          "parts_considered": 2543959995,
+          "active_parts": 8846667,
+          "edges_visited": 5218092825,
+          "orient2d_calls": 122086,
+          "zero_active_candidates": 3728237,
+          "zero_edge_candidates": 3728237,
+          "boundary_results": 0,
+          "interior_results": 1739576,
+          "exterior_results": 8662511,
+          "max_parts_considered": 2484,
+          "max_active_parts": 26,
+          "max_edges_visited": 47982,
+          "sample_reservations": 384,
+          "sampled_candidates": 384
+        },
+        "parts_considered_percentiles": {
+          "p50": 1,
+          "p95": 2484,
+          "p99": 2484
+        },
+        "edges_visited_percentiles": {
+          "p50": 0,
+          "p95": 1794,
+          "p99": 4096
+        },
+        "parts_histogram_ge_4096": 0,
+        "edges_histogram_ge_4096": 8
+      },
+      {
+        "family": "multipolygon",
+        "geometry_count": 224677,
+        "part_count": 277697,
+        "mean_parts_per_geometry": 1.235983211454666,
+        "edge_membership_count": 78326142,
+        "mean_edge_memberships_per_part_bin": 35.25701664043904,
+        "index_device_bytes": 344406632,
+        "launches": 3,
+        "kernel_seconds": 0.3938694725036621,
+        "counters": {
+          "candidates": 12470528,
+          "valid_candidates": 12470528,
+          "parts_considered": 301732731,
+          "active_parts": 6499822,
+          "edges_visited": 4035587742,
+          "orient2d_calls": 154631,
+          "zero_active_candidates": 6287728,
+          "zero_edge_candidates": 6287728,
+          "boundary_results": 0,
+          "interior_results": 2236650,
+          "exterior_results": 10233878,
+          "max_parts_considered": 4442,
+          "max_active_parts": 24,
+          "max_edges_visited": 193292,
+          "sample_reservations": 384,
+          "sampled_candidates": 384
+        },
+        "parts_considered_percentiles": {
+          "p50": 1,
+          "p95": 96,
+          "p99": 418
+        },
+        "edges_visited_percentiles": {
+          "p50": 0,
+          "p95": 1894,
+          "p99": 4096
+        },
+        "parts_histogram_ge_4096": 0,
+        "edges_histogram_ge_4096": 10
+      },
+      {
+        "family": "multipolygon",
+        "geometry_count": 134805,
+        "part_count": 160804,
+        "mean_parts_per_geometry": 1.1928637661807797,
+        "edge_membership_count": 47249986,
+        "mean_edge_memberships_per_part_bin": 36.72948589587324,
+        "index_device_bytes": 207009992,
+        "launches": 3,
+        "kernel_seconds": 0.11420659255981445,
+        "counters": {
+          "candidates": 6090922,
+          "valid_candidates": 6090922,
+          "parts_considered": 47830165,
+          "active_parts": 3984064,
+          "edges_visited": 2399394407,
+          "orient2d_calls": 141357,
+          "zero_active_candidates": 2166003,
+          "zero_edge_candidates": 2166003,
+          "boundary_results": 0,
+          "interior_results": 1557491,
+          "exterior_results": 4533431,
+          "max_parts_considered": 1404,
+          "max_active_parts": 32,
+          "max_edges_visited": 42755,
+          "sample_reservations": 384,
+          "sampled_candidates": 384
+        },
+        "parts_considered_percentiles": {
+          "p50": 1,
+          "p95": 30,
+          "p99": 198
+        },
+        "edges_visited_percentiles": {
+          "p50": 3,
+          "p95": 1494,
+          "p99": 4096
+        },
+        "parts_histogram_ge_4096": 0,
+        "edges_histogram_ge_4096": 4
+      }
+    ],
+    "index_preparation": [
+      {
+        "family": "multipolygon",
+        "build_count": 1,
+        "cache_hits": 2,
+        "build_wall_seconds": 0.14703358395490795
+      },
+      {
+        "family": "multipolygon",
+        "build_count": 1,
+        "cache_hits": 2,
+        "build_wall_seconds": 0.09646306396462023
+      },
+      {
+        "family": "multipolygon",
+        "build_count": 1,
+        "cache_hits": 2,
+        "build_wall_seconds": 0.10829215496778488
+      },
+      {
+        "family": "multipolygon",
+        "build_count": 1,
+        "cache_hits": 2,
+        "build_wall_seconds": 0.24355925188865513
+      },
+      {
+        "family": "multipolygon",
+        "build_count": 1,
+        "cache_hits": 2,
+        "build_wall_seconds": 0.07381555892061442
+      }
+    ],
+    "memory_pool": {
+      "used_bytes": 13892043948,
+      "peak_bytes": 14127194332,
+      "total_bytes": 105690361327,
+      "total_allocations": 2869,
+      "reserved_bytes": 17044435712,
+      "free_bytes": 3152391764,
+      "largest_admitted_allocation_bytes": 6039190530
+    }
+  },
+  "dispatch_summary": [
+    {
+      "surface": "geopandas.array.bounds",
+      "operation": "bounds",
+      "implementation": "gpu_nvrtc_bounds_device",
+      "selected": "gpu",
+      "reason": "GPU NVRTC bounds kernel kept bounds resident on device",
+      "count": 7
+    },
+    {
+      "surface": "vibespatial.api.SpatialIndex.query_pair_aggregate",
+      "operation": "query_pair_aggregate",
+      "implementation": "owned_gpu_spatial_right_pair_match_count_grid+owned_gpu_spatial_right_pair_match_count_grid",
+      "selected": "gpu",
+      "reason": "left/shared: bounded aligned point-grid candidate batches reused prior exact classifications and reduced only unseen pairs to aligned right pair match counts; paired dense grids passed joint complete-memory preflight; right: bounded aligned point-grid candidate batches reused prior exact classifications and reduced only unseen pairs to aligned right pair match counts; paired dense grids passed joint complete-memory preflight",
+      "count": 5
+    },
+    {
+      "surface": "vibespatial.spatial.point_grid_index",
+      "operation": "prepare",
+      "implementation": "dense_point_cell_index_gpu",
+      "selected": "gpu",
+      "reason": "grouped 3896103 point rows once into 1024x1024 cells",
+      "count": 2
+    },
+    {
+      "surface": "vibespatial.predicates.point_location_index",
+      "operation": "prepare_point_location",
+      "implementation": "polygon_part_y_edge_directory_gpu",
+      "selected": "gpu",
+      "reason": "prepared 288955 polygon parts into 2311640 y bins with 78341756 exact edge memberships",
+      "count": 1
+    },
+    {
+      "surface": "vibespatial.predicates.point_location_index",
+      "operation": "prepare_point_location",
+      "implementation": "polygon_part_y_edge_directory_gpu",
+      "selected": "gpu",
+      "reason": "prepared 295190 polygon parts into 2361520 y bins with 78876781 exact edge memberships",
+      "count": 1
+    },
+    {
+      "surface": "vibespatial.predicates.point_location_index",
+      "operation": "prepare_point_location",
+      "implementation": "polygon_part_y_edge_directory_gpu",
+      "selected": "gpu",
+      "reason": "prepared 277472 polygon parts into 2219776 y bins with 78394080 exact edge memberships",
+      "count": 1
+    },
+    {
+      "surface": "vibespatial.predicates.point_location_index",
+      "operation": "prepare_point_location",
+      "implementation": "polygon_part_y_edge_directory_gpu",
+      "selected": "gpu",
+      "reason": "prepared 277697 polygon parts into 2221576 y bins with 78326142 exact edge memberships",
+      "count": 1
+    },
+    {
+      "surface": "vibespatial.predicates.point_location_index",
+      "operation": "prepare_point_location",
+      "implementation": "polygon_part_y_edge_directory_gpu",
+      "selected": "gpu",
+      "reason": "prepared 160804 polygon parts into 1286432 y bins with 47249986 exact edge memberships",
+      "count": 1
+    }
+  ],
+  "evidence_identity": {
+    "schema_version": 1,
+    "status": "complete_contemporaneous",
+    "captured_at": "2026-08-25T18:24:40.308716+00:00",
+    "source": {
+      "git_head": "e8e7f2205bfbdbb072f2d6e8e2ed41697a45533b",
+      "git_status": [
+        "M .gitignore",
+        " M benchmarks/spatialbench/run_benchmark.py",
+        " M docs/doc_headers.json",
+        " M docs/ops/intake-index.json",
+        " M docs/testing/profiling-rails.md",
+        " M src/vibespatial/api/tools/overlay.py",
+        " M src/vibespatial/bench/cli.py",
+        " M src/vibespatial/bench/pipeline.py",
+        " M src/vibespatial/bench/shootout.py",
+        " M src/vibespatial/constructive/binary_constructive.py",
+        " M src/vibespatial/constructive/tiled_union.py",
+        " M src/vibespatial/overlay/assemble.py",
+        " M src/vibespatial/overlay/faces.py",
+        " M src/vibespatial/overlay/gpu.py",
+        " M src/vibespatial/overlay/graph.py",
+        " M src/vibespatial/overlay/split.py",
+        " M src/vibespatial/predicates/point_location_index.py",
+        " M src/vibespatial/predicates/point_relations.py",
+        " M src/vibespatial/runtime/hotpath_trace.py",
+        " M src/vibespatial/spatial/point_grid_index.py",
+        " M src/vibespatial/spatial/spatial_index_device.py",
+        " M tests/test_bench_shootout.py",
+        " M tests/test_hotpath_trace.py",
+        " M tests/test_overlay_api.py",
+        " M tests/test_pipeline_benchmarks.py",
+        " M tests/test_point_region_profile.py",
+        " M tests/test_spatial_index_device_gpu.py",
+        "?? benchmark_results/work_amplification/",
+        "?? docs/dev/work-amplification-evidence.md",
+        "?? docs/dev/work-amplification-research-plan.md",
+        "?? scripts/analyze_work_amplification.py",
+        "?? src/vibespatial/bench/amplification.py",
+        "?? src/vibespatial/bench/amplification_analysis.py",
+        "?? tests/test_analyze_work_amplification_script.py",
+        "?? tests/test_work_amplification.py",
+        "?? tests/test_work_amplification_analysis.py"
+      ],
+      "git_diff_binary_sha256": "7c9bdb150493666356a53d1293b99aceab582cb5abff17007a4263d07118f49e",
+      "relevant_source_manifest_sha256": "6b87f5a7685e2d3fdcb84bf5a5a472a7efe867c51e697b802d8025eff64a3d8e",
+      "critical_file_sha256": {
+        "benchmarks/spatialbench/run_benchmark.py": "08c86dd9c8361764cd12d4374e7a095d54a93664487aa48f090e1687e524c2be",
+        "benchmarks/spatialbench/vibespatial_queries.py": "3998dc4cf98dfc9ea5b5cdb2dbd2c4ec211a53d66f3909300245b96082e6e0ee",
+        "pyproject.toml": "407f619234e9d50fdff928906f924f9c9ed481a9fbb247659a197bd458e00e3a",
+        "uv.lock": "60942838f44a9792dfc8a49371e8a1367a59e8d858e39ed827dfa735e0d615fe",
+        "benchmark_results/experiments/2026-08-21-q11-q12-physical-shapes/experiment.py": "9886b6a2fcdd766feb347b8c2b1acb93069ffcf7ed0286f834619e4a301830ef",
+        "benchmark_results/work_amplification/2026-08-25-r2/q12_dense_experiment.py": "7866a98a4f47b84590b8d871472459969150c68c129acb936f36e53a67367e1c",
+        "benchmark_results/work_amplification/2026-08-25-r2/q11_component_first.py": "f41d29c18987e09958988604abb363e7653eefac44fe9495ed14fa0b8080a406",
+        "benchmark_results/work_amplification/2026-08-25-r2/q11_component_first_identified.py": "0b25c7782e2a182956556bc65d674f51f2729f59a15ebedcc39cc3e5aca1cb3e"
+      }
+    },
+    "dataset": {
+      "path": "/home/picard/datasets/spatialbench/v0.1.0/sf100-geoparquet",
+      "scale_factor": 100,
+      "format": "GeoParquet 1.1",
+      "geometry_encoding": "native GeoArrow",
+      "manifest_sha256": "a970d40adc2f754e781197d9ec9af1f03627351ceb8d01e92e9c09ff6c5080d3",
+      "file_inventory_sha256": "ad526c085c09b50410402945c24a9b6162b4467ceb4daa3c1f24d3db9848a35c",
+      "file_inventory_fingerprint_definition": "sha256 of sorted tab-separated relative path and byte size; not a content digest",
+      "file_count": 179,
+      "total_bytes": 37940233646,
+      "tables": {
+        "building": {
+          "files": 1,
+          "rows": 152877,
+          "geometry_columns": [
+            "b_boundary"
+          ],
+          "elapsed_seconds": 0.2626953620929271
+        },
+        "trip": {
+          "files": 154,
+          "rows": 600000000,
+          "geometry_columns": [
+            "t_pickuploc",
+            "t_dropoffloc"
+          ],
+          "elapsed_seconds": 2845.199984092964
+        },
+        "zone": {
+          "files": 23,
+          "rows": 1033509,
+          "geometry_columns": [
+            "z_boundary"
+          ],
+          "elapsed_seconds": 19.957061080029234
+        }
+      }
+    },
+    "environment": {
+      "hostname": "picard-4090",
+      "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.35",
+      "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K",
+      "memory_total": "98580128 kB",
+      "python": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+      "python_executable": "/home/picard/repos/vibeSpatial/.venv/bin/python3",
+      "package_versions": {
+        "cupy-cuda12x": "14.0.1",
+        "cudf-cu12": null,
+        "geopandas": "1.1.4",
+        "numpy": "2.4.3",
+        "pandas": "3.0.1",
+        "pyarrow": "23.0.1",
+        "pylibcudf-cu12": "26.2.1",
+        "vibespatial": "0.5.1"
+      },
+      "nvidia_smi": "NVIDIA GeForce RTX 4090, GPU-39aa5702-5aec-2729-8fb7-412d84ca1cbe, 580.173.02, 24564, 450.00",
+      "cuda_visible_devices": null,
+      "strict_native": "1",
+      "precompile": null
+    },
+    "measurement": {
+      "query": "SF100 Q11 first 4M-row trip batch",
+      "variant": "parent",
+      "zone_frames": 5,
+      "profile_enabled": true,
+      "process_isolation": "one command/process per arm",
+      "warmup_runs": 0,
+      "repeat_runs": 1,
+      "statistic": "single cold observation",
+      "clock": "time.perf_counter wall time",
+      "timed_scope": "all selected public query_pair_aggregate calls",
+      "excluded_scope": "trip/zone reads and host component fixture decomposition",
+      "profile_protocol": "profile arms are separate instrumented processes and are not used as the wall-time decision arms",
+      "command": [
+        "/home/picard/repos/vibeSpatial/.venv/bin/python3",
+        "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/q11_component_first_identified.py",
+        "--variant",
+        "parent",
+        "--zone-frames",
+        "5",
+        "--profile",
+        "--output",
+        "benchmark_results/work_amplification/2026-08-25-r2/q11_parent_z5_profile.json"
+      ]
+    }
+  }
+}

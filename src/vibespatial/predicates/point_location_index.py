@@ -25,6 +25,7 @@ from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.hotpath_trace import attach_work_amplification, hotpath_stage
 
 from .point_location_index_kernels import (
     _POINT_LOCATION_PART_Y_INDEX_PROFILE_SOURCE,
@@ -78,6 +79,55 @@ class PreparedPolygonPartYIndex:
         )
 
 
+def _point_location_preparation_metrics(
+    prepared,
+    *,
+    built: bool,
+    cache_hit: bool,
+    cache_miss: bool,
+    declined: bool,
+) -> tuple[dict[str, int], dict[str, int], tuple[str, ...]]:
+    """Return bounded cache evidence from the prepared carrier's host fields."""
+    max_metrics = {}
+    if prepared is not None:
+        part_count = int(prepared.part_count)
+        max_metrics.update(
+            {
+                "source_geometries": int(prepared.geometry_count),
+                "source_parts": part_count,
+                "part_y_bin_slots": part_count * int(prepared.bin_count),
+                "edge_memberships": int(prepared.edge_membership_count),
+                "persistent_bytes": int(prepared.device_bytes),
+            }
+        )
+    unavailable = [
+        "build_seconds",
+        "avoidable_rebuild_seconds",
+        "invalidation_reason",
+    ]
+    if prepared is None:
+        unavailable.extend(
+            (
+                "source_geometries",
+                "source_parts",
+                "part_y_bin_slots",
+                "edge_memberships",
+                "persistent_bytes",
+            )
+        )
+    return (
+        {
+            "preparation_requests": 1,
+            "build_count": int(built),
+            "cache_hits": int(cache_hit),
+            "cache_misses": int(cache_miss),
+            "declined_preparations": int(declined),
+        },
+        max_metrics,
+        tuple(unavailable),
+    )
+
+
 def point_location_part_y_index_kernels():
     return compile_kernel_group(
         "point-location-part-y-index",
@@ -101,6 +151,51 @@ def prepare_polygon_part_y_index(owned, family: GeometryFamily):
         return None
     state = owned._ensure_device_state(preserve_indexed_view=True)
     cached = state.point_location_indexes.get(family)
+    with hotpath_stage(
+        "predicate.point_location_part_y_index.prepare",
+        category="setup",
+    ) as stage_metadata:
+        prepared = _prepare_polygon_part_y_index_impl(
+            owned,
+            family,
+            state=state,
+            cached=cached,
+        )
+        if stage_metadata is not None:
+            cache_hit = cached is not None
+            built = cached is None and prepared is not None
+            sums, maxima, unavailable = _point_location_preparation_metrics(
+                prepared,
+                built=built,
+                cache_hit=cache_hit,
+                cache_miss=cached is None,
+                declined=prepared is None,
+            )
+            attach_work_amplification(
+                stage_metadata,
+                operation="prepare_point_region_y_index",
+                metric_family="rebuild",
+                sums=sums,
+                maxima=maxima,
+                unavailable=unavailable,
+                physical_shape="reusable_polygon_part_y_index",
+                consumer_kind="point_region_exact_refinement",
+                semantic_contract={
+                    "cache_scope": "OwnedGeometryDeviceState point-location indexes",
+                    "cache_identity_exported": False,
+                    "device_logical_counts_read": False,
+                },
+            )
+        return prepared
+
+
+def _prepare_polygon_part_y_index_impl(
+    owned,
+    family: GeometryFamily,
+    *,
+    state,
+    cached,
+):
     if cached is not None:
         from .point_region_profile import current_point_region_profile
 

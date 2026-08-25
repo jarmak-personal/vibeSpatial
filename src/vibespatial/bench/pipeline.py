@@ -425,7 +425,16 @@ def _iter_owned_arrays(value):
     if isinstance(value, NativeAttributeTable):
         return
     if isinstance(value, DeviceGeometryArray):
-        yield value.to_owned()
+        cached = value.cached_owned()
+        if cached is not None:
+            yield cached
+            return
+        composition = value.native_composition
+        if composition is not None:
+            for part in composition.parts:
+                owned = part.geometry.owned
+                if isinstance(owned, OwnedGeometryArray):
+                    yield owned
         return
     owned = getattr(value, "owned", None)
     if isinstance(owned, OwnedGeometryArray):
@@ -438,7 +447,7 @@ def _iter_owned_arrays(value):
         return
     values = getattr(value, "values", None)
     if isinstance(values, DeviceGeometryArray):
-        yield values.to_owned()
+        yield from _iter_owned_arrays(values)
     geometry = getattr(value, "geometry", None)
     if geometry is not None and geometry is not value:
         yield from _iter_owned_arrays(geometry)

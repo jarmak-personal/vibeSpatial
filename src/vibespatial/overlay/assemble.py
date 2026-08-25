@@ -29,7 +29,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
 from vibespatial.runtime.config import SPATIAL_EPSILON
-from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
+from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_timing_enabled
 from vibespatial.runtime.residency import Residency
 
 from .graph import _stable_radix_order_pass
@@ -65,7 +65,7 @@ class _FaceBoundaryRings:
 
 
 def _sync_hotpath(runtime) -> None:
-    if hotpath_trace_enabled():
+    if hotpath_timing_enabled():
         runtime.synchronize()
 
 

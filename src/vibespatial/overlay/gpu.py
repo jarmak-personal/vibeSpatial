@@ -37,7 +37,11 @@ from vibespatial.geometry.owned import (  # noqa: E402
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
 from vibespatial.runtime.dispatch import record_dispatch_event  # noqa: E402
 from vibespatial.runtime.fallbacks import record_fallback_event  # noqa: E402
-from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled  # noqa: E402
+from vibespatial.runtime.hotpath_trace import (  # noqa: E402
+    attach_work_amplification,
+    hotpath_stage,
+    hotpath_timing_enabled,
+)
 from vibespatial.runtime.kernel_registry import register_kernel_variant  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
 from vibespatial.runtime.residency import Residency  # noqa: E402
@@ -79,7 +83,7 @@ _MAX_LIVE_SPLIT_EVENT_BUDGET = 32 * 1024 * 1024
 
 
 def _sync_hotpath() -> None:
-    if hotpath_trace_enabled():
+    if hotpath_timing_enabled():
         get_cuda_runtime().synchronize()
 
 
@@ -1327,7 +1331,10 @@ def _build_overlay_execution_plan(
 
     _sync_hotpath()
     try:
-        with hotpath_stage("overlay.plan.split_events", category="refine"):
+        with hotpath_stage(
+            "overlay.plan.split_events",
+            category="refine",
+        ) as amplification_metadata:
             split_events = build_gpu_split_events(
                 left,
                 right,
@@ -1346,6 +1353,31 @@ def _build_overlay_execution_plan(
                 right_geometry_source_rows=_right_segment_source_rows,
                 include_same_side_splits=_include_same_side_splits,
             )
+            if amplification_metadata is not None:
+                attach_work_amplification(
+                    amplification_metadata,
+                    operation="overlay.plan.split_events",
+                    metric_family="constructive",
+                    sums={
+                        "source_segments": (
+                            int(split_events.left_segment_count)
+                            + int(split_events.right_segment_count)
+                        ),
+                        "split_events": int(split_events.count),
+                    },
+                    maxima={
+                        "left_segments": int(split_events.left_segment_count),
+                        "right_segments": int(split_events.right_segment_count),
+                    },
+                    unavailable=(
+                        "emitted_fragments",
+                        "fragment_coordinates",
+                        "retained_output_parts",
+                        "output_coordinates",
+                        "constructive_bytes",
+                        "peak_live_bytes",
+                    ),
+                )
         _sync_hotpath()
     except Exception as exc:
         raise RuntimeError(
@@ -1357,8 +1389,30 @@ def _build_overlay_execution_plan(
         if planned_right_segments is not None:
             planned_right_segments.free()
     try:
-        with hotpath_stage("overlay.plan.atomic_edges", category="refine"):
+        with hotpath_stage(
+            "overlay.plan.atomic_edges",
+            category="refine",
+        ) as amplification_metadata:
             atomic_edges = build_gpu_atomic_edges(split_events, isolate_rows=_row_isolated)
+            if amplification_metadata is not None:
+                attach_work_amplification(
+                    amplification_metadata,
+                    operation="overlay.plan.atomic_edges",
+                    metric_family="constructive",
+                    sums={
+                        "split_events": int(split_events.count),
+                        "atomic_edges": int(atomic_edges.count),
+                    },
+                    maxima={"atomic_edges_per_plan": int(atomic_edges.count)},
+                    unavailable=(
+                        "emitted_fragments",
+                        "fragment_coordinates",
+                        "retained_output_parts",
+                        "output_coordinates",
+                        "constructive_bytes",
+                        "peak_live_bytes",
+                    ),
+                )
         _sync_hotpath()
     except Exception as exc:
         _free_split_event_device_state(split_events)
@@ -1373,11 +1427,33 @@ def _build_overlay_execution_plan(
     maybe_trim_pool_memory()
 
     try:
-        with hotpath_stage("overlay.plan.half_edge_graph", category="refine"):
+        with hotpath_stage(
+            "overlay.plan.half_edge_graph",
+            category="refine",
+        ) as amplification_metadata:
             half_edge_graph = build_gpu_half_edge_graph(
                 atomic_edges,
                 isolate_rows=_row_isolated,
             )
+            if amplification_metadata is not None:
+                attach_work_amplification(
+                    amplification_metadata,
+                    operation="overlay.plan.half_edge_graph",
+                    metric_family="constructive",
+                    sums={
+                        "atomic_edges": int(atomic_edges.count),
+                        "half_edges": int(half_edge_graph.edge_count),
+                        "graph_nodes": int(half_edge_graph._node_count),
+                    },
+                    maxima={"half_edges_per_plan": int(half_edge_graph.edge_count)},
+                    unavailable=(
+                        "emitted_fragments",
+                        "retained_output_parts",
+                        "output_coordinates",
+                        "constructive_bytes",
+                        "peak_live_bytes",
+                    ),
+                )
             _sync_hotpath()
     except Exception as exc:
         _free_atomic_edge_excess(atomic_edges)
@@ -1392,7 +1468,10 @@ def _build_overlay_execution_plan(
     maybe_trim_pool_memory()
 
     try:
-        with hotpath_stage("overlay.plan.faces", category="refine"):
+        with hotpath_stage(
+            "overlay.plan.faces",
+            category="refine",
+        ) as amplification_metadata:
             faces = build_gpu_overlay_faces(
                 left,
                 right,
@@ -1402,6 +1481,23 @@ def _build_overlay_execution_plan(
                 right_geometry_source_rows=_right_geometry_source_rows,
                 right_geometry_broadcast=_right_segment_broadcast is not None,
             )
+            if amplification_metadata is not None:
+                attach_work_amplification(
+                    amplification_metadata,
+                    operation="overlay.plan.faces",
+                    metric_family="constructive",
+                    sums={
+                        "half_edges": int(half_edge_graph.edge_count),
+                        "faces": int(faces.face_count),
+                    },
+                    maxima={"faces_per_plan": int(faces.face_count)},
+                    unavailable=(
+                        "retained_output_parts",
+                        "output_coordinates",
+                        "constructive_bytes",
+                        "peak_live_bytes",
+                    ),
+                )
             _sync_hotpath()
     except Exception as exc:
         raise RuntimeError(
@@ -1591,12 +1687,38 @@ def _materialize_overlay_execution_plan(
                 ),
             )
             page_result = _physicalize_paged_overlay_output(page_result)
-            with hotpath_stage("overlay.plan.page_retirement", category="setup"):
+            with hotpath_stage(
+                "overlay.plan.page_retirement",
+                category="setup",
+            ) as amplification_metadata:
                 # A page result is compact and self-contained after
                 # physicalization. Complete its stream before planning the
                 # next page so graph and CCCL scratch ownership is bounded by
                 # one physical topology page rather than Python launch depth.
                 get_cuda_runtime().synchronize_stream()
+                if amplification_metadata is not None:
+                    attach_work_amplification(
+                        amplification_metadata,
+                        operation="overlay.plan.page_retirement",
+                        metric_family="group_compression",
+                        sums={
+                            "input_rows": int(page_row_count),
+                            "output_groups": int(page_result.row_count),
+                            "topology_pages": 1,
+                        },
+                        maxima={
+                            "rows_per_page": int(page_row_count),
+                            "planned_page_count": int(plan.page_count),
+                        },
+                        unavailable=(
+                            "max_group_size",
+                            "input_segments",
+                            "input_coordinates",
+                            "pre_reduction_fragments",
+                            "output_parts",
+                            "output_coordinates",
+                        ),
+                    )
             page_results.append(page_result)
             if page_selected is ExecutionMode.CPU:
                 selected = ExecutionMode.CPU

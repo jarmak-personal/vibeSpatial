@@ -42,6 +42,11 @@ result_images/
 .benchmark_fixtures/
 benchmarks/results/
 benchmark_results/*
+!benchmark_results/work_amplification/
+!benchmark_results/work_amplification/**
+benchmark_results/work_amplification/**/__pycache__/
+benchmark_results/work_amplification/**/*_analysis.json
+benchmark_results/work_amplification/**/*.html
 !benchmark_results/spatialbench/
 benchmark_results/spatialbench/*
 !benchmark_results/spatialbench/sf100/

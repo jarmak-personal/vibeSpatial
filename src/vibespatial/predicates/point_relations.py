@@ -20,6 +20,11 @@ from vibespatial.predicates.point_relations_kernels import (
     _POINT_BINARY_RELATIONS_KERNEL_SOURCE,
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
+from vibespatial.runtime.hotpath_trace import (
+    attach_work_amplification,
+    hotpath_stage,
+    hotpath_timing_enabled,
+)
 from vibespatial.runtime.precision import (
     CompensationMode,
     KernelClass,
@@ -32,6 +37,12 @@ from vibespatial.runtime.precision import (
 
 POINT_LOCATION_OUTSIDE = np.uint8(0)
 POINT_LOCATION_BOUNDARY = np.uint8(1)
+
+
+def _sync_hotpath(runtime) -> None:
+    """Fence only when full nested GPU timing is explicitly enabled."""
+    if hotpath_timing_enabled():
+        runtime.synchronize()
 POINT_LOCATION_INTERIOR = np.uint8(2)
 
 request_nvrtc_warmup(
@@ -170,6 +181,57 @@ class _PointRegionLaunchProfile:
         self._profile.end_launch(self._prepared)
 
 
+def _point_region_level0_packet(
+    *,
+    kernel_name: str,
+    region_family: GeometryFamily,
+    candidate_count: int,
+    launch_items: int,
+    logical_count,
+    prepared,
+) -> dict[str, object]:
+    """Build one host-known packet; never inspect device logical counts."""
+    max_metrics: dict[str, int] = {"launch_capacity": int(launch_items)}
+    if prepared is not None:
+        max_metrics.update(
+            {
+                "prepared_geometry_count": int(prepared.geometry_count),
+                "prepared_part_count": int(prepared.part_count),
+                "prepared_edge_membership_count": int(prepared.edge_membership_count),
+                "prepared_device_bytes": int(prepared.device_bytes),
+            }
+        )
+    metadata: dict[str, object] = {}
+    attach_work_amplification(
+        metadata,
+        operation="point_region_predicate",
+        metric_family="refinement",
+        physical_shape="candidate_lanes",
+        consumer_kind="exact_predicate",
+        sums={
+            "candidate_lanes": int(candidate_count),
+            "launch_items": int(launch_items),
+            "prepared_consumer_count": int(prepared is not None),
+        },
+        maxima=max_metrics,
+        unavailable=(
+            "exact_evaluations",
+            "ambiguous_lanes",
+            "survivors",
+            "early_terminated",
+        ),
+        semantic_contract={
+            "kernel_name": kernel_name,
+            "region_family": region_family.value,
+            "prepared_part_y_index": prepared is not None,
+            "logical_count_state": (
+                "full_capacity" if logical_count is None else "device_resident"
+            ),
+        },
+    )
+    return metadata["work_amplification"]
+
+
 def _launch_kernel(
     kernel_dict_fn,
     kernel_name: str,
@@ -186,6 +248,8 @@ def _launch_kernel(
     launch_capacity: int | None = None,
     device_out=None,
     launch_profile=None,
+    point_region_family: GeometryFamily | None = None,
+    point_region_prepared=None,
 ) -> np.ndarray:
     """Launch a point or multipoint binary-relation kernel.
 
@@ -270,7 +334,26 @@ def _launch_kernel(
                 logical_count=logical_count,
                 candidate_count=n_items,
             )
-        runtime.launch(kernel, grid=grid, block=block, params=params)
+        if point_region_family is None:
+            runtime.launch(kernel, grid=grid, block=block, params=params)
+        else:
+            with hotpath_stage(
+                f"predicate.point_region.{kernel_name}",
+                category="refine",
+            ) as trace_metadata:
+                runtime.launch(kernel, grid=grid, block=block, params=params)
+                _sync_hotpath(runtime)
+                if trace_metadata is not None:
+                    trace_metadata["work_amplification"] = (
+                        _point_region_level0_packet(
+                            kernel_name=kernel_name,
+                            region_family=point_region_family,
+                            candidate_count=n_items,
+                            launch_items=launch_items,
+                            logical_count=logical_count,
+                            prepared=point_region_prepared,
+                        )
+                    )
         if launch_profile is not None:
             launch_profile.end_launch()
         if return_device:
@@ -501,6 +584,8 @@ def classify_point_region_gpu(
         (KERNEL_PARAM_PTR,) * len(args),
         return_device=return_device,
         launch_profile=launch_profile,
+        point_region_family=region_family,
+        point_region_prepared=prepared,
     )
 
 
@@ -900,6 +985,8 @@ def _classify_indexed_point_region(
         launch_capacity=launch_capacity,
         device_out=relation_out,
         launch_profile=launch_profile,
+        point_region_family=region_family,
+        point_region_prepared=prepared,
     )
 
 

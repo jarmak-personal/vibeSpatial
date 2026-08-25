@@ -1,0 +1,1497 @@
+{
+  "benchmark": "spatialbench",
+  "version": "0.1.0",
+  "generated_at": "2026-08-25T16:52:41.361555+00:00",
+  "results": [
+    {
+      "engine": "vibespatial",
+      "version": "0.5.1",
+      "scale_factor": 100.0,
+      "timestamp": "2026-08-25T16:48:50.022167+00:00",
+      "total_time": 230.44,
+      "results": [
+        {
+          "query": "q11",
+          "time_seconds": 230.44,
+          "row_count": 1,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            230.44
+          ],
+          "statistic": "mean",
+          "warmup_runs": 0,
+          "telemetry_runs": [
+            {
+              "peak_vram_bytes": 12043943936,
+              "rmm_peak_allocation_bytes": 9246974695,
+              "rmm_total_allocation_bytes": 1176065732268,
+              "rmm_allocation_count": 95871,
+              "pool_reserved_bytes": 11363306624,
+              "pool_live_bytes": 48207359,
+              "largest_admitted_allocation_bytes": 6039190530,
+              "d2h_transfer_count": 5564,
+              "d2h_transfer_bytes": 79940936,
+              "d2h_transfer_seconds": 208.04158507473767,
+              "d2h_transfer_events": [
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "vibespatial.api.Series::native_series_arithmetic_sum",
+                  "item_count": 1,
+                  "bytes_transferred": 8,
+                  "elapsed_seconds": 3.058591391891241e-05,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "flat spatial index device total-bounds scalar fence",
+                  "item_count": 5,
+                  "bytes_transferred": 40,
+                  "elapsed_seconds": 0.0018555549904704094,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "flat spatial index device total-bounds scalar fence",
+                  "item_count": 5,
+                  "bytes_transferred": 40,
+                  "elapsed_seconds": 0.0024758069775998592,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition finite-bounds preflight planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 1,
+                  "elapsed_seconds": 0.004763606004416943,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition finite-bounds preflight planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 1,
+                  "elapsed_seconds": 0.0053745899349451065,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition query finite-bounds preflight planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 1,
+                  "elapsed_seconds": 0.00021468393970280886,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-grid reduction block-count planning packet",
+                  "item_count": 7022,
+                  "bytes_transferred": 56176,
+                  "elapsed_seconds": 0.0010920990025624633,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition query finite-bounds preflight planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 1,
+                  "elapsed_seconds": 0.00021255097817629576,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-grid reduction block-count planning packet",
+                  "item_count": 7022,
+                  "bytes_transferred": 56176,
+                  "elapsed_seconds": 0.0011485180584713817,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition paired reduction fault validation planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 4,
+                  "elapsed_seconds": 0.24876140896230936,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition reduction fault validation planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 4,
+                  "elapsed_seconds": 0.027075866935774684,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition query finite-bounds preflight planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 1,
+                  "elapsed_seconds": 0.00021153606940060854,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-grid reduction block-count planning packet",
+                  "item_count": 7022,
+                  "bytes_transferred": 56176,
+                  "elapsed_seconds": 2.9515009373426437e-05,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition query finite-bounds preflight planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 1,
+                  "elapsed_seconds": 0.00021067203488200903,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-grid reduction block-count planning packet",
+                  "item_count": 7022,
+                  "bytes_transferred": 56176,
+                  "elapsed_seconds": 2.6601948775351048e-05,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition paired reduction fault validation planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 4,
+                  "elapsed_seconds": 0.2948937880573794,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition reduction fault validation planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 4,
+                  "elapsed_seconds": 0.027668794034980237,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition query finite-bounds preflight planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 1,
+                  "elapsed_seconds": 0.00020404590759426355,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-grid reduction block-count planning packet",
+                  "item_count": 7022,
+                  "bytes_transferred": 56176,
+                  "elapsed_seconds": 2.8413021937012672e-05,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition query finite-bounds preflight planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 1,
+                  "elapsed_seconds": 0.00021192990243434906,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-grid reduction block-count planning packet",
+                  "item_count": 7022,
+                  "bytes_transferred": 56176,
+                  "elapsed_seconds": 2.7053989470005035e-05,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition paired reduction fault validation planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 4,
+                  "elapsed_seconds": 0.18496367300394922,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition reduction fault validation planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 4,
+                  "elapsed_seconds": 0.028848632937297225,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition query finite-bounds preflight planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 1,
+                  "elapsed_seconds": 0.00021133094560354948,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-grid reduction block-count planning packet",
+                  "item_count": 7022,
+                  "bytes_transferred": 56176,
+                  "elapsed_seconds": 2.9597082175314426e-05,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition query finite-bounds preflight planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 1,
+                  "elapsed_seconds": 0.0002109649358317256,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-grid reduction block-count planning packet",
+                  "item_count": 7022,
+                  "bytes_transferred": 56176,
+                  "elapsed_seconds": 2.6897992938756943e-05,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition paired reduction fault validation planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 4,
+                  "elapsed_seconds": 0.3472788700601086,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition reduction fault validation planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 4,
+                  "elapsed_seconds": 0.0396403738996014,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition query finite-bounds preflight planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 1,
+                  "elapsed_seconds": 0.00013548601418733597,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-grid reduction block-count planning packet",
+                  "item_count": 4213,
+                  "bytes_transferred": 33704,
+                  "elapsed_seconds": 2.8147012926638126e-05,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition query finite-bounds preflight planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 1,
+                  "elapsed_seconds": 0.000127670937217772,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-grid reduction block-count planning packet",
+                  "item_count": 4213,
+                  "bytes_transferred": 33704,
+                  "elapsed_seconds": 2.6299036107957363e-05,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition paired reduction fault validation planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 4,
+                  "elapsed_seconds": 0.1074306860100478,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition reduction fault validation planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 4,
+                  "elapsed_seconds": 0.018537812982685864,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "vibespatial.api.Series::native_series_arithmetic_sum",
+                  "item_count": 1,
+                  "bytes_transferred": 8,
+                  "elapsed_seconds": 5.239294841885567e-05,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "vibespatial.api.Series::native_series_arithmetic_sum",
+                  "item_count": 1,
+                  "bytes_transferred": 8,
+                  "elapsed_seconds": 3.592402208596468e-05,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "flat spatial index device total-bounds scalar fence",
+                  "item_count": 5,
+                  "bytes_transferred": 40,
+                  "elapsed_seconds": 0.001860165037214756,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "flat spatial index device total-bounds scalar fence",
+                  "item_count": 5,
+                  "bytes_transferred": 40,
+                  "elapsed_seconds": 0.002506116987206042,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                },
+                {
+                  "trigger": "cuda-runtime-copy",
+                  "reason": "point-partition finite-bounds preflight planning packet",
+                  "item_count": 1,
+                  "bytes_transferred": 1,
+                  "elapsed_seconds": 0.004929739981889725,
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": ""
+                }
+              ],
+              "d2h_transfer_events_truncated": true,
+              "fallback_event_count": 0,
+              "fallback_events": [],
+              "fallback_events_truncated": false,
+              "materialization_event_count": 467,
+              "materialization_events": [
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=224676, attribute_columns=2, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=0",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=224675, attribute_columns=2, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=0",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=224676, attribute_columns=2, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=0",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=224677, attribute_columns=2, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=0",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=134805, attribute_columns=2, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=0",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=3896103, attribute_columns=1, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=1",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=3896103, attribute_columns=1, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=1",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=3896103, attribute_columns=1, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=1",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=3896103, attribute_columns=1, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=1",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=3896103, attribute_columns=1, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=1",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=3896103, attribute_columns=1, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=1",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=3896103, attribute_columns=1, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=1",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=3896103, attribute_columns=1, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=1",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=3896103, attribute_columns=1, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=1",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=3896103, attribute_columns=1, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=1",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=3896103, attribute_columns=1, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=1",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.NativeTabularResult.to_geodataframe",
+                  "boundary": "user-export",
+                  "reason": "native tabular result exported to GeoDataFrame compatibility surface",
+                  "operation": "native_tabular_to_geodataframe",
+                  "detail": "native_export_target=geodataframe, rows=3896103, attribute_columns=1, attribute_storage=device, geometry_storage=owned:device, secondary_geometry=1",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": false,
+                  "strict_disallowed": false
+                },
+                {
+                  "surface": "vibespatial.api.Series",
+                  "boundary": "user-export",
+                  "reason": "native numeric expression reduced to public scalar",
+                  "operation": "native_series_arithmetic_sum",
+                  "detail": "native_export_target=scalar, rows=3896103",
+                  "pipeline": "",
+                  "dataset": "",
+                  "stage": "",
+                  "stage_category": "",
+                  "d2h_transfer": true,
+                  "strict_disallowed": false
+                }
+              ],
+              "materialization_events_truncated": true,
+              "hotpath_trace_mode": "counter",
+              "hotpath": [
+                {
+                  "name": "predicate.point_location_part_y_index.prepare",
+                  "category": "setup",
+                  "calls": 2310,
+                  "elapsed_seconds": 0.0,
+                  "timing_mode": "counter",
+                  "metadata": {
+                    "work_amplification": {
+                      "sum": {
+                        "preparation_requests": 2310,
+                        "build_count": 5,
+                        "cache_hits": 2305,
+                        "cache_misses": 5,
+                        "declined_preparations": 0
+                      },
+                      "max": {
+                        "source_geometries": 224677,
+                        "source_parts": 295190,
+                        "part_y_bin_slots": 2361520,
+                        "edge_memberships": 78876781,
+                        "persistent_bytes": 348568404
+                      },
+                      "unavailable": [
+                        "build_seconds",
+                        "avoidable_rebuild_seconds",
+                        "invalidation_reason"
+                      ],
+                      "schema_version": 1,
+                      "operation": "prepare_point_region_y_index",
+                      "metric_family": "rebuild",
+                      "physical_shape": "reusable_polygon_part_y_index",
+                      "consumer_kind": "point_region_exact_refinement",
+                      "instrumentation_level": 0,
+                      "semantic_contract": {
+                        "cache_scope": "OwnedGeometryDeviceState point-location indexes",
+                        "cache_identity_exported": false,
+                        "device_logical_counts_read": false
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "predicate.point_region.point_in_multipolygon_prepared_part_y_index_profiled",
+                  "category": "refine",
+                  "calls": 2310,
+                  "elapsed_seconds": 0.0,
+                  "timing_mode": "counter",
+                  "metadata": {
+                    "work_amplification": {
+                      "sum": {
+                        "candidate_lanes": 11265678037,
+                        "launch_items": 11265678037,
+                        "prepared_consumer_count": 2310
+                      },
+                      "max": {
+                        "launch_capacity": 6148490,
+                        "prepared_geometry_count": 224677,
+                        "prepared_part_count": 295190,
+                        "prepared_edge_membership_count": 78876781,
+                        "prepared_device_bytes": 348568404
+                      },
+                      "unavailable": [
+                        "exact_evaluations",
+                        "ambiguous_lanes",
+                        "survivors",
+                        "early_terminated"
+                      ],
+                      "schema_version": 1,
+                      "operation": "point_region_predicate",
+                      "metric_family": "refinement",
+                      "physical_shape": "candidate_lanes",
+                      "consumer_kind": "exact_predicate",
+                      "instrumentation_level": 0,
+                      "semantic_contract": {
+                        "kernel_name": "point_in_multipolygon_prepared_part_y_index_profiled",
+                        "region_family": "multipolygon",
+                        "prepared_part_y_index": true,
+                        "logical_count_state": "full_capacity"
+                      },
+                      "mixed_context": true
+                    }
+                  }
+                },
+                {
+                  "name": "spatial.point_grid_index.prepare",
+                  "category": "setup",
+                  "calls": 1540,
+                  "elapsed_seconds": 0.0,
+                  "timing_mode": "counter",
+                  "metadata": {
+                    "work_amplification": {
+                      "sum": {
+                        "preparation_requests": 1540,
+                        "build_count": 308,
+                        "declined_preparations": 0,
+                        "query_rows_requested": 318320772,
+                        "cache_hits": 1232,
+                        "cache_misses": 308
+                      },
+                      "max": {
+                        "pair_budget_slots": 16777216,
+                        "source_rows": 3896241,
+                        "grid_cells": 1048576,
+                        "persistent_bytes": 36572876
+                      },
+                      "unavailable": [
+                        "build_seconds",
+                        "avoidable_rebuild_seconds",
+                        "invalidation_reason"
+                      ],
+                      "schema_version": 1,
+                      "operation": "prepare_point_grid_index",
+                      "metric_family": "rebuild",
+                      "physical_shape": "reusable_point_partition_index",
+                      "consumer_kind": "point_partition_query",
+                      "instrumentation_level": 0,
+                      "semantic_contract": {
+                        "cache_scope": "NativeSpatialIndex point-partition cache",
+                        "cache_identity_exported": false,
+                        "device_logical_counts_read": false
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "spatial.point_partition.right_pair_count.reduce",
+                  "category": "refine",
+                  "calls": 770,
+                  "elapsed_seconds": 0.0,
+                  "timing_mode": "counter",
+                  "metadata": {
+                    "work_amplification": {
+                      "sum": {
+                        "consumer_calls": 770,
+                        "indexed_rows": 3000000000,
+                        "reduction_output_slots": 9000000000,
+                        "query_rows": 159160386,
+                        "query_partitions": 770,
+                        "planned_pair_capacity_slots": 3740884039,
+                        "submitted_pair_capacity_slots": 3740884039,
+                        "exact_classification_capacity_lanes": 7481768078,
+                        "submitted_tile_count": 770,
+                        "oversized_query_partitions": 0
+                      },
+                      "max": {
+                        "indexed_rows_per_call": 3896241,
+                        "pair_budget_slots": 16777216,
+                        "query_rows_per_call": 224677,
+                        "submitted_tile_capacity_slots": 5977008,
+                        "query_partitions_per_call": 1
+                      },
+                      "unavailable": [
+                        "logical_candidate_pairs",
+                        "exact_relation_pairs",
+                        "surviving_relation_pairs",
+                        "unique_left_rows",
+                        "unique_right_rows",
+                        "pair_bytes",
+                        "terminal_bytes"
+                      ],
+                      "schema_version": 1,
+                      "operation": "point_partition_relation_reduction",
+                      "metric_family": "relation",
+                      "physical_shape": "bounded_candidate_relation_consume",
+                      "consumer_kind": "right_pair_count",
+                      "instrumentation_level": 0,
+                      "semantic_contract": {
+                        "capacity_is_not_logical_cardinality": true,
+                        "device_logical_counts_read": false,
+                        "classification_passes_per_submitted_slot": 2,
+                        "exclusion_pass": false
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "spatial.point_partition.right_pair_count_exclusion.reduce",
+                  "category": "refine",
+                  "calls": 770,
+                  "elapsed_seconds": 0.0,
+                  "timing_mode": "counter",
+                  "metadata": {
+                    "work_amplification": {
+                      "sum": {
+                        "consumer_calls": 770,
+                        "indexed_rows": 3000000000,
+                        "reduction_output_slots": 3000000000,
+                        "query_rows": 159160386,
+                        "query_partitions": 770,
+                        "planned_pair_capacity_slots": 3783909959,
+                        "submitted_pair_capacity_slots": 3783909959,
+                        "exact_classification_capacity_lanes": 3783909959,
+                        "submitted_tile_count": 770,
+                        "oversized_query_partitions": 0
+                      },
+                      "max": {
+                        "indexed_rows_per_call": 3896241,
+                        "pair_budget_slots": 16777216,
+                        "query_rows_per_call": 224677,
+                        "submitted_tile_capacity_slots": 6148490,
+                        "query_partitions_per_call": 1
+                      },
+                      "unavailable": [
+                        "logical_candidate_pairs",
+                        "exact_relation_pairs",
+                        "surviving_relation_pairs",
+                        "unique_left_rows",
+                        "unique_right_rows",
+                        "pair_bytes",
+                        "terminal_bytes"
+                      ],
+                      "schema_version": 1,
+                      "operation": "point_partition_relation_reduction",
+                      "metric_family": "relation",
+                      "physical_shape": "bounded_candidate_relation_consume",
+                      "consumer_kind": "right_pair_count_exclusion",
+                      "instrumentation_level": 0,
+                      "semantic_contract": {
+                        "capacity_is_not_logical_cardinality": true,
+                        "device_logical_counts_read": false,
+                        "classification_passes_per_submitted_slot": 1,
+                        "exclusion_pass": true
+                      }
+                    }
+                  }
+                }
+              ],
+              "point_region_profile": {
+                "schema_version": 2,
+                "label": "spatialbench-q11-run-1",
+                "profile_wall_seconds": 230.440474144998,
+                "sample_limit": 65536,
+                "samples_per_launch": 128,
+                "forced_prepared_index": false,
+                "groups": [
+                  {
+                    "family": "multipolygon",
+                    "geometry_count": 224676,
+                    "part_count": 288955,
+                    "mean_parts_per_geometry": 1.2860964232939878,
+                    "edge_membership_count": 78341756,
+                    "mean_edge_memberships_per_part_bin": 33.890119568790986,
+                    "index_device_bytes": 345729984,
+                    "launches": 462,
+                    "kernel_seconds": 38.72986961650848,
+                    "counters": {
+                      "candidates": 1953121861,
+                      "valid_candidates": 1953121861,
+                      "parts_considered": 181137980291,
+                      "active_parts": 1513967139,
+                      "edges_visited": 1325959275301,
+                      "orient2d_calls": 22837680,
+                      "zero_active_candidates": 633277273,
+                      "zero_edge_candidates": 633277273,
+                      "boundary_results": 0,
+                      "interior_results": 545136364,
+                      "exterior_results": 1407985497,
+                      "max_parts_considered": 2880,
+                      "max_active_parts": 28,
+                      "max_edges_visited": 57766,
+                      "sample_reservations": 59136,
+                      "sampled_candidates": 59136
+                    },
+                    "parts_considered_percentiles": {
+                      "p50": 1,
+                      "p95": 600,
+                      "p99": 1183
+                    },
+                    "edges_visited_percentiles": {
+                      "p50": 5,
+                      "p95": 3117,
+                      "p99": 4096
+                    },
+                    "parts_histogram_ge_4096": 0,
+                    "edges_histogram_ge_4096": 2386
+                  },
+                  {
+                    "family": "multipolygon",
+                    "geometry_count": 224675,
+                    "part_count": 295190,
+                    "mean_parts_per_geometry": 1.3138533437187048,
+                    "edge_membership_count": 78876781,
+                    "mean_edge_memberships_per_part_bin": 33.4008524170873,
+                    "index_device_bytes": 348568404,
+                    "launches": 462,
+                    "kernel_seconds": 45.614673666000364,
+                    "counters": {
+                      "candidates": 1581455437,
+                      "valid_candidates": 1581455437,
+                      "parts_considered": 984702585751,
+                      "active_parts": 1538253402,
+                      "edges_visited": 1444193106409,
+                      "orient2d_calls": 17551736,
+                      "zero_active_candidates": 563605471,
+                      "zero_edge_candidates": 563605471,
+                      "boundary_results": 0,
+                      "interior_results": 365127469,
+                      "exterior_results": 1216327968,
+                      "max_parts_considered": 18933,
+                      "max_active_parts": 53,
+                      "max_edges_visited": 37652,
+                      "sample_reservations": 59136,
+                      "sampled_candidates": 59136
+                    },
+                    "parts_considered_percentiles": {
+                      "p50": 1,
+                      "p95": 104,
+                      "p99": 4096
+                    },
+                    "edges_visited_percentiles": {
+                      "p50": 2,
+                      "p95": 4096,
+                      "p99": 4096
+                    },
+                    "parts_histogram_ge_4096": 1542,
+                    "edges_histogram_ge_4096": 3132
+                  },
+                  {
+                    "family": "multipolygon",
+                    "geometry_count": 224676,
+                    "part_count": 277472,
+                    "mean_parts_per_geometry": 1.2349872705584932,
+                    "edge_membership_count": 78394080,
+                    "mean_edge_memberships_per_part_bin": 35.31621208626456,
+                    "index_device_bytes": 344653184,
+                    "launches": 462,
+                    "kernel_seconds": 28.624427678108216,
+                    "counters": {
+                      "candidates": 1594530991,
+                      "valid_candidates": 1594530991,
+                      "parts_considered": 391120957881,
+                      "active_parts": 1361026321,
+                      "edges_visited": 803846545111,
+                      "orient2d_calls": 18890615,
+                      "zero_active_candidates": 567356583,
+                      "zero_edge_candidates": 567356583,
+                      "boundary_results": 0,
+                      "interior_results": 267734480,
+                      "exterior_results": 1326796511,
+                      "max_parts_considered": 2484,
+                      "max_active_parts": 29,
+                      "max_edges_visited": 47986,
+                      "sample_reservations": 59136,
+                      "sampled_candidates": 59136
+                    },
+                    "parts_considered_percentiles": {
+                      "p50": 1,
+                      "p95": 2484,
+                      "p99": 2484
+                    },
+                    "edges_visited_percentiles": {
+                      "p50": 0,
+                      "p95": 1975,
+                      "p99": 4096
+                    },
+                    "parts_histogram_ge_4096": 0,
+                    "edges_histogram_ge_4096": 929
+                  },
+                  {
+                    "family": "multipolygon",
+                    "geometry_count": 224677,
+                    "part_count": 277697,
+                    "mean_parts_per_geometry": 1.235983211454666,
+                    "edge_membership_count": 78326142,
+                    "mean_edge_memberships_per_part_bin": 35.25701664043904,
+                    "index_device_bytes": 344406632,
+                    "launches": 462,
+                    "kernel_seconds": 54.57794896793366,
+                    "counters": {
+                      "candidates": 1914747043,
+                      "valid_candidates": 1914747043,
+                      "parts_considered": 46222237478,
+                      "active_parts": 1001129525,
+                      "edges_visited": 620081925319,
+                      "orient2d_calls": 23862975,
+                      "zero_active_candidates": 962238408,
+                      "zero_edge_candidates": 962238408,
+                      "boundary_results": 0,
+                      "interior_results": 344752296,
+                      "exterior_results": 1569994747,
+                      "max_parts_considered": 4442,
+                      "max_active_parts": 30,
+                      "max_edges_visited": 193292,
+                      "sample_reservations": 59136,
+                      "sampled_candidates": 59136
+                    },
+                    "parts_considered_percentiles": {
+                      "p50": 1,
+                      "p95": 59,
+                      "p99": 418
+                    },
+                    "edges_visited_percentiles": {
+                      "p50": 0,
+                      "p95": 1144,
+                      "p99": 4096
+                    },
+                    "parts_histogram_ge_4096": 1,
+                    "edges_histogram_ge_4096": 752
+                  },
+                  {
+                    "family": "multipolygon",
+                    "geometry_count": 134805,
+                    "part_count": 160804,
+                    "mean_parts_per_geometry": 1.1928637661807797,
+                    "edge_membership_count": 47249986,
+                    "mean_edge_memberships_per_part_bin": 36.72948589587324,
+                    "index_device_bytes": 207009992,
+                    "launches": 462,
+                    "kernel_seconds": 17.537999653339387,
+                    "counters": {
+                      "candidates": 937070598,
+                      "valid_candidates": 937070598,
+                      "parts_considered": 7367571106,
+                      "active_parts": 614067726,
+                      "edges_visited": 369608029234,
+                      "orient2d_calls": 21766422,
+                      "zero_active_candidates": 331997177,
+                      "zero_edge_candidates": 331997177,
+                      "boundary_results": 0,
+                      "interior_results": 240260778,
+                      "exterior_results": 696809820,
+                      "max_parts_considered": 1404,
+                      "max_active_parts": 33,
+                      "max_edges_visited": 42799,
+                      "sample_reservations": 59136,
+                      "sampled_candidates": 59136
+                    },
+                    "parts_considered_percentiles": {
+                      "p50": 1,
+                      "p95": 5,
+                      "p99": 198
+                    },
+                    "edges_visited_percentiles": {
+                      "p50": 0,
+                      "p95": 1452,
+                      "p99": 3422
+                    },
+                    "parts_histogram_ge_4096": 0,
+                    "edges_histogram_ge_4096": 434
+                  }
+                ],
+                "index_preparation": [
+                  {
+                    "family": "multipolygon",
+                    "build_count": 1,
+                    "cache_hits": 461,
+                    "build_wall_seconds": 0.1474073239369318
+                  },
+                  {
+                    "family": "multipolygon",
+                    "build_count": 1,
+                    "cache_hits": 461,
+                    "build_wall_seconds": 0.09609263902530074
+                  },
+                  {
+                    "family": "multipolygon",
+                    "build_count": 1,
+                    "cache_hits": 461,
+                    "build_wall_seconds": 0.1089102120604366
+                  },
+                  {
+                    "family": "multipolygon",
+                    "build_count": 1,
+                    "cache_hits": 461,
+                    "build_wall_seconds": 0.2446343069896102
+                  },
+                  {
+                    "family": "multipolygon",
+                    "build_count": 1,
+                    "cache_hits": 461,
+                    "build_wall_seconds": 0.073933164938353
+                  }
+                ],
+                "memory_pool": {
+                  "used_bytes": 48199475,
+                  "peak_bytes": 9246974695,
+                  "total_bytes": 1176065732268,
+                  "total_allocations": 95871,
+                  "reserved_bytes": 11363306624,
+                  "free_bytes": 11315107149,
+                  "largest_admitted_allocation_bytes": 6039190530
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

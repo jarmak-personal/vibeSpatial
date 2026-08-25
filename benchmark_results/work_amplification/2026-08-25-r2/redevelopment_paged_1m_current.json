@@ -1,0 +1,88 @@
+{
+  "schema_version": 2,
+  "type": "shootout",
+  "script": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/redevelopment_paged_control.py",
+  "status": "error",
+  "status_reason": "geopandas: harness produced no output; GeoPandas run has no correctness fingerprint",
+  "geopandas": {
+    "label": "geopandas",
+    "timing": {
+      "mean_seconds": 0.0,
+      "median_seconds": 0.0,
+      "min_seconds": 0.0,
+      "max_seconds": 0.0,
+      "stddev_seconds": 0.0,
+      "sample_count": 0
+    },
+    "error": "harness produced no output"
+  },
+  "vibespatial": {
+    "label": "vibespatial",
+    "timing": {
+      "mean_seconds": 64.09498465701472,
+      "median_seconds": 64.09498465701472,
+      "min_seconds": 64.09498465701472,
+      "max_seconds": 64.09498465701472,
+      "stddev_seconds": 0.0,
+      "sample_count": 1
+    },
+    "stdout": "SHOOTOUT_FINGERPRINT: rows=4 bounds=(599.05, 309.85, 850.0, 738.62) convex_hull_area=279078.10\n",
+    "environment": {
+      "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+      "python_implementation": "cpython",
+      "packages": {
+        "geopandas": "1.1.4",
+        "numpy": "2.4.3",
+        "pandas": "3.0.1",
+        "pyarrow": "23.0.1",
+        "pyogrio": "0.12.1",
+        "shapely": "2.1.2"
+      }
+    }
+  },
+  "speedup": null,
+  "metadata": {
+    "repeat": 1,
+    "warmup": false,
+    "timeout": 600,
+    "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+    "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+    "vibespatial_source": {
+      "package_version": "0.5.1",
+      "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+      "git_revision": "e8e7f2205bfbdbb072f2d6e8e2ed41697a45533b",
+      "tracked_source_dirty": true,
+      "untracked_source_files": [
+        "scripts/analyze_work_amplification.py",
+        "src/vibespatial/bench/amplification.py",
+        "src/vibespatial/bench/amplification_analysis.py"
+      ],
+      "worktree_source_sha256": "708b2b41c4a5a4ec8af622e52600995016b51f79a8ee2bb5a6a78adc71185250",
+      "python_version": "3.13.12"
+    },
+    "physical_shapes": [
+      "many_few_overlay",
+      "mask_clip",
+      "grouped_geometry_reduce",
+      "mask_construction"
+    ],
+    "profile_mode": "off",
+    "workload_key": "redevelopment_paged_control.py",
+    "workload_sha256": "20e80a04b224d006e11f3eea822815f7ecd21de111d5c8b488f317992f68667e",
+    "geopandas_baseline": "measured",
+    "geopandas_baseline_host": {
+      "node": "picard-4090",
+      "machine": "x86_64",
+      "processor": "x86_64",
+      "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+    },
+    "geopandas_baseline_environment_sha256": null,
+    "measurement_mode": "cold_start_probe",
+    "measurement_note": "repeat<3 with warmup disabled is cold-start sensitive; use warmup or repeat>=3 for steady-state parity comparisons",
+    "scale": "1M",
+    "vibespatial_launch": "subprocess",
+    "fingerprint": "missing",
+    "fingerprint_geopandas": null,
+    "fingerprint_vibespatial": "rows=4 bounds=(599.05, 309.85, 850.0, 738.62) convex_hull_area=279078.10"
+  }
+}

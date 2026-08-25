@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "experiment": "q11_component_first",
+  "variant": "component",
+  "profile_enabled": false,
+  "trip_rows": 3896103,
+  "zone_frames": 1,
+  "parent_zone_rows": 224676,
+  "component_zone_rows": 288955,
+  "component_to_parent_ratio": 1.2860964232939878,
+  "wall_seconds": 0.4980947169242427,
+  "stage_timings": {
+    "grid_preflight": {
+      "calls": 4,
+      "gpu_seconds": 0.009920575972646475,
+      "python_wall_seconds": 0.010525493999011815
+    },
+    "grid_prepare": {
+      "calls": 2,
+      "gpu_seconds": 0.015590399622917176,
+      "python_wall_seconds": 0.014319121022708714
+    },
+    "grid_plan": {
+      "calls": 2,
+      "gpu_seconds": 0.01667510437965393,
+      "python_wall_seconds": 0.01667795900721103
+    },
+    "grid_candidates": {
+      "calls": 2,
+      "gpu_seconds": 0.034004032135009764,
+      "python_wall_seconds": 0.0690603629918769
+    },
+    "exact_classification": {
+      "calls": 3,
+      "gpu_seconds": 0.2270330858230591,
+      "python_wall_seconds": 0.03549446596298367,
+      "work_units": 17576993
+    },
+    "grid_exclusion": {
+      "calls": 1,
+      "gpu_seconds": 0.0013341439962387086,
+      "python_wall_seconds": 7.163593545556068e-05
+    }
+  },
+  "left_count_sha256": "71ec76a473f03da66179d705120587ef8db0dec1a793ae85c2727532e3cb5d69",
+  "right_count_sha256": "3e789c032f4b5fdb2907c1a60f818db21dfe4c3821937b5a465525f885f4975f",
+  "shared_count_sha256": "573b4c16d829c4f9be8fe2ac5eed1ca4ee210fd3a7df51e28603e0b226d04126",
+  "left_count_sum": 1770232,
+  "right_count_sum": 1770240,
+  "shared_count_sum": 1688286,
+  "point_region_profile": null,
+  "dispatch_summary": [
+    {
+      "surface": "geopandas.array.bounds",
+      "operation": "bounds",
+      "implementation": "gpu_nvrtc_bounds_device",
+      "selected": "gpu",
+      "reason": "GPU NVRTC bounds kernel kept bounds resident on device",
+      "count": 3
+    },
+    {
+      "surface": "vibespatial.spatial.point_grid_index",
+      "operation": "prepare",
+      "implementation": "dense_point_cell_index_gpu",
+      "selected": "gpu",
+      "reason": "grouped 3896103 point rows once into 1024x1024 cells",
+      "count": 2
+    },
+    {
+      "surface": "vibespatial.predicates.point_location_index",
+      "operation": "prepare_point_location",
+      "implementation": "polygon_part_y_edge_directory_gpu",
+      "selected": "gpu",
+      "reason": "prepared 288955 polygon parts into 2311640 y bins with 78341756 exact edge memberships",
+      "count": 1
+    },
+    {
+      "surface": "vibespatial.api.SpatialIndex.query_pair_aggregate",
+      "operation": "query_pair_aggregate",
+      "implementation": "owned_gpu_spatial_right_pair_match_count_grid+owned_gpu_spatial_right_pair_match_count_grid",
+      "selected": "gpu",
+      "reason": "left/shared: bounded aligned point-grid candidate batches reused prior exact classifications and reduced only unseen pairs to aligned right pair match counts; paired dense grids passed joint complete-memory preflight; right: bounded aligned point-grid candidate batches reused prior exact classifications and reduced only unseen pairs to aligned right pair match counts; paired dense grids passed joint complete-memory preflight",
+      "count": 1
+    }
+  ]
+}

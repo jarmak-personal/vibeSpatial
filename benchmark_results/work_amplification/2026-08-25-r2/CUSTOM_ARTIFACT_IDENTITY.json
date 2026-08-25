@@ -1,0 +1,109 @@
+{
+  "schema_version": 2,
+  "purpose": "Identity index for custom Q11/Q12 R2 decision measurements",
+  "identity_status": "complete_for_current_decision_arms",
+  "current_common_context": {
+    "host": "picard-4090",
+    "git_revision": "e8e7f2205bfbdbb072f2d6e8e2ed41697a45533b",
+    "git_diff_binary_sha256": "7c9bdb150493666356a53d1293b99aceab582cb5abff17007a4263d07118f49e",
+    "worktree_source_sha256": "708b2b41c4a5a4ec8af622e52600995016b51f79a8ee2bb5a6a78adc71185250",
+    "dataset_path": "/home/picard/datasets/spatialbench/v0.1.0/sf100-geoparquet",
+    "dataset_scale_factor": 100,
+    "dataset_format": "GeoParquet 1.1 with native GeoArrow geometry",
+    "dataset_manifest_sha256": "a970d40adc2f754e781197d9ec9af1f03627351ceb8d01e92e9c09ff6c5080d3",
+    "dataset_inventory_sha256": "ad526c085c09b50410402945c24a9b6162b4467ceb4daa3c1f24d3db9848a35c",
+    "dataset_inventory_fingerprint_definition": "sha256 of sorted tab-separated relative path and byte size; not a content digest",
+    "environment": {
+      "hostname": "picard-4090",
+      "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K",
+      "gpu": "NVIDIA GeForce RTX 4090",
+      "gpu_uuid": "GPU-39aa5702-5aec-2729-8fb7-412d84ca1cbe",
+      "driver_version": "580.173.02",
+      "python": "3.13.12"
+    }
+  },
+  "q11": {
+    "identity_status": "complete_contemporaneous",
+    "implementation_entrypoint": "benchmark_results/work_amplification/2026-08-25-r2/q11_component_first.py",
+    "implementation_sha256": "f41d29c18987e09958988604abb363e7653eefac44fe9495ed14fa0b8080a406",
+    "identified_entrypoint": "benchmark_results/work_amplification/2026-08-25-r2/q11_component_first_identified.py",
+    "identified_entrypoint_sha256": "0b25c7782e2a182956556bc65d674f51f2729f59a15ebedcc39cc3e5aca1cb3e",
+    "relevant_source_manifest_sha256": "6b87f5a7685e2d3fdcb84bf5a5a472a7efe867c51e697b802d8025eff64a3d8e",
+    "measurement_protocol": {
+      "processes": "one isolated process per arm",
+      "warmup_runs": 0,
+      "repeat_runs": 1,
+      "statistic": "single cold observation",
+      "timed_scope": "all selected public query_pair_aggregate calls; trip/zone reads and component fixture decomposition excluded",
+      "profile_runs": "separate instrumented processes, not the wall-time decision runs"
+    },
+    "current_decision_artifacts": {
+      "q11_parent_z5.json": "682539b40589247cb9377628c7608a995c67c59141c0b16c27855208cfd46d19",
+      "q11_component_z5.json": "f28e91953b7197f9e8d20d5f0e936d0f3681e6e442f6abeeb4c8fb886b70e255",
+      "q11_parent_z5_profile.json": "df58ad8f24c3354945c4e0a97cfc5ce29aafc6db623be53e0c9ecb54066743b7",
+      "q11_component_z5_profile.json": "b0a40130b091b30eb35db336578cc5d6c2d0342fc53ed06959f09e46a57560c9"
+    },
+    "legacy_smoke_artifacts": {
+      "identity_status": "retrospective_incomplete_not_used_for_decision",
+      "q11_parent_z1.json": "89870a63cb4615ce2a9d073f8bffe099028e0da8af77d219b9d1311cec1ac594",
+      "q11_component_z1.json": "306161415ab35241118a7be0172f0add5101702fec794534efd829b49a365241"
+    }
+  },
+  "q12": {
+    "identity_status": "complete_contemporaneous",
+    "identified_entrypoint": "benchmark_results/work_amplification/2026-08-25-r2/q12_dense_experiment.py",
+    "identified_entrypoint_sha256": "7866a98a4f47b84590b8d871472459969150c68c129acb936f36e53a67367e1c",
+    "dense_implementation_source": "benchmark_results/experiments/2026-08-21-q11-q12-physical-shapes/experiment.py",
+    "dense_implementation_source_sha256": "9886b6a2fcdd766feb347b8c2b1acb93069ffcf7ed0286f834619e4a301830ef",
+    "relevant_source_manifest_sha256": "9b0f2ec8d46fdbdaa5f18716be7171185b2f957afff50f776f25f28f7a1ad22f",
+    "measurement_protocol": {
+      "processes": "indexed and dense arms run as separate commands",
+      "warmup_runs": 0,
+      "repeat_runs": 1,
+      "statistic": "single cold observation",
+      "timed_scope": "queries.q12(paths), excluding query object/data-path setup",
+      "dense_substitution": "replace the benchmark query's KNN batch implementation with tiled dense bbox lower-bound filtering followed by public exact GeoSeries.distance refinement",
+      "correctness": "ordered trip keys exact; distances checked with rtol=1e-6 and atol=1e-9"
+    },
+    "current_decision_artifacts": {
+      "q12_indexed_current.json": "91163146b58971dd546250818b60002810066d8344f73ac8928070ee9dbe150d",
+      "q12_dense_filter_current.json": "95df4062eff3a63a5da8052b63cddc4c9754e479b5923466ce820c2d0b221216",
+      "q12_baseline_result.csv": "7c16ada8366634347571e2bc5309ee74c0b5bce22639c1eb94f817b70aab260c",
+      "q12_dense_filter_result.csv": "d4ff40cfc1971b702f543264d16f20d013b4aaae08e346e5d0f09dce47e33975",
+      "q12_retained_points.npz": "e4b3390e0c8e6b4fb1e9156ab325992f27ec5ff8588036987c4cc14c0f67f88d"
+    },
+    "legacy_replaced_artifacts": {
+      "identity_status": "retrospective_incomplete_not_used_for_decision",
+      "indexed_sha256": "27783659b3ea6c068c612c34d148d1803d8c12215f616c34ffe27b638d2c50e3",
+      "dense_sha256": "cc1ba802b756458143c65e4ba0f48c725580786dc2599c9c7e51e5d8ce637468"
+    }
+  },
+  "grouped_constructive": {
+    "identity_status": "complete_current_source",
+    "worktree_source_sha256": "708b2b41c4a5a4ec8af622e52600995016b51f79a8ee2bb5a6a78adc71185250",
+    "paged_control": {
+      "artifact": "redevelopment_paged_1m_current.json",
+      "artifact_sha256": "a3d33de96938806f666210d3ee781e453098e326bda4fe5010246e5255789a9a",
+      "entrypoint": "redevelopment_paged_control.py",
+      "entrypoint_sha256": "1f6f78621539a370c99968a86b2fd4855714ca5f45a0d03426b30e254716ee11",
+      "wall_seconds": 64.09498465701472,
+      "required_environment": {
+        "PYTHONPATH": "/home/picard/repos/vibeSpatial/benchmarks/shootout",
+        "reason": "the isolated script imports the shared shootout _data fixture module"
+      },
+      "command": "PYTHONPATH=/home/picard/repos/vibeSpatial/benchmarks/shootout uv run vsbench shootout benchmark_results/work_amplification/2026-08-25-r2/redevelopment_paged_control.py --scale 1M --repeat 1 --no-warmup --baseline-python /bin/true --timeout 600 --profile-mode off --json --output benchmark_results/work_amplification/2026-08-25-r2/redevelopment_paged_1m_current.json"
+    },
+    "reduced_current": {
+      "artifact": "shootout_1m_final.json",
+      "artifact_sha256": "37db531240e760497cd607642587107cfe5a3d2b8af7b03d86c275f4e153c4d6",
+      "workload": "redevelopment_screening.py",
+      "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+      "wall_seconds": 11.115687263896689
+    },
+    "comparison": {
+      "speedup": 5.766173798825079,
+      "seconds_saved": 52.97929739311803,
+      "fingerprint": "rows=4 bounds=(599.05, 309.85, 850.0, 738.62) convex_hull_area=279078.10"
+    }
+  }
+}

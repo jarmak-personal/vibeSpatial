@@ -1,0 +1,172 @@
+{
+  "benchmark": "spatialbench",
+  "version": "0.1.0",
+  "generated_at": "2026-08-25T18:39:59.242879+00:00",
+  "results": [
+    {
+      "engine": "vibespatial",
+      "version": "0.5.1",
+      "scale_factor": 100.0,
+      "timestamp": "2026-08-25T18:32:01.764160+00:00",
+      "total_time": 464.88000000000005,
+      "results": [
+        {
+          "query": "q1",
+          "time_seconds": 12.63,
+          "row_count": 100,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            12.63
+          ],
+          "statistic": "median",
+          "warmup_runs": 0,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q2",
+          "time_seconds": 7.84,
+          "row_count": 1,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            7.84
+          ],
+          "statistic": "median",
+          "warmup_runs": 0,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q3",
+          "time_seconds": 12.92,
+          "row_count": 84,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            12.92
+          ],
+          "statistic": "median",
+          "warmup_runs": 0,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q4",
+          "time_seconds": 9.03,
+          "row_count": 614,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            9.03
+          ],
+          "statistic": "median",
+          "warmup_runs": 0,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q5",
+          "time_seconds": 21.56,
+          "row_count": 100,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            21.56
+          ],
+          "statistic": "median",
+          "warmup_runs": 0,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q6",
+          "time_seconds": 13.74,
+          "row_count": 19,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            13.74
+          ],
+          "statistic": "median",
+          "warmup_runs": 0,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q7",
+          "time_seconds": 4.7,
+          "row_count": 100,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            4.7
+          ],
+          "statistic": "median",
+          "warmup_runs": 0,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q8",
+          "time_seconds": 17.46,
+          "row_count": 100,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            17.46
+          ],
+          "statistic": "median",
+          "warmup_runs": 0,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q9",
+          "time_seconds": 0.73,
+          "row_count": 100,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            0.73
+          ],
+          "statistic": "median",
+          "warmup_runs": 0,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q10",
+          "time_seconds": 114.8,
+          "row_count": 100,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            114.8
+          ],
+          "statistic": "median",
+          "warmup_runs": 0,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q11",
+          "time_seconds": 226.18,
+          "row_count": 1,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            226.18
+          ],
+          "statistic": "median",
+          "warmup_runs": 0,
+          "telemetry_runs": []
+        },
+        {
+          "query": "q12",
+          "time_seconds": 23.29,
+          "row_count": 100,
+          "status": "success",
+          "error_message": null,
+          "run_times_seconds": [
+            23.29
+          ],
+          "statistic": "median",
+          "warmup_runs": 0,
+          "telemetry_runs": []
+        }
+      ]
+    }
+  ]
+}

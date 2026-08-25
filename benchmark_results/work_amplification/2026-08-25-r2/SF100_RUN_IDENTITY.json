@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "status": "complete_current_revision",
+  "captured_at": "2026-08-25T18:49:56Z",
+  "scope": "Fresh R2 SF100 lean and Level-0 counter runs",
+  "source": {
+    "git_revision": "e8e7f2205bfbdbb072f2d6e8e2ed41697a45533b",
+    "tracked_source_dirty": true,
+    "worktree_source_sha256": "708b2b41c4a5a4ec8af622e52600995016b51f79a8ee2bb5a6a78adc71185250",
+    "source_unchanged_between_runs_and_identity_capture": true,
+    "critical_file_sha256": {
+      "benchmarks/spatialbench/run_benchmark.py": "08c86dd9c8361764cd12d4374e7a095d54a93664487aa48f090e1687e524c2be",
+      "benchmarks/spatialbench/vibespatial_queries.py": "3998dc4cf98dfc9ea5b5cdb2dbd2c4ec211a53d66f3909300245b96082e6e0ee",
+      "pyproject.toml": "407f619234e9d50fdff928906f924f9c9ed481a9fbb247659a197bd458e00e3a",
+      "uv.lock": "60942838f44a9792dfc8a49371e8a1367a59e8d858e39ed827dfa735e0d615fe"
+    }
+  },
+  "dataset": {
+    "path": "/home/picard/datasets/spatialbench/v0.1.0/sf100-geoparquet",
+    "scale_factor": 100,
+    "format": "GeoParquet 1.1",
+    "geometry_encoding": "native GeoArrow",
+    "manifest_sha256": "a970d40adc2f754e781197d9ec9af1f03627351ceb8d01e92e9c09ff6c5080d3",
+    "file_inventory_sha256": "ad526c085c09b50410402945c24a9b6162b4467ceb4daa3c1f24d3db9848a35c",
+    "file_inventory_fingerprint_definition": "sha256 of sorted tab-separated relative path and byte size; not a content digest",
+    "file_count": 179,
+    "total_bytes": 37940233646,
+    "tables": {
+      "building": {
+        "files": 1,
+        "rows": 152877
+      },
+      "trip": {
+        "files": 154,
+        "rows": 600000000
+      },
+      "zone": {
+        "files": 23,
+        "rows": 1033509
+      }
+    }
+  },
+  "environment": {
+    "hostname": "picard-4090",
+    "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.35",
+    "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K",
+    "memory_total": "98580128 kB",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_uuid": "GPU-39aa5702-5aec-2729-8fb7-412d84ca1cbe",
+    "gpu_memory_mib": 24564,
+    "gpu_power_limit_watts": 450.0,
+    "driver_version": "580.173.02",
+    "cuda_visible_devices": null,
+    "python": "3.13.12",
+    "packages": {
+      "cupy-cuda12x": "14.0.1",
+      "geopandas": "1.1.4",
+      "numpy": "2.4.3",
+      "pandas": "3.0.1",
+      "pyarrow": "23.0.1",
+      "pylibcudf-cu12": "26.2.1",
+      "vibespatial": "0.5.1"
+    },
+    "strict_native": "1",
+    "precompile": null
+  },
+  "measurement": {
+    "process_isolation": "one isolated process per query",
+    "runs_per_query": 1,
+    "warmup_runs": 0,
+    "statistic": "mean of one cold observation",
+    "timeout_seconds": 1200,
+    "lean": {
+      "artifact": "sf100_vibespatial_lean_cold1.json",
+      "artifact_sha256": "619bb9a9a9d7f1612c503ae774e7b26b0fa05f8f663bb98d91de1f8181d9d23e",
+      "generated_at": "2026-08-25T18:39:59.242879+00:00",
+      "result_directory": "results_sf100_lean",
+      "result_manifest_sha256": "f75212b3e51f9a33b0ddd8824f088c8b1d76f252042203a0dd4ed6afe82b6b4d",
+      "profile_telemetry": false,
+      "command": [
+        "env",
+        "VIBESPATIAL_STRICT_NATIVE=1",
+        "uv",
+        "run",
+        "python",
+        "benchmarks/spatialbench/run_benchmark.py",
+        "--data-dir",
+        "/home/picard/datasets/spatialbench/v0.1.0/sf100-geoparquet",
+        "--engines",
+        "vibespatial",
+        "--timeout",
+        "1200",
+        "--runs",
+        "1",
+        "--warmup-runs",
+        "0",
+        "--statistic",
+        "mean",
+        "--output",
+        "benchmark_results/work_amplification/2026-08-25-r2/sf100_vibespatial_lean_cold1.json",
+        "--scale-factor",
+        "100",
+        "--result-dir",
+        "benchmark_results/work_amplification/2026-08-25-r2/results_sf100_lean"
+      ]
+    },
+    "counter": {
+      "artifact": "sf100_vibespatial_counter_telemetry_cold1.json",
+      "artifact_sha256": "bfc7008c01b37d34629c0b30b272a2428e2ef2d7311ebe66c1b7aec898264d78",
+      "generated_at": "2026-08-25T18:48:03.513914+00:00",
+      "result_directory": "results_sf100_counter",
+      "result_manifest_sha256": "804a85e8b5ac59d0986f8fef82f4b46663c719c33c96f9f1c59211efc6654ed2",
+      "profile_telemetry": true,
+      "command": [
+        "env",
+        "VIBESPATIAL_STRICT_NATIVE=1",
+        "uv",
+        "run",
+        "python",
+        "benchmarks/spatialbench/run_benchmark.py",
+        "--data-dir",
+        "/home/picard/datasets/spatialbench/v0.1.0/sf100-geoparquet",
+        "--engines",
+        "vibespatial",
+        "--timeout",
+        "1200",
+        "--runs",
+        "1",
+        "--warmup-runs",
+        "0",
+        "--statistic",
+        "mean",
+        "--profile-telemetry",
+        "--output",
+        "benchmark_results/work_amplification/2026-08-25-r2/sf100_vibespatial_counter_telemetry_cold1.json",
+        "--scale-factor",
+        "100",
+        "--result-dir",
+        "benchmark_results/work_amplification/2026-08-25-r2/results_sf100_counter"
+      ]
+    }
+  }
+}

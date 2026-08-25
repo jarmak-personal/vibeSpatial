@@ -2340,12 +2340,18 @@ def test_grouped_overlay_difference_owned_accepts_device_offsets_without_host_ex
     assert not any("grouped difference" in reason for reason in runtime_reasons)
 
 
-def test_grouped_overlay_difference_device_metadata_path_has_no_runtime_d2h() -> None:
+def test_grouped_overlay_difference_device_metadata_path_has_no_runtime_d2h(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if not vibespatial.has_gpu_runtime():
         pytest.skip("GPU runtime not available")
 
     cp = pytest.importorskip("cupy")
     from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count
+    from vibespatial.runtime.hotpath_trace import (
+        reset_hotpath_trace,
+        summarize_hotpath_trace,
+    )
 
     left = from_shapely_geometries(
         [
@@ -2364,6 +2370,8 @@ def test_grouped_overlay_difference_device_metadata_path_has_no_runtime_d2h() ->
         residency=Residency.DEVICE,
     )
 
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "counter")
+    reset_hotpath_trace()
     reset_d2h_transfer_count()
     get_d2h_transfer_events(clear=True)
     result = overlay_module._grouped_overlay_difference_owned(
@@ -2376,6 +2384,7 @@ def test_grouped_overlay_difference_device_metadata_path_has_no_runtime_d2h() ->
         _group_size_max=2,
     )
     runtime_events = get_d2h_transfer_events(clear=True)
+    trace_summary = summarize_hotpath_trace()
 
     expected = [
         shapely.difference(
@@ -2392,6 +2401,29 @@ def test_grouped_overlay_difference_device_metadata_path_has_no_runtime_d2h() ->
     assert result.row_count == 2
     assert runtime_events == []
     assert sum(event.bytes_transferred for event in runtime_events) <= 32
+    group_stage = next(
+        item
+        for item in trace_summary
+        if item["name"] == "overlay.diff.group_metadata"
+    )
+    group_packet = group_stage["metadata"]["work_amplification"]
+    assert group_packet["schema_version"] == 1
+    assert group_packet["instrumentation_level"] == 0
+    assert group_packet["metric_family"] == "group_compression"
+    assert group_packet["sum"] == {
+        "input_rows": 4 * group_stage["calls"],
+        "output_groups": 2 * group_stage["calls"],
+        "observed_groups": 2 * group_stage["calls"],
+    }
+    assert group_packet["max"] == {"max_group_size": 2}
+    constructive_packets = [
+        item["metadata"]["work_amplification"]
+        for item in trace_summary
+        if item.get("metadata", {}).get("work_amplification", {}).get("metric_family")
+        == "constructive"
+    ]
+    assert constructive_packets
+    assert all(packet["instrumentation_level"] == 0 for packet in constructive_packets)
     for got, want in zip(actual, expected, strict=True):
         assert shapely.symmetric_difference(got, want).area < 1e-8
 
@@ -4485,6 +4517,47 @@ def test_row_isolated_intersection_uses_same_row_candidate_fast_path(
     summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
     assert summary.get("segment.candidates.same_row_fast_path") == 1
     assert "segment.candidates.binary_search" not in summary
+
+
+def test_cpu_grouped_difference_emits_level0_group_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.runtime.hotpath_trace import reset_hotpath_trace, summarize_hotpath_trace
+
+    left = SimpleNamespace(row_count=2)
+    right = SimpleNamespace(row_count=0)
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "counter")
+    reset_hotpath_trace()
+
+    result = overlay_module._cpu_grouped_difference_owned(
+        left,
+        right,
+        np.asarray([0, 0, 0], dtype=np.int64),
+        dispatch_mode=ExecutionMode.CPU,
+    )
+
+    assert result is left
+    stage = next(
+        item
+        for item in summarize_hotpath_trace()
+        if item["name"] == "overlay.diff.group_metadata"
+    )
+    assert stage["timing_mode"] == "counter"
+    assert stage["metadata"]["work_amplification"] == {
+        "schema_version": 1,
+        "operation": "overlay.diff.group_metadata",
+        "metric_family": "group_compression",
+        "instrumentation_level": 0,
+        "sum": {"input_rows": 0, "output_groups": 2},
+        "max": {"max_group_size": 0},
+        "unavailable": [
+            "input_segments",
+            "input_coordinates",
+            "pre_reduction_fragments",
+            "output_parts",
+            "output_coordinates",
+        ],
+    }
 
 
 def test_grouped_overlay_difference_forces_gpu_segment_classification(

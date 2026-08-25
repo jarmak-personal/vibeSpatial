@@ -14,10 +14,12 @@ from vibespatial.bench.cli import main as vsbench_main
 from vibespatial.bench.output import render_shootout
 from vibespatial.bench.schema import timing_from_samples
 from vibespatial.bench.shootout import (
+    _HARNESS_CODE,
     ShootoutResult,
     ShootoutRun,
     _baseline_environment_sha256,
     _baseline_host_identity,
+    _geopandas_measurement_identity,
     _measurement_identity,
     _run_harness,
     load_reusable_geopandas_baseline,
@@ -449,6 +451,90 @@ def test_vibespatial_shootout_profile_reports_physical_plan_evidence(tmp_path: P
     assert event["surface"] == "probe.materialize"
 
 
+def test_vibespatial_shootout_counter_profile_has_counts_without_nested_timing(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "counter_profile_probe.py"
+    script.write_text(
+        "\n".join(
+            [
+                "# --- timed work starts here ---",
+                "from vibespatial.runtime.hotpath_trace import hotpath_stage",
+                "with hotpath_stage('shootout.counter_probe', category='refine'):",
+                "    value = sum(range(8))",
+                "print(f'SHOOTOUT_FINGERPRINT: rows={value // 28}')",
+                "# --- timed work ends here ---",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    run = _run_harness(
+        label="vibespatial",
+        python_cmd=[sys.executable],
+        script=script,
+        repeat=1,
+        warmup=False,
+        pipeline_warm=True,
+        env={
+            **os.environ,
+            "UV_CACHE_DIR": "/tmp/uv-cache",
+            "VIBESPATIAL_SHOOTOUT_PROFILE_MODE": "counters",
+        },
+        timeout=60,
+        quiet=True,
+        profile=True,
+    )
+
+    assert run.error is None
+    assert run.profile is not None
+    assert run.profile["profile_mode"] == "counters"
+    assert run.profile["hotpath_timing_enabled"] is False
+    assert run.profile["top_hotpath"][0]["name"] == "shootout.counter_probe"
+    assert run.profile["top_hotpath"][0]["calls"] == 1
+    assert run.profile["top_hotpath"][0]["timing_mode"] == "counter"
+    assert run.profile["hotpath_total_seconds"] is None
+    assert run.profile["composition_overhead_seconds"] is None
+    assert run.profile["composition_overhead_ratio"] is None
+
+
+def test_profiled_harness_forces_lean_child_hotpath_trace_off(tmp_path: Path) -> None:
+    script = tmp_path / "lean_trace_isolation_probe.py"
+    script.write_text(
+        "\n".join(
+            [
+                "# --- timed work starts here ---",
+                "import os",
+                "mode = os.environ.get('VIBESPATIAL_HOTPATH_TRACE', 'missing')",
+                "print(f'SHOOTOUT_FINGERPRINT: mode={mode}')",
+                "# --- timed work ends here ---",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    run = _run_harness(
+        label="vibespatial",
+        python_cmd=[sys.executable],
+        script=script,
+        repeat=1,
+        warmup=False,
+        pipeline_warm=True,
+        env={
+            **os.environ,
+            "UV_CACHE_DIR": "/tmp/uv-cache",
+            "VIBESPATIAL_HOTPATH_TRACE": "full",
+            "VIBESPATIAL_SHOOTOUT_PROFILE_MODE": "counters",
+        },
+        timeout=60,
+        quiet=True,
+        profile=True,
+    )
+
+    assert run.error is None
+    assert "SHOOTOUT_FINGERPRINT: mode=off" in run.stdout
+
+
 @pytest.mark.gpu
 def test_vibespatial_harness_pipeline_warm_drains_deferred_cache(
     tmp_path: Path,
@@ -693,6 +779,9 @@ def test_load_reusable_geopandas_baseline_validates_workload_identity(
                         _baseline_environment_sha256(baseline_environment)
                     ),
                     "measurement_sha256": _measurement_identity(),
+                    "geopandas_measurement_sha256": (
+                        _geopandas_measurement_identity()
+                    ),
                     "repeat": 3,
                     "warmup": True,
                     "timeout": 300,
@@ -741,6 +830,23 @@ def test_load_reusable_geopandas_baseline_validates_workload_identity(
             warmup=True,
             timeout=300,
         )
+
+
+def test_geopandas_measurement_identity_excludes_profile_only_code() -> None:
+    profile_edit = _HARNESS_CODE.replace(
+        '"hotpath_timing_enabled": requested_profile_mode == "full",',
+        '"hotpath_timing_enabled": False,',
+        1,
+    )
+    lean_edit = _HARNESS_CODE.replace(
+        "start = time.perf_counter()",
+        "start = time.monotonic()",
+        1,
+    )
+
+    identity = _geopandas_measurement_identity(_HARNESS_CODE)
+    assert _geopandas_measurement_identity(profile_edit) == identity
+    assert _geopandas_measurement_identity(lean_edit) != identity
 
 
 def test_shootout_cli_reuses_geopandas_with_no_warmup(
@@ -1009,6 +1115,9 @@ def test_run_shootout_isolates_upstream_baseline_from_repo_shim(
     assert baseline_paths == ["/tmp/shootout-extra"]
     assert vibespatial_paths[0] == str(source_root)
     assert vibespatial_paths[1:] == ["/tmp/shootout-extra"]
+    assert calls[1]["env"]["VIBESPATIAL_HOTPATH_TRACE"] == "off"
+    assert calls[1]["env"]["VIBESPATIAL_SHOOTOUT_PROFILE_MODE"] == "off"
+    assert result.metadata["profile_mode"] == "off"
 
 
 def test_run_shootout_metadata_tags_public_physical_shapes(

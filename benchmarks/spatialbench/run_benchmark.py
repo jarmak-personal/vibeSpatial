@@ -177,11 +177,13 @@ def _begin_vibespatial_telemetry(engine_class: type) -> dict[str, Any] | None:
         get_cuda_runtime,
         reset_d2h_transfer_count,
     )
+    from vibespatial.runtime.hotpath_trace import reset_hotpath_trace
 
     runtime = get_cuda_runtime()
     rmm_statistics.enable_statistics()
     rmm_statistics.push_statistics()
     reset_d2h_transfer_count()
+    reset_hotpath_trace()
     vibespatial.clear_fallback_events()
     vibespatial.clear_materialization_events()
     sampler = _ProcessVramSampler()
@@ -202,6 +204,10 @@ def _end_vibespatial_telemetry(state: dict[str, Any] | None) -> dict[str, Any]:
         get_d2h_transfer_events,
         get_d2h_transfer_profile,
     )
+    from vibespatial.runtime.hotpath_trace import (
+        hotpath_trace_mode,
+        summarize_hotpath_trace,
+    )
 
     sampler = state["sampler"]
     sampler.stop()
@@ -211,6 +217,7 @@ def _end_vibespatial_telemetry(state: dict[str, Any] | None) -> dict[str, Any]:
     materialization_events = vibespatial.get_materialization_events(clear=True)
     allocation_stats = state["rmm_statistics"].pop_statistics()
     pool_stats = state["runtime"].memory_pool_stats()
+    hotpath_mode = hotpath_trace_mode()
     return {
         "peak_vram_bytes": sampler.peak_bytes,
         "rmm_peak_allocation_bytes": (
@@ -242,6 +249,10 @@ def _end_vibespatial_telemetry(state: dict[str, Any] | None) -> dict[str, Any]:
             _event_dict(event) for event in materialization_events[:40]
         ],
         "materialization_events_truncated": len(materialization_events) > 40,
+        "hotpath_trace_mode": hotpath_mode,
+        "hotpath": (
+            summarize_hotpath_trace()[:120] if hotpath_mode != "off" else []
+        ),
     }
 
 

@@ -1165,6 +1165,54 @@ def test_pipeline_audit_counts_runtime_materialization_events() -> None:
     clear_materialization_events()
 
 
+def test_pipeline_audit_observes_partitioned_geometry_without_physicalizing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from shapely.geometry import box
+
+    from vibespatial.api._native_result_core import (
+        GeometryNativeResult,
+        NativeGeometryComposition,
+    )
+    from vibespatial.geometry.device_array import DeviceGeometryArray
+    from vibespatial.geometry.owned import DiagnosticKind, from_shapely_geometries
+
+    parts = [
+        GeometryNativeResult.from_owned(
+            from_shapely_geometries([geometry]),
+            crs=None,
+        )
+        for geometry in (box(0.0, 0.0, 1.0, 1.0), box(2.0, 0.0, 3.0, 1.0))
+    ]
+    composition = NativeGeometryComposition.concat(parts, crs=None)
+    array = DeviceGeometryArray._from_composition(composition, crs=None)
+    expected = [part.geometry.owned for part in composition.parts]
+
+    def _fail_physicalization(_self):
+        raise AssertionError("pipeline audit must not physicalize a composition")
+
+    monkeypatch.setattr(DeviceGeometryArray, "to_owned", _fail_physicalization)
+
+    observed = list(pipeline_module._iter_owned_arrays(array))
+    assert observed == expected
+    assert all(actual is wanted for actual, wanted in zip(observed, expected, strict=True))
+
+    audit = pipeline_module._OwnedAudit()
+    audit.observe(array)
+    expected[0]._record(
+        DiagnosticKind.TRANSFER,
+        "test existing-part diagnostic",
+        bytes_transferred=8,
+    )
+    audit.observe(array)
+
+    assert audit.transfer_count == 1
+    assert audit.transfer_bytes == 8
+    assert array.native_composition is composition
+    assert array.cached_owned() is None
+    assert composition._singular_owned_cache is None
+
+
 def test_stage_profiler_attaches_materialization_event_context() -> None:
     from vibespatial.runtime.materialization import (
         MaterializationBoundary,

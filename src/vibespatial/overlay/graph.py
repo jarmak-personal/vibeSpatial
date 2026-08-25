@@ -26,7 +26,7 @@ from vibespatial.cuda.cccl_primitives import (
     exclusive_sum,
     sort_pairs,
 )
-from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
+from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_timing_enabled
 
 from .types import (
     AtomicEdgeTable,
@@ -113,7 +113,7 @@ def _stable_radix_order_pass(order, key):
 
 
 def _sync_hotpath(runtime) -> None:
-    if hotpath_trace_enabled():
+    if hotpath_timing_enabled():
         runtime.synchronize()
 
 

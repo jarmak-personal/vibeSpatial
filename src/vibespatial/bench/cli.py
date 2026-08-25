@@ -168,6 +168,17 @@ def main(argv: list[str] | None = None) -> int:
         "--timeout", type=int, default=300, help="Per-run timeout in seconds (default: 300)"
     )
     p_shootout.add_argument("--json", action="store_true", dest="json_output")
+    p_shootout.add_argument(
+        "--profile-mode",
+        choices=("off", "counters", "full"),
+        default=None,
+        help=(
+            "Post-timing vibeSpatial replay: off disables it, counters records "
+            "bounded host-known call counts without GPU fences, and full "
+            "enables synchronized nested timing. Defaults to full with --json "
+            "for compatibility and off otherwise."
+        ),
+    )
     p_shootout.add_argument("--quiet", action="store_true")
     p_shootout.add_argument(
         "--output",
@@ -677,6 +688,7 @@ def _cmd_shootout(args: argparse.Namespace) -> int:
             quiet=args.quiet,
             scale=args.scale,
             profile=args.json_output,
+            profile_mode=args.profile_mode,
             geopandas_baseline=geopandas_baseline,
             geopandas_baseline_source=(
                 str(args.reuse_geopandas.resolve())
@@ -701,6 +713,11 @@ def _cmd_shootout(args: argparse.Namespace) -> int:
                     "script_count": len(results),
                     "passed": len(results) - all_failed,
                     "failed": all_failed,
+                    "profile_mode": (
+                        args.profile_mode
+                        if args.profile_mode is not None
+                        else ("full" if args.json_output else "off")
+                    ),
                     "geopandas_baseline": (
                         "reused" if args.reuse_geopandas is not None else "measured"
                     ),

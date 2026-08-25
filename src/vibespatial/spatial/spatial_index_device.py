@@ -56,6 +56,7 @@ from vibespatial.kernels.core.spatial_query_kernels import (
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.crossover import PhysicalWorkEstimate
+from vibespatial.runtime.hotpath_trace import attach_work_amplification, hotpath_stage
 from vibespatial.runtime.precision import (
     KernelClass,
     PrecisionMode,
@@ -106,6 +107,95 @@ _SEMIJOIN_MAX_SEGMENT_PAIR_LANES = 8 * 1024 * 1024
 # Capacity additionally uses at most one quarter of currently available bytes.
 _SEMIJOIN_TILE_BYTES_PER_LANE = 64
 _MORTON_SPAN_BUCKET_UPPER_BOUNDS = (0,) + tuple(1 << exponent for exponent in range(32))
+
+
+def _point_partition_reduction_metrics(
+    plan,
+    *,
+    tree_count: int,
+    pair_budget: int,
+    classification_passes: int,
+    reduction_output_buffers: int,
+) -> tuple[dict[str, int], dict[str, int], tuple[str, ...]]:
+    """Describe host-known reducer capacity without reading device counts."""
+    tree_count = int(tree_count)
+    pair_budget = int(pair_budget)
+    classification_passes = int(classification_passes)
+    reduction_output_buffers = int(reduction_output_buffers)
+    partitions = () if plan is None else tuple(plan.partitions)
+    planned_pair_slots = 0
+    submitted_pair_slots = 0
+    submitted_tiles = 0
+    oversized_partitions = 0
+    max_submitted_tile_slots = 0
+    query_rows = 0
+    for query_start, query_stop, capacity in partitions:
+        query_rows += int(query_stop) - int(query_start)
+        capacity = int(capacity)
+        planned_pair_slots += capacity
+        if capacity > pair_budget:
+            oversized_partitions += 1
+            submitted_pair_slots += tree_count
+            tile_count = (tree_count + pair_budget - 1) // pair_budget
+            submitted_tiles += tile_count
+            if tile_count:
+                max_submitted_tile_slots = max(
+                    max_submitted_tile_slots,
+                    min(tree_count, pair_budget),
+                )
+        elif capacity:
+            submitted_pair_slots += capacity
+            submitted_tiles += 1
+            max_submitted_tile_slots = max(max_submitted_tile_slots, capacity)
+
+    unavailable = [
+        "logical_candidate_pairs",
+        "exact_relation_pairs",
+        "surviving_relation_pairs",
+        "unique_left_rows",
+        "unique_right_rows",
+        "pair_bytes",
+        "terminal_bytes",
+    ]
+    if plan is None:
+        unavailable.extend(
+            (
+                "planned_pair_capacity_slots",
+                "submitted_pair_capacity_slots",
+                "submitted_tile_count",
+            )
+        )
+    sum_metrics = {
+        "consumer_calls": 1,
+        "indexed_rows": tree_count,
+        "reduction_output_slots": tree_count * reduction_output_buffers,
+    }
+    max_metrics = {
+        "indexed_rows_per_call": tree_count,
+        "pair_budget_slots": pair_budget,
+    }
+    if plan is not None:
+        sum_metrics.update(
+            {
+                "query_rows": query_rows,
+                "query_partitions": len(partitions),
+                "planned_pair_capacity_slots": planned_pair_slots,
+                "submitted_pair_capacity_slots": submitted_pair_slots,
+                "exact_classification_capacity_lanes": (
+                    submitted_pair_slots * classification_passes
+                ),
+                "submitted_tile_count": submitted_tiles,
+                "oversized_query_partitions": oversized_partitions,
+            }
+        )
+        max_metrics.update(
+            {
+                "query_rows_per_call": query_rows,
+                "submitted_tile_capacity_slots": max_submitted_tile_slots,
+                "query_partitions_per_call": len(partitions),
+            }
+        )
+    return sum_metrics, max_metrics, tuple(unavailable)
 
 
 def _spatial_reduction_tile_lane_capacity(
@@ -1470,6 +1560,79 @@ def _spatial_index_device_point_partition_right_reduction(
     exclude_native_index=None,
     exclude_plan=None,
 ):
+    """Profile one bounded point-partition relation-reducer invocation."""
+    exclusion_pass = exclude_native_index is not None
+    consumer_kind = (
+        "right_pair_count_exclusion"
+        if exclusion_pass
+        else reduction
+    )
+    stage_name = (
+        "spatial.point_partition.right_pair_count_exclusion.reduce"
+        if exclusion_pass
+        else f"spatial.point_partition.{reduction}.reduce"
+    )
+    with hotpath_stage(stage_name, category="refine") as stage_metadata:
+        result = _spatial_index_device_point_partition_right_reduction_impl(
+            native_index,
+            query_owned,
+            tree_owned,
+            query_bounds,
+            predicate=predicate,
+            query_family=query_family,
+            tree_family=tree_family,
+            precision_plan=precision_plan,
+            pair_budget=pair_budget,
+            reduction=reduction,
+            plan=plan,
+            initial_counts=initial_counts,
+            exclude_native_index=exclude_native_index,
+            exclude_plan=exclude_plan,
+        )
+        if stage_metadata is not None and result is not None:
+            sums, maxima, unavailable = _point_partition_reduction_metrics(
+                plan,
+                tree_count=int(tree_owned.row_count),
+                pair_budget=pair_budget,
+                classification_passes=1,
+                reduction_output_buffers=1,
+            )
+            attach_work_amplification(
+                stage_metadata,
+                operation="point_partition_relation_reduction",
+                metric_family="relation",
+                sums=sums,
+                maxima=maxima,
+                unavailable=unavailable,
+                physical_shape="bounded_candidate_relation_consume",
+                consumer_kind=consumer_kind,
+                semantic_contract={
+                    "capacity_is_not_logical_cardinality": True,
+                    "device_logical_counts_read": False,
+                    "classification_passes_per_submitted_slot": 1,
+                    "exclusion_pass": exclusion_pass,
+                },
+            )
+        return result
+
+
+def _spatial_index_device_point_partition_right_reduction_impl(
+    native_index,
+    query_owned,
+    tree_owned,
+    query_bounds,
+    *,
+    predicate: str | None,
+    query_family: GeometryFamily,
+    tree_family: GeometryFamily,
+    precision_plan: PrecisionPlan | None,
+    pair_budget: int,
+    reduction: str = "right_count",
+    plan=None,
+    initial_counts=None,
+    exclude_native_index=None,
+    exclude_plan=None,
+):
     """Reduce bounded point-partition candidates into indexed-row counts.
 
     When ``exclude_plan`` is present, pairs in that aligned provider's prior
@@ -1682,6 +1845,71 @@ def _spatial_index_device_point_partition_right_reduction(
 
 
 def _spatial_index_device_point_partition_aligned_pair_reduction(
+    native_index,
+    aligned_native_index,
+    query_owned,
+    tree_owned,
+    aligned_tree_owned,
+    query_bounds,
+    *,
+    predicate: str,
+    query_family: GeometryFamily,
+    tree_family: GeometryFamily,
+    aligned_tree_family: GeometryFamily,
+    precision_plan: PrecisionPlan,
+    pair_budget: int,
+    plan=None,
+    aligned_plan=None,
+):
+    """Profile the primary two-relation pass without device observations."""
+    with hotpath_stage(
+        "spatial.point_partition.right_pair_count.reduce",
+        category="refine",
+    ) as stage_metadata:
+        result = _spatial_index_device_point_partition_aligned_pair_reduction_impl(
+            native_index,
+            aligned_native_index,
+            query_owned,
+            tree_owned,
+            aligned_tree_owned,
+            query_bounds,
+            predicate=predicate,
+            query_family=query_family,
+            tree_family=tree_family,
+            aligned_tree_family=aligned_tree_family,
+            precision_plan=precision_plan,
+            pair_budget=pair_budget,
+            plan=plan,
+            aligned_plan=aligned_plan,
+        )
+        if stage_metadata is not None:
+            sums, maxima, unavailable = _point_partition_reduction_metrics(
+                plan,
+                tree_count=int(tree_owned.row_count),
+                pair_budget=pair_budget,
+                classification_passes=2,
+                reduction_output_buffers=3,
+            )
+            attach_work_amplification(
+                stage_metadata,
+                operation="point_partition_relation_reduction",
+                metric_family="relation",
+                sums=sums,
+                maxima=maxima,
+                unavailable=unavailable,
+                physical_shape="bounded_candidate_relation_consume",
+                consumer_kind="right_pair_count",
+                semantic_contract={
+                    "capacity_is_not_logical_cardinality": True,
+                    "device_logical_counts_read": False,
+                    "classification_passes_per_submitted_slot": 2,
+                    "exclusion_pass": False,
+                },
+            )
+        return result
+
+
+def _spatial_index_device_point_partition_aligned_pair_reduction_impl(
     native_index,
     aligned_native_index,
     query_owned,

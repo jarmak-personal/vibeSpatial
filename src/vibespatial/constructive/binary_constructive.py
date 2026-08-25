@@ -71,7 +71,11 @@ from vibespatial.runtime.fallbacks import (
     record_fallback_event,
     strict_native_mode_enabled,
 )
-from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
+from vibespatial.runtime.hotpath_trace import (
+    attach_work_amplification,
+    hotpath_stage,
+    hotpath_timing_enabled,
+)
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import (
     KernelClass,
@@ -167,7 +171,7 @@ def _polygon_constructive_chunk_rows(planned_rows: int) -> int:
 
 
 def _sync_hotpath() -> None:
-    if hotpath_trace_enabled():
+    if hotpath_timing_enabled():
         from vibespatial.cuda._runtime import get_cuda_runtime
 
         get_cuda_runtime().synchronize()
@@ -1992,7 +1996,10 @@ def _dispatch_oriented_multipolygon_polygon_intersection_gpu(
         return None
 
     _sync_hotpath()
-    with hotpath_stage("constructive.intersection.multipart_explode", category="setup"):
+    with hotpath_stage(
+        "constructive.intersection.multipart_explode",
+        category="setup",
+    ) as amplification_metadata:
         multipolygon_rows = _device_take_known_family_rows(
             left,
             cp.asarray(admitted_rows, dtype=cp.int64),
@@ -2002,6 +2009,30 @@ def _dispatch_oriented_multipolygon_polygon_intersection_gpu(
         polygon_parts = _explode_polygonal_rows_to_polygon_capacity_gpu(
             multipolygon_rows,
         )
+        if amplification_metadata is not None:
+            explode_sums = {
+                "input_rows": int(admitted_rows.size),
+                "output_groups": int(left.row_count),
+            }
+            explode_unavailable = [
+                "max_group_size",
+                "input_segments",
+                "input_coordinates",
+                "output_parts",
+                "output_coordinates",
+            ]
+            if polygon_parts is None:
+                explode_unavailable.append("pre_reduction_fragments")
+            else:
+                explode_sums["pre_reduction_fragments"] = int(polygon_parts.capacity)
+            attach_work_amplification(
+                amplification_metadata,
+                operation="constructive.intersection.multipart_explode",
+                metric_family="group_compression",
+                sums=explode_sums,
+                maxima={"row_capacity": int(left.row_count)},
+                unavailable=tuple(explode_unavailable),
+            )
     _sync_hotpath()
     if polygon_parts is None or polygon_parts.capacity == 0:
         return _empty_device_constructive_output(left.row_count)
@@ -2167,7 +2198,10 @@ def _regroup_native_grouped_parts_with_grouped_union_gpu(
     )
 
     _sync_hotpath()
-    with hotpath_stage("constructive.intersection.multipart_union.group_rows", category="setup"):
+    with hotpath_stage(
+        "constructive.intersection.multipart_union.group_rows",
+        category="setup",
+    ) as amplification_metadata:
         d_group_counts = (d_group_offsets[1:] - d_group_offsets[:-1]).astype(
             cp.int64,
             copy=False,
@@ -2255,6 +2289,31 @@ def _regroup_native_grouped_parts_with_grouped_union_gpu(
             )
             d_group_has_nonempty_rest = d_rest_counts_by_group > 0
             compact = None
+        if amplification_metadata is not None:
+            group_sums = {
+                "input_rows": int(d_sorted_order.size),
+                "pre_reduction_fragments": int(valid_parts.row_count),
+                "output_groups": int(d_group_ids.size),
+            }
+            group_maxima = {"group_capacity": int(output_row_count)}
+            group_unavailable = [
+                "input_segments",
+                "input_coordinates",
+                "output_parts",
+                "output_coordinates",
+            ]
+            if group_size_max is None:
+                group_unavailable.append("max_group_size")
+            else:
+                group_maxima["max_group_size"] = int(group_size_max)
+            attach_work_amplification(
+                amplification_metadata,
+                operation="constructive.intersection.multipart_union.group_rows",
+                metric_family="group_compression",
+                sums=group_sums,
+                maxima=group_maxima,
+                unavailable=tuple(group_unavailable),
+            )
     _sync_hotpath()
 
     if compact is None:
@@ -2262,7 +2321,7 @@ def _regroup_native_grouped_parts_with_grouped_union_gpu(
         with hotpath_stage(
             "constructive.intersection.multipart_union.plan.build",
             category="setup",
-        ):
+        ) as amplification_metadata:
             local_same_row_span_summary = same_row_span_summary
             if local_same_row_span_summary is None and bool(use_same_row_fast_path):
                 segment_span = _polygon_segment_span_bound(valid_parts)
@@ -2297,11 +2356,35 @@ def _regroup_native_grouped_parts_with_grouped_union_gpu(
                 _right_geometry_source_rows=d_right_group_rows,
                 _right_segment_source_rows=d_right_group_rows,
             )
+            if amplification_metadata is not None:
+                plan_maxima = {"group_capacity": int(output_row_count)}
+                if group_size_max is not None:
+                    plan_maxima["max_group_size"] = int(group_size_max)
+                plan_unavailable = [
+                    "input_segments",
+                    "input_coordinates",
+                    "output_parts",
+                    "output_coordinates",
+                ]
+                if group_size_max is None:
+                    plan_unavailable.append("max_group_size")
+                attach_work_amplification(
+                    amplification_metadata,
+                    operation="constructive.intersection.multipart_union.plan.build",
+                    metric_family="group_compression",
+                    sums={
+                        "input_rows": int(rest_parts.row_count),
+                        "pre_reduction_fragments": int(valid_parts.row_count),
+                        "output_groups": int(seed_parts.row_count),
+                    },
+                    maxima=plan_maxima,
+                    unavailable=tuple(plan_unavailable),
+                )
         _sync_hotpath()
         with hotpath_stage(
             "constructive.intersection.multipart_union.plan.materialize",
             category="refine",
-        ):
+        ) as amplification_metadata:
             compact, _selected = _materialize_overlay_execution_plan(
                 plan,
                 operation="union",
@@ -2316,6 +2399,29 @@ def _regroup_native_grouped_parts_with_grouped_union_gpu(
                 compact = device_select_owned_capacity_partitions(
                     compact,
                     [(seed_parts, ~d_group_has_nonempty_rest)],
+                )
+            if amplification_metadata is not None:
+                materialize_sums = {
+                    "input_rows": int(rest_parts.row_count),
+                    "pre_reduction_fragments": int(valid_parts.row_count),
+                }
+                materialize_unavailable = [
+                    "input_segments",
+                    "input_coordinates",
+                    "output_parts",
+                    "output_coordinates",
+                ]
+                if compact is None:
+                    materialize_unavailable.append("output_groups")
+                else:
+                    materialize_sums["output_groups"] = int(compact.row_count)
+                attach_work_amplification(
+                    amplification_metadata,
+                    operation="constructive.intersection.multipart_union.plan.materialize",
+                    metric_family="group_compression",
+                    sums=materialize_sums,
+                    maxima={"group_capacity": int(output_row_count)},
+                    unavailable=tuple(materialize_unavailable),
                 )
         _sync_hotpath()
 

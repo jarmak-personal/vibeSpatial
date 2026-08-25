@@ -5,7 +5,7 @@ Scope: Stage-timed profiling entrypoints, NVTX guidance, and trace interpretatio
 Read If: You are profiling join or overlay kernels, adding benchmark rails, or trying to explain where time is going.
 STOP IF: You already have the profiling script open and only need a local implementation detail.
 Source Of Truth: Stage-level profiling workflow for join and overlay kernel development.
-Body Budget: 157/220 lines
+Body Budget: 180/220 lines
 Document: docs/testing/profiling-rails.md
 
 Section Map (Body Lines)
@@ -21,7 +21,7 @@ Section Map (Body Lines)
 | 66-99 | Stage Contracts |
 | 100-110 | Trace Interpretation |
 | 111-125 | NVTX |
-| 126-157 | Shootout Physical Plans |
+| 126-180 | Shootout Physical Plans |
 DOC_HEADER:END -->
 
 This repo now has a dedicated profiling rail for join and overlay kernel work.
@@ -153,6 +153,23 @@ Public shootouts should expose physical-plan evidence when they are used for
 performance decisions. Whole-script medians are not enough once correctness is
 already passing.
 
+Use an explicit shootout replay mode:
+
+```bash
+uv run vsbench shootout benchmarks/shootout --scale 1M --json \
+  --profile-mode counters --output /tmp/shootout-counters.json
+```
+
+- `off` performs no post-timing replay.
+- `counters` records bounded host-known call and physical-shape counters. It
+  does not run nested timers, NVTX, or profiler-only GPU synchronizations.
+- `full` retains synchronized nested timing for stage attribution and Nsight
+  work. It is the backward-compatible default when `--json` is supplied.
+
+The lean timing child always forces hotpath tracing off, including when the
+parent environment enabled tracing. Counter and full data come from a separate
+replay and never replace the lean performance measurement.
+
 Shootout artifacts should report:
 
 - actual backend by stage
@@ -163,7 +180,8 @@ Shootout artifacts should report:
 - statement-level `timed_stages` with source line spans and physical-shape tags
 - `stage_totals_by_tag` and `stage_totals_by_backend`
 - `hotpath_total_seconds`, `composition_overhead_seconds`, and
-  `composition_overhead_ratio`
+  `composition_overhead_ratio` in full mode; these fields are null in counter
+  mode because nested GPU wall time was not measured
 - row-flow counts through joins, overlays, filters, and grouped reductions
 - physical shape tags such as semijoin, anti-semijoin, many-few overlay, mask
   clip, grouped geometry reduce, and area-filter-after-overlay
@@ -171,6 +189,11 @@ Shootout artifacts should report:
 Interpretation rules:
 
 - a passing fingerprint is correctness evidence, not performance evidence
+- compare each replay's total with its lean timed execution; when the replay is
+  more than 2x slower, its wall attribution is unreliable until an explicit
+  observer-effect experiment explains the difference
+- counter-mode call and physical-shape counts remain structural evidence, but
+  they do not become nested stage timing
 - a fast individual kernel does not prove the public workflow shape is fast
 - a GPU-only execution trace with high composition overhead points at public API
   orchestration, scalar synchronization, or frame assembly rather than kernel

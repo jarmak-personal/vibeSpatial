@@ -163,6 +163,7 @@ def _run_timed_sections(script_path, sections, *, run_name):
     return elapsed
 
 
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_START
 def _as_dict_event(event):
     to_dict = getattr(event, "to_dict", None)
     if callable(to_dict):
@@ -398,6 +399,8 @@ def _execute_profiled_timed_sections(
     get_materialization_events,
     materialization_context,
     get_d2h_transfer_stats,
+    reset_hotpath_trace,
+    summarize_hotpath_trace,
 ):
     _preamble_code, timed_code, _postamble_code, timed_source, timed_line_offset = sections
     statements = _compile_timed_statements(script_path, timed_source, timed_line_offset)
@@ -409,6 +412,7 @@ def _execute_profiled_timed_sections(
     stages = []
     total_start = time.perf_counter()
     for stmt in statements:
+        reset_hotpath_trace()
         before_steps = len(getattr(trace, "steps", []))
         before_transfers = len(getattr(trace, "transfers", []))
         before_fallbacks = len(get_fallback_events(clear=False))
@@ -438,6 +442,7 @@ def _execute_profiled_timed_sections(
         }
         stage.update(_profile_execution_deltas(trace, before_steps, before_transfers))
         stage["elapsed_seconds"] = elapsed
+        stage["hotpath"] = summarize_hotpath_trace()
         stage["fallback_event_count"] = max(after_fallbacks - before_fallbacks, 0)
         stage["materialization_event_count"] = len(stage_materialization_events)
         stage["materialization_d2h_event_count"] = sum(
@@ -465,10 +470,21 @@ def _execute_profiled_timed_sections(
 
 
 def _profile_timed_sections(script_path, sections):
+    requested_profile_mode = os.environ.get(
+        "VIBESPATIAL_SHOOTOUT_PROFILE_MODE", "full"
+    ).strip().lower()
+    if requested_profile_mode not in {"counters", "full"}:
+        raise ValueError(
+            "VIBESPATIAL_SHOOTOUT_PROFILE_MODE must be counters or full "
+            "inside a profile replay"
+        )
+    trace_mode = "counter" if requested_profile_mode == "counters" else "full"
     profile = {
         "available": False,
         "backend": "vibespatial",
         "mode": "post_timing_profile",
+        "profile_mode": requested_profile_mode,
+        "hotpath_timing_enabled": requested_profile_mode == "full",
     }
     old_stdout = sys.stdout
     old_hotpath = os.environ.get("VIBESPATIAL_HOTPATH_TRACE")
@@ -476,7 +492,11 @@ def _profile_timed_sections(script_path, sections):
         from vibespatial.bench.pipeline import _OwnedAudit
         from vibespatial.runtime.execution_trace import execution_trace
         from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
-        from vibespatial.runtime.hotpath_trace import reset_hotpath_trace, summarize_hotpath_trace
+        from vibespatial.runtime.hotpath_trace import (
+            aggregate_hotpath_summaries,
+            reset_hotpath_trace,
+            summarize_hotpath_trace,
+        )
         from vibespatial.runtime.materialization import (
             clear_materialization_events,
             get_materialization_events,
@@ -491,7 +511,7 @@ def _profile_timed_sections(script_path, sections):
                 get_d2h_transfer_stats = None
                 reset_d2h_transfer_count = None
 
-        os.environ["VIBESPATIAL_HOTPATH_TRACE"] = "1"
+        os.environ["VIBESPATIAL_HOTPATH_TRACE"] = trace_mode
         clear_fallback_events()
         clear_materialization_events()
         reset_hotpath_trace()
@@ -534,14 +554,30 @@ def _profile_timed_sections(script_path, sections):
                         get_materialization_events=get_materialization_events,
                         materialization_context=materialization_context,
                         get_d2h_transfer_stats=get_d2h_transfer_stats,
+                        reset_hotpath_trace=reset_hotpath_trace,
+                        summarize_hotpath_trace=summarize_hotpath_trace,
                     )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             elapsed = 0.0
         audit.observe(*globals_dict.values())
         fallback_events = [_as_dict_event(event) for event in get_fallback_events(clear=True)]
-        hotpath_summary = summarize_hotpath_trace()[:40]
-        hotpath_total_seconds = sum(float(stage["elapsed_seconds"]) for stage in hotpath_summary)
+        hotpath_summary = (
+            aggregate_hotpath_summaries(
+                [
+                    stage.get("hotpath", [])
+                    for stage in timed_stages
+                    if isinstance(stage.get("hotpath"), list)
+                ]
+            )[:40]
+            if timed_stages
+            else summarize_hotpath_trace()[:40]
+        )
+        hotpath_total_seconds = (
+            sum(float(stage["elapsed_seconds"]) for stage in hotpath_summary)
+            if requested_profile_mode == "full"
+            else None
+        )
         trace_summary = trace.summary() if trace is not None else {}
         trace_steps = [_trace_step_to_dict(step) for step in getattr(trace, "steps", [])[:80]]
         trace_transfers = [
@@ -583,10 +619,14 @@ def _profile_timed_sections(script_path, sections):
             ),
             "owned_transfer_bytes": audit.transfer_bytes,
             "hotpath_total_seconds": hotpath_total_seconds,
-            "composition_overhead_seconds": max(elapsed - hotpath_total_seconds, 0.0),
+            "composition_overhead_seconds": (
+                max(elapsed - hotpath_total_seconds, 0.0)
+                if hotpath_total_seconds is not None
+                else None
+            ),
             "composition_overhead_ratio": (
                 max(elapsed - hotpath_total_seconds, 0.0) / elapsed
-                if elapsed > 0
+                if elapsed > 0 and hotpath_total_seconds is not None
                 else None
             ),
         })
@@ -612,6 +652,7 @@ def _profile_timed_sections(script_path, sections):
         else:
             os.environ["VIBESPATIAL_HOTPATH_TRACE"] = old_hotpath
     return profile
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_END
 
 os.chdir(os.path.dirname(os.path.abspath(script)))
 sections = _load_script_sections(script)
@@ -658,6 +699,7 @@ for i in range(repeat):
         captured_stdout = capture.getvalue()
     samples.append({"elapsed": elapsed, "error": error})
 
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_START
 profile = None
 if do_pipeline_warm and do_profile:
     # Timed-script globals can contain pandas/native-state reference cycles.
@@ -667,6 +709,7 @@ if do_pipeline_warm and do_profile:
     from vibespatial.cuda._runtime import get_cuda_runtime
     get_cuda_runtime().free_pool_memory()
     profile = _profile_timed_sections(script, sections)
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_END
 
 with open(result_path, "w") as f:
     json.dump({
@@ -676,6 +719,20 @@ with open(result_path, "w") as f:
         "environment": _environment_identity(),
     }, f)
 """
+
+_GEOPANDAS_MEASUREMENT_EXCLUDE_START = (
+    "# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_START"
+)
+_GEOPANDAS_MEASUREMENT_EXCLUDE_END = (
+    "# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_END"
+)
+_LEGACY_GEOPANDAS_MEASUREMENT_IDENTITIES = frozenset(
+    {
+        # R0 predates the split comparator/profile contract. This exact harness
+        # was validated on the retained static GeoPandas artifact.
+        "dc9993b4784b881223b29ebb1c17298583f78ae49bf0d7be4f5cf8e3026ecaf8",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -860,6 +917,28 @@ def _measurement_identity() -> str:
     return hashlib.sha256(_HARNESS_CODE.encode()).hexdigest()
 
 
+def _geopandas_measurement_identity(harness_code: str | None = None) -> str:
+    """Hash only the harness code that can execute in the GeoPandas leg."""
+    remaining = _HARNESS_CODE if harness_code is None else harness_code
+    retained: list[str] = []
+    while _GEOPANDAS_MEASUREMENT_EXCLUDE_START in remaining:
+        before, marked = remaining.split(
+            _GEOPANDAS_MEASUREMENT_EXCLUDE_START,
+            1,
+        )
+        if _GEOPANDAS_MEASUREMENT_EXCLUDE_END not in marked:
+            raise RuntimeError("unclosed GeoPandas measurement exclusion")
+        _excluded, remaining = marked.split(
+            _GEOPANDAS_MEASUREMENT_EXCLUDE_END,
+            1,
+        )
+        retained.append(before)
+    if _GEOPANDAS_MEASUREMENT_EXCLUDE_END in remaining:
+        raise RuntimeError("unmatched GeoPandas measurement exclusion")
+    retained.append(remaining)
+    return hashlib.sha256("".join(retained).encode()).hexdigest()
+
+
 def _environment_identity() -> dict[str, Any]:
     packages: dict[str, str | None] = {}
     for name in _BASELINE_PACKAGES:
@@ -970,7 +1049,12 @@ def load_reusable_geopandas_baseline(
         )
     if metadata.get("geopandas_baseline_host") != _baseline_host_identity():
         raise ValueError("cached GeoPandas baseline was measured on a different host")
-    if metadata.get("measurement_sha256") != _measurement_identity():
+    comparator_measurement = metadata.get("geopandas_measurement_sha256")
+    if comparator_measurement is None:
+        legacy_measurement = metadata.get("measurement_sha256")
+        if legacy_measurement not in _LEGACY_GEOPANDAS_MEASUREMENT_IDENTITIES:
+            raise ValueError("cached GeoPandas baseline measurement contract is stale")
+    elif comparator_measurement != _geopandas_measurement_identity():
         raise ValueError("cached GeoPandas baseline measurement contract is stale")
     expected_contract = {
         "repeat": repeat,
@@ -1186,6 +1270,9 @@ def _run_harness(
 ) -> ShootoutRun:
     """Run the timing harness in a subprocess and return results."""
     if profile and not _profile_only:
+        timed_env = dict(env or os.environ)
+        timed_env["VIBESPATIAL_HOTPATH_TRACE"] = "off"
+        timed_env["VIBESPATIAL_HOTPATH_NVTX"] = "off"
         timed_run = _run_harness(
             label=label,
             python_cmd=python_cmd,
@@ -1193,7 +1280,7 @@ def _run_harness(
             repeat=repeat,
             warmup=warmup,
             pipeline_warm=pipeline_warm,
-            env=env,
+            env=timed_env,
             timeout=timeout,
             quiet=quiet,
             profile=False,
@@ -1460,11 +1547,19 @@ def run_shootout(
     quiet: bool = False,
     scale: str | None = None,
     profile: bool = False,
+    profile_mode: str | None = None,
     geopandas_baseline: ShootoutRun | None = None,
     geopandas_baseline_source: str | None = None,
 ) -> ShootoutResult:
     """Run a user script with geopandas and vibespatial, return comparison."""
     from vibespatial.runtime import has_gpu_runtime
+
+    if profile_mode is None:
+        effective_profile_mode = "full" if profile else "off"
+    else:
+        effective_profile_mode = str(profile_mode).strip().lower()
+        if effective_profile_mode not in {"off", "counters", "full"}:
+            raise ValueError("profile_mode must be off, counters, or full")
 
     script = Path(script_path)
     if not script.is_file():
@@ -1534,6 +1629,10 @@ def run_shootout(
     # explicitly select the repo-owned GeoPandas shim for only this leg.  The
     # isolated baseline above must continue to import real upstream GeoPandas.
     vs_env = os.environ.copy()
+    # Shootout timing is always the lean execution. Profiling, when requested,
+    # runs in the isolated replay and selects its own explicit trace mode.
+    vs_env["VIBESPATIAL_HOTPATH_TRACE"] = "off"
+    vs_env["VIBESPATIAL_SHOOTOUT_PROFILE_MODE"] = effective_profile_mode
     _set_repo_shim_precedence(vs_env, enabled=True)
     if scale is not None:
         vs_env["VSBENCH_SCALE"] = scale
@@ -1548,7 +1647,7 @@ def run_shootout(
         env=vs_env,
         timeout=timeout,
         quiet=quiet,
-        profile=profile,
+        profile=effective_profile_mode != "off",
     )
     launch_mode = "subprocess"
     if (
@@ -1563,7 +1662,7 @@ def run_shootout(
             warmup=warmup,
             pipeline_warm=True,
             env=vs_env,
-            profile=profile,
+            profile=effective_profile_mode != "off",
         )
         launch_mode = "in_process_retry"
 
@@ -1612,8 +1711,10 @@ def run_shootout(
         "warmup": warmup,
         "timeout": timeout,
         "measurement_sha256": _measurement_identity(),
+        "geopandas_measurement_sha256": _geopandas_measurement_identity(),
         "vibespatial_source": source_identity(),
         "physical_shapes": _infer_physical_shapes(script),
+        "profile_mode": effective_profile_mode,
         **shootout_workload_identity(script),
         "geopandas_baseline": baseline_mode,
         "geopandas_baseline_host": _baseline_host_identity(),

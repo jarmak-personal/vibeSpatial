@@ -1,0 +1,31 @@
+{
+  "query": "q12",
+  "lane": "dense_bbox_filter_public_exact_distance",
+  "wall_seconds": 24.205464220955037,
+  "row_count": 100,
+  "result_sha256": "d4ff40cfc1971b702f543264d16f20d013b4aaae08e346e5d0f09dce47e33975",
+  "baseline_result_sha256": "7c16ada8366634347571e2bc5309ee74c0b5bce22639c1eb94f817b70aab260c",
+  "same_ordered_tripkeys": true,
+  "max_abs_distance_delta": 6.51581504484966e-06,
+  "max_rel_distance_delta": 7.904508647706993e-08,
+  "suite_tolerance_match": true,
+  "knn_calls": [
+    {
+      "stages": {
+        "prepare": 0.005779300001449883,
+        "dense_seed_lower_bound": 4.19886555604171,
+        "seed_exact_distance": 0.008975871023721993,
+        "dense_candidate_compaction": 0.5924350819550455,
+        "candidate_exact_distance": 0.0029979438986629248,
+        "segmented_top5": 0.03866760595701635
+      },
+      "counts": {
+        "lower_bound_pairs_first_pass": 3057540000,
+        "seed_exact_pairs": 320000,
+        "lower_bound_pairs_second_pass": 3057540000,
+        "exact_candidate_pairs": 100000,
+        "precision_margin": 0.0006895889528095722
+      }
+    }
+  ]
+}
