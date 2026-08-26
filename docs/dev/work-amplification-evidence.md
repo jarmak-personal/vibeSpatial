@@ -22,8 +22,8 @@ Section Map (Body Lines)
 | 78-104 | R1 Capture And Observer Control |
 | 105-139 | Ranked R1 Map |
 | 140-195 | R2 Counterfactuals |
-| 196-222 | Component-First Follow-Up |
-| 223-240 | Decisions |
+| 196-225 | R3 Parent-Aware Decision |
+| 226-240 | Current Decisions |
 DOC_HEADER:END -->
 
 ## Intent
@@ -219,48 +219,48 @@ a 24.205s query. Ordered keys match and distances pass `rtol=1e-6, atol=1e-9`.
 The dense shape is archived instead of being tuned against a now-faster
 candidate.
 
-## Component-First Follow-Up
+## R3 Parent-Aware Decision
 
-The next Q11 falsifier explodes parent MultiPolygons into Polygon components
-outside timing, queries identical public point indexes against component
-bounds, and measures the margin available for a future stable parent reducer.
-One 3,896,103-row trip batch against all five zone partitions records. The
-aggregate wall is from the lean decision arms; every other row is from the
-separate instrumented profile arms and is attribution-only:
+The complete component-to-parent reducer changes the physical relation from
+`(point, parent MultiPolygon)` to ordered `(point, Polygon part, parent)`
+classifications. It preserves holes, stable part order, parent deduplication,
+and endpoints occupying different parts of the same parent. Exact tri-state
+location is required: invalid overlapping MultiPolygons disprove naive Boolean
+OR because GEOS uses the first non-exterior part classification.
 
-| Metric | Parent | Components | Change |
-|---|---:|---:|---:|
-| lean aggregate wall before parent regroup | 2.187s | 2.100s | -3.98% |
-| profile candidate lanes | 52.008M | 50.161M | -3.55% |
-| profile exact-classification GPU span | 1.241s | 1.093s | -11.91% |
-| profile parts considered | 10.496B | 50.161M | -99.52% |
-| profile edge visits | 29.670B | 26.262B | -11.49% |
+One 3,896,103-row Q11 batch against all five zone partitions is 1.979s through
+the final public path versus the frozen 2.244s parent control, an 11.8% win. The
+full cold SF100 Q11 result is exact and falls from 226.18s to 190.56s, a 15.75%
+reduction. The selector is conservative: aligned point indexes,
+`contains`/`contains_properly`, homogeneous non-indirected MultiPolygon rows,
+and measured heavy-tail part amplification. All other shapes retain the prior
+path.
 
-Left and right membership arrays are byte-identical. Component shared counts
-are lower by 1,062 because endpoints may occupy different components of the
-same parent. Production semantics require tri-state component-to-parent
-reduction, stable lineage, hole preservation, and parent-level deduplication.
+Derived-carrier reuse is material. Rebuilding the exploded carrier and its
+prepared point directory for every batch made full Q10 take 228.71s; immutable
+owner reuse reduced the prototype to 109.22s. The final exact tri-state Q10
+attribute arm was 120.38s, however, versus a 114.80s parent control. It was
+removed. Final Q10 is protected at 114.85s, while Q10+Q11 falls from 340.98s to
+305.41s.
 
-The 99.5% part-loop reduction becoming only 4.0% pre-reducer wall is the key
-result: most removed parts were cheap rejects, while edge visits fall only
-11.5%. This is promising enough for one parent-aware reducer experiment but
-does not justify a production carrier or selector.
+The constructive follow-up falsifies the obvious rewrites. Unioning lines
+before equal-radius buffering was about 268x slower at 10K because local stroke
+construction became global line noding. Distributing vegetation intersection
+before union did not complete its one-minute falsifier because it constructed
+the fragments the terminal coverage did not need. Neither graduates.
 
-## Decisions
+## Current Decisions
 
-- Instrumentation remains profiling-only and cannot influence runtime
-  selection. Counter mode is the observer-safe default for broad replays.
-- Ownership auditing must never physicalize a partitioned native composition.
-- Existing classification-once and reduce-before-construct work are the first
-  graduated general mechanisms; this program validates rather than reclaims
-  their already-landed gains.
-- No new production workstream graduates from R2. Q12 dense filtering is
-  archived, and component-first remains an experiment until parent regroup is
-  measured end to end.
-- The final 10K floor is 14/14 exact with a 2.583s vibeSpatial subtotal versus
-  the reused 3.524s comparator. The final full profile is 22 successful and 2
-  deferred, with zero compute D2H, materialization, or fallback.
-- Q10/Q11 point-region refinement remains the highest current recoverable-wall
-  queue. The next admissible experiment is parent-aware component lowering,
-  not another point-index provider, warp scheduler, generic planner, or
-  device-name selector.
+- Instrumentation remains observer-only; counter mode is the safe broad replay.
+- Parent-aware component reduction graduates only for paired membership.
+- Derived immutable carrier reuse is the next broad audit target; no generic
+  cache abstraction is authorized until other carrier families reproduce it.
+- Equal-radius stroke-coverage union is the next high-wall algorithm research
+  target. It needs a dedicated topology contract, not generic union tuning.
+- Q12 dense filtering remains archived; the indexed distance hierarchy stays
+  authoritative pending a different complete-workflow falsifier.
+- The final-source 10K floor is 14/14 exact at 2.609s versus the reused 3.524s
+  comparator. The full pipeline remains 22 successful and 2 deferred with zero
+  compute D2H, materialization, or fallback.
+- Nothing in R3 justifies device-name dispatch or a cross-library planner;
+  selection remains physical-shape- and evidence-derived.

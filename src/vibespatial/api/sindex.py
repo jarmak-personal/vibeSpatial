@@ -1064,14 +1064,10 @@ class SpatialIndex:
             return None, None
         other_tree_owned, _other_flat_index = other._owned_flat_sindex()
 
-        from vibespatial.kernels.core.geometry_analysis import (
-            compute_geometry_bounds_device,
-        )
-
-        query_bounds = compute_geometry_bounds_device(
-            query_input,
-            preserve_indexed_view=True,
-        )
+        # Let the native reducer compute only the bounds required by its
+        # selected physical shape.  Parent-aware multipart lowering works on
+        # Polygon-part bounds and would otherwise pay for unused parent bounds.
+        query_bounds = None
         left_native_index = self._native_spatial_index_for_query()
         right_native_index = other._native_spatial_index_for_query()
         pair_expressions, left_execution = (
@@ -1095,6 +1091,20 @@ class SpatialIndex:
             right_execution = left_execution
         else:
             left_expression, shared_expression = pair_expressions
+            if query_bounds is None:
+                state = query_input._ensure_device_state(
+                    preserve_indexed_view=True,
+                )
+                query_bounds = state.row_bounds
+                if query_bounds is None:
+                    from vibespatial.kernels.core.geometry_analysis import (
+                        compute_geometry_bounds_device,
+                    )
+
+                    query_bounds = compute_geometry_bounds_device(
+                        query_input,
+                        preserve_indexed_view=True,
+                    )
             right_expression, right_execution = (
                 right_native_index.query_right_match_count_expression(
                     query_input,

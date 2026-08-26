@@ -3791,6 +3791,560 @@ def test_sindex_query_pair_aggregate_reduces_candidate_tiles_before_export(
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+@pytest.mark.parametrize("predicate", ["contains", "contains_properly"])
+def test_sindex_query_pair_aggregate_component_parent_matches_distinct_parts(
+    tmp_path,
+    monkeypatch,
+    predicate,
+) -> None:
+    from shapely.geometry import MultiPolygon
+
+    from vibespatial.api import GeoDataFrame, GeoSeries, points_from_xy, read_parquet
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+    from vibespatial.spatial import component_parent_reduction
+
+    source = GeoDataFrame(
+        {
+            "dropoff": points_from_xy([2.5, 20.0], [0.5, 20.0]),
+        },
+        geometry=points_from_xy([0.5, 20.0], [0.5, 20.0]),
+        crs="EPSG:3857",
+    ).rename_geometry("pickup")
+    source["dropoff"] = source["dropoff"].set_crs(source.crs)
+    path = tmp_path / "component-parent-pair.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    source = read_parquet(path)
+    pickup = source.set_geometry("pickup").geometry
+    dropoff = source.set_geometry("dropoff").geometry
+    zones = GeoSeries(
+        [
+            MultiPolygon(
+                [
+                    box(0.0, 0.0, 1.0, 1.0),
+                    box(2.0, 0.0, 3.0, 1.0),
+                    box(4.0, 0.0, 5.0, 1.0),
+                ]
+            )
+        ],
+        crs=source.crs,
+    )
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_COMPONENT_PARENT_MIN_MAX_PARTS",
+        2,
+    )
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_COMPONENT_PARENT_MIN_AVERAGE_EXTRA_PART_LANES",
+        0,
+    )
+
+    clear_dispatch_events()
+    clear_fallback_events()
+    result = pickup.sindex.query_pair_aggregate(
+        dropoff.sindex,
+        zones,
+        predicate=predicate,
+    )
+    dispatch = get_dispatch_events(clear=True)
+
+    assert get_fallback_events(clear=True) == []
+    assert result.to_dict("list") == {
+        "left_count": [1, 0],
+        "right_count": [1, 0],
+        "shared_count": [1, 0],
+    }
+    assert any(
+        event.surface == "vibespatial.api.SpatialIndex.query_pair_aggregate"
+        and "owned_gpu_component_parent_pair_match_count"
+        in event.implementation
+        for event in dispatch
+    )
+    cached = getattr(
+        zones.array._owned,
+        "_component_parent_capacity_cache",
+        None,
+    )
+    assert cached is not None
+    first_components = cached.geometry
+    repeated = pickup.sindex.query_pair_aggregate(
+        dropoff.sindex,
+        zones,
+        predicate=predicate,
+    )
+    assert repeated.to_dict("list") == result.to_dict("list")
+    assert (
+        zones.array._owned._component_parent_capacity_cache.geometry
+        is first_components
+    )
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+@pytest.mark.parametrize("predicate", ["contains", "contains_properly"])
+def test_sindex_query_pair_aggregate_component_parent_preserves_invalid_part_order(
+    tmp_path,
+    monkeypatch,
+    predicate,
+) -> None:
+    from shapely.geometry import MultiPolygon
+
+    from vibespatial.api import GeoDataFrame, GeoSeries, points_from_xy, read_parquet
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+    from vibespatial.spatial import component_parent_reduction
+
+    source = GeoDataFrame(
+        {"dropoff": points_from_xy([1.0, 2.0], [0.5, 0.5])},
+        geometry=points_from_xy([1.0, 2.0], [0.5, 0.5]),
+        crs="EPSG:3857",
+    ).rename_geometry("pickup")
+    source["dropoff"] = source["dropoff"].set_crs(source.crs)
+    path = tmp_path / "component-parent-invalid-overlap.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    source = read_parquet(path)
+    zone = MultiPolygon(
+        [
+            box(0.0, 0.0, 2.0, 2.0),
+            box(1.0, 0.0, 3.0, 2.0),
+            box(4.0, 0.0, 5.0, 1.0),
+        ]
+    )
+    assert not zone.is_valid
+    zone_path = tmp_path / "component-parent-invalid-zone.parquet"
+    GeoDataFrame(
+        {"zone_id": [0]},
+        geometry=GeoSeries([zone], crs=source.crs),
+        crs=source.crs,
+    ).to_parquet(zone_path, geometry_encoding="geoarrow", index=False)
+    zones = read_parquet(zone_path).geometry
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_COMPONENT_PARENT_MIN_MAX_PARTS",
+        2,
+    )
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_COMPONENT_PARENT_MIN_AVERAGE_EXTRA_PART_LANES",
+        0,
+    )
+
+    clear_fallback_events()
+    result = source.set_geometry("pickup").geometry.sindex.query_pair_aggregate(
+        source.set_geometry("dropoff").geometry.sindex,
+        zones,
+        predicate=predicate,
+    )
+
+    assert result.to_dict("list") == {
+        # GEOS scans the invalid overlapping components in stable order:
+        # x=1 is interior in part 0 before it is boundary in part 1, while
+        # x=2 is boundary in part 0 before it is interior in part 1.
+        "left_count": [1, 0],
+        "right_count": [1, 0],
+        "shared_count": [1, 0],
+    }
+    assert get_fallback_events(clear=True) == []
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+@pytest.mark.parametrize("predicate", ["contains", "contains_properly"])
+def test_sindex_query_pair_aggregate_component_parent_matches_shapely_oracle(
+    tmp_path,
+    monkeypatch,
+    predicate,
+) -> None:
+    from shapely.geometry import MultiPolygon, Point, Polygon
+
+    from vibespatial.api import GeoDataFrame, GeoSeries, points_from_xy, read_parquet
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+    from vibespatial.spatial import component_parent_reduction
+
+    xs = np.linspace(-0.25, 8.25, 48)
+    ys = np.linspace(-0.25, 3.25, 20)
+    point_x, point_y = np.meshgrid(xs, ys)
+    point_x = point_x.ravel()
+    point_y = point_y.ravel()
+    points = [Point(x, y) for x, y in zip(point_x, point_y, strict=True)]
+    first = box(0.0, 0.0, 2.0, 2.0)
+    second = box(1.0, 0.0, 3.0, 2.0)
+    shell_with_hole = Polygon(
+        [(4.0, 0.0), (7.0, 0.0), (7.0, 3.0), (4.0, 3.0), (4.0, 0.0)],
+        [[(5.0, 1.0), (6.0, 1.0), (6.0, 2.0), (5.0, 2.0), (5.0, 1.0)]],
+    )
+    zones_host = [
+        MultiPolygon([first, second, box(7.5, 0.0, 8.0, 0.5)]),
+        MultiPolygon([second, first, box(7.5, 1.0, 8.0, 1.5)]),
+        MultiPolygon([box(0.0, 2.5, 0.5, 3.0), box(2.0, 2.5, 2.5, 3.0)]),
+        MultiPolygon([shell_with_hole, box(7.5, 2.0, 8.0, 2.5)]),
+    ]
+    expected = [
+        sum(bool(getattr(zone, predicate)(point)) for zone in zones_host)
+        for point in points
+    ]
+
+    source = GeoDataFrame(
+        {"dropoff": points_from_xy(point_x, point_y)},
+        geometry=points_from_xy(point_x, point_y),
+        crs="EPSG:3857",
+    ).rename_geometry("pickup")
+    source["dropoff"] = source["dropoff"].set_crs(source.crs)
+    source_path = tmp_path / "component-parent-oracle-points.parquet"
+    source.to_parquet(source_path, geometry_encoding="geoarrow", index=False)
+    source = read_parquet(source_path)
+    zone_path = tmp_path / "component-parent-oracle-zones.parquet"
+    GeoDataFrame(
+        {"zone_id": np.arange(len(zones_host), dtype=np.int64)},
+        geometry=GeoSeries(zones_host, crs=source.crs),
+        crs=source.crs,
+    ).to_parquet(zone_path, geometry_encoding="geoarrow", index=False)
+    zones = read_parquet(zone_path).geometry
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_COMPONENT_PARENT_MIN_MAX_PARTS",
+        2,
+    )
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_COMPONENT_PARENT_MIN_AVERAGE_EXTRA_PART_LANES",
+        0,
+    )
+
+    clear_fallback_events()
+    result = source.set_geometry("pickup").geometry.sindex.query_pair_aggregate(
+        source.set_geometry("dropoff").geometry.sindex,
+        zones,
+        predicate=predicate,
+    )
+
+    assert get_fallback_events(clear=True) == []
+    assert result["left_count"].to_numpy().tolist() == expected
+    assert result["right_count"].to_numpy().tolist() == expected
+    assert result["shared_count"].to_numpy().tolist() == expected
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+@pytest.mark.parametrize(
+    "declined_stage",
+    [
+        "spatial.component_parent.derived_component_cache",
+        "spatial.component_parent.left_key_sort",
+        "spatial.component_parent.right_key_sort",
+        "spatial.component_parent.intersection_reduce",
+    ],
+)
+def test_sindex_query_pair_aggregate_component_parent_capacity_failure_no_retry(
+    tmp_path,
+    monkeypatch,
+    declined_stage,
+) -> None:
+    from shapely.geometry import MultiPolygon
+
+    from vibespatial.api import GeoDataFrame, GeoSeries, points_from_xy, read_parquet
+    from vibespatial.spatial import component_parent_reduction
+    from vibespatial.spatial.query_types import CandidateRelationCapacityError
+
+    source = GeoDataFrame(
+        {"dropoff": points_from_xy([2.5, 20.0], [0.5, 20.0])},
+        geometry=points_from_xy([0.5, 20.0], [0.5, 20.0]),
+        crs="EPSG:3857",
+    ).rename_geometry("pickup")
+    source["dropoff"] = source["dropoff"].set_crs(source.crs)
+    path = tmp_path / "component-parent-capacity.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    source = read_parquet(path)
+    zones = GeoSeries(
+        [
+            MultiPolygon(
+                [
+                    box(0.0, 0.0, 1.0, 1.0),
+                    box(2.0, 0.0, 3.0, 1.0),
+                    box(4.0, 0.0, 5.0, 1.0),
+                ]
+            )
+        ],
+        crs=source.crs,
+    )
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_COMPONENT_PARENT_MIN_MAX_PARTS",
+        2,
+    )
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_COMPONENT_PARENT_MIN_AVERAGE_EXTRA_PART_LANES",
+        0,
+    )
+
+    original_require_memory = component_parent_reduction._require_memory
+
+    def _decline_after_relation(*, stage, required_bytes, requested_units):
+        if stage == declined_stage:
+            raise CandidateRelationCapacityError(stage)
+        return original_require_memory(
+            stage=stage,
+            required_bytes=required_bytes,
+            requested_units=requested_units,
+        )
+
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_require_memory",
+        _decline_after_relation,
+    )
+    with pytest.raises(
+        CandidateRelationCapacityError,
+        match=declined_stage.replace(".", r"\."),
+    ):
+        source.set_geometry("pickup").geometry.sindex.query_pair_aggregate(
+            source.set_geometry("dropoff").geometry.sindex,
+            zones,
+            predicate="contains",
+        )
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_pair_aggregate_component_parent_declines_non_point_indexes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from shapely.geometry import LineString, MultiPolygon
+
+    from vibespatial.api import GeoDataFrame, GeoSeries, read_parquet
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+    from vibespatial.spatial import component_parent_reduction
+
+    left = GeoSeries(
+        [
+            LineString([(0, 0), (1, 1)]),
+            LineString([(10, 10), (11, 11)]),
+        ],
+        crs="EPSG:3857",
+    )
+    right = GeoSeries(
+        [
+            LineString([(0, 1), (1, 0)]),
+            LineString([(20, 20), (21, 21)]),
+        ],
+        crs=left.crs,
+    )
+    frame = GeoDataFrame(
+        {"right": right},
+        geometry=left,
+        crs=left.crs,
+    ).rename_geometry("left")
+    frame["right"] = frame["right"].set_crs(frame.crs)
+    zones = GeoSeries(
+        [
+            MultiPolygon(
+                [
+                    box(-1, -1, 2, 2),
+                    box(3, 3, 4, 4),
+                    box(5, 5, 6, 6),
+                ]
+            )
+        ],
+        crs=frame.crs,
+    )
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_COMPONENT_PARENT_MIN_MAX_PARTS",
+        2,
+    )
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_COMPONENT_PARENT_MIN_AVERAGE_EXTRA_PART_LANES",
+        0,
+    )
+    path = tmp_path / "component-parent-aligned-lines.parquet"
+    frame.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    loaded = read_parquet(path)
+
+    clear_fallback_events()
+    result = loaded.set_geometry("left").geometry.sindex.query_pair_aggregate(
+        loaded.set_geometry("right").geometry.sindex,
+        zones,
+        predicate="contains",
+    )
+
+    assert result.to_dict("list") == {
+        "left_count": [1, 0],
+        "right_count": [1, 0],
+        "shared_count": [1, 0],
+    }
+    fallbacks = get_fallback_events(clear=True)
+    assert len(fallbacks) == 1
+    assert fallbacks[0].surface == (
+        "vibespatial.api.SpatialIndex.query_pair_aggregate"
+    )
+    assert "aligned owned geometry" in fallbacks[0].reason
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_pair_aggregate_reuses_non_component_query_bounds(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from shapely.geometry import LineString
+
+    from vibespatial.api import GeoDataFrame, GeoSeries, points_from_xy, read_parquet
+    from vibespatial.kernels.core import geometry_analysis
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+
+    left = GeoSeries(
+        [
+            LineString([(0, 0), (2, 0)]),
+            LineString([(10, 10), (11, 11)]),
+        ],
+        crs="EPSG:3857",
+    )
+    right = GeoSeries(
+        [
+            LineString([(1, -1), (1, 1)]),
+            LineString([(20, 20), (21, 21)]),
+        ],
+        crs=left.crs,
+    )
+    frame = GeoDataFrame(
+        {"right": right},
+        geometry=left,
+        crs=left.crs,
+    ).rename_geometry("left")
+    frame["right"] = frame["right"].set_crs(frame.crs)
+    query = points_from_xy([1, 10, 99], [0, 10, 99], crs=left.crs)
+    original = geometry_analysis.compute_geometry_bounds_device
+    bounds_calls = 0
+
+    def _counted_bounds(*args, **kwargs):
+        nonlocal bounds_calls
+        bounds_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        geometry_analysis,
+        "compute_geometry_bounds_device",
+        _counted_bounds,
+    )
+    path = tmp_path / "component-parent-query-bounds-lines.parquet"
+    frame.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    loaded = read_parquet(path)
+
+    clear_fallback_events()
+    result = loaded.set_geometry("left").geometry.sindex.query_pair_aggregate(
+        loaded.set_geometry("right").geometry.sindex,
+        query,
+        predicate="intersects",
+    )
+
+    assert result.to_dict("list") == {
+        "left_count": [1, 1],
+        "right_count": [1, 0],
+        "shared_count": [1, 0],
+    }
+    assert get_fallback_events(clear=True) == []
+    assert bounds_calls == 1
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_pair_aggregate_waits_for_component_cache_across_streams(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import cupy as cp
+    from shapely.geometry import MultiPolygon
+
+    from vibespatial.api import GeoDataFrame, GeoSeries, points_from_xy, read_parquet
+    from vibespatial.api._native_state import NativeStreamReadiness
+    from vibespatial.spatial import component_parent_reduction
+
+    source = GeoDataFrame(
+        {"dropoff": points_from_xy([0.5, 2.5], [0.5, 0.5])},
+        geometry=points_from_xy([0.5, 2.5], [0.5, 0.5]),
+        crs="EPSG:3857",
+    ).rename_geometry("pickup")
+    source["dropoff"] = source["dropoff"].set_crs(source.crs)
+    source_path = tmp_path / "component-parent-stream-points.parquet"
+    source.to_parquet(source_path, geometry_encoding="geoarrow", index=False)
+    source = read_parquet(source_path)
+    zones = GeoSeries(
+        [
+            MultiPolygon(
+                [
+                    box(0, 0, 1, 1),
+                    box(10, 0, 11, 1),
+                    box(20, 0, 21, 1),
+                ]
+            ),
+            MultiPolygon(
+                [
+                    box(2, 0, 3, 1),
+                    box(12, 0, 13, 1),
+                    box(22, 0, 23, 1),
+                ]
+            ),
+        ],
+        crs=source.crs,
+    )
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_COMPONENT_PARENT_MIN_MAX_PARTS",
+        2,
+    )
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_COMPONENT_PARENT_MIN_AVERAGE_EXTRA_PART_LANES",
+        0,
+    )
+    pickup = source.set_geometry("pickup").geometry
+    dropoff = source.set_geometry("dropoff").geometry
+    expected = {
+        "left_count": [1, 1],
+        "right_count": [1, 1],
+        "shared_count": [1, 1],
+    }
+    assert pickup.sindex.query_pair_aggregate(
+        dropoff.sindex,
+        zones,
+        predicate="contains",
+    ).to_dict("list") == expected
+    cached = zones.array._owned._component_parent_capacity_cache
+    valid_parent_rows = cached.parent_rows.copy()
+    cached.parent_rows.fill(cp.int32(0))
+    cp.cuda.get_current_stream().synchronize()
+
+    delay = cp.RawKernel(
+        r'''
+        extern "C" __global__ void component_parent_test_delay(
+            unsigned long long cycles
+        ) {
+            const unsigned long long start = clock64();
+            while (clock64() - start < cycles) { }
+        }
+        ''',
+        "component_parent_test_delay",
+    )
+    producer = cp.cuda.Stream(non_blocking=True)
+    with producer:
+        delay((1,), (1,), (np.uint64(50_000_000),))
+        cp.copyto(cached.parent_rows, valid_parent_rows)
+        event = cp.cuda.Event(disable_timing=True)
+        event.record(producer)
+    object.__setattr__(
+        cached,
+        "readiness",
+        NativeStreamReadiness(stream=producer, event=event, ready=False),
+    )
+
+    result = pickup.sindex.query_pair_aggregate(
+        dropoff.sindex,
+        zones,
+        predicate="contains",
+    )
+    producer.synchronize()
+
+    assert result.to_dict("list") == expected
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
 def test_sindex_query_pair_aggregate_respects_explicit_cpu_mode(tmp_path) -> None:
     from vibespatial.api import GeoDataFrame, GeoSeries, points_from_xy, read_parquet
     from vibespatial.api._native_public_arrays import NativeNumericExpressionArray

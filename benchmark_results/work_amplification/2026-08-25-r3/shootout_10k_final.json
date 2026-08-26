@@ -1,0 +1,1359 @@
+{
+  "schema_version": 2,
+  "type": "shootout_suite",
+  "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout",
+  "metadata": {
+    "repeat": 3,
+    "warmup": true,
+    "scale": "10K",
+    "script_count": 14,
+    "passed": 14,
+    "failed": 0,
+    "profile_mode": "off",
+    "geopandas_baseline": "reused"
+  },
+  "results": [
+    {
+      "schema_version": 2,
+      "type": "shootout",
+      "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/accessibility_redevelopment.py",
+      "status": "pass",
+      "status_reason": "ok",
+      "geopandas": {
+        "label": "geopandas",
+        "timing": {
+          "mean_seconds": 0.20943440403789282,
+          "median_seconds": 0.2094416170148179,
+          "min_seconds": 0.20893454202450812,
+          "max_seconds": 0.20992705307435244,
+          "stddev_seconds": 0.0004962948380679192,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=37 bounds=(-82.44, 27.8, -82.36, 27.84) convex_hull_area=0.00\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.5.2",
+            "pandas": "3.0.5",
+            "pyarrow": "25.0.1",
+            "pyogrio": "0.13.0",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "vibespatial": {
+        "label": "vibespatial",
+        "timing": {
+          "mean_seconds": 0.3425912823295221,
+          "median_seconds": 0.3413583739893511,
+          "min_seconds": 0.33743025606963784,
+          "max_seconds": 0.3489852169295773,
+          "stddev_seconds": 0.005875315085178885,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=37 bounds=(-82.44, 27.8, -82.36, 27.84) convex_hull_area=0.00\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.4.3",
+            "pandas": "3.0.1",
+            "pyarrow": "23.0.1",
+            "pyogrio": "0.12.1",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "speedup": 0.6135534762693461,
+      "metadata": {
+        "repeat": 3,
+        "warmup": true,
+        "timeout": 300,
+        "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+        "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+        "vibespatial_source": {
+          "package_version": "0.5.2",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+          "tracked_source_dirty": true,
+          "untracked_source_files": [
+            "src/vibespatial/spatial/component_parent_reduction.py"
+          ],
+          "worktree_source_sha256": "484d468570bd19d182693e8866f00824a7c265cb9c1a7401c848f2055a087018",
+          "python_version": "3.13.12"
+        },
+        "physical_shapes": [
+          "semijoin",
+          "many_few_overlay",
+          "mask_clip",
+          "grouped_geometry_reduce",
+          "mask_construction"
+        ],
+        "profile_mode": "off",
+        "workload_key": "accessibility_redevelopment.py",
+        "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+        "geopandas_baseline": "reused",
+        "geopandas_baseline_host": {
+          "node": "picard-4090",
+          "machine": "x86_64",
+          "processor": "x86_64",
+          "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+        },
+        "geopandas_baseline_environment_sha256": "7d2be1f8de157e502816baae4bbadf090fa010c9f4a3842c33f000b4ac8800d0",
+        "geopandas_baseline_source": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/shootout_10k_final.json",
+        "scale": "10K",
+        "vibespatial_launch": "subprocess",
+        "fingerprint": "match",
+        "fingerprint_geopandas": "rows=37 bounds=(-82.44, 27.8, -82.36, 27.84) convex_hull_area=0.00",
+        "fingerprint_vibespatial": "rows=37 bounds=(-82.44, 27.8, -82.36, 27.84) convex_hull_area=0.00"
+      }
+    },
+    {
+      "schema_version": 2,
+      "type": "shootout",
+      "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/corridor_flood_priority.py",
+      "status": "pass",
+      "status_reason": "ok",
+      "geopandas": {
+        "label": "geopandas",
+        "timing": {
+          "mean_seconds": 0.1623448159856101,
+          "median_seconds": 0.16244504391215742,
+          "min_seconds": 0.16107863700017333,
+          "max_seconds": 0.16351076704449952,
+          "stddev_seconds": 0.0012191588764691444,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=5 bounds=(495.17, 671.39, 504.83, 681.78) convex_hull_area=12.15\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.5.2",
+            "pandas": "3.0.5",
+            "pyarrow": "25.0.1",
+            "pyogrio": "0.13.0",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "vibespatial": {
+        "label": "vibespatial",
+        "timing": {
+          "mean_seconds": 0.25611572635049623,
+          "median_seconds": 0.2573385330615565,
+          "min_seconds": 0.2513592269970104,
+          "max_seconds": 0.2596494189929217,
+          "stddev_seconds": 0.004278231295959644,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=5 bounds=(495.17, 671.39, 504.83, 681.78) convex_hull_area=12.15\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.4.3",
+            "pandas": "3.0.1",
+            "pyarrow": "23.0.1",
+            "pyogrio": "0.12.1",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "speedup": 0.6312503688411865,
+      "metadata": {
+        "repeat": 3,
+        "warmup": true,
+        "timeout": 300,
+        "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+        "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+        "vibespatial_source": {
+          "package_version": "0.5.2",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+          "tracked_source_dirty": true,
+          "untracked_source_files": [
+            "src/vibespatial/spatial/component_parent_reduction.py"
+          ],
+          "worktree_source_sha256": "484d468570bd19d182693e8866f00824a7c265cb9c1a7401c848f2055a087018",
+          "python_version": "3.13.12"
+        },
+        "physical_shapes": [
+          "semijoin",
+          "many_few_overlay",
+          "mask_clip",
+          "grouped_geometry_reduce",
+          "mask_construction"
+        ],
+        "profile_mode": "off",
+        "workload_key": "corridor_flood_priority.py",
+        "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+        "geopandas_baseline": "reused",
+        "geopandas_baseline_host": {
+          "node": "picard-4090",
+          "machine": "x86_64",
+          "processor": "x86_64",
+          "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+        },
+        "geopandas_baseline_environment_sha256": "7d2be1f8de157e502816baae4bbadf090fa010c9f4a3842c33f000b4ac8800d0",
+        "geopandas_baseline_source": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/shootout_10k_final.json",
+        "scale": "10K",
+        "vibespatial_launch": "subprocess",
+        "fingerprint": "match",
+        "fingerprint_geopandas": "rows=5 bounds=(495.17, 671.39, 504.83, 681.78) convex_hull_area=12.15",
+        "fingerprint_vibespatial": "rows=5 bounds=(495.17, 671.39, 504.83, 681.78) convex_hull_area=12.15"
+      }
+    },
+    {
+      "schema_version": 2,
+      "type": "shootout",
+      "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/emergency_response_catchments.py",
+      "status": "pass",
+      "status_reason": "ok",
+      "geopandas": {
+        "label": "geopandas",
+        "timing": {
+          "mean_seconds": 0.09123617166187614,
+          "median_seconds": 0.09104421501979232,
+          "min_seconds": 0.09042031201533973,
+          "max_seconds": 0.09224398795049638,
+          "stddev_seconds": 0.0009268678403350918,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=9 bounds=(300.0, 396.44, 700.0, 666.81) convex_hull_area=379219.33\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.5.2",
+            "pandas": "3.0.5",
+            "pyarrow": "25.0.1",
+            "pyogrio": "0.13.0",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "vibespatial": {
+        "label": "vibespatial",
+        "timing": {
+          "mean_seconds": 0.1965206019813195,
+          "median_seconds": 0.19438775000162423,
+          "min_seconds": 0.19345724396407604,
+          "max_seconds": 0.2017168119782582,
+          "stddev_seconds": 0.0045240368169028764,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=9 bounds=(300.0, 396.44, 700.0, 666.81) convex_hull_area=379219.33\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.4.3",
+            "pandas": "3.0.1",
+            "pyarrow": "23.0.1",
+            "pyogrio": "0.12.1",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "speedup": 0.4683639530733371,
+      "metadata": {
+        "repeat": 3,
+        "warmup": true,
+        "timeout": 300,
+        "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+        "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+        "vibespatial_source": {
+          "package_version": "0.5.2",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+          "tracked_source_dirty": true,
+          "untracked_source_files": [
+            "src/vibespatial/spatial/component_parent_reduction.py"
+          ],
+          "worktree_source_sha256": "484d468570bd19d182693e8866f00824a7c265cb9c1a7401c848f2055a087018",
+          "python_version": "3.13.12"
+        },
+        "physical_shapes": [
+          "semijoin",
+          "many_few_overlay",
+          "mask_clip",
+          "grouped_geometry_reduce",
+          "area_filter_after_overlay",
+          "mask_construction"
+        ],
+        "profile_mode": "off",
+        "workload_key": "emergency_response_catchments.py",
+        "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+        "geopandas_baseline": "reused",
+        "geopandas_baseline_host": {
+          "node": "picard-4090",
+          "machine": "x86_64",
+          "processor": "x86_64",
+          "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+        },
+        "geopandas_baseline_environment_sha256": "7d2be1f8de157e502816baae4bbadf090fa010c9f4a3842c33f000b4ac8800d0",
+        "geopandas_baseline_source": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/shootout_10k_final.json",
+        "scale": "10K",
+        "vibespatial_launch": "subprocess",
+        "fingerprint": "match",
+        "fingerprint_geopandas": "rows=9 bounds=(300.0, 396.44, 700.0, 666.81) convex_hull_area=379219.33",
+        "fingerprint_vibespatial": "rows=9 bounds=(300.0, 396.44, 700.0, 666.81) convex_hull_area=379219.33"
+      }
+    },
+    {
+      "schema_version": 2,
+      "type": "shootout",
+      "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/flood_exposure.py",
+      "status": "pass",
+      "status_reason": "ok",
+      "geopandas": {
+        "label": "geopandas",
+        "timing": {
+          "mean_seconds": 0.038354746686915554,
+          "median_seconds": 0.038609229028224945,
+          "min_seconds": 0.03698331804480404,
+          "max_seconds": 0.03947169298771769,
+          "stddev_seconds": 0.001263555859730333,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=1440 bounds=(-5.0, 5.0, 1005.0, 795.0) convex_hull_area=11291574.57\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.5.2",
+            "pandas": "3.0.5",
+            "pyarrow": "25.0.1",
+            "pyogrio": "0.13.0",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "vibespatial": {
+        "label": "vibespatial",
+        "timing": {
+          "mean_seconds": 0.024127262372833986,
+          "median_seconds": 0.024057319038547575,
+          "min_seconds": 0.023454142035916448,
+          "max_seconds": 0.024870326044037938,
+          "stddev_seconds": 0.000710678083750363,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=1440 bounds=(-5.0, 5.0, 1005.0, 795.0) convex_hull_area=11291574.57\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.4.3",
+            "pandas": "3.0.1",
+            "pyarrow": "23.0.1",
+            "pyogrio": "0.12.1",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "speedup": 1.6048849402695504,
+      "metadata": {
+        "repeat": 3,
+        "warmup": true,
+        "timeout": 300,
+        "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+        "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+        "vibespatial_source": {
+          "package_version": "0.5.2",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+          "tracked_source_dirty": true,
+          "untracked_source_files": [
+            "src/vibespatial/spatial/component_parent_reduction.py"
+          ],
+          "worktree_source_sha256": "484d468570bd19d182693e8866f00824a7c265cb9c1a7401c848f2055a087018",
+          "python_version": "3.13.12"
+        },
+        "physical_shapes": [
+          "semijoin"
+        ],
+        "profile_mode": "off",
+        "workload_key": "flood_exposure.py",
+        "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+        "geopandas_baseline": "reused",
+        "geopandas_baseline_host": {
+          "node": "picard-4090",
+          "machine": "x86_64",
+          "processor": "x86_64",
+          "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+        },
+        "geopandas_baseline_environment_sha256": "7d2be1f8de157e502816baae4bbadf090fa010c9f4a3842c33f000b4ac8800d0",
+        "geopandas_baseline_source": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/shootout_10k_final.json",
+        "scale": "10K",
+        "vibespatial_launch": "subprocess",
+        "fingerprint": "match",
+        "fingerprint_geopandas": "rows=1440 bounds=(-5.0, 5.0, 1005.0, 795.0) convex_hull_area=11291574.57",
+        "fingerprint_vibespatial": "rows=1440 bounds=(-5.0, 5.0, 1005.0, 795.0) convex_hull_area=11291574.57"
+      }
+    },
+    {
+      "schema_version": 2,
+      "type": "shootout",
+      "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/habitat_corridor_compliance.py",
+      "status": "pass",
+      "status_reason": "ok",
+      "geopandas": {
+        "label": "geopandas",
+        "timing": {
+          "mean_seconds": 0.13023858734716973,
+          "median_seconds": 0.13071814901195467,
+          "min_seconds": 0.12884530099108815,
+          "max_seconds": 0.13115231203846633,
+          "stddev_seconds": 0.0012259932854341935,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=7 bounds=(510.0, 340.0, 673.21, 460.0) convex_hull_area=44744.83\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.5.2",
+            "pandas": "3.0.5",
+            "pyarrow": "25.0.1",
+            "pyogrio": "0.13.0",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "vibespatial": {
+        "label": "vibespatial",
+        "timing": {
+          "mean_seconds": 0.2469595306320116,
+          "median_seconds": 0.24620814493391663,
+          "min_seconds": 0.2453446629224345,
+          "max_seconds": 0.24932578403968364,
+          "stddev_seconds": 0.002094222215532054,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=7 bounds=(510.0, 340.0, 673.21, 460.0) convex_hull_area=44744.83\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.4.3",
+            "pandas": "3.0.1",
+            "pyarrow": "23.0.1",
+            "pyogrio": "0.12.1",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "speedup": 0.5309253641752592,
+      "metadata": {
+        "repeat": 3,
+        "warmup": true,
+        "timeout": 300,
+        "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+        "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+        "vibespatial_source": {
+          "package_version": "0.5.2",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+          "tracked_source_dirty": true,
+          "untracked_source_files": [
+            "src/vibespatial/spatial/component_parent_reduction.py"
+          ],
+          "worktree_source_sha256": "484d468570bd19d182693e8866f00824a7c265cb9c1a7401c848f2055a087018",
+          "python_version": "3.13.12"
+        },
+        "physical_shapes": [
+          "semijoin",
+          "mask_clip",
+          "grouped_geometry_reduce",
+          "mask_construction"
+        ],
+        "profile_mode": "off",
+        "workload_key": "habitat_corridor_compliance.py",
+        "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+        "geopandas_baseline": "reused",
+        "geopandas_baseline_host": {
+          "node": "picard-4090",
+          "machine": "x86_64",
+          "processor": "x86_64",
+          "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+        },
+        "geopandas_baseline_environment_sha256": "7d2be1f8de157e502816baae4bbadf090fa010c9f4a3842c33f000b4ac8800d0",
+        "geopandas_baseline_source": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/shootout_10k_final.json",
+        "scale": "10K",
+        "vibespatial_launch": "subprocess",
+        "fingerprint": "match",
+        "fingerprint_geopandas": "rows=7 bounds=(510.0, 340.0, 673.21, 460.0) convex_hull_area=44744.83",
+        "fingerprint_vibespatial": "rows=7 bounds=(510.0, 340.0, 673.21, 460.0) convex_hull_area=44744.83"
+      }
+    },
+    {
+      "schema_version": 2,
+      "type": "shootout",
+      "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/insurance_flood_screening.py",
+      "status": "pass",
+      "status_reason": "ok",
+      "geopandas": {
+        "label": "geopandas",
+        "timing": {
+          "mean_seconds": 0.041496521017203726,
+          "median_seconds": 0.041232140036299825,
+          "min_seconds": 0.04096826503518969,
+          "max_seconds": 0.04228915798012167,
+          "stddev_seconds": 0.0006990082405026102,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=80 bounds=(300.0, 300.0, 700.0, 700.0) convex_hull_area=3761.69\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.5.2",
+            "pandas": "3.0.5",
+            "pyarrow": "25.0.1",
+            "pyogrio": "0.13.0",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "vibespatial": {
+        "label": "vibespatial",
+        "timing": {
+          "mean_seconds": 0.19864227436482906,
+          "median_seconds": 0.1991416080854833,
+          "min_seconds": 0.19501044205389917,
+          "max_seconds": 0.2017747729551047,
+          "stddev_seconds": 0.0034096984850112257,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=80 bounds=(300.0, 300.0, 700.0, 700.0) convex_hull_area=3761.69\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.4.3",
+            "pandas": "3.0.1",
+            "pyarrow": "23.0.1",
+            "pyogrio": "0.12.1",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "speedup": 0.2070493476109752,
+      "metadata": {
+        "repeat": 3,
+        "warmup": true,
+        "timeout": 300,
+        "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+        "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+        "vibespatial_source": {
+          "package_version": "0.5.2",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+          "tracked_source_dirty": true,
+          "untracked_source_files": [
+            "src/vibespatial/spatial/component_parent_reduction.py"
+          ],
+          "worktree_source_sha256": "484d468570bd19d182693e8866f00824a7c265cb9c1a7401c848f2055a087018",
+          "python_version": "3.13.12"
+        },
+        "physical_shapes": [
+          "semijoin",
+          "many_few_overlay",
+          "area_filter_after_overlay"
+        ],
+        "profile_mode": "off",
+        "workload_key": "insurance_flood_screening.py",
+        "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+        "geopandas_baseline": "reused",
+        "geopandas_baseline_host": {
+          "node": "picard-4090",
+          "machine": "x86_64",
+          "processor": "x86_64",
+          "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+        },
+        "geopandas_baseline_environment_sha256": "7d2be1f8de157e502816baae4bbadf090fa010c9f4a3842c33f000b4ac8800d0",
+        "geopandas_baseline_source": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/shootout_10k_final.json",
+        "scale": "10K",
+        "vibespatial_launch": "subprocess",
+        "fingerprint": "match",
+        "fingerprint_geopandas": "rows=80 bounds=(300.0, 300.0, 700.0, 700.0) convex_hull_area=3761.69",
+        "fingerprint_vibespatial": "rows=80 bounds=(300.0, 300.0, 700.0, 700.0) convex_hull_area=3761.69"
+      }
+    },
+    {
+      "schema_version": 2,
+      "type": "shootout",
+      "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/nearby_buildings.py",
+      "status": "pass",
+      "status_reason": "ok",
+      "geopandas": {
+        "label": "geopandas",
+        "timing": {
+          "mean_seconds": 0.09349780867341906,
+          "median_seconds": 0.09325631405226886,
+          "min_seconds": 0.09269538801163435,
+          "max_seconds": 0.09454172395635396,
+          "stddev_seconds": 0.0009465615902963068,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=11 bounds=(-82.75, 27.84, -82.73, 27.87) convex_hull_area=0.00\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.5.2",
+            "pandas": "3.0.5",
+            "pyarrow": "25.0.1",
+            "pyogrio": "0.13.0",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "vibespatial": {
+        "label": "vibespatial",
+        "timing": {
+          "mean_seconds": 0.06420608268429835,
+          "median_seconds": 0.051377931027673185,
+          "min_seconds": 0.049513568985275924,
+          "max_seconds": 0.09172674803994596,
+          "stddev_seconds": 0.02385181812083598,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=11 bounds=(-82.75, 27.84, -82.73, 27.87) convex_hull_area=0.00\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.4.3",
+            "pandas": "3.0.1",
+            "pyarrow": "23.0.1",
+            "pyogrio": "0.12.1",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "speedup": 1.815104504734516,
+      "metadata": {
+        "repeat": 3,
+        "warmup": true,
+        "timeout": 300,
+        "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+        "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+        "vibespatial_source": {
+          "package_version": "0.5.2",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+          "tracked_source_dirty": true,
+          "untracked_source_files": [
+            "src/vibespatial/spatial/component_parent_reduction.py"
+          ],
+          "worktree_source_sha256": "484d468570bd19d182693e8866f00824a7c265cb9c1a7401c848f2055a087018",
+          "python_version": "3.13.12"
+        },
+        "physical_shapes": [],
+        "profile_mode": "off",
+        "workload_key": "nearby_buildings.py",
+        "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+        "geopandas_baseline": "reused",
+        "geopandas_baseline_host": {
+          "node": "picard-4090",
+          "machine": "x86_64",
+          "processor": "x86_64",
+          "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+        },
+        "geopandas_baseline_environment_sha256": "7d2be1f8de157e502816baae4bbadf090fa010c9f4a3842c33f000b4ac8800d0",
+        "geopandas_baseline_source": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/shootout_10k_final.json",
+        "scale": "10K",
+        "vibespatial_launch": "subprocess",
+        "fingerprint": "match",
+        "fingerprint_geopandas": "rows=11 bounds=(-82.75, 27.84, -82.73, 27.87) convex_hull_area=0.00",
+        "fingerprint_vibespatial": "rows=11 bounds=(-82.75, 27.84, -82.73, 27.87) convex_hull_area=0.00"
+      }
+    },
+    {
+      "schema_version": 2,
+      "type": "shootout",
+      "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/network_service_area.py",
+      "status": "pass",
+      "status_reason": "ok",
+      "geopandas": {
+        "label": "geopandas",
+        "timing": {
+          "mean_seconds": 0.09667541300101827,
+          "median_seconds": 0.09672399400733411,
+          "min_seconds": 0.09656247403472662,
+          "max_seconds": 0.09673977096099406,
+          "stddev_seconds": 0.00009812561157499227,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=1 bounds=(300.0, 300.0, 700.0, 700.0) convex_hull_area=120000.00\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.5.2",
+            "pandas": "3.0.5",
+            "pyarrow": "25.0.1",
+            "pyogrio": "0.13.0",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "vibespatial": {
+        "label": "vibespatial",
+        "timing": {
+          "mean_seconds": 0.095828485636351,
+          "median_seconds": 0.0944266989827156,
+          "min_seconds": 0.09005470992997289,
+          "max_seconds": 0.10300404799636453,
+          "stddev_seconds": 0.006587495233862237,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=1 bounds=(300.0, 300.0, 700.0, 700.0) convex_hull_area=120000.00\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.4.3",
+            "pandas": "3.0.1",
+            "pyarrow": "23.0.1",
+            "pyogrio": "0.12.1",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "speedup": 1.0243288714883385,
+      "metadata": {
+        "repeat": 3,
+        "warmup": true,
+        "timeout": 300,
+        "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+        "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+        "vibespatial_source": {
+          "package_version": "0.5.2",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+          "tracked_source_dirty": true,
+          "untracked_source_files": [
+            "src/vibespatial/spatial/component_parent_reduction.py"
+          ],
+          "worktree_source_sha256": "484d468570bd19d182693e8866f00824a7c265cb9c1a7401c848f2055a087018",
+          "python_version": "3.13.12"
+        },
+        "physical_shapes": [
+          "mask_clip",
+          "grouped_geometry_reduce",
+          "mask_construction"
+        ],
+        "profile_mode": "off",
+        "workload_key": "network_service_area.py",
+        "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+        "geopandas_baseline": "reused",
+        "geopandas_baseline_host": {
+          "node": "picard-4090",
+          "machine": "x86_64",
+          "processor": "x86_64",
+          "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+        },
+        "geopandas_baseline_environment_sha256": "7d2be1f8de157e502816baae4bbadf090fa010c9f4a3842c33f000b4ac8800d0",
+        "geopandas_baseline_source": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/shootout_10k_final.json",
+        "scale": "10K",
+        "vibespatial_launch": "subprocess",
+        "fingerprint": "match",
+        "fingerprint_geopandas": "rows=1 bounds=(300.0, 300.0, 700.0, 700.0) convex_hull_area=120000.00",
+        "fingerprint_vibespatial": "rows=1 bounds=(300.0, 300.0, 700.0, 700.0) convex_hull_area=120000.00"
+      }
+    },
+    {
+      "schema_version": 2,
+      "type": "shootout",
+      "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/parcel_zoning.py",
+      "status": "pass",
+      "status_reason": "ok",
+      "geopandas": {
+        "label": "geopandas",
+        "timing": {
+          "mean_seconds": 0.06728193470432113,
+          "median_seconds": 0.06766178808175027,
+          "min_seconds": 0.06612047099042684,
+          "max_seconds": 0.06806354504078627,
+          "stddev_seconds": 0.0010257195681828907,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=1075 bounds=(628.01, 328.07, 800.0, 688.65) convex_hull_area=59556.88\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.5.2",
+            "pandas": "3.0.5",
+            "pyarrow": "25.0.1",
+            "pyogrio": "0.13.0",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "vibespatial": {
+        "label": "vibespatial",
+        "timing": {
+          "mean_seconds": 0.10883137735072523,
+          "median_seconds": 0.10912554909009486,
+          "min_seconds": 0.10762042901478708,
+          "max_seconds": 0.10974815394729376,
+          "stddev_seconds": 0.001093940631974814,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=1075 bounds=(628.01, 328.07, 800.0, 688.65) convex_hull_area=59556.88\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.4.3",
+            "pandas": "3.0.1",
+            "pyarrow": "23.0.1",
+            "pyogrio": "0.12.1",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "speedup": 0.6200361752671522,
+      "metadata": {
+        "repeat": 3,
+        "warmup": true,
+        "timeout": 300,
+        "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+        "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+        "vibespatial_source": {
+          "package_version": "0.5.2",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+          "tracked_source_dirty": true,
+          "untracked_source_files": [
+            "src/vibespatial/spatial/component_parent_reduction.py"
+          ],
+          "worktree_source_sha256": "484d468570bd19d182693e8866f00824a7c265cb9c1a7401c848f2055a087018",
+          "python_version": "3.13.12"
+        },
+        "physical_shapes": [
+          "many_few_overlay"
+        ],
+        "profile_mode": "off",
+        "workload_key": "parcel_zoning.py",
+        "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+        "geopandas_baseline": "reused",
+        "geopandas_baseline_host": {
+          "node": "picard-4090",
+          "machine": "x86_64",
+          "processor": "x86_64",
+          "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+        },
+        "geopandas_baseline_environment_sha256": "7d2be1f8de157e502816baae4bbadf090fa010c9f4a3842c33f000b4ac8800d0",
+        "geopandas_baseline_source": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/shootout_10k_final.json",
+        "scale": "10K",
+        "vibespatial_launch": "subprocess",
+        "fingerprint": "match",
+        "fingerprint_geopandas": "rows=1075 bounds=(628.01, 328.07, 800.0, 688.65) convex_hull_area=59556.88",
+        "fingerprint_vibespatial": "rows=1075 bounds=(628.01, 328.07, 800.0, 688.65) convex_hull_area=59556.88"
+      }
+    },
+    {
+      "schema_version": 2,
+      "type": "shootout",
+      "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/redevelopment_screening.py",
+      "status": "pass",
+      "status_reason": "ok",
+      "geopandas": {
+        "label": "geopandas",
+        "timing": {
+          "mean_seconds": 0.71853980437542,
+          "median_seconds": 0.7172589600086212,
+          "min_seconds": 0.7142083090730011,
+          "max_seconds": 0.7241521440446377,
+          "stddev_seconds": 0.0050941520594457715,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=4 bounds=(639.35, 328.07, 844.02, 650.0) convex_hull_area=116700.36\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.5.2",
+            "pandas": "3.0.5",
+            "pyarrow": "25.0.1",
+            "pyogrio": "0.13.0",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "vibespatial": {
+        "label": "vibespatial",
+        "timing": {
+          "mean_seconds": 0.3634247579611838,
+          "median_seconds": 0.3638901188969612,
+          "min_seconds": 0.3617650419473648,
+          "max_seconds": 0.36461911303922534,
+          "stddev_seconds": 0.0014828523357904605,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=4 bounds=(639.35, 328.07, 844.02, 650.0) convex_hull_area=116700.36\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.4.3",
+            "pandas": "3.0.1",
+            "pyarrow": "23.0.1",
+            "pyogrio": "0.12.1",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "speedup": 1.9710866625969572,
+      "metadata": {
+        "repeat": 3,
+        "warmup": true,
+        "timeout": 300,
+        "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+        "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+        "vibespatial_source": {
+          "package_version": "0.5.2",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+          "tracked_source_dirty": true,
+          "untracked_source_files": [
+            "src/vibespatial/spatial/component_parent_reduction.py"
+          ],
+          "worktree_source_sha256": "484d468570bd19d182693e8866f00824a7c265cb9c1a7401c848f2055a087018",
+          "python_version": "3.13.12"
+        },
+        "physical_shapes": [
+          "many_few_overlay",
+          "mask_clip",
+          "grouped_geometry_reduce",
+          "mask_construction"
+        ],
+        "profile_mode": "off",
+        "workload_key": "redevelopment_screening.py",
+        "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+        "geopandas_baseline": "reused",
+        "geopandas_baseline_host": {
+          "node": "picard-4090",
+          "machine": "x86_64",
+          "processor": "x86_64",
+          "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+        },
+        "geopandas_baseline_environment_sha256": "7d2be1f8de157e502816baae4bbadf090fa010c9f4a3842c33f000b4ac8800d0",
+        "geopandas_baseline_source": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/shootout_10k_final.json",
+        "scale": "10K",
+        "vibespatial_launch": "subprocess",
+        "fingerprint": "match",
+        "fingerprint_geopandas": "rows=4 bounds=(639.35, 328.07, 844.02, 650.0) convex_hull_area=116700.36",
+        "fingerprint_vibespatial": "rows=4 bounds=(639.35, 328.07, 844.02, 650.0) convex_hull_area=116700.36"
+      }
+    },
+    {
+      "schema_version": 2,
+      "type": "shootout",
+      "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/retail_trade_area_screening.py",
+      "status": "pass",
+      "status_reason": "ok",
+      "geopandas": {
+        "label": "geopandas",
+        "timing": {
+          "mean_seconds": 0.6459992616825426,
+          "median_seconds": 0.6462066480889916,
+          "min_seconds": 0.6449139849282801,
+          "max_seconds": 0.6468771520303562,
+          "stddev_seconds": 0.0009978793057546325,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=24 bounds=(10.0, 0.0, 980.0, 810.0) convex_hull_area=144650.00\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.5.2",
+            "pandas": "3.0.5",
+            "pyarrow": "25.0.1",
+            "pyogrio": "0.13.0",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "vibespatial": {
+        "label": "vibespatial",
+        "timing": {
+          "mean_seconds": 0.21924797437774637,
+          "median_seconds": 0.21842829009983689,
+          "min_seconds": 0.2184132479596883,
+          "max_seconds": 0.22090238507371396,
+          "stddev_seconds": 0.001432781431235762,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=24 bounds=(10.0, 0.0, 980.0, 810.0) convex_hull_area=144650.00\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.4.3",
+            "pandas": "3.0.1",
+            "pyarrow": "23.0.1",
+            "pyogrio": "0.12.1",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "speedup": 2.958438432098838,
+      "metadata": {
+        "repeat": 3,
+        "warmup": true,
+        "timeout": 300,
+        "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+        "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+        "vibespatial_source": {
+          "package_version": "0.5.2",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+          "tracked_source_dirty": true,
+          "untracked_source_files": [
+            "src/vibespatial/spatial/component_parent_reduction.py"
+          ],
+          "worktree_source_sha256": "484d468570bd19d182693e8866f00824a7c265cb9c1a7401c848f2055a087018",
+          "python_version": "3.13.12"
+        },
+        "physical_shapes": [
+          "grouped_geometry_reduce",
+          "mask_construction"
+        ],
+        "profile_mode": "off",
+        "workload_key": "retail_trade_area_screening.py",
+        "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+        "geopandas_baseline": "reused",
+        "geopandas_baseline_host": {
+          "node": "picard-4090",
+          "machine": "x86_64",
+          "processor": "x86_64",
+          "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+        },
+        "geopandas_baseline_environment_sha256": "7d2be1f8de157e502816baae4bbadf090fa010c9f4a3842c33f000b4ac8800d0",
+        "geopandas_baseline_source": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/shootout_10k_final.json",
+        "scale": "10K",
+        "vibespatial_launch": "subprocess",
+        "fingerprint": "match",
+        "fingerprint_geopandas": "rows=24 bounds=(10.0, 0.0, 980.0, 810.0) convex_hull_area=144650.00",
+        "fingerprint_vibespatial": "rows=24 bounds=(10.0, 0.0, 980.0, 810.0) convex_hull_area=144650.00"
+      }
+    },
+    {
+      "schema_version": 2,
+      "type": "shootout",
+      "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/site_suitability.py",
+      "status": "pass",
+      "status_reason": "ok",
+      "geopandas": {
+        "label": "geopandas",
+        "timing": {
+          "mean_seconds": 0.6929881703108549,
+          "median_seconds": 0.6921741199912503,
+          "min_seconds": 0.692112548975274,
+          "max_seconds": 0.6946778419660404,
+          "stddev_seconds": 0.001463622381031092,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=3302 bounds=(200.0, 200.0, 800.0, 800.0) convex_hull_area=315664.33\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.5.2",
+            "pandas": "3.0.5",
+            "pyarrow": "25.0.1",
+            "pyogrio": "0.13.0",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "vibespatial": {
+        "label": "vibespatial",
+        "timing": {
+          "mean_seconds": 0.16046054397399226,
+          "median_seconds": 0.1598764118971303,
+          "min_seconds": 0.1598023099359125,
+          "max_seconds": 0.161702910088934,
+          "stddev_seconds": 0.0010765583810600562,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=3302 bounds=(200.0, 200.0, 800.0, 800.0) convex_hull_area=315664.33\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.4.3",
+            "pandas": "3.0.1",
+            "pyarrow": "23.0.1",
+            "pyogrio": "0.12.1",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "speedup": 4.329432414561678,
+      "metadata": {
+        "repeat": 3,
+        "warmup": true,
+        "timeout": 300,
+        "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+        "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+        "vibespatial_source": {
+          "package_version": "0.5.2",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+          "tracked_source_dirty": true,
+          "untracked_source_files": [
+            "src/vibespatial/spatial/component_parent_reduction.py"
+          ],
+          "worktree_source_sha256": "484d468570bd19d182693e8866f00824a7c265cb9c1a7401c848f2055a087018",
+          "python_version": "3.13.12"
+        },
+        "physical_shapes": [
+          "many_few_overlay",
+          "mask_clip"
+        ],
+        "profile_mode": "off",
+        "workload_key": "site_suitability.py",
+        "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+        "geopandas_baseline": "reused",
+        "geopandas_baseline_host": {
+          "node": "picard-4090",
+          "machine": "x86_64",
+          "processor": "x86_64",
+          "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+        },
+        "geopandas_baseline_environment_sha256": "7d2be1f8de157e502816baae4bbadf090fa010c9f4a3842c33f000b4ac8800d0",
+        "geopandas_baseline_source": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/shootout_10k_final.json",
+        "scale": "10K",
+        "vibespatial_launch": "subprocess",
+        "fingerprint": "match",
+        "fingerprint_geopandas": "rows=3302 bounds=(200.0, 200.0, 800.0, 800.0) convex_hull_area=315664.33",
+        "fingerprint_vibespatial": "rows=3302 bounds=(200.0, 200.0, 800.0, 800.0) convex_hull_area=315664.33"
+      }
+    },
+    {
+      "schema_version": 2,
+      "type": "shootout",
+      "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/transit_service_gap.py",
+      "status": "pass",
+      "status_reason": "ok",
+      "geopandas": {
+        "label": "geopandas",
+        "timing": {
+          "mean_seconds": 0.23803364764899015,
+          "median_seconds": 0.23759680590592325,
+          "min_seconds": 0.2365413410589099,
+          "max_seconds": 0.23996279598213732,
+          "stddev_seconds": 0.0017520592111237576,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=14130 bounds=(450.3, 265.0, 708.21, 735.0) convex_hull_area=1118101.12\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.5.2",
+            "pandas": "3.0.5",
+            "pyarrow": "25.0.1",
+            "pyogrio": "0.13.0",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "vibespatial": {
+        "label": "vibespatial",
+        "timing": {
+          "mean_seconds": 0.18525030269908407,
+          "median_seconds": 0.1704438739689067,
+          "min_seconds": 0.16998567909467965,
+          "max_seconds": 0.2153213550336659,
+          "stddev_seconds": 0.02604330292066582,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=14130 bounds=(450.3, 265.0, 708.21, 735.0) convex_hull_area=1118101.12\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.4.3",
+            "pandas": "3.0.1",
+            "pyarrow": "23.0.1",
+            "pyogrio": "0.12.1",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "speedup": 1.3939885334292914,
+      "metadata": {
+        "repeat": 3,
+        "warmup": true,
+        "timeout": 300,
+        "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+        "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+        "vibespatial_source": {
+          "package_version": "0.5.2",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+          "tracked_source_dirty": true,
+          "untracked_source_files": [
+            "src/vibespatial/spatial/component_parent_reduction.py"
+          ],
+          "worktree_source_sha256": "484d468570bd19d182693e8866f00824a7c265cb9c1a7401c848f2055a087018",
+          "python_version": "3.13.12"
+        },
+        "physical_shapes": [
+          "many_few_overlay",
+          "mask_clip"
+        ],
+        "profile_mode": "off",
+        "workload_key": "transit_service_gap.py",
+        "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+        "geopandas_baseline": "reused",
+        "geopandas_baseline_host": {
+          "node": "picard-4090",
+          "machine": "x86_64",
+          "processor": "x86_64",
+          "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+        },
+        "geopandas_baseline_environment_sha256": "7d2be1f8de157e502816baae4bbadf090fa010c9f4a3842c33f000b4ac8800d0",
+        "geopandas_baseline_source": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/shootout_10k_final.json",
+        "scale": "10K",
+        "vibespatial_launch": "subprocess",
+        "fingerprint": "match",
+        "fingerprint_geopandas": "rows=14130 bounds=(450.3, 265.0, 708.21, 735.0) convex_hull_area=1118101.12",
+        "fingerprint_vibespatial": "rows=14130 bounds=(450.3, 265.0, 708.21, 735.0) convex_hull_area=1118101.12"
+      }
+    },
+    {
+      "schema_version": 2,
+      "type": "shootout",
+      "script": "/home/picard/repos/vibeSpatial/benchmarks/shootout/vegetation_corridor.py",
+      "status": "pass",
+      "status_reason": "ok",
+      "geopandas": {
+        "label": "geopandas",
+        "timing": {
+          "mean_seconds": 0.30011852136037004,
+          "median_seconds": 0.300036306027323,
+          "min_seconds": 0.29802987806033343,
+          "max_seconds": 0.3022893799934536,
+          "stddev_seconds": 0.002130940801689405,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=998 bounds=(-9.55, 71.1, 1004.26, 1010.0) convex_hull_area=105251.17\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.5.2",
+            "pandas": "3.0.5",
+            "pyarrow": "25.0.1",
+            "pyogrio": "0.13.0",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "vibespatial": {
+        "label": "vibespatial",
+        "timing": {
+          "mean_seconds": 0.17942737364986291,
+          "median_seconds": 0.1785468430025503,
+          "min_seconds": 0.17846514203120023,
+          "max_seconds": 0.18127013591583818,
+          "stddev_seconds": 0.0015964016846823478,
+          "sample_count": 3
+        },
+        "stdout": "SHOOTOUT_FINGERPRINT: rows=998 bounds=(-9.55, 71.1, 1004.26, 1010.0) convex_hull_area=105251.17\n",
+        "environment": {
+          "python_version": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+          "python_implementation": "cpython",
+          "packages": {
+            "geopandas": "1.1.4",
+            "numpy": "2.4.3",
+            "pandas": "3.0.1",
+            "pyarrow": "23.0.1",
+            "pyogrio": "0.12.1",
+            "shapely": "2.1.2"
+          }
+        }
+      },
+      "speedup": 1.6804346746306649,
+      "metadata": {
+        "repeat": 3,
+        "warmup": true,
+        "timeout": 300,
+        "measurement_sha256": "678d35bcf58cec143f6cf5650e3933056dbea17c3868065414e6218ebaa09ac3",
+        "geopandas_measurement_sha256": "be5c8a59fa71bb0bd3217cba66e80531288b7b6ed0e2dd3c04358d862c4cf920",
+        "vibespatial_source": {
+          "package_version": "0.5.2",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+          "tracked_source_dirty": true,
+          "untracked_source_files": [
+            "src/vibespatial/spatial/component_parent_reduction.py"
+          ],
+          "worktree_source_sha256": "484d468570bd19d182693e8866f00824a7c265cb9c1a7401c848f2055a087018",
+          "python_version": "3.13.12"
+        },
+        "physical_shapes": [
+          "many_few_overlay",
+          "grouped_geometry_reduce",
+          "mask_construction"
+        ],
+        "profile_mode": "off",
+        "workload_key": "vegetation_corridor.py",
+        "workload_sha256": "7f92619167b9cd865ad1a108d5ceadb274bc7ff39a20a29a0f79448256380c74",
+        "geopandas_baseline": "reused",
+        "geopandas_baseline_host": {
+          "node": "picard-4090",
+          "machine": "x86_64",
+          "processor": "x86_64",
+          "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K"
+        },
+        "geopandas_baseline_environment_sha256": "7d2be1f8de157e502816baae4bbadf090fa010c9f4a3842c33f000b4ac8800d0",
+        "geopandas_baseline_source": "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r2/shootout_10k_final.json",
+        "scale": "10K",
+        "vibespatial_launch": "subprocess",
+        "fingerprint": "match",
+        "fingerprint_geopandas": "rows=998 bounds=(-9.55, 71.1, 1004.26, 1010.0) convex_hull_area=105251.17",
+        "fingerprint_vibespatial": "rows=998 bounds=(-9.55, 71.1, 1004.26, 1010.0) convex_hull_area=105251.17"
+      }
+    }
+  ]
+}

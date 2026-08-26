@@ -1,0 +1,394 @@
+{
+  "schema_version": 1,
+  "experiment": "q11_parent_aware_component",
+  "variant": "parent",
+  "zone_frames": 5,
+  "trip_rows": 3896103,
+  "parent_zone_rows": 1033509,
+  "component_zone_rows": null,
+  "cross_zone_trip_count": 1840940,
+  "wall_seconds": 1.9786386140622199,
+  "stage_records": [
+    {
+      "name": "parent_query_pair_aggregate",
+      "gpu_seconds": 0.5079966735839844,
+      "wall_seconds": 0.5080125520471483,
+      "pool_used_before_bytes": 0,
+      "pool_used_after_bytes": 0
+    },
+    {
+      "name": "parent_query_pair_aggregate",
+      "gpu_seconds": 0.35959844970703125,
+      "wall_seconds": 0.35960936499759555,
+      "pool_used_before_bytes": 0,
+      "pool_used_after_bytes": 0
+    },
+    {
+      "name": "parent_query_pair_aggregate",
+      "gpu_seconds": 0.28965887451171873,
+      "wall_seconds": 0.289667860022746,
+      "pool_used_before_bytes": 0,
+      "pool_used_after_bytes": 0
+    },
+    {
+      "name": "parent_query_pair_aggregate",
+      "gpu_seconds": 0.6216639404296875,
+      "wall_seconds": 0.6216738739749417,
+      "pool_used_before_bytes": 0,
+      "pool_used_after_bytes": 0
+    },
+    {
+      "name": "parent_query_pair_aggregate",
+      "gpu_seconds": 0.19961036682128908,
+      "wall_seconds": 0.19961926701944321,
+      "pool_used_before_bytes": 0,
+      "pool_used_after_bytes": 0
+    }
+  ],
+  "frame_metrics": [],
+  "pool_used_before_bytes": 0,
+  "pool_used_after_bytes": 0,
+  "fallback_event_count": 0,
+  "fallback_events": [],
+  "materialization_event_count": 10,
+  "materialization_events": [
+    {
+      "surface": "vibespatial.api.Series",
+      "boundary": "user-export",
+      "reason": "native numeric expression reduced to public scalar",
+      "operation": "native_series_arithmetic_sum",
+      "detail": "native_export_target=scalar, rows=3896103",
+      "pipeline": "",
+      "dataset": "",
+      "stage": "",
+      "stage_category": "",
+      "d2h_transfer": true,
+      "strict_disallowed": false
+    },
+    {
+      "surface": "vibespatial.api.SpatialIndex.query_pair_aggregate",
+      "boundary": "user-export",
+      "reason": "native numeric expression reduced to public scalar",
+      "operation": "query_pair_aggregate_column_to_public_array_sum",
+      "detail": "native_export_target=scalar, rows=3896103",
+      "pipeline": "",
+      "dataset": "",
+      "stage": "",
+      "stage_category": "",
+      "d2h_transfer": true,
+      "strict_disallowed": false
+    },
+    {
+      "surface": "vibespatial.api.Series",
+      "boundary": "user-export",
+      "reason": "native numeric expression reduced to public scalar",
+      "operation": "native_series_arithmetic_sum",
+      "detail": "native_export_target=scalar, rows=3896103",
+      "pipeline": "",
+      "dataset": "",
+      "stage": "",
+      "stage_category": "",
+      "d2h_transfer": true,
+      "strict_disallowed": false
+    },
+    {
+      "surface": "vibespatial.api.SpatialIndex.query_pair_aggregate",
+      "boundary": "user-export",
+      "reason": "native numeric expression reduced to public scalar",
+      "operation": "query_pair_aggregate_column_to_public_array_sum",
+      "detail": "native_export_target=scalar, rows=3896103",
+      "pipeline": "",
+      "dataset": "",
+      "stage": "",
+      "stage_category": "",
+      "d2h_transfer": true,
+      "strict_disallowed": false
+    },
+    {
+      "surface": "vibespatial.api.Series",
+      "boundary": "user-export",
+      "reason": "native numeric expression reduced to public scalar",
+      "operation": "native_series_arithmetic_sum",
+      "detail": "native_export_target=scalar, rows=3896103",
+      "pipeline": "",
+      "dataset": "",
+      "stage": "",
+      "stage_category": "",
+      "d2h_transfer": true,
+      "strict_disallowed": false
+    },
+    {
+      "surface": "vibespatial.api.SpatialIndex.query_pair_aggregate",
+      "boundary": "user-export",
+      "reason": "native numeric expression reduced to public scalar",
+      "operation": "query_pair_aggregate_column_to_public_array_sum",
+      "detail": "native_export_target=scalar, rows=3896103",
+      "pipeline": "",
+      "dataset": "",
+      "stage": "",
+      "stage_category": "",
+      "d2h_transfer": true,
+      "strict_disallowed": false
+    },
+    {
+      "surface": "vibespatial.api.Series",
+      "boundary": "user-export",
+      "reason": "native numeric expression reduced to public scalar",
+      "operation": "native_series_arithmetic_sum",
+      "detail": "native_export_target=scalar, rows=3896103",
+      "pipeline": "",
+      "dataset": "",
+      "stage": "",
+      "stage_category": "",
+      "d2h_transfer": true,
+      "strict_disallowed": false
+    },
+    {
+      "surface": "vibespatial.api.SpatialIndex.query_pair_aggregate",
+      "boundary": "user-export",
+      "reason": "native numeric expression reduced to public scalar",
+      "operation": "query_pair_aggregate_column_to_public_array_sum",
+      "detail": "native_export_target=scalar, rows=3896103",
+      "pipeline": "",
+      "dataset": "",
+      "stage": "",
+      "stage_category": "",
+      "d2h_transfer": true,
+      "strict_disallowed": false
+    },
+    {
+      "surface": "vibespatial.api.Series",
+      "boundary": "user-export",
+      "reason": "native numeric expression reduced to public scalar",
+      "operation": "native_series_arithmetic_sum",
+      "detail": "native_export_target=scalar, rows=3896103",
+      "pipeline": "",
+      "dataset": "",
+      "stage": "",
+      "stage_category": "",
+      "d2h_transfer": true,
+      "strict_disallowed": false
+    },
+    {
+      "surface": "vibespatial.api.SpatialIndex.query_pair_aggregate",
+      "boundary": "user-export",
+      "reason": "native numeric expression reduced to public scalar",
+      "operation": "query_pair_aggregate_column_to_public_array_sum",
+      "detail": "native_export_target=scalar, rows=3896103",
+      "pipeline": "",
+      "dataset": "",
+      "stage": "",
+      "stage_category": "",
+      "d2h_transfer": true,
+      "strict_disallowed": false
+    }
+  ],
+  "dispatch_summary": [
+    {
+      "surface": "geopandas.array.bounds",
+      "operation": "bounds",
+      "implementation": "gpu_nvrtc_bounds_device",
+      "selected": "gpu",
+      "reason": "GPU NVRTC bounds kernel kept bounds resident on device",
+      "count": 12
+    },
+    {
+      "surface": "vibespatial.spatial.point_grid_index",
+      "operation": "prepare",
+      "implementation": "dense_point_cell_index_gpu",
+      "selected": "gpu",
+      "reason": "grouped 3896103 point rows once into 1024x1024 cells",
+      "count": 2
+    },
+    {
+      "surface": "vibespatial.predicates.point_location_index",
+      "operation": "prepare_point_location",
+      "implementation": "polygon_part_y_edge_directory_gpu",
+      "selected": "gpu",
+      "reason": "prepared 288955 polygon parts into 2311640 y bins with 78341756 exact edge memberships",
+      "count": 1
+    },
+    {
+      "surface": "vibespatial.api.SpatialIndex.query_pair_aggregate",
+      "operation": "query_pair_aggregate",
+      "implementation": "owned_gpu_component_parent_pair_match_count+owned_gpu_component_parent_pair_match_count",
+      "selected": "gpu",
+      "reason": "left/shared: heavy-tail MultiPolygon query rows were lowered to Polygon-part relations and reduced by exact parent keys; max_parts_per_parent=2880; right: heavy-tail MultiPolygon query rows were lowered to Polygon-part relations and reduced by exact parent keys; max_parts_per_parent=2880",
+      "count": 1
+    },
+    {
+      "surface": "vibespatial.predicates.point_location_index",
+      "operation": "prepare_point_location",
+      "implementation": "polygon_part_y_edge_directory_gpu",
+      "selected": "gpu",
+      "reason": "prepared 295190 polygon parts into 2361520 y bins with 78876781 exact edge memberships",
+      "count": 1
+    },
+    {
+      "surface": "vibespatial.api.SpatialIndex.query_pair_aggregate",
+      "operation": "query_pair_aggregate",
+      "implementation": "owned_gpu_component_parent_pair_match_count+owned_gpu_component_parent_pair_match_count",
+      "selected": "gpu",
+      "reason": "left/shared: heavy-tail MultiPolygon query rows were lowered to Polygon-part relations and reduced by exact parent keys; max_parts_per_parent=18933; right: heavy-tail MultiPolygon query rows were lowered to Polygon-part relations and reduced by exact parent keys; max_parts_per_parent=18933",
+      "count": 1
+    },
+    {
+      "surface": "vibespatial.predicates.point_location_index",
+      "operation": "prepare_point_location",
+      "implementation": "polygon_part_y_edge_directory_gpu",
+      "selected": "gpu",
+      "reason": "prepared 277472 polygon parts into 2219776 y bins with 78394080 exact edge memberships",
+      "count": 1
+    },
+    {
+      "surface": "vibespatial.api.SpatialIndex.query_pair_aggregate",
+      "operation": "query_pair_aggregate",
+      "implementation": "owned_gpu_component_parent_pair_match_count+owned_gpu_component_parent_pair_match_count",
+      "selected": "gpu",
+      "reason": "left/shared: heavy-tail MultiPolygon query rows were lowered to Polygon-part relations and reduced by exact parent keys; max_parts_per_parent=2484; right: heavy-tail MultiPolygon query rows were lowered to Polygon-part relations and reduced by exact parent keys; max_parts_per_parent=2484",
+      "count": 1
+    },
+    {
+      "surface": "vibespatial.predicates.point_location_index",
+      "operation": "prepare_point_location",
+      "implementation": "polygon_part_y_edge_directory_gpu",
+      "selected": "gpu",
+      "reason": "prepared 277697 polygon parts into 2221576 y bins with 78326142 exact edge memberships",
+      "count": 1
+    },
+    {
+      "surface": "vibespatial.api.SpatialIndex.query_pair_aggregate",
+      "operation": "query_pair_aggregate",
+      "implementation": "owned_gpu_component_parent_pair_match_count+owned_gpu_component_parent_pair_match_count",
+      "selected": "gpu",
+      "reason": "left/shared: heavy-tail MultiPolygon query rows were lowered to Polygon-part relations and reduced by exact parent keys; max_parts_per_parent=4442; right: heavy-tail MultiPolygon query rows were lowered to Polygon-part relations and reduced by exact parent keys; max_parts_per_parent=4442",
+      "count": 1
+    },
+    {
+      "surface": "vibespatial.predicates.point_location_index",
+      "operation": "prepare_point_location",
+      "implementation": "polygon_part_y_edge_directory_gpu",
+      "selected": "gpu",
+      "reason": "prepared 160804 polygon parts into 1286432 y bins with 47249986 exact edge memberships",
+      "count": 1
+    },
+    {
+      "surface": "vibespatial.api.SpatialIndex.query_pair_aggregate",
+      "operation": "query_pair_aggregate",
+      "implementation": "owned_gpu_component_parent_pair_match_count+owned_gpu_component_parent_pair_match_count",
+      "selected": "gpu",
+      "reason": "left/shared: heavy-tail MultiPolygon query rows were lowered to Polygon-part relations and reduced by exact parent keys; max_parts_per_parent=1404; right: heavy-tail MultiPolygon query rows were lowered to Polygon-part relations and reduced by exact parent keys; max_parts_per_parent=1404",
+      "count": 1
+    }
+  ],
+  "evidence_identity": {
+    "schema_version": 1,
+    "status": "complete_contemporaneous",
+    "captured_at": "2026-08-26T04:37:05.857256+00:00",
+    "source": {
+      "git_head": "d87d3fa509f05860e21413ab0395a2cb20a997f2",
+      "git_status": [
+        "M docs/dev/work-amplification-evidence.md",
+        " M docs/ops/intake-index.json",
+        " M src/vibespatial/api/_native_metadata.py",
+        " M src/vibespatial/api/sindex.py",
+        " M tests/test_spatial_query.py",
+        "?? benchmark_results/work_amplification/2026-08-25-r3/",
+        "?? src/vibespatial/spatial/component_parent_reduction.py"
+      ],
+      "git_diff_binary_sha256": "f08e01a90d1e0128521fb038bd87a1c04aa8a122daf5d1aadaa49ebf6c7fc8da",
+      "relevant_source_manifest_sha256": "6e1f19c3a9f5ee5ec8860fd5d00094da6d85541aaec4dd45b18d59b45314914e",
+      "critical_file_sha256": {
+        "benchmarks/spatialbench/run_benchmark.py": "08c86dd9c8361764cd12d4374e7a095d54a93664487aa48f090e1687e524c2be",
+        "benchmarks/spatialbench/vibespatial_queries.py": "3998dc4cf98dfc9ea5b5cdb2dbd2c4ec211a53d66f3909300245b96082e6e0ee",
+        "pyproject.toml": "407f619234e9d50fdff928906f924f9c9ed481a9fbb247659a197bd458e00e3a",
+        "uv.lock": "60942838f44a9792dfc8a49371e8a1367a59e8d858e39ed827dfa735e0d615fe",
+        "benchmark_results/experiments/2026-08-21-q11-q12-physical-shapes/experiment.py": "9886b6a2fcdd766feb347b8c2b1acb93069ffcf7ed0286f834619e4a301830ef",
+        "benchmark_results/work_amplification/2026-08-25-r2/q12_dense_experiment.py": "7866a98a4f47b84590b8d871472459969150c68c129acb936f36e53a67367e1c",
+        "benchmark_results/work_amplification/2026-08-25-r3/q11_parent_aware_component.py": "af7bb6e928a8de23ab49d32522aea6991c618a460f81a076ba94d510f43403e5"
+      }
+    },
+    "dataset": {
+      "path": "/home/picard/datasets/spatialbench/v0.1.0/sf100-geoparquet",
+      "scale_factor": 100,
+      "format": "GeoParquet 1.1",
+      "geometry_encoding": "native GeoArrow",
+      "manifest_sha256": "a970d40adc2f754e781197d9ec9af1f03627351ceb8d01e92e9c09ff6c5080d3",
+      "file_inventory_sha256": "ad526c085c09b50410402945c24a9b6162b4467ceb4daa3c1f24d3db9848a35c",
+      "file_inventory_fingerprint_definition": "sha256 of sorted tab-separated relative path and byte size; not a content digest",
+      "file_count": 179,
+      "total_bytes": 37940233646,
+      "tables": {
+        "building": {
+          "files": 1,
+          "rows": 152877,
+          "geometry_columns": [
+            "b_boundary"
+          ],
+          "elapsed_seconds": 0.2626953620929271
+        },
+        "trip": {
+          "files": 154,
+          "rows": 600000000,
+          "geometry_columns": [
+            "t_pickuploc",
+            "t_dropoffloc"
+          ],
+          "elapsed_seconds": 2845.199984092964
+        },
+        "zone": {
+          "files": 23,
+          "rows": 1033509,
+          "geometry_columns": [
+            "z_boundary"
+          ],
+          "elapsed_seconds": 19.957061080029234
+        }
+      }
+    },
+    "environment": {
+      "hostname": "picard-4090",
+      "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.35",
+      "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K",
+      "memory_total": "98580128 kB",
+      "python": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+      "python_executable": "/home/picard/repos/vibeSpatial/.venv/bin/python3",
+      "package_versions": {
+        "cupy-cuda12x": "14.0.1",
+        "cudf-cu12": null,
+        "geopandas": "1.1.4",
+        "numpy": "2.4.3",
+        "pandas": "3.0.1",
+        "pyarrow": "23.0.1",
+        "pylibcudf-cu12": "26.2.1",
+        "vibespatial": "0.5.2"
+      },
+      "nvidia_smi": "NVIDIA GeForce RTX 4090, GPU-39aa5702-5aec-2729-8fb7-412d84ca1cbe, 580.173.02, 24564, 450.00",
+      "cuda_visible_devices": null,
+      "strict_native": "1",
+      "precompile": null
+    },
+    "measurement": {
+      "query": "SF100 Q11 first 4M-row trip batch",
+      "variant": "parent",
+      "zone_frames": 5,
+      "process_isolation": "one command/process per arm",
+      "warmup_runs": 0,
+      "repeat_runs": 1,
+      "statistic": "single cold observation",
+      "clock": "time.perf_counter wall time with synchronized stage events",
+      "excluded_scope": "trip/zone IO and host component fixture decomposition",
+      "included_scope": "public spatial queries, device parent mapping/deduplication, shared-parent intersection, reduction, and terminal scalar export",
+      "command": [
+        "/home/picard/repos/vibeSpatial/.venv/bin/python3",
+        "/home/picard/repos/vibeSpatial/benchmark_results/work_amplification/2026-08-25-r3/q11_parent_aware_component.py",
+        "--variant",
+        "parent",
+        "--zone-frames",
+        "5",
+        "--output",
+        "benchmark_results/work_amplification/2026-08-25-r3/q11_parent_aware_final_z5.json"
+      ]
+    }
+  }
+}

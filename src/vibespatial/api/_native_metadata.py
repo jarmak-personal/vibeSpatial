@@ -900,6 +900,19 @@ class NativeSpatialIndex:
         ):
             return None, None
 
+        from vibespatial.spatial.component_parent_reduction import (
+            try_component_parent_pair_match_counts,
+        )
+
+        component_parent = try_component_parent_pair_match_counts(
+            self,
+            aligned_native_index,
+            query_owned,
+            predicate=predicate,
+        )
+        if component_parent is not None:
+            return component_parent
+
         from vibespatial.kernels.core.geometry_analysis import (
             compute_geometry_bounds_device,
         )
