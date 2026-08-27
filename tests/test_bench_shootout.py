@@ -8,8 +8,10 @@ import sys
 import time
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
+from benchmarks.shootout.corpora._common import fingerprint
 from vibespatial.bench.cli import main as vsbench_main
 from vibespatial.bench.output import render_shootout
 from vibespatial.bench.schema import timing_from_samples
@@ -19,6 +21,7 @@ from vibespatial.bench.shootout import (
     ShootoutRun,
     _baseline_environment_sha256,
     _baseline_host_identity,
+    _fingerprints_match,
     _geopandas_measurement_identity,
     _measurement_identity,
     _run_harness,
@@ -59,6 +62,178 @@ def test_site_fixture_subset_matches_full_catalog(
         gpd.read_file(full["transit"]),
         gpd.read_file(subset["transit"]),
     )
+
+
+def test_shootout_workload_identity_uses_nearest_manifest_root(
+    tmp_path: Path,
+) -> None:
+    outer = tmp_path / "benchmarks" / "shootout"
+    corpus = outer / "corpus"
+    corpus.mkdir(parents=True)
+    unrelated = outer / "unrelated.py"
+    unrelated.write_text("print('unrelated')\n", encoding="utf-8")
+    manifest = corpus / "vsbench-workload.json"
+    manifest.write_text('{"schema_version": 1}\n', encoding="utf-8")
+    helper = corpus / "_common.py"
+    helper.write_text("VALUE = 1\n", encoding="utf-8")
+    script = corpus / "workflow.py"
+    script.write_text("from _common import VALUE\n", encoding="utf-8")
+
+    initial = shootout_workload_identity(script)
+    unrelated.write_text("print('changed')\n", encoding="utf-8")
+    after_unrelated = shootout_workload_identity(script)
+    helper.write_text("VALUE = 2\n", encoding="utf-8")
+    after_helper = shootout_workload_identity(script)
+    manifest.write_text('{"schema_version": 2}\n', encoding="utf-8")
+    after_manifest = shootout_workload_identity(script)
+
+    assert initial["workload_key"] == "workflow.py"
+    assert after_unrelated == initial
+    assert after_helper["workload_sha256"] != initial["workload_sha256"]
+    assert after_manifest["workload_sha256"] != after_helper["workload_sha256"]
+
+
+def _relation_result_frame():
+    from shapely.geometry import Point
+
+    import geopandas as gpd
+
+    return gpd.GeoDataFrame(
+        {
+            "left_id": [10, 20, 30],
+            "right_id": [101, 202, 303],
+            "distance_m": [1.25, None, 3.5],
+            "label": ["alpha", "beta", pd.NA],
+        },
+        geometry=[Point(0, 0), Point(1, 1), None],
+        index=pd.Index([7, 8, 9], name="relation_id"),
+        crs=4326,
+    )
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("label", "wrong"),
+        ("right_id", 999),
+        ("distance_m", 1.2501),
+    ],
+)
+def test_external_corpus_fingerprint_detects_exact_attribute_changes(
+    column: str,
+    value: object,
+) -> None:
+    frame = _relation_result_frame()
+    changed = frame.copy()
+    changed.loc[7, column] = value
+
+    assert fingerprint(changed) != fingerprint(frame)
+
+
+def test_external_corpus_fingerprint_preserves_geometry_row_association() -> None:
+    frame = _relation_result_frame()
+    changed = frame.copy()
+    changed.geometry = changed.geometry.iloc[[1, 0, 2]].set_axis(changed.index)
+
+    assert fingerprint(changed) != fingerprint(frame)
+    assert fingerprint(changed, order_sensitive=False) != fingerprint(
+        frame, order_sensitive=False
+    )
+
+
+def test_external_corpus_fingerprint_declares_order_semantics() -> None:
+    frame = _relation_result_frame()
+    reordered = frame.iloc[::-1]
+
+    assert fingerprint(reordered) != fingerprint(frame)
+    assert fingerprint(reordered, order_sensitive=False) == fingerprint(
+        frame, order_sensitive=False
+    )
+
+
+def test_external_corpus_fingerprint_normalizes_constructive_geometry_order() -> None:
+    from shapely.geometry import MultiPolygon, Polygon
+
+    import geopandas as gpd
+
+    clockwise = Polygon([(0, 0), (0, 1), (1, 1), (1, 0), (0, 0)])
+    counterclockwise = Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)])
+    left = gpd.GeoDataFrame({"id": [1]}, geometry=[clockwise])
+    right = gpd.GeoDataFrame({"id": [1]}, geometry=[counterclockwise])
+    rotated = gpd.GeoDataFrame(
+        {"id": [1]},
+        geometry=[Polygon([(1, 1), (1, 0), (0, 0), (0, 1), (1, 1)])],
+    )
+    part_a = Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])
+    part_b = Polygon([(2, 0), (3, 0), (3, 1), (2, 0)])
+    parts_left = gpd.GeoDataFrame(
+        {"id": [1]}, geometry=[MultiPolygon([part_a, part_b])]
+    )
+    parts_right = gpd.GeoDataFrame(
+        {"id": [1]}, geometry=[MultiPolygon([part_b, part_a])]
+    )
+
+    assert clockwise.equals(counterclockwise)
+    assert fingerprint(left) == fingerprint(right)
+    assert fingerprint(left) == fingerprint(rotated)
+    assert fingerprint(parts_left) == fingerprint(parts_right)
+
+
+def test_external_corpus_fingerprint_allows_only_declared_float_tolerance() -> None:
+    from shapely.geometry import Point
+
+    frame = _relation_result_frame()
+    close_attribute = frame.copy()
+    close_attribute.loc[7, "distance_m"] += 1e-13
+    far_attribute = frame.copy()
+    far_attribute.loc[7, "distance_m"] += 1e-5
+
+    close_geometry = frame.copy()
+    close_geometry.loc[8, "geometry"] = Point(1 + 1e-13, 1)
+    far_geometry = frame.copy()
+    far_geometry.loc[8, "geometry"] = Point(1 + 1e-7, 1)
+    changed_topology = frame.copy()
+    changed_topology.loc[8, "geometry"] = Point(1, 2)
+
+    assert fingerprint(close_attribute) == fingerprint(frame)
+    assert fingerprint(far_attribute) != fingerprint(frame)
+    assert fingerprint(close_geometry) == fingerprint(frame)
+    assert fingerprint(far_geometry) != fingerprint(frame)
+    assert fingerprint(changed_topology) != fingerprint(frame)
+
+
+def test_external_corpus_fingerprint_covers_schema_index_and_nested_nulls() -> None:
+    frame = pd.DataFrame(
+        {
+            "payload": [[{"key": "a", "value": None}], pd.NA],
+            "count": pd.Series([1, None], dtype="Int64"),
+        },
+        index=pd.Index([40, 50], name="source_row"),
+    )
+    expected = fingerprint(frame)
+
+    assert fingerprint(frame.copy()) == expected
+    assert fingerprint(frame.rename(columns={"count": "total"})) != expected
+    assert fingerprint(frame.rename_axis("other_index")) != expected
+    assert fingerprint(frame.astype({"count": "Float64"})) != expected
+    assert fingerprint(frame.fillna({"count": 0}).astype({"count": "int64"})) != expected
+    changed = frame.copy()
+    changed.at[40, "payload"] = [{"key": "a", "value": "not-null"}]
+    assert fingerprint(changed) != expected
+
+
+def test_external_corpus_fingerprint_fails_closed_for_unsupported_values() -> None:
+    frame = pd.DataFrame({"opaque": [object()]})
+
+    with pytest.raises(TypeError, match="unsupported result value"):
+        fingerprint(frame)
+
+
+def test_versioned_result_fingerprints_never_use_numeric_tolerance() -> None:
+    left = "vsbench-result-v3:ordered:sha256=" + "0" * 64
+    right = "vsbench-result-v3:ordered:sha256=" + "0" * 63 + "1"
+
+    assert not _fingerprints_match(left, right)
 
 
 def test_vsbench_shootout_directory_smoke(capsys: pytest.CaptureFixture[str]) -> None:

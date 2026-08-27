@@ -92,6 +92,52 @@ def test_public_dissolve_exports_grouped_attributes_with_pandas_dtypes() -> None
     assert get_native_state(result) is not None
 
 
+@pytest.mark.gpu
+def test_public_dissolve_preserves_string_group_index_through_parquet(
+    tmp_path: Path,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    source_path = tmp_path / "multipolygons.parquet"
+    output_path = tmp_path / "summary.parquet"
+    source = geopandas.GeoDataFrame(
+        {
+            "osm_id": [1, 2, 3, 4],
+            "osm_type": ["way", "relation", "way", "relation"],
+            "area_m2": [1.0, 2.0, 3.0, 4.0],
+            "geometry": [
+                MultiPolygon([box(0.0, 0.0, 0.1, 0.1), box(0.2, 0.0, 0.3, 0.1)]),
+                MultiPolygon([box(1.0, 0.0, 1.1, 0.1)]),
+                MultiPolygon([box(2.0, 0.0, 2.1, 0.1)]),
+                MultiPolygon([box(3.0, 0.0, 3.1, 0.1)]),
+            ],
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    source.to_parquet(source_path)
+
+    frame = geopandas.read_parquet(source_path)
+    projected = frame.to_crs(3857)
+    parts = projected.explode(index_parts=False, ignore_index=False)
+    parts["perimeter_m"] = parts.length
+    summary = parts.dissolve(
+        by="osm_type",
+        sort=False,
+        aggfunc={"osm_id": "count", "area_m2": "sum", "perimeter_m": "mean"},
+    )
+    expected_index = pd.Index(["way", "relation"], dtype="str", name="osm_type")
+
+    summary.to_parquet(output_path)
+    roundtrip = geopandas.read_parquet(output_path)
+
+    assert get_native_state(summary) is not None
+    assert summary.index.tolist() == expected_index.tolist()
+    assert summary.index.name == expected_index.name
+    pd.testing.assert_index_equal(roundtrip.index, expected_index, exact=True)
+
+
 def test_execute_grouped_union_emits_empty_geometry_for_unobserved_group() -> None:
     geometries = [Point(0, 0), Point(1, 1)]
     grouped = execute_grouped_union(
@@ -6209,6 +6255,40 @@ def test_lazy_grouped_union_propagates_admitted_exact_materializer_failure(
 
     with pytest.raises(RuntimeError, match="admitted grouped topology failed"):
         lazy.to_owned()
+
+
+def test_lazy_grouped_union_host_plan_uses_rows_groups_and_coordinate_shape() -> None:
+    grouped = NativeGrouped.from_dense_codes(
+        np.arange(627, dtype=np.int32) % 3,
+        group_count=3,
+    )
+    source_owned = SimpleNamespace(
+        row_count=627,
+        residency=Residency.DEVICE,
+        runtime_history=[],
+        diagnostics=[],
+        device_adopted=True,
+        geoarrow_backed=False,
+        shares_geoarrow_memory=False,
+        take=lambda _rows: source_owned,
+        device_state=SimpleNamespace(
+            families={"polygon": SimpleNamespace(x=np.empty(136_789))}
+        ),
+    )
+    lazy = dissolve_module.LazyGroupedUnionOwned(
+        source_owned=source_owned,
+        grouped=grouped,
+        geometries=np.empty(627, dtype=object),
+        method=DissolveUnionMethod.UNARY,
+        grid_size=None,
+        geometry_name="geometry",
+        crs=None,
+    )
+
+    assert lazy._prefer_host_exact_materialization()
+
+    source_owned.device_state.families["polygon"].x = np.empty(10_000)
+    assert not lazy._prefer_host_exact_materialization()
 
 
 def test_lazy_grouped_union_make_valid_consumes_semantic_proof_without_materializing(

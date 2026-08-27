@@ -809,6 +809,9 @@ def _find_uv() -> str | None:
 
 def _shootout_root(script: Path) -> Path | None:
     script = script.resolve()
+    for parent in (script.parent, *script.parents):
+        if (parent / "vsbench-workload.json").is_file():
+            return parent
     for parent in script.parents:
         if parent.name == "shootout" and parent.parent.name == "benchmarks":
             return parent
@@ -819,7 +822,15 @@ def shootout_workload_identity(script: Path) -> dict[str, Any]:
     """Return a conservative identity for one shootout and its shared fixtures."""
     script = script.resolve()
     root = _shootout_root(script)
-    files = sorted(root.rglob("*.py")) if root is not None else [script]
+    if root is None:
+        files = [script]
+    else:
+        files = sorted(
+            {
+                *root.rglob("*.py"),
+                *root.rglob("vsbench-workload.json"),
+            }
+        )
     digest = hashlib.sha256()
     for path in files:
         relative = path.relative_to(root) if root is not None else Path(path.name)
@@ -1189,6 +1200,7 @@ def _run_timed_script_sections(
 
 
 _FP_NUMBER_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+_VERSIONED_FINGERPRINT_PREFIX = "vsbench-result-v"
 
 
 def _fingerprints_match(fp_a: str, fp_b: str, *, rtol: float = 1e-3) -> bool:
@@ -1200,6 +1212,10 @@ def _fingerprints_match(fp_a: str, fp_b: str, *, rtol: float = 1e-3) -> bool:
     """
     if fp_a == fp_b:
         return True
+    if fp_a.startswith(_VERSIONED_FINGERPRINT_PREFIX) or fp_b.startswith(
+        _VERSIONED_FINGERPRINT_PREFIX
+    ):
+        return False
     nums_a = _FP_NUMBER_RE.findall(fp_a)
     nums_b = _FP_NUMBER_RE.findall(fp_b)
     if len(nums_a) != len(nums_b):

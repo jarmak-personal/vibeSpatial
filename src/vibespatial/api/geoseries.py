@@ -24,6 +24,7 @@ from vibespatial.api.geo_base import (
     is_geometry_type,
 )
 from vibespatial.api.geometry_array import (
+    GeometryArray,
     from_shapely,
     from_wkb,
     from_wkt,
@@ -81,6 +82,110 @@ def _geoseries_expanddim(data=None, *args, **kwargs):
 
 def _geoseries_accepts_native_state(result) -> bool:
     return isinstance(result, Series) and _is_geometry_like_dtype(getattr(result, "dtype", None))
+
+
+def _native_geoseries_parts(owner):
+    """Expand an owned device geometry into public single-part geometry.
+
+    Only the compact source-row map crosses to the host because pandas index
+    labels are public host state.  Coordinate and nested geometry buffers stay
+    device-owned through the returned ``GeometryArray``.
+    """
+    from vibespatial.runtime import ExecutionMode, get_requested_mode
+
+    if get_requested_mode() is ExecutionMode.CPU:
+        return None
+    owned = getattr(owner.values, "_owned", None)
+    if owned is None or getattr(owned, "device_state", None) is None:
+        return None
+
+    from vibespatial.api._native_result_core import NativeTabularSelection
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    has_point = owned.family_has_rows(GeometryFamily.POINT) or owned.family_has_rows(
+        GeometryFamily.MULTIPOINT
+    )
+    has_lineal = owned.family_has_rows(
+        GeometryFamily.LINESTRING
+    ) or owned.family_has_rows(GeometryFamily.MULTILINESTRING)
+    has_polygonal = owned.family_has_rows(
+        GeometryFamily.POLYGON
+    ) or owned.family_has_rows(GeometryFamily.MULTIPOLYGON)
+    family_classes = sum((has_point, has_lineal, has_polygonal))
+    if family_classes == 0:
+        return None
+    if family_classes > 1:
+        from vibespatial.api.geodataframe import (
+            _mixed_geometry_parts_native_tabular_result,
+        )
+
+        parts = _mixed_geometry_parts_native_tabular_result(
+            owned,
+            crs=owner.crs,
+            geometry_name=owner.name or "geometry",
+            source_tokens=(f"public_geoseries_explode:{id(owner)}",),
+            include_point=has_point,
+            include_lineal=has_lineal,
+            include_polygonal=has_polygonal,
+        )
+    else:
+        if has_point:
+            from vibespatial.constructive.binary_constructive import (
+                point_parts_native_tabular_result as part_builder,
+            )
+        elif has_lineal:
+            from vibespatial.constructive.binary_constructive import (
+                lineal_parts_native_tabular_result as part_builder,
+            )
+        else:
+            from vibespatial.constructive.binary_constructive import (
+                polygonal_parts_native_tabular_result as part_builder,
+            )
+        parts = part_builder(
+            owned,
+            crs=owner.crs,
+            geometry_name=owner.name or "geometry",
+            source_tokens=(f"public_geoseries_explode:{id(owner)}",),
+        )
+    if parts is None:
+        return None
+    if isinstance(parts, NativeTabularSelection):
+        capacity_source_rows = getattr(parts.capacity_result.provenance, "source_rows", None)
+        if capacity_source_rows is None:
+            return None
+        parts = parts.sort_selected_by_int64(capacity_source_rows)
+        parts = parts.to_native_tabular_result(
+            surface="geopandas.GeoSeries.explode",
+            strict_disallowed=False,
+        )
+    exploded_owned = parts.geometry.cached_owned()
+    source_rows = getattr(parts.provenance, "source_rows", None)
+    if exploded_owned is None or source_rows is None:
+        return None
+
+    if hasattr(source_rows, "__cuda_array_interface__"):
+        from vibespatial.cuda._runtime import get_cuda_runtime
+        from vibespatial.runtime.materialization import (
+            MaterializationBoundary,
+            record_materialization_event,
+        )
+
+        record_materialization_event(
+            surface="geopandas.GeoSeries.explode",
+            boundary=MaterializationBoundary.USER_EXPORT,
+            operation="native_explode_source_rows_to_public_index",
+            reason="public pandas index labels require exploded source-row positions",
+            detail=f"rows={parts.geometry.row_count}, bytes={parts.geometry.row_count * 8}",
+            d2h_transfer=True,
+        )
+        source_rows = get_cuda_runtime().copy_device_to_host(
+            source_rows,
+            reason="geopandas.GeoSeries.explode::public_index_source_rows",
+        )
+    source_rows = np.asarray(source_rows, dtype=np.int64)
+    if source_rows.size != parts.geometry.row_count:
+        return None
+    return GeometryArray.from_owned(exploded_owned, crs=owner.crs), source_rows
 
 
 def _geoseries_row_positions(key, row_count: int):
@@ -924,7 +1029,10 @@ class GeoSeries(GeoPandasBase, Series):
                 data = data.reindex(index)
             else:
                 index = data.index
-            data = data.to_numpy(na_value=None)
+            # Preserve Arrow-backed binary buffers for from_wkb. The array
+            # constructor can decode those buffers directly into owned
+            # geometry instead of first creating one Shapely object per row.
+            data = data.array
         return cls(
             from_wkb_or_wkt_function(data, crs=crs, on_invalid=on_invalid),
             index=index,
@@ -1608,6 +1716,36 @@ class GeoSeries(GeoPandasBase, Series):
 
         """
         from vibespatial.api.geo_base import _get_index_for_parts
+
+        native_parts = _native_geoseries_parts(self)
+        if native_parts is not None:
+            geometries, outer_idx = native_parts
+            index = _get_index_for_parts(
+                self.index,
+                outer_idx,
+                ignore_index=ignore_index,
+                index_parts=index_parts,
+            )
+            from vibespatial.runtime import ExecutionMode
+            from vibespatial.runtime.dispatch import record_dispatch_event
+
+            record_dispatch_event(
+                surface="geopandas.GeoSeries.explode",
+                operation="explode",
+                selected=ExecutionMode.GPU,
+                implementation="owned_geometry_part_capacity_gpu",
+                reason=(
+                    "device-owned multipart geometry expands through native part "
+                    "capacity while coordinates remain resident"
+                ),
+                detail=f"input_rows={len(self)}, output_rows={len(outer_idx)}",
+            )
+            return GeoSeries(
+                geometries,
+                index=index,
+                name=self.name,
+                crs=self.crs,
+            ).__finalize__(self)
 
         geometries, outer_idx = shapely.get_parts(self.values._data, return_index=True)
 

@@ -5,6 +5,7 @@ import numbers
 import operator
 import typing
 import warnings
+from dataclasses import dataclass
 from functools import lru_cache
 from time import perf_counter as _perf_counter
 from typing import Any, ClassVar, Literal
@@ -475,6 +476,220 @@ def to_shapely(geoms: GeometryArray) -> np.ndarray:
     return geoms._data
 
 
+def _record_forced_constructor_fallback(
+    *,
+    surface: str,
+    pipeline: str,
+    requested: ExecutionMode,
+    reason: str,
+    detail: str = "",
+) -> None:
+    """Record a constructor decline when the effective mode requires native work."""
+    if requested is ExecutionMode.GPU:
+        record_fallback_event(
+            surface=surface,
+            reason=reason,
+            detail=detail,
+            requested=requested,
+            selected=ExecutionMode.CPU,
+            pipeline=pipeline,
+        )
+
+
+def _try_native_wkb_array(
+    data,
+    *,
+    crs: Any | None,
+    on_invalid: str,
+) -> GeometryArray | None:
+    """Decode a sufficiently large WKB byte stream without Shapely objects."""
+    requested = _native_strict_dispatch_mode()
+    if requested is ExecutionMode.CPU:
+        return None
+    if on_invalid not in {"raise", "ignore"}:
+        if requested is ExecutionMode.GPU:
+            record_fallback_event(
+                surface="geopandas.array.from_wkb",
+                reason="native WKB construction does not implement the requested invalid-WKB policy",
+                detail=f"on_invalid={on_invalid!r}",
+                requested=requested,
+                selected=ExecutionMode.CPU,
+                pipeline="io/from_wkb",
+            )
+        return None
+
+    try:
+        rows = len(data)
+    except TypeError as exc:
+        _record_forced_constructor_fallback(
+            surface="geopandas.array.from_wkb",
+            pipeline="io/from_wkb",
+            requested=requested,
+            reason="native WKB construction requires one-dimensional array-like input",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        return None
+    if rows == 0:
+        _record_forced_constructor_fallback(
+            surface="geopandas.array.from_wkb",
+            pipeline="io/from_wkb",
+            requested=requested,
+            reason="native WKB construction does not implement empty input",
+        )
+        return None
+
+    # Reject clear small-input losses before touching CUDA runtime state. For
+    # mid-sized direct Arrow inputs, payload bytes can still justify the GPU;
+    # object/pandas carriers wait for the measured row crossover because
+    # discovering their byte size first would itself require Arrow staging.
+    if requested is ExecutionMode.AUTO:
+        if rows < 8_000:
+            return None
+        if rows < 32_000 and (
+            not type(data).__module__.startswith("pyarrow")
+            or int(getattr(data, "nbytes", 0)) < 1536 * 1024
+        ):
+            return None
+
+    try:
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        gpu_available = get_cuda_runtime().available()
+    except Exception:
+        gpu_available = False
+    if not gpu_available:
+        if requested is ExecutionMode.GPU:
+            record_fallback_event(
+                surface="geopandas.array.from_wkb",
+                reason="native WKB construction requires an available GPU runtime",
+                detail="device runtime unavailable",
+                requested=requested,
+                selected=ExecutionMode.CPU,
+                pipeline="io/from_wkb",
+            )
+        return None
+
+    try:
+        import pyarrow as pa
+    except ImportError:
+        if requested is ExecutionMode.GPU:
+            record_fallback_event(
+                surface="geopandas.array.from_wkb",
+                reason="native WKB construction requires Arrow byte buffers",
+                detail="pyarrow unavailable",
+                requested=requested,
+                selected=ExecutionMode.CPU,
+                pipeline="io/from_wkb",
+            )
+        return None
+
+    direct_arrow_input = isinstance(data, (pa.Array, pa.ChunkedArray))
+    if not direct_arrow_input and requested is not ExecutionMode.GPU and rows < 32_000:
+        return None
+
+    try:
+        if isinstance(data, pa.ChunkedArray):
+            arrow = data.combine_chunks()
+        elif isinstance(data, pa.Array):
+            arrow = data
+        else:
+            # Infer first so hexadecimal strings remain distinguishable from
+            # binary WKB instead of being UTF-8 encoded as invalid WKB bytes.
+            arrow = pa.array(data, from_pandas=True)
+    except (TypeError, ValueError, pa.ArrowException):
+        arrow = None
+    if arrow is not None and not (
+        pa.types.is_binary(arrow.type) or pa.types.is_large_binary(arrow.type)
+    ):
+        if pa.types.is_string(arrow.type) or pa.types.is_large_string(arrow.type):
+            data = arrow.to_pylist()
+            arrow = None
+        else:
+            _record_forced_constructor_fallback(
+                surface="geopandas.array.from_wkb",
+                pipeline="io/from_wkb",
+                requested=requested,
+                reason="native WKB construction requires binary or hexadecimal WKB input",
+                detail=f"arrow_type={arrow.type}",
+            )
+            return None
+    if arrow is None:
+        # Hex WKB is a valid public input but cannot enter an Arrow binary
+        # array directly. Normalize only large/forced inputs, then require the
+        # same all-native device decode as binary input.
+        if requested is not ExecutionMode.GPU and rows < 250_000:
+            return None
+        try:
+            if isinstance(data, ExtensionArray):
+                sequence = data.to_numpy(na_value=None).tolist()
+            elif isinstance(data, np.ndarray):
+                sequence = data.tolist()
+            else:
+                sequence = list(data)
+            normalized = [
+                bytes.fromhex(value)
+                if isinstance(value, str)
+                else bytes(value)
+                if value is not None
+                else None
+                for value in sequence
+            ]
+            arrow = pa.array(normalized, type=pa.binary(), from_pandas=True)
+        except (TypeError, ValueError, pa.ArrowException) as exc:
+            _record_forced_constructor_fallback(
+                surface="geopandas.array.from_wkb",
+                pipeline="io/from_wkb",
+                requested=requested,
+                reason="native WKB construction could not normalize hexadecimal input",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            return None
+
+    from vibespatial.io.wkb import (
+        _plan_arrow_wkb_gpu_admission,
+        decode_wkb_arrow_array_owned,
+    )
+
+    admission = _plan_arrow_wkb_gpu_admission(
+        rows=len(arrow),
+        payload_bytes=int(arrow.nbytes),
+        requested_mode=requested,
+    )
+    if not admission.selected:
+        return None
+
+    try:
+        owned = decode_wkb_arrow_array_owned(
+            arrow,
+            on_invalid=on_invalid,
+            allow_fallback=False,
+            requested_mode=requested,
+        )
+    except Exception as exc:
+        record_fallback_event(
+            surface="geopandas.array.from_wkb",
+            reason="native Arrow WKB construction could not preserve public decode semantics",
+            detail=f"{type(exc).__name__}: {exc}",
+            requested=requested,
+            selected=ExecutionMode.CPU,
+            pipeline="io/from_wkb",
+        )
+        return None
+    record_dispatch_event(
+        surface="geopandas.array.from_wkb",
+        operation="from_wkb",
+        implementation="arrow_wkb_owned_constructor",
+        reason=admission.reason,
+        detail=f"rows={admission.rows}, bytes={admission.payload_bytes}",
+        selected=(
+            ExecutionMode.GPU
+            if owned.residency.value == "device"
+            else ExecutionMode.CPU
+        ),
+    )
+    return GeometryArray.from_owned(owned, crs=crs)
+
+
 def from_wkb(
     data,
     crs: Any | None = None,
@@ -501,12 +716,73 @@ def from_wkb(
           without a warning. Requires GEOS >= 3.11 and shapely >= 2.1.
 
     """
+    native = _try_native_wkb_array(data, crs=crs, on_invalid=on_invalid)
+    if native is not None:
+        return native
     if isinstance(data, ExtensionArray):
         data = data.to_numpy(na_value=None)
     return GeometryArray(shapely.from_wkb(data, on_invalid=on_invalid), crs=crs)
 
 
-_WKT_GPU_MIN_ROWS = 100_000
+@dataclass(frozen=True)
+class _WktGpuAdmission:
+    selected: bool
+    reason: str
+    rows: int
+    text_bytes: int
+    max_row_bytes: int
+
+
+def _plan_wkt_gpu_admission(
+    *,
+    rows: int,
+    text_bytes: int,
+    max_row_bytes: int,
+    requested_mode: ExecutionMode | str,
+) -> _WktGpuAdmission:
+    """Choose the native parser from physical text shape, not row count alone.
+
+    The GPU parser has a small fixed launch cost, while host WKT parsing grows
+    with both geometry count and text volume.  Very large individual rows are
+    a distinct skew regime: byte-parallel parsing removes their former serial
+    scan, but staging plus exact nested assembly can still be no faster than
+    GEOS for a tiny batch.  Explicit GPU mode remains an override.
+    """
+    requested = (
+        requested_mode
+        if isinstance(requested_mode, ExecutionMode)
+        else ExecutionMode(requested_mode)
+    )
+    if requested is ExecutionMode.GPU:
+        selected = True
+        reason = "explicit GPU mode"
+    elif requested is ExecutionMode.CPU:
+        selected = False
+        reason = "explicit CPU mode"
+    else:
+        many_rows = rows >= 8_000
+        enough_regular_text = text_bytes >= 192 * 1024 and max_row_bytes <= 64 * 1024
+        enough_moderate_skew = (
+            rows >= 2_000
+            and text_bytes >= 1024 * 1024
+            and max_row_bytes * 4 <= text_bytes
+        )
+        selected = many_rows or enough_regular_text or enough_moderate_skew
+        if many_rows:
+            reason = "geometry cardinality amortizes native parser launch"
+        elif enough_regular_text:
+            reason = "regular WKT text volume amortizes native parser launch"
+        elif enough_moderate_skew:
+            reason = "moderately skewed WKT work has sufficient parallel volume"
+        else:
+            reason = "small or highly skewed WKT batch remains host-favorable"
+    return _WktGpuAdmission(
+        selected=selected,
+        reason=reason,
+        rows=int(rows),
+        text_bytes=int(text_bytes),
+        max_row_bytes=int(max_row_bytes),
+    )
 
 
 def _try_large_wkt_gpu_array(
@@ -515,27 +791,90 @@ def _try_large_wkt_gpu_array(
     crs: Any | None,
     on_invalid: Literal["raise", "warn", "ignore"],
 ) -> GeometryArray | None:
-    if get_requested_mode() is ExecutionMode.CPU:
+    requested = _native_strict_dispatch_mode()
+    if requested is ExecutionMode.CPU:
         return None
     if on_invalid != "raise":
+        if requested is ExecutionMode.GPU:
+            record_fallback_event(
+                surface="geopandas.array.from_wkt",
+                reason="native WKT construction requires on_invalid='raise'",
+                detail=f"on_invalid={on_invalid!r}",
+                requested=requested,
+                selected=ExecutionMode.CPU,
+                pipeline="io/from_wkt",
+            )
         return None
 
     try:
         values = np.asarray(data, dtype=object)
-    except Exception:
+    except Exception as exc:
+        _record_forced_constructor_fallback(
+            surface="geopandas.array.from_wkt",
+            pipeline="io/from_wkt",
+            requested=requested,
+            reason="native WKT construction requires one-dimensional array-like input",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
         return None
-    if values.ndim != 1 or values.size < _WKT_GPU_MIN_ROWS:
+    if values.ndim != 1 or values.size == 0:
+        _record_forced_constructor_fallback(
+            surface="geopandas.array.from_wkt",
+            pipeline="io/from_wkt",
+            requested=requested,
+            reason="native WKT construction requires non-empty one-dimensional input",
+            detail=f"ndim={values.ndim}, rows={values.size}",
+        )
         return None
 
     items = values.tolist()
-    if any(not isinstance(item, str) or "\n" in item or "\r" in item for item in items):
-        return None
+    encoded_items: list[bytes] = []
+    max_row_bytes = 0
+    for item in items:
+        if not isinstance(item, str) or "\n" in item or "\r" in item:
+            _record_forced_constructor_fallback(
+                surface="geopandas.array.from_wkt",
+                pipeline="io/from_wkt",
+                requested=requested,
+                reason="native WKT construction requires one geometry per text row",
+                detail=f"value_type={type(item).__name__}",
+            )
+            return None
+        encoded = item.encode("utf-8")
+        prefix_pos = 0
+        while prefix_pos < len(encoded) and encoded[prefix_pos] in b" \t":
+            prefix_pos += 1
+        if (
+            prefix_pos + 1 < len(encoded)
+            and (encoded[prefix_pos] | 0x20) == ord("s")
+            and (encoded[prefix_pos + 1] | 0x20) == ord("r")
+        ):
+            _record_forced_constructor_fallback(
+                surface="geopandas.array.from_wkt",
+                pipeline="io/from_wkt",
+                requested=requested,
+                reason="GeoPandas from_wkt does not accept EWKT/SRID prefixes",
+            )
+            return None
+        encoded_items.append(encoded)
+        max_row_bytes = max(max_row_bytes, len(encoded))
 
-    try:
-        text = "\n".join(items)
-    except TypeError:
+    text_bytes = sum(map(len, encoded_items)) + max(len(encoded_items) - 1, 0)
+    admission = _plan_wkt_gpu_admission(
+        rows=len(encoded_items),
+        text_bytes=text_bytes,
+        max_row_bytes=max_row_bytes,
+        requested_mode=requested,
+    )
+    if text_bytes == 0:
+        _record_forced_constructor_fallback(
+            surface="geopandas.array.from_wkt",
+            pipeline="io/from_wkt",
+            requested=requested,
+            reason="native WKT construction requires non-empty text",
+        )
         return None
-    if not text:
+    if not admission.selected:
         return None
 
     try:
@@ -543,13 +882,17 @@ def _try_large_wkt_gpu_array(
 
         from vibespatial.io.wkt_gpu import read_wkt_gpu
 
-        host_bytes = np.frombuffer(text.encode("utf-8"), dtype=np.uint8)
-        owned = read_wkt_gpu(cp.asarray(host_bytes))
+        host_bytes = np.frombuffer(b"\n".join(encoded_items), dtype=np.uint8)
+        owned = read_wkt_gpu(
+            cp.asarray(host_bytes),
+            row_count_hint=len(encoded_items),
+        )
     except Exception as exc:
         record_fallback_event(
             surface="geopandas.array.from_wkt",
             reason="GPU WKT constructor failed; falling back to Shapely from_wkt",
             detail=str(exc),
+            requested=requested,
             selected=ExecutionMode.CPU,
             pipeline="io/from_wkt",
             d2h_transfer=False,
@@ -560,11 +903,11 @@ def _try_large_wkt_gpu_array(
         surface="geopandas.array.from_wkt",
         operation="from_wkt",
         implementation="wkt_gpu_large_array_constructor",
-        reason=(
-            "large public GeoSeries.from_wkt input uses the repo-owned GPU WKT "
-            "parser instead of Shapely host parsing"
+        reason=admission.reason,
+        detail=(
+            f"rows={admission.rows}, bytes={admission.text_bytes}, "
+            f"max_row_bytes={admission.max_row_bytes}"
         ),
-        detail=f"rows={int(values.size)}, bytes={int(host_bytes.size)}",
         selected=ExecutionMode.GPU,
     )
     return GeometryArray.from_owned(owned, crs=crs)
@@ -679,6 +1022,14 @@ def points_from_xy(
     y = np.asarray(y, dtype="float64")
     if z is not None:
         z = np.asarray(z, dtype="float64")
+
+    if z is None:
+        # Point is already the canonical owned storage shape. Building its
+        # offsets and SoA coordinate buffers directly avoids one host object
+        # per row and lets downstream public operations retain native state.
+        from vibespatial.constructive.point import point_owned_from_xy
+
+        return GeometryArray.from_owned(point_owned_from_xy(x, y), crs=crs)
 
     return GeometryArray(shapely.points(x, y, z), crs=crs)
 
@@ -2981,6 +3332,10 @@ class GeometryArray(ExtensionArray):
 
     @property
     def nbytes(self):
+        if self._owned is not None:
+            from vibespatial.geometry.device_array import DeviceGeometryArray
+
+            return DeviceGeometryArray._from_owned(self._owned, crs=self.crs).nbytes
         return self._data.nbytes
 
     def shift(self, periods: int = 1, fill_value: Any | None = None) -> GeometryArray:

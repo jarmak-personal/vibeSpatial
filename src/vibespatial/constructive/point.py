@@ -76,16 +76,23 @@ def _point_rows_and_xy(points: OwnedGeometryArray) -> tuple[np.ndarray, np.ndarr
     return point_rows, buffer.x[coord_rows], buffer.y[coord_rows]
 
 
+def _coerce_point_xy_inputs(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if x.ndim != 1 or y.ndim != 1:
+        raise ValueError("x and y must be one-dimensional")
+    if x.shape != y.shape:
+        raise ValueError("x and y must have the same length")
+    return x, y
+
+
 def point_owned_from_xy(x: np.ndarray, y: np.ndarray) -> OwnedGeometryArray:
     """Create a point-only OwnedGeometryArray directly from x/y coordinate arrays.
 
     Avoids Shapely round-trip.  Both arrays must be 1-D float64 of equal length.
     """
-    x = np.asarray(x, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64)
+    x, y = _coerce_point_xy_inputs(x, y)
     row_count = x.size
-    if y.size != row_count:
-        raise ValueError("x and y must have the same length")
 
     geom_offsets = np.arange(row_count + 1, dtype=np.int32)
     validity = np.ones(row_count, dtype=bool)
@@ -122,11 +129,8 @@ def point_owned_from_xy_device(x: np.ndarray, y: np.ndarray) -> OwnedGeometryArr
 
     Both arrays must be 1-D float64 of equal length.
     """
-    x = np.asarray(x, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64)
+    x, y = _coerce_point_xy_inputs(x, y)
     row_count = x.size
-    if y.size != row_count:
-        raise ValueError("x and y must have the same length")
     if row_count == 0:
         return _empty_point_output()
 
@@ -166,6 +170,9 @@ def point_owned_from_xy_device(x: np.ndarray, y: np.ndarray) -> OwnedGeometryArr
         result.device_state.trusted_all_valid = True
         result.device_state.trusted_homogeneous_family = GeometryFamily.POINT
         result.device_state.trusted_all_non_empty = True
+        result.device_state.trusted_all_finite_coordinates = bool(
+            np.all(np.isfinite(x)) and np.all(np.isfinite(y))
+        )
     result.families[GeometryFamily.POINT] = FamilyGeometryBuffer(
         family=GeometryFamily.POINT,
         schema=get_geometry_buffer_schema(GeometryFamily.POINT),

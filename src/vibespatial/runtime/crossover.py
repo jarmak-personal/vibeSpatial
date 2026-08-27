@@ -867,6 +867,7 @@ _KERNEL_CROSSOVER_OVERRIDES: dict[str, int] = {
     "clip_scalar_mask_bounds_filter": 50_000,
     "make_valid_repair": 2_000,
     "polygon_centroid": 500,
+    "segmented_point_union": 10_000,
     "geometry_area": 500,
     "geometry_length": 500,
     "intersects": 0,

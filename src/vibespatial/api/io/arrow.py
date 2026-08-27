@@ -103,21 +103,21 @@ _geometry_type_names += [geom_type + " Z" for geom_type in _geometry_type_names]
 
 def _get_geometry_types(series):
     """Get unique geometry types from a GeoSeries."""
+    from vibespatial.geometry.buffers import GeometryFamily
     from vibespatial.geometry.device_array import DeviceGeometryArray
+
+    family_names = {
+        GeometryFamily.POINT: "Point",
+        GeometryFamily.LINESTRING: "LineString",
+        GeometryFamily.POLYGON: "Polygon",
+        GeometryFamily.MULTIPOINT: "MultiPoint",
+        GeometryFamily.MULTILINESTRING: "MultiLineString",
+        GeometryFamily.MULTIPOLYGON: "MultiPolygon",
+    }
 
     arr = series.array
     if isinstance(arr, DeviceGeometryArray):
         # Satisfy from owned tags without Shapely materialization.
-        from vibespatial.geometry.buffers import GeometryFamily
-        family_names = {
-            GeometryFamily.POINT: "Point",
-            GeometryFamily.LINESTRING: "LineString",
-            GeometryFamily.POLYGON: "Polygon",
-            GeometryFamily.MULTIPOINT: "MultiPoint",
-            GeometryFamily.MULTILINESTRING: "MultiLineString",
-            GeometryFamily.MULTIPOLYGON: "MultiPolygon",
-        }
-
         family_domain = arr.native_family_domain
         if family_domain is None:
             cached_owned = arr.cached_owned()
@@ -129,6 +129,17 @@ def _get_geometry_types(series):
         return sorted(
             family_names[family]
             for family in family_domain
+            if family in family_names
+        )
+
+    owned = getattr(arr, "_owned", None)
+    if owned is not None:
+        # GeometryArray.from_owned is the public points_from_xy/WKB ingress
+        # carrier. Its family buffers already prove the 2D geometry domain;
+        # reading arr._data here would needlessly construct Shapely objects.
+        return sorted(
+            family_names[family]
+            for family in owned.families
             if family in family_names
         )
 

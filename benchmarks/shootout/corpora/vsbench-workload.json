@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "correctness_fingerprint": "vsbench-result-v3:ordered:sha256",
+  "data_root_env": "VSBENCH_CORPUS_ROOT",
+  "default_data_root": "benchmark_results/external-corpora/data",
+  "assets": {
+    "osm_multipolygon_algeria": {
+      "repository": "NoeFlandre/osm-polygon-description-tag",
+      "revision": "fcac0ce894d8d6569b526c73874b20d447005dd1",
+      "source_path": "data/algeria-latest.parquet",
+      "local_path": "NoeFlandre__osm-polygon-description-tag/data/algeria-latest.parquet",
+      "url": "https://huggingface.co/datasets/NoeFlandre/osm-polygon-description-tag/resolve/fcac0ce894d8d6569b526c73874b20d447005dd1/data/algeria-latest.parquet?download=true",
+      "sha256": "ac6a325e9fa424ea3f425ea7057018d31b9763ab916cee9ee2c8609e7a50409c",
+      "size_bytes": 851510,
+      "license": "ODbL-1.0",
+      "shape": "GeoParquet 1.1 WKB MultiPolygon with nested attributes"
+    },
+    "osm_landuse_american_oceania": {
+      "repository": "NoeFlandre/osm-polygon-selection",
+      "revision": "65bf0c2d1443dbc17776e565dff508d09bd79d2e",
+      "source_path": "per_country/american-oceania/american-oceania.parquet",
+      "local_path": "NoeFlandre__osm-polygon-selection/per_country/american-oceania/american-oceania.parquet",
+      "url": "https://huggingface.co/datasets/NoeFlandre/osm-polygon-selection/resolve/65bf0c2d1443dbc17776e565dff508d09bd79d2e/per_country/american-oceania/american-oceania.parquet?download=true",
+      "sha256": "21e823dbd8120d663b5237cc3f731477d3827ae1609336f0c0929d3e69f60b35",
+      "size_bytes": 973870,
+      "license": "ODbL-1.0",
+      "shape": "Parquet attributes plus WKT Polygon/MultiPolygon geometry"
+    },
+    "osm_power_substations": {
+      "repository": "GridGrapher/osm-power-grid",
+      "revision": "cfab28c423b794cd69f5dda6a18056d45a185b38",
+      "source_path": "extract/substations.parquet",
+      "local_path": "GridGrapher__osm-power-grid/extract/substations.parquet",
+      "url": "https://huggingface.co/datasets/GridGrapher/osm-power-grid/resolve/cfab28c423b794cd69f5dda6a18056d45a185b38/extract/substations.parquet?download=true",
+      "sha256": "dc3cf0d757d530018df00a503805fc76416f4d4b4d090cfc3abaea5b0f5f3969",
+      "size_bytes": 5183229,
+      "license": "ODbL-1.0",
+      "shape": "Parquet attributes plus 164374 longitude/latitude points"
+    },
+    "cmab_beijing_level1": {
+      "repository": "DannHiroaki/CMAB-Spatial-Join-0.08B",
+      "revision": "41e3c90fa42fc8eede910404fe3db29ad3897b81",
+      "source_path": "level_1/province=beijing/data_00001.parquet",
+      "local_path": "DannHiroaki__CMAB-Spatial-Join-0.08B/level_1/province=beijing/data_00001.parquet",
+      "url": "https://huggingface.co/datasets/DannHiroaki/CMAB-Spatial-Join-0.08B/resolve/41e3c90fa42fc8eede910404fe3db29ad3897b81/level_1/province%3Dbeijing/data_00001.parquet?download=true",
+      "sha256": "cb9777320294a98e4003972e7085e661311e9cff115d3e5762855d450c367836",
+      "size_bytes": 14603751,
+      "license": "CC-BY-4.0",
+      "shape": "104640 attributed building AABBs and expanded AABBs"
+    },
+    "geolife_level1_part3": {
+      "repository": "DannHiroaki/Geolife-Spatial-Join-0.15B",
+      "revision": "a9b8439beb16de106f6ff3f54c73c6b6964d77af",
+      "source_path": "dims=3/level=1/part-00003.parquet",
+      "local_path": "DannHiroaki__Geolife-Spatial-Join-0.15B/dims=3/level=1/part-00003.parquet",
+      "url": "https://huggingface.co/datasets/DannHiroaki/Geolife-Spatial-Join-0.15B/resolve/a9b8439beb16de106f6ff3f54c73c6b6964d77af/dims%3D3/level%3D1/part-00003.parquet?download=true",
+      "sha256": "b20403c9998c0132207896f106b2b307787068f0791762ce5aa4e2189df4b7cc",
+      "size_bytes": 58540741,
+      "license": "Microsoft Research License Agreement",
+      "shape": "2507357 spatiotemporal trajectory rectangles"
+    }
+  }
+}

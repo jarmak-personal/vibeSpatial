@@ -141,7 +141,10 @@ def geopandas_to_arrow(
     for col in geometry_columns:
         df_attr[col] = None
 
-    table = pa.Table.from_pandas(df_attr, preserve_index=index)
+    from vibespatial.api._native_result_core import _append_pandas_index_to_arrow
+
+    table = pa.Table.from_pandas(df_attr, preserve_index=False)
+    table = _append_pandas_index_to_arrow(table, df_attr.index, index)
 
     geometry_encoding_dict = {}
 

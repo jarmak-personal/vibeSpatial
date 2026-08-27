@@ -169,6 +169,18 @@
   },
   {
     "geom_types": [
+      "point"
+    ],
+    "kernel": "segmented_point_union",
+    "module": "vibespatial.constructive.grouped_point_union",
+    "tier": 3,
+    "variants": [
+      "gpu-cccl-radix",
+      "cpu"
+    ]
+  },
+  {
+    "geom_types": [
       "polygon"
     ],
     "kernel": "polygon_intersection",

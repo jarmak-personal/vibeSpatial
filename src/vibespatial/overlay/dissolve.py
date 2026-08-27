@@ -26,7 +26,7 @@ from vibespatial.api._native_results import (
     _coerce_constructive_export_frame,
     _grouped_constructive_to_native_tabular_result,
 )
-from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime import ExecutionMode, get_requested_mode, has_gpu_runtime
 from vibespatial.runtime.config import (
     OVERLAY_GROUPED_BOX_GPU_THRESHOLD,
     OVERLAY_GROUPED_COVERAGE_EDGE_THRESHOLD,
@@ -526,6 +526,41 @@ class LazyGroupedUnionOwned:
             return materialized
 
         grouped_union = None if self._exact_materializer is None else self._exact_materializer()
+        host_planned = False
+        if grouped_union is None and self._prefer_host_exact_materialization():
+            host_planned = True
+            group_codes = self._grouped.group_codes
+            if _is_device_array(group_codes):
+                group_codes = overlay_device_to_host(
+                    group_codes,
+                    reason="lazy grouped-union host-plan group-code export",
+                )
+            group_positions = _group_positions_from_codes(
+                np.asarray(group_codes, dtype=np.int32),
+                self.row_count,
+            )
+            grouped_union = execute_grouped_union(
+                self._geometries,
+                group_positions,
+                method=self._method,
+                grid_size=self._grid_size,
+                owned=None,
+            )
+            record_dispatch_event(
+                surface="vibespatial.overlay.dissolve.LazyGroupedUnionOwned",
+                operation="materialize_grouped_union",
+                implementation="shape_planned_host_exact_grouped_union",
+                reason=(
+                    "small high-complexity groups favor GEOS exact union over "
+                    "device pairwise topology amplification"
+                ),
+                detail=(
+                    f"rows={self._source_owned.row_count}, groups={self.row_count}, "
+                    f"coordinates={self._source_coordinate_capacity()}"
+                ),
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+            )
         if grouped_union is None:
             grouped_union = execute_native_grouped_union(
                 self._grouped,
@@ -564,16 +599,44 @@ class LazyGroupedUnionOwned:
         self.residency = owned.residency
         self.runtime_history = list(getattr(owned, "runtime_history", []))
         self.diagnostics = list(getattr(owned, "diagnostics", []))
-        record_dispatch_event(
-            surface="vibespatial.overlay.dissolve.LazyGroupedUnionOwned",
-            operation="materialize_grouped_union",
-            implementation="lazy_grouped_union_materialized_exact",
-            reason="delayed dissolve geometry was materialized for an exact-union consumer",
-            detail=f"rows={self._source_owned.row_count}, groups={self.row_count}",
-            requested=ExecutionMode.GPU,
-            selected=ExecutionMode.GPU,
-        )
+        if not host_planned:
+            record_dispatch_event(
+                surface="vibespatial.overlay.dissolve.LazyGroupedUnionOwned",
+                operation="materialize_grouped_union",
+                implementation="lazy_grouped_union_materialized_exact",
+                reason="delayed dissolve geometry was materialized for an exact-union consumer",
+                detail=f"rows={self._source_owned.row_count}, groups={self.row_count}",
+                requested=ExecutionMode.GPU,
+                selected=ExecutionMode.GPU,
+            )
         return owned
+
+    def _source_coordinate_capacity(self) -> int:
+        state = getattr(self._source_owned, "device_state", None)
+        if state is None:
+            return 0
+        return sum(int(buffer.x.size) for buffer in state.families.values())
+
+    def _prefer_host_exact_materialization(self) -> bool:
+        """Protect auto mode from small, topology-dense pairwise union trees."""
+        if (
+            get_requested_mode() is not ExecutionMode.AUTO
+            or strict_native_mode_enabled()
+            or self._method is not DissolveUnionMethod.UNARY
+            or self._grid_size is not None
+        ):
+            return False
+        rows = int(self._source_owned.row_count)
+        groups = max(int(self.row_count), 1)
+        coordinates = self._source_coordinate_capacity()
+        if rows == 0:
+            return False
+        return (
+            rows <= 4_096
+            and coordinates >= 32_768
+            and coordinates >= rows * 64
+            and rows >= groups * 16
+        )
 
     def _materialize_collective_coverage(self) -> OwnedGeometryArray | None:
         """Retain exact tiled coverage for a downstream relation consumer."""
@@ -5298,6 +5361,37 @@ def execute_grouped_union_codes(
     geometry_count = int(owned.row_count) if owned is not None else int(len(geometries))
     if geometry_count != row_group_codes.size:
         raise ValueError("row_group_codes length must match geometries length")
+
+    if (
+        owned is not None
+        and normalized is DissolveUnionMethod.UNARY
+        and grid_size is None
+    ):
+        from vibespatial.constructive.grouped_point_union import (
+            grouped_point_union_owned,
+            supports_grouped_point_union,
+        )
+
+        if supports_grouped_point_union(owned):
+            if native_grouped is None:
+                native_grouped = NativeGrouped.from_dense_codes(
+                    row_group_codes,
+                    group_count=group_count,
+                )
+            accelerated = grouped_point_union_owned(
+                native_grouped,
+                owned,
+                _admitted=True,
+            )
+            if accelerated is not None:
+                return GroupedUnionResult(
+                    geometries=None,
+                    group_count=group_count,
+                    non_empty_groups=group_count,
+                    empty_groups=0,
+                    method=normalized,
+                    owned=accelerated,
+                )
 
     if (
         owned is not None

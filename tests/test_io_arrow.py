@@ -1109,6 +1109,148 @@ def test_decode_wkb_owned_large_native_list_prefers_arrow_gpu_bridge(monkeypatch
     assert decoded.to_shapely()[1].equals(Point(1, 1))
 
 
+def test_arrow_wkb_decode_uses_device_bridge_before_uniform_host_parse_at_scale(
+    monkeypatch,
+) -> None:
+    expected = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    calls: list[str] = []
+    monkeypatch.setattr(
+        io_wkb,
+        "_plan_arrow_wkb_gpu_admission",
+        lambda **_kwargs: io_wkb._ArrowWkbGpuAdmission(
+            selected=True,
+            reason="test scale admission",
+            rows=2,
+            payload_bytes=42,
+        ),
+    )
+    monkeypatch.setattr(
+        io_wkb,
+        "_try_gpu_wkb_arrow_decode",
+        lambda array, on_invalid="raise", **_kwargs: (
+            calls.append("device")
+            or io_wkb._GpuWkbDecodeAttempt(result=expected)
+        ),
+    )
+    monkeypatch.setattr(
+        io_wkb,
+        "_try_uniform_arrow_wkb_fast_decode",
+        lambda _array: (_ for _ in ()).throw(
+            AssertionError("uniform host parse must not shadow admitted device decode")
+        ),
+    )
+
+    decoded = io_wkb.decode_wkb_arrow_array_owned(
+        pa.array([Point(0, 0).wkb, Point(1, 1).wkb], type=pa.binary())
+    )
+
+    assert decoded is expected
+    assert calls == ["device"]
+
+
+def test_arrow_wkb_decode_strict_auto_only_attempts_device_decoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.testing import strict_native_environment
+
+    expected = from_shapely_geometries([Point(0, 0)])
+    requested_modes: list[ExecutionMode] = []
+
+    def _device_attempt(array, *, on_invalid="raise", requested_mode=None):
+        requested_modes.append(requested_mode)
+        return io_wkb._GpuWkbDecodeAttempt(result=expected)
+
+    monkeypatch.setattr(io_wkb, "_try_gpu_wkb_arrow_decode", _device_attempt)
+    monkeypatch.setattr(
+        io_wkb,
+        "_try_uniform_arrow_wkb_fast_decode",
+        lambda _array: (_ for _ in ()).throw(
+            AssertionError("strict AUTO must not attempt the uniform host decoder")
+        ),
+    )
+
+    with strict_native_environment(execution_mode="auto"):
+        decoded = io_wkb.decode_wkb_arrow_array_owned(
+            pa.array([Point(0, 0).wkb], type=pa.binary())
+        )
+
+    assert decoded is expected
+    assert requested_modes == [ExecutionMode.GPU]
+
+
+def test_arrow_wkb_decode_forced_gpu_failure_records_requested_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    geopandas.clear_fallback_events()
+    monkeypatch.setattr(
+        io_wkb,
+        "_try_gpu_wkb_arrow_decode",
+        lambda array, on_invalid="raise", **_kwargs: io_wkb._GpuWkbDecodeAttempt(
+            result=None,
+            fallback_detail="GPU Arrow WKB decode bridge failed: RuntimeError: boom",
+        ),
+    )
+    monkeypatch.setattr(
+        io_wkb,
+        "_try_uniform_arrow_wkb_fast_decode",
+        lambda _array: (_ for _ in ()).throw(
+            AssertionError("forced GPU mode must not attempt the uniform host decoder")
+        ),
+    )
+
+    with pytest.raises(NotImplementedError, match="RuntimeError: boom"):
+        io_wkb.decode_wkb_arrow_array_owned(
+            pa.array([Point(0, 0).wkb], type=pa.binary()),
+            requested_mode=ExecutionMode.GPU,
+        )
+
+    fallbacks = geopandas.get_fallback_events(clear=True)
+    assert any(
+        event.surface == "vibespatial.io.wkb"
+        and event.requested is ExecutionMode.GPU
+        and "RuntimeError: boom" in event.detail
+        for event in fallbacks
+    )
+
+
+def test_arrow_wkb_decode_strict_auto_failure_is_observable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.runtime.fallbacks import StrictNativeFallbackError
+    from vibespatial.testing import strict_native_environment
+
+    geopandas.clear_fallback_events()
+    monkeypatch.setattr(
+        io_wkb,
+        "_try_gpu_wkb_arrow_decode",
+        lambda array, on_invalid="raise", **_kwargs: io_wkb._GpuWkbDecodeAttempt(
+            result=None,
+            fallback_detail="test-only device decoder miss",
+        ),
+    )
+    monkeypatch.setattr(
+        io_wkb,
+        "_try_uniform_arrow_wkb_fast_decode",
+        lambda _array: (_ for _ in ()).throw(
+            AssertionError("strict AUTO must not attempt the uniform host decoder")
+        ),
+    )
+
+    with strict_native_environment(execution_mode="auto"):
+        with pytest.raises(StrictNativeFallbackError):
+            io_wkb.decode_wkb_arrow_array_owned(
+                pa.array([Point(0, 0).wkb], type=pa.binary())
+            )
+
+    fallbacks = geopandas.get_fallback_events(clear=True)
+    assert any(
+        event.surface == "vibespatial.io.wkb"
+        and event.requested is ExecutionMode.GPU
+        and "test-only device decoder miss" in event.detail
+        for event in fallbacks
+    )
+
+
 def test_decode_wkb_owned_raises_on_invalid_device_row_when_on_invalid_raise(monkeypatch) -> None:
     import vibespatial.kernels.core.wkb_decode as io_wkb_decode
 
@@ -1162,7 +1304,7 @@ def test_decode_wkb_arrow_array_records_fallback_when_gpu_bridge_misses(monkeypa
     monkeypatch.setattr(
         io_wkb,
         "_try_gpu_wkb_arrow_decode",
-        lambda array, on_invalid="raise": io_wkb._GpuWkbDecodeAttempt(
+        lambda array, on_invalid="raise", **_kwargs: io_wkb._GpuWkbDecodeAttempt(
             result=None,
             fallback_detail="GPU Arrow WKB decode bridge failed: RuntimeError: boom",
         ),
@@ -1174,6 +1316,7 @@ def test_decode_wkb_arrow_array_records_fallback_when_gpu_bridge_misses(monkeypa
     assert decoded.to_shapely()[0].equals(Point(0, 0))
     assert any(
         event.surface == "vibespatial.io.wkb"
+        and event.requested is ExecutionMode.AUTO
         and "GPU Arrow WKB decode could not complete" in event.reason
         and "RuntimeError: boom" in event.detail
         for event in fallbacks
@@ -2595,7 +2738,10 @@ def test_decode_wkb_arrow_uniform_fast_paths_skip_generic_gpu_bridge(
     monkeypatch.setattr("vibespatial.io.wkb._try_gpu_wkb_arrow_decode", _boom)
 
     point_arrow = pa.array([Point(0, 0).wkb, Point(1, 1).wkb], type=pa.binary())
-    point_restored = io_wkb.decode_wkb_arrow_array_owned(point_arrow).to_shapely()
+    point_restored = io_wkb.decode_wkb_arrow_array_owned(
+        point_arrow,
+        requested_mode=ExecutionMode.AUTO,
+    ).to_shapely()
     assert point_restored[0].equals(Point(0, 0))
     assert point_restored[1].equals(Point(1, 1))
 
@@ -2606,7 +2752,10 @@ def test_decode_wkb_arrow_uniform_fast_paths_skip_generic_gpu_bridge(
         ],
         type=pa.binary(),
     )
-    line_restored = io_wkb.decode_wkb_arrow_array_owned(line_arrow).to_shapely()
+    line_restored = io_wkb.decode_wkb_arrow_array_owned(
+        line_arrow,
+        requested_mode=ExecutionMode.AUTO,
+    ).to_shapely()
     assert line_restored[0].equals(LineString([(0, 0), (1, 1)]))
     assert line_restored[1].equals(LineString([(2, 2), (3, 3)]))
 
@@ -2617,7 +2766,10 @@ def test_decode_wkb_arrow_uniform_fast_paths_skip_generic_gpu_bridge(
         ],
         type=pa.binary(),
     )
-    polygon_restored = io_wkb.decode_wkb_arrow_array_owned(polygon_arrow).to_shapely()
+    polygon_restored = io_wkb.decode_wkb_arrow_array_owned(
+        polygon_arrow,
+        requested_mode=ExecutionMode.AUTO,
+    ).to_shapely()
     assert polygon_restored[0].equals(Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]))
     assert polygon_restored[1].equals(Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]))
 
@@ -3494,6 +3646,58 @@ def test_read_geoparquet_table_with_pylibcudf_disables_unneeded_schema_metadata(
     assert table == "device-table"
     assert ("use_arrow_schema", False) in calls
     assert ("use_pandas_metadata", False) in calls
+
+
+def test_public_geoparquet_gpu_roundtrip_restores_nested_struct_field_names(
+    tmp_path,
+) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("GPU pylibcudf runtime unavailable")
+
+    import pyarrow.parquet as pq
+
+    source_path = tmp_path / "nested-list-struct-source.parquet"
+    output_path = tmp_path / "nested-list-struct-output.parquet"
+    source = geopandas.GeoDataFrame(
+        {"geometry": [Point(0, 0), Point(1, 1), Point(2, 2)]},
+        crs="EPSG:4326",
+    )
+    source.to_parquet(source_path)
+
+    nested_type = pa.list_(
+        pa.struct(
+            [
+                pa.field("key", pa.string(), nullable=False),
+                pa.field("value", pa.string()),
+            ]
+        )
+    )
+    nested = pa.array(
+        [
+            [{"key": "name", "value": "alpha"}],
+            [{"key": "name", "value": None}],
+            [],
+        ],
+        type=nested_type,
+    )
+    table = pq.read_table(source_path).append_column("tags", nested)
+    metadata = dict(table.schema.metadata or {})
+    metadata.pop(b"pandas", None)
+    table = table.replace_schema_metadata(metadata)
+    pq.write_table(table, source_path)
+    source_nested_type = pq.read_schema(source_path).field("tags").type
+
+    result = geopandas.read_parquet(source_path)
+
+    assert list(result["tags"].iloc[0]) == [{"key": "name", "value": "alpha"}]
+    assert list(result["tags"].iloc[1]) == [{"key": "name", "value": None}]
+    assert list(result["tags"].iloc[2]) == []
+
+    result.to_parquet(output_path, row_group_size=1)
+    output_schema = pq.read_schema(output_path)
+    assert output_schema.field("tags").type == source_nested_type
+    roundtripped = geopandas.read_parquet(output_path)
+    assert list(roundtripped["tags"].iloc[0]) == [{"key": "name", "value": "alpha"}]
 
 
 # ---------------------------------------------------------------------------
@@ -6616,6 +6820,251 @@ def test_geodataframe_to_parquet_native_device_attrs_and_index_skip_public_expor
     assert list(result["value"]) == [101, 202]
     assert list(result["score"]) == [1.5, 2.5]
     assert list(result.geometry.astype(str)) == ["POINT (0 0)", "POINT (1 1)"]
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="device-backed Arrow attributes unavailable",
+)
+@pytest.mark.parametrize(
+    ("column_name", "index", "expected_index_field"),
+    [
+        ("x", pd.Index([3, 4], name="x"), "__index_level_0__"),
+        (
+            "__index_level_0__",
+            pd.Index([3, 4]),
+            "__index_level_0___1",
+        ),
+        ("x", pd.Index([3, 4], name="site"), "site"),
+        ("x", pd.RangeIndex(3, 5, name="x"), None),
+    ],
+)
+def test_device_attribute_default_arrow_export_preserves_colliding_index(
+    column_name,
+    index,
+    expected_index_field,
+) -> None:
+    import pylibcudf as plc
+
+    source = pa.table({column_name: pa.array([1, 2], type=pa.int64())})
+    attributes = NativeAttributeTable(
+        device_table=plc.Table.from_arrow(source),
+        index_override=index,
+        column_override=(column_name,),
+        schema_override=source.schema,
+    )
+
+    table = attributes.to_arrow()
+    restored = table.to_pandas()
+
+    expected_fields = [column_name]
+    if expected_index_field is not None:
+        expected_fields.append(expected_index_field)
+    assert table.column_names == expected_fields
+    assert restored.index.equals(index)
+    assert list(restored.columns) == [column_name]
+    assert list(restored[column_name]) == [1, 2]
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="device-backed Arrow attributes unavailable",
+)
+def test_device_attribute_default_arrow_export_preserves_duplicate_multiindex_names() -> None:
+    import pylibcudf as plc
+
+    source = pa.table({"x": pa.array([1, 2], type=pa.int64())})
+    index = pd.MultiIndex.from_arrays(
+        [[3, 4], [5, 6]],
+        names=["x", "x"],
+    )
+    attributes = NativeAttributeTable(
+        device_table=plc.Table.from_arrow(source),
+        index_override=index,
+        column_override=("x",),
+        schema_override=source.schema,
+    )
+
+    table = attributes.to_arrow()
+    restored = table.to_pandas()
+
+    assert table.column_names == [
+        "x",
+        "__index_level_0__",
+        "__index_level_1__",
+    ]
+    assert restored.index.equals(index)
+    assert list(restored["x"]) == [1, 2]
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="device-backed Arrow export unavailable",
+)
+def test_public_device_geodataframe_to_arrow_preserves_colliding_named_index() -> None:
+    gdf, owned = _make_device_dga_gdf([Point(0, 0), Point(1, 1)])
+    gdf = gdf.rename(columns={"idx": "x"})
+    gdf.index = pd.Index([3, 4], name="x")
+    owned.diagnostics.clear()
+
+    table = pa.table(gdf.to_arrow(geometry_encoding="geoarrow"))
+    restored = table.to_pandas()
+
+    assert table.column_names == ["geometry", "x", "__index_level_0__"]
+    assert restored.index.equals(gdf.index)
+    assert list(restored["x"]) == [0, 1]
+    assert not any(
+        event.kind == DiagnosticKind.MATERIALIZATION for event in owned.diagnostics
+    )
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU GeoParquet writer unavailable",
+)
+def test_public_device_geodataframe_to_parquet_preserves_colliding_named_index(
+    tmp_path,
+) -> None:
+    geometries = [box(0, 0, 1, 1), box(1, 1, 2, 2)]
+    gdf, owned = _make_device_dga_gdf(geometries)
+    gdf = gdf.rename(columns={"idx": "x"})
+    gdf.index = pd.Index([3, 4], name="x")
+    owned.diagnostics.clear()
+    path = tmp_path / "colliding-index-name.parquet"
+
+    gdf.to_parquet(path, geometry_encoding="geoarrow")
+    result = geopandas.read_parquet(path)
+
+    assert result.index.equals(gdf.index)
+    assert list(result.columns) == ["geometry", "x"]
+    assert list(result["x"]) == [0, 1]
+    assert all(
+        actual.equals(expected)
+        for actual, expected in zip(result.geometry, geometries, strict=True)
+    )
+    assert not any(
+        event.kind == DiagnosticKind.MATERIALIZATION for event in owned.diagnostics
+    )
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU GeoParquet writer unavailable",
+)
+@pytest.mark.parametrize(
+    ("column_name", "index", "expected_index_field"),
+    [
+        ("value", pd.Index([3, 4], name="site"), "site"),
+        ("x", pd.Index([3, 4], name="x"), "__index_level_0__"),
+        (
+            "__index_level_0__",
+            pd.Index([3, 4]),
+            "__index_level_0___1",
+        ),
+    ],
+)
+def test_public_points_from_xy_to_parquet_preserves_default_index(
+    tmp_path,
+    column_name,
+    index,
+    expected_index_field,
+) -> None:
+    import pyarrow.parquet as pq
+
+    geometry = geopandas.points_from_xy(
+        [0.0, 1.0],
+        [2.0, 3.0],
+        crs="EPSG:4326",
+    )
+    gdf = geopandas.GeoDataFrame(
+        {column_name: [10, 20]},
+        geometry=geometry,
+        index=index,
+        crs="EPSG:4326",
+    )
+    assert gdf.geometry.array._shapely_data is None
+    owned = gdf.geometry.array.to_owned()
+    owned.diagnostics.clear()
+    path = tmp_path / f"point-index-{column_name}.parquet"
+
+    gdf.to_parquet(path, geometry_encoding="WKB")
+    write_materializations = [
+        event
+        for event in owned.diagnostics
+        if event.kind == DiagnosticKind.MATERIALIZATION
+    ]
+    physical_table = pq.read_table(path)
+    result = geopandas.read_parquet(path)
+
+    assert physical_table.column_names == [
+        column_name,
+        "geometry",
+        expected_index_field,
+    ]
+    assert result.index.equals(index)
+    assert list(result.columns) == [column_name, "geometry"]
+    assert list(result[column_name]) == [10, 20]
+    assert list(result.geometry.astype(str)) == ["POINT (0 2)", "POINT (1 3)"]
+    assert write_materializations == []
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU GeoParquet writer unavailable",
+)
+@pytest.mark.parametrize(
+    ("column_name", "index", "expected_index_field"),
+    [
+        ("value", pd.Index([3, 4], name="site"), "site"),
+        ("x", pd.Index([3, 4], name="x"), "__index_level_0__"),
+        (
+            "__index_level_0__",
+            pd.Index([3, 4]),
+            "__index_level_0___1",
+        ),
+    ],
+)
+def test_public_device_point_to_parquet_preserves_default_index(
+    tmp_path,
+    column_name,
+    index,
+    expected_index_field,
+) -> None:
+    import pyarrow.parquet as pq
+
+    gdf, owned = _make_device_dga_gdf([Point(0, 2), Point(1, 3)])
+    gdf = gdf.rename(columns={"idx": column_name})
+    gdf.index = index
+    owned.diagnostics.clear()
+    path = tmp_path / f"device-point-index-{column_name}.parquet"
+
+    geopandas.clear_dispatch_events()
+    gdf.to_parquet(path, geometry_encoding="WKB")
+    write_materializations = [
+        event
+        for event in owned.diagnostics
+        if event.kind == DiagnosticKind.MATERIALIZATION
+    ]
+    dispatches = geopandas.get_dispatch_events(clear=True)
+    physical_table = pq.read_table(path)
+    result = geopandas.read_parquet(path)
+
+    assert physical_table.column_names == [
+        "geometry",
+        column_name,
+        expected_index_field,
+    ]
+    assert result.index.equals(index)
+    assert list(result.columns) == ["geometry", column_name]
+    assert list(result[column_name]) == [0, 1]
+    assert list(result.geometry.astype(str)) == ["POINT (0 2)", "POINT (1 3)"]
+    assert write_materializations == []
+    assert any(
+        event.surface == "geopandas.geodataframe.to_parquet"
+        and event.implementation == "native_geodataframe_device_export"
+        and event.selected == ExecutionMode.GPU
+        for event in dispatches
+    )
 
 
 def test_native_wkb_to_parquet_exports_host_label_take_index_once(tmp_path) -> None:

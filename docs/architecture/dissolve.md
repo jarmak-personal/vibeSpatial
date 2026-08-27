@@ -5,7 +5,7 @@ Scope: Grouped dissolve pipeline staging, segmented union, and attribute aggrega
 Read If: You are changing dissolve, grouped union, or segmented attribute aggregation.
 STOP IF: Your task already has the dissolve pipeline open and only needs local implementation detail.
 Source Of Truth: Dissolve pipeline architecture for grouped constructive work.
-Body Budget: 106/220 lines
+Body Budget: 110/220 lines
 Document: docs/architecture/dissolve.md
 
 Section Map (Body Lines)
@@ -19,7 +19,7 @@ Section Map (Body Lines)
 | 29-34 | Risks |
 | 35-44 | Decision |
 | 45-53 | Pipeline |
-| 54-106 | Performance Notes |
+| 54-110 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent
@@ -98,6 +98,10 @@ iteration.
 - Many small polygon groups should still batch when enough groups need real
   reduction. The reusable shape is `OwnedGeometryArray + dense group offsets ->
   grouped constructive result`; public `dissolve` is only the first consumer.
+- All-valid, non-empty Point groups may lower to an exact segmented point-set
+  reduction: stable `(group, x, y)` radix partitioning, coordinate
+  deduplication, and direct Point/MultiPoint offset assembly. Null, empty,
+  mixed, non-finite, or unobserved-group shapes decline before execution.
 - Sparse grouped coverage and disjoint-subset reducers must assemble unobserved
   groups by scattering observed owned reductions into device empty-polygon rows;
   a host object array is only a compatibility fallback for host-resident rows.

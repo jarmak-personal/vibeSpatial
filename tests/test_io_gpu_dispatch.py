@@ -27,12 +27,197 @@ needs_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime not av
 
 
 # ---------------------------------------------------------------------------
+# WKB tests
+# ---------------------------------------------------------------------------
+
+
+class TestWkbGpuDispatch:
+    def test_wkb_admission_uses_byte_stream_shape(self) -> None:
+        from vibespatial.io.wkb import _plan_arrow_wkb_gpu_admission
+
+        many_rows = _plan_arrow_wkb_gpu_admission(
+            rows=32_000,
+            payload_bytes=800_000,
+            requested_mode=ExecutionMode.AUTO,
+        )
+        enough_bytes = _plan_arrow_wkb_gpu_admission(
+            rows=16_000,
+            payload_bytes=2_000_000,
+            requested_mode=ExecutionMode.AUTO,
+        )
+        tiny = _plan_arrow_wkb_gpu_admission(
+            rows=8_000,
+            payload_bytes=200_000,
+            requested_mode=ExecutionMode.AUTO,
+        )
+
+        assert many_rows.selected
+        assert enough_bytes.selected
+        assert not tiny.selected
+
+    def test_small_wkb_arrow_input_remains_shapely_favorable(self, monkeypatch) -> None:
+        import pyarrow as pa
+
+        monkeypatch.setattr(
+            "vibespatial.cuda._runtime.get_cuda_runtime",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("small WKB admission must not probe CUDA")
+            ),
+        )
+        arrow = pa.array([Point(1, 2).wkb] * 1_000, type=pa.binary())
+        geopandas.clear_dispatch_events()
+        geopandas.clear_fallback_events()
+        result = geopandas.GeoSeries.from_wkb(arrow)
+        events = geopandas.get_dispatch_events(clear=True)
+        fallbacks = geopandas.get_fallback_events(clear=True)
+
+        assert result.values._owned is None
+        assert result.iloc[0].equals(Point(1, 2))
+        assert not any(event.surface == "geopandas.array.from_wkb" for event in events)
+        assert not any(event.surface == "geopandas.array.from_wkb" for event in fallbacks)
+
+    @needs_gpu
+    def test_small_wkb_arrow_strict_auto_uses_native_decode(self) -> None:
+        import pyarrow as pa
+
+        from vibespatial.testing import strict_native_environment
+
+        arrow = pa.array([Point(1, 2).wkb], type=pa.binary())
+        with strict_native_environment(execution_mode="auto"):
+            result = geopandas.GeoSeries.from_wkb(arrow)
+
+        assert result.values._owned is not None
+        assert result.values._owned.residency.value == "device"
+
+    @needs_gpu
+    def test_small_dimensional_wkb_strict_auto_raises(self) -> None:
+        import pyarrow as pa
+        import shapely
+
+        from vibespatial.runtime.fallbacks import StrictNativeFallbackError
+        from vibespatial.testing import strict_native_environment
+
+        point_z = Point(1, 2, 3)
+        arrow = pa.array(
+            [shapely.to_wkb(point_z, output_dimension=3)],
+            type=pa.binary(),
+        )
+        with strict_native_environment(execution_mode="auto"):
+            with pytest.raises(StrictNativeFallbackError):
+                geopandas.GeoSeries.from_wkb(arrow)
+
+    @needs_gpu
+    def test_large_wkb_arrow_input_stays_owned_and_device_resident(self) -> None:
+        import pandas as pd
+        import pyarrow as pa
+
+        point = Point(1, 2)
+        values = [point.wkb] * 31_999 + [None]
+        source = pd.Series(
+            values,
+            index=pd.RangeIndex(100, 32_100),
+            dtype=pd.ArrowDtype(pa.binary()),
+        )
+        geopandas.clear_dispatch_events()
+
+        result = geopandas.GeoSeries.from_wkb(source, crs="EPSG:4326")
+        events = geopandas.get_dispatch_events(clear=True)
+
+        assert result.index.equals(source.index)
+        assert result.crs.to_epsg() == 4326
+        assert result.values._owned is not None
+        assert result.values._owned.residency.value == "device"
+        assert result.values._shapely_data is None
+        assert not bool(result.values._owned.validity[-1])
+        assert any(
+            event.surface == "geopandas.array.from_wkb"
+            and event.implementation == "arrow_wkb_owned_constructor"
+            for event in events
+        )
+
+    @needs_gpu
+    def test_dimensional_wkb_falls_back_without_losing_z(self) -> None:
+        import pyarrow as pa
+        import shapely
+
+        point_z = Point(1, 2, 3)
+        arrow = pa.array(
+            [shapely.to_wkb(point_z, output_dimension=3)],
+            type=pa.binary(),
+        )
+        set_execution_mode(ExecutionMode.GPU)
+        try:
+            geopandas.clear_fallback_events()
+            result = geopandas.GeoSeries.from_wkb(arrow)
+            fallbacks = geopandas.get_fallback_events(clear=True)
+        finally:
+            set_execution_mode(None)
+
+        assert result.iloc[0].equals_exact(point_z, tolerance=0.0)
+        assert result.iloc[0].has_z
+        assert result.values._owned is None
+        assert any(event.surface == "geopandas.array.from_wkb" for event in fallbacks)
+
+    @needs_gpu
+    def test_hex_wkb_explicit_gpu_mode_uses_owned_decode(self) -> None:
+        point = Point(1, 2)
+        set_execution_mode(ExecutionMode.GPU)
+        try:
+            result = geopandas.GeoSeries.from_wkb([point.wkb_hex])
+        finally:
+            set_execution_mode(None)
+
+        assert result.values._owned is not None
+        assert result.values._shapely_data is None
+        assert result.values._owned.residency.value == "device"
+
+
+# ---------------------------------------------------------------------------
 # WKT tests
 # ---------------------------------------------------------------------------
 
 
 class TestWktGpuDispatch:
     """WKT files must always route through GPU (no pyogrio/GDAL fallback)."""
+
+    def test_wkt_admission_uses_text_shape_not_only_rows(self) -> None:
+        from vibespatial.api.geometry_array import _plan_wkt_gpu_admission
+
+        polygon_heavy = _plan_wkt_gpu_admission(
+            rows=4_000,
+            text_bytes=218_449,
+            max_row_bytes=64,
+            requested_mode=ExecutionMode.AUTO,
+        )
+        skewed_tiny_batch = _plan_wkt_gpu_admission(
+            rows=627,
+            text_bytes=3_283_938,
+            max_row_bytes=470_000,
+            requested_mode=ExecutionMode.AUTO,
+        )
+        tiny = _plan_wkt_gpu_admission(
+            rows=1_000,
+            text_bytes=50_449,
+            max_row_bytes=64,
+            requested_mode=ExecutionMode.AUTO,
+        )
+
+        assert polygon_heavy.selected
+        assert not skewed_tiny_batch.selected
+        assert not tiny.selected
+
+    def test_small_wkt_auto_input_remains_shapely_favorable(self) -> None:
+        geopandas.clear_dispatch_events()
+        geopandas.clear_fallback_events()
+
+        result = geopandas.GeoSeries.from_wkt(["POINT (1 2)"])
+        events = geopandas.get_dispatch_events(clear=True)
+        fallbacks = geopandas.get_fallback_events(clear=True)
+
+        assert result.values._owned is None
+        assert result.iloc[0].equals(Point(1, 2))
+        assert not any(event.surface == "geopandas.array.from_wkt" for event in events)
+        assert not any(event.surface == "geopandas.array.from_wkt" for event in fallbacks)
 
     @needs_gpu
     def test_read_wkt_point_file(self, tmp_path) -> None:
@@ -83,20 +268,20 @@ class TestWktGpuDispatch:
         assert result.geometry.iloc[1].equals(LineString([(10, 10), (20, 20)]))
 
     @needs_gpu
-    def test_geoseries_from_wkt_large_input_uses_gpu(self, monkeypatch) -> None:
-        import vibespatial.api.geometry_array as geometry_array_module
-
-        monkeypatch.setattr(geometry_array_module, "_WKT_GPU_MIN_ROWS", 1)
-
-        geopandas.clear_dispatch_events()
-        result = geopandas.GeoSeries.from_wkt(
-            [
-                "POINT (1 2)",
-                "LINESTRING (0 0, 1 1)",
-            ],
-            crs="EPSG:4326",
-        )
-        events = geopandas.get_dispatch_events(clear=True)
+    def test_geoseries_from_wkt_explicit_gpu_mode_uses_gpu(self) -> None:
+        set_execution_mode(ExecutionMode.GPU)
+        try:
+            geopandas.clear_dispatch_events()
+            result = geopandas.GeoSeries.from_wkt(
+                [
+                    "POINT (1 2)",
+                    "LINESTRING (0 0, 1 1)",
+                ],
+                crs="EPSG:4326",
+            )
+            events = geopandas.get_dispatch_events(clear=True)
+        finally:
+            set_execution_mode(None)
 
         assert result.iloc[0].equals(Point(1, 2))
         assert result.iloc[1].equals(LineString([(0, 0), (1, 1)]))
@@ -105,11 +290,227 @@ class TestWktGpuDispatch:
             for event in events
         )
 
-    def test_geoseries_from_wkt_large_input_respects_cpu_mode(self, monkeypatch) -> None:
-        import vibespatial.api.geometry_array as geometry_array_module
+    @needs_gpu
+    def test_small_wkt_strict_auto_uses_native_parser(self) -> None:
+        from vibespatial.testing import strict_native_environment
 
-        monkeypatch.setattr(geometry_array_module, "_WKT_GPU_MIN_ROWS", 1)
+        with strict_native_environment(execution_mode="auto"):
+            result = geopandas.GeoSeries.from_wkt(["POINT (1 2)"])
 
+        assert result.values._owned is not None
+        assert result.values._owned.residency.value == "device"
+
+    @needs_gpu
+    def test_small_dimensional_wkt_strict_auto_raises(self) -> None:
+        from vibespatial.runtime.fallbacks import StrictNativeFallbackError
+        from vibespatial.testing import strict_native_environment
+
+        with strict_native_environment(execution_mode="auto"):
+            with pytest.raises(StrictNativeFallbackError):
+                geopandas.GeoSeries.from_wkt(["POINT Z (1 2 3)"])
+
+    @needs_gpu
+    @pytest.mark.parametrize(
+        "wkt_text",
+        [
+            "SRID=4326;POINT (1 2)",
+            "SRXX;POINT (1 2)",
+            "SRID=abc;POINT (1 2)",
+            "sr;POINT (1 2)",
+        ],
+    )
+    def test_public_from_wkt_rejects_ewkt_like_prefix_in_cpu_and_gpu(
+        self,
+        wkt_text,
+    ) -> None:
+        from shapely.errors import GEOSException
+
+        for mode in (ExecutionMode.CPU, ExecutionMode.GPU):
+            set_execution_mode(mode)
+            try:
+                geopandas.clear_fallback_events()
+                with pytest.raises(GEOSException):
+                    geopandas.GeoSeries.from_wkt([wkt_text], on_invalid="raise")
+                fallbacks = geopandas.get_fallback_events(clear=True)
+            finally:
+                set_execution_mode(None)
+            if mode is ExecutionMode.GPU:
+                assert any(
+                    event.surface == "geopandas.array.from_wkt"
+                    and "EWKT/SRID" in event.reason
+                    for event in fallbacks
+                )
+
+    @needs_gpu
+    @pytest.mark.parametrize(
+        "wkt_text",
+        [
+            "SRID=4326;POINT (1 2)",
+            "SRXX;POINT (1 2)",
+            "SRID=abc;POINT (1 2)",
+            "sr;POINT (1 2)",
+        ],
+    )
+    def test_public_strict_from_wkt_rejects_ewkt_like_prefix(self, wkt_text) -> None:
+        from vibespatial.runtime.fallbacks import StrictNativeFallbackError
+        from vibespatial.testing import strict_native_environment
+
+        with strict_native_environment(execution_mode="auto"):
+            with pytest.raises(StrictNativeFallbackError):
+                geopandas.GeoSeries.from_wkt([wkt_text], on_invalid="raise")
+
+    @needs_gpu
+    def test_malformed_wkt_rows_cannot_pair_coordinates_across_rows(self) -> None:
+        from shapely.errors import GEOSException
+
+        set_execution_mode(ExecutionMode.GPU)
+        try:
+            with pytest.raises(GEOSException):
+                geopandas.GeoSeries.from_wkt(["POINT (1)", "POINT (2)"])
+        finally:
+            set_execution_mode(None)
+
+    @needs_gpu
+    @pytest.mark.parametrize(
+        "wkt_text",
+        [
+            "POINT (1 2, 3 4)",
+            "POINT ((1 2))",
+            "POLYGON ((0 0, 1 0, 1 1, 0 1))",
+            "POINT (1e 2)",
+            "POINT (--1 2)",
+            "POINT (1..2 3)",
+            "POINT (1e+ 2)",
+            "POINT (+ 2)",
+            "POINT (1e2e3 4)",
+            "POINT (1-2 3)",
+            "POINT (1x 2)",
+            "POINTXYZ (1 2)",
+            "POINT FOO (1 2)",
+            "POINT (,1 2)",
+            "LINESTRING (0 0,1 1,)",
+            "MULTIPOINT (,0 0,1 1)",
+            "POLYGON ((,0 0,1 0,1 1,0 0))",
+            "MULTILINESTRING ((0 0,1 1),,(2 2,3 3))",
+            "MULTIPOLYGON (((0 0,1 0,1 1,0 0)),)",
+        ],
+    )
+    def test_malformed_wkt_gpu_constructor_uses_exact_public_raise_semantics(
+        self,
+        wkt_text,
+    ) -> None:
+        from shapely.errors import GEOSException
+
+        set_execution_mode(ExecutionMode.GPU)
+        try:
+            geopandas.clear_fallback_events()
+            with pytest.raises(GEOSException):
+                geopandas.GeoSeries.from_wkt([wkt_text], on_invalid="raise")
+            fallbacks = geopandas.get_fallback_events(clear=True)
+        finally:
+            set_execution_mode(None)
+
+        assert any(
+            event.surface == "geopandas.array.from_wkt" for event in fallbacks
+        )
+
+    @needs_gpu
+    @pytest.mark.parametrize(
+        "wkt_text",
+        [
+            "POINT (1 2, 3 4)",
+            "POINT ((1 2))",
+            "POLYGON ((0 0, 1 0, 1 1, 0 1))",
+            "POINT (1e 2)",
+            "POINT (--1 2)",
+            "POINT (1..2 3)",
+            "POINT (1e+ 2)",
+            "POINT (+ 2)",
+            "POINT (1e2e3 4)",
+            "POINT (1-2 3)",
+            "POINT (1x 2)",
+            "POINTXYZ (1 2)",
+            "POINT FOO (1 2)",
+            "POINT (1 2,)",
+            "LINESTRING (,0 0,1 1)",
+            "MULTIPOINT (0 0,1 1,)",
+            "POLYGON ((0 0,1 0,1 1,0 0,))",
+            "MULTILINESTRING ((,0 0,1 1),(2 2,3 3))",
+            "MULTIPOLYGON (((,0 0,1 0,1 1,0 0)))",
+        ],
+    )
+    def test_malformed_wkt_strict_auto_cannot_return_owned_geometry(
+        self,
+        wkt_text,
+    ) -> None:
+        from vibespatial.runtime.fallbacks import StrictNativeFallbackError
+        from vibespatial.testing import strict_native_environment
+
+        with strict_native_environment(execution_mode="auto"):
+            with pytest.raises(StrictNativeFallbackError):
+                geopandas.GeoSeries.from_wkt([wkt_text], on_invalid="raise")
+
+    @needs_gpu
+    def test_geoseries_from_wkt_gpu_roundtrips_multipart_and_empty(self) -> None:
+        import shapely
+
+        values = [
+            "MULTILINESTRING((0 0,1 1),(2 2,3 3,4 4))",
+            (
+                "MULTIPOLYGON(((0 0,4 0,4 4,0 0),"
+                "(1 1,2 1,2 2,1 1)),((10 10,12 10,12 12,10 10)))"
+            ),
+            "POINT EMPTY",
+        ]
+        set_execution_mode(ExecutionMode.GPU)
+        try:
+            result = geopandas.GeoSeries.from_wkt(values)
+        finally:
+            set_execution_mode(None)
+
+        assert result.values._owned is not None
+        assert shapely.equals_exact(result.to_numpy(), shapely.from_wkt(values), 0).all()
+
+    @needs_gpu
+    def test_geoseries_from_wkt_dimensional_input_falls_back_observably(self) -> None:
+        set_execution_mode(ExecutionMode.GPU)
+        try:
+            geopandas.clear_dispatch_events()
+            geopandas.clear_fallback_events()
+            result = geopandas.GeoSeries.from_wkt(["POINT Z (1 2 3)"])
+            events = geopandas.get_dispatch_events(clear=True)
+            fallbacks = geopandas.get_fallback_events(clear=True)
+        finally:
+            set_execution_mode(None)
+
+        assert result.iloc[0].has_z
+        assert not any(
+            event.implementation == "wkt_gpu_large_array_constructor"
+            for event in events
+        )
+        assert any(event.surface == "geopandas.array.from_wkt" for event in fallbacks)
+
+    @needs_gpu
+    def test_wkt_owned_explode_keeps_coordinates_device_resident(self) -> None:
+        values = [
+            "MULTIPOLYGON(((0 0,4 0,4 4,0 0)),((10 10,12 10,12 12,10 10)))",
+            "POLYGON((20 20,21 20,21 21,20 20))",
+        ]
+        set_execution_mode(ExecutionMode.GPU)
+        try:
+            result = geopandas.GeoSeries.from_wkt(values).explode(index_parts=True)
+        finally:
+            set_execution_mode(None)
+
+        assert list(result.index) == [(0, 0), (0, 1), (1, 0)]
+        assert result.values._owned is not None
+        assert [geom.bounds for geom in result] == [
+            (0.0, 0.0, 4.0, 4.0),
+            (10.0, 10.0, 12.0, 12.0),
+            (20.0, 20.0, 21.0, 21.0),
+        ]
+
+    def test_geoseries_from_wkt_large_input_respects_cpu_mode(self) -> None:
         set_execution_mode(ExecutionMode.CPU)
         try:
             geopandas.clear_dispatch_events()
@@ -131,25 +532,28 @@ class TestWktGpuDispatch:
             for event in events
         )
 
-    def test_geoseries_from_wkt_multiline_input_stays_on_shapely(self, monkeypatch) -> None:
-        import vibespatial.api.geometry_array as geometry_array_module
-
-        monkeypatch.setattr(geometry_array_module, "_WKT_GPU_MIN_ROWS", 1)
-
-        geopandas.clear_dispatch_events()
-        result = geopandas.GeoSeries.from_wkt(
-            [
-                "LINESTRING (0 0,\n1 1)",
-            ],
-            crs="EPSG:4326",
-        )
-        events = geopandas.get_dispatch_events(clear=True)
+    def test_geoseries_from_wkt_multiline_input_stays_on_shapely(self) -> None:
+        set_execution_mode(ExecutionMode.GPU)
+        try:
+            geopandas.clear_dispatch_events()
+            geopandas.clear_fallback_events()
+            result = geopandas.GeoSeries.from_wkt(
+                [
+                    "LINESTRING (0 0,\n1 1)",
+                ],
+                crs="EPSG:4326",
+            )
+            events = geopandas.get_dispatch_events(clear=True)
+            fallbacks = geopandas.get_fallback_events(clear=True)
+        finally:
+            set_execution_mode(None)
 
         assert result.iloc[0].equals(LineString([(0, 0), (1, 1)]))
         assert not any(
             event.implementation == "wkt_gpu_large_array_constructor"
             for event in events
         )
+        assert any(event.surface == "geopandas.array.from_wkt" for event in fallbacks)
 
     @needs_gpu
     def test_read_wkt_mixed_types(self, tmp_path) -> None:

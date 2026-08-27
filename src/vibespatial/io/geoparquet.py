@@ -3355,7 +3355,10 @@ def _write_geoparquet_native(
         {col: (None if col in geometry_columns_set else df[col]) for col in df.columns},
         index=df.index,
     )
-    table = pa.Table.from_pandas(df_attr, preserve_index=index)
+    from vibespatial.api._native_result_core import _append_pandas_index_to_arrow
+
+    table = pa.Table.from_pandas(df_attr, preserve_index=False)
+    table = _append_pandas_index_to_arrow(table, df_attr.index, index)
 
     geometry_encoding_dict = {}
     use_geoarrow = geometry_encoding.lower() == "geoarrow"

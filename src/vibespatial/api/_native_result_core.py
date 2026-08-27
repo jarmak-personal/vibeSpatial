@@ -357,33 +357,91 @@ def _device_table_row_count(table: Any) -> int:
     raise TypeError("device attribute table does not expose a row count")
 
 
+def _pandas_index_field_name(index_name, level: int, column_names) -> str:
+    """Return a deterministic physical Arrow field for a pandas index level."""
+    taken = {str(name) for name in column_names}
+    if index_name is not None:
+        candidate = str(index_name)
+        if candidate not in taken:
+            return candidate
+    base = f"__index_level_{level:d}__"
+    candidate = base
+    suffix = 1
+    while candidate in taken:
+        candidate = f"{base}_{suffix:d}"
+        suffix += 1
+    return candidate
+
+
 def _append_pandas_index_to_arrow(table: Any, index: pd.Index, preserve_index):
     if preserve_index is False:
         return table
     import pyarrow as pa
     import pyarrow.pandas_compat as pandas_compat
 
+    index_frame = _arrow_compatible_pandas_frame(pd.DataFrame(index=index))
     index_table = pa.Table.from_pandas(
-        pd.DataFrame(index=index),
+        index_frame,
         preserve_index=preserve_index,
     )
-    result = table
-    for field, column in zip(index_table.schema, index_table.columns, strict=True):
-        if field.name in result.column_names:
-            continue
-        result = result.append_column(field, column)
-
     index_metadata = index_table.schema.metadata or {}
     try:
         pandas_index_metadata = json.loads(index_metadata[b"pandas"].decode("utf-8"))
         index_descriptors = pandas_index_metadata["index_columns"]
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return table
+
+    result = table
+    used_field_names = set(table.column_names)
+    serialized_descriptor_positions = [
+        position
+        for position, descriptor in enumerate(index_descriptors)
+        if not isinstance(descriptor, dict)
+    ]
+    if len(serialized_descriptor_positions) != index_table.num_columns:
         return result
 
-    if isinstance(index, pd.MultiIndex):
-        index_levels = [index.get_level_values(level) for level in range(index.nlevels)]
+    physical_index_fields = []
+    physical_index_columns = []
+    for level, (descriptor_position, field, column) in enumerate(
+        zip(
+            serialized_descriptor_positions,
+            index_table.schema,
+            index_table.columns,
+            strict=True,
+        )
+    ):
+        physical_name = _pandas_index_field_name(
+            field.name,
+            level,
+            used_field_names,
+        )
+        used_field_names.add(physical_name)
+        index_descriptors[descriptor_position] = physical_name
+        physical_field = field.with_name(physical_name)
+        physical_index_fields.append(physical_field)
+        physical_index_columns.append(column)
+
+    if table.num_columns:
+        for field, column in zip(
+            physical_index_fields,
+            physical_index_columns,
+            strict=True,
+        ):
+            result = result.append_column(field, column)
+    elif physical_index_columns:
+        result = pa.Table.from_arrays(
+            physical_index_columns,
+            schema=pa.schema(physical_index_fields, metadata=table.schema.metadata),
+        )
+
+    export_index = index_frame.index
+    if isinstance(export_index, pd.MultiIndex):
+        index_levels = [
+            export_index.get_level_values(level) for level in range(export_index.nlevels)
+        ]
     else:
-        index_levels = [index]
+        index_levels = [export_index]
     if len(index_levels) != len(index_descriptors):
         return result
 
@@ -409,7 +467,7 @@ def _append_pandas_index_to_arrow(table: Any, index: pd.Index, preserve_index):
         preserve_index,
         [
             *(field.type for field in attribute_fields),
-            *(field.type for field in index_table.schema),
+            *(field.type for field in physical_index_fields),
         ],
         column_field_names=column_names,
     )
@@ -433,6 +491,52 @@ def _index_equals_without_lazy_native_export(left: pd.Index, right: pd.Index) ->
 
 def _rename_device_arrow_table(table: Any, column_override, *, schema) -> Any:
     import pyarrow as pa
+
+    def _restore_array_type(array: Any, expected_type: Any) -> Any:
+        """Restore logical Arrow types that libcudf cannot name losslessly."""
+        if isinstance(array, pa.ChunkedArray):
+            if array.type == expected_type:
+                return array
+            return pa.chunked_array(
+                [_restore_array_type(chunk, expected_type) for chunk in array.chunks],
+                type=expected_type,
+            )
+        if array.type == expected_type:
+            return array
+
+        actual_type = array.type
+        mask = array.is_null() if array.null_count else None
+        if pa.types.is_list(actual_type) and pa.types.is_list(expected_type):
+            values = _restore_array_type(array.values, expected_type.value_type)
+            return pa.ListArray.from_arrays(
+                array.offsets,
+                values,
+                type=expected_type,
+                mask=mask,
+            )
+        if pa.types.is_large_list(actual_type) and pa.types.is_large_list(expected_type):
+            values = _restore_array_type(array.values, expected_type.value_type)
+            return pa.LargeListArray.from_arrays(
+                array.offsets,
+                values,
+                type=expected_type,
+                mask=mask,
+            )
+        if pa.types.is_struct(actual_type) and pa.types.is_struct(expected_type):
+            if actual_type.num_fields != expected_type.num_fields:
+                raise pa.ArrowTypeError(
+                    "device Arrow struct field count does not match its authoritative schema"
+                )
+            children = [
+                _restore_array_type(array.field(index), expected_type[index].type)
+                for index in range(expected_type.num_fields)
+            ]
+            return pa.StructArray.from_arrays(
+                children,
+                fields=list(expected_type),
+                mask=mask,
+            )
+        return array.cast(expected_type)
 
     def _normalize_pandas_range_metadata(output):
         metadata = output.schema.metadata
@@ -475,14 +579,17 @@ def _rename_device_arrow_table(table: Any, column_override, *, schema) -> Any:
             )
         )
     fields = []
+    arrays = []
     for index, name in enumerate(names):
         try:
-            fields.append(schema.field(name))
+            field = schema.field(name)
         except KeyError:
-            fields.append(pa.field(name, table.column(index).type))
+            field = pa.field(name, table.column(index).type)
+        fields.append(field)
+        arrays.append(_restore_array_type(table.column(index), field.type))
     return _normalize_pandas_range_metadata(
         pa.Table.from_arrays(
-            [table.column(index) for index in range(table.num_columns)],
+            arrays,
             schema=pa.schema(fields, metadata=schema.metadata),
         )
     )
@@ -1398,7 +1505,11 @@ class NativeAttributeTable:
             )
             if requested_columns is not None and self.row_positions is None:
                 table = table.select([str(column) for column in requested_columns])
-            return table
+            return _append_pandas_index_to_arrow(
+                table,
+                self.index,
+                index,
+            )
         can_skip_index = index is False or (
             index is None
             and isinstance(self.index_override, pd.RangeIndex)

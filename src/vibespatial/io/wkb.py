@@ -77,6 +77,9 @@ WKB_POINT_RECORD_DTYPE = np.dtype(
     }
 )
 DEVICE_WKB_LIST_DECODE_MIN_ROWS = 8_000
+DEVICE_WKB_ARROW_DECODE_MIN_ROWS = 8_000
+DEVICE_WKB_ARROW_DECODE_CROSSOVER_ROWS = 32_000
+DEVICE_WKB_ARROW_DECODE_CROSSOVER_BYTES = 1536 * 1024
 
 _GEOARROW_ENCODING_FAMILIES: dict[str, GeometryFamily] = {
     "point": GeometryFamily.POINT,
@@ -107,6 +110,72 @@ _request_nvrtc_warmup(
 class _GpuWkbDecodeAttempt:
     result: OwnedGeometryArray | None
     fallback_detail: str | None = None
+
+
+@dataclass(frozen=True)
+class _ArrowWkbGpuAdmission:
+    selected: bool
+    reason: str
+    rows: int
+    payload_bytes: int
+
+
+def _resolve_arrow_wkb_decode_mode(
+    requested_mode: ExecutionMode | str | None,
+) -> ExecutionMode:
+    """Resolve the shared Arrow decoder's one authoritative execution mode."""
+    if requested_mode is not None:
+        return (
+            requested_mode
+            if isinstance(requested_mode, ExecutionMode)
+            else ExecutionMode(requested_mode)
+        )
+
+    from vibespatial.runtime import get_requested_mode
+
+    requested = get_requested_mode()
+    if requested is ExecutionMode.AUTO and strict_native_mode_enabled():
+        return ExecutionMode.GPU
+    return requested
+
+
+def _plan_arrow_wkb_gpu_admission(
+    *,
+    rows: int,
+    payload_bytes: int,
+    requested_mode: ExecutionMode | str,
+) -> _ArrowWkbGpuAdmission:
+    """Select device WKB decode from row and byte work, not carrier type alone."""
+    requested = (
+        requested_mode
+        if isinstance(requested_mode, ExecutionMode)
+        else ExecutionMode(requested_mode)
+    )
+    if requested is ExecutionMode.GPU:
+        selected = True
+        reason = "explicit GPU mode"
+    elif requested is ExecutionMode.CPU:
+        selected = False
+        reason = "explicit CPU mode"
+    else:
+        enough_rows = rows >= DEVICE_WKB_ARROW_DECODE_CROSSOVER_ROWS
+        enough_bytes = (
+            rows >= DEVICE_WKB_ARROW_DECODE_MIN_ROWS
+            and payload_bytes >= DEVICE_WKB_ARROW_DECODE_CROSSOVER_BYTES
+        )
+        selected = enough_rows or enough_bytes
+        if enough_rows:
+            reason = "WKB row cardinality amortizes Arrow-to-device decode"
+        elif enough_bytes:
+            reason = "WKB payload volume amortizes Arrow-to-device decode"
+        else:
+            reason = "small WKB byte stream remains host-favorable"
+    return _ArrowWkbGpuAdmission(
+        selected=selected,
+        reason=reason,
+        rows=int(rows),
+        payload_bytes=int(payload_bytes),
+    )
 
 
 @dataclass(frozen=True)
@@ -1478,6 +1547,25 @@ def _apply_geoarrow_child_metadata(column_meta, family: GeometryFamily) -> None:
         point_meta.child(1).set_name("y")
 
 
+def _apply_arrow_nested_child_metadata(column_meta, field) -> None:
+    """Preserve authoritative Arrow child names in libcudf Parquet metadata."""
+    import pyarrow as pa
+
+    column_meta.set_nullability(field.nullable)
+    field_type = field.type
+    if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
+        value_field = field_type.value_field
+        value_meta = column_meta.child(1)
+        value_meta.set_name(value_field.name)
+        _apply_arrow_nested_child_metadata(value_meta, value_field)
+        return
+    if pa.types.is_struct(field_type):
+        for index, child_field in enumerate(field_type):
+            child_meta = column_meta.child(index)
+            child_meta.set_name(child_field.name)
+            _apply_arrow_nested_child_metadata(child_meta, child_field)
+
+
 def _compression_type_from_name(name: str):
     import pylibcudf as plc
 
@@ -1506,21 +1594,6 @@ def _empty_pandas_series_for_arrow_field(field, *, name):
         return pd.Series([], dtype=dtype, name=name)
     except (TypeError, ValueError):
         return pd.Series([], dtype=object, name=name)
-
-
-def _native_index_field_name(index_name, level: int, column_names) -> str:
-    taken = {str(name) for name in column_names}
-    if index_name is not None:
-        candidate = str(index_name)
-        if candidate not in taken:
-            return candidate
-    base = f"__index_level_{level:d}__"
-    candidate = base
-    suffix = 1
-    while candidate in taken:
-        candidate = f"{base}_{suffix:d}"
-        suffix += 1
-    return candidate
 
 
 def _range_index_for_native_export(index_plan, fallback_index, row_count: int):
@@ -1582,7 +1655,9 @@ def _native_device_index_columns(
     if not (_np.issubdtype(dtype, _np.number) or _np.issubdtype(dtype, _np.bool_)):
         return None
 
-    field_name = _native_index_field_name(logical_name, 0, attribute_columns)
+    from vibespatial.api._native_result_core import _pandas_index_field_name
+
+    field_name = _pandas_index_field_name(logical_name, 0, attribute_columns)
     from vibespatial.cuda._runtime import pylibcudf_column_from_device
 
     column = pylibcudf_column_from_device(labels)
@@ -1767,7 +1842,10 @@ def _build_native_host_attribute_table_from_frame(attribute_frame, ordered_colum
 
     import pandas as pd
 
-    from vibespatial.api._native_result_core import _arrow_compatible_pandas_frame
+    from vibespatial.api._native_result_core import (
+        _append_pandas_index_to_arrow,
+        _arrow_compatible_pandas_frame,
+    )
 
     df_attr = pd.DataFrame(
         {column_name: attribute_frame[column_name] for column_name in ordered_columns},
@@ -1775,26 +1853,21 @@ def _build_native_host_attribute_table_from_frame(attribute_frame, ordered_colum
         copy=False,
     )
     df_attr = _arrow_compatible_pandas_frame(df_attr)
-    pandas_metadata = pa.Schema.from_pandas(df_attr, preserve_index=index).metadata
-
-    if index not in (None, False):
-        return pa.Table.from_pandas(df_attr, preserve_index=index)
-
-    if not ordered_columns:
-        return pa.table({}).replace_schema_metadata(pandas_metadata)
-
     arrays = []
     names = []
     for column_name in ordered_columns:
         values = df_attr[column_name].to_numpy(copy=False)
         if not isinstance(values, np.ndarray) or values.dtype == object:
-            return pa.Table.from_pandas(df_attr, preserve_index=index)
+            attributes = pa.Table.from_pandas(df_attr, preserve_index=False)
+            return _append_pandas_index_to_arrow(attributes, df_attr.index, index)
         try:
             arrays.append(pa.array(values, from_pandas=True))
         except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
-            return pa.Table.from_pandas(df_attr, preserve_index=index)
+            attributes = pa.Table.from_pandas(df_attr, preserve_index=False)
+            return _append_pandas_index_to_arrow(attributes, df_attr.index, index)
         names.append(column_name)
-    return pa.Table.from_arrays(arrays, names=names).replace_schema_metadata(pandas_metadata)
+    attributes = pa.Table.from_arrays(arrays, names=names)
+    return _append_pandas_index_to_arrow(attributes, df_attr.index, index)
 
 
 def _build_native_host_attribute_table(df, non_geometry_columns, *, index, pa):
@@ -2825,6 +2898,11 @@ def _write_geoparquet_native_device_wkb_chunks(
                             metadata.column_metadata[index].child(child_index).set_name(
                                 child_name
                             )
+                    else:
+                        _apply_arrow_nested_child_metadata(
+                            metadata.column_metadata[index],
+                            attribute_schema.field(column_name),
+                        )
                 builder = plc.io.parquet.ChunkedParquetWriterOptions.builder(
                     plc.io.types.SinkInfo([sink])
                 )
@@ -3138,6 +3216,11 @@ def _write_geoparquet_native_device_payload(
         elif column_name == "bbox":
             for child_idx, child_name in enumerate(("xmin", "ymin", "xmax", "ymax")):
                 metadata.column_metadata[idx].child(child_idx).set_name(child_name)
+        else:
+            _apply_arrow_nested_child_metadata(
+                metadata.column_metadata[idx],
+                attribute_schema.field(column_name),
+            )
 
     normalized_geometry_crs = geometry_crs
     if normalized_geometry_crs is not None and not hasattr(
@@ -3459,6 +3542,11 @@ def _write_geoparquet_native_device(
             # Set child names for the struct children: xmin, ymin, xmax, ymax
             for child_idx, child_name in enumerate(("xmin", "ymin", "xmax", "ymax")):
                 metadata.column_metadata[idx].child(child_idx).set_name(child_name)
+        else:
+            _apply_arrow_nested_child_metadata(
+                metadata.column_metadata[idx],
+                host_table.schema.field(column_name),
+            )
 
     geo_metadata = _create_metadata(
         df,
@@ -5226,21 +5314,82 @@ def decode_wkb_arrow_array_owned(
     *,
     on_invalid: str = "raise",
     allow_fallback: bool = True,
+    requested_mode: ExecutionMode | str | None = None,
 ) -> OwnedGeometryArray:
+    requested = _resolve_arrow_wkb_decode_mode(requested_mode)
+    admission = _plan_arrow_wkb_gpu_admission(
+        rows=len(array),
+        payload_bytes=int(getattr(array, "nbytes", 0)),
+        requested_mode=requested,
+    )
+    gpu_attempt: _GpuWkbDecodeAttempt | None = None
+    gpu_failure_recorded = False
+
+    # At scale, go directly from Arrow offsets/payload buffers to the generic
+    # device decoder. The uniform-family parsers construct host buffers first
+    # and can otherwise shadow a much faster byte-stream-shaped device path.
+    if admission.selected:
+        gpu_attempt = _try_gpu_wkb_arrow_decode(
+            array,
+            on_invalid=on_invalid,
+            requested_mode=requested,
+        )
+        if gpu_attempt.result is not None:
+            return gpu_attempt.result
+        if requested is ExecutionMode.GPU:
+            failure_detail = gpu_attempt.fallback_detail or (
+                "device-native Arrow WKB decode is unavailable for the current runtime"
+            )
+            if not allow_fallback:
+                raise NotImplementedError(failure_detail)
+            record_fallback_event(
+                surface="vibespatial.io.wkb",
+                reason="explicit CPU fallback after GPU Arrow WKB decode could not complete",
+                detail=failure_detail,
+                requested=requested,
+                selected=ExecutionMode.CPU,
+                pipeline="io/wkb_decode",
+                d2h_transfer=True,
+            )
+            # Explicit GPU and strict-native AUTO are device-only contracts.
+            # In non-strict explicit GPU mode the event above remains visible,
+            # but host parsing is still not an eligible implementation.
+            raise NotImplementedError(failure_detail)
+        if gpu_attempt.fallback_detail is not None:
+            if not allow_fallback:
+                raise NotImplementedError(gpu_attempt.fallback_detail)
+            record_fallback_event(
+                surface="vibespatial.io.wkb",
+                reason="explicit CPU fallback after GPU Arrow WKB decode could not complete",
+                detail=gpu_attempt.fallback_detail,
+                requested=requested,
+                selected=ExecutionMode.CPU,
+                pipeline="io/wkb_decode",
+                d2h_transfer=True,
+            )
+            gpu_failure_recorded = True
+
     uniform_fast = _try_uniform_arrow_wkb_fast_decode(array)
     if uniform_fast is not None:
         return uniform_fast
 
-    gpu_attempt = _try_gpu_wkb_arrow_decode(array, on_invalid=on_invalid)
-    if gpu_attempt.result is not None:
-        return gpu_attempt.result
-    if gpu_attempt.fallback_detail is not None:
+    if gpu_attempt is None:
+        gpu_attempt = _try_gpu_wkb_arrow_decode(
+            array,
+            on_invalid=on_invalid,
+            requested_mode=requested,
+        )
+        if gpu_attempt.result is not None:
+            return gpu_attempt.result
+
+    if gpu_attempt.fallback_detail is not None and not gpu_failure_recorded:
         if not allow_fallback:
             raise NotImplementedError(gpu_attempt.fallback_detail)
         record_fallback_event(
             surface="vibespatial.io.wkb",
             reason="explicit CPU fallback after GPU Arrow WKB decode could not complete",
             detail=gpu_attempt.fallback_detail,
+            requested=requested,
             selected=ExecutionMode.CPU,
             pipeline="io/wkb_decode",
             d2h_transfer=True,
@@ -5264,11 +5413,13 @@ def _try_gpu_wkb_arrow_decode(
     array,
     *,
     on_invalid: str = "raise",
+    requested_mode: ExecutionMode | str | None = None,
 ) -> _GpuWkbDecodeAttempt:
     """Attempt GPU WKB decode of a PyArrow binary/large_binary array via pylibcudf."""
     from vibespatial.runtime import ExecutionMode, get_requested_mode
 
-    if get_requested_mode() is ExecutionMode.CPU:
+    requested = get_requested_mode() if requested_mode is None else ExecutionMode(requested_mode)
+    if requested is ExecutionMode.CPU:
         return _GpuWkbDecodeAttempt(result=None)
     runtime = get_cuda_runtime()
     if not runtime.available():

@@ -5,7 +5,7 @@ Scope: Post-Phase-6b GPU-native IO execution model, staged decode policy, and fo
 Read If: You are changing GeoArrow, GeoParquet, WKB, GeoJSON, or Shapefile performance strategy or decode architecture.
 STOP IF: Your task already has the routed IO implementation files open and only needs local adapter detail.
 Source Of Truth: IO acceleration policy for turning repo-owned adapters into GPU-dominant ingest and emission paths.
-Body Budget: 160/260 lines
+Body Budget: 193/260 lines
 Document: docs/architecture/io-acceleration.md
 
 Section Map (Body Lines)
@@ -20,10 +20,10 @@ Section Map (Body Lines)
 | 37-43 | Risks |
 | 44-65 | Decision |
 | 66-79 | Execution Model |
-| 80-115 | Format Strategy |
-| 116-128 | CCCL Preference Order |
-| 129-147 | Performance Targets |
-| 148-160 | Non-Negotiable Constraints |
+| 80-148 | Format Strategy |
+| 149-161 | CCCL Preference Order |
+| 162-180 | Performance Targets |
+| 181-193 | Non-Negotiable Constraints |
 DOC_HEADER:END -->
 
 ## Purpose
@@ -116,10 +116,43 @@ The critical rule is that decode happens after pruning, not before it.
 
 - Treat WKB as a byte-stream compatibility bridge.
 - Use GPU header scans, size scans, and family partitions before decode.
+- Public `geopandas.array.from_wkb(...)` and `GeoSeries.from_wkb(...)` preserve
+  Arrow binary buffers and lower sufficiently large byte streams directly into
+  device-resident owned geometry. Pandas Arrow extension arrays retain this
+  path through index handling instead of being converted to object-dtype NumPy.
+- Automatic constructor admission uses both rows and payload bytes. Small WKB
+  arrays remain on vectorized Shapely because measured launch and promotion
+  cost is larger there; explicit GPU mode remains an override.
+- Generic device decode must run before uniform-family host parsing once the
+  byte-stream shape crosses the device threshold. Host parsing is a small-input
+  optimization, not a reason to shadow the scalable path.
+- Arrays that already contain Shapely geometries stay lazily Shapely-backed:
+  object creation has already occurred, and eager owned conversion would tax
+  constructor-only workflows. WKB and GeoArrow are the public object-free
+  ingress surfaces.
 - Compact unsupported or ambiguous rows into an explicit fallback pool.
 - Classify big-endian 2D, EWKB SRID-annotated 2D, Z/M/ZM, and
   `GeometryCollection` rows explicitly instead of letting those cases blur into
   one generic fallback reason.
+
+### WKT
+
+- Native WKT decode uses a fixed-capacity device count/validation pass followed
+  by direct family scatter. Data-dependent CuPy selection is forbidden because
+  its host-known allocation sizes introduce hidden scalar D2H fences.
+- Public ingress passes its host-known row count as structural metadata. Opaque
+  device-byte callers may omit the hint and use byte count as a conservative
+  row capacity.
+- Exactly one compact device-to-host packet combines the semantic-validation
+  verdict with family, coordinate, part, and ring allocation totals. This is
+  the synchronous error boundary required to preserve malformed-WKT exception
+  semantics; successful parsing must perform no other physical D2H copies.
+- Numeric tokens stay device-resident. An NVRTC exact-rounding parser compares
+  difficult decimal values with adjacent binary64 midpoints so results match
+  GEOS/`strtod` bit-for-bit. Common bounded decimals use an exact
+  integer/division fast path.
+- Coordinates remain fp64 storage. Integer text structure and allocation
+  planning do not require a coordinate `PrecisionPlan`.
 
 ### GeoJSON
 

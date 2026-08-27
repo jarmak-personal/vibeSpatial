@@ -654,6 +654,7 @@ class OwnedGeometryDeviceState:
     trusted_all_ogc_valid: bool | None = None
     trusted_homogeneous_family: GeometryFamily | None = None
     trusted_all_non_empty: bool | None = None
+    trusted_all_finite_coordinates: bool | None = None
     trusted_nonempty_polygonal_positive_area: bool | None = None
     trusted_polygonal_only: bool | None = None
     trusted_unique_family_rows: bool | None = None
@@ -1099,6 +1100,9 @@ class OwnedGeometryArray:
                 trusted_all_ogc_valid=ds.trusted_all_ogc_valid,
                 trusted_homogeneous_family=ds.trusted_homogeneous_family,
                 trusted_all_non_empty=ds.trusted_all_non_empty,
+                trusted_all_finite_coordinates=(
+                    True if ds.trusted_all_finite_coordinates is True else None
+                ),
                 trusted_nonempty_polygonal_positive_area=(
                     ds.trusted_nonempty_polygonal_positive_area
                 ),
@@ -1162,6 +1166,11 @@ class OwnedGeometryArray:
                     trusted_all_ogc_valid=base_state.trusted_all_ogc_valid,
                     trusted_homogeneous_family=trusted_homogeneous_family,
                     trusted_all_non_empty=base_state.trusted_all_non_empty,
+                    trusted_all_finite_coordinates=(
+                        True
+                        if base_state.trusted_all_finite_coordinates is True
+                        else None
+                    ),
                     trusted_nonempty_polygonal_positive_area=(
                         base_state.trusted_nonempty_polygonal_positive_area
                     ),
@@ -1669,6 +1678,11 @@ class OwnedGeometryArray:
                             trusted_all_ogc_valid=base_state.trusted_all_ogc_valid,
                             trusted_homogeneous_family=base_state.trusted_homogeneous_family,
                             trusted_all_non_empty=base_state.trusted_all_non_empty,
+                            trusted_all_finite_coordinates=(
+                                True
+                                if base_state.trusted_all_finite_coordinates is True
+                                else None
+                            ),
                             trusted_nonempty_polygonal_positive_area=(
                                 base_state.trusted_nonempty_polygonal_positive_area
                             ),
@@ -1735,6 +1749,7 @@ class OwnedGeometryArray:
         )
         trusted_homogeneous_family = None
         trusted_all_non_empty = None
+        trusted_all_finite_coordinates = None
         valid_tags = np.unique(
             np.asarray(self.tags, dtype=np.int8)[np.asarray(self.validity, dtype=np.bool_)]
         )
@@ -1773,6 +1788,11 @@ class OwnedGeometryArray:
                     and bool(np.all(~np.asarray(host_buffer.empty_mask, dtype=bool)))
                 ):
                     trusted_all_non_empty = True
+                    if family is GeometryFamily.POINT:
+                        trusted_all_finite_coordinates = bool(
+                            np.all(np.isfinite(host_buffer.x))
+                            and np.all(np.isfinite(host_buffer.y))
+                        )
         self.device_state = OwnedGeometryDeviceState(
             validity=d_validity,
             tags=d_tags,
@@ -1782,6 +1802,7 @@ class OwnedGeometryArray:
             trusted_all_ogc_valid=trusted_all_ogc_valid,
             trusted_homogeneous_family=trusted_homogeneous_family,
             trusted_all_non_empty=trusted_all_non_empty,
+            trusted_all_finite_coordinates=trusted_all_finite_coordinates,
             trusted_polygonal_only=(
                 True
                 if set(self.families)
@@ -2333,6 +2354,11 @@ class OwnedGeometryArray:
         trusted_all_non_empty = (
             True if all(ds.trusted_all_non_empty is True for ds in device_states) else None
         )
+        trusted_all_finite_coordinates = (
+            True
+            if all(ds.trusted_all_finite_coordinates is True for ds in device_states)
+            else None
+        )
         trusted_nonempty_polygonal_positive_area = (
             True
             if all(ds.trusted_nonempty_polygonal_positive_area is True for ds in device_states)
@@ -2442,6 +2468,7 @@ class OwnedGeometryArray:
                 trusted_all_ogc_valid=trusted_all_ogc_valid,
                 trusted_homogeneous_family=trusted_homogeneous_family,
                 trusted_all_non_empty=trusted_all_non_empty,
+                trusted_all_finite_coordinates=trusted_all_finite_coordinates,
                 trusted_nonempty_polygonal_positive_area=(trusted_nonempty_polygonal_positive_area),
                 trusted_polygonal_only=(
                     True if all(ds.trusted_polygonal_only is True for ds in device_states) else None
@@ -2738,6 +2765,8 @@ class OwnedGeometryArray:
                 )
             if source_state.trusted_all_non_empty is True:
                 view.device_state.trusted_all_non_empty = True
+            if source_state.trusted_all_finite_coordinates is True:
+                view.device_state.trusted_all_finite_coordinates = True
             if source_state.trusted_nonempty_polygonal_positive_area is True:
                 view.device_state.trusted_nonempty_polygonal_positive_area = True
             if source_state.trusted_polygonal_only is True:
@@ -3177,6 +3206,11 @@ class OwnedGeometryArray:
                     and d_state.trusted_homogeneous_family is family
                 ):
                     result.device_state.trusted_all_non_empty = True
+                if (
+                    d_active_rows is None
+                    and d_state.trusted_all_finite_coordinates is True
+                ):
+                    result.device_state.trusted_all_finite_coordinates = True
                 if d_state.trusted_polygonal_only is True or family in (
                     GeometryFamily.POLYGON,
                     GeometryFamily.MULTIPOLYGON,
@@ -3315,6 +3349,8 @@ class OwnedGeometryArray:
                 result.device_state.trusted_homogeneous_family = family
                 if d_state.trusted_all_non_empty is True:
                     result.device_state.trusted_all_non_empty = True
+                if d_state.trusted_all_finite_coordinates is True:
+                    result.device_state.trusted_all_finite_coordinates = True
         if result.device_state is not None:
             polygonal_families = {
                 GeometryFamily.POLYGON,
@@ -7880,6 +7916,9 @@ def device_mask_owned_capacity(
             ),
             trusted_homogeneous_family=state.trusted_homogeneous_family,
             trusted_all_non_empty=None,
+            trusted_all_finite_coordinates=(
+                True if state.trusted_all_finite_coordinates is True else None
+            ),
             trusted_nonempty_polygonal_positive_area=(
                 state.trusted_nonempty_polygonal_positive_area
             ),
@@ -8580,6 +8619,11 @@ def tile_single_row(
             tags=d_tags,
             family_row_offsets=d_fro,
             families=dict(owned.device_state.families),  # shared reference
+            trusted_all_finite_coordinates=(
+                True
+                if owned.device_state.trusted_all_finite_coordinates is True
+                else None
+            ),
         )
         result = OwnedGeometryArray(
             validity=validity,

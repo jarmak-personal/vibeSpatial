@@ -539,6 +539,20 @@
       "stopIf": "You only need a narrow operation implementation detail already routed by intake.",
       "sourceOfTruth": "Current execution plan for public benchmark parity and IO-zero cleanup.",
       "maxBodyLines": 300
+    },
+    "docs/testing/external-corpus-generalization-plan.md": {
+      "scope": "External real-data discovery, public workflow measurement, corpus promotion, and performance-generalization gates.",
+      "readIf": "You are adding an external dataset, interpreting external-corpus evidence, or optimizing a public workflow found by the corpus sweep.",
+      "stopIf": "You only need an operation-local kernel benchmark or an existing immutable comparator timing.",
+      "sourceOfTruth": "External-corpus benchmark portfolio and public automatic-acceleration policy.",
+      "maxBodyLines": 250
+    },
+    "docs/testing/external-corpus-discovery-2026-08-26.md": {
+      "scope": "Archived initial external-corpus measurements and reusable bottleneck classifications.",
+      "readIf": "You are choosing the next general performance remediation or extending the external corpus suite.",
+      "stopIf": "You only need the portfolio policy or acquisition commands.",
+      "sourceOfTruth": "Identity-qualified archive of the initial RTX 4090 discovery.",
+      "maxBodyLines": 180
     }
   }
 }

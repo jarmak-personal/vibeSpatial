@@ -1,6 +1,10 @@
 """Tests for GPU WKT reader: structural analysis and coordinate extraction."""
 from __future__ import annotations
 
+import math
+import random
+import time
+
 import numpy as np
 import pytest
 
@@ -15,6 +19,17 @@ except (ImportError, ModuleNotFoundError):
     HAS_GPU = False
 
 needs_gpu = pytest.mark.skipif(not HAS_GPU, reason="GPU not available")
+
+
+def test_capacity_numeric_token_positions_retain_64_bit_byte_domain() -> None:
+    from vibespatial.io.wkt_gpu import _WKT_TOKEN_POSITION_DTYPE
+    from vibespatial.io.wkt_gpu_kernels import _WKT_CAPACITY_SOURCE
+
+    assert np.dtype(_WKT_TOKEN_POSITION_DTYPE) == np.dtype(np.int64)
+    assert "long long* __restrict__ out_starts" in _WKT_CAPACITY_SOURCE
+    assert "long long* __restrict__ out_ends" in _WKT_CAPACITY_SOURCE
+    assert "const long long* __restrict__ token_starts" in _WKT_CAPACITY_SOURCE
+    assert "const long long* __restrict__ token_ends" in _WKT_CAPACITY_SOURCE
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +147,24 @@ class TestWktStructuralAnalysis:
     @pytest.mark.parametrize(
         "wkt_text",
         [
+            "SRXX;POINT (1 2)",
+            "SRID=abc;POINT (1 2)",
+            "sr;POINT (1 2)",
+            "SRID=;POINT (1 2)",
+            "SRID=4326 POINT (1 2)",
+        ],
+    )
+    def test_malformed_ewkt_prefix_is_not_classified(self, wkt_text):
+        from vibespatial.io.wkt_gpu import wkt_structural_analysis
+
+        result = wkt_structural_analysis(_to_device_bytes(wkt_text))
+
+        np.testing.assert_array_equal(result.d_family_tags.get(), [-4])
+
+    @needs_gpu
+    @pytest.mark.parametrize(
+        "wkt_text",
+        [
             "POINT Z(1 2 3)",
             "POINT ZM(1 2 3 4)",
             "POINTZ(1 2 3)",
@@ -140,7 +173,7 @@ class TestWktStructuralAnalysis:
         ],
         ids=["z-space", "zm-space", "z-nospace", "zm-nospace", "m-space"],
     )
-    def test_dimension_suffixes_classified_as_point(self, wkt_text):
+    def test_dimension_suffixes_are_explicitly_unsupported(self, wkt_text):
         from vibespatial.io.wkt_gpu import wkt_structural_analysis
 
         d_bytes = _to_device_bytes(wkt_text)
@@ -148,13 +181,13 @@ class TestWktStructuralAnalysis:
 
         assert result.n_geometries == 1
         tags = result.d_family_tags.get()
-        assert tags[0] == 0  # POINT
+        assert tags[0] == -2
         empty_flags = result.d_empty_flags.get()
         assert empty_flags[0] == 0
 
     @needs_gpu
     def test_dimension_suffix_empty(self):
-        """POINT Z EMPTY should be classified as POINT and flagged EMPTY."""
+        """Dimensional EMPTY remains recognizable but unsupported by 2D storage."""
         from vibespatial.io.wkt_gpu import wkt_structural_analysis
 
         d_bytes = _to_device_bytes("POINT Z EMPTY")
@@ -162,7 +195,7 @@ class TestWktStructuralAnalysis:
 
         assert result.n_geometries == 1
         tags = result.d_family_tags.get()
-        assert tags[0] == 0  # POINT
+        assert tags[0] == -2
         empty_flags = result.d_empty_flags.get()
         assert empty_flags[0] == 1
 
@@ -201,6 +234,37 @@ class TestReadWktGpuPoint:
     """Coordinate extraction for POINT geometries."""
 
     @needs_gpu
+    def test_raw_reader_retains_exact_ewkt_support(self):
+        from vibespatial.io.wkt_gpu import read_wkt_gpu
+
+        owned = read_wkt_gpu(
+            _to_device_bytes("SRID=4326;POINT (1.25 -2.5)"),
+            row_count_hint=1,
+        )
+        x, y = _get_device_coords(owned, GeometryFamily.POINT)
+
+        np.testing.assert_array_equal(x, [1.25])
+        np.testing.assert_array_equal(y, [-2.5])
+
+    @needs_gpu
+    @pytest.mark.parametrize(
+        "wkt_text",
+        [
+            "SRXX;POINT (1 2)",
+            "SRID=abc;POINT (1 2)",
+            "sr;POINT (1 2)",
+        ],
+    )
+    def test_raw_reader_rejects_malformed_ewkt_prefix(self, wkt_text):
+        from vibespatial.io.wkt_gpu import read_wkt_gpu
+
+        with pytest.raises(
+            ValueError,
+            match=r"unbalanced parentheses|trailing structure",
+        ):
+            read_wkt_gpu(_to_device_bytes(wkt_text), row_count_hint=1)
+
+    @needs_gpu
     def test_simple_point(self):
         from vibespatial.io.wkt_gpu import read_wkt_gpu
 
@@ -213,6 +277,14 @@ class TestReadWktGpuPoint:
         assert len(x) == 1
         np.testing.assert_allclose(x[0], 1.5, atol=1e-10)
         np.testing.assert_allclose(y[0], -2.3, atol=1e-10)
+
+    @needs_gpu
+    def test_odd_coordinate_counts_are_validated_per_geometry(self):
+        from vibespatial.io.wkt_gpu import read_wkt_gpu
+
+        d_bytes = _to_device_bytes("POINT(1)\nPOINT(2)")
+        with pytest.raises(ValueError, match="odd number of values in a geometry"):
+            read_wkt_gpu(d_bytes)
 
     @needs_gpu
     def test_negative_coordinates(self):
@@ -475,14 +547,15 @@ class TestEmptyGeometries:
     """Tests for WKT EMPTY geometry handling."""
 
     @needs_gpu
-    def test_point_empty_produces_invalid_row(self):
+    def test_point_empty_produces_valid_empty_row(self):
         from vibespatial.io.wkt_gpu import read_wkt_gpu
 
         d_bytes = _to_device_bytes("POINT EMPTY")
         owned = read_wkt_gpu(d_bytes)
 
         assert owned.row_count == 1
-        assert not owned.validity[0]
+        assert owned.validity[0]
+        assert owned.device_state.families[GeometryFamily.POINT].empty_mask.get()[0]
 
     @needs_gpu
     def test_linestring_empty(self):
@@ -492,7 +565,8 @@ class TestEmptyGeometries:
         owned = read_wkt_gpu(d_bytes)
 
         assert owned.row_count == 1
-        assert not owned.validity[0]
+        assert owned.validity[0]
+        assert owned.device_state.families[GeometryFamily.LINESTRING].empty_mask.get()[0]
 
     @needs_gpu
     def test_polygon_empty(self):
@@ -502,7 +576,8 @@ class TestEmptyGeometries:
         owned = read_wkt_gpu(d_bytes)
 
         assert owned.row_count == 1
-        assert not owned.validity[0]
+        assert owned.validity[0]
+        assert owned.device_state.families[GeometryFamily.POLYGON].empty_mask.get()[0]
 
     @needs_gpu
     def test_empty_mixed_with_valid(self):
@@ -515,7 +590,7 @@ class TestEmptyGeometries:
 
         assert owned.row_count == 3
         assert owned.validity[0]
-        assert not owned.validity[1]
+        assert owned.validity[1]
         assert owned.validity[2]
 
     @needs_gpu
@@ -523,33 +598,135 @@ class TestEmptyGeometries:
         """Input containing only EMPTY geometries of the same type."""
         from vibespatial.io.wkt_gpu import read_wkt_gpu
 
-        # Use same-type EMPTY to exercise homogeneous path.
-        # Mixed-type all-EMPTY (POINT EMPTY + LINESTRING EMPTY) hits a
-        # known bug in _assemble_wkt_mixed where pt_starts indexes into
-        # an empty coordinate array (IndexError).  That is a wkt_gpu.py
-        # issue to fix separately.
         wkt = "POINT EMPTY\nPOINT EMPTY"
         d_bytes = _to_device_bytes(wkt)
         owned = read_wkt_gpu(d_bytes)
 
         assert owned.row_count == 2
-        assert not any(owned.validity)
+        assert all(owned.validity)
+        assert all(owned.device_state.families[GeometryFamily.POINT].empty_mask.get())
 
     @needs_gpu
-    def test_all_empty_mixed_types_known_limitation(self):
-        """Mixed-type all-EMPTY triggers IndexError in _assemble_wkt_mixed.
-
-        This is a known limitation: when ALL geometries are EMPTY and the
-        input is mixed-type, the mixed assembly path tries to index into
-        an empty coordinate array.  Marked as xfail until wkt_gpu.py is
-        patched.
-        """
+    def test_all_empty_mixed_types(self):
         from vibespatial.io.wkt_gpu import read_wkt_gpu
 
         wkt = "POINT EMPTY\nLINESTRING EMPTY\nPOLYGON EMPTY"
         d_bytes = _to_device_bytes(wkt)
-        with pytest.raises(IndexError):
-            read_wkt_gpu(d_bytes)
+        owned = read_wkt_gpu(d_bytes)
+
+        assert owned.row_count == 3
+        assert all(owned.validity)
+        assert set(owned.families) == {
+            GeometryFamily.POINT,
+            GeometryFamily.LINESTRING,
+            GeometryFamily.POLYGON,
+        }
+
+    @needs_gpu
+    @pytest.mark.parametrize(
+        "wkt_text, family, expected_part_offsets, expected_ring_offsets",
+        [
+            ("POINT EMPTY", GeometryFamily.POINT, None, None),
+            ("LINESTRING EMPTY", GeometryFamily.LINESTRING, None, None),
+            ("POLYGON EMPTY", GeometryFamily.POLYGON, None, [0]),
+            ("MULTIPOINT EMPTY", GeometryFamily.MULTIPOINT, None, None),
+            (
+                "MULTILINESTRING EMPTY",
+                GeometryFamily.MULTILINESTRING,
+                [0],
+                None,
+            ),
+            (
+                "MULTIPOLYGON EMPTY",
+                GeometryFamily.MULTIPOLYGON,
+                [0],
+                [0],
+            ),
+        ],
+    )
+    def test_empty_family_offsets_are_canonical_zero(
+        self,
+        wkt_text,
+        family,
+        expected_part_offsets,
+        expected_ring_offsets,
+    ):
+        from vibespatial.io.wkt_gpu import read_wkt_gpu
+
+        owned = read_wkt_gpu(_to_device_bytes(wkt_text), row_count_hint=1)
+        buffer = owned.device_state.families[family]
+
+        np.testing.assert_array_equal(buffer.geometry_offsets.get(), [0, 0])
+        if expected_part_offsets is None:
+            assert buffer.part_offsets is None
+        else:
+            np.testing.assert_array_equal(
+                buffer.part_offsets.get(), expected_part_offsets
+            )
+        if expected_ring_offsets is None:
+            assert buffer.ring_offsets is None
+        else:
+            np.testing.assert_array_equal(
+                buffer.ring_offsets.get(), expected_ring_offsets
+            )
+
+    @needs_gpu
+    @pytest.mark.parametrize(
+        "wkt_text, family, geometry_offsets, part_offsets, ring_offsets",
+        [
+            (
+                "LINESTRING (0 0, 1 1)\nLINESTRING EMPTY\n"
+                "LINESTRING (2 2, 3 3)",
+                GeometryFamily.LINESTRING,
+                [0, 2, 2, 4],
+                None,
+                None,
+            ),
+            (
+                "POLYGON ((0 0, 1 0, 1 1, 0 0))\nPOLYGON EMPTY\n"
+                "POLYGON ((2 2, 3 2, 3 3, 2 2))",
+                GeometryFamily.POLYGON,
+                [0, 1, 1, 2],
+                None,
+                [0, 4, 8],
+            ),
+            (
+                "MULTILINESTRING ((0 0, 1 1))\nMULTILINESTRING EMPTY\n"
+                "MULTILINESTRING ((2 2, 3 3))",
+                GeometryFamily.MULTILINESTRING,
+                [0, 1, 1, 2],
+                [0, 2, 4],
+                None,
+            ),
+            (
+                "MULTIPOLYGON (((0 0, 1 0, 1 1, 0 0)))\n"
+                "MULTIPOLYGON EMPTY\n"
+                "MULTIPOLYGON (((2 2, 3 2, 3 3, 2 2)))",
+                GeometryFamily.MULTIPOLYGON,
+                [0, 1, 1, 2],
+                [0, 1, 2],
+                [0, 4, 8],
+            ),
+        ],
+    )
+    def test_empty_row_repeats_preceding_family_offsets(
+        self,
+        wkt_text,
+        family,
+        geometry_offsets,
+        part_offsets,
+        ring_offsets,
+    ):
+        from vibespatial.io.wkt_gpu import read_wkt_gpu
+
+        owned = read_wkt_gpu(_to_device_bytes(wkt_text), row_count_hint=3)
+        buffer = owned.device_state.families[family]
+
+        np.testing.assert_array_equal(buffer.geometry_offsets.get(), geometry_offsets)
+        if part_offsets is not None:
+            np.testing.assert_array_equal(buffer.part_offsets.get(), part_offsets)
+        if ring_offsets is not None:
+            np.testing.assert_array_equal(buffer.ring_offsets.get(), ring_offsets)
 
 
 # ===================================================================
@@ -569,20 +746,249 @@ class TestEdgeCases:
         assert owned.row_count == 0
 
     @needs_gpu
-    def test_single_point_linestring(self):
-        """Degenerate linestring with a single coordinate pair."""
+    def test_single_point_linestring_is_rejected(self):
+        """LineString cardinality must match the GEOS WKT parser."""
         from vibespatial.io.wkt_gpu import read_wkt_gpu
 
-        # This is technically invalid WKT (linestring needs >= 2 points)
-        # but the parser should handle it gracefully.
         d_bytes = _to_device_bytes("LINESTRING(5 10)")
-        owned = read_wkt_gpu(d_bytes)
+        with pytest.raises(ValueError, match="cardinality or nesting"):
+            read_wkt_gpu(d_bytes)
 
-        assert owned.row_count == 1
-        x, y = _get_device_coords(owned, GeometryFamily.LINESTRING)
-        assert len(x) == 1
-        np.testing.assert_allclose(x[0], 5.0, atol=1e-10)
-        np.testing.assert_allclose(y[0], 10.0, atol=1e-10)
+    @needs_gpu
+    @pytest.mark.parametrize(
+        "wkt_text, error",
+        [
+            ("POINT (1 2, 3 4)", "cardinality or nesting"),
+            ("POINT (1, 2)", "cardinality or nesting"),
+            ("POINT ((1 2))", "cardinality or nesting"),
+            ("POINT (1 2", "unbalanced parentheses"),
+            ("POINT (1 2))", "unbalanced parentheses"),
+            ("POINT (1 2) trailing", "trailing structure"),
+            ("POINT EMPTY trailing", "unbalanced parentheses|trailing structure"),
+            ("POINT (1e 2)", "cardinality or nesting"),
+            ("POINT (--1 2)", "cardinality or nesting"),
+            ("POINT (1..2 3)", "cardinality or nesting"),
+            ("POINT (1e+ 2)", "cardinality or nesting"),
+            ("POINT (+ 2)", "cardinality or nesting"),
+            ("POINT (1e2e3 4)", "cardinality or nesting"),
+            ("POINT (1-2 3)", "cardinality or nesting"),
+            ("POINT (1x 2)", "cardinality or nesting"),
+            ("POINTXYZ (1 2)", "unbalanced parentheses|trailing structure"),
+            ("POINT FOO (1 2)", "unbalanced parentheses|trailing structure"),
+            ("MULTIPOINT ((0 0, 1 1))", "cardinality or nesting"),
+            ("LINESTRING (0 0 1 1)", "cardinality or nesting"),
+            ("MULTILINESTRING ((0 0))", "cardinality or nesting"),
+            ("MULTIPOLYGON ((0 0, 1 0, 0 0))", "cardinality or nesting"),
+            ("POINT (,1 2)", "cardinality or nesting"),
+            ("POINT (1 2,)", "cardinality or nesting"),
+            ("POINT (1 2,,)", "cardinality or nesting"),
+            ("LINESTRING (,0 0,1 1)", "cardinality or nesting"),
+            ("LINESTRING (0 0,1 1,)", "cardinality or nesting"),
+            ("LINESTRING (0 0,,1 1)", "cardinality or nesting"),
+            ("MULTIPOINT (,0 0,1 1)", "cardinality or nesting"),
+            ("MULTIPOINT (0 0,1 1,)", "cardinality or nesting"),
+            ("MULTIPOINT ((,0 0),(1 1))", "cardinality or nesting"),
+            (
+                "POLYGON ((,0 0,1 0,1 1,0 0))",
+                "cardinality or nesting",
+            ),
+            (
+                "POLYGON ((0 0,1 0,1 1,0 0,))",
+                "cardinality or nesting",
+            ),
+            (
+                "MULTILINESTRING ((,0 0,1 1),(2 2,3 3))",
+                "cardinality or nesting",
+            ),
+            (
+                "MULTILINESTRING ((0 0,1 1),,(2 2,3 3))",
+                "cardinality or nesting",
+            ),
+            (
+                "MULTIPOLYGON (((,0 0,1 0,1 1,0 0)))",
+                "cardinality or nesting",
+            ),
+            (
+                "MULTIPOLYGON (((0 0,1 0,1 1,0 0)),)",
+                "cardinality or nesting",
+            ),
+            ("MULTILINESTRING ((),(0 0,1 1))", "cardinality or nesting"),
+            ("MULTIPOLYGON ((,))", "cardinality or nesting"),
+            (
+                "POLYGON ((0 0, 1 0, 1 1, 0 1))",
+                "ring is not closed",
+            ),
+            (
+                "MULTIPOLYGON (((0 0, 1 0, 1 1, 0 1)))",
+                "ring is not closed",
+            ),
+        ],
+    )
+    def test_malformed_even_token_wkt_is_rejected(self, wkt_text, error):
+        from vibespatial.io.wkt_gpu import read_wkt_gpu
+
+        with pytest.raises(ValueError, match=error):
+            read_wkt_gpu(_to_device_bytes(wkt_text))
+
+    @needs_gpu
+    @pytest.mark.parametrize(
+        "wkt_text",
+        [
+            "POINT (+1 .5)",
+            "POINT (1e+2 -3E-1)",
+            "POINT (+1 .5)\nLINESTRING (0 0, 1e+2 -3E-1)",
+        ],
+    )
+    def test_valid_numeric_wkt_parse_has_one_explicit_validation_packet(self, wkt_text):
+        from vibespatial.cuda._runtime import (
+            get_d2h_transfer_events,
+            reset_d2h_transfer_count,
+        )
+        from vibespatial.io.wkt_gpu import read_wkt_gpu
+
+        d_bytes = _to_device_bytes(wkt_text)
+        reset_d2h_transfer_count()
+        get_d2h_transfer_events(clear=True)
+        owned = read_wkt_gpu(
+            d_bytes,
+            row_count_hint=wkt_text.count("\n") + 1,
+        )
+
+        assert owned.device_state is not None
+        events = get_d2h_transfer_events(clear=True)
+        assert len(events) == 1
+        assert events[0].reason == "WKT semantic validation and exact allocation packet"
+        reset_d2h_transfer_count()
+
+    @needs_gpu
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "1.234567890123456789",
+            "9007199254740993",
+            "2.2250738585072014e-308",
+            "4.9406564584124654e-324",
+            "1.7976931348623157e308",
+            "0.1000000000000000055511151231257827021181583404541015625",
+            "1.00000000000000011102230246251565404236316680908203125",
+            "1.00000000000000011102230246251565404236316680908203126",
+            "2.4703282292062327208828439643411068618252990130716e-324",
+            "1000000000000000128",
+            f"1.{('0' * 767)}1",
+        ],
+    )
+    def test_decimal_conversion_matches_strtod_exact_bits(self, token):
+        from vibespatial.io.wkt_gpu import read_wkt_gpu
+
+        owned = read_wkt_gpu(
+            _to_device_bytes(f"POINT ({token} 0)"),
+            row_count_hint=1,
+        )
+        actual = owned.device_state.families[GeometryFamily.POINT].x.get()
+        expected = np.asarray([float(token)], dtype=np.float64)
+
+        np.testing.assert_array_equal(
+            actual.view(np.uint64),
+            expected.view(np.uint64),
+        )
+
+    @needs_gpu
+    def test_decimal_conversion_matches_strtod_deterministic_corpus(self):
+        from vibespatial.io.wkt_gpu import read_wkt_gpu
+
+        rng = random.Random(20260826)
+        tokens = []
+        while len(tokens) < 2000:
+            digit_count = rng.randint(1, 45)
+            digits = "".join(str(rng.randrange(10)) for _ in range(digit_count))
+            if not any(character != "0" for character in digits):
+                continue
+            decimal_at = rng.randint(0, digit_count)
+            if decimal_at == 0:
+                mantissa = f".{digits}"
+            elif decimal_at == digit_count:
+                mantissa = f"{digits}."
+            else:
+                mantissa = f"{digits[:decimal_at]}.{digits[decimal_at:]}"
+            if rng.randrange(2):
+                mantissa = f"-{mantissa}"
+            token = f"{mantissa}e{rng.randint(-340, 310):+d}"
+            expected = float(token)
+            if math.isfinite(expected):
+                tokens.append(token)
+
+        wkt_text = "\n".join(f"POINT ({token} 0)" for token in tokens)
+        owned = read_wkt_gpu(
+            _to_device_bytes(wkt_text),
+            row_count_hint=len(tokens),
+        )
+        actual = owned.device_state.families[GeometryFamily.POINT].x.get()
+        expected = np.asarray([float(token) for token in tokens], dtype=np.float64)
+
+        np.testing.assert_array_equal(
+            actual.view(np.uint64),
+            expected.view(np.uint64),
+        )
+
+    @needs_gpu
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "1e1000000",
+            "-1e1000000",
+            "1e-1000000",
+            "-1e-1000000",
+            "0e1000000",
+            "-0e1000000",
+            "0e-1000000",
+            "-0e-1000000",
+        ],
+    )
+    def test_extreme_exponent_has_exact_constant_time_result(self, token):
+        from vibespatial.io.wkt_gpu import read_wkt_gpu
+
+        # Warm NVRTC separately so the bound covers parsing, not compilation.
+        read_wkt_gpu(_to_device_bytes("POINT (1 0)"), row_count_hint=1)
+        started = time.perf_counter()
+        owned = read_wkt_gpu(
+            _to_device_bytes(f"POINT ({token} 0)"),
+            row_count_hint=1,
+        )
+        elapsed = time.perf_counter() - started
+        actual = owned.device_state.families[GeometryFamily.POINT].x.get()
+        expected = np.asarray([float(token)], dtype=np.float64)
+
+        np.testing.assert_array_equal(
+            actual.view(np.uint64),
+            expected.view(np.uint64),
+        )
+        assert elapsed < 1.0
+
+    @needs_gpu
+    @pytest.mark.parametrize(
+        "wkt_text",
+        [
+            "POINT (1 2)",
+            "POINT (+1 2)",
+            "POINT (.5 2.)",
+            "POINT (1e+2 -3E-1)",
+            "POINT (-.5 +.25)",
+            "LINESTRING (0 0, 1 1)",
+            "POLYGON ((0 0, 1 0, 1 1, 0 0))",
+            "MULTIPOINT (0 0, 1 1)",
+            "MULTIPOINT ((0 0), (1 1))",
+            "MULTILINESTRING ((0 0, 1 1), (2 2, 3 3))",
+            "MULTIPOLYGON (((0 0, 1 0, 1 1, 0 0)))",
+        ],
+    )
+    def test_structure_validation_preserves_valid_family_controls(self, wkt_text):
+        import shapely
+
+        from vibespatial.io.wkt_gpu import read_wkt_gpu
+
+        owned = read_wkt_gpu(_to_device_bytes(wkt_text))
+        expected = shapely.from_wkt([wkt_text], on_invalid="raise")
+        assert shapely.equals_exact(owned.to_shapely(), expected, 0).all()
 
     @needs_gpu
     def test_very_small_polygon(self):
@@ -822,7 +1228,7 @@ class TestOwnedStructure:
 
         validity = owned.validity
         assert validity[0]
-        assert not validity[1]
+        assert validity[1]
         assert validity[2]
 
     @needs_gpu
