@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import gc
 import hashlib
 import importlib.metadata
 import io
@@ -18,9 +20,12 @@ import sys
 import tempfile
 import time
 import warnings
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from .schema import TimingSummary, timing_from_samples
 
@@ -35,6 +40,70 @@ _BASELINE_PACKAGES = (
     "pyogrio",
     "shapely",
 )
+
+
+class _DeviceMemoryMonitor:
+    """Measure allocations made inside one workflow-phase-local RMM scope.
+
+    ``push_statistics`` starts a fresh nested counter, so allocations that
+    existed before the warmup or sample phase are not reported as part of that
+    phase's peak. Shootout execution takes the maximum of the independent
+    warmup and sample scopes, preserving cold-workflow capacity without making
+    repeat peaks cumulative. The monitor is best-effort: an unavailable RMM
+    statistics adaptor makes the measurement unavailable instead of changing
+    benchmark execution.
+    """
+
+    def __init__(self, *, enabled: bool) -> None:
+        self.available = False
+        self._peak_bytes: int | None = None
+        self._active = False
+        self._statistics = None
+        if not enabled:
+            return
+        try:
+            from rmm import statistics
+
+            statistics.enable_statistics()
+            statistics.push_statistics()
+        except Exception:
+            return
+        self.available = True
+        self._active = True
+        self._statistics = statistics
+
+    def _update(self) -> None:
+        if not self.available or self._statistics is None:
+            return
+        try:
+            stats = self._statistics.get_statistics()
+        except Exception:
+            return
+        if stats is not None:
+            self._peak_bytes = max(self._peak_bytes or 0, int(stats.peak_bytes))
+
+    @property
+    def peak_bytes(self) -> int | None:
+        """Seal the nested statistics scope and return its allocation peak."""
+        if not self._active or self._statistics is None:
+            return self._peak_bytes
+        self._update()
+        try:
+            stats = self._statistics.pop_statistics()
+        except Exception:
+            stats = None
+        if stats is not None:
+            self._peak_bytes = max(self._peak_bytes or 0, int(stats.peak_bytes))
+        self._active = False
+        return self._peak_bytes
+
+    def __del__(self) -> None:
+        if not self._active or self._statistics is None:
+            return
+        try:
+            self._statistics.pop_statistics()
+        except Exception:
+            pass
 
 
 def _repo_source_root() -> Path | None:
@@ -161,6 +230,27 @@ def _run_timed_sections(script_path, sections, *, run_name):
         if strict_native is not None:
             os.environ["VIBESPATIAL_STRICT_NATIVE"] = strict_native
     return elapsed
+
+
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_START
+def _start_device_memory_monitor():
+    if not do_pipeline_warm:
+        return None
+    try:
+        from vibespatial.bench.shootout import _DeviceMemoryMonitor
+        return _DeviceMemoryMonitor(enabled=True)
+    except Exception:
+        return None
+
+
+def _finish_device_memory_monitor(monitor):
+    if monitor is None:
+        return None
+    try:
+        return monitor.peak_bytes
+    except Exception:
+        return None
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_END
 
 
 # VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_START
@@ -665,7 +755,13 @@ if do_pipeline_warm:
     except Exception:
         pass
 
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_START
+peak_device_memory_bytes = None
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_END
 if do_warmup:
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_START
+    warmup_memory_monitor = _start_device_memory_monitor()
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_END
     old = sys.stdout
     sys.stdout = io.StringIO()
     try:
@@ -677,10 +773,24 @@ if do_warmup:
         pass
     finally:
         sys.stdout = old
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_START
+        warmup_peak_device_memory_bytes = _finish_device_memory_monitor(
+            warmup_memory_monitor
+        )
+        if warmup_peak_device_memory_bytes is not None:
+            peak_device_memory_bytes = warmup_peak_device_memory_bytes
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_END
 
 samples = []
 captured_stdout = ""
 for i in range(repeat):
+    # Reclaim cycles left by the warmup/previous workflow before opening the
+    # next timing boundary. In particular, marker-delimited pandas globals can
+    # otherwise survive all repeat samples and multiply peak host memory.
+    gc.collect()
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_START
+    memory_monitor = _start_device_memory_monitor()
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_END
     old = sys.stdout
     sys.stdout = capture = io.StringIO()
     error = None
@@ -698,6 +808,14 @@ for i in range(repeat):
     if i == 0:
         captured_stdout = capture.getvalue()
     samples.append({"elapsed": elapsed, "error": error})
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_START
+    sample_peak_device_memory_bytes = _finish_device_memory_monitor(memory_monitor)
+    if sample_peak_device_memory_bytes is not None:
+        peak_device_memory_bytes = max(
+            peak_device_memory_bytes or 0,
+            sample_peak_device_memory_bytes,
+        )
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_END
 
 # VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_START
 profile = None
@@ -717,6 +835,9 @@ with open(result_path, "w") as f:
         "stdout": captured_stdout,
         "profile": profile,
         "environment": _environment_identity(),
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_START
+        "peak_device_memory_bytes": peak_device_memory_bytes,
+# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_END
     }, f)
 """
 
@@ -750,11 +871,18 @@ class ShootoutRun:
     stdout: str = ""
     profile: dict[str, Any] | None = None
     environment: dict[str, Any] | None = None
+    peak_device_memory_bytes: int | None = None
+    correctness_packet: dict[str, Any] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "label": self.label,
             "timing": self.timing.to_dict(),
+            "peak_device_memory_bytes": self.peak_device_memory_bytes,
         }
         if self.error:
             d["error"] = self.error
@@ -914,6 +1042,7 @@ def _shootout_run_from_dict(raw: dict[str, Any]) -> ShootoutRun:
     stdout = raw.get("stdout", "")
     if not isinstance(stdout, str):
         raise ValueError("cached GeoPandas baseline stdout field is not text")
+    peak_device_memory_bytes = _parse_peak_device_memory_bytes(raw)
     return ShootoutRun(
         label="geopandas",
         timing=TimingSummary(sample_count=sample_count, **numeric_timing),
@@ -921,6 +1050,7 @@ def _shootout_run_from_dict(raw: dict[str, Any]) -> ShootoutRun:
         stdout=stdout,
         profile=raw.get("profile"),
         environment=raw.get("environment"),
+        peak_device_memory_bytes=peak_device_memory_bytes,
     )
 
 
@@ -1094,6 +1224,22 @@ def load_reusable_geopandas_baseline(
     environment_sha256 = _baseline_environment_sha256(run.environment)
     if metadata.get("geopandas_baseline_environment_sha256") != environment_sha256:
         raise ValueError("cached GeoPandas baseline environment identity is stale")
+    if expected["workload_key"] == "power_substation_nearest.py":
+        oracle = metadata.get("geopandas_correctness_oracle")
+        if not isinstance(oracle, dict):
+            raise ValueError(
+                "cached Power nearest baseline has no correctness oracle packet"
+            )
+        run = ShootoutRun(
+            label=run.label,
+            timing=run.timing,
+            error=run.error,
+            stdout=run.stdout,
+            profile=run.profile,
+            environment=run.environment,
+            peak_device_memory_bytes=run.peak_device_memory_bytes,
+            correctness_packet=oracle,
+        )
     return run
 
 
@@ -1112,15 +1258,27 @@ def _build_run_from_result(label: str, raw: dict[str, Any]) -> ShootoutRun:
     samples_raw = raw.get("samples", [])
     times = [s["elapsed"] for s in samples_raw]
     errors = [s["error"] for s in samples_raw if s.get("error")]
+    correctness_packet, stdout = _extract_correctness_packet(raw.get("stdout", ""))
 
     return ShootoutRun(
         label=label,
         timing=timing_from_samples(times),
         error=errors[0] if errors else None,
-        stdout=raw.get("stdout", ""),
+        stdout=stdout,
         profile=raw.get("profile"),
         environment=raw.get("environment"),
+        peak_device_memory_bytes=_parse_peak_device_memory_bytes(raw),
+        correctness_packet=correctness_packet,
     )
+
+
+def _parse_peak_device_memory_bytes(raw: dict[str, Any]) -> int | None:
+    value = raw.get("peak_device_memory_bytes")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("peak_device_memory_bytes must be a non-negative integer or null")
+    return value
 
 
 def _error_run(label: str, error: str) -> ShootoutRun:
@@ -1132,6 +1290,19 @@ def _error_run(label: str, error: str) -> ShootoutRun:
 
 
 _FINGERPRINT_PREFIX = "SHOOTOUT_FINGERPRINT: "
+_CORRECTNESS_PREFIX = "SHOOTOUT_CORRECTNESS: "
+_POWER_NEAREST_CONTRACT = "power-nearest-v1"
+_WEB_MERCATOR_WORLD_COORDINATE = 20_037_508.342789244
+_POWER_NEAREST_COORDINATE_ULP_BUDGET = 2
+_POWER_NEAREST_COORDINATE_ATOL = (
+    _POWER_NEAREST_COORDINATE_ULP_BUDGET
+    * math.ulp(_WEB_MERCATOR_WORLD_COORDINATE)
+)
+_POWER_NEAREST_MAX_DISTANCE = 100_000.0
+_POWER_NEAREST_DISTANCE_ATOL = (
+    2.0 * math.sqrt(2.0) * _POWER_NEAREST_COORDINATE_ATOL
+    + 2.0 * math.ulp(_POWER_NEAREST_MAX_DISTANCE)
+)
 _NESTED_GPU_LAUNCH_ERRORS = (
     "GPU execution was requested, but no GPU runtime is available",
     "GPU WKB encode unavailable",
@@ -1145,6 +1316,143 @@ def _extract_fingerprint(stdout: str) -> str | None:
         if line.startswith(_FINGERPRINT_PREFIX):
             return line[len(_FINGERPRINT_PREFIX) :].strip()
     return None
+
+
+def _extract_correctness_packet(stdout: str) -> tuple[dict[str, Any] | None, str]:
+    """Extract a workload verifier packet without persisting its numeric payload."""
+    packet = None
+    retained: list[str] = []
+    for line in stdout.splitlines():
+        if not line.startswith(_CORRECTNESS_PREFIX):
+            retained.append(line)
+            continue
+        try:
+            value = json.loads(line[len(_CORRECTNESS_PREFIX) :])
+        except json.JSONDecodeError as exc:
+            packet = {"parse_error": str(exc)}
+            continue
+        packet = value if isinstance(value, dict) else {
+            "parse_error": "correctness packet is not an object"
+        }
+    cleaned = "\n".join(retained)
+    if stdout.endswith("\n") and cleaned:
+        cleaned += "\n"
+    return packet, cleaned
+
+
+def _decode_power_nearest_numeric(packet: dict[str, Any]) -> np.ndarray:
+    row_count = packet.get("row_count")
+    shape = packet.get("numeric_shape")
+    encoded = packet.get("numeric_f64_zlib_base64")
+    if (
+        isinstance(row_count, bool)
+        or not isinstance(row_count, int)
+        or row_count < 0
+        or row_count > 10_000_000
+        or shape != [row_count, 3]
+        or not isinstance(encoded, str)
+    ):
+        raise ValueError("invalid Power nearest numeric packet shape")
+    expected_bytes = row_count * 3 * np.dtype("<f8").itemsize
+    try:
+        compressed = base64.b64decode(encoded, validate=True)
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(compressed, expected_bytes + 1)
+    except (ValueError, zlib.error) as exc:
+        raise ValueError("invalid Power nearest numeric packet encoding") from exc
+    if (
+        len(raw) != expected_bytes
+        or decoder.unused_data
+        or decoder.unconsumed_tail
+        or not decoder.eof
+    ):
+        raise ValueError("invalid Power nearest numeric packet byte count")
+    return np.frombuffer(raw, dtype="<f8").reshape(row_count, 3)
+
+
+def _compare_power_nearest_correctness_packets(
+    geopandas_packet: dict[str, Any] | None,
+    vibespatial_packet: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Compare the exact Power relation plus bounded projection numerics."""
+    summary: dict[str, Any] = {
+        "contract": _POWER_NEAREST_CONTRACT,
+        "status": "mismatch",
+        "coordinate_atol": _POWER_NEAREST_COORDINATE_ATOL,
+        "distance_atol": _POWER_NEAREST_DISTANCE_ATOL,
+        "coordinate_tolerance_derivation": (
+            "2 fp64 ULPs at the EPSG:3857 world-coordinate bound"
+        ),
+        "distance_tolerance_derivation": (
+            "2*sqrt(2)*coordinate_atol plus 2 fp64 ULPs at max_distance=100000"
+        ),
+    }
+    if not isinstance(geopandas_packet, dict) or not isinstance(
+        vibespatial_packet, dict
+    ):
+        summary["reason"] = "missing correctness packet"
+        return summary
+    exact_fields = (
+        "contract",
+        "row_count",
+        "columns",
+        "logical_dtypes",
+        "index_type",
+        "index_names",
+        "logical_index_dtypes",
+        "crs_sha256",
+        "exact_values_fingerprint",
+        "numeric_shape",
+    )
+    for field_name in exact_fields:
+        if geopandas_packet.get(field_name) != vibespatial_packet.get(field_name):
+            summary["reason"] = f"exact field mismatch: {field_name}"
+            return summary
+    if geopandas_packet.get("contract") != _POWER_NEAREST_CONTRACT:
+        summary["reason"] = "unsupported correctness contract"
+        return summary
+    try:
+        geopandas_numeric = _decode_power_nearest_numeric(geopandas_packet)
+        vibespatial_numeric = _decode_power_nearest_numeric(vibespatial_packet)
+    except ValueError as exc:
+        summary["reason"] = str(exc)
+        return summary
+    if not np.array_equal(
+        np.isfinite(geopandas_numeric),
+        np.isfinite(vibespatial_numeric),
+    ):
+        summary["reason"] = "numeric finite-mask mismatch"
+        return summary
+    if not np.all(np.isfinite(geopandas_numeric)):
+        summary["reason"] = "non-finite numerics are unsupported"
+        return summary
+    finite = np.isfinite(geopandas_numeric) & np.isfinite(vibespatial_numeric)
+    delta = np.zeros_like(geopandas_numeric)
+    np.subtract(
+        vibespatial_numeric,
+        geopandas_numeric,
+        out=delta,
+        where=finite,
+    )
+    coordinate_max = float(np.max(np.abs(delta[:, :2]), initial=0.0))
+    distance_max = float(np.max(np.abs(delta[:, 2]), initial=0.0))
+    summary.update(
+        {
+            "row_count": int(geopandas_numeric.shape[0]),
+            "exact_fields": "match",
+            "max_coordinate_abs_diff": coordinate_max,
+            "max_distance_abs_diff": distance_max,
+        }
+    )
+    if coordinate_max > _POWER_NEAREST_COORDINATE_ATOL:
+        summary["reason"] = "coordinate tolerance exceeded"
+        return summary
+    if distance_max > _POWER_NEAREST_DISTANCE_ATOL:
+        summary["reason"] = "distance tolerance exceeded"
+        return summary
+    summary["status"] = "match"
+    summary["reason"] = "exact relation and bounded reprojection numerics match"
+    return summary
 
 
 def _load_script_sections(script: Path) -> tuple[object, object, object, str, int] | None:
@@ -1334,6 +1642,8 @@ def _run_harness(
             stdout=timed_run.stdout,
             profile=profile_result,
             environment=timed_run.environment,
+            peak_device_memory_bytes=timed_run.peak_device_memory_bytes,
+            correctness_packet=timed_run.correctness_packet,
         )
 
     harness_fd, harness_path = tempfile.mkstemp(suffix=".py", prefix="vsbench_harness_")
@@ -1482,7 +1792,9 @@ def _run_harness_in_process(
                 except Exception:
                     pass
 
+            peak_device_memory_bytes: int | None = None
             if warmup:
+                warmup_memory_monitor = _DeviceMemoryMonitor(enabled=pipeline_warm)
                 try:
                     if sections is None:
                         sys.stdout = io.StringIO()
@@ -1497,11 +1809,20 @@ def _run_harness_in_process(
                     pass
                 finally:
                     sys.stdout = original_stdout
+                    warmup_peak_device_memory_bytes = (
+                        warmup_memory_monitor.peak_bytes
+                    )
+                    if warmup_peak_device_memory_bytes is not None:
+                        peak_device_memory_bytes = warmup_peak_device_memory_bytes
 
             samples: list[float] = []
             errors: list[str] = []
             captured_stdout = ""
             for i in range(repeat):
+                # Match the isolated harness: cyclic cleanup is outside the
+                # sample and therefore also separates warmup from sample 0.
+                gc.collect()
+                memory_monitor = _DeviceMemoryMonitor(enabled=pipeline_warm)
                 error = None
                 try:
                     if sections is None:
@@ -1526,13 +1847,24 @@ def _run_harness_in_process(
                 samples.append(elapsed)
                 if error is not None:
                     errors.append(error)
+                sample_peak_device_memory_bytes = memory_monitor.peak_bytes
+                if sample_peak_device_memory_bytes is not None:
+                    peak_device_memory_bytes = max(
+                        peak_device_memory_bytes or 0,
+                        sample_peak_device_memory_bytes,
+                    )
 
+            correctness_packet, captured_stdout = _extract_correctness_packet(
+                captured_stdout
+            )
             return ShootoutRun(
                 label=label,
                 timing=timing_from_samples(samples),
                 error=errors[0] if errors else None,
                 stdout=captured_stdout,
                 environment=_environment_identity(),
+                peak_device_memory_bytes=peak_device_memory_bytes,
+                correctness_packet=correctness_packet,
             )
     finally:
         sys.stdout = original_stdout
@@ -1692,6 +2024,25 @@ def run_shootout(
     # --- fingerprint comparison ---
     gpd_fp = _extract_fingerprint(gpd_run.stdout)
     vs_fp = _extract_fingerprint(vs_run.stdout)
+    power_contract_required = script.name == "power_substation_nearest.py"
+    correctness_contract = (
+        _compare_power_nearest_correctness_packets(
+            gpd_run.correctness_packet,
+            vs_run.correctness_packet,
+        )
+        if power_contract_required
+        else None
+    )
+    contract_match = bool(
+        correctness_contract
+        and correctness_contract.get("status") == "match"
+    )
+    if power_contract_required and not contract_match:
+        errors.append(
+            "Power nearest correctness contract failed: "
+            + str(correctness_contract.get("reason", "unknown reason"))
+        )
+        has_error = True
     fingerprint_match: str | None = None
     if not gpd_fp or not vs_fp:
         fingerprint_match = "missing"
@@ -1705,14 +2056,17 @@ def run_shootout(
             fingerprint_match = "match"
         else:
             fingerprint_match = "mismatch"
-            if not has_error:
+            if not contract_match:
                 errors.append(f"fingerprint mismatch: geopandas={gpd_fp} vibespatial={vs_fp}")
                 has_error = True
 
     # A cached timing is comparable only after the current result matches its
     # correctness oracle. Never report a speedup for a failed comparison.
     speedup = None
-    timing_comparable = not has_error and fingerprint_match == "match"
+    timing_comparable = not has_error and (
+        fingerprint_match == "match"
+        or (power_contract_required and contract_match)
+    )
     if (
         timing_comparable
         and gpd_run.timing.median_seconds > 0
@@ -1755,6 +2109,10 @@ def run_shootout(
         meta["fingerprint"] = fingerprint_match
         meta["fingerprint_geopandas"] = gpd_fp
         meta["fingerprint_vibespatial"] = vs_fp
+    if correctness_contract is not None:
+        meta["correctness_contract"] = correctness_contract
+        if isinstance(gpd_run.correctness_packet, dict):
+            meta["geopandas_correctness_oracle"] = gpd_run.correctness_packet
 
     return ShootoutResult(
         script=str(script),

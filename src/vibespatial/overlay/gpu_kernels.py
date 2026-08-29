@@ -1217,10 +1217,14 @@ __device__ __forceinline__ bool indexed_containment_bounds_match(
   if (isolate_rows != 0 && source_rows[root_edge] != source_rows[candidate_edge]) {
     return false;
   }
-  return px >= face_bounds[candidate_face * 4] &&
-      px <= face_bounds[candidate_face * 4 + 2] &&
-      py >= face_bounds[candidate_face * 4 + 1] &&
-      py <= face_bounds[candidate_face * 4 + 3];
+  const double* root_bounds = face_bounds + root_face * 4;
+  const double* candidate_bounds = face_bounds + candidate_face * 4;
+  return root_bounds[0] >= candidate_bounds[0] &&
+      root_bounds[1] >= candidate_bounds[1] &&
+      root_bounds[2] <= candidate_bounds[2] &&
+      root_bounds[3] <= candidate_bounds[3] &&
+      px >= candidate_bounds[0] && px <= candidate_bounds[2] &&
+      py >= candidate_bounds[1] && py <= candidate_bounds[3];
 }
 
 // Fixed-capacity indexed reduction for disconnected component containment.

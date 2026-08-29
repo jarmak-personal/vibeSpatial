@@ -1,0 +1,286 @@
+{
+  "schema_version": 1,
+  "kind": "spatialbench_sf100_geopandas_optimized",
+  "status": "accepted_immutable",
+  "accepted_date": "2026-08-17",
+  "engine": {
+    "name": "geopandas_optimized",
+    "geopandas_version": "1.1.4",
+    "python_version": "3.13.12"
+  },
+  "host": {
+    "hostname": "picard-4090",
+    "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900K",
+    "storage": "ext4 WD_BLACK SN770 1 TB NVMe /dev/nvme0n1p2"
+  },
+  "identity_sources": [
+    {
+      "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/provenance.json",
+      "sha256": "1e3057c7e0e236bb1f5355d90033c7ae168bf61980a1fcff6fcd1d7caae96e63"
+    },
+    {
+      "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/same_data_correctness.json",
+      "sha256": "bca547bce14685ad8903a9558161a801ff4dea8efab7fbcb0b588e002de40d8a"
+    },
+    {
+      "path": "docs/dev/cross-device-performance-report.md",
+      "sha256": "43ff4c33222dc36e0b44c8f096cdac9c95469c8a925c7f4f05a9bad5191beed4"
+    }
+  ],
+  "dataset": {
+    "scale_factor": 100,
+    "format": "GeoParquet 1.1",
+    "geometry_encoding": "native GeoArrow",
+    "manifest_sha256": "a970d40adc2f754e781197d9ec9af1f03627351ceb8d01e92e9c09ff6c5080d3",
+    "file_inventory_sha256": "ad526c085c09b50410402945c24a9b6162b4467ceb4daa3c1f24d3db9848a35c",
+    "file_count": 179,
+    "total_bytes": 37940233646
+  },
+  "environment": {
+    "packages": {
+      "geopandas": "1.1.4",
+      "pandas": "3.0.1",
+      "pyarrow": "23.0.1"
+    },
+    "lock": {
+      "path": "uv.lock",
+      "sha256": "60942838f44a9792dfc8a49371e8a1367a59e8d858e39ed827dfa735e0d615fe"
+    }
+  },
+  "workload": {
+    "name": "SpatialBench",
+    "version": "0.1.0",
+    "query_count": 12,
+    "sources": [
+      {
+        "path": "benchmarks/spatialbench/geopandas_optimized_queries.py",
+        "sha256": "8325d9bb2288b49008bc81eca8a2f9ff9eff6efdc2d472a9c7bce2e7877a2b35"
+      },
+      {
+        "path": "benchmarks/spatialbench/geoparquet_public_api_queries.py",
+        "sha256": "b34099f0665ece2f23fa5044698eda82c962e1cf875313cbbbcd8b27080e63f9"
+      },
+      {
+        "path": "benchmarks/spatialbench/public_api_queries.py",
+        "sha256": "36e230f02f8f8e21b1f3542d6c9e76005bd1b7c5b3422e572a82ea8f08930e65"
+      }
+    ]
+  },
+  "measurement": {
+    "isolated_process_per_engine_query": true,
+    "warmup_runs": 1,
+    "measured_runs": 3,
+    "statistic": "median",
+    "scale_factor": 100,
+    "timed_boundary": "scan_compute_public_result",
+    "result_serialization_timed": false
+  },
+  "derivation": {
+    "policy": "Start from the accepted twelve-query artifact and replace only Q5 with the later same-contract accepted Q5 median and samples.",
+    "base": {
+      "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/geopandas_optimized.json",
+      "sha256": "ba4f201b943f3d9f2be8fd9029d230af2c9b51e9c731fabad1f0dda9f8999633"
+    },
+    "replacement_query": "q5",
+    "replacement": {
+      "path": "benchmark_results/spatialbench/sf100/2026-08-16-public-grouped-pair-reducers/checkpoint.json",
+      "sha256": "801c6f3cd24b2ed9b68a9cf3640e2cfe3c02573bcbaa88604bf6492e67bb9e0a"
+    },
+    "arithmetic": "8177.23 - 834.69 + 743.46 = 8086.00"
+  },
+  "correctness": {
+    "oracle": "same-data SQL-derived optimized GeoPandas normalized CSV output",
+    "rtol": 1e-06,
+    "atol": 1e-09,
+    "column_order": "exact",
+    "row_order": "exact",
+    "integer_string_datetime": "exact",
+    "floating_point": "rtol_atol"
+  },
+  "acceptance": {
+    "minimum_suite_speedup": 10.0,
+    "maximum_candidate_total_seconds": 808.6,
+    "q9_per_query_speedup_exempt": true,
+    "all_queries_must_pass_correctness": true
+  },
+  "total_time_seconds": 8086.0,
+  "queries": {
+    "q1": {
+      "time_seconds": 106.03,
+      "run_times_seconds": [106.03, 107.21, 105.59],
+      "row_count": 100,
+      "columns": [
+        {"name": "t_tripkey", "kind": "int"},
+        {"name": "pickup_lon", "kind": "float"},
+        {"name": "pickup_lat", "kind": "float"},
+        {"name": "t_pickuptime", "kind": "datetime"},
+        {"name": "distance_to_center", "kind": "float"}
+      ],
+      "oracle": {
+        "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/results/geopandas_optimized_q1_result.csv",
+        "sha256": "2aaa5d3772801229db3e6a7ad7463d6a58fe81e82be353e16f322126c52631a8"
+      }
+    },
+    "q2": {
+      "time_seconds": 113.25,
+      "run_times_seconds": [116.38, 107.69, 113.25],
+      "row_count": 1,
+      "columns": [
+        {"name": "trip_count_in_coconino_county", "kind": "int"}
+      ],
+      "oracle": {
+        "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/results/geopandas_optimized_q2_result.csv",
+        "sha256": "0ffcda3f82fe5b8b4ac2e977651c4d20d9b8680513330ad472bf613b367c837e"
+      }
+    },
+    "q3": {
+      "time_seconds": 405.03,
+      "run_times_seconds": [405.03, 405.52, 403.78],
+      "row_count": 84,
+      "columns": [
+        {"name": "pickup_month", "kind": "datetime"},
+        {"name": "total_trips", "kind": "int"},
+        {"name": "avg_distance", "kind": "float"},
+        {"name": "avg_duration", "kind": "float"},
+        {"name": "avg_fare", "kind": "float"}
+      ],
+      "oracle": {
+        "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/results/geopandas_optimized_q3_result.csv",
+        "sha256": "751132513a472f49250c231e837eca272e995ebbb81f5edb6eab9cb8a5ad67ea"
+      }
+    },
+    "q4": {
+      "time_seconds": 231.98,
+      "run_times_seconds": [230.35, 231.98, 232.35],
+      "row_count": 614,
+      "columns": [
+        {"name": "z_zonekey", "kind": "int"},
+        {"name": "z_name", "kind": "string"},
+        {"name": "trip_count", "kind": "int"}
+      ],
+      "oracle": {
+        "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/results/geopandas_optimized_q4_result.csv",
+        "sha256": "0b538a2253662aa596bd833d1c05cb906de31bdfd96918b290bdfef5bb2662f9"
+      }
+    },
+    "q5": {
+      "time_seconds": 743.46,
+      "run_times_seconds": [746.27, 742.66, 743.46],
+      "row_count": 100,
+      "columns": [
+        {"name": "c_custkey", "kind": "int"},
+        {"name": "customer_name", "kind": "string"},
+        {"name": "pickup_month", "kind": "datetime"},
+        {"name": "monthly_travel_hull_area", "kind": "float"},
+        {"name": "dropoff_count", "kind": "int"}
+      ],
+      "oracle": {
+        "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/results/geopandas_optimized_q5_result.csv",
+        "sha256": "1126c88d1502b509f1aed0dcc5a32849cb8a16fc7dbadab0c97c3da4376e35a9"
+      }
+    },
+    "q6": {
+      "time_seconds": 371.42,
+      "run_times_seconds": [371.42, 372.75, 369.09],
+      "row_count": 19,
+      "columns": [
+        {"name": "z_zonekey", "kind": "int"},
+        {"name": "z_name", "kind": "string"},
+        {"name": "total_pickups", "kind": "int"},
+        {"name": "avg_distance", "kind": "float"},
+        {"name": "avg_duration", "kind": "float"}
+      ],
+      "oracle": {
+        "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/results/geopandas_optimized_q6_result.csv",
+        "sha256": "0380c5edcbb0839bb06977295b899dea59de7658ded4b1eabc9f69feae68a8b9"
+      }
+    },
+    "q7": {
+      "time_seconds": 337.44,
+      "run_times_seconds": [337.44, 338.08, 334.69],
+      "row_count": 100,
+      "columns": [
+        {"name": "t_tripkey", "kind": "int"},
+        {"name": "reported_distance_m", "kind": "float"},
+        {"name": "line_distance_m", "kind": "float"},
+        {"name": "detour_ratio", "kind": "float"}
+      ],
+      "oracle": {
+        "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/results/geopandas_optimized_q7_result.csv",
+        "sha256": "e4cdfcf8e539c15e39d96f06a76a3b82eb52b323e54ca0c5a92d7209c1ec9d99"
+      }
+    },
+    "q8": {
+      "time_seconds": 285.06,
+      "run_times_seconds": [285.63, 285.06, 284.26],
+      "row_count": 100,
+      "columns": [
+        {"name": "b_buildingkey", "kind": "int"},
+        {"name": "b_name", "kind": "string"},
+        {"name": "nearby_pickup_count", "kind": "int"}
+      ],
+      "oracle": {
+        "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/results/geopandas_optimized_q8_result.csv",
+        "sha256": "6c9de0ab1237783f82122add0d74fe33b924c0ddb2168076ea34ce28f45a34b9"
+      }
+    },
+    "q9": {
+      "time_seconds": 0.19,
+      "run_times_seconds": [0.2, 0.19, 0.19],
+      "row_count": 100,
+      "columns": [
+        {"name": "building_1", "kind": "int"},
+        {"name": "building_2", "kind": "int"},
+        {"name": "area1", "kind": "float"},
+        {"name": "area2", "kind": "float"},
+        {"name": "overlap_area", "kind": "float"},
+        {"name": "iou", "kind": "float"}
+      ],
+      "oracle": {
+        "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/results/geopandas_optimized_q9_result.csv",
+        "sha256": "67d7b7383e1dcf20e4ce396a467701d61b424930d3e4e9f8a92461b8c1ca0ab8"
+      }
+    },
+    "q10": {
+      "time_seconds": 1738.0,
+      "run_times_seconds": [1739.46, 1736.7, 1738.0],
+      "row_count": 100,
+      "columns": [
+        {"name": "z_zonekey", "kind": "int"},
+        {"name": "pickup_zone", "kind": "string"},
+        {"name": "avg_duration", "kind": "float"},
+        {"name": "avg_distance", "kind": "float"},
+        {"name": "num_trips", "kind": "int"}
+      ],
+      "oracle": {
+        "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/results/geopandas_optimized_q10_result.csv",
+        "sha256": "72ca3eae290aef8de1485443f310f16e58fa20375785836fbcae0844e2552b82"
+      }
+    },
+    "q11": {
+      "time_seconds": 3127.5,
+      "run_times_seconds": [3153.31, 3127.5, 3108.9],
+      "row_count": 1,
+      "columns": [
+        {"name": "cross_zone_trip_count", "kind": "int"}
+      ],
+      "oracle": {
+        "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/results/geopandas_optimized_q11_result.csv",
+        "sha256": "6c1b134bcaca7a99d4bdc050e6adb131d07013f1afba138866edc2454a00d16e"
+      }
+    },
+    "q12": {
+      "time_seconds": 626.64,
+      "run_times_seconds": [635.27, 625.19, 626.64],
+      "row_count": 100,
+      "columns": [
+        {"name": "t_tripkey", "kind": "int"},
+        {"name": "avg_distance_to_5_nearest", "kind": "float"}
+      ],
+      "oracle": {
+        "path": "benchmark_results/spatialbench/sf100/2026-08-14-final-median/results/geopandas_optimized_q12_result.csv",
+        "sha256": "ff7f7155a0c47292de28dd5d92b96ce37cfca0f66e17f7df97e133c9f98828fe"
+      }
+    }
+  }
+}

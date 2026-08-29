@@ -751,8 +751,36 @@ class TestEdgeCases:
         from vibespatial.io.wkt_gpu import read_wkt_gpu
 
         d_bytes = _to_device_bytes("LINESTRING(5 10)")
-        with pytest.raises(ValueError, match="cardinality or nesting"):
+        with pytest.raises(
+            ValueError,
+            match="point array must contain 0 or >1 elements",
+        ):
             read_wkt_gpu(d_bytes)
+
+    @needs_gpu
+    @pytest.mark.parametrize("on_invalid", ["warn", "ignore"])
+    def test_single_point_linestring_invalid_policy_returns_null(self, on_invalid):
+        """Native invalid-row policies preserve valid rows and null bad rows."""
+        from contextlib import nullcontext
+
+        from vibespatial.io.wkt_gpu import read_wkt_gpu
+
+        warning_context = (
+            pytest.warns(UserWarning, match="point array must contain")
+            if on_invalid == "warn"
+            else nullcontext()
+        )
+        with warning_context:
+            owned = read_wkt_gpu(
+                _to_device_bytes("POINT(1 2)\nLINESTRING(5 10)"),
+                row_count_hint=2,
+                on_invalid=on_invalid,
+            )
+
+        np.testing.assert_array_equal(
+            owned.device_state.validity.get(),
+            [True, False],
+        )
 
     @needs_gpu
     @pytest.mark.parametrize(

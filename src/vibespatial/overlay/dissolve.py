@@ -2893,6 +2893,36 @@ def _reduce_native_grouped_dissolve_attributes(
     if device_take is not None:
         return device_take, True
 
+    numeric_device_columns = {}
+    device_take_reducers = {}
+    for column, reducer in reducers.items():
+        numeric_column = attributes.numeric_column_arrays((column,))
+        if numeric_column is not None:
+            numeric_device_columns[column] = numeric_column[column]
+        elif reducer in _NATIVE_GROUPED_TAKE_REDUCERS:
+            device_take_reducers[column] = reducer
+        else:
+            break
+    else:
+        if numeric_device_columns and device_take_reducers:
+            numeric_table = grouped.reduce_numeric_columns(
+                numeric_device_columns,
+                {column: reducers[column] for column in numeric_device_columns},
+            ).to_native_attribute_table()
+            take_table = attributes.grouped_device_take_columns(
+                grouped,
+                device_take_reducers,
+            )
+            if take_table is not None:
+                combined = NativeAttributeTable.combine_columns(
+                    [numeric_table, take_table],
+                    index_override=take_table.index,
+                )
+                if combined is not None:
+                    projected = combined.project_columns(tuple(reducers))
+                    if projected is not None:
+                        return projected, True
+
     reduced_columns = {}
     used_take_reducer = False
     for column, reducer in reducers.items():
@@ -5384,11 +5414,12 @@ def execute_grouped_union_codes(
                 _admitted=True,
             )
             if accelerated is not None:
+                observed_group_count = int(native_grouped.group_ids.size)
                 return GroupedUnionResult(
                     geometries=None,
                     group_count=group_count,
-                    non_empty_groups=group_count,
-                    empty_groups=0,
+                    non_empty_groups=observed_group_count,
+                    empty_groups=group_count - observed_group_count,
                     method=normalized,
                     owned=accelerated,
                 )
@@ -5565,6 +5596,29 @@ def execute_native_grouped_union(
     normalized = method if isinstance(method, DissolveUnionMethod) else DissolveUnionMethod(method)
     if owned is None or grid_size is not None:
         return None
+    if normalized is DissolveUnionMethod.UNARY:
+        from vibespatial.constructive.grouped_point_union import (
+            grouped_point_union_owned,
+            supports_grouped_point_union,
+        )
+
+        if supports_grouped_point_union(owned):
+            reduced_points = grouped_point_union_owned(
+                grouped,
+                owned,
+                _admitted=True,
+            )
+            if reduced_points is not None:
+                group_count = grouped.resolved_group_count
+                observed_group_count = int(grouped.group_ids.size)
+                return GroupedUnionResult(
+                    geometries=None,
+                    group_count=group_count,
+                    non_empty_groups=observed_group_count,
+                    empty_groups=group_count - observed_group_count,
+                    method=normalized,
+                    owned=reduced_points,
+                )
     if normalized is DissolveUnionMethod.COVERAGE:
         accelerated = execute_grouped_box_union_gpu_owned_codes(
             grouped.group_codes,

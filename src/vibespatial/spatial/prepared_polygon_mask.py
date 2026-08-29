@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import isfinite
 
+import numpy as np
+
 from vibespatial.constructive.representative_point import representative_point_owned
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
@@ -30,8 +32,9 @@ from vibespatial.runtime.precision import (
     PrecisionPlan,
     RefinementMode,
 )
-from vibespatial.spatial.indexing import build_flat_spatial_index
+from vibespatial.spatial.indexing import build_flat_spatial_index, generate_bounds_pairs
 from vibespatial.spatial.segment_primitives import (
+    DeviceRingLocalSegmentRelation,
     _extract_segments_gpu,
     device_segment_table_as_linestrings,
 )
@@ -739,6 +742,11 @@ class PreparedPolygonMask:
     mask: OwnedGeometryArray
     boundary_lines: OwnedGeometryArray
     segment_index: object
+    source_segments: object
+    segment_ring_ids: object
+    ring_starts: object
+    ring_ends: object
+    ancestor_shell_ring_ids: object
     precision_plan: PrecisionPlan
 
     @classmethod
@@ -756,10 +764,44 @@ class PreparedPolygonMask:
         if not set(state.families).intersection(polygonal):
             return None
         segments = _extract_segments_gpu(mask)
-        try:
-            boundary_lines = device_segment_table_as_linestrings(segments)
-        finally:
-            segments.free()
+        boundary_lines = device_segment_table_as_linestrings(segments)
+        d_parts = cp.asarray(segments.part_indices, dtype=cp.int32)
+        d_rings = cp.asarray(segments.ring_indices, dtype=cp.int32)
+        if int(segments.count) == 0:
+            d_segment_ring_ids = cp.empty(0, dtype=cp.int32)
+            d_ring_starts = cp.empty(0, dtype=cp.int64)
+            d_ring_ends = cp.empty(0, dtype=cp.int64)
+            d_shell_ring_ids = cp.empty(0, dtype=cp.int32)
+        else:
+            d_ring_start_mask = cp.empty(segments.count, dtype=cp.bool_)
+            d_ring_start_mask[0] = True
+            d_ring_start_mask[1:] = (d_parts[1:] != d_parts[:-1]) | (
+                d_rings[1:] != d_rings[:-1]
+            )
+            d_ring_starts = cp.flatnonzero(d_ring_start_mask).astype(
+                cp.int64,
+                copy=False,
+            )
+            d_ring_ends = cp.concatenate(
+                (d_ring_starts[1:], cp.asarray([segments.count], dtype=cp.int64))
+            )
+            d_segment_ring_ids = cp.cumsum(
+                d_ring_start_mask.astype(cp.int32, copy=False),
+                dtype=cp.int32,
+            ) - np.int32(1)
+            d_ring_parts = d_parts[d_ring_starts]
+            d_ring_locals = d_rings[d_ring_starts]
+            d_ring_keys = (
+                d_ring_parts.astype(cp.uint64, copy=False) << cp.uint64(32)
+            ) | d_ring_locals.astype(cp.uint32, copy=False).astype(
+                cp.uint64,
+                copy=False,
+            )
+            d_shell_keys = d_ring_parts.astype(cp.uint64, copy=False) << cp.uint64(32)
+            d_shell_ring_ids = cp.searchsorted(d_ring_keys, d_shell_keys).astype(
+                cp.int32,
+                copy=False,
+            )
         flat_index = build_flat_spatial_index(
             boundary_lines,
             runtime_selection=RuntimeSelection(
@@ -787,7 +829,84 @@ class PreparedPolygonMask:
             mask=mask,
             boundary_lines=boundary_lines,
             segment_index=segment_index,
+            source_segments=segments,
+            segment_ring_ids=d_segment_ring_ids,
+            ring_starts=d_ring_starts,
+            ring_ends=d_ring_ends,
+            ancestor_shell_ring_ids=d_shell_ring_ids,
             precision_plan=precision_plan,
+        )
+
+    def close(self) -> None:
+        """Release the retained singular source segment table."""
+        self.source_segments.free()
+
+    def complete_ring_relation(
+        self,
+        rows: OwnedGeometryArray,
+    ) -> DeviceRingLocalSegmentRelation:
+        """Relate rows to intersecting complete rings plus winding shells.
+
+        The Morton relation is segment-local, but topology cannot consume a
+        clipped fragment of a closed ring.  Candidate segment ids are lowered
+        to unique ``(row, ring)`` pairs and every hole pair adds its component
+        shell.  That ancestor shell supplies the exact face-walk winding
+        baseline without copying unrelated holes or components.
+        """
+        from vibespatial.api._native_relation import NativeRelation
+
+        ring_count = int(self.ring_starts.size)
+        pairs = generate_bounds_pairs(rows, self.boundary_lines)
+        d_pair_rows = cp.asarray(pairs.device_left_indices, dtype=cp.int64)
+        d_pair_segments = cp.asarray(pairs.device_right_indices, dtype=cp.int64)
+        if int(d_pair_rows.size) == 0 or ring_count == 0:
+            d_rows = cp.empty(0, dtype=cp.int32)
+            d_ring_ids = cp.empty(0, dtype=cp.int32)
+        else:
+            d_candidate_ring_ids = cp.asarray(
+                self.segment_ring_ids,
+                dtype=cp.int32,
+            )[d_pair_segments]
+            d_shell_ring_ids = cp.asarray(
+                self.ancestor_shell_ring_ids,
+                dtype=cp.int32,
+            )[d_candidate_ring_ids]
+            d_candidate_keys = (
+                d_pair_rows.astype(cp.int64, copy=False) * np.int64(ring_count)
+                + d_candidate_ring_ids.astype(cp.int64, copy=False)
+            )
+            d_shell_keys = (
+                d_pair_rows.astype(cp.int64, copy=False) * np.int64(ring_count)
+                + d_shell_ring_ids.astype(cp.int64, copy=False)
+            )
+            d_complete_keys = cp.unique(
+                cp.concatenate((d_candidate_keys, d_shell_keys))
+            )
+            d_rows = (d_complete_keys // np.int64(ring_count)).astype(
+                cp.int32,
+                copy=False,
+            )
+            d_ring_ids = (d_complete_keys % np.int64(ring_count)).astype(
+                cp.int32,
+                copy=False,
+            )
+        relation = NativeRelation(
+            left_indices=d_rows,
+            right_indices=d_ring_ids,
+            left_token="prepared-mask-unresolved-rows",
+            right_token="prepared-mask-complete-rings",
+            predicate="bounds-intersects-plus-ancestor-shell",
+            left_row_count=int(rows.row_count),
+            right_row_count=ring_count,
+            sorted_by_left=True,
+            duplicate_policy="drop",
+        )
+        return DeviceRingLocalSegmentRelation(
+            source_segments=self.source_segments,
+            ring_relation=relation,
+            ring_starts=self.ring_starts,
+            ring_ends=self.ring_ends,
+            ancestor_shell_ring_ids=self.ancestor_shell_ring_ids,
         )
 
     def _representative_points(self, rows: OwnedGeometryArray):

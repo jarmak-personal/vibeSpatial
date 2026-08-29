@@ -937,6 +937,10 @@ wkt_capacity_count_validate(
     if (structural_bad) status[row] = -4;
     if (shape_bad) status[row] = -5;
     if (token_count & 1) status[row] = -3;
+    // Preserve GEOS' specific public diagnostic for a one-point LineString.
+    if (tag == 1 && pairs == 1 && !structural_bad && !(token_count & 1)) {
+        status[row] = -7;
+    }
 }
 
 extern "C" __global__ void __launch_bounds__(256, 4)

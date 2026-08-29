@@ -40,17 +40,407 @@ from vibespatial.spatial.query_types import (
     require_device_candidate_pair_capacity,
 )
 from vibespatial.spatial.spatial_index_device import (
+    _MORTON_PREFIX_COVER_BUDGET,
     _MORTON_SPAN_BUCKET_UPPER_BOUNDS,
     _classify_homogeneous_reduction_tile,
     _family_group_launch_capacities,
+    _morton_prefix_cover_ranges_device,
     _morton_range_query,
     _morton_reduction_span_schedule,
     _point_partition_reduction_metrics,
+    _prepare_morton_range_query,
     _spatial_index_device_relation_reduction,
     _spatial_reduction_tile_lane_capacity,
+    spatial_index_device_morton_span_upper_packet,
 )
 
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+
+
+def _morton_packet_random_boxes(count: int) -> np.ndarray:
+    rng = np.random.default_rng(901)
+    lower = rng.uniform(0.0, 993.0, size=(count, 2))
+    return np.asarray(
+        [box(x, y, x + 7.0, y + 7.0) for x, y in lower],
+        dtype=object,
+    )
+
+
+@requires_gpu
+@pytest.mark.parametrize(
+    ("tree_geoms", "query_bounds"),
+    [
+        (
+            _morton_packet_random_boxes(257),
+            np.asarray(
+                [
+                    [0.0, 0.0, 25.0, 25.0],
+                    [250.0, 250.0, 750.0, 750.0],
+                    [np.nan, np.nan, np.nan, np.nan],
+                    [990.0, 990.0, 1_010.0, 1_010.0],
+                ],
+                dtype=np.float64,
+            ),
+        ),
+        (
+            np.asarray(
+                [
+                    box(-1.0e9, -1.0e9, 1.0e9, 1.0e9),
+                    box(-3.0, -3.0, -2.0, -2.0),
+                    box(2.0, 2.0, 3.0, 3.0),
+                    Polygon(),
+                ],
+                dtype=object,
+            ),
+            np.asarray(
+                [
+                    [-0.1, -0.1, 0.1, 0.1],
+                    [-2.5, -2.5, -2.25, -2.25],
+                    [np.nan, np.nan, np.nan, np.nan],
+                ],
+                dtype=np.float64,
+            ),
+        ),
+    ],
+)
+def test_morton_span_packet_upper_bounds_all_bbox_pairs_without_refinement(
+    tree_geoms,
+    query_bounds,
+    monkeypatch,
+) -> None:
+    """Expanded Morton spans are conservative for random and skewed MBRs."""
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        get_cuda_runtime,
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.spatial import spatial_index_device
+
+    tree_owned = from_shapely_geometries(tree_geoms, residency=Residency.DEVICE)
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="Morton structural packet proof fixture",
+        ),
+    )
+    assert flat_index.regular_grid is None
+
+    def _forbid_candidate_or_refine(*_args, **_kwargs):
+        raise AssertionError("structural planning must not scan or refine candidates")
+
+    monkeypatch.setattr(
+        spatial_index_device,
+        "_morton_range_query",
+        _forbid_candidate_or_refine,
+    )
+    monkeypatch.setattr(
+        spatial_index_device,
+        "_spatial_index_device_relation_reduction",
+        _forbid_candidate_or_refine,
+    )
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    packet, execution = spatial_index_device_morton_span_upper_packet(
+        flat_index,
+        cp.asarray(query_bounds),
+    )
+    assert packet is not None
+    assert execution.selected is ExecutionMode.GPU
+    assert get_d2h_transfer_events(clear=True) == []
+    host_packet = np.asarray(
+        get_cuda_runtime().copy_device_to_host(
+            packet.values,
+            reason="test Morton structural 24-byte packet",
+        ),
+        dtype=np.int64,
+    )
+    transfers = get_d2h_transfer_events(clear=True)
+    tree_bounds = np.asarray([geom.bounds for geom in tree_geoms], dtype=np.float64)
+    actual_left, actual_right = _cpu_bbox_pairs(query_bounds, tree_bounds)
+
+    assert host_packet[0] >= actual_left.size
+    assert host_packet[1] <= query_bounds.shape[0]
+    assert host_packet[2] <= len(tree_geoms)
+    assert min(host_packet) >= 0
+    assert packet.temporary_byte_count >= 8 * len(tree_geoms) + 24
+    assert actual_right.size == actual_left.size
+    assert len(transfers) == 1
+    assert transfers[0].bytes_transferred == 24
+
+
+@requires_gpu
+@pytest.mark.parametrize("seed", [11, 29, 83])
+def test_morton_prefix_cover_packet_randomized_upper_bound(seed) -> None:
+    """The bounded disjoint cover never misses randomized bbox pairs."""
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    rng = np.random.default_rng(seed)
+    tree_lower = rng.uniform(-500.0, 480.0, size=(511, 2))
+    tree_size = rng.uniform(0.01, 20.0, size=(511, 2))
+    tree_geoms = np.asarray(
+        [
+            box(x, y, x + width, y + height)
+            for (x, y), (width, height) in zip(
+                tree_lower,
+                tree_size,
+                strict=True,
+            )
+        ],
+        dtype=object,
+    )
+    query_lower = rng.uniform(-550.0, 500.0, size=(41, 2))
+    query_size = rng.uniform(0.01, 240.0, size=(41, 2))
+    query_bounds = np.column_stack(
+        (
+            query_lower[:, 0],
+            query_lower[:, 1],
+            query_lower[:, 0] + query_size[:, 0],
+            query_lower[:, 1] + query_size[:, 1],
+        )
+    )
+    flat_index = build_flat_spatial_index(
+        from_shapely_geometries(tree_geoms, residency=Residency.DEVICE),
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="randomized Morton-prefix cover proof",
+        ),
+    )
+
+    packet, execution = spatial_index_device_morton_span_upper_packet(
+        flat_index,
+        cp.asarray(query_bounds),
+    )
+    assert packet is not None
+    assert execution.selected is ExecutionMode.GPU
+    host_packet = np.asarray(
+        get_cuda_runtime().copy_device_to_host(packet.values),
+        dtype=np.int64,
+    )
+    tree_bounds = np.asarray([geom.bounds for geom in tree_geoms], dtype=np.float64)
+    actual_left, _actual_right = _cpu_bbox_pairs(query_bounds, tree_bounds)
+
+    assert min(host_packet) >= 0
+    assert host_packet[0] >= actual_left.size
+
+
+@requires_gpu
+def test_morton_prefix_cover_is_tighter_than_single_common_prefix() -> None:
+    """Sixteen disjoint cells tighten a root-crossing stripe over B=1."""
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    tree_geoms = np.asarray(
+        [Point(float(x), float(y)) for y in range(64) for x in range(64)],
+        dtype=object,
+    )
+    flat_index = build_flat_spatial_index(
+        from_shapely_geometries(tree_geoms, residency=Residency.DEVICE),
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="Morton-prefix tightness proof",
+        ),
+    )
+    query_bounds = cp.asarray([[30.0, 0.0, 33.0, 63.0]], dtype=cp.float64)
+
+    packet, _execution = spatial_index_device_morton_span_upper_packet(
+        flat_index,
+        query_bounds,
+    )
+    assert packet is not None
+    covered = int(
+        np.asarray(
+            get_cuda_runtime().copy_device_to_host(packet.values),
+            dtype=np.int64,
+        )[0]
+    )
+    state = _prepare_morton_range_query(
+        flat_index,
+        query_bounds,
+        query_bounds,
+    )
+    assert state is not None
+    try:
+        single_prefix = int(
+            np.asarray(
+                get_cuda_runtime().copy_device_to_host(
+                    cp.sum(state.d_ends - state.d_starts, dtype=cp.uint64).reshape(1)
+                ),
+                dtype=np.uint64,
+            )[0]
+        )
+    finally:
+        state.close()
+    host_query_bounds = np.asarray([[30.0, 0.0, 33.0, 63.0]], dtype=np.float64)
+    tree_bounds = np.asarray([geom.bounds for geom in tree_geoms], dtype=np.float64)
+    actual_left, _actual_right = _cpu_bbox_pairs(host_query_bounds, tree_bounds)
+
+    assert _MORTON_PREFIX_COVER_BUDGET == 16
+    assert covered >= actual_left.size
+    assert covered < single_prefix
+
+
+@requires_gpu
+def test_morton_prefix_cover_quantization_boundaries_are_disjoint() -> None:
+    """Outward quantization covers llround thresholds with disjoint cells."""
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    coordinate_max = float((1 << 16) - 1)
+    thresholds = np.asarray(
+        [(value + 0.5) / coordinate_max for value in (1, 32767, 65533)],
+        dtype=np.float64,
+    )
+    boundary_values = np.concatenate(
+        (
+            np.asarray([0.0, 1.0], dtype=np.float64),
+            np.nextafter(thresholds, -np.inf),
+            thresholds,
+            np.nextafter(thresholds, np.inf),
+        )
+    )
+    tree_geoms = np.asarray(
+        [Point(float(value), float(value)) for value in boundary_values],
+        dtype=object,
+    )
+    flat_index = build_flat_spatial_index(
+        from_shapely_geometries(tree_geoms, residency=Residency.DEVICE),
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="Morton quantization-boundary proof",
+        ),
+    )
+    query_bounds = np.column_stack(
+        (boundary_values, boundary_values, boundary_values, boundary_values)
+    )
+    packet, execution = spatial_index_device_morton_span_upper_packet(
+        flat_index,
+        cp.asarray(query_bounds),
+    )
+    assert packet is not None
+    assert execution.selected is ExecutionMode.GPU
+    host_packet = np.asarray(
+        get_cuda_runtime().copy_device_to_host(packet.values),
+        dtype=np.int64,
+    )
+    tree_bounds = np.asarray([geom.bounds for geom in tree_geoms], dtype=np.float64)
+    actual_left, _actual_right = _cpu_bbox_pairs(query_bounds, tree_bounds)
+    assert min(host_packet) >= 0
+    assert host_packet[0] >= actual_left.size
+
+    expanded = cp.asarray(
+        [
+            [
+                np.nextafter(thresholds[1], -np.inf),
+                0.0,
+                np.nextafter(thresholds[1], np.inf),
+                1.0,
+            ],
+            [-1.0e150, -1.0e150, 1.0e150, 1.0e150],
+            [0.5, 0.5, 0.5, 0.5],
+        ],
+        dtype=cp.float64,
+    )
+    range_low, range_high, cell_valid, _temporary_bytes = (
+        _morton_prefix_cover_ranges_device(
+            expanded,
+            total_bounds=(-1.0e150, -1.0e150, 1.0e150, 1.0e150),
+            active_rows=cp.ones(3, dtype=cp.bool_),
+        )
+    )
+    host_low = cp.asnumpy(range_low)
+    host_high = cp.asnumpy(range_high)
+    host_valid = cp.asnumpy(cell_valid)
+    for row in range(host_valid.shape[0]):
+        lows = host_low[row, host_valid[row]]
+        highs = host_high[row, host_valid[row]]
+        assert lows.size <= _MORTON_PREFIX_COVER_BUDGET
+        assert np.all(lows <= highs)
+        order = np.argsort(lows, kind="stable")
+        assert np.all(highs[order][:-1] < lows[order][1:])
+
+
+@requires_gpu
+def test_morton_span_packet_nan_rows_zero_and_nonfinite_state_fails_closed(
+    monkeypatch,
+) -> None:
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    tree_geoms = np.asarray(
+        [box(0.0, 0.0, 1.0, 1.0), box(10.0, 10.0, 11.0, 11.0)],
+        dtype=object,
+    )
+    flat_index = build_flat_spatial_index(
+        from_shapely_geometries(tree_geoms, residency=Residency.DEVICE),
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="Morton NaN underflow regression",
+        ),
+    )
+    nan_packet, _ = spatial_index_device_morton_span_upper_packet(
+        flat_index,
+        cp.asarray(
+            [[np.nan, np.nan, np.nan, np.nan], [0.25, 0.25, 0.75, 0.75]],
+            dtype=cp.float64,
+        ),
+    )
+    assert nan_packet is not None
+    nan_host = get_cuda_runtime().copy_device_to_host(nan_packet.values)
+    assert tuple(np.asarray(nan_host, dtype=np.int64)) == (1, 1, 1)
+
+    invalid_packet, _ = spatial_index_device_morton_span_upper_packet(
+        flat_index,
+        cp.asarray([[0.0, 0.0, cp.inf, 1.0]], dtype=cp.float64),
+    )
+    assert invalid_packet is not None
+    invalid_host = get_cuda_runtime().copy_device_to_host(invalid_packet.values)
+    assert tuple(np.asarray(invalid_host, dtype=np.int64)) == (-1, -1, -1)
+
+    empty_tree = build_flat_spatial_index(
+        from_shapely_geometries(
+            np.asarray([Polygon(), Polygon()], dtype=object),
+            residency=Residency.DEVICE,
+        ),
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="all-empty indexed tree regression",
+        ),
+    )
+    query_bounds = cp.asarray([[0.0, 0.0, 1.0, 1.0]], dtype=cp.float64)
+    normal_candidates, normal_execution = spatial_index_device_query(
+        empty_tree,
+        query_bounds,
+    )
+    assert normal_candidates is None or normal_candidates.total_pairs == 0
+    assert normal_execution.selected is ExecutionMode.GPU
+
+    from vibespatial.spatial import spatial_index_device
+
+    def _forbid_placeholder_search(*_args, **_kwargs):
+        raise AssertionError("all-empty structural planning must not search Morton keys")
+
+    monkeypatch.setattr(
+        spatial_index_device,
+        "_prepare_morton_range_query",
+        _forbid_placeholder_search,
+    )
+    empty_packet, empty_execution = spatial_index_device_morton_span_upper_packet(
+        empty_tree,
+        query_bounds,
+    )
+    assert empty_packet is not None
+    assert empty_execution.selected is ExecutionMode.GPU
+    empty_host = get_cuda_runtime().copy_device_to_host(empty_packet.values)
+    assert tuple(np.asarray(empty_host, dtype=np.int64)) == (0, 0, 0)
 
 
 def test_point_partition_level0_packet_uses_only_host_plan_capacities() -> None:
@@ -1599,6 +1989,13 @@ def test_device_query_does_not_treat_regular_grid_identity_as_morton_keys():
 
     assert candidates is not None
     assert "brute-force" in execution.reason
+    packet, packet_execution = spatial_index_device_morton_span_upper_packet(
+        flat_index,
+        query_bounds,
+    )
+    assert packet is None
+    assert packet_execution.selected is ExecutionMode.CPU
+    assert "regular-grid identity keys" in packet_execution.reason
     gpu_left, gpu_right = candidates.to_host()
     cpu_left, cpu_right = _cpu_bbox_pairs(query_bounds, flat_index.bounds)
     assert set(zip(gpu_left.tolist(), gpu_right.tolist())) == set(

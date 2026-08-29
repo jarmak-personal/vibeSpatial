@@ -301,6 +301,41 @@ class TestWktGpuDispatch:
         assert result.values._owned.residency.value == "device"
 
     @needs_gpu
+    @pytest.mark.parametrize("kind", ["wkb", "wkt"])
+    @pytest.mark.parametrize("on_invalid", ["warn", "ignore"])
+    def test_strict_native_invalid_constructor_policies_stay_owned(
+        self,
+        kind,
+        on_invalid,
+    ) -> None:
+        from contextlib import nullcontext
+
+        from vibespatial.testing import strict_native_environment
+
+        value = (
+            "01020000000100000000000000000008400000000000000840"
+            if kind == "wkb"
+            else "LINESTRING(3 3)"
+        )
+        constructor = (
+            geopandas.GeoSeries.from_wkb
+            if kind == "wkb"
+            else geopandas.GeoSeries.from_wkt
+        )
+        warning_context = (
+            pytest.warns(Warning, match="point array must contain")
+            if on_invalid == "warn"
+            else nullcontext()
+        )
+        geopandas.clear_fallback_events()
+        with strict_native_environment(), warning_context:
+            result = constructor([value], on_invalid=on_invalid)
+
+        assert result.iloc[0] is None
+        assert result.values._owned is not None
+        assert geopandas.get_fallback_events(clear=True) == []
+
+    @needs_gpu
     def test_small_dimensional_wkt_strict_auto_raises(self) -> None:
         from vibespatial.runtime.fallbacks import StrictNativeFallbackError
         from vibespatial.testing import strict_native_environment
@@ -308,6 +343,28 @@ class TestWktGpuDispatch:
         with strict_native_environment(execution_mode="auto"):
             with pytest.raises(StrictNativeFallbackError):
                 geopandas.GeoSeries.from_wkt(["POINT Z (1 2 3)"])
+
+    def test_geometry_collection_wkt_is_an_explicit_strict_compatibility_boundary(
+        self,
+    ) -> None:
+        from vibespatial.testing import strict_native_environment
+
+        geopandas.clear_dispatch_events()
+        geopandas.clear_fallback_events()
+        with strict_native_environment():
+            result = geopandas.GeoSeries.from_wkt(
+                [
+                    "GEOMETRYCOLLECTION (MULTILINESTRING EMPTY, "
+                    "MULTILINESTRING ((0 0, 1 1)))"
+                ]
+            )
+
+        assert result.iloc[0].geom_type == "GeometryCollection"
+        assert geopandas.get_fallback_events(clear=True) == []
+        assert any(
+            event.implementation == "geometry_collection_wkt_compatibility_boundary"
+            for event in geopandas.get_dispatch_events(clear=True)
+        )
 
     @needs_gpu
     @pytest.mark.parametrize(

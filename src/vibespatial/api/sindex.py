@@ -19,6 +19,7 @@ from vibespatial.runtime.materialization import (
     record_native_export_boundary,
 )
 from vibespatial.runtime.residency import Residency
+from vibespatial.spatial.indexing import compact_indexed_spatial_input
 from vibespatial.spatial.query import (
     build_owned_spatial_index,
     nearest_spatial_index,
@@ -372,7 +373,8 @@ class SpatialIndex:
         precomputed_query_bounds = None
         raw_box_array_fast_path = False
         if (
-            predicate in (None, "intersects")
+            get_requested_mode() is not ExecutionMode.CPU
+            and predicate in (None, "intersects")
             and isinstance(raw_geometry, np.ndarray)
             and raw_geometry.ndim >= 1
             and self._supports_owned_tree_input()
@@ -383,7 +385,7 @@ class SpatialIndex:
 
                 precomputed_query_bounds = _extract_box_query_bounds_shapely(raw_geometry)
                 raw_box_array_fast_path = precomputed_query_bounds is not None
-        if (
+        if get_requested_mode() is not ExecutionMode.CPU and (
             raw_box_array_fast_path
             or (
                 predicate in OWNED_QUERY_PREDICATES
@@ -1745,6 +1747,60 @@ class SpatialIndex:
             precomputed_query_bounds=precomputed_query_bounds,
         )
 
+    def query_right_match_count_expression(
+        self,
+        geometry,
+        *,
+        predicate=None,
+        distance=None,
+        source_token: str | None = None,
+        query_row_count: int | None = None,
+        precomputed_query_bounds=None,
+        allow_relation_fallback: bool = True,
+    ):
+        """Query directly into private per-indexed-row match counts.
+
+        Planning callers can set ``allow_relation_fallback=False`` to decline
+        when the direct device reduction is unavailable.  This prevents an
+        ostensibly cheap cardinality probe from allocating the full relation
+        it is meant to admit or reject.
+        """
+        native_index = self._native_spatial_index_for_query(
+            source_token=source_token,
+        )
+        if query_row_count is None:
+            query_row_count, _scalar = self._query_cardinality(geometry)
+        return native_index.query_right_match_count_expression(
+            geometry,
+            predicate=predicate,
+            distance=distance,
+            query_row_count=query_row_count,
+            return_metadata=True,
+            precomputed_query_bounds=precomputed_query_bounds,
+            allow_relation_fallback=allow_relation_fallback,
+        )
+
+    def query_morton_span_upper_packet(
+        self,
+        geometry,
+        *,
+        source_token: str | None = None,
+        query_row_count: int | None = None,
+        precomputed_query_bounds=None,
+    ):
+        """Query directly into a fixed structural Morton-span packet."""
+        native_index = self._native_spatial_index_for_query(
+            source_token=source_token,
+        )
+        if query_row_count is None:
+            query_row_count, _scalar = self._query_cardinality(geometry)
+        return native_index.query_morton_span_upper_packet(
+            geometry,
+            query_row_count=query_row_count,
+            return_metadata=True,
+            precomputed_query_bounds=precomputed_query_bounds,
+        )
+
     def _query_native_relation_for_public_output(
         self,
         raw_geometry,
@@ -1979,14 +2035,29 @@ class SpatialIndex:
     def _owned_query_input(geometry):
         # Already-owned — pass through without any H->D conversion.
         if isinstance(geometry, OwnedGeometryArray):
-            return geometry
+            return compact_indexed_spatial_input(geometry)
         if isinstance(geometry, geoseries.GeoSeries):
             values = geometry.values
-            return values.to_owned() if hasattr(values, "to_owned") else (
+            owned = values.to_owned() if hasattr(values, "to_owned") else (
                 values._owned if values._owned is not None else values._data
             )
+            if isinstance(owned, OwnedGeometryArray):
+                compacted = compact_indexed_spatial_input(owned)
+                if compacted is not owned and hasattr(values, "_owned"):
+                    values._owned = compacted
+                    if hasattr(values, "_owned_flat_sindex"):
+                        values._owned_flat_sindex = None
+                    if hasattr(values, "_owned_flat_sindex_cache"):
+                        values._owned_flat_sindex_cache = None
+                return compacted
+            return owned
         if isinstance(geometry, array.GeometryArray):
-            return geometry.to_owned()
+            owned = geometry.to_owned()
+            compacted = compact_indexed_spatial_input(owned)
+            if compacted is not owned:
+                geometry._owned = compacted
+                geometry._owned_flat_sindex = None
+            return compacted
         if isinstance(geometry, np.ndarray) and geometry.ndim >= 1:
             # Keep Shapely arrays as Shapely here. query_spatial_index() has
             # bounds-only regular-grid and point-tree fast paths that avoid

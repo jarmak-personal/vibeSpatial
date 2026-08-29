@@ -720,7 +720,10 @@ class TestUnionAllGPU:
 
         assert result.row_count == 1
         assert result.residency is Residency.DEVICE
-        assert reasons == []
+        assert reasons == [
+            "overlay compact topology page-weight planning packet",
+            "overlay compact topology work-summary planning packet",
+        ]
 
     def test_coverage_union_all_filters_empty_device_rows_before_tree_reduce(self, monkeypatch):
         """Coverage union uses the same structural device empty-row filter."""
@@ -776,10 +779,14 @@ class TestUnionAllGPU:
         )
         monkeypatch.setattr(union_all_module, "_tree_reduce_global", _fail_tree_reduce)
 
-        for fn_name in (
-            "union_all_gpu_owned",
-            "coverage_union_all_gpu_owned",
-        ):
+        expected_reasons = {
+            "union_all_gpu_owned": [
+                "overlay compact topology page-weight planning packet",
+                "overlay compact topology work-summary planning packet",
+            ],
+            "coverage_union_all_gpu_owned": [],
+        }
+        for fn_name, expected in expected_reasons.items():
             owned = from_shapely_geometries(
                 [Polygon(), Polygon()],
                 residency=Residency.DEVICE,
@@ -795,7 +802,7 @@ class TestUnionAllGPU:
             assert result.row_count == 1
             assert result.residency is Residency.DEVICE
             assert result.device_state is not None
-            assert reasons == []
+            assert reasons == expected
 
     def test_single_row_union_preserves_enclosed_hole(self):
         """Single-row union must not fill holes created by coverage boundaries."""

@@ -22,6 +22,7 @@ from vibespatial.api._native_result_core import (
     NativeReadProvenance,
     NativeTabularResult,
     NativeTabularSelection,
+    _arrow_compatible_pandas_frame,
     _assigned_device_attribute_table,
     _copy_public_frame_attrs,
     _host_array,
@@ -626,7 +627,10 @@ def _native_attribute_table_from_projected_frames(
                         to_pandas_kwargs=None,
                     )
                 if table is None:
-                    arrow_column = pa.array(series)
+                    physical_series = _arrow_compatible_pandas_frame(
+                        series.to_frame(),
+                    ).iloc[:, 0]
+                    arrow_column = pa.array(physical_series)
                     table = NativeAttributeTable(
                         arrow_table=pa.table({str(column): arrow_column}),
                         index_override=index_override,
@@ -656,7 +660,12 @@ def _native_attribute_table_from_projected_frames(
                 ):
                     device_admissible = False
                     break
-        tables.append(pa.Table.from_pandas(frame, preserve_index=False))
+        tables.append(
+            pa.Table.from_pandas(
+                _arrow_compatible_pandas_frame(frame),
+                preserve_index=False,
+            )
+        )
         declared_names.extend(list(frame.columns))
 
     if not tables:
@@ -1570,6 +1579,7 @@ def _device_attribute_table_from_column(
     *,
     row_count: int,
     index_override: pd.Index,
+    numpy_public_dtype: bool = False,
 ) -> NativeAttributeTable | None:
     try:
         import cupy as cp
@@ -1590,11 +1600,24 @@ def _device_attribute_table_from_column(
     ):
         return None
     column = pylibcudf_column_from_device(d_values)
+    field_metadata = (
+        {b"vibespatial:public_dtype": b"numpy"}
+        if numpy_public_dtype
+        else None
+    )
     return NativeAttributeTable(
         device_table=plc.Table([column]),
         index_override=index_override,
         column_override=(name,),
-        schema_override=pa.schema([pa.field(str(name), column.type().to_arrow())]),
+        schema_override=pa.schema(
+            [
+                pa.field(
+                    str(name),
+                    column.type().to_arrow(),
+                    metadata=field_metadata,
+                )
+            ]
+        ),
     )
 
 
@@ -1617,19 +1640,67 @@ def _attribute_table_for_device_position_take(
         return None
 
 
+def _relation_join_source_state(frame: GeoDataFrame):
+    """Admit an ordinary owned public frame into relation consumption.
+
+    The state is intentionally transient: public pandas operations have not
+    established lineage for it, so attaching it to ``frame`` would make stale
+    sidecars possible.  Host attributes are lowered once to Arrow/device
+    columns and the relation gather below produces the device-backed output.
+    """
+    from vibespatial.api._native_rowset import NativeIndexPlan
+    from vibespatial.api._native_state import NativeFrameState, get_native_state
+
+    state = get_native_state(frame)
+    if state is not None:
+        return state
+
+    geometry_name = frame.geometry.name
+    if _has_secondary_geometry_columns(frame, geometry_name):
+        return None
+    geometry = GeometryNativeResult.from_geoseries(frame.geometry)
+    owned = geometry.cached_owned()
+    if owned is None:
+        return None
+
+    attribute_frame = frame.drop(geometry_name, axis=1).copy(deep=False)
+    try:
+        attributes = _native_attribute_table_from_projected_frames(
+            [attribute_frame],
+            index_override=frame.index,
+            storage="device",
+        )
+    except (ImportError, TypeError, ValueError):
+        return None
+
+    return NativeFrameState(
+        attributes=attributes,
+        geometry=geometry,
+        geometry_name=geometry_name,
+        column_order=tuple(frame.columns),
+        index_plan=NativeIndexPlan.from_index(frame.index),
+        row_count=len(frame),
+        secondary_geometry=(),
+        attrs=frame.attrs.copy(),
+        provenance=None,
+        geometry_metadata_cache=_cached_geometry_metadata(geometry),
+        residency=combined_residency(owned),
+    )
+
+
 def _relation_join_export_result_to_native_frame_state_device(
     result: RelationJoinExportResult,
     *,
     strict_index_materialization: bool = True,
 ):
     """Build an inner relation-join frame state without host pair export."""
-    if result.how != "inner" or result.on_attribute:
+    if result.how != "inner":
         return None
 
-    from vibespatial.api._native_state import NativeFrameState, get_native_state
+    from vibespatial.api._native_state import NativeFrameState
 
-    left_state = get_native_state(result.left_df)
-    right_state = get_native_state(result.right_df)
+    left_state = _relation_join_source_state(result.left_df)
+    right_state = _relation_join_source_state(result.right_df)
     if left_state is None or right_state is None:
         return None
 
@@ -1661,6 +1732,17 @@ def _relation_join_export_result_to_native_frame_state_device(
 
     left_attrs = NativeAttributeTable.from_value(left_state.attributes)
     right_attrs = NativeAttributeTable.from_value(right_state.attributes)
+    if result.on_attribute:
+        excluded_right_columns = set(result.on_attribute)
+        right_attrs = right_attrs.project_columns(
+            tuple(
+                column
+                for column in right_attrs.columns
+                if column not in excluded_right_columns
+            )
+        )
+        if right_attrs is None:
+            return None
     left_attrs = _attribute_table_for_device_position_take(left_attrs)
     right_attrs = _attribute_table_for_device_position_take(right_attrs)
     if left_attrs is None or right_attrs is None:
@@ -1754,6 +1836,7 @@ def _relation_join_export_result_to_native_frame_state_device(
         right_index_values,
         row_count=pair_count,
         index_override=out_index,
+        numpy_public_dtype=True,
     )
     if right_index_attributes is None:
         return None
@@ -1783,6 +1866,10 @@ def _relation_join_export_result_to_native_frame_state_device(
             unique=False,
             grouped=relation.sorted_by_left,
         )
+    joined_index_name = (
+        None if result.left_df.index.names[0] is None else left_columns[0]
+    )
+    index_plan = index_plan.with_name(joined_index_name)
     column_order: list[Any] = []
     left_column_iter = iter(left_output_columns)
     for column_name in result.left_df.columns:
@@ -2052,14 +2139,50 @@ class RelationJoinExportResult:
             strict_index_materialization=False,
         )
         if state is not None:
+            from vibespatial.api._native_rowset import NativeIndexPlan
+            from vibespatial.api._native_state import attach_native_state, get_native_state
             from vibespatial.api.geodataframe import _public_frame_from_native_state
 
+            public_state = state
+            if get_native_state(self.left_df) is None:
+                if (
+                    state.index_plan.source_index is not None
+                    and state.index_plan.take_positions is not None
+                ):
+                    public_positions = _pairwise_index_to_host(
+                        state.index_plan.take_positions,
+                        side="left-index",
+                        surface="vibespatial.api.RelationJoinExportResult.to_geodataframe",
+                        operation="relation_join_public_index_to_host",
+                        reason="terminal public relation join requires exact pandas index semantics",
+                        strict_disallowed=False,
+                    )
+                    public_index = state.index_plan.source_index.take(public_positions)
+                else:
+                    public_index = state.index_plan.to_public_index(
+                        surface="vibespatial.api.RelationJoinExportResult.to_geodataframe",
+                        strict_disallowed=False,
+                    )
+                public_state = replace(
+                    state,
+                    index_plan=NativeIndexPlan.from_index(public_index),
+                )
             frame = _public_frame_from_native_state(
                 self.left_df,
-                state,
-                geometry_column=state.geometry_name,
+                public_state,
+                geometry_column=public_state.geometry_name,
             )
             if frame is not None:
+                if public_state is not state:
+                    # The public shell owns exact pandas index representation,
+                    # while the private state retains device labels and source
+                    # row indirection for sanctioned downstream consumers.
+                    attached_state = (
+                        public_state
+                        if isinstance(public_index, pd.RangeIndex)
+                        else state
+                    )
+                    attach_native_state(frame, attached_state)
                 if self.left_df.attrs:
                     frame.attrs.update(self.left_df.attrs)
                 return frame

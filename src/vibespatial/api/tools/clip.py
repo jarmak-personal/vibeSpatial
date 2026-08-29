@@ -540,6 +540,7 @@ def _clip_collective_grouped_mask_work_estimates(
     collective_source_count: int,
     positive_area_pair_count: int | None = None,
     mask_rectangle_strip_admissible: bool = False,
+    planning_temporary_byte_count: int = 0,
 ) -> tuple[PhysicalWorkEstimate, PhysicalWorkEstimate]:
     """Estimate relation-first and union-first collective clip shapes.
 
@@ -628,7 +629,12 @@ def _clip_collective_grouped_mask_work_estimates(
         )
         * 16
     )
-    relation_temporary_bytes = pair_count * 32 + relation_output_bytes * 2 + source_count * 16
+    relation_temporary_bytes = (
+        pair_count * 32
+        + relation_output_bytes * 2
+        + source_count * 16
+        + max(int(planning_temporary_byte_count), 0)
+    )
     relation_estimate = PhysicalWorkEstimate(
         row_count=source_count,
         coordinate_count=pair_constructive_units,
@@ -686,6 +692,7 @@ def _clip_collective_grouped_mask_prefers_relation(
     positive_area_pair_count: int | None = None,
     mask_rectangle_strip_admissible: bool = False,
     available_device_bytes: int | None = None,
+    planning_temporary_byte_count: int = 0,
 ) -> tuple[bool, PhysicalWorkEstimate, PhysicalWorkEstimate]:
     relation_estimate, union_estimate = _clip_collective_grouped_mask_work_estimates(
         source_owned,
@@ -694,11 +701,427 @@ def _clip_collective_grouped_mask_prefers_relation(
         collective_source_count=collective_source_count,
         positive_area_pair_count=positive_area_pair_count,
         mask_rectangle_strip_admissible=mask_rectangle_strip_admissible,
+        planning_temporary_byte_count=planning_temporary_byte_count,
+    )
+    relation_selected = (
+        relation_estimate.dispatch_unit_count()
+        <= union_estimate.dispatch_unit_count()
+    )
+    if available_device_bytes is not None:
+        relation_selected = (
+            relation_selected
+            and relation_estimate.is_device_memory_admissible(
+                int(available_device_bytes),
+            )
+        )
+    return relation_selected, relation_estimate, union_estimate
+
+
+def _clip_collective_grouped_mask_relation_is_memory_admissible(
+    source_owned,
+    mask_source_owned,
+    *,
+    relation_pair_count: int,
+    collective_source_count: int,
+    available_device_bytes: int | None,
+    planning_temporary_byte_count: int = 0,
+) -> tuple[bool, PhysicalWorkEstimate, PhysicalWorkEstimate]:
+    """Report the legacy whole-lifecycle diagnostic for isolated tests."""
+    relation_estimate, union_estimate = _clip_collective_grouped_mask_work_estimates(
+        source_owned,
+        mask_source_owned,
+        relation_pair_count=relation_pair_count,
+        collective_source_count=collective_source_count,
+        planning_temporary_byte_count=planning_temporary_byte_count,
+    )
+    admitted = available_device_bytes is not None and (
+        relation_estimate.is_device_memory_admissible(int(available_device_bytes))
+    )
+    return admitted, relation_estimate, union_estimate
+
+
+@dataclass(frozen=True)
+class _ClipGroupedRelationExecutionState:
+    """Reusable source-grouped state for one admitted exact relation."""
+
+    sorted_source_rows: object
+    sorted_mask_rows: object
+    sorted_active: object
+    source_pair_counts: object
+    pair_offsets: object
+    pair_capacity: int
+    persistent_byte_count: int
+
+
+def _clip_grouped_relation_execution_state(
+    relation,
+    relation_pair_selection,
+    *,
+    source_row_count: int,
+) -> _ClipGroupedRelationExecutionState:
+    """Sort and count one exact relation once for planning and execution."""
+    import cupy as cp
+
+    from vibespatial.cuda.cccl_primitives import PairSortStrategy, sort_pairs
+
+    d_relation_mask_rows = cp.asarray(relation.left_indices, dtype=cp.int64)
+    d_relation_source_rows = cp.asarray(relation.right_indices, dtype=cp.int64)
+    if int(d_relation_mask_rows.size) != int(d_relation_source_rows.size):
+        raise ValueError("grouped clip relation pair columns must align")
+    d_capacity_active = relation_pair_selection.active_capacity_mask()
+    d_capacity_source_rows = relation_pair_selection.gather_capacity(
+        d_relation_source_rows,
+        fill_value=0,
+    )
+    d_capacity_mask_rows = relation_pair_selection.gather_capacity(
+        d_relation_mask_rows,
+        fill_value=0,
+    )
+    pair_capacity = int(relation_pair_selection.capacity)
+    d_sort_keys = (
+        cp.where(
+            d_capacity_active,
+            d_capacity_source_rows,
+            cp.int64(source_row_count),
+        ).astype(cp.uint64, copy=False)
+        << cp.uint64(32)
+    ) | cp.arange(pair_capacity, dtype=cp.uint64)
+    d_pair_order = sort_pairs(
+        d_sort_keys,
+        cp.arange(pair_capacity, dtype=cp.int32),
+        strategy=PairSortStrategy.RADIX,
+        synchronize=False,
+    ).values.astype(cp.int64, copy=False)
+    d_sorted_source_rows = d_capacity_source_rows[d_pair_order]
+    d_sorted_mask_rows = d_capacity_mask_rows[d_pair_order]
+    d_sorted_active = d_capacity_active[d_pair_order]
+    d_source_pair_counts = cp.bincount(
+        d_sorted_source_rows,
+        weights=d_sorted_active.astype(cp.int64, copy=False),
+        minlength=int(source_row_count),
+    ).astype(cp.int64, copy=False)
+    d_pair_offsets = cp.empty(int(source_row_count) + 1, dtype=cp.int64)
+    d_pair_offsets[0] = 0
+    d_pair_offsets[1:] = cp.cumsum(d_source_pair_counts, dtype=cp.int64)
+    persistent_arrays = (
+        d_sorted_source_rows,
+        d_sorted_mask_rows,
+        d_sorted_active,
+        d_source_pair_counts,
+        d_pair_offsets,
+    )
+    persistent_byte_count = sum(
+        max(int(getattr(values, "nbytes", 0)), 0) for values in persistent_arrays
+    )
+    return _ClipGroupedRelationExecutionState(
+        sorted_source_rows=d_sorted_source_rows,
+        sorted_mask_rows=d_sorted_mask_rows,
+        sorted_active=d_sorted_active,
+        source_pair_counts=d_source_pair_counts,
+        pair_offsets=d_pair_offsets,
+        pair_capacity=pair_capacity,
+        persistent_byte_count=persistent_byte_count,
+    )
+
+
+def _clip_grouped_relation_page_admission(
+    state: _ClipGroupedRelationExecutionState,
+    relation_estimate: PhysicalWorkEstimate,
+    *,
+    relation_pair_count: int,
+    available_device_bytes: int | None,
+) -> tuple[bool, int, int, int, int]:
+    """Admit persistent relation state plus one complete-source page."""
+    import cupy as cp
+
+    pair_count = max(int(relation_pair_count), 1)
+    page_bytes_per_pair = max(
+        (
+            int(relation_estimate.output_byte_count)
+            + int(relation_estimate.temporary_byte_count)
+            + pair_count
+            - 1
+        )
+        // pair_count,
+        256,
+    )
+    d_packet = cp.stack(
+        (
+            cp.max(state.source_pair_counts),
+            cp.sum(state.source_pair_counts, dtype=cp.int64),
+        )
+    ).astype(cp.int64, copy=False)
+    host_packet = np.asarray(
+        get_cuda_runtime().copy_device_to_host(
+            d_packet,
+            reason="clip grouped-mask largest complete-source page admission packet",
+        ),
+        dtype=np.int64,
+    )
+    largest_source_group = int(host_packet[0])
+    exact_pair_count = int(host_packet[1])
+    if exact_pair_count != int(relation_pair_count):
+        raise ValueError("grouped clip relation counts must preserve exact pair cardinality")
+    if available_device_bytes is None or int(available_device_bytes) <= 0:
+        return False, 0, largest_source_group, page_bytes_per_pair, 0
+    available = int(available_device_bytes)
+    remaining_after_persistent = available - int(state.persistent_byte_count)
+    page_byte_budget = min(max(available // 5, 1), max(remaining_after_persistent, 0))
+    page_pair_budget = page_byte_budget // page_bytes_per_pair
+    admitted = (
+        remaining_after_persistent > 0
+        and page_pair_budget > 0
+        and largest_source_group <= page_pair_budget
     )
     return (
-        relation_estimate.dispatch_unit_count() <= union_estimate.dispatch_unit_count(),
-        relation_estimate,
-        union_estimate,
+        admitted,
+        page_pair_budget,
+        largest_source_group,
+        page_bytes_per_pair,
+        page_byte_budget,
+    )
+
+
+def _clip_try_exact_grouped_relation(
+    query_relation,
+    candidate_mask_owned,
+    *,
+    relation_work_preferred: bool,
+    source_token: str,
+):
+    """Attempt one exact relation only when structural work prefers it."""
+    from vibespatial.spatial.query_types import CandidateRelationCapacityError
+
+    if not relation_work_preferred:
+        return None, False
+    try:
+        relation, _execution = query_relation(
+            candidate_mask_owned,
+            predicate="intersects",
+            sort=False,
+            source_token=source_token,
+            query_row_count=candidate_mask_owned.row_count,
+            return_device=True,
+        )
+    except CandidateRelationCapacityError:
+        return None, True
+    return relation, False
+
+
+@dataclass(frozen=True)
+class _ClipGroupedRelationRefinedPlan:
+    """Minimal retained state after exact relation refinement."""
+
+    covered_result: object
+    execution_state: _ClipGroupedRelationExecutionState | None
+    relation_estimate: PhysicalWorkEstimate
+    union_estimate: PhysicalWorkEstimate
+    relation_work_preferred: bool
+    unresolved_source_count: int
+    unresolved_pair_count: int
+    positive_area_pair_count: int
+    mask_rectangle_strip_admissible: bool
+
+
+def _clip_grouped_relation_refined_plan(
+    gdf,
+    relation,
+    *,
+    owned,
+    relation_mask_owned,
+    source_state,
+) -> _ClipGroupedRelationRefinedPlan | None:
+    """Consume exact pair temporaries into one disposable refined plan."""
+    import cupy as cp
+
+    d_mask_rows = cp.asarray(relation.left_indices, dtype=cp.int64)
+    d_source_rows = cp.asarray(relation.right_indices, dtype=cp.int64)
+    if int(d_mask_rows.size) != int(d_source_rows.size):
+        raise ValueError("grouped clip relation pair columns must align")
+    pair_count = int(d_source_rows.size)
+    coverage = _clip_lazy_grouped_union_coverage_rows_device(
+        owned=owned,
+        mask_source_owned=relation_mask_owned,
+        source_state=source_state,
+        d_mask_rows=d_mask_rows,
+        d_source_rows=d_source_rows,
+        pair_count=pair_count,
+    )
+    if coverage is None:
+        return None
+    covered_selection, unresolved_selection = coverage
+    covered_result = _native_state_passthrough_take(gdf, covered_selection)
+    if covered_result is None:
+        return None
+    d_unresolved_source_mask = unresolved_selection.source_mask()
+    d_unresolved_pair_active = d_unresolved_source_mask[d_source_rows]
+    relation_pair_selection = NativeDeviceSelection.from_mask(
+        d_unresolved_pair_active,
+    )
+
+    from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        device_trusted_rectangle_bounds_matrix,
+    )
+
+    d_source_rectangle_bounds = device_trusted_rectangle_bounds_matrix(owned)
+    d_mask_rectangle_bounds = device_trusted_rectangle_bounds_matrix(relation_mask_owned)
+    d_mask_rectangle_strip = _clip_collective_rectangle_strip_admissible_device(
+        relation_mask_owned
+    )
+    if d_source_rectangle_bounds is not None and d_mask_rectangle_bounds is not None:
+        d_source_pair_bounds = cp.asarray(d_source_rectangle_bounds, dtype=cp.float64)[
+            d_source_rows
+        ]
+        d_mask_pair_bounds = cp.asarray(d_mask_rectangle_bounds, dtype=cp.float64)[
+            d_mask_rows
+        ]
+        d_positive_area_pairs = d_unresolved_pair_active & (
+            cp.minimum(d_source_pair_bounds[:, 2], d_mask_pair_bounds[:, 2])
+            > cp.maximum(d_source_pair_bounds[:, 0], d_mask_pair_bounds[:, 0])
+        ) & (
+            cp.minimum(d_source_pair_bounds[:, 3], d_mask_pair_bounds[:, 3])
+            > cp.maximum(d_source_pair_bounds[:, 1], d_mask_pair_bounds[:, 1])
+        )
+        d_positive_area_pair_count = cp.count_nonzero(d_positive_area_pairs).astype(
+            cp.int64
+        )
+    else:
+        d_positive_area_pair_count = cp.asarray(
+            relation_pair_selection.logical_count,
+            dtype=cp.int64,
+        )[0]
+
+    d_plan_counts = cp.concatenate(
+        [
+            cp.asarray(unresolved_selection.logical_count, dtype=cp.int64),
+            cp.asarray(relation_pair_selection.logical_count, dtype=cp.int64),
+            cp.asarray(d_positive_area_pair_count, dtype=cp.int64).reshape(1),
+            cp.asarray(d_mask_rectangle_strip, dtype=cp.int64).reshape(1),
+        ]
+    )
+    (
+        unresolved_source_count,
+        unresolved_pair_count,
+        positive_area_pair_count,
+        mask_rectangle_strip_admissible,
+    ) = (
+        int(value)
+        for value in np.asarray(
+            get_cuda_runtime().copy_device_to_host(
+                d_plan_counts,
+                reason="clip grouped-mask physical-plan aggregate admission counts",
+            ),
+            dtype=np.int64,
+        )
+    )
+    relation_work_preferred, relation_estimate, union_estimate = (
+        _clip_collective_grouped_mask_prefers_relation(
+            owned,
+            relation_mask_owned,
+            relation_pair_count=unresolved_pair_count,
+            collective_source_count=unresolved_source_count,
+            positive_area_pair_count=positive_area_pair_count,
+            mask_rectangle_strip_admissible=bool(
+                mask_rectangle_strip_admissible
+            ),
+        )
+    )
+    execution_state = (
+        _clip_grouped_relation_execution_state(
+            relation,
+            relation_pair_selection,
+            source_row_count=source_state.row_count,
+        )
+        if relation_work_preferred and unresolved_source_count > 0
+        else None
+    )
+    return _ClipGroupedRelationRefinedPlan(
+        covered_result=covered_result,
+        execution_state=execution_state,
+        relation_estimate=relation_estimate,
+        union_estimate=union_estimate,
+        relation_work_preferred=relation_work_preferred,
+        unresolved_source_count=unresolved_source_count,
+        unresolved_pair_count=unresolved_pair_count,
+        positive_area_pair_count=positive_area_pair_count,
+        mask_rectangle_strip_admissible=bool(mask_rectangle_strip_admissible),
+    )
+
+
+def _clip_grouped_relation_page_launch_admission(
+    *,
+    page_pair_count: int,
+    page_bytes_per_pair: int,
+    available_device_bytes: int | None,
+) -> tuple[bool, int, int]:
+    """Reserve at most half current allocator availability for one page."""
+    required_bytes = max(int(page_pair_count), 0) * max(
+        int(page_bytes_per_pair),
+        1,
+    )
+    if available_device_bytes is None or int(available_device_bytes) <= 0:
+        return False, required_bytes, 0
+    reserved_bytes = int(available_device_bytes) // 2
+    return required_bytes <= reserved_bytes, required_bytes, reserved_bytes
+
+
+@dataclass(frozen=True)
+class _ClipGroupedRelationPageRun:
+    """Retained page outputs or one pre-launch admission rejection."""
+
+    partitions: tuple[object, ...]
+    aborted: bool
+    launched_page_count: int
+    rejected_required_bytes: int = 0
+    rejected_reserved_bytes: int = 0
+
+
+def _clip_run_grouped_relation_pages(
+    source_spans,
+    pair_boundaries,
+    *,
+    page_bytes_per_pair: int,
+    available_bytes,
+    execute_page,
+) -> _ClipGroupedRelationPageRun:
+    """Execute pages only while each fits a fresh reserved-memory envelope."""
+    partitions = []
+    launched_page_count = 0
+    for page_index, (source_start, source_end) in enumerate(source_spans):
+        pair_start = int(pair_boundaries[page_index])
+        pair_end = int(pair_boundaries[page_index + 1])
+        if pair_end <= pair_start:
+            continue
+        admitted, required_bytes, reserved_bytes = (
+            _clip_grouped_relation_page_launch_admission(
+                page_pair_count=pair_end - pair_start,
+                page_bytes_per_pair=page_bytes_per_pair,
+                available_device_bytes=available_bytes(),
+            )
+        )
+        if not admitted:
+            partitions.clear()
+            return _ClipGroupedRelationPageRun(
+                partitions=(),
+                aborted=True,
+                launched_page_count=launched_page_count,
+                rejected_required_bytes=required_bytes,
+                rejected_reserved_bytes=reserved_bytes,
+            )
+        partition = execute_page(
+            source_start=source_start,
+            source_end=source_end,
+            pair_start=pair_start,
+            pair_end=pair_end,
+        )
+        if partition is None:
+            raise RuntimeError("grouped-mask relation page execution declined")
+        partitions.append(partition)
+        launched_page_count += 1
+    return _ClipGroupedRelationPageRun(
+        partitions=tuple(partitions),
+        aborted=False,
+        launched_page_count=launched_page_count,
     )
 
 
@@ -6447,6 +6870,44 @@ def _clip_grouped_polygon_pair_capacity(
     return grouped_result, d_keep
 
 
+def _clip_grouped_mask_morton_span_planning_packet(packet):
+    """Export one fixed structural packet and derive safe relation uppers."""
+    d_packet = packet.values
+    if (
+        getattr(d_packet, "ndim", None) != 1
+        or int(getattr(d_packet, "size", -1)) != 3
+        or int(getattr(d_packet, "nbytes", -1)) != 24
+        or str(getattr(d_packet, "dtype", "")) != "int64"
+    ):
+        raise ValueError("grouped clip Morton planning packet must be exactly 3 int64")
+    host_packet = np.asarray(
+        get_cuda_runtime().copy_device_to_host(
+            d_packet,
+            reason="clip grouped-mask Morton span upper planning packet",
+        ),
+        dtype=np.int64,
+    )
+    total_span, nonempty_query_spans, max_query_span = (
+        int(host_packet[0]),
+        int(host_packet[1]),
+        int(host_packet[2]),
+    )
+    if min(total_span, nonempty_query_spans, max_query_span) < 0:
+        return None
+    candidate_source_upper = min(int(packet.tree_count), total_span)
+    max_source_query_fanout_upper = min(
+        int(packet.query_count),
+        nonempty_query_spans,
+    )
+    return (
+        total_span,
+        candidate_source_upper,
+        max_source_query_fanout_upper,
+        max_query_span,
+        int(packet.temporary_byte_count),
+    )
+
+
 def _clip_gdf_with_lazy_grouped_union_mask_native(
     gdf,
     mask,
@@ -6457,10 +6918,10 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
 ) -> NativeTabularResult | NativeTabularSelection | None:
     """Clip polygon rows against a lazy grouped-union mask without union export.
 
-    Physical shape: native spatial relation pairs from grouped mask members to
-    source rows -> row-aligned exact intersections -> grouped constructive
-    reduction by source row. The public mask is a single dissolved geometry,
-    but the GPU work stays pair/group shaped until the explicit clip export.
+    Physical shape: conservative Cartesian relation bound -> optional direct
+    device Morton span upper packet -> one admitted original relation, tiled
+    relation, or reduced union carrier. Relation execution stays pair/group
+    shaped through exact intersections; union execution stays source-row shaped.
     """
     if (
         sort
@@ -6479,16 +6940,13 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
     mask_source_owned = getattr(lazy_mask_owned, "_source_owned", None)
     if mask_source_owned is None or mask_source_owned.residency is not Residency.DEVICE:
         return None
+    # Plan from grouped source members before reducing them.  Tiled collective
+    # coverage and the one-row union are deliberately deferred until the
+    # original relation fails structural Morton-span admission: source members
+    # remain the cheapest sparse shape, tiled coverage is the bounded
+    # intermediate relation shape, and the union is the dense/fanout escape
+    # hatch.
     relation_mask_owned = mask_source_owned
-    materialize_coverage = getattr(
-        lazy_mask_owned,
-        "_materialize_collective_coverage",
-        None,
-    )
-    if callable(materialize_coverage):
-        collective_coverage = materialize_coverage()
-        if collective_coverage is not None:
-            relation_mask_owned = collective_coverage
 
     from vibespatial.geometry.buffers import GeometryFamily
 
@@ -6522,26 +6980,11 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
     except ModuleNotFoundError:  # pragma: no cover - guarded by runtime
         return None
 
-    relation, _execution = gdf.sindex.query_relation(
-        relation_mask_owned,
-        predicate="intersects",
-        sort=False,
-        source_token=source_state.lineage_token,
-        query_row_count=relation_mask_owned.row_count,
-        return_device=True,
-    )
-
-    d_mask_rows = cp.asarray(relation.left_indices, dtype=cp.int64)
-    d_source_rows = cp.asarray(relation.right_indices, dtype=cp.int64)
-    if int(d_mask_rows.size) != int(d_source_rows.size):
-        return None
-
     from vibespatial.api._native_rowset import NativeRowSet
     from vibespatial.geometry.owned import build_null_owned_array
     from vibespatial.runtime.dispatch import record_dispatch_event
 
-    pair_count = int(d_source_rows.size)
-    if pair_count == 0:
+    def _empty_result():
         empty_owned = build_null_owned_array(0, residency=owned.residency)
         empty_rowset = NativeRowSet.from_positions(
             cp.empty(0, dtype=cp.int64),
@@ -6559,6 +7002,7 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
             keep_geom_type=keep_geom_type,
         )
 
+    available_device_bytes = _clip_available_device_bytes()
     result_partitions = []
     materialized_mask_owned = None
 
@@ -6583,10 +7027,15 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
         materialized = _materialized_mask_owned_once()
         if materialized is None:
             return False
+        candidate_rows = (
+            cp.arange(source_state.row_count, dtype=cp.int64)
+            if selection is None
+            else selection
+        )
         partition = _clip_homogeneous_polygon_device_candidates_native(
             gdf,
             mask,
-            selection,
+            candidate_rows,
             mask_owned=materialized,
             clipping_by_rectangle=False,
             rectangle_bounds=None,
@@ -6605,7 +7054,7 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
             ),
             detail=(
                 f"source_rows={owned.row_count}, mask_rows={mask_source_owned.row_count}, "
-                f"selected_capacity={selection.capacity}, "
+                f"selected_capacity={getattr(selection, 'capacity', source_state.row_count)}, "
                 "selected_rows=device-resident"
             ),
             requested=ExecutionMode.AUTO,
@@ -6613,81 +7062,140 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
         )
         return True
 
-    # Shape admission must precede semantic pair refinement. Dense relations
-    # can make exact pairwise coverage itself the dominant operation even when
-    # the only feasible constructive carrier is one reduced mask. Build the
-    # candidate source rowset directly from the resident relation and use
-    # conservative host-known capacities for this first decision.
-    d_candidate_source_mask = cp.zeros(owned.row_count, dtype=cp.bool_)
-    d_candidate_source_mask[d_source_rows] = True
-    candidate_source_selection = NativeDeviceSelection.from_mask(
-        d_candidate_source_mask,
-        source_token=source_state.lineage_token,
-        source_row_count=source_state.row_count,
-        geometry_family_domain=tuple(polygonal),
-        trusted_all_valid_rows=None,
-    )
-    available_device_bytes = _clip_available_device_bytes()
-    coarse_source_count = min(int(owned.row_count), pair_count)
+    def _structural_relation_plan(candidate_mask_owned):
+        cartesian_pairs = int(owned.row_count) * int(candidate_mask_owned.row_count)
+        source_upper = int(owned.row_count) if int(candidate_mask_owned.row_count) else 0
+        total_pairs = cartesian_pairs
+        max_fanout = int(candidate_mask_owned.row_count)
+        max_query_span = int(owned.row_count)
+        temporary_bytes = 0
+        span_packet, span_execution = gdf.sindex.query_morton_span_upper_packet(
+            candidate_mask_owned,
+            source_token=source_state.lineage_token,
+            query_row_count=candidate_mask_owned.row_count,
+        )
+        structural = (
+            _clip_grouped_mask_morton_span_planning_packet(span_packet)
+            if span_packet is not None
+            and span_execution is not None
+            and span_execution.selected is ExecutionMode.GPU
+            else None
+        )
+        if structural is not None:
+            (
+                total_pairs,
+                source_upper,
+                max_fanout,
+                max_query_span,
+                temporary_bytes,
+            ) = structural
+        relation_preferred, relation_shape, union_shape = (
+            _clip_collective_grouped_mask_prefers_relation(
+                owned,
+                candidate_mask_owned,
+                relation_pair_count=total_pairs,
+                collective_source_count=source_upper,
+            )
+        )
+        return (
+            relation_preferred,
+            relation_shape,
+            union_shape,
+            total_pairs,
+            source_upper,
+            max_fanout,
+            max_query_span,
+            temporary_bytes,
+        )
+
     (
-        coarse_relation_selected,
-        coarse_relation_estimate,
-        coarse_union_estimate,
-    ) = _clip_collective_grouped_mask_prefers_relation(
-        owned,
-        relation_mask_owned,
-        relation_pair_count=pair_count,
-        collective_source_count=coarse_source_count,
-        available_device_bytes=available_device_bytes,
+        relation_work_preferred,
+        relation_estimate,
+        union_estimate,
+        planning_total_pairs,
+        planning_source_count,
+        planning_max_fanout,
+        planning_max_query_span,
+        planning_temporary_bytes,
+    ) = _structural_relation_plan(mask_source_owned)
+    candidate_source_selection = None
+    relation = None
+    relation_strategy = None
+    capacity_rejected = False
+    tiled_coverage = None
+    if planning_total_pairs == 0:
+        return _empty_result()
+    relation, capacity_rejected = _clip_try_exact_grouped_relation(
+        gdf.sindex.query_relation,
+        mask_source_owned,
+        relation_work_preferred=relation_work_preferred,
+        source_token=source_state.lineage_token,
     )
-    if (
-        coarse_relation_selected
-        and available_device_bytes is not None
-        and not coarse_relation_estimate.is_device_memory_admissible(
-            available_device_bytes
+    if relation is not None:
+        relation_strategy = "original_relation"
+
+    if relation is None:
+        materialize_coverage = getattr(
+            lazy_mask_owned,
+            "_materialize_collective_coverage",
+            None,
         )
-    ):
-        coarse_mask_rectangle_strip_admissible = bool(
-            np.asarray(
-                get_cuda_runtime().copy_device_to_host(
-                    cp.asarray(
-                        _clip_collective_rectangle_strip_admissible_device(
-                            relation_mask_owned
-                        ),
-                        dtype=cp.bool_,
-                    ).reshape(1),
-                    reason="clip grouped-mask constrained-memory shape packet",
-                ),
-                dtype=np.bool_,
-            )[0]
+        tiled_coverage = (
+            materialize_coverage() if callable(materialize_coverage) else None
         )
-        (
-            coarse_relation_selected,
-            coarse_relation_estimate,
-            coarse_union_estimate,
-        ) = _clip_collective_grouped_mask_prefers_relation(
-            owned,
-            relation_mask_owned,
-            relation_pair_count=pair_count,
-            collective_source_count=coarse_source_count,
-            mask_rectangle_strip_admissible=coarse_mask_rectangle_strip_admissible,
-            available_device_bytes=available_device_bytes,
-        )
-    if not coarse_relation_selected:
+        if (
+            tiled_coverage is not None
+            and tiled_coverage.residency is Residency.DEVICE
+            and int(getattr(tiled_coverage, "row_count", -1)) >= 0
+            and _owned_active_family_subset(tiled_coverage, polygonal)
+        ):
+            (
+                tiled_work_preferred,
+                relation_estimate,
+                union_estimate,
+                planning_total_pairs,
+                planning_source_count,
+                planning_max_fanout,
+                planning_max_query_span,
+                planning_temporary_bytes,
+            ) = _structural_relation_plan(tiled_coverage)
+            if planning_total_pairs == 0:
+                return _empty_result()
+            relation, tiled_capacity_rejected = _clip_try_exact_grouped_relation(
+                gdf.sindex.query_relation,
+                tiled_coverage,
+                relation_work_preferred=tiled_work_preferred,
+                source_token=source_state.lineage_token,
+            )
+            capacity_rejected = capacity_rejected or tiled_capacity_rejected
+            if relation is not None:
+                relation_mask_owned = tiled_coverage
+                relation_strategy = "tiled_coverage_relation"
+        if relation is None:
+            relation_strategy = "materialized_union"
+    tiled_coverage = None
+
+    if relation_strategy == "materialized_union":
         record_dispatch_event(
             surface="geopandas.clip",
             operation="clip",
             implementation="lazy_grouped_union_mask_union_plan_gpu",
             reason=(
-                "grouped-mask clip selected union-first execution before exact "
-                "pair refinement from resident relation shape and memory admission"
+                "grouped-mask clip selected union-first execution from structural "
+                "work comparison or exact relation capacity rejection"
             ),
             detail=(
-                f"source_rows<={coarse_source_count}, pair_rows={pair_count}, "
-                f"relation_units={coarse_relation_estimate.dispatch_unit_count()}, "
-                f"union_units={coarse_union_estimate.dispatch_unit_count()}, "
-                f"relation_live_bytes={coarse_relation_estimate.live_device_byte_count()}, "
+                "strategy=materialized_union, "
+                f"source_rows={planning_source_count}, "
+                f"pair_rows={planning_total_pairs}, "
+                f"max_mask_fanout={planning_max_fanout}, "
+                f"max_query_span={planning_max_query_span}, "
+                f"planning_temporary_bytes={planning_temporary_bytes}, "
+                f"relation_units={relation_estimate.dispatch_unit_count()}, "
+                f"union_units={union_estimate.dispatch_unit_count()}, "
+                "relation_memory=not_allocated, "
                 f"available_device_bytes={available_device_bytes}, "
+                f"capacity_rejected={capacity_rejected}, "
                 "semantic_pair_refinement=skipped"
             ),
             requested=ExecutionMode.AUTO,
@@ -6705,98 +7213,80 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
             crs=geometry.crs,
         )
 
-    coverage = _clip_lazy_grouped_union_coverage_rows_device(
+    record_dispatch_event(
+        surface="geopandas.clip",
+        operation="clip",
+        implementation="lazy_grouped_union_mask_relation_plan_gpu",
+        reason=(
+            "grouped-mask clip retained one exact relation selected by structural "
+            "work and the query allocator capacity fence"
+        ),
+        detail=(
+            f"strategy={relation_strategy}, source_rows={planning_source_count}, "
+            f"pair_rows<={planning_total_pairs}, "
+            f"max_mask_fanout={planning_max_fanout}, "
+            f"max_query_span={planning_max_query_span}, "
+            f"planning_temporary_bytes={planning_temporary_bytes}, "
+            f"relation_units={relation_estimate.dispatch_unit_count()}, "
+            "relation_live_bytes=deferred_to_exact_page_admission, "
+            f"available_device_bytes={available_device_bytes}"
+        ),
+        requested=ExecutionMode.AUTO,
+        selected=ExecutionMode.GPU,
+    )
+    pair_count = len(relation)
+    if pair_count == 0:
+        return _empty_result()
+    refined_plan = _clip_grouped_relation_refined_plan(
+        gdf,
+        relation,
         owned=owned,
-        mask_source_owned=relation_mask_owned,
+        relation_mask_owned=relation_mask_owned,
         source_state=source_state,
-        d_mask_rows=d_mask_rows,
-        d_source_rows=d_source_rows,
-        pair_count=pair_count,
     )
-    if coverage is None:
+    # The refined plan retains only covered output plus sorted/count execution
+    # state. Exact relation columns and all pair-planning temporaries die here.
+    relation = None
+    if refined_plan is None:
         return None
-    covered_selection, unresolved_selection = coverage
-    covered_result = _native_state_passthrough_take(gdf, covered_selection)
-    if covered_result is None:
-        return None
-    result_partitions.append(covered_result)
-    d_unresolved_source_mask = unresolved_selection.source_mask()
-    d_unresolved_pair_active = d_unresolved_source_mask[d_source_rows]
-    relation_pair_selection = NativeDeviceSelection.from_mask(
-        d_unresolved_pair_active,
-    )
-    from vibespatial.kernels.constructive.polygon_rect_intersection import (
-        device_trusted_rectangle_bounds_matrix,
-    )
-
-    d_source_rectangle_bounds = device_trusted_rectangle_bounds_matrix(owned)
-    d_mask_rectangle_bounds = device_trusted_rectangle_bounds_matrix(relation_mask_owned)
-    d_mask_rectangle_strip = _clip_collective_rectangle_strip_admissible_device(
-        relation_mask_owned
-    )
-    if d_source_rectangle_bounds is not None and d_mask_rectangle_bounds is not None:
-        d_source_pair_bounds = cp.asarray(d_source_rectangle_bounds, dtype=cp.float64)[
-            d_source_rows
-        ]
-        d_mask_pair_bounds = cp.asarray(d_mask_rectangle_bounds, dtype=cp.float64)[d_mask_rows]
-        d_positive_area_pairs = d_unresolved_pair_active & (
-            cp.minimum(d_source_pair_bounds[:, 2], d_mask_pair_bounds[:, 2])
-            > cp.maximum(d_source_pair_bounds[:, 0], d_mask_pair_bounds[:, 0])
-        ) & (
-            cp.minimum(d_source_pair_bounds[:, 3], d_mask_pair_bounds[:, 3])
-            > cp.maximum(d_source_pair_bounds[:, 1], d_mask_pair_bounds[:, 1])
-        )
-        d_positive_area_pair_count = cp.count_nonzero(d_positive_area_pairs).astype(cp.int64)
-
-    else:
-        d_positive_area_pair_count = cp.asarray(
-            relation_pair_selection.logical_count,
-            dtype=cp.int64,
-        )[0]
-
-    d_plan_counts = cp.concatenate(
-        [
-            cp.asarray(unresolved_selection.logical_count, dtype=cp.int64),
-            cp.asarray(relation_pair_selection.logical_count, dtype=cp.int64),
-            cp.asarray(d_positive_area_pair_count, dtype=cp.int64).reshape(1),
-            cp.asarray(d_mask_rectangle_strip, dtype=cp.int64).reshape(1),
-        ]
-    )
-    (
-        unresolved_source_count,
-        unresolved_pair_count,
-        positive_area_pair_count,
-        mask_rectangle_strip_admissible,
-    ) = (
-        int(value)
-        for value in np.asarray(
-            get_cuda_runtime().copy_device_to_host(
-                d_plan_counts,
-                reason="clip grouped-mask physical-plan aggregate admission counts",
-            ),
-            dtype=np.int64,
-        )
+    unresolved_source_count = refined_plan.unresolved_source_count
+    unresolved_pair_count = refined_plan.unresolved_pair_count
+    positive_area_pair_count = refined_plan.positive_area_pair_count
+    mask_rectangle_strip_admissible = (
+        refined_plan.mask_rectangle_strip_admissible
     )
     if unresolved_source_count == 0:
+        result_partitions.append(refined_plan.covered_result)
         return _clip_concat_source_ordered_native_results(
             result_partitions,
             source_state=source_state,
             geometry_name=geometry_name,
             crs=geometry.crs,
         )
-    (
-        relation_selected,
-        relation_estimate,
-        union_estimate,
-    ) = _clip_collective_grouped_mask_prefers_relation(
-        owned,
-        relation_mask_owned,
-        relation_pair_count=unresolved_pair_count,
-        collective_source_count=unresolved_source_count,
-        positive_area_pair_count=positive_area_pair_count,
-        mask_rectangle_strip_admissible=bool(mask_rectangle_strip_admissible),
-        available_device_bytes=available_device_bytes,
-    )
+    relation_selected = refined_plan.relation_work_preferred
+    relation_estimate = refined_plan.relation_estimate
+    union_estimate = refined_plan.union_estimate
+    relation_execution_state = refined_plan.execution_state
+    page_pair_budget = 0
+    largest_source_group = 0
+    page_bytes_per_pair = 0
+    page_byte_budget = 0
+    if relation_selected and relation_execution_state is not None:
+        (
+            page_admitted,
+            page_pair_budget,
+            largest_source_group,
+            page_bytes_per_pair,
+            page_byte_budget,
+        ) = _clip_grouped_relation_page_admission(
+            relation_execution_state,
+            relation_estimate,
+            relation_pair_count=unresolved_pair_count,
+            available_device_bytes=available_device_bytes,
+        )
+        relation_selected = page_admitted
+    else:
+        relation_selected = False
     record_dispatch_event(
         surface="geopandas.clip",
         operation="clip",
@@ -6816,7 +7306,11 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
             f"rectangle_strip={bool(mask_rectangle_strip_admissible)}, "
             f"relation_units={relation_estimate.dispatch_unit_count()}, "
             f"union_units={union_estimate.dispatch_unit_count()}, "
-            f"relation_live_bytes={relation_estimate.live_device_byte_count()}, "
+            "relation_live_bytes=page-shaped, "
+            f"persistent_relation_bytes={getattr(relation_execution_state, 'persistent_byte_count', 0)}, "
+            f"largest_source_group={largest_source_group}, "
+            f"page_bytes_per_pair={page_bytes_per_pair}, "
+            f"page_byte_budget={page_byte_budget}, "
             f"available_device_bytes={available_device_bytes}, "
             "geometry_allocation=source-or-pair-capacity"
         ),
@@ -6824,8 +7318,15 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
         selected=ExecutionMode.GPU,
     )
     if not relation_selected:
+        # One carrier owns every exact-pair planning temporary. Dropping it and
+        # the sort state releases them before union materialization.
+        refined_plan = None
+        relation_execution_state = None
+        relation_mask_owned = None
+        result_partitions.clear()
+        candidate_source_selection = None
         if not _append_physicalized_source_rows(
-            unresolved_selection,
+            None,
             implementation="lazy_grouped_union_mask_union_physicalized_gpu",
         ):
             return None
@@ -6836,81 +7337,43 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
             crs=geometry.crs,
         )
 
+    result_partitions.append(refined_plan.covered_result)
+    refined_plan = None
+
     from vibespatial.constructive.binary_constructive import _binary_constructive_gpu
-    from vibespatial.cuda.cccl_primitives import PairSortStrategy, sort_pairs
     from vibespatial.overlay.gpu import _compact_bounded_device_work_spans
 
-    d_capacity_active = relation_pair_selection.active_capacity_mask()
-    d_capacity_source_rows = relation_pair_selection.gather_capacity(
-        d_source_rows,
-        fill_value=0,
-    )
-    d_capacity_mask_rows = relation_pair_selection.gather_capacity(
-        d_mask_rows,
-        fill_value=0,
-    )
-    pair_capacity = relation_pair_selection.capacity
-    d_sort_keys = (
-        cp.where(
-            d_capacity_active,
-            d_capacity_source_rows,
-            cp.int64(source_state.row_count),
-        ).astype(cp.uint64, copy=False)
-        << cp.uint64(32)
-    ) | cp.arange(pair_capacity, dtype=cp.uint64)
-    d_pair_order = sort_pairs(
-        d_sort_keys,
-        cp.arange(pair_capacity, dtype=cp.int32),
-        strategy=PairSortStrategy.RADIX,
-        synchronize=False,
-    ).values.astype(cp.int64, copy=False)
-    d_sorted_source_rows = d_capacity_source_rows[d_pair_order]
-    d_sorted_mask_rows = d_capacity_mask_rows[d_pair_order]
-    d_sorted_active = d_capacity_active[d_pair_order]
-    d_source_pair_counts = cp.bincount(
-        d_sorted_source_rows,
-        weights=d_sorted_active.astype(cp.int64, copy=False),
-        minlength=source_state.row_count,
-    ).astype(cp.int64, copy=False)
-    relation_live_bytes = max(int(relation_estimate.live_device_byte_count()), 1)
-    estimated_bytes_per_pair = max(
-        (relation_live_bytes + max(unresolved_pair_count, 1) - 1)
-        // max(unresolved_pair_count, 1),
-        256,
-    )
-    page_available_bytes = max(int(available_device_bytes or relation_live_bytes) // 5, 1)
-    page_pair_budget = max(
-        64 * 1024,
-        page_available_bytes // estimated_bytes_per_pair,
-    )
     source_spans = _compact_bounded_device_work_spans(
-        d_source_pair_counts,
+        relation_execution_state.source_pair_counts,
         live_event_budget=page_pair_budget,
     )
-    d_pair_offsets = cp.empty(source_state.row_count + 1, dtype=cp.int64)
-    d_pair_offsets[0] = 0
-    d_pair_offsets[1:] = cp.cumsum(d_source_pair_counts, dtype=cp.int64)
     d_span_boundaries = cp.asarray(
         [source_spans[0][0], *(end for _start, end in source_spans)],
         dtype=cp.int64,
     )
     host_pair_boundaries = np.asarray(
         get_cuda_runtime().copy_device_to_host(
-            d_pair_offsets[d_span_boundaries],
+            relation_execution_state.pair_offsets[d_span_boundaries],
             reason="clip grouped-mask complete-source page-offset planning packet",
         ),
         dtype=np.int64,
     )
 
-    for page_index, (source_start, source_end) in enumerate(source_spans):
-        pair_start = int(host_pair_boundaries[page_index])
-        pair_end = int(host_pair_boundaries[page_index + 1])
-        if pair_end <= pair_start:
-            continue
+    def _execute_relation_page(
+        *,
+        source_start: int,
+        source_end: int,
+        pair_start: int,
+        pair_end: int,
+    ):
         page_source_count = source_end - source_start
-        d_page_source_rows = d_sorted_source_rows[pair_start:pair_end]
-        d_page_mask_rows = d_sorted_mask_rows[pair_start:pair_end]
-        d_page_active = d_sorted_active[pair_start:pair_end]
+        d_page_source_rows = relation_execution_state.sorted_source_rows[
+            pair_start:pair_end
+        ]
+        d_page_mask_rows = relation_execution_state.sorted_mask_rows[
+            pair_start:pair_end
+        ]
+        d_page_active = relation_execution_state.sorted_active[pair_start:pair_end]
         d_page_group_rows = (d_page_source_rows - np.int64(source_start)).astype(
             cp.int64,
             copy=False,
@@ -7006,12 +7469,59 @@ def _clip_gdf_with_lazy_grouped_union_mask_native(
         )
         if capacity_result is None:
             return None
-        result_partitions.append(
-            NativeTabularSelection(
-                capacity_result=capacity_result,
-                selection=NativeDeviceSelection.from_mask(d_output_keep),
-            )
+        return NativeTabularSelection(
+            capacity_result=capacity_result,
+            selection=NativeDeviceSelection.from_mask(d_output_keep),
         )
+
+    page_run = _clip_run_grouped_relation_pages(
+        source_spans,
+        host_pair_boundaries,
+        page_bytes_per_pair=page_bytes_per_pair,
+        available_bytes=_clip_available_device_bytes,
+        execute_page=_execute_relation_page,
+    )
+    if page_run.aborted:
+        # Covered output and every completed relation page are discarded before
+        # the union carrier is allocated. The single execution carrier owns all
+        # remaining sorted/count relation state.
+        result_partitions.clear()
+        relation_execution_state = None
+        relation_mask_owned = None
+        record_dispatch_event(
+            surface="geopandas.clip",
+            operation="clip",
+            implementation="lazy_grouped_union_mask_union_plan_gpu",
+            reason=(
+                "grouped-mask relation paging stopped before an over-budget "
+                "complete-source page and retired retained relation outputs"
+            ),
+            detail=(
+                "strategy=materialized_union_after_page_admission, "
+                f"launched_pages={page_run.launched_page_count}, "
+                "rejected_page_required_bytes="
+                f"{page_run.rejected_required_bytes}, "
+                "rejected_page_reserved_bytes="
+                f"{page_run.rejected_reserved_bytes}, "
+                "relation_state=retired"
+            ),
+            requested=ExecutionMode.AUTO,
+            selected=ExecutionMode.GPU,
+        )
+        page_run = None
+        if not _append_physicalized_source_rows(
+            None,
+            implementation="lazy_grouped_union_mask_union_physicalized_gpu",
+        ):
+            return None
+        return _clip_concat_source_ordered_native_results(
+            result_partitions,
+            source_state=source_state,
+            geometry_name=geometry_name,
+            crs=geometry.crs,
+        )
+
+    result_partitions.extend(page_run.partitions)
 
     record_dispatch_event(
         surface="geopandas.clip",

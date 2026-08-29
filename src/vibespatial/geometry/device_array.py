@@ -275,6 +275,8 @@ class DeviceGeometryArray(ExtensionArray):
         self._owned_flat_sindex_cache = None
         self._sindex_cache = None
         self._provenance = None
+        self._selection_source_owned = None
+        self._selection_positions = None
 
     @classmethod
     def _from_owned(
@@ -1495,23 +1497,33 @@ class DeviceGeometryArray(ExtensionArray):
         if self._owned_flat_sindex_cache is not None:
             return self.to_owned(), self._owned_flat_sindex_cache
 
+        from vibespatial.runtime import ExecutionMode
         from vibespatial.runtime.adaptive import plan_dispatch_selection
         from vibespatial.runtime.crossover import estimate_spatial_index_work_from_owned
         from vibespatial.runtime.precision import KernelClass
-        from vibespatial.spatial.indexing import build_flat_spatial_index
+        from vibespatial.spatial.indexing import (
+            build_flat_spatial_index,
+            compact_indexed_spatial_input,
+        )
 
+        owned = self.to_owned()
         selection = plan_dispatch_selection(
             kernel_name="flat_index_build",
             kernel_class=KernelClass.COARSE,
-            row_count=self.to_owned().row_count,
-            work_estimate=estimate_spatial_index_work_from_owned(self.to_owned()),
-            current_residency=self.to_owned().residency,
+            row_count=owned.row_count,
+            work_estimate=estimate_spatial_index_work_from_owned(owned),
+            current_residency=owned.residency,
         )
+        if selection.runtime_selection.selected is ExecutionMode.GPU:
+            compacted = compact_indexed_spatial_input(owned)
+            if compacted is not owned:
+                owned = compacted
+                self._owned = compacted
         self._owned_flat_sindex_cache = build_flat_spatial_index(
-            self.to_owned(),
+            owned,
             runtime_selection=selection.runtime_selection,
         )
-        return self.to_owned(), self._owned_flat_sindex_cache
+        return owned, self._owned_flat_sindex_cache
 
     @property
     def sindex(self):
@@ -2205,6 +2217,8 @@ class DeviceGeometryArray(ExtensionArray):
             )
         if self._shapely_cache is not None:
             result._shapely_cache = self._shapely_cache
+        result._selection_source_owned = self._selection_source_owned
+        result._selection_positions = self._selection_positions
         return result
 
     def __getitem__(self, idx: Any) -> DeviceGeometryArray | BaseGeometry | None:
@@ -2234,6 +2248,8 @@ class DeviceGeometryArray(ExtensionArray):
 
     def __setitem__(self, key: Any, value: Any) -> None:
         key = pd.api.indexers.check_array_indexer(self, key)
+        self._selection_source_owned = None
+        self._selection_positions = None
 
         # Fast path: DGA-to-DGA assignment at the owned level.
         # Avoids Shapely materialization entirely (zero-copy discipline).
@@ -2351,11 +2367,34 @@ class DeviceGeometryArray(ExtensionArray):
                 result._shapely_cache = self._shapely_cache[indices]
             return result
 
-        new_owned = self.to_owned().take(indices)
+        source_owned = self.to_owned()
+        new_owned = source_owned.take(indices)
         result = DeviceGeometryArray._from_owned(
             new_owned,
             crs=self._crs,
         )
+        if int(np.unique(indices).size) == int(indices.size):
+            selection_source_owned = self._selection_source_owned or source_owned
+            source_positions = self._selection_positions
+            if source_owned.residency is Residency.DEVICE:
+                try:
+                    import cupy as cp
+                except ModuleNotFoundError:  # pragma: no cover - device runtime owns CuPy
+                    pass
+                else:
+                    d_indices = cp.asarray(indices, dtype=cp.int64)
+                    result._selection_source_owned = selection_source_owned
+                    result._selection_positions = (
+                        d_indices
+                        if source_positions is None
+                        else cp.asarray(source_positions, dtype=cp.int64)[d_indices]
+                    )
+            elif source_positions is not None:
+                result._selection_source_owned = selection_source_owned
+                result._selection_positions = np.asarray(
+                    source_positions,
+                    dtype=np.int64,
+                )[indices]
         # Propagate shapely cache subset if available
         if self._shapely_cache is not None:
             result._shapely_cache = self._shapely_cache[indices]
@@ -2370,6 +2409,8 @@ class DeviceGeometryArray(ExtensionArray):
             )
             if self._shapely_cache is not None:
                 result._shapely_cache = self._shapely_cache.copy()
+            result._selection_source_owned = self._selection_source_owned
+            result._selection_positions = self._selection_positions
             return result
         new_owned = _copy_owned_array(self.to_owned())
         new_owned._record(DiagnosticKind.CREATED, "DeviceGeometryArray: copy", visible=False)
@@ -2378,6 +2419,8 @@ class DeviceGeometryArray(ExtensionArray):
             crs=self._crs,
             provenance=getattr(self, "_provenance", None),
         )
+        result._selection_source_owned = self._selection_source_owned
+        result._selection_positions = self._selection_positions
         if self._shapely_cache is not None:
             result._shapely_cache = self._shapely_cache.copy()
         return result
@@ -2535,6 +2578,8 @@ class DeviceGeometryArray(ExtensionArray):
         self._crs = crs
         self._shapely_cache = None
         self._provenance = None
+        self._selection_source_owned = None
+        self._selection_positions = None
 
     # ------------------------------------------------------------------
     # pandas interop

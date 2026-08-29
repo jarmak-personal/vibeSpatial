@@ -285,8 +285,11 @@ def test_small_grouped_constructive_reduce_pipeline_smoke() -> None:
         "runtime_d2h_transfer_events",
         (),
     )
-    assert len(native_grouped_events) == 0
-    assert sum(event["bytes_transferred"] for event in native_grouped_events) <= 2040
+    assert len(native_grouped_events) == 8
+    reasons = [event["reason"] for event in native_grouped_events]
+    assert reasons.count("overlay compact topology page-weight planning packet") == 4
+    assert reasons.count("overlay compact topology work-summary planning packet") == 4
+    assert sum(event["bytes_transferred"] for event in native_grouped_events) <= 8192
     removed_overlay_fences = {
         "overlay assemble boundary total-coords allocation fence",
         "overlay assemble compact-hole total-coords allocation fence",

@@ -23,6 +23,44 @@ if TYPE_CHECKING:
     from vibespatial.api.geoseries import GeoSeries
 
 
+@dataclass(frozen=True)
+class _NativeDeviceArrayReadiness:
+    stream: Any
+    event: Any
+
+
+def _record_native_device_array_readiness(values):
+    if not _is_device_array(values):
+        return None
+    import cupy as cp
+
+    stream = cp.cuda.get_current_stream()
+    event = cp.cuda.Event(disable_timing=True)
+    event.record(stream)
+    return _NativeDeviceArrayReadiness(stream=stream, event=event)
+
+
+def _wait_for_native_device_array_readiness(readiness) -> None:
+    if readiness is None:
+        return
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import (
+        cuda_stream_identity,
+        get_cuda_completion_retainer,
+    )
+
+    consumer = cp.cuda.get_current_stream()
+    if cuda_stream_identity(readiness.stream) == cuda_stream_identity(consumer):
+        return
+    consumer.wait_event(readiness.event)
+    get_cuda_completion_retainer().defer(
+        consumer,
+        readiness.event,
+        lambda _event: None,
+    )
+
+
 def _host_array(
     values: Any,
     *,
@@ -856,6 +894,8 @@ class NativeAttributeColumnPolicy:
     can_project_take: bool
     can_compute_numeric: bool
     can_sort: bool
+    can_distinct: bool
+    can_grouped_nth: bool
 
 
 def _device_attribute_column_policy(arrow_type, *, null_count: int) -> NativeAttributeColumnPolicy:
@@ -870,6 +910,8 @@ def _device_attribute_column_policy(arrow_type, *, null_count: int) -> NativeAtt
                 can_project_take=True,
                 can_compute_numeric=True,
                 can_sort=True,
+                can_distinct=True,
+                can_grouped_nth=True,
             )
         return NativeAttributeColumnPolicy(
             category="nullable-numeric-bool-movement-only",
@@ -878,6 +920,8 @@ def _device_attribute_column_policy(arrow_type, *, null_count: int) -> NativeAtt
             can_project_take=True,
             can_compute_numeric=False,
             can_sort=True,
+            can_distinct=True,
+            can_grouped_nth=True,
         )
     if pa.types.is_dictionary(arrow_type):
         category = "categorical-movement-only"
@@ -896,7 +940,6 @@ def _device_attribute_column_policy(arrow_type, *, null_count: int) -> NativeAtt
         or pa.types.is_large_string(arrow_type)
         or pa.types.is_temporal(arrow_type)
         or pa.types.is_duration(arrow_type)
-        or pa.types.is_null(arrow_type)
     )
     return NativeAttributeColumnPolicy(
         category=category,
@@ -905,6 +948,8 @@ def _device_attribute_column_policy(arrow_type, *, null_count: int) -> NativeAtt
         can_project_take=True,
         can_compute_numeric=False,
         can_sort=can_sort,
+        can_distinct=can_sort,
+        can_grouped_nth=can_sort,
     )
 
 
@@ -922,6 +967,7 @@ class NativeAttributeTable:
     schema_override: Any | None = None
     to_pandas_kwargs: dict[str, Any] | None = None
     row_positions: Any | None = None
+    row_positions_readiness: Any | None = None
 
     @property
     def is_device_backed(self) -> bool:
@@ -1004,6 +1050,15 @@ class NativeAttributeTable:
         if self.row_positions is not None:
             positions = _normalize_row_selection(self.row_positions)
             object.__setattr__(self, "row_positions", positions)
+            if (
+                _is_device_array(positions)
+                and self.row_positions_readiness is None
+            ):
+                object.__setattr__(
+                    self,
+                    "row_positions_readiness",
+                    _record_native_device_array_readiness(positions),
+                )
             row_count = _row_aligned_size(positions)
             if self.index_override is None:
                 object.__setattr__(self, "index_override", pd.RangeIndex(row_count))
@@ -1194,19 +1249,14 @@ class NativeAttributeTable:
         grouped,
         reducers: Mapping[Any, str],
     ) -> NativeAttributeTable | None:
-        """Reduce all-valid device columns with grouped first/last gathers.
+        """Reduce device columns with null-skipping grouped first/last.
 
-        This is the non-numeric device-attribute compute contract: string,
-        datetime, categorical, and numeric/bool columns may participate only
-        when the reducer is positional (`first`/`last`), every group has at
-        least one row, and the source column has no nulls. Null-skipping and
-        missing-group semantics still decline to the exact host/export path.
+        Physical shape: gather rows in segmented group order, apply one
+        pylibcudf ``nth_element`` reduction per column, then nullable-gather
+        observed groups into dense output order. Strings, categoricals,
+        temporal values, nullable numerics, all-null groups, and unobserved
+        groups remain device-native with their Arrow dtype preserved.
         """
-        if self.row_positions is not None:
-            return self._physicalize_device_row_view().grouped_device_take_columns(
-                grouped,
-                reducers,
-            )
         if self.device_table is None or not hasattr(self.device_table, "columns"):
             return None
         if not reducers:
@@ -1223,14 +1273,10 @@ class NativeAttributeTable:
         if not getattr(grouped, "is_device", False):
             return None
         group_count = int(grouped.resolved_group_count)
-        if group_count == 0:
-            return None
         group_ids = getattr(grouped, "group_ids", None)
         group_offsets = getattr(grouped, "group_offsets", None)
         sorted_order = getattr(grouped, "sorted_order", None)
         if group_ids is None or group_offsets is None or sorted_order is None:
-            return None
-        if int(getattr(group_ids, "size", 0)) != group_count:
             return None
 
         requested = tuple(normalized_reducers)
@@ -1240,8 +1286,7 @@ class NativeAttributeTable:
         policies = self.device_column_policies(requested)
         if any(
             (policy := policies.get(column)) is None
-            or not policy.can_project_take
-            or policy.null_count != 0
+            or not policy.can_grouped_nth
             for column in requested
         ):
             return None
@@ -1253,33 +1298,161 @@ class NativeAttributeTable:
         except ModuleNotFoundError:
             return None
 
-        d_offsets = cp.asarray(group_offsets, dtype=cp.int64)
-        d_sorted_order = cp.asarray(sorted_order, dtype=cp.int64)
-        first_positions = d_sorted_order[d_offsets[:-1]]
-        last_positions = d_sorted_order[d_offsets[1:] - 1]
-        target_dtype = cp.int32 if len(self) <= np.iinfo(np.int32).max else cp.int64
         source_columns = self.device_table.columns()
-        output_columns = []
-        fields = []
-        from vibespatial.cuda._runtime import pylibcudf_current_stream
+        source_bytes = sum(
+            int(source_columns[positions[column]].device_buffer_size())
+            for column in requested
+        )
+        row_count = len(self)
+        index_width = 4 if row_count <= np.iinfo(np.int32).max else 8
+        required_bytes = (
+            5 * max(source_bytes, row_count * len(requested))
+            + row_count * (3 * index_width)
+            + group_count * (2 * index_width + 8 * len(requested))
+            + (1 << 20)
+        )
+        from vibespatial.cuda._runtime import (
+            get_cuda_runtime,
+            pylibcudf_current_stream,
+        )
+
+        admission = get_cuda_runtime().admit_device_memory(
+            stage="tabular-grouped-first-last",
+            required_bytes=required_bytes,
+            requested_units=row_count,
+        )
+        if not admission.admitted:
+            return None
 
         stream = pylibcudf_current_stream(self.device_table)
-        for column in requested:
-            selected_rows = (
-                first_positions if normalized_reducers[column] == "first" else last_positions
-            )
+        source_table = self._gathered_device_table(requested)
+        target_dtype = cp.int32 if row_count <= np.iinfo(np.int32).max else cp.int64
+        observed_group_count = int(getattr(group_ids, "size", 0))
+        all_requested_valid = all(
+            policies[column].null_count == 0 for column in requested
+        )
+
+        if group_count == 0:
             gather_map = _pylibcudf_column_from_device(
-                selected_rows.astype(target_dtype, copy=False)
+                cp.empty(0, dtype=target_dtype)
             )
-            gathered = plc.copying.gather(
-                plc.Table([source_columns[positions[column]]]),
+            output_table = plc.copying.gather(
+                source_table,
                 gather_map,
                 plc.copying.OutOfBoundsPolicy.DONT_CHECK,
                 stream=stream,
             )
-            output_column = gathered.columns()[0]
-            output_columns.append(output_column)
-            fields.append(_field_for_device_column(column, output_column, self.schema_override))
+        elif all_requested_valid and observed_group_count == group_count:
+            d_offsets = cp.asarray(group_offsets, dtype=cp.int64)
+            d_sorted_order = cp.asarray(sorted_order, dtype=cp.int64)
+            first_positions = d_sorted_order[d_offsets[:-1]]
+            last_positions = d_sorted_order[d_offsets[1:] - 1]
+            output_columns = []
+            for column, source_column in zip(
+                requested,
+                source_table.columns(),
+                strict=True,
+            ):
+                selected_rows = (
+                    first_positions
+                    if normalized_reducers[column] == "first"
+                    else last_positions
+                )
+                gather_map = _pylibcudf_column_from_device(
+                    selected_rows.astype(target_dtype, copy=False)
+                )
+                gathered = plc.copying.gather(
+                    plc.Table([source_column]),
+                    gather_map,
+                    plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                    stream=stream,
+                )
+                output_columns.append(gathered.columns()[0])
+            output_table = plc.Table(output_columns)
+        elif observed_group_count == 0:
+            invalid = np.iinfo(target_dtype).min
+            gather_map = _pylibcudf_column_from_device(
+                cp.full(group_count, invalid, dtype=target_dtype)
+            )
+            output_table = plc.copying.gather(
+                source_table,
+                gather_map,
+                plc.copying.OutOfBoundsPolicy.NULLIFY,
+                stream=stream,
+            )
+        else:
+            d_sorted_order = cp.asarray(sorted_order, dtype=cp.int64)
+            sorted_gather_map = _pylibcudf_column_from_device(
+                d_sorted_order.astype(target_dtype, copy=False)
+            )
+            sorted_values = plc.copying.gather(
+                source_table,
+                sorted_gather_map,
+                plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                stream=stream,
+            )
+            sorted_codes = cp.asarray(grouped.group_codes, dtype=cp.int64)[d_sorted_order]
+            key_column = _pylibcudf_column_from_device(
+                sorted_codes.astype(target_dtype, copy=False)
+            )
+            groupby = plc.groupby.GroupBy(
+                plc.Table([key_column]),
+                keys_are_sorted=plc.types.Sorted.YES,
+                column_order=[plc.types.Order.ASCENDING],
+                null_precedence=[plc.types.NullOrder.AFTER],
+            )
+            requests = [
+                plc.groupby.GroupByRequest(
+                    value_column,
+                    [
+                        plc.aggregation.nth_element(
+                            0 if normalized_reducers[column] == "first" else -1,
+                            plc.types.NullPolicy.EXCLUDE,
+                        )
+                    ],
+                )
+                for column, value_column in zip(
+                    requested,
+                    sorted_values.columns(),
+                    strict=True,
+                )
+            ]
+            _observed_keys, reduced_tables = groupby.aggregate(
+                requests,
+                stream=stream,
+            )
+            output_table = plc.Table(
+                [table.columns()[0] for table in reduced_tables]
+            )
+            if observed_group_count != group_count:
+                dense_dtype = (
+                    cp.int32
+                    if observed_group_count <= np.iinfo(np.int32).max
+                    else cp.int64
+                )
+                invalid = np.iinfo(dense_dtype).min
+                dense_positions = cp.full(group_count, invalid, dtype=dense_dtype)
+                dense_positions[cp.asarray(group_ids, dtype=cp.int64)] = cp.arange(
+                    observed_group_count,
+                    dtype=dense_dtype,
+                )
+                dense_gather_map = _pylibcudf_column_from_device(dense_positions)
+                output_table = plc.copying.gather(
+                    output_table,
+                    dense_gather_map,
+                    plc.copying.OutOfBoundsPolicy.NULLIFY,
+                    stream=stream,
+                )
+
+        output_columns = output_table.columns()
+        fields = [
+            _field_for_device_column(column, output_column, self.schema_override)
+            for column, output_column in zip(
+                requested,
+                output_columns,
+                strict=True,
+            )
+        ]
 
         index_override = (
             grouped.output_index_plan.index
@@ -1287,7 +1460,7 @@ class NativeAttributeTable:
             else pd.RangeIndex(group_count)
         )
         return type(self)(
-            device_table=plc.Table(output_columns),
+            device_table=output_table,
             index_override=index_override,
             column_override=requested,
             schema_override=pa.schema(
@@ -1533,6 +1706,27 @@ class NativeAttributeTable:
 
     def to_pylibcudf_columns(self, columns) -> list[Any]:
         requested_columns = list(columns)
+        if self.parts is not None:
+            columns_by_name = {}
+            for part in self.parts:
+                part_columns = [
+                    column
+                    for column in requested_columns
+                    if column in part.columns
+                ]
+                if not part_columns:
+                    continue
+                resolved = part.to_pylibcudf_columns(part_columns)
+                columns_by_name.update(
+                    zip(part_columns, resolved, strict=True)
+                )
+            if any(
+                column not in columns_by_name for column in requested_columns
+            ):
+                raise KeyError(
+                    "requested columns are not present in native device table parts"
+                )
+            return [columns_by_name[column] for column in requested_columns]
         if self.device_table is None:
             table = _pylibcudf_table_from_arrow(
                 self.to_arrow(index=False, columns=requested_columns)
@@ -1562,6 +1756,9 @@ class NativeAttributeTable:
         from vibespatial.cuda._runtime import pylibcudf_current_stream
 
         stream = pylibcudf_current_stream(self.device_table)
+        _wait_for_native_device_array_readiness(
+            self.row_positions_readiness
+        )
         source_columns = self.device_table.columns()
         requested = tuple(self.columns if columns is None else columns)
         positions = _column_position_map(self.columns)
@@ -1658,7 +1855,29 @@ class NativeAttributeTable:
     def arrow_schema_for_columns(self, columns):
         import pyarrow as pa
 
-        requested_columns = [str(column) for column in columns]
+        requested = tuple(columns)
+        requested_columns = [str(column) for column in requested]
+        if self.parts is not None:
+            fields_by_name = {}
+            for part in self.parts:
+                part_columns = tuple(
+                    column for column in requested if column in part.columns
+                )
+                if not part_columns:
+                    continue
+                part_schema = part.arrow_schema_for_columns(part_columns)
+                fields_by_name.update(
+                    zip(part_columns, part_schema, strict=True)
+                )
+            return pa.schema(
+                [
+                    fields_by_name.get(
+                        column,
+                        pa.field(str(column), pa.null()),
+                    )
+                    for column in requested
+                ]
+            )
         schema = self.schema_override
         if schema is None and self.arrow_table is not None:
             schema = self.arrow_table.schema
@@ -1999,6 +2218,7 @@ class NativeAttributeTable:
                 ),
                 to_pandas_kwargs=self.to_pandas_kwargs,
                 row_positions=self.row_positions,
+                row_positions_readiness=self.row_positions_readiness,
             )
 
         frame = self.dataframe.loc[:, list(requested)].copy(deep=False)
@@ -2034,6 +2254,7 @@ class NativeAttributeTable:
             schema_override=self.schema_override,
             to_pandas_kwargs=self.to_pandas_kwargs,
             row_positions=self.row_positions,
+            row_positions_readiness=self.row_positions_readiness,
         )
 
     def reset_index_deferred(
@@ -2187,6 +2408,7 @@ class NativeAttributeTable:
                 ),
                 to_pandas_kwargs=self.to_pandas_kwargs,
                 row_positions=self.row_positions,
+                row_positions_readiness=self.row_positions_readiness,
             )
         frame = self.dataframe.copy(deep=False)
         frame.columns = _renamed_pandas_columns_like(
@@ -2203,6 +2425,9 @@ class NativeAttributeTable:
             if self.row_positions is None:
                 selected_positions = cp.asarray(normalized)
             else:
+                _wait_for_native_device_array_readiness(
+                    self.row_positions_readiness
+                )
                 selected_positions = cp.asarray(self.row_positions)[
                     cp.asarray(normalized)
                 ]

@@ -52,6 +52,7 @@ from vibespatial.api._native_results import (
     RelationJoinResult,
     _concat_native_tabular_results,
     _geometry_composition_from_owned_parts_at_capacity,
+    _native_attribute_table_from_projected_frames,
     _native_pairwise_attribute_table,
     _ordered_geometry_collection_from_owned_parts_at_capacity,
     _pairwise_constructive_to_native_tabular_result,
@@ -997,6 +998,290 @@ def test_native_topk_memory_estimate_scales_with_float_sort_keys() -> None:
     assert _native_topk_required_bytes(1_000, (pa.string(),)) is None
 
 
+def _device_topk_frame(
+    table: pa.Table,
+    *,
+    composed: bool = False,
+) -> GeoDataFrame:
+    plc = pytest.importorskip("pylibcudf")
+    row_count = table.num_rows
+    index = pd.Index(
+        [f"row-{position // 2}" for position in range(row_count)],
+        name="source",
+    )
+    public = table.to_pandas()
+    for column in table.column_names:
+        if pa.types.is_boolean(table.schema.field(column).type):
+            public[column] = pd.array(table[column].to_pylist(), dtype="boolean")
+    owned = from_shapely_geometries(
+        [Point(position, position) for position in range(row_count)],
+        residency=Residency.DEVICE,
+    )
+    gdf = GeoDataFrame(
+        {
+            **{column: public[column].array for column in table.column_names},
+            "geometry": GeoSeries(
+                DeviceGeometryArray._from_owned(owned),
+                index=index,
+                name="geometry",
+            ),
+        },
+        index=index,
+    )
+    if composed:
+        parts = tuple(
+            NativeAttributeTable(
+                device_table=plc.Table.from_arrow(table.select([column])),
+                index_override=index,
+                column_override=(column,),
+                schema_override=table.select([column]).schema,
+            )
+            for column in table.column_names
+        )
+        attributes = NativeAttributeTable(
+            parts=parts,
+            index_override=index,
+            column_override=tuple(table.column_names),
+        )
+    else:
+        attributes = NativeAttributeTable(
+            device_table=plc.Table.from_arrow(table),
+            index_override=index,
+            column_override=tuple(table.column_names),
+            schema_override=table.schema,
+        )
+    attach_native_state(
+        gdf,
+        NativeFrameState.from_native_tabular_result(
+            NativeTabularResult(
+                attributes=attributes,
+                geometry=GeometryNativeResult.from_owned(owned, crs=None),
+                geometry_name="geometry",
+                column_order=(*table.column_names, "geometry"),
+            )
+        ),
+    )
+    return gdf
+
+
+@pytest.mark.parametrize(
+    ("keep", "expected_positions"),
+    [
+        pytest.param("first", [1], id="first"),
+        pytest.param("last", [4], id="last"),
+        pytest.param("all", [1, 2, 4], id="all"),
+    ],
+)
+def test_geodataframe_topk_refines_primary_skew_and_exact_ties_device_native(
+    keep: str,
+    expected_positions: list[int],
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device top-k")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    table = pa.table(
+        {
+            "primary": pa.array([10, 10, 10, 10, 10], type=pa.int64()),
+            "secondary": pa.array([2, 3, 3, 1, 3], type=pa.int64()),
+            "source_position": pa.array(range(5), type=pa.int64()),
+        }
+    )
+    gdf = _device_topk_frame(table, composed=True)
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+    clear_dispatch_events()
+    clear_fallback_events()
+
+    with assert_zero_d2h_transfers():
+        selected = gdf.nlargest(1, ["primary", "secondary"], keep=keep)
+        selected_state = get_native_state(selected)
+
+    assert selected_state is not None
+    assert selected_state.attributes.is_device_backed
+    assert selected["source_position"].tolist() == expected_positions
+    assert selected.index.tolist() == [gdf.index[position] for position in expected_positions]
+    assert get_fallback_events(clear=True) == []
+    assert [event.implementation for event in get_dispatch_events(clear=True)] == [
+        "native_device_topk_rowset"
+    ]
+    reset_d2h_transfer_count()
+
+
+@pytest.mark.parametrize(
+    ("columns", "n", "expected_positions"),
+    [
+        pytest.param(["a", "b"], 3, [0, 1, 3], id="multikey-truncated-boundary"),
+        pytest.param(["a", "b"], 4, [0, 1, 2, 3], id="multikey-full-boundary"),
+        pytest.param(["single"], 3, [1, 0, 2], id="single-key-reverses-selected-ties"),
+    ],
+)
+def test_geodataframe_topk_keep_last_matches_pandas_recursive_tie_order(
+    columns: list[str],
+    n: int,
+    expected_positions: list[int],
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device top-k tie ordering")
+    table = pa.table(
+        {
+            "a": pa.array([3, 3, 2, 2, 1], type=pa.int64()),
+            "b": pa.array([7, 7, 5, 5, 0], type=pa.int64()),
+            "single": pa.array([4, 4, 3, 2, 1], type=pa.int64()),
+            "source_position": pa.array(range(5), type=pa.int64()),
+        }
+    )
+    gdf = _device_topk_frame(table)
+
+    selected = gdf.nlargest(n, columns, keep="last")
+
+    assert selected["source_position"].tolist() == expected_positions
+
+
+@pytest.mark.parametrize(
+    "key_array",
+    [
+        pytest.param(
+            pa.array([3, None, 2, None, 1], type=pa.int64()),
+            id="nullable-int64",
+        ),
+        pytest.param(
+            pa.array(
+                [
+                    pd.Timestamp("2026-01-03"),
+                    None,
+                    pd.Timestamp("2026-01-02"),
+                    None,
+                    pd.Timestamp("2026-01-01"),
+                ],
+                type=pa.timestamp("ns"),
+            ),
+            id="nullable-timestamp",
+        ),
+        pytest.param(
+            pa.array([True, None, False, None, True], type=pa.bool_()),
+            id="nullable-bool",
+        ),
+    ],
+)
+@pytest.mark.parametrize("method", ["nlargest", "nsmallest"])
+def test_geodataframe_topk_nullable_fixed_width_matches_pandas(
+    key_array: pa.Array,
+    method: str,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for nullable device top-k")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    table = pa.table(
+        {
+            "key": key_array,
+            "source_position": pa.array(range(len(key_array)), type=pa.int64()),
+        }
+    )
+    gdf = _device_topk_frame(table)
+    reference = table.to_pandas()
+    if pa.types.is_boolean(key_array.type):
+        reference["key"] = pd.array(key_array.to_pylist(), dtype="boolean")
+    expected = getattr(reference, method)(4, "key", keep="first")
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+    clear_fallback_events()
+
+    with assert_zero_d2h_transfers():
+        selected = getattr(gdf, method)(4, "key", keep="first")
+        selected_state = get_native_state(selected)
+
+    assert selected_state is not None
+    assert selected["source_position"].tolist() == expected["source_position"].tolist()
+    assert get_fallback_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+@pytest.mark.parametrize("n", [0, 20])
+def test_geodataframe_topk_empty_and_full_selection_stay_device_native(n: int) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for boundary device top-k")
+    table = pa.table(
+        {
+            "key": pa.array([2, None, 1], type=pa.int64()),
+            "source_position": pa.array(range(3), type=pa.int64()),
+        }
+    )
+    gdf = _device_topk_frame(table)
+
+    selected = gdf.nsmallest(n, "key", keep="last")
+    expected = table.to_pandas().nsmallest(n, "key", keep="last")
+
+    assert get_native_state(selected) is not None
+    assert selected["source_position"].tolist() == expected["source_position"].tolist()
+
+
+def test_geodataframe_topk_admission_precedes_row_view_gather_and_strict_rejects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device top-k admission")
+    from vibespatial.api import geodataframe as geodataframe_module
+    from vibespatial.cuda._runtime import DeviceMemoryAdmission, get_cuda_runtime
+    from vibespatial.testing import strict_native_environment
+
+    table = pa.table(
+        {
+            "key": pa.array([3, 2, 1], type=pa.int64()),
+            "source_position": pa.array(range(3), type=pa.int64()),
+        }
+    )
+    gdf = _device_topk_frame(table)
+    state = get_native_state(gdf)
+    assert state is not None
+    runtime = get_cuda_runtime()
+    admission_calls = []
+
+    def _decline(*, stage, required_bytes, requested_units=0):
+        admission_calls.append((stage, required_bytes, requested_units))
+        return DeviceMemoryAdmission(
+            stage=stage,
+            required_bytes=required_bytes,
+            remaining_bytes=0,
+            budget_bytes=0,
+            admitted=False,
+            requested_units=requested_units,
+            admitted_units=0,
+            bytes_per_unit=required_bytes,
+        )
+
+    monkeypatch.setattr(runtime, "admit_device_memory", _decline)
+    monkeypatch.setattr(
+        NativeAttributeTable,
+        "to_pylibcudf_columns",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("declined top-k must not gather logical keys")
+        ),
+    )
+
+    assert geodataframe_module._native_topk_rowset(
+        gdf,
+        1,
+        "key",
+        largest=True,
+        keep="first",
+    ) is None
+    assert admission_calls and admission_calls[0][0] == "tabular-topk"
+    clear_fallback_events()
+    with strict_native_environment(), pytest.raises(StrictNativeFallbackError):
+        gdf.nlargest(1, "key")
+    assert [event.surface for event in get_fallback_events(clear=True)] == [
+        "geopandas.geodataframe.nlargest"
+    ]
+
+
 def test_datetime_component_host_fallback_is_observable_and_strict_rejects() -> None:
     from vibespatial.testing import strict_native_environment
 
@@ -1823,6 +2108,7 @@ def test_native_attribute_reset_index_preserves_numeric_device_payload_without_r
     )
     reset_d2h_transfer_count()
     clear_materialization_events()
+    clear_dispatch_events()
 
     with assert_zero_d2h_transfers():
         reset, leading_columns, trailing_columns = attributes.reset_index_deferred()
@@ -2238,6 +2524,84 @@ def test_native_attribute_arrow_export_uses_physical_extension_dtypes() -> None:
     }
 
 
+def test_projected_frame_arrow_export_lowers_mixed_native_index_label_column() -> None:
+    from vibespatial.api._native_public_arrays import (
+        NativeAttributeColumnArray,
+        NativeIndexLabelsArray,
+    )
+
+    source_attributes = NativeAttributeTable(
+        arrow_table=pa.table({"region": ["north", "south"]}),
+        index_override=pd.RangeIndex(2),
+    )
+    label_plan = NativeIndexPlan.from_index(pd.Index([200, 100])).with_selection(
+        np.asarray([1, 0], dtype=np.int64),
+        source_token="projected-frame-source",
+        source_row_count=2,
+        unique=True,
+    )
+    frames = [
+        pd.DataFrame(
+            {
+                "region": NativeAttributeColumnArray(
+                    source_attributes,
+                    "region",
+                )
+            }
+        ),
+        pd.DataFrame(
+            {
+                "parcel_id": NativeIndexLabelsArray(label_plan),
+                "score": pd.array([1.5, 2.5], dtype="Float64"),
+            }
+        ),
+    ]
+
+    attributes = _native_attribute_table_from_projected_frames(
+        frames,
+        index_override=pd.RangeIndex(2),
+    )
+    exported = attributes.to_arrow(index=False)
+
+    assert exported.column_names == ["region", "parcel_id", "score"]
+    assert exported.to_pydict() == {
+        "region": ["north", "south"],
+        "parcel_id": [200, 100],
+        "score": [1.5, 2.5],
+    }
+    assert b"vibespatial_" not in (exported.schema.metadata or {}).get(b"pandas", b"")
+
+
+def test_projected_frame_arrow_export_lowers_generic_native_index_label_column() -> None:
+    from vibespatial.api._native_public_arrays import NativeIndexLabelsArray
+
+    label_plan = NativeIndexPlan.from_index(pd.Index([300, 400])).with_selection(
+        np.asarray([0, 1], dtype=np.int64),
+        source_token="generic-projected-frame-source",
+        source_row_count=2,
+        unique=True,
+    )
+    frame = pd.DataFrame(
+        {
+            "parcel_id": NativeIndexLabelsArray(label_plan),
+            "zone": pd.array(["west", "east"], dtype="string"),
+        }
+    )
+
+    attributes = _native_attribute_table_from_projected_frames(
+        [frame],
+        index_override=pd.RangeIndex(2),
+    )
+    exported = attributes.to_arrow(index=False)
+
+    assert exported.column_names == ["parcel_id", "zone"]
+    assert exported.to_pydict() == {
+        "parcel_id": [300, 400],
+        "zone": ["west", "east"],
+    }
+    assert b"vibespatial_" not in (exported.schema.metadata or {}).get(b"pandas", b"")
+
+
 def test_native_attribute_array_vector_indexing_preserves_extension_blocks() -> None:
     from vibespatial.api._native_public_arrays import NativeAttributeColumnArray
 
@@ -2304,6 +2668,7 @@ def test_native_attribute_table_reports_device_dtype_policies_without_runtime_d2
                 pd.to_datetime(["2020-01-01", "2020-01-02", "2020-01-03"]),
                 type=pa.timestamp("us"),
             ),
+            "nothing": pa.nulls(3),
         }
     )
     attributes = NativeAttributeTable(
@@ -2327,15 +2692,29 @@ def test_native_attribute_table_reports_device_dtype_policies_without_runtime_d2
     assert policies["score"].category == "all-valid-numeric-bool"
     assert policies["score"].can_compute_numeric is True
     assert policies["score"].can_sort is True
+    assert policies["score"].can_distinct is True
+    assert policies["score"].can_grouped_nth is True
     assert policies["flag"].category == "all-valid-numeric-bool"
     assert policies["maybe"].category == "nullable-numeric-bool-movement-only"
     assert policies["maybe"].can_compute_numeric is False
+    assert policies["maybe"].can_distinct is True
+    assert policies["maybe"].can_grouped_nth is True
     assert policies["category"].category == "categorical-movement-only"
     assert policies["category"].can_sort is True
+    assert policies["category"].can_distinct is True
+    assert policies["category"].can_grouped_nth is True
     assert policies["name"].category == "string-movement-only"
     assert policies["name"].can_sort is True
+    assert policies["name"].can_distinct is True
+    assert policies["name"].can_grouped_nth is True
     assert policies["when"].category == "datetime-movement-only"
     assert policies["when"].can_sort is True
+    assert policies["when"].can_distinct is True
+    assert policies["when"].can_grouped_nth is True
+    assert policies["nothing"].category == "null-movement-only"
+    assert policies["nothing"].can_sort is False
+    assert policies["nothing"].can_distinct is False
+    assert policies["nothing"].can_grouped_nth is False
     assert numeric is not None
     assert nullable_numeric is None
     assert categorical_numeric is None
@@ -2415,6 +2794,221 @@ def test_native_attribute_table_grouped_device_take_columns_preserve_non_numeric
     ]
     assert exported["category"].astype(str).tolist() == ["c1", "c0"]
     reset_d2h_transfer_count()
+
+
+@pytest.mark.parametrize(
+    ("reducer", "expected_labels", "expected_categories", "expected_when"),
+    [
+        (
+            "first",
+            ["alpha", "charlie", None, None],
+            ["c0", "c2", None, None],
+            [pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-03"), pd.NaT, pd.NaT],
+        ),
+        (
+            "last",
+            ["bravo", "charlie", None, None],
+            ["c1", "c2", None, None],
+            [pd.Timestamp("2020-01-02"), pd.Timestamp("2020-01-03"), pd.NaT, pd.NaT],
+        ),
+    ],
+)
+def test_native_attribute_table_grouped_device_take_columns_skip_nulls_and_dense_groups(
+    reducer: str,
+    expected_labels: list[str | None],
+    expected_categories: list[str | None],
+    expected_when: list[pd.Timestamp],
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for nullable device grouped attribute takes")
+
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    source = pa.table(
+        {
+            "label": pa.array(
+                [None, "alpha", "bravo", None, "charlie", None],
+                type=pa.string(),
+            ),
+            "category": pa.array(
+                [None, "c0", "c1", None, "c2", None],
+                type=pa.dictionary(pa.int8(), pa.string()),
+            ),
+            "when": pa.array(
+                [
+                    None,
+                    pd.Timestamp("2020-01-01"),
+                    pd.Timestamp("2020-01-02"),
+                    None,
+                    pd.Timestamp("2020-01-03"),
+                    None,
+                ],
+                type=pa.timestamp("us"),
+            ),
+        }
+    )
+    physical = NativeAttributeTable(
+        device_table=plc.Table.from_arrow(source),
+        index_override=pd.RangeIndex(6),
+        column_override=tuple(source.column_names),
+        schema_override=source.schema,
+    )
+    attributes = physical.take(
+        cp.asarray([5, 1, 2, 0, 4, 3], dtype=cp.int32),
+        preserve_index=False,
+    )
+    output_index = pd.CategoricalIndex(
+        pd.Categorical(
+            ["g0", "g1", "g2", "g3"],
+            categories=["g0", "g1", "g2", "g3"],
+        ),
+        name="group",
+    )
+    grouped = NativeGrouped.from_dense_codes(
+        cp.asarray([0, 0, 0, 1, 1, 2], dtype=cp.int32),
+        group_count=4,
+        output_index=output_index,
+    )
+
+    assert attributes.row_positions is not None
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+    with assert_zero_d2h_transfers():
+        reduced = attributes.grouped_device_take_columns(
+            grouped,
+            {"label": reducer, "category": reducer, "when": reducer},
+        )
+
+    assert reduced is not None
+    assert reduced.device_table is not None
+    assert reduced.row_positions is None
+    pd.testing.assert_index_equal(reduced.index, output_index)
+    assert reduced.schema_override is not None
+    assert reduced.schema_override.field("label").type == pa.string()
+    assert reduced.schema_override.field("category").type == source.schema.field(
+        "category"
+    ).type
+    assert reduced.schema_override.field("when").type == pa.timestamp("us")
+    assert get_materialization_events(clear=True) == []
+
+    exported = reduced.to_pandas()
+    assert exported["label"].tolist()[:2] == expected_labels[:2]
+    assert exported["label"].isna().tolist() == [False, False, True, True]
+    assert exported["category"].astype(object).tolist()[:2] == expected_categories[:2]
+    assert exported["category"].isna().tolist() == [False, False, True, True]
+    assert isinstance(exported["category"].dtype, pd.CategoricalDtype)
+    assert exported["when"].tolist()[:2] == expected_when[:2]
+    assert exported["when"].isna().tolist() == [False, False, True, True]
+    assert pd.api.types.is_datetime64_any_dtype(exported["when"].dtype)
+    reset_d2h_transfer_count()
+
+
+def test_native_attribute_table_grouped_device_take_columns_preserve_empty_schema() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for empty device grouped attribute takes")
+
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    source = pa.table(
+        {
+            "label": pa.array([], type=pa.string()),
+            "when": pa.array([], type=pa.timestamp("us")),
+        }
+    )
+    attributes = NativeAttributeTable(
+        device_table=plc.Table.from_arrow(source),
+        index_override=pd.RangeIndex(0),
+        column_override=tuple(source.column_names),
+        schema_override=source.schema,
+    )
+    output_index = pd.Index([], dtype="object", name="group")
+    grouped = NativeGrouped.from_dense_codes(
+        cp.empty(0, dtype=cp.int32),
+        group_count=0,
+        output_index=output_index,
+    )
+
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+    with assert_zero_d2h_transfers():
+        reduced = attributes.grouped_device_take_columns(
+            grouped,
+            {"label": "first", "when": "last"},
+        )
+
+    assert reduced is not None
+    assert reduced.device_table is not None
+    assert len(reduced) == 0
+    pd.testing.assert_index_equal(reduced.index, output_index)
+    assert reduced.schema_override == source.schema
+    assert get_materialization_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_native_attribute_table_grouped_device_take_columns_honors_admission_decline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for grouped attribute admission")
+
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+    from vibespatial.cuda._runtime import DeviceMemoryAdmission, get_cuda_runtime
+
+    source = pa.table({"label": pa.array([None, "alpha"], type=pa.string())})
+    attributes = NativeAttributeTable(
+        device_table=plc.Table.from_arrow(source),
+        index_override=pd.RangeIndex(2),
+        column_override=("label",),
+        schema_override=source.schema,
+    )
+    grouped = NativeGrouped.from_dense_codes(
+        cp.asarray([0, 0], dtype=cp.int32),
+        group_count=1,
+    )
+    runtime = get_cuda_runtime()
+    admission_calls = []
+
+    def _decline_grouped_take(*, stage, required_bytes, requested_units=0):
+        admission_calls.append((stage, required_bytes, requested_units))
+        return DeviceMemoryAdmission(
+            stage=stage,
+            required_bytes=required_bytes,
+            remaining_bytes=0,
+            budget_bytes=0,
+            admitted=False,
+            requested_units=requested_units,
+            admitted_units=0,
+            bytes_per_unit=required_bytes,
+        )
+
+    def _fail_groupby(*_args, **_kwargs):
+        raise AssertionError("declined grouped take must not construct a groupby")
+
+    monkeypatch.setattr(runtime, "admit_device_memory", _decline_grouped_take)
+    monkeypatch.setattr(plc.groupby, "GroupBy", _fail_groupby)
+
+    reduced = attributes.grouped_device_take_columns(
+        grouped,
+        {"label": "first"},
+    )
+
+    assert reduced is None
+    assert len(admission_calls) == 1
+    stage, required_bytes, requested_units = admission_calls[0]
+    assert stage == "tabular-grouped-first-last"
+    assert required_bytes >= 1 << 20
+    assert requested_units == 2
 
 
 def test_native_attribute_table_concat_preserves_device_payload_without_runtime_d2h() -> None:
@@ -5495,13 +6089,25 @@ def test_public_spatial_index_query_relation_reuses_native_index_cache() -> None
     np.testing.assert_array_equal(relation.right_indices, np.asarray([0, 1], dtype=np.int32))
     np.testing.assert_array_equal(relation_again.left_indices, relation.left_indices)
     np.testing.assert_array_equal(relation_again.right_indices, relation.right_indices)
+    semijoin_count = int(_host_array(semijoin.logical_count, dtype=np.int64)[0])
+    assert semijoin_count == 2
     np.testing.assert_array_equal(
-        _host_array(semijoin.positions, dtype=np.int64),
+        _host_array(semijoin.positions[:semijoin_count], dtype=np.int64),
         np.asarray([0, 2], dtype=np.int64),
     )
     np.testing.assert_array_equal(
-        _host_array(antijoin.positions, dtype=np.int64),
+        _host_array(semijoin.partition_capacity_positions(), dtype=np.int64),
+        np.asarray([0, 2, 1], dtype=np.int64),
+    )
+    antijoin_count = int(_host_array(antijoin.logical_count, dtype=np.int64)[0])
+    assert antijoin_count == 1
+    np.testing.assert_array_equal(
+        _host_array(antijoin.positions[:antijoin_count], dtype=np.int64),
         np.asarray([1], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(
+        _host_array(antijoin.partition_capacity_positions(), dtype=np.int64),
+        np.asarray([1, 0, 2], dtype=np.int64),
     )
     np.testing.assert_array_equal(
         _host_array(counts.values, dtype=np.int64),
@@ -8049,6 +8655,202 @@ def test_relation_join_export_result_can_build_device_attribute_frame_with_dista
     reset_d2h_transfer_count()
 
 
+def test_public_sjoin_transiently_lowers_owned_sources_with_on_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for transient relation source lowering")
+    pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+
+    left_index = pd.RangeIndex(10, 12, name="left_id")
+    right_index = pd.RangeIndex(20, 22, name="right_id")
+    left = GeoDataFrame(
+        {
+            "zone": ["a", "b"],
+            "value": [1, 2],
+            "nullable": pd.array([1, None], dtype="Int64"),
+            "geometry": GeoSeries.from_wkt(
+                ["POINT (0 0)", "POINT (2 0)"],
+                index=left_index,
+                name="geometry",
+            ),
+        },
+        index=left_index,
+    )
+    right = GeoDataFrame(
+        {
+            "zone": ["a", "b"],
+            "value": [10, 20],
+            "label": pd.array(["x", None], dtype="string"),
+            "geometry": GeoSeries.from_wkt(
+                [
+                    "POLYGON ((-1 -1, 1 -1, 1 1, -1 1, -1 -1))",
+                    "POLYGON ((1 -1, 3 -1, 3 1, 1 1, 1 -1))",
+                ],
+                index=right_index,
+                name="geometry",
+            ),
+        },
+        index=right_index,
+    )
+    assert get_native_state(left) is None
+    assert get_native_state(right) is None
+
+    def _fail_relation_host_export(self, **kwargs):
+        raise AssertionError("transient relation lowering must not export pair rows")
+
+    monkeypatch.setattr(RelationIndexResult, "to_host", _fail_relation_host_export)
+    joined = geopandas.sjoin(
+        left,
+        right,
+        how="inner",
+        predicate="intersects",
+        lsuffix="L",
+        rsuffix="R",
+        on_attribute="zone",
+    )
+    joined_state = get_native_state(joined)
+
+    assert joined.index.tolist() == [10, 11]
+    assert tuple(joined.columns) == (
+        "zone",
+        "value_L",
+        "nullable",
+        "geometry",
+        "right_id",
+        "value_R",
+        "label",
+    )
+    assert joined["right_id"].tolist() == [20, 21]
+    assert joined["value_L"].tolist() == [1, 2]
+    assert joined["value_R"].tolist() == [10, 20]
+    assert joined["nullable"].isna().tolist() == [False, True]
+    assert joined["label"].isna().tolist() == [False, True]
+    assert joined_state is not None
+    assert joined_state.index_plan.kind == "range"
+    assert joined_state.column_order == tuple(joined.columns)
+    assert NativeAttributeTable.from_value(joined_state.attributes).is_device_backed
+
+
+def test_public_sjoin_nearest_transiently_lowers_owned_sources_with_distance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for transient nearest source lowering")
+    pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+
+    left_index = pd.RangeIndex(30, 32, name="left_id")
+    right_index = pd.RangeIndex(40, 42, name="right_id")
+    left = GeoDataFrame(
+        {
+            "zone": ["a", "b"],
+            "value": [1, 2],
+            "geometry": GeoSeries.from_wkt(
+                ["POINT (0 0)", "POINT (10 0)"],
+                index=left_index,
+                name="geometry",
+            ),
+        },
+        index=left_index,
+    )
+    right = GeoDataFrame(
+        {
+            "zone": ["a", "b"],
+            "value": [10, 20],
+            "label": pd.array(["x", None], dtype="string"),
+            "geometry": GeoSeries.from_wkt(
+                ["POINT (1 0)", "POINT (12 0)"],
+                index=right_index,
+                name="geometry",
+            ),
+        },
+        index=right_index,
+    )
+    assert get_native_state(left) is None
+    assert get_native_state(right) is None
+
+    def _fail_relation_host_export(self, **kwargs):
+        raise AssertionError("transient nearest lowering must not export pair rows")
+
+    monkeypatch.setattr(RelationIndexResult, "to_host", _fail_relation_host_export)
+    joined = geopandas.sjoin_nearest(
+        left,
+        right,
+        how="inner",
+        lsuffix="L",
+        rsuffix="R",
+        distance_col="distance",
+    )
+    joined_state = get_native_state(joined)
+
+    assert joined.index.tolist() == [30, 31]
+    assert tuple(joined.columns) == (
+        "zone_L",
+        "value_L",
+        "geometry",
+        "right_id",
+        "zone_R",
+        "value_R",
+        "label",
+        "distance",
+    )
+    assert joined["right_id"].tolist() == [40, 41]
+    assert np.issubdtype(joined["right_id"].dtype, np.integer)
+    assert joined["label"].isna().tolist() == [False, True]
+    assert joined["distance"].tolist() == [1.0, 2.0]
+    assert joined_state is not None
+    assert joined_state.index_plan.kind == "range"
+    assert joined_state.column_order == tuple(joined.columns)
+    assert NativeAttributeTable.from_value(joined_state.attributes).is_device_backed
+
+
+def test_public_sjoin_transient_state_suffixes_colliding_output_index_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for transient relation index naming")
+    pytest.importorskip("cupy")
+    pytest.importorskip("pylibcudf")
+
+    left_index = pd.Index(["a", "b"], name="myidx")
+    left = GeoDataFrame(
+        {
+            "geometry": GeoSeries(
+                [Point(1, 1), Point(2, 2)],
+                index=left_index,
+            )
+        },
+        index=left_index,
+    )
+    right = GeoDataFrame(
+        {
+            "myidx": [1, 2],
+            "geometry": GeoSeries([Point(1, 1), Point(2, 2)]),
+        }
+    )
+
+    def _fail_relation_host_export(self, **kwargs):
+        raise AssertionError("native join index naming must not export relation pairs")
+
+    monkeypatch.setattr(RelationIndexResult, "to_host", _fail_relation_host_export)
+    joined = geopandas.sjoin(left, right, how="inner")
+    joined_state = get_native_state(joined)
+
+    assert joined.index.tolist() == ["a", "b"]
+    assert joined.index.name == "myidx_left"
+    assert tuple(joined.columns) == (
+        "geometry",
+        "index_right",
+        "myidx_right",
+    )
+    assert joined_state is not None
+    assert joined_state.index_plan.name == "myidx_left"
+    assert joined_state.index_plan.to_public_index().name == "myidx_left"
+    assert NativeAttributeTable.from_value(joined_state.attributes).is_device_backed
+
+
 def test_public_sjoin_export_attaches_joined_private_native_state() -> None:
     left = GeoDataFrame(
         {
@@ -10232,6 +11034,58 @@ def _native_backed_geodataframe_only() -> GeoDataFrame:
     return gdf
 
 
+def _device_native_expression_geodataframe(
+    values: list[int] | None = None,
+) -> GeoDataFrame:
+    plc = pytest.importorskip("pylibcudf")
+    source_values = [1, 2, 3] if values is None else values
+    owned = from_shapely_geometries(
+        [Point(position, position) for position in range(len(source_values))],
+        residency=Residency.DEVICE,
+    )
+    arrow = pa.table(
+        {
+            "value": pa.array(source_values, type=pa.int64()),
+            "other": pa.array(
+                [position + 10 for position in range(len(source_values))],
+                type=pa.int64(),
+            ),
+        }
+    )
+    index = pd.Index(
+        [100 + position for position in range(len(source_values))],
+        name="source_id",
+    )
+    gdf = GeoDataFrame(
+        {
+            "value": source_values,
+            "other": [position + 10 for position in range(len(source_values))],
+            "geometry": GeoSeries(
+                DeviceGeometryArray._from_owned(owned),
+                index=index,
+                name="geometry",
+            ),
+        },
+        index=index,
+    )
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=NativeAttributeTable(
+                device_table=plc.Table.from_arrow(arrow),
+                index_override=index,
+                column_override=tuple(arrow.column_names),
+                schema_override=arrow.schema,
+            ),
+            geometry=GeometryNativeResult.from_owned(owned, crs=None),
+            geometry_name="geometry",
+            column_order=("value", "other", "geometry"),
+            index_plan=NativeIndexPlan.from_index(index),
+        )
+    )
+    attach_native_state(gdf, state)
+    return gdf
+
+
 def _native_backed_nullable_geodataframe() -> GeoDataFrame:
     gdf = GeoDataFrame(
         {
@@ -10278,6 +11132,16 @@ def _attach_two_geometry_native_tabular_state(
             arrow_table=pa.Table.from_pandas(non_geometry, preserve_index=False),
             index_override=gdf.index,
             column_override=tuple(non_geometry.columns),
+        )
+    elif attribute_storage == "device":
+        import pylibcudf as plc
+
+        arrow_table = pa.Table.from_pandas(non_geometry, preserve_index=False)
+        attributes = NativeAttributeTable(
+            device_table=plc.Table.from_arrow(arrow_table),
+            index_override=gdf.index,
+            column_override=tuple(non_geometry.columns),
+            schema_override=arrow_table.schema,
         )
     else:
         raise ValueError(f"unsupported attribute storage {attribute_storage!r}")
@@ -12737,6 +13601,210 @@ def test_geodataframe_drop_duplicates_lazy_native_columns_preserves_device_rowfl
     reset_d2h_transfer_count()
 
 
+@pytest.mark.parametrize(
+    "key_array",
+    [
+        pytest.param(
+            pa.array([1, None, 2, None, 1, 3], type=pa.int64()),
+            id="nullable-int64",
+        ),
+        pytest.param(
+            pa.array(["x", None, "y", None, "x", "z"], type=pa.string()),
+            id="string",
+        ),
+        pytest.param(
+            pa.array(
+                [
+                    pd.Timestamp("2026-01-01"),
+                    None,
+                    pd.Timestamp("2026-01-02"),
+                    None,
+                    pd.Timestamp("2026-01-01"),
+                    pd.Timestamp("2026-01-03"),
+                ],
+                type=pa.timestamp("ns"),
+            ),
+            id="datetime",
+        ),
+        pytest.param(
+            pa.array(
+                pd.Categorical(
+                    ["x", None, "y", None, "x", "z"],
+                    categories=["x", "y", "z"],
+                )
+            ),
+            id="categorical",
+        ),
+        pytest.param(
+            pa.array([1.0, np.nan, 2.0, np.nan, 1.0, 3.0], type=pa.float64()),
+            id="float-nan",
+        ),
+        pytest.param(
+            pa.array([1.0, None, 2.0, np.nan, 1.0, 3.0], type=pa.float64()),
+            id="float-null-nan",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("keep", "expected_positions"),
+    [
+        pytest.param("first", [0, 1, 2, 5], id="first"),
+        pytest.param("last", [2, 3, 4, 5], id="last"),
+        pytest.param(False, [2, 5], id="none"),
+    ],
+)
+def test_geodataframe_drop_duplicates_device_dtype_breadth_stays_native_until_export(
+    key_array: pa.Array,
+    keep: str | bool,
+    expected_positions: list[int],
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device native dtype deduplication")
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    arrow = pa.table(
+        {
+            "key": key_array,
+            "source_position": pa.array(range(len(key_array)), type=pa.int64()),
+        }
+    )
+    owned = from_shapely_geometries(
+        [Point(position, position) for position in range(len(key_array))],
+        residency=Residency.DEVICE,
+    )
+    public_attributes = arrow.to_pandas()
+    gdf = GeoDataFrame(
+        {
+            "key": public_attributes["key"],
+            "source_position": public_attributes["source_position"],
+            "geometry": GeoSeries(DeviceGeometryArray._from_owned(owned), name="geometry"),
+        }
+    )
+    attach_native_state(
+        gdf,
+        NativeFrameState.from_native_tabular_result(
+            NativeTabularResult(
+                attributes=NativeAttributeTable(
+                    device_table=plc.Table.from_arrow(arrow),
+                    index_override=pd.RangeIndex(len(key_array)),
+                    column_override=tuple(arrow.column_names),
+                    schema_override=arrow.schema,
+                ),
+                geometry=GeometryNativeResult.from_owned(owned, crs=None),
+                geometry_name="geometry",
+                column_order=("key", "source_position", "geometry"),
+            )
+        ),
+    )
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+    clear_dispatch_events()
+
+    with assert_zero_d2h_transfers():
+        deduped = gdf.drop_duplicates("key", keep=keep)
+        deduped_state = get_native_state(deduped)
+        assert deduped_state is not None
+        assert deduped_state.attributes.is_device_backed
+        assert deduped_state.attributes.row_positions is not None
+        result_positions = cp.asarray(deduped_state.attributes.row_positions)
+
+    assert cp.asnumpy(result_positions).tolist() == expected_positions
+    assert get_materialization_events(clear=True) == []
+    dispatch_events = get_dispatch_events(clear=True)
+    assert [event.implementation for event in dispatch_events] == [
+        "native_device_distinct_rowset"
+    ]
+
+    exported = deduped_state.attributes.to_arrow(index=False)
+    assert exported["source_position"].to_pylist() == expected_positions
+    assert exported.schema.field("key").type == key_array.type
+    export_events = get_materialization_events(clear=True)
+    assert [event.operation for event in export_events] == ["device_attributes_to_arrow"]
+    assert all(event.d2h_transfer for event in export_events)
+    reset_d2h_transfer_count()
+
+
+def test_geodataframe_drop_duplicates_device_admission_decline_skips_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device distinct admission")
+    plc = pytest.importorskip("pylibcudf")
+    from vibespatial.cuda._runtime import DeviceMemoryAdmission, get_cuda_runtime
+
+    arrow = pa.table(
+        {
+            "key": pa.array(["x", "x", "y"], type=pa.string()),
+            "source_position": pa.array([0, 1, 2], type=pa.int64()),
+        }
+    )
+    owned = from_shapely_geometries(
+        [Point(0, 0), Point(1, 1), Point(2, 2)],
+        residency=Residency.DEVICE,
+    )
+    gdf = GeoDataFrame(
+        {
+            "key": ["x", "x", "y"],
+            "source_position": [0, 1, 2],
+            "geometry": GeoSeries(DeviceGeometryArray._from_owned(owned), name="geometry"),
+        }
+    )
+    attach_native_state(
+        gdf,
+        NativeFrameState.from_native_tabular_result(
+            NativeTabularResult(
+                attributes=NativeAttributeTable(
+                    device_table=plc.Table.from_arrow(arrow),
+                    index_override=pd.RangeIndex(3),
+                    column_override=tuple(arrow.column_names),
+                    schema_override=arrow.schema,
+                ),
+                geometry=GeometryNativeResult.from_owned(owned, crs=None),
+                geometry_name="geometry",
+                column_order=("key", "source_position", "geometry"),
+            )
+        ),
+    )
+    runtime = get_cuda_runtime()
+    admission_calls = []
+
+    def _decline_distinct(*, stage, required_bytes, requested_units=0):
+        admission_calls.append((stage, required_bytes, requested_units))
+        return DeviceMemoryAdmission(
+            stage=stage,
+            required_bytes=required_bytes,
+            remaining_bytes=0,
+            budget_bytes=0,
+            admitted=False,
+            requested_units=requested_units,
+            admitted_units=0,
+            bytes_per_unit=required_bytes,
+        )
+
+    monkeypatch.setattr(runtime, "admit_device_memory", _decline_distinct)
+
+    def _fail_distinct(*_args, **_kwargs):
+        raise AssertionError("declined tabular distinct must not launch")
+
+    monkeypatch.setattr(plc.stream_compaction, "distinct_indices", _fail_distinct)
+
+    from vibespatial.api import geodataframe as geodataframe_module
+
+    rowset = geodataframe_module._native_drop_duplicates_rowset(gdf, "key", "first")
+
+    assert rowset is None
+    assert len(admission_calls) == 1
+    stage, required_bytes, requested_units = admission_calls[0]
+    assert stage == "tabular-distinct"
+    assert required_bytes >= 1 << 20
+    assert requested_units == 3
+
+
 def test_geodataframe_identity_native_drop_duplicates_rebuilds_without_lazy_column_export() -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for native lazy identity drop_duplicates")
@@ -14767,6 +15835,98 @@ def test_geodataframe_sort_dedupe_composes_native_attribute_row_view() -> None:
     reset_d2h_transfer_count()
 
 
+def test_geodataframe_sort_dedupe_accepts_composed_device_attribute_tables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for composed device attribute sorting")
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    geodataframe_module = importlib.import_module("vibespatial.api.geodataframe")
+    owned = from_shapely_geometries(
+        [Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3)],
+        residency=Residency.DEVICE,
+    )
+    index = pd.RangeIndex(4)
+
+    def _device_part(name: str, values) -> NativeAttributeTable:
+        arrow = pa.table({name: values})
+        return NativeAttributeTable(
+            device_table=plc.Table.from_arrow(arrow),
+            index_override=index,
+            column_override=(name,),
+            schema_override=arrow.schema,
+        )
+
+    attributes = NativeAttributeTable(
+        parts=(
+            _device_part("left_key", pa.array([2, 1, 1, 2], type=pa.int64())),
+            _device_part("right_key", pa.array([3, 4, 2, 1], type=pa.int64())),
+            _device_part("label", pa.array(["a", "b", None, "d"])),
+        ),
+        index_override=index,
+        column_override=("left_key", "right_key", "label"),
+    )
+    gdf = GeoDataFrame(
+        {
+            "left_key": [2, 1, 1, 2],
+            "right_key": [3, 4, 2, 1],
+            "label": ["a", "b", None, "d"],
+            "geometry": GeoSeries(DeviceGeometryArray._from_owned(owned), name="geometry"),
+        }
+    )
+    attach_native_state(
+        gdf,
+        NativeFrameState.from_native_tabular_result(
+            NativeTabularResult(
+                attributes=attributes,
+                geometry=GeometryNativeResult.from_owned(owned, crs=None),
+                geometry_name="geometry",
+                column_order=("left_key", "right_key", "label", "geometry"),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        geodataframe_module,
+        "_cupy_native_sort_positions",
+        lambda *_args, **_kwargs: None,
+    )
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+    clear_dispatch_events()
+
+    with assert_zero_d2h_transfers():
+        sorted_gdf = gdf.sort_values(
+            ["left_key", "right_key"],
+            kind="stable",
+        )
+        sorted_state = get_native_state(sorted_gdf)
+        deduped = sorted_gdf.drop_duplicates("left_key", keep="first")
+        deduped_state = get_native_state(deduped)
+        key_values = deduped_state.attributes.numeric_column_arrays(
+            ("left_key", "right_key")
+        )
+
+    assert sorted_state is not None
+    assert sorted_state.attributes.parts is not None
+    assert deduped_state is not None
+    assert deduped_state.attributes.parts is not None
+    assert key_values is not None
+    assert cp.asnumpy(key_values["left_key"]).tolist() == [1, 2]
+    assert cp.asnumpy(key_values["right_key"]).tolist() == [2, 1]
+    assert get_materialization_events(clear=True) == []
+    assert [event.operation for event in get_dispatch_events(clear=True)] == [
+        "sort_values",
+        "drop_duplicates",
+    ]
+    reset_d2h_transfer_count()
+
+
 def test_geodataframe_small_native_sort_uses_cupy_rowset_without_pylibcudf_sort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -14839,6 +15999,139 @@ def test_geodataframe_small_native_sort_uses_cupy_rowset_without_pylibcudf_sort(
     assert get_materialization_events(clear=True) == []
     assert sorted_gdf["parcel_id"].tolist() == [1, 1, 2, 2]
     reset_d2h_transfer_count()
+
+@pytest.mark.parametrize(
+    ("ascending", "na_position", "expected_positions"),
+    [
+        pytest.param(True, "last", [2, 0, 1, 3], id="ascending-nulls-last"),
+        pytest.param(True, "first", [1, 3, 2, 0], id="ascending-nulls-first"),
+        pytest.param(False, "last", [0, 2, 1, 3], id="descending-nulls-last"),
+        pytest.param(False, "first", [1, 3, 0, 2], id="descending-nulls-first"),
+    ],
+)
+def test_geodataframe_pylibcudf_sort_normalizes_float_nulls_and_nans(
+    monkeypatch: pytest.MonkeyPatch,
+    ascending: bool,
+    na_position: str,
+    expected_positions: list[int],
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for pylibcudf missing-value sort")
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+    from vibespatial.api import geodataframe as geodataframe_module
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    monkeypatch.setattr(geodataframe_module, "_NATIVE_SORT_CUPY_MAX_ROWS", 0)
+    arrow = pa.table(
+        {
+            "key": pa.array([1.0, np.nan, 0.0, None], type=pa.float64()),
+            "source_position": pa.array(range(4), type=pa.int64()),
+        }
+    )
+    owned = from_shapely_geometries(
+        [Point(position, position) for position in range(4)],
+        residency=Residency.DEVICE,
+    )
+    gdf = GeoDataFrame(
+        {
+            "key": arrow["key"].to_pandas(),
+            "source_position": range(4),
+            "geometry": GeoSeries(DeviceGeometryArray._from_owned(owned), name="geometry"),
+        }
+    )
+    attach_native_state(
+        gdf,
+        NativeFrameState.from_native_tabular_result(
+            NativeTabularResult(
+                attributes=NativeAttributeTable(
+                    device_table=plc.Table.from_arrow(arrow),
+                    index_override=pd.RangeIndex(4),
+                    column_override=tuple(arrow.column_names),
+                    schema_override=arrow.schema,
+                ),
+                geometry=GeometryNativeResult.from_owned(owned, crs=None),
+                geometry_name="geometry",
+                column_order=("key", "source_position", "geometry"),
+            )
+        ),
+    )
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+    clear_fallback_events()
+
+    with assert_zero_d2h_transfers():
+        sorted_gdf = gdf.sort_values(
+            "key",
+            ascending=ascending,
+            na_position=na_position,
+            kind="stable",
+        )
+        sorted_state = get_native_state(sorted_gdf)
+        assert sorted_state is not None
+        result_positions = cp.asarray(sorted_state.attributes.row_positions)
+
+    assert cp.asnumpy(result_positions).tolist() == expected_positions
+    assert get_materialization_events(clear=True) == []
+    assert get_fallback_events(clear=True) == []
+    reset_d2h_transfer_count()
+
+
+def test_geodataframe_native_tabular_declines_record_fallback_events() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device tabular fallback observability")
+    plc = pytest.importorskip("pylibcudf")
+    arrow = pa.table(
+        {
+            "value": pa.array([1, 2], type=pa.int64()),
+            "name": pa.array(["a", "b"], type=pa.string()),
+        }
+    )
+    owned = from_shapely_geometries(
+        [Point(0, 0), Point(1, 1)],
+        residency=Residency.DEVICE,
+    )
+    gdf = GeoDataFrame(
+        {
+            "value": [1, 2],
+            "name": ["a", "b"],
+            "geometry": GeoSeries(DeviceGeometryArray._from_owned(owned), name="geometry"),
+        }
+    )
+    attach_native_state(
+        gdf,
+        NativeFrameState.from_native_tabular_result(
+            NativeTabularResult(
+                attributes=NativeAttributeTable(
+                    device_table=plc.Table.from_arrow(arrow),
+                    index_override=pd.RangeIndex(2),
+                    column_override=tuple(arrow.column_names),
+                    schema_override=arrow.schema,
+                ),
+                geometry=GeometryNativeResult.from_owned(owned, crs=None),
+                geometry_name="geometry",
+                column_order=("value", "name", "geometry"),
+            )
+        ),
+    )
+    clear_fallback_events()
+
+    sorted_gdf = gdf.sort_values("value", key=lambda values: -values)
+    sort_events = get_fallback_events(clear=True)
+    deduped = gdf.drop_duplicates("geometry")
+    dedup_events = get_fallback_events(clear=True)
+
+    assert sorted_gdf["value"].tolist() == [2, 1]
+    assert deduped["name"].tolist() == ["a", "b"]
+    assert [event.surface for event in sort_events] == [
+        "geopandas.geodataframe.sort_values"
+    ]
+    assert [event.surface for event in dedup_events] == [
+        "geopandas.geodataframe.drop_duplicates"
+    ]
 
 
 def test_geodataframe_sort_values_duplicate_index_preserves_private_native_state() -> None:
@@ -15024,6 +16317,122 @@ def test_geodataframe_query_expression_inplace_clears_private_native_state() -> 
     assert get_native_state(gdf) is None
 
 
+@pytest.mark.gpu
+def test_geodataframe_query_integer_expression_keeps_device_state() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native query expression")
+    cp = pytest.importorskip("cupy")
+    gdf = _device_native_expression_geodataframe()
+
+    clear_dispatch_events()
+    clear_fallback_events()
+    queried = gdf.query("value > 1")
+    state = get_native_state(queried)
+    events = get_dispatch_events(clear=True)
+
+    assert queried.index.tolist() == [101, 102]
+    assert state is not None
+    assert state.attributes.is_device_backed
+    arrays = state.attributes.numeric_column_arrays(("value",))
+    assert arrays is not None
+    assert cp.asnumpy(arrays["value"]).tolist() == [2, 3]
+    assert get_fallback_events(clear=True) == []
+    assert any(
+        event.surface == "geopandas.geodataframe.query"
+        and event.implementation == "native_device_scalar_expression"
+        for event in events
+    )
+
+
+@pytest.mark.gpu
+def test_geodataframe_query_and_eval_preserve_public_and_state_attrs() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native expression metadata")
+    gdf = _device_native_expression_geodataframe()
+    gdf.attrs["source"] = "kept"
+    gdf.columns.name = "fields"
+
+    queried = gdf.query("value > 1")
+    evaluated = gdf.eval("score = value * 2")
+
+    assert queried.attrs == {"source": "kept"}
+    assert evaluated.attrs == {"source": "kept"}
+    assert queried.columns.name == "fields"
+    assert evaluated.columns.name == "fields"
+    assert get_native_state(queried).attrs == queried.attrs
+    assert get_native_state(evaluated).attrs == evaluated.attrs
+
+
+@pytest.mark.gpu
+def test_geodataframe_query_composes_over_device_row_view() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native query composition")
+    cp = pytest.importorskip("cupy")
+    gdf = _device_native_expression_geodataframe([1, 2, 3, 4])
+
+    queried = gdf.query("value > 1").query("value < 4")
+    state = get_native_state(queried)
+
+    assert queried.index.tolist() == [101, 102]
+    assert state is not None
+    arrays = state.attributes.numeric_column_arrays(("value",))
+    assert arrays is not None
+    assert cp.asnumpy(arrays["value"]).tolist() == [2, 3]
+
+
+@pytest.mark.gpu
+def test_geodataframe_eval_composes_over_sorted_device_row_view() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native eval composition")
+    cp = pytest.importorskip("cupy")
+    gdf = _device_native_expression_geodataframe([3, 1, 2])
+
+    evaluated = gdf.sort_values("value").eval("score = value * 2")
+    state = get_native_state(evaluated)
+
+    assert evaluated.index.tolist() == [101, 102, 100]
+    assert state is not None
+    arrays = state.attributes.numeric_column_arrays(("value", "score"))
+    assert arrays is not None
+    assert cp.asnumpy(arrays["value"]).tolist() == [1, 2, 3]
+    assert cp.asnumpy(arrays["score"]).tolist() == [2, 4, 6]
+
+
+@pytest.mark.gpu
+def test_geodataframe_query_preserves_exact_int64_scalar_comparison() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native int64 query expression")
+    gdf = _device_native_expression_geodataframe([2**53, 2**53 + 1])
+
+    queried = gdf.query(f"value > {2**53}")
+
+    assert queried.index.tolist() == [101]
+    assert queried["value"].tolist() == [2**53 + 1]
+    assert get_native_state(queried) is not None
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    ("expr", "expected_index"),
+    [
+        pytest.param("value > 99", [], id="empty"),
+        pytest.param("value >= 1", [100, 101, 102], id="identity"),
+    ],
+)
+def test_geodataframe_query_empty_and_identity_device_rowsets(
+    expr: str,
+    expected_index: list[int],
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native query rowset edge cases")
+    gdf = _device_native_expression_geodataframe()
+
+    queried = gdf.query(expr)
+
+    assert queried.index.tolist() == expected_index
+    assert get_native_state(queried) is not None
+
+
 def test_geodataframe_eval_expression_drops_result_private_native_state() -> None:
     gdf, _state = _native_backed_geodataframe()
 
@@ -15044,6 +16453,284 @@ def test_geodataframe_eval_expression_inplace_clears_private_native_state() -> N
     assert get_native_state(gdf) is None
 
 
+@pytest.mark.gpu
+def test_geodataframe_eval_assignment_keeps_device_expression_state() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native eval expression")
+    cp = pytest.importorskip("cupy")
+    gdf = _device_native_expression_geodataframe()
+
+    clear_dispatch_events()
+    clear_fallback_events()
+    evaluated = gdf.eval("score = value * 2 + other")
+    state = get_native_state(evaluated)
+    events = get_dispatch_events(clear=True)
+
+    assert evaluated.index.equals(gdf.index)
+    assert state is not None
+    assert state.attributes.is_device_backed
+    arrays = state.attributes.numeric_column_arrays(("score",))
+    assert arrays is not None
+    assert cp.asnumpy(arrays["score"]).tolist() == [12, 15, 18]
+    assert cp.asarray(arrays["score"]).dtype == cp.dtype("int64")
+    assert get_fallback_events(clear=True) == []
+    assert any(
+        event.surface == "geopandas.geodataframe.eval"
+        and event.implementation == "native_device_scalar_expression"
+        for event in events
+    )
+
+
+@pytest.mark.gpu
+def test_geodataframe_eval_unproven_division_falls_back_observably() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native eval fallback")
+    gdf = _device_native_expression_geodataframe()
+
+    clear_fallback_events()
+    evaluated = gdf.eval("score = value / 2")
+    events = get_fallback_events(clear=True)
+
+    assert evaluated["score"].tolist() == [0.5, 1.0, 1.5]
+    assert get_native_state(evaluated) is None
+    assert len(events) == 1
+    assert events[0].surface == "geopandas.geodataframe.eval"
+
+
+@pytest.mark.gpu
+def test_geodataframe_eval_unproven_division_is_strict_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for strict native eval fallback")
+    gdf = _device_native_expression_geodataframe()
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    with pytest.raises(StrictNativeFallbackError, match=r"geodataframe\.eval"):
+        gdf.eval("score = value / 2")
+
+    assert get_native_state(gdf) is not None
+
+
+@pytest.mark.gpu
+def test_geodataframe_invalid_query_keeps_pandas_error_in_strict_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for strict native invalid query")
+    from pandas.errors import UndefinedVariableError
+
+    gdf = _device_native_expression_geodataframe()
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+    clear_fallback_events()
+
+    with pytest.raises(UndefinedVariableError):
+        gdf.query("missing_column > 1")
+
+    assert get_fallback_events(clear=True) == []
+
+
+@pytest.mark.gpu
+def test_geodataframe_malformed_local_query_keeps_pandas_error_in_strict_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for strict malformed query")
+    from pandas.errors import UndefinedVariableError
+
+    gdf = _device_native_expression_geodataframe()
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+    clear_fallback_events()
+
+    with pytest.raises(UndefinedVariableError):
+        gdf.query("value > @")
+
+    assert get_fallback_events(clear=True) == []
+
+
+@pytest.mark.gpu
+def test_geodataframe_malformed_backtick_query_keeps_pandas_error_in_strict_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for strict malformed backtick query")
+    gdf = _device_native_expression_geodataframe()
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+    clear_fallback_events()
+
+    with pytest.raises(SyntaxError):
+        gdf.query("value > `other` +")
+
+    assert get_fallback_events(clear=True) == []
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "expr",
+    [
+        pytest.param("`missing name` > 1", id="backtick"),
+        pytest.param("value > @missing", id="local"),
+    ],
+)
+def test_geodataframe_undefined_pandas_name_keeps_error_in_strict_mode(
+    expr: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for strict pandas name validation")
+    from pandas.errors import UndefinedVariableError
+
+    gdf = _device_native_expression_geodataframe()
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+    clear_fallback_events()
+
+    with pytest.raises(UndefinedVariableError):
+        gdf.query(expr)
+
+    assert get_fallback_events(clear=True) == []
+
+
+@pytest.mark.gpu
+def test_geodataframe_quoted_at_sign_remains_strict_observable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for quoted query fallback")
+    gdf = _device_native_expression_geodataframe().rename(
+        columns={"value": "value space"}
+    )
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    with pytest.raises(
+        StrictNativeFallbackError,
+        match=r"geodataframe\.query",
+    ):
+        gdf.query('`value space` > 1 and "x@y.com" == "x@y.com"')
+
+
+@pytest.mark.gpu
+def test_geodataframe_comment_at_sign_remains_strict_observable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for commented query fallback")
+    gdf = _device_native_expression_geodataframe().rename(
+        columns={"value": "value space"}
+    )
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    with pytest.raises(
+        StrictNativeFallbackError,
+        match=r"geodataframe\.query",
+    ):
+        gdf.query("`value space` > 1 # @missing")
+
+
+@pytest.mark.gpu
+def test_geodataframe_query_admission_declines_before_expression_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native query admission")
+    from vibespatial.api import geodataframe as geodataframe_module
+    from vibespatial.cuda._runtime import DeviceMemoryAdmission, get_cuda_runtime
+
+    gdf = _device_native_expression_geodataframe()
+    runtime = get_cuda_runtime()
+    admissions = []
+
+    def _decline(*, stage, required_bytes, requested_units=0):
+        admissions.append((stage, required_bytes, requested_units))
+        return DeviceMemoryAdmission(
+            stage=stage,
+            required_bytes=required_bytes,
+            remaining_bytes=0,
+            budget_bytes=0,
+            admitted=False,
+            requested_units=requested_units,
+            admitted_units=0,
+            bytes_per_unit=required_bytes,
+        )
+
+    monkeypatch.setattr(runtime, "admit_device_memory", _decline)
+    monkeypatch.setattr(
+        geodataframe_module,
+        "_native_query_selection_node",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("declined query must not gather expression columns")
+        ),
+    )
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    with pytest.raises(StrictNativeFallbackError):
+        gdf.query("value > 1")
+
+    assert admissions
+    assert admissions[0][0] == "tabular-query-expression"
+    assert admissions[0][1] > len(gdf) * 112 + (1 << 20)
+
+
+@pytest.mark.gpu
+def test_geodataframe_query_unsupported_device_expression_falls_back_observably() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native query fallback")
+    gdf = _device_native_expression_geodataframe()
+
+    clear_fallback_events()
+    queried = gdf.query("value > 1.5")
+    events = get_fallback_events(clear=True)
+
+    assert queried.index.tolist() == [101, 102]
+    assert get_native_state(queried) is None
+    assert len(events) == 1
+    assert events[0].surface == "geopandas.geodataframe.query"
+
+
+@pytest.mark.gpu
+def test_geodataframe_query_unsupported_device_expression_is_strict_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for strict native query fallback")
+    gdf = _device_native_expression_geodataframe()
+    source_state = get_native_state(gdf)
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    with pytest.raises(StrictNativeFallbackError, match=r"geodataframe\.query"):
+        gdf.query("value > 1.5")
+
+    assert get_native_state(gdf) is source_state
+
+
+@pytest.mark.gpu
+def test_geodataframe_query_supported_function_falls_back_observably() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native query function fallback")
+    gdf = _device_native_expression_geodataframe()
+
+    clear_fallback_events()
+    queried = gdf.query("abs(value) > 1")
+    events = get_fallback_events(clear=True)
+
+    assert queried.index.tolist() == [101, 102]
+    assert get_native_state(queried) is None
+    assert len(events) == 1
+    assert events[0].surface == "geopandas.geodataframe.query"
+
+
+@pytest.mark.gpu
+def test_geodataframe_query_supported_function_is_strict_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for strict native query function fallback")
+    gdf = _device_native_expression_geodataframe()
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    with pytest.raises(StrictNativeFallbackError, match=r"geodataframe\.query"):
+        gdf.query("abs(value) > 1")
+
+
 def test_geodataframe_merge_drops_private_native_state() -> None:
     gdf, _state = _native_backed_geodataframe()
 
@@ -15057,6 +16744,612 @@ def test_geodataframe_merge_drops_private_native_state() -> None:
     assert get_native_state(merged) is None
 
 
+@pytest.mark.gpu
+def test_geodataframe_merge_unique_right_relation_keeps_device_state() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native equality merge")
+    cp = pytest.importorskip("cupy")
+    gdf = _device_native_expression_geodataframe([2, 1, 2, 3])
+    right = pd.DataFrame(
+        {
+            "value": [2, 1],
+            "score": [20, 10],
+            "other": [200, 100],
+        }
+    )
+
+    clear_dispatch_events()
+    clear_fallback_events()
+    merged = gdf.merge(
+        right,
+        on="value",
+        suffixes=("_left", "_right"),
+    )
+    state = get_native_state(merged)
+    events = get_dispatch_events(clear=True)
+
+    assert merged.columns.tolist() == [
+        "value",
+        "other_left",
+        "geometry",
+        "score",
+        "other_right",
+    ]
+    assert merged.index.equals(pd.RangeIndex(3))
+    assert state is not None
+    assert state.attributes.is_device_backed
+    arrays = state.attributes.numeric_column_arrays(
+        ("value", "score", "other_right"),
+    )
+    assert arrays is not None
+    assert cp.asnumpy(arrays["value"]).tolist() == [2, 1, 2]
+    assert cp.asnumpy(arrays["score"]).tolist() == [20, 10, 20]
+    assert cp.asnumpy(arrays["other_right"]).tolist() == [200, 100, 200]
+    assert get_fallback_events(clear=True) == []
+    assert any(
+        event.surface == "geopandas.geodataframe.merge"
+        and event.implementation == "pylibcudf_unique_right_inner_join"
+        for event in events
+    )
+
+
+@pytest.mark.gpu
+def test_geodataframe_query_then_merge_uses_logical_key_domain() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native query/merge composition")
+    cp = pytest.importorskip("cupy")
+    gdf = _device_native_expression_geodataframe([2, 1, 2, 3])
+    right = pd.DataFrame({"value": [2, 3], "score": [20, 30]})
+
+    merged = gdf.query("value > 1").merge(right, on="value")
+    state = get_native_state(merged)
+
+    assert state is not None
+    arrays = state.attributes.numeric_column_arrays(("value", "score"))
+    assert arrays is not None
+    assert cp.asnumpy(arrays["value"]).tolist() == [2, 2, 3]
+    assert cp.asnumpy(arrays["score"]).tolist() == [20, 20, 30]
+
+
+@pytest.mark.gpu
+def test_geodataframe_query_then_merge_orders_row_view_across_streams() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for row-view stream ordering")
+    cp = pytest.importorskip("cupy")
+    gdf = _device_native_expression_geodataframe([2, 1, 2, 3])
+    right = pd.DataFrame({"value": [2, 3], "score": [20, 30]})
+    producer = cp.cuda.Stream(non_blocking=True)
+    consumer = cp.cuda.Stream(non_blocking=True)
+
+    with producer:
+        queried = gdf.query("value > 1")
+    queried_state = get_native_state(queried)
+    assert queried_state.attributes.row_positions_readiness is not None
+
+    with consumer:
+        merged = queried.merge(right, on="value")
+        arrays = get_native_state(merged).attributes.numeric_column_arrays(
+            ("value", "score")
+        )
+    consumer.synchronize()
+
+    assert arrays is not None
+    assert cp.asnumpy(arrays["value"]).tolist() == [2, 2, 3]
+    assert cp.asnumpy(arrays["score"]).tolist() == [20, 20, 30]
+
+
+@pytest.mark.gpu
+def test_geodataframe_merge_admission_precedes_h2d_and_relation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native merge admission")
+    from vibespatial.api import geodataframe as geodataframe_module
+    from vibespatial.cuda._runtime import DeviceMemoryAdmission, get_cuda_runtime
+
+    gdf = _device_native_expression_geodataframe()
+    state = get_native_state(gdf)
+    right = pd.DataFrame({"value": [1, 2, 3], "score": [10, 20, 30]})
+    runtime = get_cuda_runtime()
+    admissions = []
+
+    def _decline(*, stage, required_bytes, requested_units=0):
+        admissions.append((stage, required_bytes, requested_units))
+        return DeviceMemoryAdmission(
+            stage=stage,
+            required_bytes=required_bytes,
+            remaining_bytes=0,
+            budget_bytes=0,
+            admitted=False,
+            requested_units=requested_units,
+            admitted_units=0,
+            bytes_per_unit=required_bytes,
+        )
+
+    monkeypatch.setattr(runtime, "admit_device_memory", _decline)
+    monkeypatch.setattr(
+        geodataframe_module,
+        "_native_device_carrier_bytes",
+        lambda _value: 4096,
+    )
+    monkeypatch.setattr(
+        geodataframe_module,
+        "_native_device_table_from_public_frame",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("declined merge must not upload the right frame")
+        ),
+    )
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    with pytest.raises(StrictNativeFallbackError, match=r"geodataframe\.merge"):
+        gdf.merge(right, on="value")
+
+    left_bytes = geodataframe_module._native_device_column_storage_bytes(
+        state.attributes,
+        tuple(state.attributes.columns),
+    )
+    right_bytes = int(right.memory_usage(index=False, deep=True).sum())
+    expected = (
+        5 * max(left_bytes + right_bytes, len(gdf))
+        + 2 * 4096
+        + len(gdf) * 32
+        + (1 << 20)
+    )
+    assert admissions == [
+        ("tabular-unique-right-inner-merge", expected, len(gdf))
+    ]
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("operation", ["merge", "join"])
+@pytest.mark.parametrize("metadata_equal", [True, False])
+def test_geodataframe_native_join_metadata_matches_pandas(
+    operation: str,
+    metadata_equal: bool,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native join metadata")
+    gdf = _device_native_expression_geodataframe()
+    gdf.attrs = {"source": "shared"}
+    gdf.columns.name = "fields"
+    if operation == "merge":
+        right = pd.DataFrame(
+            {"value": [1, 2, 3], "score": [10, 20, 30]},
+        )
+    else:
+        right = pd.DataFrame(
+            {"score": [10, 20, 30]},
+            index=gdf.index,
+        )
+    right.attrs = {"source": "shared" if metadata_equal else "other"}
+    right.columns.name = "fields" if metadata_equal else "right_fields"
+
+    result = gdf.merge(right, on="value") if operation == "merge" else gdf.join(right)
+    state = get_native_state(result)
+
+    expected_attrs = {"source": "shared"} if metadata_equal else {}
+    assert result.attrs == expected_attrs
+    assert result.columns.name == ("fields" if metadata_equal else None)
+    assert state is not None
+    assert state.attrs == expected_attrs
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "case",
+    [
+        "merge_missing_key",
+        "merge_invalid_validate",
+        "merge_empty_suffixes",
+        "join_invalid_validate",
+        "join_empty_suffixes",
+    ],
+)
+def test_geodataframe_invalid_join_input_keeps_pandas_error_in_strict_mode(
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for strict native join validation")
+    gdf = _device_native_expression_geodataframe()
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+    clear_fallback_events()
+
+    expected_error = KeyError if case == "merge_missing_key" else ValueError
+    with pytest.raises(expected_error):
+        if case == "merge_missing_key":
+            gdf.merge(pd.DataFrame({"value": [1]}), on="missing")
+        elif case == "merge_invalid_validate":
+            gdf.merge(
+                pd.DataFrame({"value": [1, 2, 3]}),
+                on="value",
+                validate="bogus",
+            )
+        elif case == "merge_empty_suffixes":
+            gdf.merge(
+                pd.DataFrame({"value": [1, 2, 3], "other": [4, 5, 6]}),
+                on="value",
+                suffixes=("", ""),
+            )
+        elif case == "join_invalid_validate":
+            gdf.join(
+                pd.DataFrame({"score": [1, 2, 3]}, index=gdf.index),
+                validate="bogus",
+            )
+        else:
+            gdf.join(pd.DataFrame({"other": [1, 2, 3]}, index=gdf.index))
+
+    assert get_fallback_events(clear=True) == []
+
+
+@pytest.mark.gpu
+def test_geodataframe_array_key_merge_remains_observable_in_strict_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for array-key merge fallback")
+    gdf = _device_native_expression_geodataframe()
+    right = pd.DataFrame({"score": [10, 20, 30]})
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    with pytest.raises(StrictNativeFallbackError, match=r"geodataframe\.merge"):
+        gdf.merge(
+            right,
+            left_on=np.asarray([1, 2, 3]),
+            right_on=np.asarray([1, 2, 3]),
+        )
+
+
+@pytest.mark.gpu
+def test_geodataframe_ambiguous_merge_key_keeps_pandas_error_in_strict_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for ambiguous merge key validation")
+    gdf = _device_native_expression_geodataframe().rename_axis("value")
+    right = pd.DataFrame({"value": [1, 2, 3], "score": [10, 20, 30]})
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+    clear_fallback_events()
+
+    with pytest.raises(ValueError, match="both an index level and a column label"):
+        gdf.merge(right, on="value")
+
+    assert get_fallback_events(clear=True) == []
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    ("operation", "invalid_kind"),
+    [
+        pytest.param("merge", "missing", id="merge-missing"),
+        pytest.param("merge", "ambiguous", id="merge-ambiguous"),
+        pytest.param("join", "missing", id="join-missing"),
+        pytest.param("join", "ambiguous", id="join-ambiguous"),
+    ],
+)
+def test_geodataframe_list_key_errors_survive_strict_mode(
+    operation: str,
+    invalid_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for list-form key validation")
+    gdf = _device_native_expression_geodataframe()
+    if invalid_kind == "ambiguous":
+        gdf = gdf.rename_axis("value")
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+    clear_fallback_events()
+
+    expected_error = KeyError if invalid_kind == "missing" else ValueError
+    key = "missing" if invalid_kind == "missing" else "value"
+    with pytest.raises(expected_error):
+        if operation == "merge":
+            gdf.merge(
+                pd.DataFrame({"value": [1, 2, 3], "score": [10, 20, 30]}),
+                left_on=[key],
+                right_on=["value"],
+            )
+        else:
+            gdf.join(
+                pd.DataFrame({"score": [10, 20, 30]}, index=gdf.index),
+                on=[key],
+            )
+
+    assert get_fallback_events(clear=True) == []
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("operation", ["merge", "join"])
+def test_geodataframe_key_arity_error_survives_strict_mode(
+    operation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for key arity validation")
+    gdf = _device_native_expression_geodataframe()
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+    clear_fallback_events()
+
+    with pytest.raises(ValueError):
+        if operation == "merge":
+            gdf.merge(
+                pd.DataFrame(
+                    {
+                        "value": [1, 2, 3],
+                        "other": [10, 11, 12],
+                    }
+                ),
+                left_on=["value", "other"],
+                right_on=["value"],
+            )
+        else:
+            gdf.join(
+                pd.DataFrame({"score": [10, 20, 30]}, index=gdf.index),
+                on=["value", "other"],
+            )
+
+    assert get_fallback_events(clear=True) == []
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "on",
+    [
+        pytest.param(np.asarray([1, 2, 3]), id="ndarray"),
+        pytest.param(pd.Series([1, 2, 3]), id="series"),
+        pytest.param(pd.Index([1, 2, 3]), id="index"),
+        pytest.param(pd.array([1, 2, 3], dtype="Int64"), id="extension-array"),
+    ],
+)
+def test_geodataframe_array_join_key_remains_observable_in_strict_mode(
+    on,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for array-valued join fallback")
+    gdf = _device_native_expression_geodataframe()
+    right = pd.DataFrame(
+        {"score": [10, 20, 30]},
+        index=pd.Index([1, 2, 3]),
+    )
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    with pytest.raises(
+        StrictNativeFallbackError,
+        match=r"geodataframe\.join",
+    ):
+        gdf.join(right, on=on)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "on",
+    [
+        pytest.param([np.asarray([1, 2, 3])], id="list-ndarray"),
+        pytest.param((pd.Series([1, 2, 3]),), id="tuple-series"),
+        pytest.param([pd.array([1, 2, 3], dtype="Int64")], id="list-extension"),
+    ],
+)
+def test_geodataframe_nested_array_join_key_remains_strict_observable(
+    on,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for nested array join fallback")
+    gdf = _device_native_expression_geodataframe()
+    right = pd.DataFrame(
+        {"score": [10, 20, 30]},
+        index=pd.Index([1, 2, 3]),
+    )
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    with pytest.raises(
+        StrictNativeFallbackError,
+        match=r"geodataframe\.join",
+    ):
+        gdf.join(right, on=on)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("operation", ["merge", "join"])
+def test_geodataframe_suffix_collision_keeps_pandas_error_in_strict_mode(
+    operation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for suffix collision validation")
+    from pandas.errors import MergeError
+
+    gdf = _device_native_expression_geodataframe().eval(
+        "other_left = value + 1"
+    )
+    if operation == "merge":
+        right = pd.DataFrame(
+            {"value": [1, 2, 3], "other": [20, 21, 22]},
+        )
+    else:
+        right = pd.DataFrame(
+            {"other": [20, 21, 22]},
+            index=gdf.index,
+        )
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+    clear_fallback_events()
+
+    with pytest.raises(MergeError):
+        if operation == "merge":
+            gdf.merge(right, on="value", suffixes=("_left", "_right"))
+        else:
+            gdf.join(right, lsuffix="_left", rsuffix="_right")
+
+    assert get_fallback_events(clear=True) == []
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    ("values", "validate"),
+    [
+        pytest.param([1, 2, 3], "m:1", id="duplicate-right"),
+        pytest.param([1, 1, 2], "1:1", id="duplicate-left"),
+    ],
+)
+def test_geodataframe_merge_validate_failure_keeps_pandas_error_in_strict_mode(
+    values: list[int],
+    validate: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for merge cardinality validation")
+    from pandas.errors import MergeError
+
+    gdf = _device_native_expression_geodataframe(values)
+    right_values = [1, 2, 2] if validate == "m:1" else [1, 2, 3]
+    right = pd.DataFrame(
+        {"value": right_values, "score": [10, 20, 30]},
+    )
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+    clear_fallback_events()
+
+    with pytest.raises(MergeError):
+        gdf.merge(right, on="value", validate=validate)
+
+    assert get_fallback_events(clear=True) == []
+
+
+@pytest.mark.gpu
+def test_geodataframe_join_validate_failure_keeps_pandas_error_in_strict_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for join cardinality validation")
+    from pandas.errors import MergeError
+
+    gdf = _device_native_expression_geodataframe().set_axis(
+        pd.Index([1, 1, 2]),
+        axis=0,
+    )
+    right = pd.DataFrame({"score": [10, 20]}, index=pd.Index([1, 2]))
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+    clear_fallback_events()
+
+    with pytest.raises(MergeError):
+        gdf.join(right, validate="1:1")
+
+    assert get_fallback_events(clear=True) == []
+
+
+@pytest.mark.gpu
+def test_geodataframe_join_multiindex_columns_is_strict_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for MultiIndex join fallback")
+    gdf = _device_native_expression_geodataframe()
+    right = pd.DataFrame(
+        [[10, 20, 30]],
+        index=pd.MultiIndex.from_tuples([("metrics", "score")]),
+        columns=gdf.index,
+    ).T
+    assert isinstance(right.columns, pd.MultiIndex)
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    with pytest.raises(StrictNativeFallbackError, match=r"geodataframe\.join"):
+        gdf.join(right)
+
+
+@pytest.mark.gpu
+def test_geodataframe_merge_nullable_string_keys_match_pandas_order() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native nullable-string merge")
+    plc = pytest.importorskip("pylibcudf")
+    keys = ["b", None, "a", "b"]
+    owned = from_shapely_geometries(
+        [Point(position, position) for position in range(4)],
+        residency=Residency.DEVICE,
+    )
+    arrow = pa.table(
+        {
+            "key": pa.array(keys, type=pa.string()),
+            "value": pa.array([0, 1, 2, 3], type=pa.int64()),
+        }
+    )
+    gdf = GeoDataFrame(
+        {
+            "key": keys,
+            "value": [0, 1, 2, 3],
+            "geometry": GeoSeries(
+                DeviceGeometryArray._from_owned(owned),
+                name="geometry",
+            ),
+        }
+    )
+    attach_native_state(
+        gdf,
+        NativeFrameState.from_native_tabular_result(
+            NativeTabularResult(
+                attributes=NativeAttributeTable(
+                    device_table=plc.Table.from_arrow(arrow),
+                    index_override=gdf.index,
+                    column_override=tuple(arrow.column_names),
+                    schema_override=arrow.schema,
+                ),
+                geometry=GeometryNativeResult.from_owned(owned, crs=None),
+                geometry_name="geometry",
+                column_order=("key", "value", "geometry"),
+            )
+        ),
+    )
+    right = pd.DataFrame(
+        {
+            "key": ["a", None, "b"],
+            "label": ["A", "missing", "B"],
+        }
+    )
+
+    merged = gdf.merge(right, on="key")
+
+    merged_keys = merged["key"].tolist()
+    assert merged_keys[0] == "b"
+    assert pd.isna(merged_keys[1])
+    assert merged_keys[2:] == ["a", "b"]
+    assert merged["value"].tolist() == [0, 1, 2, 3]
+    assert merged["label"].tolist() == ["B", "missing", "A", "B"]
+    assert get_native_state(merged) is not None
+    assert get_native_state(merged).attributes.is_device_backed
+
+
+@pytest.mark.gpu
+def test_geodataframe_merge_duplicate_right_falls_back_observably() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native equality merge fallback")
+    gdf = _device_native_expression_geodataframe()
+    right = pd.DataFrame({"value": [2, 2], "score": [20, 21]})
+
+    clear_fallback_events()
+    merged = gdf.merge(right, on="value")
+    events = get_fallback_events(clear=True)
+
+    assert merged["score"].tolist() == [20, 21]
+    assert get_native_state(merged) is None
+    assert len(events) == 1
+    assert events[0].surface == "geopandas.geodataframe.merge"
+
+
+@pytest.mark.gpu
+def test_geodataframe_merge_duplicate_right_is_strict_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for strict native equality merge")
+    gdf = _device_native_expression_geodataframe()
+    right = pd.DataFrame({"value": [2, 2], "score": [20, 21]})
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    with pytest.raises(StrictNativeFallbackError, match=r"geodataframe\.merge"):
+        gdf.merge(right, on="value")
+
+    assert get_native_state(gdf) is not None
+
+
 def test_geodataframe_join_drops_private_native_state() -> None:
     gdf, _state = _native_backed_geodataframe()
 
@@ -15065,6 +17358,109 @@ def test_geodataframe_join_drops_private_native_state() -> None:
     assert joined["score"].tolist() == [10, 20]
     assert get_native_state(gdf) is not None
     assert get_native_state(joined) is None
+
+
+@pytest.mark.gpu
+def test_geodataframe_join_exact_unique_index_keeps_device_state() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native exact-index join")
+    cp = pytest.importorskip("cupy")
+    gdf = _device_native_expression_geodataframe()
+    right = pd.DataFrame(
+        {"score": [30, 20, 10]},
+        index=gdf.index,
+    )
+
+    clear_dispatch_events()
+    clear_fallback_events()
+    joined = gdf.join(right)
+    state = get_native_state(joined)
+    events = get_dispatch_events(clear=True)
+
+    assert joined.columns.tolist() == ["value", "other", "geometry", "score"]
+    assert joined.index.equals(gdf.index)
+    assert state is not None
+    assert state.attributes.is_device_backed
+    arrays = state.attributes.numeric_column_arrays(("score",))
+    assert arrays is not None
+    assert cp.asnumpy(arrays["score"]).tolist() == [30, 20, 10]
+    assert get_fallback_events(clear=True) == []
+    assert any(
+        event.surface == "geopandas.geodataframe.join"
+        and event.implementation == "native_exact_index_column_join"
+        for event in events
+    )
+
+
+@pytest.mark.gpu
+def test_geodataframe_join_device_index_declines_before_public_index_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for native device-index join decline")
+    gdf = _device_native_expression_geodataframe().query("value > 1")
+    assert get_native_state(gdf).index_plan.kind == "host-labels-take"
+    right = pd.DataFrame(
+        {"score": [20, 30]},
+        index=pd.Index([101, 102], name="source_id"),
+    )
+    monkeypatch.setattr(
+        NativeIndexPlan,
+        "to_public_index",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("native join admission must not export device labels")
+        ),
+    )
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    with pytest.raises(StrictNativeFallbackError, match=r"geodataframe\.join"):
+        gdf.join(right)
+
+
+@pytest.mark.gpu
+def test_geodataframe_merge_secondary_geometry_falls_back_observably() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for secondary geometry merge fallback")
+    gdf = _two_geometry_geodataframe()
+    _attach_two_geometry_native_tabular_state(
+        gdf,
+        owned=True,
+        attribute_storage="device",
+    )
+    right = pd.DataFrame({"value": [1, 2], "score": [10, 20]})
+
+    clear_fallback_events()
+    merged = gdf.merge(right, on="value")
+    events = get_fallback_events(clear=True)
+
+    assert "other_geometry" in merged.columns
+    assert get_native_state(merged) is None
+    assert len(events) == 1
+    assert events[0].surface == "geopandas.geodataframe.merge"
+
+
+@pytest.mark.gpu
+def test_geodataframe_merge_right_geometry_dtype_falls_back_observably() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for right geometry merge fallback")
+    gdf = _device_native_expression_geodataframe()
+    right = pd.DataFrame(
+        {
+            "value": [1, 2, 3],
+            "right_geometry": GeoSeries.from_wkt(
+                ["POINT (1 1)", "POINT (2 2)", "POINT (3 3)"],
+            ),
+        }
+    )
+
+    clear_fallback_events()
+    merged = gdf.merge(right, on="value")
+    events = get_fallback_events(clear=True)
+
+    assert "right_geometry" in merged.columns
+    assert get_native_state(merged) is None
+    assert len(events) == 1
+    assert events[0].surface == "geopandas.geodataframe.merge"
 
 
 def test_geodataframe_concat_preserves_exact_private_native_state() -> None:

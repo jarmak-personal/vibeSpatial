@@ -4338,14 +4338,18 @@ class _ExactDeviceRowSelection:
 
 def _flatten_exact_device_row_selection(
     owned: OwnedGeometryArray,
-    active_mask: DeviceArray,
+    active_mask: DeviceArray | None,
 ) -> _ExactDeviceRowSelection:
     """Resolve logical row indirection while retaining a device activity mask."""
     if cp is None:  # pragma: no cover - exercised only on CPU-only installs
         raise RuntimeError("CuPy is required for exact device row physicalization")
 
     row_count = int(owned.row_count)
-    d_active = cp.asarray(active_mask, dtype=cp.bool_)
+    d_active = (
+        cp.ones(row_count, dtype=cp.bool_)
+        if active_mask is None
+        else cp.asarray(active_mask, dtype=cp.bool_)
+    )
     if d_active.ndim != 1 or int(d_active.size) != row_count:
         raise ValueError("exact physicalization activity must match logical rows")
 
@@ -4462,10 +4466,11 @@ def _flatten_exact_device_row_selection(
 
 
 def device_physicalize_owned_row_selections_exact(
-    selections: list[tuple[OwnedGeometryArray, DeviceArray]],
+    selections: list[tuple[OwnedGeometryArray, DeviceArray | None]],
     *,
     reason: str,
     compact_concrete_prefix: bool = False,
+    materialize_all_null: bool = False,
 ) -> list[OwnedGeometryArray | None]:
     """Gather several logical row selections through one exact-allocation packet.
 
@@ -4474,10 +4479,49 @@ def device_physicalize_owned_row_selections_exact(
     totals cross once so each selected span is copied exactly once. When
     ``compact_concrete_prefix`` is true, every active lane must be concrete and
     active lanes must form a prefix. The result then uses that prefix's exact
-    logical row count instead of retaining source capacity.
+    logical row count instead of retaining source capacity. A ``None`` activity
+    mask means all logical rows and lets this boundary admit its own mask before
+    allocating it. ``materialize_all_null`` returns an all-null device carrier
+    instead of ``None`` when a selection has no active geometry families.
     """
     if cp is None:  # pragma: no cover - exercised only on CPU-only installs
         raise RuntimeError("CuPy is required for exact device row physicalization")
+
+    planning_required_bytes = 0
+    planning_rows = 0
+    packet_part_count = 0
+    for owned, active_mask in selections:
+        row_count = int(owned.row_count)
+        current = owned
+        while current.is_indexed_view:
+            if current._base is None:
+                raise RuntimeError("exact device physicalization requires a base carrier")
+            current = current._base
+        state = current._ensure_device_state(preserve_indexed_view=True)
+        family_count = len(state.families)
+        planning_rows += row_count
+        packet_part_count += family_count + int(compact_concrete_prefix)
+        # Per row, flattening retains the resolved row map and logical
+        # validity/tag arrays, plus one row map and activity mask per family.
+        # The additional 64 bytes per family cover the widest nested-offset
+        # count pass while those retained vectors are live.  This admission is
+        # intentionally conservative and occurs before any of those arrays.
+        planning_required_bytes += row_count * (32 + 80 * family_count)
+        if active_mask is None:
+            planning_required_bytes += row_count * np.dtype(np.bool_).itemsize
+    planning_required_bytes += packet_part_count * 7 * np.dtype(np.int64).itemsize
+    planning_admission = get_cuda_runtime().admit_device_memory(
+        stage="geometry.exact_row_physicalization.plan",
+        required_bytes=planning_required_bytes,
+        requested_units=planning_rows,
+    )
+    if not planning_admission.admitted:
+        raise MemoryError(
+            "exact device row physicalization planning requires "
+            f"{planning_required_bytes} device bytes with "
+            f"{planning_admission.remaining_bytes} available"
+        )
+
     prepared = [_flatten_exact_device_row_selection(owned, active) for owned, active in selections]
     work_keys = [
         (selection_index, family)
@@ -4517,7 +4561,9 @@ def device_physicalize_owned_row_selections_exact(
         for position, key in enumerate(work_keys)
     }
 
-    results: list[OwnedGeometryArray | None] = []
+    row_counts: list[int] = []
+    required_bytes = 0
+    requested_rows = 0
     for selection_index, selection in enumerate(prepared):
         capacity = int(selection.indices.size)
         row_count = capacity
@@ -4533,6 +4579,68 @@ def device_physicalize_owned_row_selections_exact(
                     "compact exact physicalization requires concrete active lanes"
                 )
             row_count = active_count
+        row_counts.append(row_count)
+        requested_rows += row_count
+
+        source_state = selection.base._ensure_device_state(preserve_indexed_view=True)
+        # The exact count packet is also the memory-admission boundary.  Count
+        # the physical result plus conservative gather scratch before any
+        # coordinate-shaped output allocation occurs.
+        if materialize_all_null and not any(
+            int(host_stats[(selection_index, family)][0])
+            for family in selection.family_stats
+        ):
+            required_bytes += row_count * (
+                np.dtype(np.bool_).itemsize
+                + np.dtype(np.int8).itemsize
+                + np.dtype(np.int32).itemsize
+            )
+        else:
+            required_bytes += row_count * np.dtype(np.int32).itemsize
+        if source_state.row_bounds is not None:
+            required_bytes += 2 * row_count * 4 * np.dtype(np.float64).itemsize
+        for family in selection.family_stats:
+            (
+                active_count,
+                first_total,
+                second_total,
+                coord_total,
+                _max_first,
+                _max_second,
+                _max_coord,
+            ) = (int(value) for value in host_stats[(selection_index, family)])
+            if active_count == 0:
+                continue
+            buffer = source_state.families[family]
+            required_bytes += 2 * coord_total * np.dtype(np.float64).itemsize
+            required_bytes += (row_count + 1) * np.dtype(np.int32).itemsize
+            required_bytes += 2 * row_count * np.dtype(np.bool_).itemsize
+            required_bytes += 12 * row_count
+            if buffer.bounds is not None:
+                required_bytes += 2 * row_count * 4 * np.dtype(np.float64).itemsize
+            if family in (GeometryFamily.POLYGON, GeometryFamily.MULTILINESTRING):
+                required_bytes += (first_total + 1) * np.dtype(np.int32).itemsize
+                required_bytes += 16 * first_total
+            elif family is GeometryFamily.MULTIPOLYGON:
+                required_bytes += (first_total + 1) * np.dtype(np.int32).itemsize
+                required_bytes += (second_total + 1) * np.dtype(np.int32).itemsize
+                required_bytes += 16 * first_total + 16 * second_total
+
+    admission = get_cuda_runtime().admit_device_memory(
+        stage="geometry.exact_row_physicalization",
+        required_bytes=required_bytes,
+        requested_units=requested_rows,
+    )
+    if not admission.admitted:
+        raise MemoryError(
+            "exact device row physicalization requires "
+            f"{required_bytes} device bytes with {admission.remaining_bytes} available"
+        )
+
+    results: list[OwnedGeometryArray | None] = []
+    for selection_index, selection in enumerate(prepared):
+        capacity = int(selection.indices.size)
+        row_count = row_counts[selection_index]
         device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
         d_family_row_offsets = cp.full(row_count, -1, dtype=cp.int32)
         segment_bound = 0
@@ -4597,7 +4705,26 @@ def device_physicalize_owned_row_selections_exact(
             segment_bound = max(segment_bound, max_coord)
 
         if not device_families:
-            results.append(None)
+            if materialize_all_null:
+                result = build_device_resident_owned(
+                    device_families={},
+                    row_count=row_count,
+                    tags=selection.tags[:row_count],
+                    validity=selection.validity[:row_count],
+                    family_row_offsets=d_family_row_offsets,
+                    execution_mode="gpu",
+                )
+                result._record(
+                    DiagnosticKind.MATERIALIZATION,
+                    (
+                        "exact device row physicalization: "
+                        f"{row_count} null rows from {capacity} capacity lanes"
+                    ),
+                    visible=False,
+                )
+                results.append(result)
+            else:
+                results.append(None)
             continue
         result = build_device_resident_owned(
             device_families=device_families,

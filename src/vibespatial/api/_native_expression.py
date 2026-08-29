@@ -116,9 +116,13 @@ def _device_bool_equal_rowset(values: Any, scalar: bool):
 def _comparison_mask(values: Any, op: str, scalar: float):
     xp = _array_namespace(values)
     values_array = xp.asarray(values)
-    threshold = np.float64(scalar)
-    if not np.isfinite(threshold):
-        raise ValueError("NativeExpression scalar comparisons require a finite threshold")
+    dtype = np.dtype(getattr(values_array, "dtype", np.float64))
+    if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.bool_):
+        threshold = scalar
+    else:
+        threshold = np.float64(scalar)
+        if not np.isfinite(threshold):
+            raise ValueError("NativeExpression scalar comparisons require a finite threshold")
 
     if op == ">":
         mask = values_array > threshold
@@ -138,7 +142,6 @@ def _comparison_mask(values: Any, op: str, scalar: float):
             "'>', '>=', '<', '<=', '==', or '!='"
         )
 
-    dtype = np.dtype(getattr(values_array, "dtype", np.float64))
     if np.issubdtype(dtype, np.floating):
         mask = mask & xp.isfinite(values_array)
     return mask

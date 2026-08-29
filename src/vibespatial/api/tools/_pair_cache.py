@@ -218,18 +218,50 @@ def _device_subset_remap_result(df1, cached: _CachedIntersectionPairs):
 
     source_state = get_native_state(cached_left_df)
     subset_state = get_native_state(df1)
-    if source_state is None or subset_state is None:
+    if not bool(cached.left_index_unique):
         return None
-    plan = subset_state.index_plan
-    if not bool(cached.left_index_unique) or bool(getattr(plan, "has_duplicates", False)):
-        return None
-    selection_positions = getattr(plan, "selection_positions", None)
-    if selection_positions is None:
-        return None
-    if getattr(plan, "selection_source_token", None) != source_state.lineage_token:
-        return None
-    if getattr(plan, "selection_source_row_count", None) != source_state.row_count:
-        return None
+    if source_state is not None and subset_state is not None:
+        plan = subset_state.index_plan
+        if bool(getattr(plan, "has_duplicates", False)):
+            return None
+        selection_positions = getattr(plan, "selection_positions", None)
+        if selection_positions is None:
+            return None
+        if getattr(plan, "selection_source_token", None) != source_state.lineage_token:
+            return None
+        if getattr(plan, "selection_source_row_count", None) != source_state.row_count:
+            return None
+        source_row_count = int(source_state.row_count)
+        left_token = subset_state.lineage_token
+    else:
+        cached_values = getattr(getattr(cached_left_df, "geometry", None), "values", None)
+        subset_values = getattr(getattr(df1, "geometry", None), "values", None)
+        cached_owned = getattr(cached_values, "_owned", None)
+        subset_owned = getattr(subset_values, "_owned", None)
+        selection_source_owned = getattr(
+            subset_values,
+            "_selection_source_owned",
+            None,
+        )
+        selection_positions = getattr(subset_values, "_selection_positions", None)
+        has_public_selection_provenance = (
+            cached_owned is not None
+            and selection_source_owned is cached_owned
+            and _is_device_array(selection_positions)
+        )
+        has_owned_view_provenance = (
+            cached_owned is not None
+            and subset_owned is not None
+            and bool(getattr(subset_owned, "is_indexed_view", False))
+            and getattr(subset_owned, "_base", None) is cached_owned
+            and bool(getattr(subset_owned, "_index_map_unique", False))
+        )
+        if not (has_public_selection_provenance or has_owned_view_provenance):
+            return None
+        if not has_public_selection_provenance:
+            selection_positions = getattr(subset_owned, "_index_map", None)
+        source_row_count = int(cached_owned.row_count)
+        left_token = None
     if not _is_device_array(selection_positions):
         return None
 
@@ -246,7 +278,6 @@ def _device_subset_remap_result(df1, cached: _CachedIntersectionPairs):
     if int(d_cached_left.size) != int(d_cached_right.size):
         return None
 
-    source_row_count = int(source_state.row_count)
     d_source_to_subset = cp.full(source_row_count, -1, dtype=cp.int32)
     d_subset_rows = cp.arange(len(df1), dtype=cp.int32)
     d_source_to_subset[d_selection] = d_subset_rows
@@ -262,12 +293,13 @@ def _device_subset_remap_result(df1, cached: _CachedIntersectionPairs):
     relation = NativeRelation(
         left_indices=d_mapped_left.astype(cp.int32, copy=False),
         right_indices=d_cached_right,
-        left_token=subset_state.lineage_token,
+        left_token=left_token,
         right_token=(None if right_state is None else right_state.lineage_token),
         predicate="intersects",
         left_row_count=len(df1),
         right_row_count=len(cached.right_frame),
         sorted_by_left=False,
+        origin="intersection-pair-cache-subset",
     )
     return NativeRelationSelection(
         relation=relation,

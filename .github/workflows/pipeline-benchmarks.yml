@@ -1,26 +1,32 @@
 name: Pipeline Benchmarks
 
 on:
+  pull_request:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
-      suite:
-        description: "Benchmark suite to run"
-        required: false
-        default: "full"
-        type: choice
-        options:
-          - smoke
-          - ci
-          - full
       run_gpu:
-        description: "Run the GPU benchmark job on a self-hosted NVIDIA runner"
+        description: "Run full base/current comparison on a self-hosted NVIDIA runner"
         required: false
         default: false
         type: boolean
 
+permissions:
+  contents: read
+
+env:
+  PIPELINE_SUITE: ${{ github.event_name == 'pull_request' && 'ci' || 'full' }}
+  CPU_PIPELINES: constructive,predicate-heavy,predicate-heavy-geopandas
+
 jobs:
   pipeline-benchmarks-cpu:
+    name: CPU public/reference base/current comparison (${{ github.event_name == 'pull_request' && 'ci' || 'full' }})
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      BASE_WORKTREE: ${{ github.workspace }}-pipeline-base-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,25 +34,197 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.13"
-      - name: Sync dependencies
+      - name: Resolve comparison base
+        id: base
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            base_sha="${{ github.event.before }}"
+          else
+            base_sha="$(git rev-parse HEAD^ 2>/dev/null || true)"
+          fi
+
+          if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "reason=no-base-revision" >> "$GITHUB_OUTPUT"
+          elif ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "reason=base-revision-unavailable" >> "$GITHUB_OUTPUT"
+          elif ! git cat-file -e "${base_sha}:scripts/benchmark_pipelines.py" 2>/dev/null || \
+            ! git cat-file -e "${base_sha}:src/vibespatial/bench/provenance.py" 2>/dev/null; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "reason=base-predates-supported-pipeline-benchmark-rail" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+            echo "reason=available" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check out comparison base worktree
+        if: steps.base.outputs.available == 'true'
+        shell: bash
+        run: git worktree add --detach "$BASE_WORKTREE" "${{ steps.base.outputs.sha }}"
+      - name: Sync base dependencies
+        if: steps.base.outputs.available == 'true'
+        run: uv sync --project "$BASE_WORKTREE" --group dev --group upstream-optional
+      - name: Run base pipeline suite
+        if: steps.base.outputs.available == 'true'
+        run: >-
+          uv run --project "$BASE_WORKTREE"
+          python "$BASE_WORKTREE/scripts/benchmark_pipelines.py"
+          --suite "$PIPELINE_SUITE"
+          --pipeline constructive
+          --pipeline predicate-heavy
+          --pipeline predicate-heavy-geopandas
+          --repeat 3 --output pipeline-base.json
+      - name: Sync current dependencies
         run: uv sync --group dev --group upstream-optional
       - name: Run current pipeline suite
-        run: uv run python scripts/benchmark_pipelines.py --suite "${{ inputs.suite }}" --repeat 3 --output pipeline-current.json
-      - name: Upload pipeline benchmark artifacts
+        run: >-
+          uv run python scripts/benchmark_pipelines.py
+          --suite "$PIPELINE_SUITE"
+          --pipeline constructive
+          --pipeline predicate-heavy
+          --pipeline predicate-heavy-geopandas
+          --repeat 3 --output pipeline-current.json
+      - name: Validate comparison contract
+        if: steps.base.outputs.available == 'true'
+        id: contract
+        shell: bash
+        run: |
+          uv run python - \
+            "$PIPELINE_SUITE" \
+            "$CPU_PIPELINES" \
+            "${{ steps.base.outputs.sha }}" \
+            "${{ github.sha }}" \
+            "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          suite, pipeline_csv, base_revision, current_revision, output_path = sys.argv[1:]
+          expected_pipelines = set(pipeline_csv.split(","))
+          payloads = [
+              json.loads(Path(path).read_text(encoding="utf-8"))
+              for path in ("pipeline-base.json", "pipeline-current.json")
+          ]
+          valid_metadata = all(
+              payload.get("metadata", {}).get("suite") == suite
+              and payload.get("results")
+              for payload in payloads
+          )
+          source_revisions = [
+              payload.get("metadata", {})
+              .get("vibespatial_source", {})
+              .get("git_revision")
+              for payload in payloads
+          ]
+          valid_provenance = source_revisions == [base_revision, current_revision]
+          invalid_results = [
+              result
+              for payload in payloads
+              for result in payload["results"]
+              if result.get("status") not in {"ok", "deferred"}
+          ]
+          if invalid_results:
+              raise SystemExit(f"pipeline execution failed: {invalid_results}")
+          result_sets = [
+              sorted(
+                  (result["pipeline"], int(result["scale"]))
+                  for result in payload["results"]
+                  if result.get("status") != "deferred"
+              )
+              for payload in payloads
+          ]
+          selected_pipelines = [
+              {result_pipeline for result_pipeline, _scale in result_set}
+              for result_set in result_sets
+          ]
+          expected_selection = all(
+              pipelines == expected_pipelines for pipelines in selected_pipelines
+          )
+          cpu_only = all(
+              result.get("selected_runtime") == "cpu"
+              for payload in payloads
+              for result in payload["results"]
+              if result.get("status") != "deferred"
+          )
+          if not valid_metadata or not expected_selection or not cpu_only:
+              available, reason = False, "invalid-or-mismatched-suite-metadata"
+          elif not valid_provenance:
+              available, reason = False, "source-provenance-mismatch"
+          elif result_sets[0] != result_sets[1]:
+              available, reason = False, "incompatible-result-set"
+          else:
+              available, reason = True, "compatible"
+          with Path(output_path).open("a", encoding="utf-8") as stream:
+              stream.write(f"available={str(available).lower()}\nreason={reason}\n")
+          PY
+      - name: Compare base and current pipelines
+        if: steps.base.outputs.available == 'true' && steps.contract.outputs.available == 'true'
+        run: uv run vsbench compare pipeline-base.json pipeline-current.json --json | tee pipeline-comparison.json
+      - name: Record unavailable comparison
+        if: steps.base.outputs.available != 'true' || steps.contract.outputs.available != 'true'
+        env:
+          BASE_REASON: ${{ steps.base.outputs.reason }}
+          CONTRACT_REASON: ${{ steps.contract.outputs.reason }}
+        shell: bash
+        run: |
+          uv run python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          payload = {
+              "status": "unavailable",
+              "reason": os.environ.get("CONTRACT_REASON") or os.environ.get("BASE_REASON"),
+              "suite": os.environ["PIPELINE_SUITE"],
+              "pipelines": os.environ["CPU_PIPELINES"].split(","),
+              "current_revision": "${{ github.sha }}",
+              "base_revision": "${{ steps.base.outputs.sha }}" or None,
+          }
+          Path("pipeline-comparison.json").write_text(
+              json.dumps(payload, indent=2), encoding="utf-8"
+          )
+          PY
+      - name: Upload CPU pipeline benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-benchmarks-cpu-${{ github.run_id }}
-          path: pipeline-current.json
+          path: |
+            pipeline-base.json
+            pipeline-base.html
+            pipeline-current.json
+            pipeline-current.html
+            pipeline-comparison.json
+          if-no-files-found: warn
+      - name: Remove comparison base worktree
+        if: always() && steps.base.outputs.available == 'true'
+        run: git worktree remove --force "$BASE_WORKTREE"
 
+  # GitHub Actions cannot probe whether a labeled self-hosted runner is online.
+  # Set VIBESPATIAL_GPU_RUNNER_AVAILABLE=true to automate PR/main GPU runs;
+  # workflow_dispatch keeps the one-run override explicit.
   pipeline-benchmarks-gpu:
-    if: ${{ inputs.run_gpu }}
+    name: GPU base/current full comparison (explicit self-hosted availability)
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.run_gpu) ||
+      (github.event_name == 'push' && vars.VIBESPATIAL_GPU_RUNNER_AVAILABLE == 'true') ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       vars.VIBESPATIAL_GPU_RUNNER_AVAILABLE == 'true')
     runs-on:
       - self-hosted
       - linux
       - x64
       - gpu
       - nvidia
+    timeout-minutes: 120
+    env:
+      PIPELINE_SUITE: full
+      BASE_WORKTREE: ${{ github.workspace }}-pipeline-base-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,13 +232,158 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.13"
-      - name: Sync dependencies
+      - name: Record NVIDIA hardware identity
+        run: |
+          nvidia-smi -L | tee gpu-hardware.txt
+          nvidia-smi --query-gpu=name,uuid,driver_version,memory.total,compute_cap --format=csv | tee -a gpu-hardware.txt
+      - name: Resolve comparison base
+        id: base
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            base_sha="${{ github.event.before }}"
+          else
+            base_sha="$(git rev-parse HEAD^ 2>/dev/null || true)"
+          fi
+
+          if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "reason=no-base-revision" >> "$GITHUB_OUTPUT"
+          elif ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "reason=base-revision-unavailable" >> "$GITHUB_OUTPUT"
+          elif ! git cat-file -e "${base_sha}:scripts/benchmark_pipelines.py" 2>/dev/null || \
+            ! git cat-file -e "${base_sha}:src/vibespatial/bench/provenance.py" 2>/dev/null; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "reason=base-predates-supported-pipeline-benchmark-rail" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+            echo "reason=available" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check out comparison base worktree
+        if: steps.base.outputs.available == 'true'
+        run: git worktree add --detach "$BASE_WORKTREE" "${{ steps.base.outputs.sha }}"
+      - name: Sync base GPU dependencies
+        if: steps.base.outputs.available == 'true'
+        run: uv sync --project "$BASE_WORKTREE" --group dev --group upstream-optional --extra cu12
+      - name: Run base GPU pipeline suite
+        if: steps.base.outputs.available == 'true'
+        run: >-
+          uv run --project "$BASE_WORKTREE"
+          python "$BASE_WORKTREE/scripts/benchmark_pipelines.py"
+          --suite full --repeat 3 --nvtx --gpu-sparkline --output pipeline-gpu-base.json
+      - name: Sync current GPU dependencies
         run: uv sync --group dev --group upstream-optional --extra cu12
-      - name: Run GPU pipeline suite
-        run: uv run python scripts/benchmark_pipelines.py --suite "${{ inputs.suite }}" --repeat 3 --nvtx --output pipeline-gpu-current.json
+      - name: Run current GPU pipeline suite
+        run: >-
+          uv run python scripts/benchmark_pipelines.py
+          --suite full --repeat 3 --nvtx --gpu-sparkline --output pipeline-gpu-current.json
+      - name: Validate GPU comparison contract
+        if: steps.base.outputs.available == 'true'
+        id: contract
+        shell: bash
+        run: |
+          uv run python - \
+            "${{ steps.base.outputs.sha }}" \
+            "${{ github.sha }}" \
+            "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          base_revision, current_revision, output_path = sys.argv[1:]
+          output_path = Path(output_path)
+          payloads = [
+              json.loads(Path(path).read_text(encoding="utf-8"))
+              for path in ("pipeline-gpu-base.json", "pipeline-gpu-current.json")
+          ]
+          valid_metadata = all(
+              payload.get("metadata", {}).get("suite") == "full"
+              and payload.get("results")
+              for payload in payloads
+          )
+          source_revisions = [
+              payload.get("metadata", {})
+              .get("vibespatial_source", {})
+              .get("git_revision")
+              for payload in payloads
+          ]
+          valid_provenance = source_revisions == [base_revision, current_revision]
+          invalid_results = [
+              result
+              for payload in payloads
+              for result in payload["results"]
+              if result.get("status") not in {"ok", "deferred"}
+          ]
+          if invalid_results:
+              raise SystemExit(f"pipeline execution failed: {invalid_results}")
+          result_sets = [
+              sorted(
+                  (result["pipeline"], int(result["scale"]))
+                  for result in payload["results"]
+                  if result.get("status") != "deferred"
+              )
+              for payload in payloads
+          ]
+          gpu_backed = all(
+              result.get("selected_runtime") in {"gpu", "hybrid"}
+              for payload in payloads
+              for result in payload["results"]
+              if result.get("status") != "deferred"
+          )
+          if not valid_metadata or not gpu_backed:
+              available, reason = False, "invalid-or-mismatched-suite-metadata"
+          elif not valid_provenance:
+              available, reason = False, "source-provenance-mismatch"
+          elif result_sets[0] != result_sets[1]:
+              available, reason = False, "incompatible-result-set"
+          else:
+              available, reason = True, "compatible"
+          with output_path.open("a", encoding="utf-8") as stream:
+              stream.write(f"available={str(available).lower()}\nreason={reason}\n")
+          PY
+      - name: Compare base and current GPU pipelines
+        if: steps.base.outputs.available == 'true' && steps.contract.outputs.available == 'true'
+        run: uv run vsbench compare pipeline-gpu-base.json pipeline-gpu-current.json --json | tee pipeline-gpu-comparison.json
+      - name: Record unavailable GPU comparison
+        if: steps.base.outputs.available != 'true' || steps.contract.outputs.available != 'true'
+        env:
+          BASE_REASON: ${{ steps.base.outputs.reason }}
+          CONTRACT_REASON: ${{ steps.contract.outputs.reason }}
+        shell: bash
+        run: |
+          uv run python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          payload = {
+              "status": "unavailable",
+              "reason": os.environ.get("CONTRACT_REASON") or os.environ.get("BASE_REASON"),
+              "suite": "full",
+              "current_revision": "${{ github.sha }}",
+              "base_revision": "${{ steps.base.outputs.sha }}" or None,
+          }
+          Path("pipeline-gpu-comparison.json").write_text(
+              json.dumps(payload, indent=2), encoding="utf-8"
+          )
+          PY
       - name: Upload GPU pipeline benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-benchmarks-gpu-${{ github.run_id }}
-          path: pipeline-gpu-current.json
+          path: |
+            gpu-hardware.txt
+            pipeline-gpu-base.json
+            pipeline-gpu-base.html
+            pipeline-gpu-current.json
+            pipeline-gpu-current.html
+            pipeline-gpu-comparison.json
+          if-no-files-found: warn
+      - name: Remove comparison base worktree
+        if: always() && steps.base.outputs.available == 'true'
+        run: git worktree remove --force "$BASE_WORKTREE"

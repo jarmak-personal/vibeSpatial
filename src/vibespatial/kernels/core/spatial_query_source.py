@@ -961,10 +961,9 @@ extern "C" __global__ void point_nearest_tie_count_from_sorted_x(
         return;
     }
 
-    const double best = sqrt(best_sq);
-    const double tol = 1e-8 + 1e-5 * fabs(best);
     const int start = start_idx[q];
     const int stop = end_idx[q];
+    const double best = sqrt(best_sq);
     int count = 0;
     for (int idx = start; idx < stop; ++idx) {
         const int tree_row = sorted_tree_rows[idx];
@@ -979,7 +978,7 @@ extern "C" __global__ void point_nearest_tie_count_from_sorted_x(
         const double dx = tx - qx;
         const double dy = ty - qy;
         const double dist = sqrt(dx * dx + dy * dy);
-        if (fabs(dist - best) <= tol) {
+        if (dist == best) {
             ++count;
         }
     }
@@ -1013,10 +1012,9 @@ extern "C" __global__ void point_nearest_tie_scatter_from_sorted_x(
         return;
     }
 
-    const double best = sqrt(best_sq);
-    const double tol = 1e-8 + 1e-5 * fabs(best);
     const int start = start_idx[q];
     const int stop = end_idx[q];
+    const double best = sqrt(best_sq);
     int write_pos = offsets[q];
     for (int idx = start; idx < stop; ++idx) {
         const int tree_row = sorted_tree_rows[idx];
@@ -1031,7 +1029,7 @@ extern "C" __global__ void point_nearest_tie_scatter_from_sorted_x(
         const double dx = tx - qx;
         const double dy = ty - qy;
         const double dist = sqrt(dx * dx + dy * dy);
-        if (fabs(dist - best) <= tol) {
+        if (dist == best) {
             out_left[write_pos] = q;
             out_right[write_pos] = tree_row;
             ++write_pos;
@@ -1547,7 +1545,7 @@ extern "C" __global__ void grid_nearest_search(
     out_min_idx[q] = best_idx;
 }
 
-// Count tied nearest neighbours per query (distance within isclose tolerance).
+// Count exactly tied nearest neighbours per query.
 extern "C" __global__ void grid_nearest_tie_count(
     const double* query_x,
     const double* query_y,
@@ -1600,7 +1598,7 @@ extern "C" __global__ void grid_nearest_tie_count(
                 const double dy = qy - sorted_tree_y[j];
                 const double dist = sqrt(dx * dx + dy * dy);
                 if (exclusive && dx == 0.0 && dy == 0.0) continue;
-                if (fabs(dist - best) <= tol) ++count;
+                if (dist == best) ++count;
             }
         }
     }
@@ -1659,7 +1657,7 @@ extern "C" __global__ void grid_nearest_tie_scatter(
                 const double dy = qy - sorted_tree_y[j];
                 const double dist = sqrt(dx * dx + dy * dy);
                 if (exclusive && dx == 0.0 && dy == 0.0) continue;
-                if (fabs(dist - best) <= tol) {
+                if (dist == best) {
                     out_left[write_pos] = q;
                     out_right[write_pos] = sorted_tree_global_idx[j];
                     ++write_pos;

@@ -99,6 +99,24 @@ _SUPPORTED_DEVICE_GEOARROW_PROMOTIONS = {
 }
 
 
+def _wkb_arrow_field_metadata(crs: Any | None) -> dict[bytes, bytes]:
+    """Return the complete GeoArrow WKB field metadata contract."""
+    import json
+
+    metadata = {
+        b"ARROW:extension:name": b"geoarrow.wkb",
+        b"ARROW:extension:metadata": b"{}",
+    }
+    if crs is not None:
+        try:
+            crs_json = crs.to_json_dict()
+        except AttributeError:
+            crs_json = None
+        if crs_json is not None:
+            metadata[b"ARROW:extension:metadata"] = json.dumps({"crs": crs_json}).encode()
+    return metadata
+
+
 _request_nvrtc_warmup(
     [
         ("wkb-encode", _WKB_ENCODE_KERNEL_SOURCE, _WKB_ENCODE_KERNEL_NAMES),
@@ -1742,7 +1760,7 @@ def _try_native_device_attribute_export(
 
     if not isinstance(attribute_frame, NativeAttributeTable):
         return None
-    if getattr(attribute_frame, "device_table", None) is None:
+    if not bool(getattr(attribute_frame, "is_device_backed", False)):
         return None
 
     try:
@@ -3706,6 +3724,7 @@ class DeviceWKBHeaderScan:
     native_mask: Any
     fallback_mask: Any
     point_mask: Any
+    semantic_invalid_mask: Any
 
 
 def plan_wkb_bridge(operation: IOOperation | str) -> WKBBridgePlan:
@@ -5271,7 +5290,10 @@ def _try_gpu_wkb_list_decode(
         )
 
         plc_column = pylibcudf_column_from_arrow(arrow_str)
-        result = _decode_pylibcudf_wkb_general_column_to_owned(plc_column)
+        result = _decode_pylibcudf_wkb_general_column_to_owned(
+            plc_column,
+            on_invalid=on_invalid,
+        )
         if on_invalid == "raise":
             _raise_on_invalid_gpu_wkb_decode(result, non_null_mask)
         return _GpuWkbDecodeAttempt(result=result)
@@ -5443,7 +5465,10 @@ def _try_gpu_wkb_arrow_decode(
             )
 
         plc_column = pylibcudf_column_from_arrow(array)
-        result = _decode_pylibcudf_wkb_general_column_to_owned(plc_column)
+        result = _decode_pylibcudf_wkb_general_column_to_owned(
+            plc_column,
+            on_invalid=on_invalid,
+        )
         if on_invalid == "raise":
             _raise_on_invalid_gpu_wkb_decode(result, non_null_mask)
         return _GpuWkbDecodeAttempt(result=result)
@@ -5536,17 +5561,7 @@ def _try_gpu_wkb_encode_arrow(
         arrow_col = pylibcudf_to_arrow(plc_column)
         wkb_arr = arrow_col.cast(pa.binary())
 
-        field_metadata = {}
-        if crs is not None:
-            try:
-                crs_json = crs.to_json_dict()
-            except AttributeError:
-                crs_json = None
-            if crs_json is not None:
-                import json
-
-                field_metadata[b"ARROW:extension:metadata"] = json.dumps({"crs": crs_json}).encode()
-        field_metadata[b"ARROW:extension:name"] = b"geoarrow.wkb"
+        field_metadata = _wkb_arrow_field_metadata(crs)
         field = pa.field(field_name, pa.binary(), nullable=True, metadata=field_metadata)
         return field, wkb_arr
     except Exception:
@@ -5667,19 +5682,7 @@ def _encode_owned_wkb_array(
             arrow_col = pylibcudf_to_arrow(plc_column)
             wkb_arr = arrow_col.cast(pa.binary())
 
-            field_metadata = {}
-            if crs is not None:
-                try:
-                    crs_json = crs.to_json_dict()
-                except AttributeError:
-                    crs_json = None
-                if crs_json is not None:
-                    import json
-
-                    field_metadata[b"ARROW:extension:metadata"] = json.dumps(
-                        {"crs": crs_json}
-                    ).encode()
-            field_metadata[b"ARROW:extension:name"] = b"geoarrow.wkb"
+            field_metadata = _wkb_arrow_field_metadata(crs)
             field = pa.field(field_name, pa.binary(), nullable=True, metadata=field_metadata)
             record_dispatch_event(
                 surface="vibespatial.io.wkb",
@@ -5723,17 +5726,7 @@ def _encode_owned_wkb_array(
         frow = int(owned.family_row_offsets[row])
         wkb_list.append(_encode_family_row_wkb(family, buf, frow))
     wkb_arr = pa.array(wkb_list, type=pa.binary())
-    field_metadata = {}
-    if crs is not None:
-        try:
-            crs_json = crs.to_json_dict()
-        except AttributeError:
-            crs_json = None
-        if crs_json is not None:
-            import json
-
-            field_metadata[b"ARROW:extension:metadata"] = json.dumps({"crs": crs_json}).encode()
-    field_metadata[b"ARROW:extension:name"] = b"geoarrow.wkb"
+    field_metadata = _wkb_arrow_field_metadata(crs)
     field = pa.field(field_name, pa.binary(), nullable=True, metadata=field_metadata)
     result = (field, wkb_arr)
     return (*result, ExecutionMode.CPU) if return_mode else result

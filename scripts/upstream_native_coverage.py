@@ -373,7 +373,7 @@ def main(argv: list[str] | None = None) -> int:
         default=30,
         help="Emit a progress heartbeat to stderr after this many seconds without child output.",
     )
-    parser.add_argument("--check", action="store_true", help="Exit non-zero when native coverage is not 100%.")
+    parser.add_argument("--check", action="store_true", help="Exit non-zero when native coverage is not 100%%.")
     parser.add_argument(
         "--grouped",
         action="store_true",

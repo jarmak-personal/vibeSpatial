@@ -5,7 +5,7 @@ Scope: Tracking plan for generalized native performance work after the ADR0044 r
 Read If: You are planning native substrate performance work, interpreting 10k shootouts, or deciding whether a change improves generalized execution.
 STOP IF: You only need a local kernel implementation detail already routed by intake.
 Source Of Truth: Reach-goal tracking plan for native physical workload shapes and 100ms-stage performance targets.
-Body Budget: 316/320 lines
+Body Budget: 320/320 lines
 Document: docs/dev/native-100ms-physical-shape-plan.md
 
 Section Map (Body Lines)
@@ -24,7 +24,7 @@ Section Map (Body Lines)
 | 133-230 | Next Autonomous Push Queue |
 | 231-248 | Acceptance |
 | 249-260 | Tracking |
-| 261-304 | Fresh Session Handoff |
+| 261-308 | Fresh Session Handoff |
 | ... | (1 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -137,7 +137,7 @@ not polish existing wrappers.
 | Spatial join | Relation consumers are green; public joined rows remain terminal/export behavior. | <=100ms |
 | Grouped geometry reduce | NativeGrouped union, disjoint-assembly, and grouped-difference canaries are green; broader dissolve cases need segmented carriers. | <=100ms |
 | Copy and tabular filter | Zero-transfer canary is green; admitted pandas composition needs continued stale-state guards. | <=100ms combined |
-| Mask clip and area filtering | Device rowset paths are green; terminal GEOS typing and unsupported shapes must stay explicit boundaries. | <=100ms combined |
+| Mask clip and area filtering | Device rowset paths are green. Lazy grouped masks now plan from original members, selecting exact relation/group reduction or one-time union before topology work; habitat 100K is exact at 2.5196 s versus 2.4663 s GeoPandas, down from 14.1656 s. Terminal GEOS typing and unsupported shapes remain explicit boundaries. | <=100ms combined |
 | Dispatch shape estimates | Runtime planner accepts physical work estimates; more callers need to pass dominant work units. | Expand |
 | Terminal native export | IO is a separate terminal boundary, not a compute-stage target. | Track separately |
 
@@ -153,8 +153,8 @@ The detailed map is `docs/dev/native-physical-shape-ledger.md`. Its contracts ar
   `NativeDeviceSelection`, `NativeRowSet`, or `NativeExpression` before pair allocation.
 - Overlay remains index/metadata -> candidate relation -> refine -> constructive
   provenance -> native projection -> explicit export.
-- Grouped constructive work uses `NativeGrouped` offsets, family partitions,
-  segmented assembly, and pressure-bounded pages or tiles.
+- Grouped constructive work uses `NativeGrouped` offsets and family partitions;
+  grouped-mask clip admits original-member relations before pages or tiles.
 - Copy, filtering, and admitted selection remain `NativeFrameState` transitions;
   unknown pandas operations conservatively drop native state.
 
@@ -222,10 +222,11 @@ now completes its exact 30,553,577-row public write/read in 191.44s versus the
 historical 411s GeoPandas gate. Its former terminal OOM was a wrong-shaped WKB
 page admission and read-composition selector, not topology capacity.
 
-The mandatory full profile passes every active 1M pipeline in 594.19ms. No
-stage exceeds 68.78ms; the largest is the native mixed-strip exact union.
-Compute has zero materializations, zero D2H packets, and zero
-fallbacks. Peak tracked device allocation is 1.28GiB.
+The August 27 mandatory full profile passes every active 1M pipeline with zero
+compute materializations, D2H packets, or fallbacks. The 72.33ms maximum is
+mixed-strip exact union; other exact stages are 67.07ms positive-degenerate
+union, 51.70ms small-group union, 10.69ms grouped difference, 2.86ms
+relation-overlay constructive, and 0.58ms point-in-polygon.
 
 The current 10K repeat-3 gate is 14/14 exact: GeoPandas is 3.559s and
 vibeSpatial is 2.800s, or 1.271x aggregate. Transit is 191.0ms versus 239.9ms,
@@ -237,11 +238,10 @@ and verification. Those whole-profile counters are not comparable to the older
 compute-only 24/66 checkpoint; the 64 internal conversions are the actionable
 debt. Its absolute wall time is 1.0% above the 2.772s rich floor.
 
-The PRD remains active. Relation-grouped multi-tile constructive execution,
-reusable downstream tile coverage, mixed-family direct reductions, and
-compute-stage zero-transfer execution are complete. Ring-local winding
-baselines and the 64 statement-level internal host conversions follow. Do not
-add resident-data GEOS redirects or workflow branches.
+The PRD remains active. Relation-grouped multi-tile construction, reusable tile
+coverage, mixed-family reductions, zero-transfer compute, and ring-local
+winding are complete. The 64 internal host conversions follow. Do
+not add resident-data GEOS redirects or workflow branches.
 
 ### Queue Rules
 
@@ -280,7 +280,7 @@ And it must satisfy all of:
 |---|---|---|---|
 | Physical shape ledger | Ledger table | Intake routes hot stages to shapes | Complete; maintain with profiles |
 | Relation consumers | Direct range-sliced Morton left/right existential and anti selections plus count expressions | 10K <=100ms; 1M bounded by tile memory and Morton intervals, not relation cardinality | Complete; homogeneous and one-pass grouped mixed-family reductions are green |
-| Many/few overlay | Overlay relation-to-constructive profile | Many/few overlay <=100ms | Complete; canary green |
+| Many/few overlay | Overlay relation-to-constructive profile plus complete-ring winding canary | Many/few overlay <=100ms; exact topology bounded by candidate-ring segments, not unresolved rows times all mask segments | Complete; relation and ring-local canaries green |
 | Grouped geometry reduce | NativeGrouped union/disjoint/difference and direct/tiled collective profiles | 10K <=100ms; memory-bounded exact topology at 1M | Complete; grouped multi-tile execution and habitat tiled-mask reuse are green |
 | Native composition | Zero-transfer rowset/profile | Copy + filter <=100ms | Complete; canary green |
 | Mask clip and area filtering | Predicate-heavy and clip rowset canaries | Mask/area cleanup <=100ms | Complete; canaries green |
@@ -297,6 +297,9 @@ And it must satisfy all of:
   O(E) boundary peel replace face-pair probes and host convergence. Exact
   construction preserves every positive fp64 sliver. Do not restore tolerances,
   host regroup, retry, semantic repair, or Shapely repair paths.
+- Prepared one-mask exact topology lowers unresolved row/segment evidence to a CUDA-resident `NativeRelation` of complete candidate rings. Candidate holes
+  include their ancestor shell for the canonical fp64 face-walk baseline. The
+  canaries record 12 versus 18 segments and an adversarial 20 versus 72.
 - Runtime ordering is explicit across driver, pylibcudf, and CCCL on the active
   CuPy stream. Planner calls carry authoritative physical estimates, and
   `ARCH009` confines mutating device resolution to owned internals.
@@ -320,11 +323,12 @@ And it must satisfy all of:
   harness versus the historical 359.83s GeoPandas reference; reusable tiled
   coverage closes habitat at 38.18s versus the historical 157.49s reference; transit's
   30.55M-row public result completes exactly in 191.44s after page-shaped WKB
-  export and row-group read composition. The full mandatory profile passes
-  every active 1M pipeline in 594.19ms with no stage above 68.78ms,
-  zero compute materializations, D2H packets, or fallbacks, and 1.28GiB peak
-  tracked device allocation. The largest stage is the native mixed-strip exact
-  union.
+  export and row-group read composition.
+- August 27 full-profile refresh: every active 1M pipeline passes with zero
+  compute materializations, D2H packets, or fallbacks. Exact stage times are
+  72.33ms mixed-strip union, 67.07ms positive-degenerate union, 51.70ms
+  small-group union, 10.69ms grouped difference, 2.86ms relation-overlay
+  constructive, and 0.58ms point-in-polygon.
 - Correctness gates pass: strict-native upstream is 1,971 passed / 423 skipped /
   5 xfailed; contract health passes every surface; the focused carrier suite is
   612 passed; and the uninterrupted local plus vendored-upstream suite is 7,158
@@ -335,7 +339,7 @@ And it must satisfy all of:
 The PRD is active; the previously failing 1M vegetation, habitat, and transit
 workflows are recovered, and active boundary tiles execute through pressure-bounded
 relation-grouped clip/topology batches with reusable downstream coverage.
-Immediate remaining work is ring-local winding baselines and the 64
+Ring-local winding baselines are complete. Immediate remaining work is the 64
 statement-profile internal host conversions. Mixed-family direct reductions
 are complete through one grouped relation partition with device span metadata.
 Broad compatibility verification remains part of each landed recovery. Eager public

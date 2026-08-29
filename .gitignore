@@ -51,9 +51,16 @@ benchmark_results/work_amplification/**/*.html
 benchmark_results/spatialbench/*
 !benchmark_results/spatialbench/sf100/
 benchmark_results/spatialbench/sf100/*
+!benchmark_results/spatialbench/sf100/accepted-geopandas-comparator.json
 !benchmark_results/spatialbench/sf100/2026-08-18-public-capacity-closure/
 benchmark_results/spatialbench/sf100/2026-08-18-public-capacity-closure/*
 !benchmark_results/spatialbench/sf100/2026-08-18-public-capacity-closure/checkpoint.json
+!benchmark_results/native-consolidation/
+benchmark_results/native-consolidation/*
+!benchmark_results/native-consolidation/2026-08-28/
+benchmark_results/native-consolidation/2026-08-28/*
+!benchmark_results/native-consolidation/2026-08-28/candidate-evidence-manifest.md
+!benchmark_results/native-consolidation/2026-08-28/redevelopment-1m-geopandas-capacity.json
 /benchmark_results.json
 
 # Example data (large downloads)

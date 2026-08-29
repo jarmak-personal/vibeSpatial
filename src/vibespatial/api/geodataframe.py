@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ast
 import json
 import typing
 import warnings
+from contextvars import ContextVar
+from dataclasses import replace as dataclass_replace
 from typing import Any, Literal
 
 import numpy as np
@@ -541,6 +544,142 @@ def _take_public_frame_with_native_rowset(
     )
 
 
+def _native_device_column_policies(attributes, columns):
+    """Resolve device column contracts across a composed attribute table."""
+    requested = tuple(dict.fromkeys(columns))
+    if not requested or not bool(getattr(attributes, "is_device_backed", False)):
+        return {}
+    parts = getattr(attributes, "parts", None)
+    if parts is None:
+        return attributes.device_column_policies(requested)
+
+    policies = {}
+    remaining = set(requested)
+    for part in parts:
+        part_columns = tuple(column for column in requested if column in part.columns)
+        if not part_columns:
+            continue
+        part_policies = _native_device_column_policies(part, part_columns)
+        if any(column not in part_policies for column in part_columns):
+            return {}
+        policies.update(part_policies)
+        remaining.difference_update(part_columns)
+    if remaining:
+        return {}
+    return {column: policies[column] for column in requested}
+
+
+def _native_pylibcudf_columns(attributes, columns):
+    """Resolve requested device columns without combining parts through Arrow."""
+    requested = tuple(columns)
+    parts = getattr(attributes, "parts", None)
+    if parts is None:
+        return attributes.to_pylibcudf_columns(requested)
+
+    columns_by_name = {}
+    for part in parts:
+        part_columns = tuple(column for column in requested if column in part.columns)
+        if not part_columns:
+            continue
+        resolved = _native_pylibcudf_columns(part, part_columns)
+        columns_by_name.update(zip(part_columns, resolved, strict=True))
+    if any(column not in columns_by_name for column in requested):
+        raise KeyError("requested columns are not present in native device table parts")
+    return [columns_by_name[column] for column in requested]
+
+
+def _native_pylibcudf_missing_normalized_columns(columns, *, stream):
+    """Return sort/distinct keys with floating NaNs represented as nulls."""
+    import pylibcudf as plc
+
+    normalized = []
+    for column in columns:
+        if column.type().id() in {plc.types.TypeId.FLOAT32, plc.types.TypeId.FLOAT64}:
+            null_mask, null_count = plc.transform.nans_to_nulls(
+                column,
+                stream=stream,
+            )
+            column = column.with_mask(null_mask, int(null_count))
+        normalized.append(column)
+    return normalized
+
+
+def _native_device_column_storage_bytes(attributes, columns) -> int | None:
+    """Return source device-buffer bytes for logical columns without a gather."""
+    requested = tuple(dict.fromkeys(columns))
+    parts = getattr(attributes, "parts", None)
+    if parts is not None:
+        total = 0
+        remaining = set(requested)
+        for part in parts:
+            part_columns = tuple(column for column in requested if column in part.columns)
+            if not part_columns:
+                continue
+            part_bytes = _native_device_column_storage_bytes(part, part_columns)
+            if part_bytes is None:
+                return None
+            total += part_bytes
+            remaining.difference_update(part_columns)
+        return None if remaining else total
+
+    table = getattr(attributes, "device_table", None)
+    if table is None or not hasattr(table, "columns"):
+        return None
+    positions = {name: index for index, name in enumerate(attributes.columns)}
+    if any(column not in positions for column in requested):
+        return None
+    try:
+        source_columns = table.columns()
+        return sum(
+            int(source_columns[positions[column]].device_buffer_size())
+            for column in requested
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _native_distinct_required_bytes(attributes, labels, row_count: int) -> int | None:
+    """Conservatively bound distinct key copies, row orders, and workspace."""
+    source_bytes = _native_device_column_storage_bytes(attributes, labels)
+    if source_bytes is None:
+        return None
+    index_width = 4 if row_count <= np.iinfo(np.int32).max else 8
+    # Stable order can retain several key-sized radix/sort buffers. A row-indirected
+    # input also needs one key gather before sorting; source_bytes deliberately uses
+    # the full physical columns so the estimate stays conservative for such views.
+    key_and_workspace_bytes = 5 * max(source_bytes, row_count * len(labels))
+    row_order_bytes = row_count * (5 * index_width + 4)
+    return key_and_workspace_bytes + row_order_bytes + (1 << 20)
+
+
+def _native_sort_required_bytes(attributes, labels, row_count: int) -> int | None:
+    """Conservatively bound stable-sort key copies, row order, and workspace."""
+    source_bytes = _native_device_column_storage_bytes(attributes, labels)
+    if source_bytes is None:
+        return None
+    index_width = 4 if row_count <= np.iinfo(np.int32).max else 8
+    key_and_workspace_bytes = 4 * max(source_bytes, row_count * len(labels))
+    row_order_bytes = row_count * (4 * index_width)
+    return key_and_workspace_bytes + row_order_bytes + (1 << 20)
+
+
+def _native_column_requires_numpy_public_dtype(attributes, column) -> bool:
+    """Whether a lazy device column must expose a NumPy dtype to pandas users."""
+    parts = getattr(attributes, "parts", None)
+    if parts is not None:
+        for part in parts:
+            if column in part.columns:
+                return _native_column_requires_numpy_public_dtype(part, column)
+        return False
+
+    schema = getattr(attributes, "schema_override", None)
+    if schema is None or column not in attributes.columns:
+        return False
+    position = tuple(attributes.columns).index(column)
+    metadata = schema.field(position).metadata or {}
+    return metadata.get(b"vibespatial:public_dtype") == b"numpy"
+
+
 def _native_lazy_public_attribute_frame(native_state):
     from vibespatial.api._native_public_arrays import (
         NativeAttributeColumnArray,
@@ -557,8 +696,8 @@ def _native_lazy_public_attribute_frame(native_state):
     numeric_arrays = attributes.numeric_column_arrays(attribute_columns)
     if numeric_arrays is None:
         numeric_columns: tuple[Any, ...] = ()
-        if getattr(attributes, "device_table", None) is not None:
-            policies = attributes.device_column_policies(attribute_columns)
+        if bool(getattr(attributes, "is_device_backed", False)):
+            policies = _native_device_column_policies(attributes, attribute_columns)
             numeric_columns = tuple(
                 column
                 for column in attribute_columns
@@ -695,11 +834,16 @@ def _public_frame_columns_are_native_lazy(frame) -> bool:
     return True
 
 
+_NATIVE_PUBLIC_METADATA_DEFAULT = object()
+
+
 def _public_frame_from_native_state(
     frame,
     native_state,
     *,
     geometry_column,
+    attrs=_NATIVE_PUBLIC_METADATA_DEFAULT,
+    columns_name=_NATIVE_PUBLIC_METADATA_DEFAULT,
 ):
     from vibespatial.api._native_state import attach_native_state
 
@@ -720,6 +864,24 @@ def _public_frame_from_native_state(
     result.__class__ = type(frame)
     if geometry_column in result:
         result._geometry_column_name = geometry_column
+    try:
+        finalized = result.__finalize__(frame)
+        if finalized is not None:
+            result = finalized
+    except Exception:
+        pass
+    result.attrs = (
+        frame.attrs.copy()
+        if attrs is _NATIVE_PUBLIC_METADATA_DEFAULT
+        else dict(attrs)
+    )
+    result.columns.name = (
+        frame.columns.name
+        if columns_name is _NATIVE_PUBLIC_METADATA_DEFAULT
+        else columns_name
+    )
+    if dict(getattr(native_state, "attrs", {}) or {}) != result.attrs:
+        native_state = dataclass_replace(native_state, attrs=result.attrs.copy())
     attach_native_state(result, native_state)
     return result
 
@@ -1130,6 +1292,30 @@ def _native_sort_values_rowset(
     attribute_columns = tuple(attributes.columns)
     if any(column not in attribute_columns for column in sort_columns):
         return None
+    device_backed = bool(getattr(attributes, "is_device_backed", False))
+    if device_backed:
+        policies = _native_device_column_policies(attributes, sort_columns)
+        if any(
+            (policy := policies.get(column)) is None or not policy.can_sort
+            for column in sort_columns
+        ):
+            return None
+        required_bytes = _native_sort_required_bytes(
+            attributes,
+            sort_columns,
+            int(state.row_count),
+        )
+        if required_bytes is None:
+            return None
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        admission = get_cuda_runtime().admit_device_memory(
+            stage="tabular-stable-sort",
+            required_bytes=required_bytes,
+            requested_units=int(state.row_count),
+        )
+        if not admission.admitted:
+            return None
 
     try:
         import cupy as cp
@@ -1159,14 +1345,7 @@ def _native_sort_values_rowset(
                         identity=False,
                     )
 
-    if getattr(attributes, "device_table", None) is None:
-        return None
-    policies = attributes.device_column_policies(sort_columns)
-    if any(
-        (policy := policies.get(column)) is None
-        or not policy.can_sort
-        for column in sort_columns
-    ):
+    if not device_backed:
         return None
 
     try:
@@ -1179,15 +1358,24 @@ def _native_sort_values_rowset(
     try:
         from vibespatial.cuda._runtime import pylibcudf_current_stream
 
-        key_table = plc.Table(attributes.to_pylibcudf_columns(sort_columns))
+        stream = pylibcudf_current_stream(attributes.device_table)
+        key_columns = _native_pylibcudf_missing_normalized_columns(
+            _native_pylibcudf_columns(attributes, sort_columns),
+            stream=stream,
+        )
+        key_table = plc.Table(key_columns)
         column_order = [
             Order.ASCENDING if is_ascending else Order.DESCENDING
             for is_ascending in ascending_values
         ]
-        null_order = (
-            NullOrder.BEFORE if na_position == "first" else NullOrder.AFTER
-        )
-        null_precedence = [null_order] * len(sort_columns)
+        null_precedence = [
+            (
+                NullOrder.BEFORE
+                if (na_position == "first") == is_ascending
+                else NullOrder.AFTER
+            )
+            for is_ascending in ascending_values
+        ]
         sort_fn = (
             sorting.stable_sorted_order
             if kind in {"stable", "mergesort"} or len(sort_columns) > 1
@@ -1197,10 +1385,10 @@ def _native_sort_values_rowset(
             key_table,
             column_order,
             null_precedence,
-            stream=pylibcudf_current_stream(),
+            stream=stream,
         )
         sorted_positions = _pylibcudf_numeric_column_view(order_column)
-    except Exception:
+    except (AttributeError, KeyError, NotImplementedError, TypeError, ValueError):
         return None
     if sorted_positions is None:
         return None
@@ -1219,8 +1407,6 @@ def _native_sort_values_rowset(
 
 def _native_topk_required_bytes(row_count: int, arrow_types) -> int | None:
     """Conservatively bound incremental top-k keys, candidates, and workspace."""
-    import pyarrow as pa
-
     source_width = 0
     expanded_sort_width = 0
     for arrow_type in arrow_types:
@@ -1229,13 +1415,15 @@ def _native_topk_required_bytes(row_count: int, arrow_types) -> int | None:
         except (AttributeError, ValueError):
             return None
         source_width += width
-        expanded_sort_width += width
-        if pa.types.is_floating(arrow_type):
-            # Missing discriminator plus a cleaned value copy.
-            expanded_sort_width += 1 + width
-    # Worst-case candidate copy plus four key-widths of radix/stable-sort
-    # workspace, position/order/mask/rank arrays, and a fixed library reserve.
-    bytes_per_row = 64 + source_width + 5 * expanded_sort_width
+        # Every fixed-width key may need a missing discriminator and cleaned
+        # value copy. Admission deliberately assumes the expanded form before
+        # inspecting null counts or gathering a row-indirected key.
+        expanded_sort_width += 1 + width
+    # Iterative selection keeps two position sets, two masks, one selected-row
+    # order, gathered keys, and top-k workspace. The final stable sort is over
+    # at most the requested/output rows, but charge it at full row count so a
+    # keep='all' complete-key tie also remains admitted.
+    bytes_per_row = 72 + 2 * source_width + 5 * expanded_sort_width
     return int(row_count) * bytes_per_row + (1 << 20)
 
 
@@ -1247,23 +1435,83 @@ def _native_topk_public_dtype_admitted(arrow_type) -> bool:
         pa.types.is_integer(arrow_type)
         or pa.types.is_floating(arrow_type)
         or pa.types.is_boolean(arrow_type)
-        or pa.types.is_temporal(arrow_type)
+        or pa.types.is_timestamp(arrow_type)
         or pa.types.is_duration(arrow_type)
+    )
+
+
+def _native_topk_public_series_dtype_admitted(dtype) -> bool:
+    """Match pandas SelectN's public Series dtype validation."""
+    if getattr(dtype, "name", None) == "vibespatial_attribute":
+        # Lazy device columns expose a neutral public extension dtype. Their
+        # exact logical dtype is validated separately from the Arrow schema.
+        return True
+    return bool(
+        (
+            pd.api.types.is_numeric_dtype(dtype)
+            and not pd.api.types.is_complex_dtype(dtype)
+        )
+        or pd.api.types.is_datetime64_any_dtype(dtype)
+        or pd.api.types.is_timedelta64_dtype(dtype)
+    )
+
+
+def _native_topk_request_targets_device_attributes(owner, n, columns, keep) -> bool:
+    """Whether a valid public top-k request would otherwise leave the GPU path."""
+    if (
+        isinstance(n, (bool, np.bool_))
+        or not isinstance(n, (int, np.integer))
+        or keep not in {"first", "last", "all"}
+    ):
+        return False
+    sort_columns = _normalize_sort_columns(columns)
+    if sort_columns is None or len(set(sort_columns)) != len(sort_columns):
+        return False
+
+    from vibespatial.api._native_state import get_native_state
+
+    state = get_native_state(owner)
+    attributes = getattr(state, "attributes", None)
+    if attributes is None or not bool(getattr(attributes, "is_device_backed", False)):
+        return False
+    attribute_columns = tuple(attributes.columns)
+    if any(column not in attribute_columns for column in sort_columns):
+        return False
+    try:
+        public_dtypes = tuple(
+            getattr(owner[column], "dtype", None) for column in sort_columns
+        )
+        if any(
+            _is_geometry_like_dtype(dtype)
+            or not _native_topk_public_series_dtype_admitted(dtype)
+            for dtype in public_dtypes
+        ):
+            return False
+        policies = _native_device_column_policies(attributes, sort_columns)
+        schema = attributes.arrow_schema_for_columns(sort_columns)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+    return all(
+        (policy := policies.get(column)) is not None
+        and policy.can_sort
+        and _native_topk_public_dtype_admitted(field.type)
+        for column, field in zip(sort_columns, schema, strict=True)
     )
 
 
 def _native_topk_rowset(owner, n: int, columns, *, largest: bool, keep: str):
     """Return an exact bounded pylibcudf top-k rowset for sortable columns.
 
-    Physical shape: select the primary-key top-k threshold, compact every row
-    tied at that threshold, lexicographically sort only that bounded candidate
-    set, and retain ``n`` source positions. This preserves pandas' stable
-    secondary-key and ``keep='first'`` semantics without a full row order.
+    Physical shape: refine only the boundary-equal span once per key, retain
+    strict winners as a bounded selected set, then stable-sort only the output
+    rows. Primary-key skew therefore remains linear selection/compaction work;
+    it cannot turn into a full-table multi-key sort. Complete-key ties preserve
+    pandas ``keep='first'``, ``keep='last'``, and ``keep='all'`` semantics.
     """
     if isinstance(n, (bool, np.bool_)) or not isinstance(n, (int, np.integer)):
         return None
     n = int(n)
-    if keep != "first" or n <= 0:
+    if keep not in {"first", "last", "all"}:
         return None
     sort_columns = _normalize_sort_columns(columns)
     if sort_columns is None:
@@ -1277,19 +1525,25 @@ def _native_topk_rowset(owner, n: int, columns, *, largest: bool, keep: str):
     if state is None or not _native_state_can_take_device_row_positions(state):
         return None
     row_count = int(state.row_count)
-    if row_count == 0 or n >= row_count:
-        return None
     attributes = getattr(state, "attributes", None)
-    if attributes is None or getattr(attributes, "device_table", None) is None:
+    if attributes is None or not bool(getattr(attributes, "is_device_backed", False)):
         return None
-    policies = attributes.device_column_policies(sort_columns)
+    attribute_columns = tuple(attributes.columns)
+    if (
+        len(set(sort_columns)) != len(sort_columns)
+        or any(column not in attribute_columns for column in sort_columns)
+        or any(
+            (dtype := getattr(owner[column], "dtype", None)) is None
+            or _is_geometry_like_dtype(dtype)
+            or not _native_topk_public_series_dtype_admitted(dtype)
+            for column in sort_columns
+        )
+    ):
+        return None
+    policies = _native_device_column_policies(attributes, sort_columns)
     if any(
         (policy := policies.get(column)) is None
         or not policy.can_sort
-        or (
-            int(policy.null_count) != 0
-            and policy.arrow_type not in {"float", "double", "float32", "float64"}
-        )
         for column in sort_columns
     ):
         return None
@@ -1299,20 +1553,29 @@ def _native_topk_rowset(owner, n: int, columns, *, largest: bool, keep: str):
         import pyarrow as pa
         import pylibcudf as plc
         from pylibcudf.types import NullOrder, Order, TypeId
+
         from vibespatial.cuda._runtime import (
             get_cuda_runtime,
             pylibcudf_column_from_device,
             pylibcudf_current_stream,
         )
-
-        key_columns = attributes.to_pylibcudf_columns(sort_columns)
-        arrow_types = tuple(column.type().to_arrow() for column in key_columns)
+        arrow_schema = attributes.arrow_schema_for_columns(sort_columns)
+        arrow_types = tuple(field.type for field in arrow_schema)
     except ModuleNotFoundError:
         return None
-    except (AttributeError, KeyError, NotImplementedError, ValueError):
+    except (AttributeError, KeyError, NotImplementedError, TypeError, ValueError):
         return None
     if not all(_native_topk_public_dtype_admitted(value) for value in arrow_types):
         return None
+    if n <= 0 or row_count == 0:
+        return NativeRowSet.from_positions(
+            cp.empty(0, dtype=cp.int64),
+            source_token=state.lineage_token,
+            source_row_count=row_count,
+            ordered=True,
+            unique=True,
+            identity=row_count == 0,
+        )
     required_bytes = _native_topk_required_bytes(row_count, arrow_types)
     if required_bytes is None:
         return None
@@ -1325,123 +1588,273 @@ def _native_topk_rowset(owner, n: int, columns, *, largest: bool, keep: str):
         return None
 
     try:
-        stream = pylibcudf_current_stream(attributes.device_table)
+        # Resolving a row-indirected or multipart logical key may gather it, so
+        # this must remain strictly after memory admission.
+        key_columns = _native_pylibcudf_columns(attributes, sort_columns)
+        stream = pylibcudf_current_stream(*key_columns)
         direction = Order.DESCENDING if largest else Order.ASCENDING
         sort_key_columns = []
         sort_orders = []
-        primary_rank_column = None
+        rank_columns = []
+        missing_columns = []
         for column_index, (column, key_column) in enumerate(
             zip(sort_columns, key_columns, strict=True)
         ):
             policy = policies[column]
-            if policy.arrow_type in {"float", "double", "float32", "float64"}:
-                arrow_type = key_column.type().to_arrow()
-                nan_scalar = plc.Scalar.from_arrow(
-                    pa.scalar(np.nan, type=arrow_type),
+            arrow_type = arrow_types[column_index]
+            floating = pa.types.is_floating(arrow_type)
+            nullable = int(policy.null_count) != 0
+            normalized_key = key_column
+            if floating:
+                normalized_key = _native_pylibcudf_missing_normalized_columns(
+                    [key_column],
+                    stream=stream,
+                )[0]
+            if floating or nullable:
+                missing_mask = plc.unary.is_null(normalized_key, stream=stream)
+                neutral_value = False if pa.types.is_boolean(arrow_type) else 0
+                neutral_scalar = plc.Scalar.from_arrow(
+                    pa.scalar(neutral_value, type=arrow_type),
                     stream=stream,
                 )
-                if int(policy.null_count):
-                    key_column = plc.replace.replace_nulls(
-                        key_column,
-                        nan_scalar,
-                        stream=stream,
-                    )
-                missing_mask = plc.unary.is_nan(key_column, stream=stream)
-                zero_scalar = plc.Scalar.from_arrow(
-                    pa.scalar(0.0, type=arrow_type),
-                    stream=stream,
-                )
-                clean_key_column = plc.copying.copy_if_else(
-                    zero_scalar,
-                    key_column,
-                    missing_mask,
+                clean_key_column = plc.replace.replace_nulls(
+                    normalized_key,
+                    neutral_scalar,
                     stream=stream,
                 )
                 sort_key_columns.extend((missing_mask, clean_key_column))
                 sort_orders.extend((Order.ASCENDING, direction))
-                if column_index == 0:
-                    d_values = cp.asarray(
-                        _pylibcudf_numeric_column_view(clean_key_column)
-                    )
-                    d_missing = cp.asarray(
-                        _pylibcudf_numeric_column_view(missing_mask),
-                        dtype=cp.bool_,
-                    )
-                    if d_values.dtype == cp.float32:
-                        d_bits = d_values.view(cp.uint32)
-                        sign_mask = cp.uint32(1 << 31)
-                        missing_rank = cp.uint32(0 if largest else np.iinfo(np.uint32).max)
-                    else:
-                        d_values = d_values.astype(cp.float64, copy=False)
-                        d_bits = d_values.view(cp.uint64)
-                        sign_mask = cp.uint64(1 << 63)
-                        missing_rank = cp.uint64(0 if largest else np.iinfo(np.uint64).max)
-                    d_rank = cp.where(
-                        (d_bits & sign_mask) != 0,
-                        ~d_bits,
-                        d_bits ^ sign_mask,
-                    )
-                    # pandas treats IEEE -0.0 and +0.0 as equal and resolves
-                    # their top-k boundary with stable ``keep='first'`` order.
-                    d_rank = cp.where(d_values == 0.0, sign_mask, d_rank)
-                    d_rank = cp.where(d_missing, missing_rank, d_rank)
-                    primary_rank_column = pylibcudf_column_from_device(d_rank)
+                rank_column = clean_key_column
+                missing_columns.append(missing_mask)
             else:
-                sort_key_columns.append(key_column)
+                clean_key_column = normalized_key
+                sort_key_columns.append(clean_key_column)
                 sort_orders.append(direction)
-                if column_index == 0:
-                    primary_rank_column = key_column
-        if primary_rank_column is None:
-            return None
-        primary_top = plc.sorting.top_k(
-            primary_rank_column,
-            n,
-            direction,
-            stream=stream,
+                rank_column = normalized_key
+                missing_columns.append(None)
+            rank_columns.append(rank_column)
+
+        position_dtype = cp.int32 if row_count <= np.iinfo(np.int32).max else cp.int64
+        active_positions = pylibcudf_column_from_device(
+            cp.arange(row_count, dtype=position_dtype)
         )
-        boundary = plc.copying.get_element(primary_top, n - 1, stream=stream)
-        boundary_operator = (
-            plc.binaryop.BinaryOperator.GREATER_EQUAL
-            if largest
-            else plc.binaryop.BinaryOperator.LESS_EQUAL
-        )
-        candidate_mask = plc.binaryop.binary_operation(
-            primary_rank_column,
-            boundary,
-            boundary_operator,
-            plc.DataType(TypeId.BOOL8),
-            stream=stream,
-        )
-        position_column = pylibcudf_column_from_device(
-            cp.arange(row_count, dtype=cp.int32)
-        )
-        candidates = plc.stream_compaction.apply_boolean_mask(
-            plc.Table([*sort_key_columns, position_column]),
-            candidate_mask,
-            stream=stream,
-        )
-        candidate_columns = candidates.columns()
-        candidate_order = plc.sorting.stable_sorted_order(
-            plc.Table(candidate_columns[:-1]),
-            sort_orders,
-            [NullOrder.AFTER] * len(sort_key_columns),
-            stream=stream,
-        )
-        ordered_positions = plc.copying.gather(
-            plc.Table([candidate_columns[-1]]),
-            candidate_order,
-            plc.copying.OutOfBoundsPolicy.DONT_CHECK,
-            stream=stream,
-        )
-        bounded_positions = plc.copying.slice(
-            ordered_positions,
-            [0, n],
-            stream=stream,
-        )[0].columns()[0]
-        positions = _pylibcudf_numeric_column_view(bounded_positions)
+
+        def _reverse_position_table(table):
+            count = int(table.columns()[0].size())
+            reverse_map = pylibcudf_column_from_device(
+                cp.arange(count - 1, -1, -1, dtype=position_dtype)
+            )
+            return plc.copying.gather(
+                table,
+                reverse_map,
+                plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                stream=stream,
+            )
+
+        if n >= row_count:
+            full_order = plc.sorting.stable_sorted_order(
+                plc.Table(sort_key_columns),
+                sort_orders,
+                [NullOrder.AFTER] * len(sort_key_columns),
+                stream=stream,
+            )
+            positions = _pylibcudf_numeric_column_view(full_order)
+        else:
+            selected_position_tables = []
+            remaining = n
+            for key_index, rank_column in enumerate(rank_columns):
+                active_count = int(active_positions.size())
+                final_key_keep_last_reversal = bool(
+                    keep == "last"
+                    and len(rank_columns) > 1
+                    and key_index + 1 == len(rank_columns)
+                    and active_count > remaining
+                )
+                active_map = plc.Table([active_positions])
+                missing_column = missing_columns[key_index]
+                if missing_column is not None:
+                    active_missing = plc.copying.gather(
+                        plc.Table([missing_column]),
+                        active_positions,
+                        plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                        stream=stream,
+                    ).columns()[0]
+                    active_valid = plc.unary.unary_operation(
+                        active_missing,
+                        plc.unary.UnaryOperator.NOT,
+                        stream=stream,
+                    )
+                    valid_positions = plc.stream_compaction.apply_boolean_mask(
+                        active_map,
+                        active_valid,
+                        stream=stream,
+                    ).columns()[0]
+                    valid_count = int(valid_positions.size())
+                    if valid_count < remaining:
+                        if valid_count:
+                            valid_table = plc.Table([valid_positions])
+                            selected_position_tables.append(
+                                _reverse_position_table(valid_table)
+                                if final_key_keep_last_reversal
+                                else valid_table
+                            )
+                            remaining -= valid_count
+                        active_positions = plc.stream_compaction.apply_boolean_mask(
+                            active_map,
+                            active_missing,
+                            stream=stream,
+                        ).columns()[0]
+                        if key_index + 1 != len(rank_columns):
+                            continue
+                        boundary_count = int(active_positions.size())
+                        if keep == "all":
+                            selected_position_tables.append(
+                                plc.Table([active_positions])
+                            )
+                        else:
+                            start = (
+                                0
+                                if keep == "first"
+                                else boundary_count - remaining
+                            )
+                            chosen = plc.copying.slice(
+                                plc.Table([active_positions]),
+                                [start, start + remaining],
+                                stream=stream,
+                            )[0]
+                            selected_position_tables.append(
+                                _reverse_position_table(chosen)
+                                if final_key_keep_last_reversal
+                                else chosen
+                            )
+                        break
+                    active_positions = valid_positions
+                    active_map = plc.Table([active_positions])
+                active_rank = plc.copying.gather(
+                    plc.Table([rank_column]),
+                    active_positions,
+                    plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                    stream=stream,
+                ).columns()[0]
+                boundary_values = plc.sorting.top_k(
+                    active_rank,
+                    remaining,
+                    direction,
+                    stream=stream,
+                )
+                boundary = plc.reduce.reduce(
+                    boundary_values,
+                    (
+                        plc.aggregation.min()
+                        if largest
+                        else plc.aggregation.max()
+                    ),
+                    boundary_values.type(),
+                    stream=stream,
+                )
+                better_operator = (
+                    plc.binaryop.BinaryOperator.GREATER
+                    if largest
+                    else plc.binaryop.BinaryOperator.LESS
+                )
+                better_mask = plc.binaryop.binary_operation(
+                    active_rank,
+                    boundary,
+                    better_operator,
+                    plc.DataType(TypeId.BOOL8),
+                    stream=stream,
+                )
+                equal_mask = plc.binaryop.binary_operation(
+                    active_rank,
+                    boundary,
+                    plc.binaryop.BinaryOperator.EQUAL,
+                    plc.DataType(TypeId.BOOL8),
+                    stream=stream,
+                )
+                strict_winners = plc.stream_compaction.apply_boolean_mask(
+                    active_map,
+                    better_mask,
+                    stream=stream,
+                )
+                strict_count = int(strict_winners.columns()[0].size())
+                if strict_count:
+                    selected_position_tables.append(
+                        _reverse_position_table(strict_winners)
+                        if final_key_keep_last_reversal
+                        else strict_winners
+                    )
+                    remaining -= strict_count
+                boundary_positions = plc.stream_compaction.apply_boolean_mask(
+                    active_map,
+                    equal_mask,
+                    stream=stream,
+                ).columns()[0]
+
+                if key_index + 1 != len(rank_columns):
+                    active_positions = boundary_positions
+                    continue
+
+                boundary_count = int(boundary_positions.size())
+                if keep == "all":
+                    selected_position_tables.append(plc.Table([boundary_positions]))
+                else:
+                    start = 0 if keep == "first" else boundary_count - remaining
+                    if start < 0 or start + remaining > boundary_count:
+                        raise RuntimeError(
+                            "top-k boundary refinement produced an invalid slice: "
+                            f"boundary_count={boundary_count}, remaining={remaining}, "
+                            f"keep={keep!r}"
+                        )
+                    chosen = plc.copying.slice(
+                        plc.Table([boundary_positions]),
+                        [start, start + remaining],
+                        stream=stream,
+                    )[0]
+                    selected_position_tables.append(
+                        _reverse_position_table(chosen)
+                        if final_key_keep_last_reversal
+                        else chosen
+                    )
+
+            selected_positions_table = plc.concatenate.concatenate(
+                selected_position_tables,
+                stream=stream,
+            )
+            selected_positions_column = selected_positions_table.columns()[0]
+            selected_keys = plc.copying.gather(
+                plc.Table(sort_key_columns),
+                selected_positions_column,
+                plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                stream=stream,
+            )
+            position_tiebreak_order = None
+            if keep in {"first", "all"}:
+                position_tiebreak_order = Order.ASCENDING
+            elif len(rank_columns) == 1:
+                position_tiebreak_order = Order.DESCENDING
+            final_sort_columns = list(selected_keys.columns())
+            final_sort_orders = list(sort_orders)
+            if position_tiebreak_order is not None:
+                final_sort_columns.append(selected_positions_column)
+                final_sort_orders.append(position_tiebreak_order)
+            final_sort_table = plc.Table(final_sort_columns)
+            final_order = plc.sorting.stable_sorted_order(
+                final_sort_table,
+                final_sort_orders,
+                [NullOrder.AFTER] * len(final_sort_columns),
+                stream=stream,
+            )
+            ordered_positions = plc.copying.gather(
+                plc.Table([selected_positions_column]),
+                final_order,
+                plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                stream=stream,
+            ).columns()[0]
+            positions = _pylibcudf_numeric_column_view(ordered_positions)
     except Exception as exc:
         raise RuntimeError("admitted pylibcudf top-k execution failed") from exc
-    if positions is None or int(positions.size) != n:
+    expected_min = min(max(n, 0), row_count)
+    if positions is None or int(positions.size) < expected_min:
         return None
     return NativeRowSet.from_positions(
         cp.asarray(positions, dtype=cp.int64),
@@ -2522,6 +2935,1268 @@ def _drop_native_state_from_result(result):
     return result
 
 
+_NATIVE_EXPRESSION_BINOPS = {
+    ast.Add: "+",
+    ast.Sub: "-",
+    ast.Mult: "*",
+    ast.Div: "/",
+    ast.FloorDiv: "//",
+    ast.Mod: "%",
+}
+_NATIVE_QUERY_COMPARISONS = {
+    ast.Gt: ">",
+    ast.GtE: ">=",
+    ast.Lt: "<",
+    ast.LtE: "<=",
+    ast.Eq: "==",
+    ast.NotEq: "!=",
+}
+_NATIVE_REVERSED_COMPARISON = {
+    ">": "<",
+    ">=": "<=",
+    "<": ">",
+    "<=": ">=",
+    "==": "==",
+    "!=": "!=",
+}
+_PANDAS_EXPRESSION_FUNCTIONS = frozenset(
+    {
+        "abs",
+        "arccos",
+        "arccosh",
+        "arcsin",
+        "arcsinh",
+        "arctan",
+        "arctan2",
+        "arctanh",
+        "ceil",
+        "cos",
+        "cosh",
+        "exp",
+        "expm1",
+        "floor",
+        "log",
+        "log10",
+        "log1p",
+        "sin",
+        "sinh",
+        "sqrt",
+        "tan",
+        "tanh",
+    }
+)
+_PANDAS_QUERY_FALLBACK_ACTIVE = ContextVar(
+    "vibespatial_pandas_query_fallback_active",
+    default=False,
+)
+_PANDAS_JOIN_FALLBACK_ACTIVE = ContextVar(
+    "vibespatial_pandas_join_fallback_active",
+    default=False,
+)
+
+
+def _native_device_expression_state(owner):
+    """Return the device-backed frame state admitted by query/eval."""
+    from vibespatial.api._native_result_core import NativeAttributeTable
+    from vibespatial.api._native_state import get_native_state
+
+    state = get_native_state(owner)
+    if state is None:
+        return None
+    attributes = NativeAttributeTable.from_value(state.attributes)
+    if not attributes.is_device_backed:
+        return None
+    return state
+
+
+def _native_expression_column(state, name, *, comparison: bool):
+    """Resolve one exact all-valid numeric device column and its Arrow type."""
+    if not isinstance(name, str) or name == state.geometry_name:
+        return None
+    attributes = state.attributes
+    policies = _native_device_column_policies(attributes, (name,))
+    policy = policies.get(name)
+    if (
+        policy is None
+        or not policy.can_compute_numeric
+        or int(policy.null_count) != 0
+    ):
+        return None
+    try:
+        import pyarrow as pa
+
+        arrow_type = attributes.arrow_schema_for_columns((name,)).field(0).type
+    except (AttributeError, ImportError, KeyError, TypeError, ValueError):
+        return None
+    if comparison and not (
+        pa.types.is_integer(arrow_type) or pa.types.is_boolean(arrow_type)
+    ):
+        # NativeExpression comparisons deliberately treat nonfinite floats as
+        # missing.  Until query has a validity-aware float contract, decline
+        # rather than changing pandas NaN/inf semantics.
+        return None
+    try:
+        from vibespatial.api._native_expression import NativeExpression
+        from vibespatial.api._native_result_core import _pylibcudf_numeric_column_view
+        from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+        columns = _native_pylibcudf_columns(attributes, (name,))
+        pylibcudf_current_stream(*columns)
+        values = _pylibcudf_numeric_column_view(columns[0])
+    except (AttributeError, ImportError, KeyError, TypeError, ValueError):
+        return None
+    expression = NativeExpression(
+        operation=f"attribute.{name}",
+        values=values,
+        source_token=state.lineage_token,
+        source_row_count=state.row_count,
+        dtype=str(getattr(values, "dtype", "")) or None,
+        precision="source",
+        readiness=state.readiness,
+    )
+    return expression, arrow_type
+
+
+def _native_expression_scalar(node):
+    if not isinstance(node, ast.Constant):
+        return None
+    value = node.value
+    if isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float) and np.isfinite(value):
+        return value
+    return None
+
+
+def _native_eval_expression_node(node, state):
+    """Lower the restricted fixed-width eval grammar to NativeExpression."""
+    if isinstance(node, ast.Name):
+        resolved = _native_expression_column(state, node.id, comparison=False)
+        if resolved is None:
+            return None
+        import pyarrow as pa
+
+        return resolved[0] if pa.types.is_int64(resolved[1]) else None
+    scalar = _native_expression_scalar(node)
+    if scalar is not None:
+        return (
+            scalar
+            if isinstance(scalar, int)
+            and not isinstance(scalar, bool)
+            and np.iinfo(np.int64).min <= scalar <= np.iinfo(np.int64).max
+            else None
+        )
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        operand = _native_eval_expression_node(node.operand, state)
+        if operand is None:
+            return None
+        if isinstance(node.op, ast.UAdd):
+            return operand
+        if isinstance(operand, (bool, int, float)):
+            return -operand
+        return operand.binary_arithmetic("*", -1)
+    if isinstance(node, ast.BinOp):
+        symbol = _NATIVE_EXPRESSION_BINOPS.get(type(node.op))
+        if symbol not in {"+", "-", "*"}:
+            return None
+        left = _native_eval_expression_node(node.left, state)
+        right = _native_eval_expression_node(node.right, state)
+        if left is None or right is None:
+            return None
+        from vibespatial.api._native_expression import NativeExpression
+
+        if isinstance(left, NativeExpression):
+            return left.binary_arithmetic(symbol, right)
+        if isinstance(right, NativeExpression):
+            return right.binary_arithmetic(symbol, left, reverse=True)
+        return None
+    return None
+
+
+def _native_query_scalar_fits_arrow(value, arrow_type) -> bool:
+    import pyarrow as pa
+
+    if pa.types.is_boolean(arrow_type):
+        return isinstance(value, bool)
+    if not isinstance(value, int) or isinstance(value, bool):
+        return False
+    bit_width = int(arrow_type.bit_width)
+    if pa.types.is_unsigned_integer(arrow_type):
+        return 0 <= value <= (1 << bit_width) - 1
+    return -(1 << (bit_width - 1)) <= value <= (1 << (bit_width - 1)) - 1
+
+
+def _native_query_selection_node(node, state):
+    """Lower one exact integer/bool comparison to row-flow selection."""
+    if (
+        not isinstance(node, ast.Compare)
+        or len(node.ops) != 1
+        or len(node.comparators) != 1
+    ):
+        return None
+    symbol = _NATIVE_QUERY_COMPARISONS.get(type(node.ops[0]))
+    if symbol is None:
+        return None
+
+    left = (
+        _native_expression_column(state, node.left.id, comparison=True)
+        if isinstance(node.left, ast.Name)
+        else None
+    )
+    right_node = node.comparators[0]
+    right = (
+        _native_expression_column(state, right_node.id, comparison=True)
+        if isinstance(right_node, ast.Name)
+        else None
+    )
+    left_scalar = _native_expression_scalar(node.left)
+    right_scalar = _native_expression_scalar(right_node)
+
+    if left is not None and right is not None:
+        return left[0].compare(symbol, right[0])
+    if left is not None and right_scalar is not None:
+        if not _native_query_scalar_fits_arrow(right_scalar, left[1]):
+            return None
+        return left[0].compare_scalar_selection(symbol, right_scalar)
+    if left_scalar is not None and right is not None:
+        if not _native_query_scalar_fits_arrow(left_scalar, right[1]):
+            return None
+        return right[0].compare_scalar_selection(
+            _NATIVE_REVERSED_COMPARISON[symbol],
+            left_scalar,
+        )
+    return None
+
+
+def _native_device_carrier_bytes(value, *, seen: set[int] | None = None) -> int:
+    """Count unique live CUDA buffers reachable from one private carrier."""
+    if value is None:
+        return 0
+    if seen is None:
+        seen = set()
+    value_id = id(value)
+    if value_id in seen:
+        return 0
+    seen.add(value_id)
+    if hasattr(value, "__cuda_array_interface__"):
+        return int(getattr(value, "nbytes", 0))
+    if isinstance(value, dict):
+        return sum(_native_device_carrier_bytes(item, seen=seen) for item in value.values())
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return sum(_native_device_carrier_bytes(item, seen=seen) for item in value)
+    if type(value).__module__.startswith("vibespatial") and hasattr(value, "__dict__"):
+        return sum(
+            _native_device_carrier_bytes(item, seen=seen)
+            for item in vars(value).values()
+        )
+    return 0
+
+
+def _native_expression_transition_bytes(state, *, query: bool) -> int:
+    attributes = _native_device_column_storage_bytes(
+        state.attributes,
+        tuple(state.attributes.columns),
+    )
+    if attributes is None:
+        return 0
+    carrier_bytes = _native_device_carrier_bytes(
+        (
+            state.geometry,
+            state.secondary_geometry,
+            state.geometry_metadata_cache,
+            state.provenance,
+            state.index_plan,
+        )
+    )
+    if query:
+        # Almost-identity query output is the worst admitted public take: all
+        # attributes plus geometry/index row maps can be live beside sources.
+        return int(attributes) + carrier_bytes + int(state.row_count) * 32
+    physicalize_bytes = _native_attribute_row_view_gather_bytes(state.attributes)
+    return physicalize_bytes + int(state.row_count) * 16
+
+
+def _native_attribute_row_view_gather_bytes(attributes) -> int:
+    """Bound the gather needed to physicalize deferred attribute row maps."""
+    parts = getattr(attributes, "parts", None)
+    if parts is not None:
+        return sum(_native_attribute_row_view_gather_bytes(part) for part in parts)
+    if getattr(attributes, "row_positions", None) is None:
+        return 0
+    storage_bytes = _native_device_column_storage_bytes(
+        attributes,
+        tuple(attributes.columns),
+    )
+    return 0 if storage_bytes is None else int(storage_bytes)
+
+
+def _admit_native_public_expression(state, tree, *, stage: str, query: bool) -> bool:
+    """Admit row-aligned expression scratch before any device allocation."""
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    operator_count = sum(
+        isinstance(node, (ast.BinOp, ast.UnaryOp, ast.Compare))
+        for node in ast.walk(tree)
+    )
+    scratch_bytes = int(state.row_count) * (96 + 16 * operator_count)
+    required_bytes = (
+        scratch_bytes
+        + _native_expression_transition_bytes(state, query=query)
+        + (1 << 20)
+    )
+    return get_cuda_runtime().admit_device_memory(
+        stage=stage,
+        required_bytes=required_bytes,
+        requested_units=int(state.row_count),
+    ).admitted
+
+
+def _native_query_result(owner, expr: str, state):
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except (SyntaxError, TypeError, ValueError):
+        return None
+    if not _admit_native_public_expression(
+        state,
+        tree,
+        stage="tabular-query-expression",
+        query=True,
+    ):
+        return None
+    selection = _native_query_selection_node(tree.body, state)
+    if selection is None:
+        return None
+    from vibespatial.api._native_rowset import NativeDeviceSelection
+
+    rowset = (
+        selection.compact_rowset(
+            surface="geopandas.geodataframe.query",
+            strict_disallowed=False,
+        )
+        if isinstance(selection, NativeDeviceSelection)
+        else selection
+    )
+    return _take_public_frame_with_native_state(
+        owner,
+        rowset,
+        source_native_state=state,
+        geometry_column=owner._geometry_column_name,
+        preserve_index=True,
+    )
+
+
+def _native_eval_result(owner, expr: str, state):
+    try:
+        tree = ast.parse(expr, mode="exec")
+    except (SyntaxError, TypeError, ValueError):
+        return None
+    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Assign):
+        return None
+    assignment = tree.body[0]
+    if len(assignment.targets) != 1 or not isinstance(assignment.targets[0], ast.Name):
+        return None
+    target = assignment.targets[0].id
+    if target == state.geometry_name:
+        return None
+    if not _admit_native_public_expression(
+        state,
+        tree,
+        stage="tabular-eval-expression",
+        query=False,
+    ):
+        return None
+    expression = _native_eval_expression_node(assignment.value, state)
+    from vibespatial.api._native_expression import NativeExpression
+
+    if not isinstance(expression, NativeExpression):
+        return None
+    column_order = tuple(owner.columns)
+    if target not in column_order:
+        column_order = (*column_order, target)
+    assigned = state.assign_expression_columns(
+        {target: expression},
+        column_order=column_order,
+    )
+    if assigned is None:
+        return None
+    return _public_frame_from_native_state(
+        owner,
+        assigned,
+        geometry_column=owner._geometry_column_name,
+    )
+
+
+def _native_normalize_pandas_expression_syntax(
+    expr: str,
+) -> tuple[str, tuple[str, ...], tuple[str, ...]] | None:
+    """Replace pandas-only name syntax so Python's AST can validate grammar."""
+    output = []
+    position = 0
+    backtick_count = 0
+    backtick_names = []
+    local_names = []
+    quote = None
+    escaped = False
+    while position < len(expr):
+        character = expr[position]
+        if quote is not None:
+            output.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif expr.startswith(quote, position):
+                if len(quote) > 1:
+                    output.extend(quote[1:])
+                    position += len(quote) - 1
+                quote = None
+            position += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character * 3 if expr.startswith(character * 3, position) else character
+            output.extend(quote)
+            position += len(quote)
+            continue
+        if character == "#":
+            end = expr.find("\n", position)
+            if end < 0:
+                output.append(expr[position:])
+                position = len(expr)
+            else:
+                output.append(expr[position:end])
+                position = end
+            continue
+        if character == "`":
+            end = expr.find("`", position + 1)
+            if end < 0:
+                return None
+            backtick_names.append(expr[position + 1 : end])
+            output.append(f"__vibespatial_backtick_{backtick_count}")
+            backtick_count += 1
+            position = end + 1
+            continue
+        if character == "@":
+            position += 1
+            while position < len(expr) and expr[position].isspace():
+                position += 1
+            if position >= len(expr) or not (
+                expr[position].isalpha() or expr[position] == "_"
+            ):
+                return None
+            end = position + 1
+            while end < len(expr) and (
+                expr[end].isalnum() or expr[end] == "_"
+            ):
+                end += 1
+            local_names.append(expr[position:end])
+            output.append(expr[position:end])
+            position = end
+            continue
+        output.append(character)
+        position += 1
+    if quote is not None:
+        return None
+    return "".join(output), tuple(backtick_names), tuple(local_names)
+
+
+def _native_expression_local_name_exists(
+    name: str,
+    *,
+    scope_kwargs,
+    scope_locals,
+    scope_globals,
+) -> bool:
+    local_dict = scope_kwargs.get("local_dict")
+    global_dict = scope_kwargs.get("global_dict")
+    return any(
+        mapping is not None and name in mapping
+        for mapping in (
+            local_dict,
+            global_dict,
+            scope_locals,
+            scope_globals,
+        )
+    )
+
+
+def _native_public_expression_is_invalid(
+    owner,
+    expr: str,
+    *,
+    assignment: bool,
+    scope_kwargs=None,
+    scope_locals=None,
+    scope_globals=None,
+) -> bool:
+    """Identify syntax/undefined-name errors that are not CPU fallbacks."""
+    mode = "exec" if assignment else "eval"
+    try:
+        tree = ast.parse(expr, mode=mode)
+    except (SyntaxError, TypeError, ValueError):
+        if not isinstance(expr, str):
+            return True
+        normalized_expression = _native_normalize_pandas_expression_syntax(expr)
+        if normalized_expression is None:
+            return True
+        normalized, backtick_names, local_names = normalized_expression
+        try:
+            ast.parse(normalized, mode=mode)
+        except (SyntaxError, TypeError, ValueError):
+            return True
+        public_names = set(owner.columns) | set(owner.index.names)
+        if any(name not in public_names for name in backtick_names):
+            return True
+        scope_kwargs = {} if scope_kwargs is None else scope_kwargs
+        if any(
+            not _native_expression_local_name_exists(
+                name,
+                scope_kwargs=scope_kwargs,
+                scope_locals=scope_locals,
+                scope_globals=scope_globals,
+            )
+            for name in local_names
+        ):
+            return True
+        return False
+    known = {
+        column
+        for column in owner.columns
+        if isinstance(column, str) and column.isidentifier()
+    }
+    known.add("index")
+    known.update(
+        name
+        for name in owner.index.names
+        if isinstance(name, str) and name.isidentifier()
+    )
+    referenced = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+    supported_calls = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _PANDAS_EXPRESSION_FUNCTIONS
+    }
+    return bool(referenced - known - supported_calls)
+
+
+def _native_device_table_from_public_frame(frame: pd.DataFrame):
+    """Lower an already-public attribute frame for one admitted join."""
+    from vibespatial.api._native_result_core import NativeAttributeTable
+    from vibespatial.api._native_results import (
+        _native_attribute_table_from_projected_frames,
+    )
+
+    try:
+        attributes = _native_attribute_table_from_projected_frames(
+            [frame],
+            index_override=frame.index,
+            storage="device",
+        )
+    except (ImportError, TypeError, ValueError):
+        return None
+    if attributes.is_device_backed or len(attributes.columns) == 0:
+        return attributes
+    try:
+        import pylibcudf as plc
+
+        columns = tuple(attributes.columns)
+        return NativeAttributeTable(
+            device_table=plc.Table(attributes.to_pylibcudf_columns(columns)),
+            index_override=frame.index,
+            column_override=columns,
+            schema_override=attributes.arrow_schema_for_columns(columns),
+        )
+    except (ImportError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _native_join_output_names(
+    left_columns,
+    right_columns,
+    *,
+    shared_keys,
+    suffixes,
+):
+    """Return exact pandas-style column mappings for an admitted equality join."""
+    try:
+        left_suffix, right_suffix = suffixes
+    except (TypeError, ValueError):
+        return None
+    shared_keys = set(shared_keys)
+    overlap = (set(left_columns) - shared_keys) & (set(right_columns) - shared_keys)
+    if overlap and not left_suffix and not right_suffix:
+        return None
+
+    left_mapping = {
+        name: f"{name}{left_suffix}"
+        for name in overlap
+        if left_suffix is not None
+    }
+    right_mapping = {
+        name: f"{name}{right_suffix}"
+        for name in overlap
+        if right_suffix is not None
+    }
+    left_output = tuple(left_mapping.get(name, name) for name in left_columns)
+    right_output = tuple(right_mapping.get(name, name) for name in right_columns)
+    combined = (*left_output, *right_output)
+    if len(set(combined)) != len(combined):
+        return None
+    return left_mapping, right_mapping, left_output, right_output
+
+
+_PANDAS_VALID_MERGE_VALIDATIONS = frozenset(
+    {
+        "1:1",
+        "1:m",
+        "m:1",
+        "m:m",
+        "one_to_one",
+        "one_to_many",
+        "many_to_one",
+        "many_to_many",
+    }
+)
+
+
+def _native_validate_argument_is_invalid(validate) -> bool:
+    if validate is None:
+        return False
+    try:
+        return validate not in _PANDAS_VALID_MERGE_VALIDATIONS
+    except TypeError:
+        return True
+
+
+def _native_key_labels(value) -> tuple[Any, ...] | None:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)):
+        return (value,)
+    try:
+        return tuple(value)
+    except TypeError:
+        return (value,)
+
+
+def _native_explicit_key_labels(value) -> tuple[Any, ...] | None:
+    """Separate pandas label sequences from array-valued merge keys."""
+    if isinstance(value, (np.ndarray, pd.Series, pd.Index, ExtensionArray)):
+        return None
+    labels = _native_key_labels(value)
+    if labels is None:
+        return None
+    try:
+        for label in labels:
+            hash(label)
+    except TypeError:
+        return None
+    return labels
+
+
+def _native_is_array_valued_key(value) -> bool:
+    return isinstance(value, (np.ndarray, pd.Series, pd.Index, ExtensionArray))
+
+
+def _native_join_on_key_specs(value) -> tuple[Any, ...]:
+    if _native_is_array_valued_key(value):
+        return (value,)
+    if isinstance(value, (str, bytes)):
+        return (value,)
+    try:
+        return tuple(value)
+    except TypeError:
+        return (value,)
+
+
+def _native_merge_key_count(value) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (np.ndarray, pd.Series, pd.Index, ExtensionArray)):
+        return 1
+    labels = _native_key_labels(value)
+    return 0 if labels is None else len(labels)
+
+
+def _native_public_key_exists(frame, key) -> bool:
+    try:
+        return key in frame.columns or key in frame.index.names
+    except (TypeError, ValueError):
+        return False
+
+
+def _native_public_key_is_ambiguous(frame, key) -> bool:
+    try:
+        return key in frame.columns and key in frame.index.names
+    except (TypeError, ValueError):
+        return False
+
+
+def _native_suffixes_are_invalid(suffixes) -> bool:
+    if isinstance(suffixes, (str, bytes)):
+        return True
+    try:
+        _left_suffix, _right_suffix = suffixes
+    except (TypeError, ValueError):
+        return True
+    return False
+
+
+def _native_public_merge_is_invalid(
+    owner,
+    right,
+    *,
+    on,
+    left_on,
+    right_on,
+    left_index,
+    right_index,
+    suffixes,
+    validate,
+) -> bool:
+    """Classify public validation failures that strict-native must not mask."""
+    if _native_validate_argument_is_invalid(validate):
+        return True
+    if not isinstance(right, pd.DataFrame):
+        return False
+    if _native_suffixes_are_invalid(suffixes):
+        return True
+    keys = _native_key_labels(on)
+    if keys is not None and any(
+        not _native_public_key_exists(owner, key)
+        or not _native_public_key_exists(right, key)
+        or _native_public_key_is_ambiguous(owner, key)
+        or _native_public_key_is_ambiguous(right, key)
+        for key in keys
+    ):
+        return True
+    if on is not None and left_on is None and right_on is None:
+        shared_keys = set(keys or ())
+        right_nonkeys = tuple(
+            column for column in right.columns if column not in shared_keys
+        )
+        if _native_join_output_names(
+            tuple(owner.columns),
+            right_nonkeys,
+            shared_keys=shared_keys,
+            suffixes=suffixes,
+        ) is None:
+            return True
+    left_keys = _native_explicit_key_labels(left_on)
+    if not left_index and left_keys is not None and any(
+        not _native_public_key_exists(owner, key)
+        or _native_public_key_is_ambiguous(owner, key)
+        for key in left_keys
+    ):
+        return True
+    right_keys = _native_explicit_key_labels(right_on)
+    if not right_index and right_keys is not None and any(
+        not _native_public_key_exists(right, key)
+        or _native_public_key_is_ambiguous(right, key)
+        for key in right_keys
+    ):
+        return True
+    if on is not None and (left_on is not None or right_on is not None):
+        return True
+    if on is not None and (left_index or right_index):
+        return True
+    if left_on is not None and left_index:
+        return True
+    if right_on is not None and right_index:
+        return True
+    if left_on is not None and right_on is None and not right_index:
+        return True
+    if right_on is not None and left_on is None and not left_index:
+        return True
+    if left_index and not right_index and right_on is None:
+        return True
+    if right_index and not left_index and left_on is None:
+        return True
+    if on is None:
+        left_key_count = (
+            int(owner.index.nlevels)
+            if left_index
+            else _native_merge_key_count(left_on)
+        )
+        right_key_count = (
+            int(right.index.nlevels)
+            if right_index
+            else _native_merge_key_count(right_on)
+        )
+        if left_key_count and right_key_count and left_key_count != right_key_count:
+            return True
+    if (
+        on is None
+        and left_on is None
+        and right_on is None
+        and not left_index
+        and not right_index
+        and not (set(owner.columns) & set(right.columns))
+    ):
+        return True
+    return False
+
+
+def _native_join_validate_cardinality_is_invalid(state, other, validate) -> bool:
+    if not isinstance(other, pd.DataFrame) or validate is None:
+        return False
+    left_unique = not bool(getattr(state.index_plan, "has_duplicates", False))
+    right_unique = bool(other.index.is_unique)
+    if validate in {"one_to_one", "1:1"}:
+        return not left_unique or not right_unique
+    if validate in {"one_to_many", "1:m"}:
+        return not left_unique
+    if validate in {"many_to_one", "m:1"}:
+        return not right_unique
+    return False
+
+
+def _native_public_join_is_invalid(
+    owner,
+    other,
+    *,
+    state,
+    on,
+    lsuffix,
+    rsuffix,
+    validate,
+) -> bool:
+    """Classify index-join validation failures before strict fallback policy."""
+    if _native_validate_argument_is_invalid(validate):
+        return True
+    if on is None and _native_join_validate_cardinality_is_invalid(
+        state,
+        other,
+        validate,
+    ):
+        return True
+    if on is not None:
+        keys = _native_explicit_key_labels(on)
+        if keys is None:
+            key_specs = _native_join_on_key_specs(on)
+            for key in key_specs:
+                if _native_is_array_valued_key(key):
+                    if len(key) != len(owner):
+                        return True
+                elif (
+                    not _native_public_key_exists(owner, key)
+                    or _native_public_key_is_ambiguous(owner, key)
+                ):
+                    return True
+            if (
+                isinstance(other, pd.DataFrame)
+                and len(key_specs) != int(other.index.nlevels)
+            ):
+                return True
+        else:
+            if any(
+                not _native_public_key_exists(owner, key) for key in keys
+            ):
+                return True
+            if any(
+                _native_public_key_is_ambiguous(owner, key) for key in keys
+            ):
+                return True
+            if (
+                isinstance(other, pd.DataFrame)
+                and len(keys) != int(other.index.nlevels)
+            ):
+                return True
+    if isinstance(other, pd.DataFrame):
+        if _native_join_output_names(
+            tuple(owner.columns),
+            tuple(other.columns),
+            shared_keys=(),
+            suffixes=(lsuffix, rsuffix),
+        ) is None:
+            return True
+    return False
+
+
+def _native_frame_has_geometry_dtype(frame: pd.DataFrame) -> bool:
+    return any(_is_geometry_like_dtype(dtype) for dtype in frame.dtypes)
+
+
+def _native_join_columns_are_flat(frame: pd.DataFrame) -> bool:
+    return not isinstance(frame.columns, pd.MultiIndex) and not any(
+        isinstance(column, tuple) for column in frame.columns
+    )
+
+
+def _native_join_output_metadata(owner, right) -> tuple[dict[Any, Any], Any]:
+    attrs = owner.attrs.copy() if owner.attrs == right.attrs else {}
+    columns_name = (
+        owner.columns.name
+        if owner.columns.name == right.columns.name
+        else None
+    )
+    return attrs, columns_name
+
+
+def _native_join_admitted(
+    state,
+    right: pd.DataFrame,
+    *,
+    stage: str,
+    output_rows: int,
+) -> bool:
+    """Admit inputs, relation maps, gathers, and output columns before H2D."""
+    left_bytes = _native_device_column_storage_bytes(
+        state.attributes,
+        tuple(state.attributes.columns),
+    )
+    if left_bytes is None:
+        return False
+    try:
+        right_bytes = int(right.memory_usage(index=False, deep=True).sum())
+    except (AttributeError, TypeError, ValueError):
+        return False
+    carrier_bytes = _native_device_carrier_bytes(
+        (
+            state.geometry,
+            state.secondary_geometry,
+            state.geometry_metadata_cache,
+            state.provenance,
+            state.index_plan,
+        )
+    )
+    row_view_gather_bytes = _native_attribute_row_view_gather_bytes(
+        state.attributes
+    )
+    row_map_bytes = int(output_rows) * 32
+    output_bytes = max(int(left_bytes) + right_bytes, int(output_rows))
+    required_bytes = (
+        5 * output_bytes
+        + 2 * carrier_bytes
+        + row_view_gather_bytes
+        + row_map_bytes
+        + (1 << 20)
+    )
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    return get_cuda_runtime().admit_device_memory(
+        stage=stage,
+        required_bytes=required_bytes,
+        requested_units=int(output_rows),
+    ).admitted
+
+
+def _native_unique_right_inner_merge(
+    owner,
+    right,
+    *,
+    on,
+    suffixes,
+    validate,
+):
+    """Execute a stable many-to-one inner equality merge on device.
+
+    Physical shape: two key tables -> unique-right equality relation -> stable
+    left-row order -> output-shaped gathers -> NativeFrameState.  Requiring a
+    unique right key bounds relation cardinality by the left row count.
+    """
+    state = _native_device_expression_state(owner)
+    if state is None or not isinstance(right, pd.DataFrame):
+        return None
+    if isinstance(right, GeoDataFrame) or not owner.columns.is_unique or not right.columns.is_unique:
+        return None
+    if not _native_join_columns_are_flat(owner) or not _native_join_columns_are_flat(right):
+        return None
+    if state.secondary_geometry or _native_frame_has_geometry_dtype(right):
+        return None
+    if on is None:
+        return None
+    keys = (on,) if isinstance(on, (str, bytes)) else tuple(on)
+    if not keys or len(set(keys)) != len(keys):
+        return None
+    if any(key == state.geometry_name for key in keys):
+        return None
+    if any(key not in state.attributes.columns or key not in right.columns for key in keys):
+        return None
+    if state.geometry_name in right.columns:
+        return None
+    if validate is not None and validate not in _PANDAS_VALID_MERGE_VALIDATIONS:
+        return None
+    if not _native_join_admitted(
+        state,
+        right,
+        stage="tabular-unique-right-inner-merge",
+        output_rows=state.row_count,
+    ):
+        return None
+
+    right_attributes = _native_device_table_from_public_frame(right)
+    if right_attributes is None or not right_attributes.is_device_backed:
+        return None
+    from pandas.errors import MergeError
+
+    try:
+        import cupy as cp
+        import pylibcudf as plc
+        import pylibcudf.sorting as sorting
+
+        from vibespatial.api._native_result_core import (
+            NativeAttributeTable,
+            _pylibcudf_numeric_column_view,
+        )
+        from vibespatial.api._native_rowset import NativeIndexPlan
+        from vibespatial.api._native_state import NativeFrameState
+        from vibespatial.cuda._runtime import pylibcudf_current_stream
+        from vibespatial.runtime.residency import combined_residency
+
+        left_raw_columns = _native_pylibcudf_columns(state.attributes, keys)
+        right_raw_columns = _native_pylibcudf_columns(right_attributes, keys)
+        stream = pylibcudf_current_stream(
+            *left_raw_columns,
+            *right_raw_columns,
+        )
+        left_key_columns = _native_pylibcudf_missing_normalized_columns(
+            left_raw_columns,
+            stream=stream,
+        )
+        right_key_columns = _native_pylibcudf_missing_normalized_columns(
+            right_raw_columns,
+            stream=stream,
+        )
+        if any(
+            left_column.type() != right_column.type()
+            for left_column, right_column in zip(
+                left_key_columns,
+                right_key_columns,
+                strict=True,
+            )
+        ):
+            return None
+        left_keys = plc.Table(left_key_columns)
+        right_keys = plc.Table(right_key_columns)
+        unique_right = plc.stream_compaction.distinct_indices(
+            right_keys,
+            plc.stream_compaction.DuplicateKeepOption.KEEP_FIRST,
+            plc.types.NullEquality.EQUAL,
+            plc.types.NanEquality.ALL_EQUAL,
+            stream=stream,
+        )
+        if int(unique_right.size()) != len(right):
+            if validate in {"many_to_one", "m:1", "one_to_one", "1:1"}:
+                relationship = (
+                    "one-to-one"
+                    if validate in {"one_to_one", "1:1"}
+                    else "many-to-one"
+                )
+                raise MergeError(
+                    "Merge keys are not unique in right dataset; "
+                    f"not a {relationship} merge"
+                )
+            return None
+        if validate in {"one_to_one", "1:1", "one_to_many", "1:m"}:
+            unique_left = plc.stream_compaction.distinct_indices(
+                left_keys,
+                plc.stream_compaction.DuplicateKeepOption.KEEP_FIRST,
+                plc.types.NullEquality.EQUAL,
+                plc.types.NanEquality.ALL_EQUAL,
+                stream=stream,
+            )
+            if int(unique_left.size()) != len(owner):
+                relationship = (
+                    "one-to-one"
+                    if validate in {"one_to_one", "1:1"}
+                    else "one-to-many"
+                )
+                raise MergeError(
+                    "Merge keys are not unique in left dataset; "
+                    f"not a {relationship} merge"
+                )
+        left_column, right_column = plc.join.inner_join(
+            left_keys,
+            right_keys,
+            plc.types.NullEquality.EQUAL,
+            stream=stream,
+        )
+        order_column = sorting.stable_sorted_order(
+            plc.Table([left_column, right_column]),
+            [plc.types.Order.ASCENDING, plc.types.Order.ASCENDING],
+            [plc.types.NullOrder.AFTER, plc.types.NullOrder.AFTER],
+            stream=stream,
+        )
+        order = cp.asarray(_pylibcudf_numeric_column_view(order_column), dtype=cp.int64)
+        left_positions = cp.asarray(
+            _pylibcudf_numeric_column_view(left_column),
+            dtype=cp.int64,
+        )[order]
+        right_positions = cp.asarray(
+            _pylibcudf_numeric_column_view(right_column),
+            dtype=cp.int64,
+        )[order]
+    except MergeError:
+        raise
+    except (AttributeError, KeyError, NotImplementedError, TypeError, ValueError):
+        return None
+
+    right_nonkeys = tuple(column for column in right.columns if column not in keys)
+    names = _native_join_output_names(
+        tuple(state.column_order),
+        right_nonkeys,
+        shared_keys=keys,
+        suffixes=suffixes,
+    )
+    if names is None:
+        return None
+    left_mapping, right_mapping, left_output, right_output = names
+    geometry_name = left_mapping.get(state.geometry_name, state.geometry_name)
+    if geometry_name != state.geometry_name:
+        return None
+
+    left_attributes = state.attributes.take(
+        left_positions,
+        preserve_index=False,
+    ).rename_columns(left_mapping)
+    right_projected = right_attributes.project_columns(right_nonkeys)
+    if right_projected is None:
+        return None
+    right_projected = right_projected.take(
+        right_positions,
+        preserve_index=False,
+    ).rename_columns(right_mapping)
+    output_index = pd.RangeIndex(int(left_positions.size))
+    attributes = NativeAttributeTable.combine_columns(
+        [left_attributes, right_projected],
+        index_override=output_index,
+    )
+    if attributes is None:
+        return None
+    geometry = state.geometry.take(
+        left_positions,
+        unique=False,
+        defer_device_metadata=True,
+    )
+    metadata = (
+        None
+        if state.geometry_metadata_cache is None
+        else state.geometry_metadata_cache.take(left_positions)
+    )
+    provenance = (
+        state.provenance.take(left_positions)
+        if state.provenance is not None and hasattr(state.provenance, "take")
+        else state.provenance
+    )
+    output_attrs, output_columns_name = _native_join_output_metadata(owner, right)
+    joined_state = NativeFrameState(
+        attributes=attributes,
+        geometry=geometry,
+        geometry_name=geometry_name,
+        column_order=(*left_output, *right_output),
+        index_plan=NativeIndexPlan.from_index(output_index),
+        row_count=int(left_positions.size),
+        secondary_geometry=(),
+        attrs=output_attrs,
+        provenance=provenance,
+        geometry_metadata_cache=metadata,
+        residency=combined_residency(geometry),
+        readiness=state.readiness,
+    )
+    return _public_frame_from_native_state(
+        owner,
+        joined_state,
+        geometry_column=geometry_name,
+        attrs=output_attrs,
+        columns_name=output_columns_name,
+    )
+
+
+def _native_exact_index_join(
+    owner,
+    right,
+    *,
+    lsuffix,
+    rsuffix,
+    validate,
+):
+    """Combine exact unique aligned indexes without constructing a relation."""
+    state = _native_device_expression_state(owner)
+    if state is None or not isinstance(right, pd.DataFrame):
+        return None
+    if isinstance(right, GeoDataFrame) or not owner.columns.is_unique or not right.columns.is_unique:
+        return None
+    if not _native_join_columns_are_flat(owner) or not _native_join_columns_are_flat(right):
+        return None
+    if state.secondary_geometry or _native_frame_has_geometry_dtype(right):
+        return None
+    index_plan = state.index_plan
+    source_index = getattr(index_plan, "index", None)
+    if (
+        getattr(index_plan, "kind", None) not in {"range", "host-labels"}
+        or not isinstance(source_index, pd.Index)
+        or bool(getattr(index_plan, "has_duplicates", False))
+        or not right.index.is_unique
+        or not source_index.equals(right.index)
+    ):
+        return None
+    if state.geometry_name in right.columns:
+        return None
+    if validate not in {None, "one_to_one", "1:1", "many_to_one", "m:1"}:
+        return None
+    if not _native_join_admitted(
+        state,
+        right,
+        stage="tabular-exact-index-join",
+        output_rows=state.row_count,
+    ):
+        return None
+    right_attributes = _native_device_table_from_public_frame(right)
+    if right_attributes is None or not right_attributes.is_device_backed:
+        return None
+    names = _native_join_output_names(
+        tuple(state.column_order),
+        tuple(right.columns),
+        shared_keys=(),
+        suffixes=(lsuffix, rsuffix),
+    )
+    if names is None:
+        return None
+    left_mapping, right_mapping, left_output, right_output = names
+    if left_mapping.get(state.geometry_name, state.geometry_name) != state.geometry_name:
+        return None
+
+    from vibespatial.api._native_result_core import NativeAttributeTable
+    from vibespatial.api._native_state import NativeFrameState
+
+    left_attributes = state.attributes.rename_columns(left_mapping)
+    right_attributes = right_attributes.rename_columns(right_mapping)
+    attributes = NativeAttributeTable.combine_columns(
+        [left_attributes, right_attributes],
+        index_override=source_index,
+    )
+    if attributes is None:
+        return None
+    output_attrs, output_columns_name = _native_join_output_metadata(owner, right)
+    joined_state = NativeFrameState(
+        attributes=attributes,
+        geometry=state.geometry,
+        geometry_name=state.geometry_name,
+        column_order=(*left_output, *right_output),
+        index_plan=state.index_plan,
+        row_count=state.row_count,
+        secondary_geometry=state.secondary_geometry,
+        attrs=output_attrs,
+        provenance=state.provenance,
+        geometry_metadata_cache=state.geometry_metadata_cache,
+        residency=state.residency,
+        readiness=state.readiness,
+    )
+    return _public_frame_from_native_state(
+        owner,
+        joined_state,
+        geometry_column=state.geometry_name,
+        attrs=output_attrs,
+        columns_name=output_columns_name,
+    )
+
+
 def _native_drop_duplicates_positions(owner, subset, keep) -> np.ndarray | None:
     """Return source row positions for admitted non-geometry duplicate drops."""
     if subset is None:
@@ -2571,7 +4246,12 @@ def _normalize_drop_duplicates_subset(subset, columns) -> tuple[Any, ...] | None
 
 
 def _native_drop_duplicates_rowset(owner, subset, keep):
-    """Return a native rowset for device-backed attribute duplicate filtering."""
+    """Return a native rowset for device-backed attribute duplicate filtering.
+
+    Physical shape: stable device row order -> sorted key gather -> distinct row
+    positions -> source-ordered ``NativeRowSet``. Null and NaN equality follow
+    pandas duplicate semantics; no key or result crosses to host.
+    """
     if keep not in {"first", "last", False}:
         return None
 
@@ -2594,6 +4274,30 @@ def _native_drop_duplicates_rowset(owner, subset, keep):
     attribute_columns = tuple(attributes.columns)
     if any(label not in attribute_columns for label in labels):
         return None
+
+    if bool(getattr(attributes, "is_device_backed", False)):
+        policies = _native_device_column_policies(attributes, labels)
+        if any(
+            (policy := policies.get(label)) is None or not policy.can_distinct
+            for label in labels
+        ):
+            return None
+        required_bytes = _native_distinct_required_bytes(
+            attributes,
+            labels,
+            int(state.row_count),
+        )
+        if required_bytes is None:
+            return None
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        admission = get_cuda_runtime().admit_device_memory(
+            stage="tabular-distinct",
+            required_bytes=required_bytes,
+            requested_units=int(state.row_count),
+        )
+        if not admission.admitted:
+            return None
 
     if len(labels) == 1:
         arrays = attributes.numeric_column_arrays(labels)
@@ -2644,13 +4348,7 @@ def _native_drop_duplicates_rowset(owner, subset, keep):
                         identity=int(unique_positions.size) == int(state.row_count),
                     )
 
-    if getattr(attributes, "device_table", None) is None:
-        return None
-    policies = attributes.device_column_policies(labels)
-    if any(
-        (policy := policies.get(label)) is None or not policy.can_compute_numeric
-        for label in labels
-    ):
+    if not bool(getattr(attributes, "is_device_backed", False)):
         return None
 
     try:
@@ -2670,8 +4368,12 @@ def _native_drop_duplicates_rowset(owner, subset, keep):
     try:
         from vibespatial.cuda._runtime import pylibcudf_current_stream
 
-        stream = pylibcudf_current_stream()
-        key_table = plc.Table(attributes.to_pylibcudf_columns(labels))
+        stream = pylibcudf_current_stream(attributes.device_table)
+        key_columns = _native_pylibcudf_missing_normalized_columns(
+            _native_pylibcudf_columns(attributes, labels),
+            stream=stream,
+        )
+        key_table = plc.Table(key_columns)
         sorted_column = sorting.stable_sorted_order(
             key_table,
             [Order.ASCENDING] * len(labels),
@@ -2702,7 +4404,7 @@ def _native_drop_duplicates_rowset(owner, subset, keep):
             stream=stream,
         )
         unique_local = _pylibcudf_numeric_column_view(unique_local_column)
-    except Exception:
+    except (AttributeError, KeyError, NotImplementedError, TypeError, ValueError):
         return None
     if unique_local is None:
         return None
@@ -5200,9 +6902,23 @@ default 'snappy'
         ):
             from vibespatial.api._native_public_arrays import (
                 NativeAttributeColumnArray,
+                NativeNumericExpressionArray,
             )
 
             public_array = getattr(result, "array", None)
+            if isinstance(
+                public_array,
+                NativeNumericExpressionArray,
+            ) and _native_column_requires_numpy_public_dtype(
+                source_native_state.attributes,
+                key,
+            ):
+                result = Series(
+                    public_array.to_numpy(copy=False),
+                    index=result.index,
+                    name=result.name,
+                )
+                public_array = result.array
             if isinstance(public_array, NativeAttributeColumnArray):
                 # GeoParquet decimal attributes are exposed lazily because they
                 # cannot be viewed as a numeric CuPy array until a public cast.
@@ -5673,15 +7389,105 @@ default 'snappy'
     def query(self, expr: str, *, inplace: bool = False, **kwargs):
         from vibespatial.api._native_state import drop_native_state
 
+        state = _native_device_expression_state(self)
+        if state is not None and not inplace and not kwargs:
+            native_result = _native_query_result(self, expr, state)
+            if native_result is not None:
+                record_dispatch_event(
+                    surface="geopandas.geodataframe.query",
+                    operation="query",
+                    implementation="native_device_scalar_expression",
+                    reason="row-aligned device predicate lowered to NativeRowSet",
+                    detail=f"rows={len(self)}",
+                    selected=ExecutionMode.GPU,
+                )
+                return native_result
+        public_invalid = False
+        if state is not None:
+            import inspect
+
+            caller_frame = inspect.currentframe().f_back
+            try:
+                public_invalid = _native_public_expression_is_invalid(
+                    self,
+                    expr,
+                    assignment=False,
+                    scope_kwargs=kwargs,
+                    scope_locals=caller_frame.f_locals,
+                    scope_globals=caller_frame.f_globals,
+                )
+            finally:
+                del caller_frame
+        if state is not None and not public_invalid:
+            record_fallback_event(
+                surface="geopandas.geodataframe.query",
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+                reason=(
+                    "native query expression was not admitted or inplace pandas "
+                    "mutation was requested"
+                ),
+                detail=f"rows={len(self)}, inplace={inplace}",
+                pipeline="geodataframe",
+            )
         if inplace:
             drop_native_state(self)
-        result = super().query(expr, inplace=inplace, **kwargs)
+        query_fallback_token = _PANDAS_QUERY_FALLBACK_ACTIVE.set(True)
+        try:
+            result = super().query(expr, inplace=inplace, **kwargs)
+        finally:
+            _PANDAS_QUERY_FALLBACK_ACTIVE.reset(query_fallback_token)
         return _drop_native_state_from_result(result)
 
     @doc(pd.DataFrame)
     def eval(self, expr: str, *, inplace: bool = False, **kwargs):
         from vibespatial.api._native_state import drop_native_state
 
+        state = (
+            None
+            if _PANDAS_QUERY_FALLBACK_ACTIVE.get(False)
+            else _native_device_expression_state(self)
+        )
+        if state is not None and not inplace and not kwargs:
+            native_result = _native_eval_result(self, expr, state)
+            if native_result is not None:
+                record_dispatch_event(
+                    surface="geopandas.geodataframe.eval",
+                    operation="eval",
+                    implementation="native_device_scalar_expression",
+                    reason="row-aligned device arithmetic lowered to NativeExpression",
+                    detail=f"rows={len(self)}",
+                    selected=ExecutionMode.GPU,
+                )
+                return native_result
+        public_invalid = False
+        if state is not None:
+            import inspect
+
+            caller_frame = inspect.currentframe().f_back
+            try:
+                public_invalid = _native_public_expression_is_invalid(
+                    self,
+                    expr,
+                    assignment=True,
+                    scope_kwargs=kwargs,
+                    scope_locals=caller_frame.f_locals,
+                    scope_globals=caller_frame.f_globals,
+                )
+            finally:
+                del caller_frame
+        if state is not None and not public_invalid:
+            record_fallback_event(
+                surface="geopandas.geodataframe.eval",
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+                reason=(
+                    "native eval expression was not admitted or inplace pandas "
+                    "mutation was requested"
+                ),
+                detail=f"rows={len(self)}, inplace={inplace}",
+                pipeline="geodataframe",
+            )
         if inplace:
             drop_native_state(self)
         result = super().eval(expr, inplace=inplace, **kwargs)
@@ -5813,13 +7619,160 @@ default 'snappy'
         return super().update(*args, **kwargs)
 
     @doc(pd.DataFrame)
-    def merge(self, *args, **kwargs):
-        result = super().merge(*args, **kwargs)
+    def merge(
+        self,
+        right,
+        how: str = "inner",
+        on=None,
+        left_on=None,
+        right_on=None,
+        left_index: bool = False,
+        right_index: bool = False,
+        sort: bool = False,
+        suffixes=("_x", "_y"),
+        copy=lib.no_default,
+        indicator: bool | str = False,
+        validate=None,
+    ):
+        state = (
+            None
+            if _PANDAS_JOIN_FALLBACK_ACTIVE.get(False)
+            else _native_device_expression_state(self)
+        )
+        public_invalid = state is not None and _native_public_merge_is_invalid(
+            self,
+            right,
+            on=on,
+            left_on=left_on,
+            right_on=right_on,
+            left_index=left_index,
+            right_index=right_index,
+            suffixes=suffixes,
+            validate=validate,
+        )
+        if (
+            state is not None
+            and not public_invalid
+            and how == "inner"
+            and left_on is None
+            and right_on is None
+            and not left_index
+            and not right_index
+            and not sort
+            and not indicator
+        ):
+            native_result = _native_unique_right_inner_merge(
+                self,
+                right,
+                on=on,
+                suffixes=suffixes,
+                validate=validate,
+            )
+            if native_result is not None:
+                record_dispatch_event(
+                    surface="geopandas.geodataframe.merge",
+                    operation="merge",
+                    implementation="pylibcudf_unique_right_inner_join",
+                    reason=(
+                        "bounded many-to-one equality relation consumed as "
+                        "NativeFrameState"
+                    ),
+                    detail=f"left_rows={len(self)}, right_rows={len(right)}",
+                    selected=ExecutionMode.GPU,
+                )
+                return native_result
+        if state is not None and not public_invalid:
+            record_fallback_event(
+                surface="geopandas.geodataframe.merge",
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+                reason="generic merge shape was not admitted by the bounded native relation path",
+                detail=f"left_rows={len(self)}, how={how!r}",
+                pipeline="geodataframe",
+            )
+        result = super().merge(
+            right,
+            how=how,
+            on=on,
+            left_on=left_on,
+            right_on=right_on,
+            left_index=left_index,
+            right_index=right_index,
+            sort=sort,
+            suffixes=suffixes,
+            copy=copy,
+            indicator=indicator,
+            validate=validate,
+        )
         return _drop_native_state_from_result(result)
 
     @doc(pd.DataFrame)
-    def join(self, *args, **kwargs):
-        result = super().join(*args, **kwargs)
+    def join(
+        self,
+        other,
+        on=None,
+        how: str = "left",
+        lsuffix: str = "",
+        rsuffix: str = "",
+        sort: bool = False,
+        validate=None,
+    ):
+        state = _native_device_expression_state(self)
+        public_invalid = state is not None and _native_public_join_is_invalid(
+            self,
+            other,
+            state=state,
+            on=on,
+            lsuffix=lsuffix,
+            rsuffix=rsuffix,
+            validate=validate,
+        )
+        if (
+            state is not None
+            and not public_invalid
+            and on is None
+            and how == "left"
+            and not sort
+        ):
+            native_result = _native_exact_index_join(
+                self,
+                other,
+                lsuffix=lsuffix,
+                rsuffix=rsuffix,
+                validate=validate,
+            )
+            if native_result is not None:
+                record_dispatch_event(
+                    surface="geopandas.geodataframe.join",
+                    operation="join",
+                    implementation="native_exact_index_column_join",
+                    reason="unique aligned indexes require no relation materialization",
+                    detail=f"rows={len(self)}",
+                    selected=ExecutionMode.GPU,
+                )
+                return native_result
+        if state is not None and not public_invalid:
+            record_fallback_event(
+                surface="geopandas.geodataframe.join",
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+                reason="generic index join shape was not admitted by the native aligned path",
+                detail=f"left_rows={len(self)}, how={how!r}",
+                pipeline="geodataframe",
+            )
+        join_fallback_token = _PANDAS_JOIN_FALLBACK_ACTIVE.set(True)
+        try:
+            result = super().join(
+                other,
+                on=on,
+                how=how,
+                lsuffix=lsuffix,
+                rsuffix=rsuffix,
+                sort=sort,
+                validate=validate,
+            )
+        finally:
+            _PANDAS_JOIN_FALLBACK_ACTIVE.reset(join_fallback_token)
         return _drop_native_state_from_result(result)
 
     @doc(pd.DataFrame)
@@ -5961,7 +7914,27 @@ default 'snappy'
                 preserve_index=not ignore_index,
             )
             if result is not None:
+                record_dispatch_event(
+                    surface="geopandas.geodataframe.drop_duplicates",
+                    operation="drop_duplicates",
+                    implementation="native_device_distinct_rowset",
+                    reason="consume device-backed attribute keys without pandas row assembly",
+                    detail=f"rows={len(self)}, keys={len(_normalize_drop_duplicates_subset(subset, self.columns) or ())}",
+                    selected=ExecutionMode.GPU,
+                )
                 return result
+        if source_native_state is not None:
+            record_fallback_event(
+                surface="geopandas.geodataframe.drop_duplicates",
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+                reason=(
+                    "native device distinct was not admitted for the requested "
+                    "keys/options or could not assemble the public result"
+                ),
+                detail=f"rows={len(self)}, keep={keep!r}, inplace={inplace}",
+                pipeline="geodataframe",
+            )
         positions = (
             None
             if inplace or source_native_state is None
@@ -6077,15 +8050,27 @@ default 'snappy'
         ignore_index: bool = False,
         key=None,
     ):
+        from vibespatial.api._native_state import get_native_state
+
+        native_state = get_native_state(self)
+        native_device_attributes = native_state is not None and bool(
+            getattr(native_state.attributes, "is_device_backed", False)
+        )
         if inplace:
+            if native_device_attributes:
+                record_fallback_event(
+                    surface="geopandas.geodataframe.sort_values",
+                    requested=ExecutionMode.AUTO,
+                    selected=ExecutionMode.CPU,
+                    reason="in-place sort requires pandas mutation semantics",
+                    detail=f"rows={len(self)}, axis={axis!r}",
+                    pipeline="geodataframe",
+                )
             from vibespatial.api._native_state import drop_native_state
 
             drop_native_state(self)
         axis_number = self._get_axis_number(axis)
         if not inplace and axis_number == 0:
-            from vibespatial.api._native_state import get_native_state
-
-            native_state = get_native_state(self)
             native_rowset = _native_sort_values_rowset(
                 self,
                 by,
@@ -6103,7 +8088,30 @@ default 'snappy'
                     preserve_index=not ignore_index,
                 )
                 if result is not None:
+                    record_dispatch_event(
+                        surface="geopandas.geodataframe.sort_values",
+                        operation="sort_values",
+                        implementation="native_device_sorted_rowset",
+                        reason="consume device-backed attribute keys without pandas row assembly",
+                        detail=f"rows={len(self)}, keys={len(_normalize_sort_columns(by) or ())}",
+                        selected=ExecutionMode.GPU,
+                    )
                     return result
+        if native_device_attributes and not inplace:
+            record_fallback_event(
+                surface="geopandas.geodataframe.sort_values",
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+                reason=(
+                    "native device stable sort was not admitted for the requested "
+                    "keys/options or could not assemble the public result"
+                ),
+                detail=(
+                    f"rows={len(self)}, kind={kind!r}, "
+                    f"na_position={na_position!r}"
+                ),
+                pipeline="geodataframe",
+            )
         if not inplace and axis_number == 0 and (
             not self.index.is_unique or getattr(self.index, "nlevels", 1) != 1
         ):
@@ -6163,6 +8171,12 @@ default 'snappy'
 
     @doc(pd.DataFrame)
     def nlargest(self, n: int, columns, keep: str = "first"):
+        device_request = _native_topk_request_targets_device_attributes(
+            self,
+            n,
+            columns,
+            keep,
+        )
         native_rowset = _native_topk_rowset(
             self,
             n,
@@ -6181,11 +8195,37 @@ default 'snappy'
                 preserve_index=True,
             )
             if result is not None:
+                record_dispatch_event(
+                    surface="geopandas.geodataframe.nlargest",
+                    operation="nlargest",
+                    implementation="native_device_topk_rowset",
+                    reason="bounded lexicographic top-k over device-backed attributes",
+                    detail=f"rows={len(self)}, n={int(n)}, keep={keep!r}",
+                    selected=ExecutionMode.GPU,
+                )
                 return result
+        if device_request:
+            record_fallback_event(
+                surface="geopandas.geodataframe.nlargest",
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+                reason=(
+                    "native device top-k was not admitted or could not assemble "
+                    "the public result"
+                ),
+                detail=f"rows={len(self)}, n={int(n)}, keep={keep!r}",
+                pipeline="geodataframe",
+            )
         return super().nlargest(n, columns, keep=keep)
 
     @doc(pd.DataFrame)
     def nsmallest(self, n: int, columns, keep: str = "first"):
+        device_request = _native_topk_request_targets_device_attributes(
+            self,
+            n,
+            columns,
+            keep,
+        )
         native_rowset = _native_topk_rowset(
             self,
             n,
@@ -6204,7 +8244,27 @@ default 'snappy'
                 preserve_index=True,
             )
             if result is not None:
+                record_dispatch_event(
+                    surface="geopandas.geodataframe.nsmallest",
+                    operation="nsmallest",
+                    implementation="native_device_topk_rowset",
+                    reason="bounded lexicographic top-k over device-backed attributes",
+                    detail=f"rows={len(self)}, n={int(n)}, keep={keep!r}",
+                    selected=ExecutionMode.GPU,
+                )
                 return result
+        if device_request:
+            record_fallback_event(
+                surface="geopandas.geodataframe.nsmallest",
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+                reason=(
+                    "native device top-k was not admitted or could not assemble "
+                    "the public result"
+                ),
+                detail=f"rows={len(self)}, n={int(n)}, keep={keep!r}",
+                pipeline="geodataframe",
+            )
         return super().nsmallest(n, columns, keep=keep)
 
     @doc(pd.DataFrame)

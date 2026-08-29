@@ -392,6 +392,7 @@ class NativeRelation:
     sorted_by_left: bool = False
     left_group_offsets: Any | None = None
     duplicate_policy: str = "preserve"
+    origin: str | None = None
 
     @classmethod
     def from_relation_index_result(

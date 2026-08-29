@@ -12,19 +12,19 @@ Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-2 | Preamble |
-| 3-13 | Intent |
-| 14-26 | Request Signals |
-| 27-39 | Open First |
-| 40-50 | Verify |
-| 51-62 | Risks |
-| 63-86 | Hold Policy |
-| 87-104 | Definition |
-| 105-127 | Boundary Rules |
-| 128-148 | Kernel Scope |
-| 149-167 | Carrier Scope |
-| 168-223 | Milestones |
-| 224-238 | Surface Matrix |
-| 239-258 | Acceptance Gates |
+| 3-11 | Intent |
+| 12-24 | Request Signals |
+| 25-37 | Open First |
+| 38-48 | Verify |
+| 49-60 | Risks |
+| 61-84 | Hold Policy |
+| 85-102 | Definition |
+| 103-125 | Boundary Rules |
+| 126-146 | Kernel Scope |
+| 147-165 | Carrier Scope |
+| 166-221 | Milestones |
+| 222-236 | Surface Matrix |
+| 237-256 | Acceptance Gates |
 | ... | (2 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -34,10 +34,8 @@ Define the repository-wide feature hold and completion plan for reaching 100%
 `Native*` functionality across vibeSpatial.
 
 The prior Native* plans completed the private carrier substrate. This PRD is
-stricter: the library is not considered Native* complete until the kernels,
-runtime boundaries, export boundaries, tests, benchmarks, and public workflow
-composition are complete enough that GPU-selected paths do not depend on hidden
-host execution.
+stricter: completion requires kernels, runtime/export boundaries, tests,
+benchmarks, and public workflow composition without hidden host execution.
 
 ## Request Signals
 
@@ -55,9 +53,9 @@ host execution.
 ## Open First
 
 - docs/dev/native-full-coverage-prd.md
+- docs/dev/native-consolidation-execution-plan.md
 - docs/dev/native-format-library-plan.md
 - docs/dev/native-format-inventory.md
-- docs/dev/private-native-execution-substrate-plan.md
 - docs/decisions/0044-private-native-execution-substrate.md
 - docs/decisions/0046-gpu-physical-workload-shape-contracts.md
 - docs/testing/performance-tiers.md
@@ -288,6 +286,7 @@ complete.
 
 - Start every new task by routing through intake. If it is not Native*
   completion work, defer it.
+- Execute the closure queue in `docs/dev/native-consolidation-execution-plan.md`.
 - Prefer deleting compatibility boundaries over documenting them.
 - If a boundary cannot be deleted, decide whether it is terminal export,
   bounded fence, or unsupported-native decline.
@@ -299,10 +298,11 @@ complete.
 
 ## Completion Record
 
-When complete, update this section with:
-
-- accepted baseline commit
-- verification commands and artifact paths
-- shootout geomean and aggregate comparison
-- remaining terminal export surfaces
-- explicit maintainer approval to lift the feature hold
+The landing-tree grouped sweep records 2,239 passed, 54 failed, 410 skipped,
+and 6 xfailed (97.39% native). The strict ledger dispositions all 54; one
+admitted `build_area` capability remains open and nothing is unclassified.
+Contract health, complete overlay, the adjacent Native/shape suite, the full
+pipeline, and SF100 acceptance are green on landing-tree source digest
+`2107dee8d82084d086913376219ccfc1bfcbd992d9f9aef66a9193cc72ebbf93`.
+That digest is not yet the clean candidate. The hold requires
+`build_area`, a clean artifact/CI revision, core 1M capacity disposition, and maintainer approval.

@@ -1316,7 +1316,12 @@ def test_overlay_intersection_reuses_cached_sjoin_pairs_for_polygon_subset(
 
     geopandas.sjoin(left, right, predicate="intersects")
     poly_mask = left.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+    source_owned = left.geometry.values._owned
     left_poly = left[poly_mask]
+    subset_values = left_poly.geometry.values
+    assert not subset_values._owned.is_indexed_view
+    assert subset_values._selection_source_owned is source_owned
+    assert hasattr(subset_values._selection_positions, "__cuda_array_interface__")
     monkeypatch.setattr(
         overlay_module,
         "_intersecting_index_pairs",
@@ -1355,6 +1360,7 @@ def test_overlay_cached_subset_relation_stays_capacity_backed_static() -> None:
 
     assert "NativeRelationSelection(" in remap_source
     assert "NativeDeviceSelection.from_mask(" in remap_source
+    assert 'origin="intersection-pair-cache-subset"' in remap_source
     assert "cp.flatnonzero" not in remap_source
     assert "_device_intersection_pairs(" not in remap_source
     assert "copy_device_to_host" not in remap_source

@@ -1241,6 +1241,7 @@ def _dispatch_prepared_polygon_intersection_broadcast_right_gpu(
         return None
     classification = prepared.classify_polygon_rows(left)
     if classification is None:
+        prepared.close()
         return None
 
     row_count = int(left.row_count)
@@ -1272,11 +1273,15 @@ def _dispatch_prepared_polygon_intersection_broadcast_right_gpu(
     exact_result = None
     d_exact_rows = cp.empty(0, dtype=cp.int64)
     if exact_left is not None:
-        exact_result = _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
-            exact_left,
-            right_one,
-            dispatch_mode=dispatch_mode,
-        )
+        try:
+            exact_result = _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
+                exact_left,
+                right_one,
+                dispatch_mode=dispatch_mode,
+                _prepared_mask=prepared,
+            )
+        finally:
+            prepared.close()
         if exact_result is None or int(exact_result.row_count) != int(exact_left.row_count):
             return None
         d_exact_rows = cp.asarray(
@@ -1288,6 +1293,8 @@ def _dispatch_prepared_polygon_intersection_broadcast_right_gpu(
             exact_result,
             d_exact_rows,
         )
+    else:
+        prepared.close()
 
     def _scatter_exact_metadata(name: str, *, base):
         d_values = cp.asarray(base, dtype=cp.bool_).copy()
@@ -1601,6 +1608,7 @@ def _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
     *,
     dispatch_mode: ExecutionMode = ExecutionMode.GPU,
     _cached_right_segments: DeviceSegmentTable | None = None,
+    _prepared_mask=None,
 ) -> OwnedGeometryArray | None:
     """Preserve row cardinality for polygon intersection against a scalar right polygon.
 
@@ -1620,6 +1628,46 @@ def _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
         DeviceBroadcastSegmentRelation,
         _extract_segments_gpu,
     )
+
+    if _prepared_mask is not None:
+        ring_relation = _prepared_mask.complete_ring_relation(left)
+        local_segments = ring_relation.materialize_segments()
+        logical_right_segments = int(local_segments.count)
+        source_segment_count = int(ring_relation.source_segments.count)
+        candidate_ring_count = int(ring_relation.candidate_ring_count)
+        right_rows = tile_single_row(right, int(left.row_count))
+        try:
+            batch_result = _dispatch_overlay_gpu(
+                "intersection",
+                left,
+                right_rows,
+                dispatch_mode=dispatch_mode,
+                _cached_right_segments=local_segments,
+                _row_isolated=True,
+            )
+            if batch_result.row_count != left.row_count:
+                return None
+            record_dispatch_event(
+                surface="vibespatial.constructive.binary",
+                operation="intersection",
+                requested=dispatch_mode,
+                selected=ExecutionMode.GPU,
+                implementation="broadcast_right_ring_local_winding_topology_gpu",
+                reason=(
+                    "scalar-right exact topology expanded only complete local rings; "
+                    "ancestor shells carried component winding baselines"
+                ),
+                detail=(
+                    f"rows={left.row_count}; "
+                    f"physical_mask_segments={source_segment_count}; "
+                    f"candidate_rings={candidate_ring_count}; "
+                    f"logical_right_segments={logical_right_segments}; "
+                    "workload_shape=complete_ring_candidates_plus_ancestor_shell_baseline"
+                ),
+            )
+            return batch_result
+        finally:
+            local_segments.free()
 
     source_segments = _cached_right_segments
     owns_source_segments = source_segments is None

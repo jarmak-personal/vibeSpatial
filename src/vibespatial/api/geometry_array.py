@@ -506,7 +506,7 @@ def _try_native_wkb_array(
     requested = _native_strict_dispatch_mode()
     if requested is ExecutionMode.CPU:
         return None
-    if on_invalid not in {"raise", "ignore"}:
+    if on_invalid not in {"raise", "warn", "ignore"}:
         if requested is ExecutionMode.GPU:
             record_fallback_event(
                 surface="geopandas.array.from_wkb",
@@ -530,13 +530,7 @@ def _try_native_wkb_array(
         )
         return None
     if rows == 0:
-        _record_forced_constructor_fallback(
-            surface="geopandas.array.from_wkb",
-            pipeline="io/from_wkb",
-            requested=requested,
-            reason="native WKB construction does not implement empty input",
-        )
-        return None
+        return GeometryArray(np.empty(0, dtype=object), crs=crs)
 
     # Reject clear small-input losses before touching CUDA runtime state. For
     # mid-sized direct Arrow inputs, payload bytes can still justify the GPU;
@@ -601,6 +595,8 @@ def _try_native_wkb_array(
     if arrow is not None and not (
         pa.types.is_binary(arrow.type) or pa.types.is_large_binary(arrow.type)
     ):
+        if pa.types.is_null(arrow.type):
+            return GeometryArray(np.full(rows, None, dtype=object), crs=crs)
         if pa.types.is_string(arrow.type) or pa.types.is_large_string(arrow.type):
             data = arrow.to_pylist()
             arrow = None
@@ -646,6 +642,7 @@ def _try_native_wkb_array(
             return None
 
     from vibespatial.io.wkb import (
+        _GpuWkbOnInvalidError,
         _plan_arrow_wkb_gpu_admission,
         decode_wkb_arrow_array_owned,
     )
@@ -665,6 +662,8 @@ def _try_native_wkb_array(
             allow_fallback=False,
             requested_mode=requested,
         )
+    except _GpuWkbOnInvalidError:
+        raise
     except Exception as exc:
         record_fallback_event(
             surface="geopandas.array.from_wkb",
@@ -794,18 +793,6 @@ def _try_large_wkt_gpu_array(
     requested = _native_strict_dispatch_mode()
     if requested is ExecutionMode.CPU:
         return None
-    if on_invalid != "raise":
-        if requested is ExecutionMode.GPU:
-            record_fallback_event(
-                surface="geopandas.array.from_wkt",
-                reason="native WKT construction requires on_invalid='raise'",
-                detail=f"on_invalid={on_invalid!r}",
-                requested=requested,
-                selected=ExecutionMode.CPU,
-                pipeline="io/from_wkt",
-            )
-        return None
-
     try:
         values = np.asarray(data, dtype=object)
     except Exception as exc:
@@ -817,21 +804,41 @@ def _try_large_wkt_gpu_array(
             detail=f"{type(exc).__name__}: {exc}",
         )
         return None
-    if values.ndim != 1 or values.size == 0:
+    if values.ndim != 1:
         _record_forced_constructor_fallback(
             surface="geopandas.array.from_wkt",
             pipeline="io/from_wkt",
             requested=requested,
-            reason="native WKT construction requires non-empty one-dimensional input",
+            reason="native WKT construction requires one-dimensional input",
             detail=f"ndim={values.ndim}, rows={values.size}",
         )
         return None
+    if values.size == 0:
+        return GeometryArray(np.empty(0, dtype=object), crs=crs)
 
     items = values.tolist()
     encoded_items: list[bytes] = []
+    input_validity: list[bool] = []
     max_row_bytes = 0
     for item in items:
-        if not isinstance(item, str) or "\n" in item or "\r" in item:
+        is_missing = (
+            item is None
+            or item is pd.NA
+            or (
+                isinstance(item, (float, np.floating))
+                and bool(np.isnan(item))
+            )
+        )
+        if is_missing:
+            encoded = b"POINT EMPTY"
+            input_validity.append(False)
+        elif isinstance(item, str):
+            encoded = item.encode("utf-8")
+            input_validity.append(True)
+        elif isinstance(item, bytes):
+            encoded = item
+            input_validity.append(True)
+        else:
             _record_forced_constructor_fallback(
                 surface="geopandas.array.from_wkt",
                 pipeline="io/from_wkt",
@@ -840,7 +847,14 @@ def _try_large_wkt_gpu_array(
                 detail=f"value_type={type(item).__name__}",
             )
             return None
-        encoded = item.encode("utf-8")
+        if b"\n" in encoded or b"\r" in encoded:
+            _record_forced_constructor_fallback(
+                surface="geopandas.array.from_wkt",
+                pipeline="io/from_wkt",
+                requested=requested,
+                reason="native WKT construction requires one geometry per text row",
+            )
+            return None
         prefix_pos = 0
         while prefix_pos < len(encoded) and encoded[prefix_pos] in b" \t":
             prefix_pos += 1
@@ -880,13 +894,41 @@ def _try_large_wkt_gpu_array(
     try:
         import cupy as cp
 
-        from vibespatial.io.wkt_gpu import read_wkt_gpu
+        from vibespatial.io.wkt_gpu import (
+            _GpuWktCompatibilityDecline,
+            _GpuWktOnInvalidError,
+            read_wkt_gpu,
+        )
 
         host_bytes = np.frombuffer(b"\n".join(encoded_items), dtype=np.uint8)
         owned = read_wkt_gpu(
             cp.asarray(host_bytes),
             row_count_hint=len(encoded_items),
+            on_invalid=on_invalid,
+            input_validity=(
+                None
+                if all(input_validity)
+                else cp.asarray(input_validity, dtype=cp.bool_)
+            ),
         )
+    except _GpuWktCompatibilityDecline as exc:
+        # The device parser has established that the input cannot be represented
+        # by its exact 2D grammar.  Public ``on_invalid='raise'`` still owes the
+        # caller Shapely/GEOS exception semantics, while strict-native must stop
+        # before that CPU compatibility work.  Record the decline here and let
+        # the public wrapper perform the terminal compatibility parse.
+        record_fallback_event(
+            surface="geopandas.array.from_wkt",
+            reason="native WKT parser rejected input requiring public compatibility semantics",
+            detail=str(exc),
+            requested=requested,
+            selected=ExecutionMode.CPU,
+            pipeline="io/from_wkt",
+            d2h_transfer=False,
+        )
+        return None
+    except _GpuWktOnInvalidError:
+        raise
     except Exception as exc:
         record_fallback_event(
             surface="geopandas.array.from_wkt",
@@ -911,6 +953,62 @@ def _try_large_wkt_gpu_array(
         selected=ExecutionMode.GPU,
     )
     return GeometryArray.from_owned(owned, crs=crs)
+
+
+def _try_geometry_collection_wkt_compatibility(
+    data,
+    *,
+    crs: Any | None,
+    on_invalid: Literal["raise", "warn", "ignore"],
+) -> GeometryArray | None:
+    """Materialize WKT collections at the explicit public compatibility boundary.
+
+    GeometryCollection is intentionally not a concrete ``OwnedGeometryArray``
+    family. Native constructive producers retain its concrete children in a
+    ``NativeGeometryComposition`` and assemble the collection only for public
+    compatibility. Direct WKT ingress has no concrete child carrier to retain,
+    so it uses the same terminal Shapely representation and records that CPU
+    selection explicitly instead of reporting a failed GPU fallback.
+    """
+    try:
+        values = np.asarray(data, dtype=object)
+    except Exception:
+        return None
+    if values.ndim != 1 or values.size == 0:
+        return None
+
+    has_collection = False
+    for item in values.tolist():
+        if item is None or item is pd.NA or (
+            isinstance(item, (float, np.floating)) and bool(np.isnan(item))
+        ):
+            continue
+        if isinstance(item, bytes):
+            text = item.lstrip().upper()
+            has_collection |= text.startswith(b"GEOMETRYCOLLECTION")
+        elif isinstance(item, str):
+            text = item.lstrip().upper()
+            has_collection |= text.startswith("GEOMETRYCOLLECTION")
+        else:
+            return None
+    if not has_collection:
+        return None
+
+    record_dispatch_event(
+        surface="geopandas.array.from_wkt",
+        operation="from_wkt",
+        implementation="geometry_collection_wkt_compatibility_boundary",
+        reason=(
+            "GeometryCollection remains an explicit public compatibility type; "
+            "the concrete 2D owned family model does not encode collection rows"
+        ),
+        detail=f"rows={values.size}",
+        selected=ExecutionMode.CPU,
+    )
+    return GeometryArray(
+        shapely.from_wkt(values, on_invalid=on_invalid),
+        crs=crs,
+    )
 
 
 def to_wkb(geoms: GeometryArray, hex: bool = False, **kwargs):
@@ -954,6 +1052,13 @@ def from_wkt(
     """
     if isinstance(data, ExtensionArray):
         data = data.to_numpy(na_value=None)
+    collection_result = _try_geometry_collection_wkt_compatibility(
+        data,
+        crs=crs,
+        on_invalid=on_invalid,
+    )
+    if collection_result is not None:
+        return collection_result
     gpu_result = _try_large_wkt_gpu_array(data, crs=crs, on_invalid=on_invalid)
     if gpu_result is not None:
         return gpu_result
@@ -1214,6 +1319,40 @@ class GeometryArray(ExtensionArray):
             result._readonly = self._readonly
             return result
 
+        if (
+            isinstance(idx, slice)
+            and self._owned is not None
+            and self._shapely_data is None
+        ):
+            from vibespatial.runtime._runtime import has_gpu_runtime
+            from vibespatial.runtime.residency import Residency
+
+            if self._owned.residency is Residency.DEVICE and has_gpu_runtime():
+                try:
+                    import cupy as cp
+                except ModuleNotFoundError:  # pragma: no cover - guarded by runtime
+                    cp = None
+                if cp is not None:
+                    # Python's ``slice.indices`` is the canonical normalization
+                    # for positive/negative steps and clipped bounds.  Lower
+                    # that scalar plan straight to a device rowset: constructing
+                    # a host index vector here would add an avoidable H2D copy,
+                    # while slicing through ``self._data`` would export the full
+                    # geometry payload before selecting any rows.
+                    start, stop, step = idx.indices(len(self))
+                    d_indices = cp.arange(start, stop, step, dtype=cp.int64)
+                    subset_owned = self._owned._device_indexed_take(
+                        d_indices,
+                        assume_unique_indices=True,
+                    )
+                    subset_owned = self._owned._propagate_cached_validity_mask(
+                        subset_owned,
+                        d_indices,
+                    )
+                    result = GeometryArray.from_owned(subset_owned, crs=self.crs)
+                    result._readonly = self._readonly
+                    return result
+
         # array-like, slice
         # validate and convert IntegerArray/BooleanArray
         # to numpy array, pass-through non-array-like indexers
@@ -1223,7 +1362,30 @@ class GeometryArray(ExtensionArray):
         # downstream GPU dispatches don't silently fall back to Shapely.
         if self._owned is not None and isinstance(idx, np.ndarray):
             int_indices = np.flatnonzero(idx) if idx.dtype == bool else idx
-            subset_owned = self._owned.take(int_indices)
+            from vibespatial.runtime._runtime import has_gpu_runtime
+            from vibespatial.runtime.residency import Residency
+
+            if self._owned.residency is Residency.DEVICE and has_gpu_runtime():
+                try:
+                    import cupy as cp
+                except ModuleNotFoundError:  # pragma: no cover - guarded by runtime
+                    cp = None
+                if cp is not None:
+                    host_indices = np.asarray(int_indices, dtype=np.int64)
+                    d_indices = cp.asarray(host_indices, dtype=cp.int64)
+                    subset_owned = self._owned._device_indexed_take(
+                        d_indices,
+                        host_indices_for_metadata=host_indices,
+                        assume_unique_indices=idx.dtype == bool,
+                    )
+                    subset_owned = self._owned._propagate_cached_validity_mask(
+                        subset_owned,
+                        d_indices,
+                    )
+                else:
+                    subset_owned = self._owned.take(int_indices)
+            else:
+                subset_owned = self._owned.take(int_indices)
             result = GeometryArray.from_owned(subset_owned, crs=self.crs)
             result._readonly = self._readonly
             return result
@@ -1349,19 +1511,27 @@ class GeometryArray(ExtensionArray):
         if owned is None:
             owned = self.to_owned()
         if self._owned_flat_sindex is None:
-            from vibespatial.runtime import ExecutionMode
             from vibespatial.runtime.adaptive import plan_dispatch_selection
             from vibespatial.runtime.crossover import estimate_spatial_index_work_from_owned
             from vibespatial.runtime.precision import KernelClass
-            from vibespatial.spatial.indexing import build_flat_spatial_index
+            from vibespatial.spatial.indexing import (
+                build_flat_spatial_index,
+                compact_indexed_spatial_input,
+            )
 
             selection = plan_dispatch_selection(
                 kernel_name="flat_index_build",
                 kernel_class=KernelClass.COARSE,
                 row_count=owned.row_count,
                 work_estimate=estimate_spatial_index_work_from_owned(owned),
-                requested_mode=ExecutionMode.CPU,
+                requested_mode=_native_strict_dispatch_mode(),
+                current_residency=owned.residency,
             )
+            if selection.runtime_selection.selected is ExecutionMode.GPU:
+                compacted = compact_indexed_spatial_input(owned)
+                if compacted is not owned:
+                    owned = compacted
+                    self._owned = compacted
             self._owned_flat_sindex = build_flat_spatial_index(
                 owned,
                 runtime_selection=selection.runtime_selection,

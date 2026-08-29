@@ -6,12 +6,16 @@ import shutil
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from benchmarks.shootout.corpora._common import fingerprint
+from benchmarks.shootout.corpora._common import (
+    fingerprint,
+    power_nearest_correctness_packet,
+)
 from vibespatial.bench.cli import main as vsbench_main
 from vibespatial.bench.output import render_shootout
 from vibespatial.bench.schema import timing_from_samples
@@ -21,10 +25,13 @@ from vibespatial.bench.shootout import (
     ShootoutRun,
     _baseline_environment_sha256,
     _baseline_host_identity,
+    _compare_power_nearest_correctness_packets,
+    _DeviceMemoryMonitor,
     _fingerprints_match,
     _geopandas_measurement_identity,
     _measurement_identity,
     _run_harness,
+    _run_harness_in_process,
     load_reusable_geopandas_baseline,
     run_shootout,
     shootout_workload_identity,
@@ -234,6 +241,131 @@ def test_versioned_result_fingerprints_never_use_numeric_tolerance() -> None:
     right = "vsbench-result-v3:ordered:sha256=" + "0" * 63 + "1"
 
     assert not _fingerprints_match(left, right)
+
+
+def _power_nearest_result_frame():
+    from shapely.geometry import Point
+
+    import geopandas as gpd
+
+    return gpd.GeoDataFrame(
+        {
+            "node_id_left": [10, 20],
+            "power_value": ["substation", "substation"],
+            "voltage": ["20000", pd.NA],
+            "operator": ["operator", pd.NA],
+            "name": ["first", "second"],
+            "index_right": [3, 5],
+            "node_id_right": [30, 50],
+            "distance_m": [7.2253595, 11.800565],
+        },
+        geometry=[Point(1_000.0, 2_000.0), Point(3_000.0, 4_000.0)],
+        index=pd.Index([2, 4]),
+        crs=3857,
+    )[
+        [
+            "node_id_left",
+            "power_value",
+            "voltage",
+            "operator",
+            "name",
+            "geometry",
+            "index_right",
+            "node_id_right",
+            "distance_m",
+        ]
+    ]
+
+
+def test_power_nearest_correctness_contract_is_exact_except_declared_numerics() -> None:
+    from shapely.geometry import Point
+
+    baseline = _power_nearest_result_frame()
+    within = baseline.copy()
+    within.loc[2, "geometry"] = Point(1_000.0, 2_000.0 + 5.0e-9)
+    within.loc[2, "distance_m"] += 1.0e-8
+
+    accepted = _compare_power_nearest_correctness_packets(
+        power_nearest_correctness_packet(baseline),
+        power_nearest_correctness_packet(within),
+    )
+    assert accepted["status"] == "match"
+    assert accepted["max_coordinate_abs_diff"] <= accepted["coordinate_atol"]
+    assert accepted["max_distance_abs_diff"] <= accepted["distance_atol"]
+    assert "EPSG:3857" in accepted["coordinate_tolerance_derivation"]
+    assert "2*sqrt(2)" in accepted["distance_tolerance_derivation"]
+
+    wrong_id = within.copy()
+    wrong_id.loc[2, "node_id_right"] = 999
+    rejected_id = _compare_power_nearest_correctness_packets(
+        power_nearest_correctness_packet(baseline),
+        power_nearest_correctness_packet(wrong_id),
+    )
+    assert rejected_id["status"] == "mismatch"
+    assert rejected_id["reason"] == "exact field mismatch: exact_values_fingerprint"
+
+    wrong_coordinate = within.copy()
+    wrong_coordinate.loc[2, "geometry"] = Point(
+        1_000.0,
+        2_000.0 + accepted["coordinate_atol"] * 1.01,
+    )
+    rejected_coordinate = _compare_power_nearest_correctness_packets(
+        power_nearest_correctness_packet(baseline),
+        power_nearest_correctness_packet(wrong_coordinate),
+    )
+    assert rejected_coordinate["reason"] == "coordinate tolerance exceeded"
+
+    wrong_distance = within.copy()
+    wrong_distance.loc[2, "distance_m"] = (
+        baseline.loc[2, "distance_m"] + accepted["distance_atol"] * 1.01
+    )
+    rejected_distance = _compare_power_nearest_correctness_packets(
+        power_nearest_correctness_packet(baseline),
+        power_nearest_correctness_packet(wrong_distance),
+    )
+    assert rejected_distance["reason"] == "distance tolerance exceeded"
+
+
+def test_run_shootout_power_contract_persists_oracle_and_enables_timing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = _power_nearest_result_frame()
+    current = baseline.copy()
+    current.loc[2, "distance_m"] += 1.0e-8
+    packets = {
+        "geopandas": power_nearest_correctness_packet(baseline),
+        "vibespatial": power_nearest_correctness_packet(current),
+    }
+
+    def _fake_run_harness(**kwargs):
+        label = kwargs["label"]
+        return ShootoutRun(
+            label=label,
+            timing=timing_from_samples([1.0 if label == "geopandas" else 0.5]),
+            stdout=(
+                "SHOOTOUT_FINGERPRINT: vsbench-result-v3:ordered:sha256="
+                + ("0" * 64 if label == "geopandas" else "1" * 64)
+                + "\n"
+            ),
+            correctness_packet=packets[label],
+        )
+
+    monkeypatch.setattr("vibespatial.bench.shootout._run_harness", _fake_run_harness)
+    monkeypatch.setattr("vibespatial.runtime.has_gpu_runtime", lambda: False)
+
+    result = run_shootout(
+        Path("benchmarks/shootout/corpora/power_substation_nearest.py"),
+        repeat=1,
+        warmup=False,
+        quiet=True,
+        baseline_python=sys.executable,
+    )
+
+    assert result.status == "pass"
+    assert result.speedup == 2.0
+    assert result.metadata["fingerprint"] == "mismatch"
+    assert result.metadata["correctness_contract"]["status"] == "match"
+    assert result.metadata["geopandas_correctness_oracle"] == packets["geopandas"]
 
 
 def test_vsbench_shootout_directory_smoke(capsys: pytest.CaptureFixture[str]) -> None:
@@ -485,6 +617,258 @@ def test_shootout_postamble_runs_without_strict_native_env(tmp_path: Path) -> No
 
     assert run.error is None
     assert "TIMED=1;POST=None" in run.stdout
+
+
+def test_shootout_harness_collects_cycles_before_every_timed_sample(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = tmp_path / "gc_probe.py"
+    script.write_text(
+        "\n".join(
+            [
+                "# --- timed work starts here ---",
+                "value = object()",
+                "# --- timed work ends here ---",
+                "print('SHOOTOUT_FINGERPRINT: rows=1')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # The isolated harness imports this hook before running its warmup. Each
+    # logged collection therefore proves the warmup/sample-0 transition or a
+    # later inter-sample boundary, without relying on harness internals.
+    isolated_log = tmp_path / "isolated-gc.log"
+    (tmp_path / "sitecustomize.py").write_text(
+        "\n".join(
+            [
+                "import gc",
+                "import os",
+                "_original_collect = gc.collect",
+                "def _tracked_collect(*args, **kwargs):",
+                "    with open(os.environ['VSBENCH_GC_LOG'], 'a', encoding='utf-8') as stream:",
+                "        stream.write('collect\\n')",
+                "    return _original_collect(*args, **kwargs)",
+                "gc.collect = _tracked_collect",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    isolated = _run_harness(
+        label="geopandas",
+        python_cmd=[sys.executable],
+        script=script,
+        repeat=3,
+        warmup=True,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(tmp_path),
+            "VSBENCH_GC_LOG": str(isolated_log),
+        },
+        quiet=True,
+    )
+
+    assert isolated.error is None
+    assert isolated.peak_device_memory_bytes is None
+    assert isolated_log.read_text(encoding="utf-8").splitlines() == [
+        "collect",
+        "collect",
+        "collect",
+    ]
+
+    in_process_events: list[str] = []
+    clock = iter(float(value) for value in range(8))
+    monkeypatch.setattr(
+        "vibespatial.bench.shootout.gc.collect",
+        lambda: in_process_events.append("collect") or 0,
+    )
+
+    def _perf_counter() -> float:
+        in_process_events.append("timer")
+        return next(clock)
+
+    monkeypatch.setattr("vibespatial.bench.shootout.time.perf_counter", _perf_counter)
+    in_process = _run_harness_in_process(
+        label="vibespatial",
+        script=script,
+        repeat=3,
+        warmup=True,
+        pipeline_warm=False,
+    )
+
+    assert in_process.error is None
+    assert in_process_events == [
+        "timer",
+        "timer",
+        "collect",
+        "timer",
+        "timer",
+        "collect",
+        "timer",
+        "timer",
+        "collect",
+        "timer",
+        "timer",
+    ]
+
+
+def test_device_memory_monitor_reports_only_nested_scope_peak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class _Statistics:
+        @staticmethod
+        def enable_statistics() -> None:
+            events.append("enable")
+
+        @staticmethod
+        def push_statistics() -> None:
+            events.append("push")
+
+        @staticmethod
+        def get_statistics() -> object:
+            events.append("get")
+            return types.SimpleNamespace(peak_bytes=2048)
+
+        @staticmethod
+        def pop_statistics() -> object:
+            events.append("pop")
+            return types.SimpleNamespace(peak_bytes=4096)
+
+    fake_rmm = types.ModuleType("rmm")
+    fake_rmm.statistics = _Statistics  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "rmm", fake_rmm)
+
+    monitor = _DeviceMemoryMonitor(enabled=True)
+
+    assert monitor.peak_bytes == 4096
+    assert events == ["enable", "push", "get", "pop"]
+
+
+def test_in_process_shootout_peak_includes_exceptional_warmup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = tmp_path / "memory_probe.py"
+    script.write_text(
+        "\n".join(
+            [
+                "# --- timed work starts here ---",
+                "if __name__ == '__warmup__':",
+                "    raise RuntimeError('expected warmup failure')",
+                "value = object()",
+                "# --- timed work ends here ---",
+                "print('SHOOTOUT_FINGERPRINT: rows=1')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    peaks = iter([16_384, 1024, 8192, 4096])
+    sealed_scopes: list[int] = []
+
+    class _Monitor:
+        def __init__(self, *, enabled: bool) -> None:
+            assert enabled is True
+
+        @property
+        def peak_bytes(self) -> int:
+            peak = next(peaks)
+            sealed_scopes.append(peak)
+            return peak
+
+    monkeypatch.setattr("vibespatial.bench.shootout._DeviceMemoryMonitor", _Monitor)
+    run = _run_harness_in_process(
+        label="vibespatial",
+        script=script,
+        repeat=3,
+        warmup=True,
+        pipeline_warm=True,
+    )
+
+    assert sealed_scopes == [16_384, 1024, 8192, 4096]
+    assert run.peak_device_memory_bytes == 16_384
+    assert run.to_dict()["peak_device_memory_bytes"] == 16_384
+    unavailable = ShootoutRun(
+        label="geopandas",
+        timing=timing_from_samples([1.0]),
+    )
+    assert unavailable.to_dict()["peak_device_memory_bytes"] is None
+
+
+def test_isolated_shootout_peak_includes_and_seals_exceptional_warmup(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "memory_probe.py"
+    script.write_text(
+        "\n".join(
+            [
+                "# --- timed work starts here ---",
+                "if __name__ == '__warmup__':",
+                "    raise RuntimeError('expected warmup failure')",
+                "value = object()",
+                "# --- timed work ends here ---",
+                "print('SHOOTOUT_FINGERPRINT: rows=1')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monitor_log = tmp_path / "monitor.log"
+    (tmp_path / "sitecustomize.py").write_text(
+        "\n".join(
+            [
+                "import os",
+                "from pathlib import Path",
+                "import vibespatial.bench.shootout as shootout",
+                "import vibespatial.cuda.cccl_precompile as cccl_precompile",
+                "_peaks = iter([16384, 1024, 8192, 4096])",
+                "_log = Path(os.environ['VSBENCH_MONITOR_LOG'])",
+                "class _Monitor:",
+                "    def __init__(self, *, enabled):",
+                "        assert enabled is True",
+                "        with _log.open('a', encoding='utf-8') as stream:",
+                "            stream.write('start\\n')",
+                "    @property",
+                "    def peak_bytes(self):",
+                "        peak = next(_peaks)",
+                "        with _log.open('a', encoding='utf-8') as stream:",
+                "            stream.write(f'finish={peak}\\n')",
+                "        return peak",
+                "shootout._DeviceMemoryMonitor = _Monitor",
+                "cccl_precompile.precompile_all = lambda **kwargs: None",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    run = _run_harness(
+        label="vibespatial",
+        python_cmd=[sys.executable],
+        script=script,
+        repeat=3,
+        warmup=True,
+        pipeline_warm=True,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(tmp_path),
+            "VSBENCH_MONITOR_LOG": str(monitor_log),
+        },
+        quiet=True,
+    )
+
+    assert run.error is None
+    assert run.peak_device_memory_bytes == 16_384
+    assert monitor_log.read_text(encoding="utf-8").splitlines() == [
+        "start",
+        "finish=16384",
+        "start",
+        "finish=1024",
+        "start",
+        "finish=8192",
+        "start",
+        "finish=4096",
+    ]
 
 
 def test_shootout_timeout_reaps_harness_descendants(tmp_path: Path) -> None:
@@ -1018,10 +1402,28 @@ def test_geopandas_measurement_identity_excludes_profile_only_code() -> None:
         "start = time.monotonic()",
         1,
     )
+    peak_evidence_edit = _HARNESS_CODE.replace(
+        '"peak_device_memory_bytes": peak_device_memory_bytes,',
+        '"peak_device_memory_bytes": None,',
+        1,
+    )
+    warmup_peak_edit = _HARNESS_CODE.replace(
+        "    warmup_memory_monitor = _start_device_memory_monitor()",
+        "    warmup_memory_monitor = None",
+        1,
+    )
+    gc_boundary_edit = _HARNESS_CODE.replace(
+        "    gc.collect()\n# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_START",
+        "    gc.collect(2)\n# VIBESPATIAL_GEOPANDAS_MEASUREMENT_EXCLUDE_START",
+        1,
+    )
 
     identity = _geopandas_measurement_identity(_HARNESS_CODE)
     assert _geopandas_measurement_identity(profile_edit) == identity
+    assert _geopandas_measurement_identity(peak_evidence_edit) == identity
+    assert _geopandas_measurement_identity(warmup_peak_edit) == identity
     assert _geopandas_measurement_identity(lean_edit) != identity
+    assert _geopandas_measurement_identity(gc_boundary_edit) != identity
 
 
 def test_shootout_cli_reuses_geopandas_with_no_warmup(

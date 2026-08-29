@@ -361,7 +361,7 @@ def test_gpu_row_isolated_topology_pages_preserve_complete_rows(
         "overlay compact topology page-weight planning packet",
         "overlay compact topology work-summary planning packet",
     }
-    assert sum(event.item_count for event in events) <= 5
+    assert sum(event.item_count for event in events) <= 7
 
     result, selected = overlay_gpu._materialize_overlay_execution_plan(
         plan,
@@ -385,6 +385,267 @@ def test_gpu_row_isolated_topology_pages_preserve_complete_rows(
         actual.normalize().equals_exact(wanted.normalize(), tolerance=1.0e-9)
         for actual, wanted in zip(result.to_shapely(), expected, strict=True)
     )
+
+
+@pytest.mark.gpu
+def test_gpu_grouped_topology_pages_without_optional_span_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Device row ownership must bound grouped topology without host maxima."""
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    overlay_gpu = importlib.import_module("vibespatial.overlay.gpu")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    monkeypatch.setattr(overlay_gpu, "_compute_live_split_event_budget", lambda: 400)
+    left_geometries = [
+        box(0, 0, 10, 10),
+        box(20, 0, 30, 10),
+        box(40, 0, 50, 10),
+    ]
+    right_geometries = [
+        box(1, -1, 4, 6),
+        box(3, 4, 7, 11),
+        box(21, -1, 24, 6),
+        box(23, 4, 27, 11),
+        box(41, -1, 44, 6),
+        box(43, 4, 47, 11),
+    ]
+    left = from_shapely_geometries(left_geometries)
+    right = from_shapely_geometries(right_geometries)
+    d_group_rows = cp.repeat(cp.arange(3, dtype=cp.int32), 2)
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    plan = overlay_gpu._build_overlay_execution_plan(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+        _same_row_span_summary=None,
+        _include_same_side_splits=True,
+        _right_geometry_source_rows=d_group_rows,
+        _right_segment_source_rows=d_group_rows,
+    )
+    events = get_d2h_transfer_events(clear=True)
+
+    assert isinstance(plan, PagedOverlayExecutionPlan)
+    assert plan.max_left_segments_per_row == 4
+    assert plan.max_right_segments_per_row == 8
+    assert [plan.row_span(index) for index in range(plan.page_count)] == [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+    ]
+    assert events
+    assert {
+        event.reason
+        for event in events
+    } <= {
+        "overlay compact topology page-weight planning packet",
+        "overlay compact topology work-summary planning packet",
+    }
+    assert sum(event.item_count for event in events) <= 7
+
+    result, selected = overlay_gpu._materialize_overlay_execution_plan(
+        plan,
+        operation="difference",
+        requested=ExecutionMode.GPU,
+        preserve_row_count=3,
+    )
+    expected = [
+        source.difference(right_geometries[index * 2].union(right_geometries[index * 2 + 1]))
+        for index, source in enumerate(left_geometries)
+    ]
+    assert selected is ExecutionMode.GPU
+    assert result.row_count == 3
+    assert all(
+        actual.normalize().equals_exact(wanted.normalize(), tolerance=1.0e-9)
+        for actual, wanted in zip(result.to_shapely(), expected, strict=True)
+    )
+
+
+@pytest.mark.gpu
+def test_gpu_paged_overlay_input_physicalization_uses_logical_coordinate_spans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A padded source buffer must not size a page's coordinate allocation."""
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    overlay_gpu = importlib.import_module("vibespatial.overlay.gpu")
+    api_overlay = importlib.import_module("vibespatial.api.tools.overlay")
+    owned_module = importlib.import_module("vibespatial.geometry.owned")
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import (
+        FAMILY_TAGS,
+        DeviceFamilyGeometryBuffer,
+        build_device_resident_owned,
+    )
+
+    logical_x = cp.asarray([0, 4, 4, 0, 0, 10, 14, 14, 10, 10], dtype=cp.float64)
+    logical_y = cp.asarray([0, 0, 4, 4, 0, 0, 0, 4, 4, 0], dtype=cp.float64)
+    coordinate_capacity = 1_000_000
+    right = build_device_resident_owned(
+        device_families={
+            GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.POLYGON,
+                x=cp.pad(logical_x, (0, coordinate_capacity - logical_x.size)),
+                y=cp.pad(logical_y, (0, coordinate_capacity - logical_y.size)),
+                geometry_offsets=cp.asarray([0, 1, 2], dtype=cp.int32),
+                ring_offsets=cp.asarray([0, 5, 10], dtype=cp.int32),
+                empty_mask=cp.zeros(2, dtype=cp.bool_),
+            )
+        },
+        row_count=2,
+        tags=cp.full(2, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=cp.int8),
+        validity=cp.ones(2, dtype=cp.bool_),
+        family_row_offsets=cp.arange(2, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+    left_geometries = [
+        box(-1, -1, 15, 5),
+        box(20, -1, 25, 5),
+        box(30, -1, 35, 5),
+    ]
+    left = from_shapely_geometries(left_geometries)
+    d_right_source_rows = cp.zeros(2, dtype=cp.int32)
+
+    physicalized_coordinate_counts: list[int] = []
+    padded_input_indexed_flags: list[bool] = []
+    grouped_topology_coordinate_counts: list[int] = []
+    original_physicalize = owned_module.device_physicalize_owned_row_selections_exact
+
+    def _record_exact_physicalization(selections, *, reason, **kwargs):
+        if reason == "paged overlay input exact-allocation packet":
+            for owned, _active in selections:
+                state = owned._ensure_device_state(preserve_indexed_view=True)
+                polygon = state.families.get(GeometryFamily.POLYGON)
+                if polygon is not None and int(polygon.x.size) == coordinate_capacity:
+                    padded_input_indexed_flags.append(owned.is_indexed_view)
+        physicalized = original_physicalize(selections, reason=reason, **kwargs)
+        if reason == "paged overlay input exact-allocation packet":
+            for owned in physicalized:
+                if owned is None:
+                    continue
+                state = owned._ensure_device_state(preserve_indexed_view=True)
+                polygon = state.families.get(GeometryFamily.POLYGON)
+                if polygon is not None:
+                    physicalized_coordinate_counts.append(int(polygon.x.size))
+        elif reason == "grouped overlay topology input exact-allocation packet":
+            for owned in physicalized:
+                if owned is None:
+                    continue
+                state = owned._ensure_device_state(preserve_indexed_view=True)
+                polygon = state.families.get(GeometryFamily.POLYGON)
+                if polygon is not None:
+                    grouped_topology_coordinate_counts.append(int(polygon.x.size))
+        return physicalized
+
+    monkeypatch.setattr(
+        owned_module,
+        "device_physicalize_owned_row_selections_exact",
+        _record_exact_physicalization,
+    )
+    assert not right.is_indexed_view
+    _, exact_right = overlay_gpu._physicalize_paged_overlay_inputs(left, right)
+    exact_polygon = exact_right._ensure_device_state(
+        preserve_indexed_view=True,
+    ).families[GeometryFamily.POLYGON]
+    assert int(exact_polygon.x.size) == logical_x.size
+
+    grouped_left = left._device_indexed_take(
+        cp.asarray([0], dtype=cp.int64),
+        assume_unique_indices=True,
+    )
+    grouped_right = right._device_indexed_take(
+        cp.arange(2, dtype=cp.int64),
+        assume_unique_indices=True,
+    )
+    assert grouped_right.is_indexed_view
+    grouped_result = api_overlay._grouped_overlay_difference_owned(
+        grouped_left,
+        grouped_right,
+        cp.asarray([0, 2], dtype=cp.int64),
+        dispatch_mode=ExecutionMode.GPU,
+        _all_groups_observed=True,
+        _group_size_min=2,
+        _group_size_max=2,
+        _skip_containment_union=True,
+        _skip_direct_specializations=True,
+    )
+    mask_geometries = right.to_shapely()
+    expected_grouped = left_geometries[0].difference(
+        mask_geometries[0].union(mask_geometries[1])
+    )
+    assert grouped_topology_coordinate_counts == [5, logical_x.size]
+    assert grouped_result.to_shapely()[0].normalize().equals_exact(
+        expected_grouped.normalize(),
+        tolerance=1.0e-9,
+    )
+
+    monkeypatch.setattr(overlay_gpu, "_compute_live_split_event_budget", lambda: 160)
+    plan = overlay_gpu._build_overlay_execution_plan(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+        _same_row_span_summary=None,
+        _right_geometry_source_rows=d_right_source_rows,
+        _right_segment_source_rows=d_right_source_rows,
+    )
+
+    assert isinstance(plan, PagedOverlayExecutionPlan)
+    result, selected = overlay_gpu._materialize_overlay_execution_plan(
+        plan,
+        operation="difference",
+        requested=ExecutionMode.GPU,
+        preserve_row_count=3,
+    )
+
+    expected = [
+        left_geometries[0].difference(mask_geometries[0].union(mask_geometries[1])),
+        left_geometries[1],
+        left_geometries[2],
+    ]
+    assert selected is ExecutionMode.GPU
+    assert False in padded_input_indexed_flags
+    assert physicalized_coordinate_counts
+    assert logical_x.size in physicalized_coordinate_counts
+    assert max(physicalized_coordinate_counts) < coordinate_capacity
+    assert coordinate_capacity not in physicalized_coordinate_counts
+    assert all(
+        actual.normalize().equals_exact(wanted.normalize(), tolerance=1.0e-9)
+        for actual, wanted in zip(result.to_shapely(), expected, strict=True)
+    )
+
+
+@pytest.mark.gpu
+def test_gpu_segment_extraction_ignores_inactive_indexed_capacity_lanes() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    cp = pytest.importorskip("cupy")
+    from vibespatial.spatial.segment_primitives import _extract_segments_gpu
+
+    base = from_shapely_geometries([box(0, 0, 1, 1), box(2, 0, 3, 1)])
+    capacity = 4096
+    d_indices = cp.arange(capacity, dtype=cp.int64) % cp.int64(2)
+    d_active = cp.zeros(capacity, dtype=cp.bool_)
+    d_active[0] = True
+    d_active[-1] = True
+    masked = base._device_indexed_take(d_indices)._apply_row_activity(d_active)
+
+    segments = _extract_segments_gpu(masked)
+
+    assert segments.count == 8
+    assert cp.asnumpy(cp.unique(segments.row_indices)).tolist() == [0, capacity - 1]
 
 
 @pytest.mark.gpu
@@ -499,6 +760,7 @@ def test_gpu_oversized_grouped_difference_uses_interval_component_pages(
         operation="difference",
         requested=ExecutionMode.GPU,
         preserve_row_count=1,
+        valid_empty_rows=cp.ones(1, dtype=cp.bool_),
     )
     expected = left_geom.difference(shapely.union_all(right_geoms))
     assert selected is ExecutionMode.GPU

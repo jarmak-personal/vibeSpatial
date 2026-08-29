@@ -1006,19 +1006,10 @@ def _owned_wkb_arrow_array_host_bridge(
     return_mode: bool,
 ):
     """Encode host-owned geometry to Arrow WKB without the upstream Shapely bridge."""
-    import json
-
     import pyarrow as pa
 
     values, _partition_plan = _encode_native_wkb(owned)
-    field_metadata = {b"ARROW:extension:name": b"geoarrow.wkb"}
-    if crs is not None:
-        try:
-            crs_json = crs.to_json_dict()
-        except AttributeError:
-            crs_json = None
-        if crs_json is not None:
-            field_metadata[b"ARROW:extension:metadata"] = json.dumps({"crs": crs_json}).encode()
+    field_metadata = _geoarrow_field_metadata(extension_name="geoarrow.wkb", crs=crs)
     field = pa.field(field_name, pa.binary(), nullable=True, metadata=field_metadata)
     result = (field, pa.array(values, type=pa.binary()))
     return (*result, ExecutionMode.CPU) if return_mode else result
@@ -2252,6 +2243,98 @@ def geodataframe_to_arrow(
     return ArrowTable(table)
 
 
+def _native_tabular_attribute_table_to_arrow(
+    attributes,
+    *,
+    index_plan,
+    index,
+    columns,
+):
+    """Export attributes plus an admitted device index plan to host Arrow.
+
+    The terminal Arrow conversion copies the final label column, never the
+    device row-position indirection used to derive it.
+    """
+    if index is False:
+        return attributes.to_arrow(index=False, columns=columns)
+
+    try:
+        import pyarrow as pa
+        import pylibcudf as plc
+
+        from vibespatial.cuda._runtime import pylibcudf_to_arrow
+        from vibespatial.io.wkb import (
+            _native_device_index_columns,
+            _native_pandas_schema_metadata,
+        )
+        from vibespatial.runtime.materialization import (
+            MaterializationBoundary,
+            record_materialization_event,
+        )
+    except ModuleNotFoundError:
+        return None
+
+    index_result = _native_device_index_columns(
+        index_plan=index_plan,
+        fallback_index=attributes.index,
+        row_count=len(attributes),
+        index=index,
+        attribute_columns=columns,
+        pa=pa,
+        plc=plc,
+    )
+    if index_result is None:
+        return None
+
+    index_columns, range_index = index_result
+    table = attributes.to_arrow(
+        index=None if range_index is not None else False,
+        columns=columns,
+    )
+    attribute_fields = list(table.schema)
+    for index_column in index_columns:
+        record_materialization_event(
+            surface="vibespatial.api.NativeIndexPlan.to_arrow",
+            boundary=MaterializationBoundary.USER_EXPORT,
+            operation="device_index_labels_to_arrow",
+            reason="terminal Arrow export copied final device index labels",
+            detail=f"rows={len(attributes)}, columns=1, bytes=unknown",
+            d2h_transfer=True,
+        )
+        index_table = pylibcudf_to_arrow(plc.Table([index_column.column]))
+        if table.num_columns == 0:
+            table = pa.Table.from_arrays(
+                [index_table.column(0)],
+                schema=pa.schema([index_column.field]),
+            )
+        else:
+            table = table.append_column(
+                index_column.field,
+                index_table.column(0),
+            )
+
+    if table.num_columns == 0:
+        # PyArrow drops the logical row count when replacing metadata on a
+        # zero-column table. The RangeIndex metadata already emitted above is
+        # authoritative and must survive until the geometry column is added.
+        return table
+
+    metadata = {
+        key: value
+        for key, value in (table.schema.metadata or {}).items()
+        if key != b"pandas"
+    }
+    metadata.update(
+        _native_pandas_schema_metadata(
+            attribute_fields=attribute_fields,
+            index_columns=index_columns,
+            range_index=range_index,
+            preserve_index=index,
+        )
+    )
+    return table.replace_schema_metadata(metadata or None)
+
+
 def native_tabular_to_arrow(
     payload,
     *,
@@ -2263,6 +2346,7 @@ def native_tabular_to_arrow(
     record_export_boundary: bool = True,
 ):
 
+    from vibespatial.api._native_result_core import NativeAttributeTable
     from vibespatial.api._native_results import NativeTabularResult
     from vibespatial.api.io._geoarrow import construct_wkb_array
     from vibespatial.io.wkb import _encode_owned_wkb_array
@@ -2270,11 +2354,7 @@ def native_tabular_to_arrow(
     if not isinstance(payload, NativeTabularResult):
         raise TypeError("native_tabular_to_arrow expects a NativeTabularResult")
 
-    attributes = payload.attributes_for_export(
-        surface="vibespatial.native_tabular.to_arrow",
-        include_index=index is not False,
-        strict_disallowed=False,
-    )
+    attributes = NativeAttributeTable.from_value(payload.attributes)
     resolved_column_order = list(payload.resolved_column_order)
     geometry_columns = sorted(
         payload.geometry_columns,
@@ -2282,15 +2362,21 @@ def native_tabular_to_arrow(
     )
     geometry_names = {column.name for column in geometry_columns}
     attr_columns = [column for column in resolved_column_order if column not in geometry_names]
-    if attr_columns:
+    table = _native_tabular_attribute_table_to_arrow(
+        attributes,
+        index_plan=payload.index_plan,
+        index=index,
+        columns=attr_columns,
+    )
+    if table is None:
+        attributes = payload.attributes_for_export(
+            surface="vibespatial.native_tabular.to_arrow",
+            include_index=index is not False,
+            strict_disallowed=False,
+        )
         table = attributes.to_arrow(
             index=index,
             columns=attr_columns,
-        )
-    else:
-        table = attributes.to_arrow(
-            index=index,
-            columns=[],
         )
 
     geometry_encoding_dict: dict[str, str] = {}

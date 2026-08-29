@@ -7,6 +7,8 @@ import json
 import os
 import struct
 import sys
+import zlib
+from base64 import b64encode
 from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -14,6 +16,7 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import shapely
@@ -648,3 +651,68 @@ def fingerprint(frame, *, order_sensitive: bool = True) -> str:
             digest.update(_pack(b"w", row_digest))
 
     return f"{_RESULT_FINGERPRINT_VERSION}:{semantics}:sha256={digest.hexdigest()}"
+
+
+def power_nearest_correctness_packet(frame) -> dict[str, Any]:
+    """Return the fail-closed same-row oracle for the Power nearest workload."""
+    expected_columns = [
+        "node_id_left",
+        "power_value",
+        "voltage",
+        "operator",
+        "name",
+        "geometry",
+        "index_right",
+        "node_id_right",
+        "distance_m",
+    ]
+    if list(frame.columns) != expected_columns:
+        raise TypeError(
+            "Power nearest correctness contract requires the canonical output schema"
+        )
+    geometry = np.asarray(frame.geometry.array)
+    type_ids = np.asarray(shapely.get_type_id(geometry), dtype=np.int8)
+    missing = np.asarray(shapely.is_missing(geometry), dtype=np.bool_)
+    empty = np.asarray(shapely.is_empty(geometry), dtype=np.bool_)
+    if np.any(missing | empty) or np.any(type_ids != 0):
+        raise TypeError(
+            "Power nearest correctness contract requires one non-empty Point per row"
+        )
+    coordinates = np.asarray(shapely.get_coordinates(geometry), dtype=np.float64)
+    distances = np.asarray(frame["distance_m"], dtype=np.float64)
+    if coordinates.shape != (len(frame), 2) or distances.shape != (len(frame),):
+        raise TypeError("Power nearest correctness contract has invalid numeric shape")
+    numeric = np.column_stack((coordinates, distances)).astype("<f8", copy=False)
+    exact_columns = pd.DataFrame(frame.drop(columns=["geometry", "distance_m"]))
+    public_values = frame.to_wkb(hex=False)
+    logical_dtypes = _logical_schema_descriptors(
+        public_values,
+        list(frame.dtypes),
+        semantic_overrides={expected_columns.index("geometry"): "geometry"},
+    )
+    index_frame = frame.index.to_frame(index=False)
+    logical_index_dtypes = _logical_schema_descriptors(
+        index_frame,
+        list(index_frame.dtypes),
+    )
+    crs = getattr(frame, "crs", None)
+    crs_text = crs.to_wkt() if crs is not None else None
+    return {
+        "contract": "power-nearest-v1",
+        "row_count": len(frame),
+        "columns": [repr(value) for value in frame.columns],
+        "logical_dtypes": [descriptor.hex() for descriptor in logical_dtypes],
+        "index_type": type(frame.index).__name__,
+        "index_names": [repr(value) for value in frame.index.names],
+        "logical_index_dtypes": [
+            descriptor.hex() for descriptor in logical_index_dtypes
+        ],
+        "crs_sha256": hashlib.sha256(
+            (crs_text or "").encode("utf-8")
+        ).hexdigest(),
+        "exact_values_fingerprint": fingerprint(exact_columns),
+        "numeric_shape": list(numeric.shape),
+        "numeric_f64_zlib_base64": b64encode(
+            zlib.compress(numeric.tobytes(order="C"), level=9)
+        ).decode("ascii"),
+    }

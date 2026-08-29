@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 
-import cupy as cp
 import pytest
 
 from vibespatial.api import read_file
@@ -11,6 +10,8 @@ from vibespatial.overlay.faces import _select_overlay_face_indices_gpu, build_gp
 from vibespatial.overlay.graph import build_gpu_half_edge_graph
 from vibespatial.overlay.host_fallback import _build_polygon_output_from_faces
 from vibespatial.overlay.split import build_gpu_atomic_edges, build_gpu_split_events
+
+cp = pytest.importorskip("cupy", reason="overlay stage debugging requires the optional CuPy dependency")
 
 
 @pytest.mark.gpu

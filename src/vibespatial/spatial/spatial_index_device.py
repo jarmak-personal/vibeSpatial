@@ -55,6 +55,7 @@ from vibespatial.kernels.core.spatial_query_kernels import (
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.config import SPATIAL_EPSILON
 from vibespatial.runtime.crossover import PhysicalWorkEstimate
 from vibespatial.runtime.hotpath_trace import attach_work_amplification, hotpath_stage
 from vibespatial.runtime.precision import (
@@ -107,6 +108,9 @@ _SEMIJOIN_MAX_SEGMENT_PAIR_LANES = 8 * 1024 * 1024
 # Capacity additionally uses at most one quarter of currently available bytes.
 _SEMIJOIN_TILE_BYTES_PER_LANE = 64
 _MORTON_SPAN_BUCKET_UPPER_BOUNDS = (0,) + tuple(1 << exponent for exponent in range(32))
+_MORTON_PREFIX_COVER_BUDGET = 16
+_MORTON_COORDINATE_BITS = 16
+_MORTON_KEY_MAX = (1 << (2 * _MORTON_COORDINATE_BITS)) - 1
 
 
 def _point_partition_reduction_metrics(
@@ -849,6 +853,31 @@ class _MortonRangeQueryState:
     d_range_low: object
     d_range_high: object
 
+    def explicit_temporary_byte_count(self) -> int:
+        """Return bytes owned solely by this prepared query state.
+
+        Cached index columns and a caller-owned device query-bounds array are
+        excluded.  Gathered/sorted columns, copied bounds, range vectors, and
+        binary-search outputs are transient and remain live through the span
+        reduction.
+        """
+        owned = (
+            self.d_sorted_keys,
+            self.d_sorted_tree_bounds,
+            self.temp_tree_bounds,
+            self.temp_query_bounds,
+            self.temp_expanded_bounds,
+            self.d_range_low,
+            self.d_range_high,
+            self.d_starts,
+            self.d_ends,
+        )
+        return sum(
+            int(getattr(value, "nbytes", 0))
+            for value in owned
+            if value is not None
+        )
+
     def close(self) -> None:
         """Retire owned temporaries after current-stream work completes."""
         runtime = get_cuda_runtime()
@@ -867,6 +896,8 @@ def _prepare_morton_range_query(
     flat_index,
     original_bounds,
     effective_bounds,
+    *,
+    device_extent_summary: bool = False,
 ) -> _MortonRangeQueryState | None:
     """Build reusable device Morton ranges without exporting index columns."""
     import cupy as cp
@@ -879,7 +910,9 @@ def _prepare_morton_range_query(
     host_tree_bounds = getattr(flat_index, "_host_bounds", None)
     if host_tree_bounds is not None:
         host_tree_bounds = np.asarray(host_tree_bounds, dtype=np.float64).reshape(-1, 4)
-        finite_rows = np.isfinite(host_tree_bounds).all(axis=1)
+        finite_rows = np.isfinite(host_tree_bounds).all(axis=1) & (
+            host_tree_bounds[:, 0] <= host_tree_bounds[:, 2]
+        ) & (host_tree_bounds[:, 1] <= host_tree_bounds[:, 3])
         finite_bounds = host_tree_bounds[finite_rows]
         extent_summary = np.asarray(
             (
@@ -893,29 +926,51 @@ def _prepare_morton_range_query(
             ),
             dtype=np.float64,
         )
+        if int(extent_summary[0]) == 0:
+            runtime.free(temp_tree_bounds)
+            return None
+        expanded_bounds = effective_bounds.copy()
+        expanded_bounds[:, 0] -= float(extent_summary[1])
+        expanded_bounds[:, 1] -= float(extent_summary[2])
+        expanded_bounds[:, 2] += float(extent_summary[1])
+        expanded_bounds[:, 3] += float(extent_summary[2])
     else:
         d_width = d_tree_bounds[:, 2] - d_tree_bounds[:, 0]
         d_height = d_tree_bounds[:, 3] - d_tree_bounds[:, 1]
+        d_finite_tree = cp.isfinite(d_tree_bounds).all(axis=1) & (
+            d_tree_bounds[:, 0] <= d_tree_bounds[:, 2]
+        ) & (d_tree_bounds[:, 1] <= d_tree_bounds[:, 3])
         d_extent_summary = cp.stack(
             (
-                cp.count_nonzero(cp.isfinite(d_tree_bounds).all(axis=1)),
-                cp.max(cp.where(cp.isfinite(d_width), d_width, 0.0)) * 0.5,
-                cp.max(cp.where(cp.isfinite(d_height), d_height, 0.0)) * 0.5,
+                cp.count_nonzero(d_finite_tree),
+                cp.max(cp.where(d_finite_tree, d_width, 0.0)) * 0.5,
+                cp.max(cp.where(d_finite_tree, d_height, 0.0)) * 0.5,
             )
         ).astype(cp.float64, copy=False)
-        extent_summary = runtime.copy_device_to_host(
-            d_extent_summary,
-            reason="device spatial-index tree extent planning fence",
-        )
-    if int(extent_summary[0]) == 0:
-        runtime.free(temp_tree_bounds)
-        return None
-
-    expanded_bounds = effective_bounds.copy()
-    expanded_bounds[:, 0] -= float(extent_summary[1])
-    expanded_bounds[:, 1] -= float(extent_summary[2])
-    expanded_bounds[:, 2] += float(extent_summary[1])
-    expanded_bounds[:, 3] += float(extent_summary[2])
+        if device_extent_summary:
+            # Structural admission exports only its final packet.  Keep the
+            # extent expansion on device in this opt-in mode.
+            expanded_bounds = cp.asarray(effective_bounds, dtype=cp.float64).copy()
+            expanded_bounds[:, 0] -= d_extent_summary[1]
+            expanded_bounds[:, 1] -= d_extent_summary[2]
+            expanded_bounds[:, 2] += d_extent_summary[1]
+            expanded_bounds[:, 3] += d_extent_summary[2]
+        else:
+            # Preserve the established generic relation/query semantics: the
+            # extent fence also detects an all-invalid tree before Morton keys
+            # are searched.
+            extent_summary = runtime.copy_device_to_host(
+                d_extent_summary,
+                reason="device spatial-index tree extent planning fence",
+            )
+            if int(extent_summary[0]) == 0:
+                runtime.free(temp_tree_bounds)
+                return None
+            expanded_bounds = effective_bounds.copy()
+            expanded_bounds[:, 0] -= float(extent_summary[1])
+            expanded_bounds[:, 1] -= float(extent_summary[2])
+            expanded_bounds[:, 2] += float(extent_summary[1])
+            expanded_bounds[:, 3] += float(extent_summary[2])
 
     device_order = getattr(flat_index, "device_order", None)
     if device_order is None:
@@ -938,6 +993,10 @@ def _prepare_morton_range_query(
         expanded_bounds,
         runtime,
     )
+    if temp_expanded_bounds is None and _is_device_array(expanded_bounds):
+        # ``expanded_bounds`` is operation-local even when already device
+        # resident.  Retain and account for it until range preparation closes.
+        temp_expanded_bounds = expanded_bounds
     d_range_low = runtime.allocate((query_count,), cp.uint64)
     d_range_high = runtime.allocate((query_count,), cp.uint64)
 
@@ -987,6 +1046,541 @@ def _prepare_morton_range_query(
         temp_expanded_bounds=temp_expanded_bounds,
         d_range_low=d_range_low,
         d_range_high=d_range_high,
+    )
+
+
+@dataclass(frozen=True)
+class MortonSpanUpperPacket:
+    """Device-resident conservative Morton relation-shape summary."""
+
+    values: object
+    tree_count: int
+    query_count: int
+    temporary_byte_count: int
+
+
+def _spread_morton_coordinate_bits_device(values):
+    """Interleave one uint16 coordinate column into even Morton bits."""
+    values = cp.asarray(values, dtype=cp.uint64)
+    values = (values | (values << cp.uint64(16))) & cp.uint64(
+        0x0000FFFF0000FFFF
+    )
+    values = (values | (values << cp.uint64(8))) & cp.uint64(
+        0x00FF00FF00FF00FF
+    )
+    values = (values | (values << cp.uint64(4))) & cp.uint64(
+        0x0F0F0F0F0F0F0F0F
+    )
+    values = (values | (values << cp.uint64(2))) & cp.uint64(
+        0x3333333333333333
+    )
+    return (values | (values << cp.uint64(1))) & cp.uint64(
+        0x5555555555555555
+    )
+
+
+def _morton_prefix_cover_ranges_device(
+    expanded_bounds,
+    *,
+    total_bounds: tuple[float, float, float, float],
+    active_rows,
+):
+    """Return at most 16 disjoint dyadic Morton cells per query row.
+
+    Each row chooses the deepest uniform quadtree level whose rectangular
+    block of intersected cells fits the fixed cover budget.  The selected
+    cells are disjoint and their union contains the complete expanded query
+    rectangle.  Boundary coordinates use outward floor/ceil quantization, so
+    an indexed center rounded by the Morton-key builder cannot escape the
+    cover.
+    """
+    d_bounds = cp.asarray(expanded_bounds, dtype=cp.float64).reshape(-1, 4)
+    d_active = cp.asarray(active_rows, dtype=cp.bool_).reshape(-1)
+    query_count = int(d_bounds.shape[0])
+    if int(d_active.size) != query_count:
+        raise ValueError("Morton prefix cover activity must align with query bounds")
+
+    total_minx, total_miny, total_maxx, total_maxy = (
+        float(value) for value in total_bounds
+    )
+    span_x = max(total_maxx - total_minx, SPATIAL_EPSILON)
+    span_y = max(total_maxy - total_miny, SPATIAL_EPSILON)
+    coordinate_max = float((1 << _MORTON_COORDINATE_BITS) - 1)
+
+    d_outside = d_active & (
+        (d_bounds[:, 2] < total_minx)
+        | (d_bounds[:, 0] > total_maxx)
+        | (d_bounds[:, 3] < total_miny)
+        | (d_bounds[:, 1] > total_maxy)
+    )
+    d_cover_active = d_active & ~d_outside
+    # Inactive rows may contain NaN/Inf. Substitute finite root bounds before
+    # floor/ceil so they cannot trigger undefined numeric casts; their lanes
+    # are masked after cover construction.
+    d_safe_bounds = cp.where(
+        d_cover_active[:, None],
+        d_bounds,
+        cp.asarray(total_bounds, dtype=cp.float64)[None, :],
+    )
+    d_x_low = cp.clip(
+        cp.floor((d_safe_bounds[:, 0] - total_minx) * coordinate_max / span_x),
+        0.0,
+        coordinate_max,
+    ).astype(cp.uint32)
+    d_y_low = cp.clip(
+        cp.floor((d_safe_bounds[:, 1] - total_miny) * coordinate_max / span_y),
+        0.0,
+        coordinate_max,
+    ).astype(cp.uint32)
+    d_x_high = cp.clip(
+        cp.ceil((d_safe_bounds[:, 2] - total_minx) * coordinate_max / span_x),
+        0.0,
+        coordinate_max,
+    ).astype(cp.uint32)
+    d_y_high = cp.clip(
+        cp.ceil((d_safe_bounds[:, 3] - total_miny) * coordinate_max / span_y),
+        0.0,
+        coordinate_max,
+    ).astype(cp.uint32)
+
+    d_depths = cp.arange(_MORTON_COORDINATE_BITS + 1, dtype=cp.uint32)
+    d_shifts = cp.uint32(_MORTON_COORDINATE_BITS) - d_depths
+    d_level_x_low = d_x_low[:, None] >> d_shifts[None, :]
+    d_level_y_low = d_y_low[:, None] >> d_shifts[None, :]
+    d_level_x_high = d_x_high[:, None] >> d_shifts[None, :]
+    d_level_y_high = d_y_high[:, None] >> d_shifts[None, :]
+    d_level_x_count = (
+        d_level_x_high.astype(cp.int64) - d_level_x_low.astype(cp.int64) + 1
+    )
+    d_level_y_count = (
+        d_level_y_high.astype(cp.int64) - d_level_y_low.astype(cp.int64) + 1
+    )
+    d_level_cell_count = d_level_x_count * d_level_y_count
+    d_admissible_depths = cp.where(
+        d_level_cell_count <= cp.int64(_MORTON_PREFIX_COVER_BUDGET),
+        d_depths[None, :].astype(cp.int32),
+        cp.int32(-1),
+    )
+    d_depth = cp.max(d_admissible_depths, axis=1).astype(cp.uint32, copy=False)
+    d_depth_column = d_depth[:, None].astype(cp.int64, copy=False)
+    d_cell_x_low = cp.take_along_axis(
+        d_level_x_low,
+        d_depth_column,
+        axis=1,
+    )[:, 0]
+    d_cell_y_low = cp.take_along_axis(
+        d_level_y_low,
+        d_depth_column,
+        axis=1,
+    )[:, 0]
+    d_cell_x_count = cp.take_along_axis(
+        d_level_x_count,
+        d_depth_column,
+        axis=1,
+    )[:, 0]
+    d_cell_count = cp.take_along_axis(
+        d_level_cell_count,
+        d_depth_column,
+        axis=1,
+    )[:, 0]
+
+    d_lanes = cp.arange(_MORTON_PREFIX_COVER_BUDGET, dtype=cp.int64)[None, :]
+    d_cell_valid = d_cover_active[:, None] & (d_lanes < d_cell_count[:, None])
+    d_cell_x = d_cell_x_low[:, None].astype(cp.int64) + (
+        d_lanes % d_cell_x_count[:, None]
+    )
+    d_cell_y = d_cell_y_low[:, None].astype(cp.int64) + (
+        d_lanes // d_cell_x_count[:, None]
+    )
+    d_coordinate_shift = (
+        cp.uint32(_MORTON_COORDINATE_BITS) - d_depth
+    )[:, None]
+    d_cell_x_min = d_cell_x.astype(cp.uint64) << d_coordinate_shift
+    d_cell_y_min = d_cell_y.astype(cp.uint64) << d_coordinate_shift
+    d_range_low = _spread_morton_coordinate_bits_device(d_cell_x_min) | (
+        _spread_morton_coordinate_bits_device(d_cell_y_min) << cp.uint64(1)
+    )
+    d_suffix_bits = (
+        cp.uint64(2)
+        * (cp.uint64(_MORTON_COORDINATE_BITS) - d_depth.astype(cp.uint64))
+    )[:, None]
+    d_suffix_mask = (cp.uint64(1) << d_suffix_bits) - cp.uint64(1)
+    d_range_high = d_range_low | d_suffix_mask
+    d_range_low = cp.where(d_cell_valid, d_range_low, cp.uint64(0))
+    d_range_high = cp.where(d_cell_valid, d_range_high, cp.uint64(0))
+    explicit_arrays = (
+        d_active,
+        d_outside,
+        d_cover_active,
+        d_safe_bounds,
+        d_x_low,
+        d_y_low,
+        d_x_high,
+        d_y_high,
+        d_depths,
+        d_shifts,
+        d_level_x_low,
+        d_level_y_low,
+        d_level_x_high,
+        d_level_y_high,
+        d_level_x_count,
+        d_level_y_count,
+        d_level_cell_count,
+        d_admissible_depths,
+        d_depth,
+        d_depth_column,
+        d_cell_x_low,
+        d_cell_y_low,
+        d_cell_x_count,
+        d_cell_count,
+        d_lanes,
+        d_cell_valid,
+        d_cell_x,
+        d_cell_y,
+        d_coordinate_shift,
+        d_cell_x_min,
+        d_cell_y_min,
+        d_suffix_bits,
+        d_suffix_mask,
+        d_range_low,
+        d_range_high,
+    )
+    # Every named array above remains referenced through this return point.
+    # Their sum is a conservative explicit-live upper bound: CuPy may alias an
+    # ``asarray`` input, while short-lived ufunc intermediates retire before
+    # the returned ranges are consumed. Admission needs an OOM-safe bound, not
+    # allocator-pool reservation bytes.
+    temporary_byte_count = sum(int(values.nbytes) for values in explicit_arrays)
+    return d_range_low, d_range_high, d_cell_valid, temporary_byte_count
+
+
+def spatial_index_device_morton_span_upper_packet(
+    flat_index,
+    query_bounds,
+    *,
+    native_index=None,
+) -> tuple[MortonSpanUpperPacket | None, SpatialQueryExecution]:
+    """Reduce prepared Morton intervals without scanning candidate lanes.
+
+    The three int64 values are ``(sum(span), nonempty spans, max(span))``.
+    Query bounds are expanded by the largest indexed directional center
+    extents; consequently every bbox (and therefore every exact) hit is
+    contained in its query's Morton cells.  This helper deliberately performs
+    no interval scan, pair allocation, or predicate refinement.
+    """
+    if cp is None or not has_gpu_runtime():
+        return None, SpatialQueryExecution(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.CPU,
+            implementation="owned_cpu_spatial_query",
+            reason="GPU runtime unavailable for direct Morton span planning",
+        )
+    if native_index is not None:
+        from vibespatial.spatial.point_partition import wait_for_point_partition
+
+        wait_for_point_partition(native_index.readiness)
+
+    query_count = int(query_bounds.shape[0])
+    tree_count = int(flat_index.size)
+    total_bounds = getattr(flat_index, "total_bounds", None)
+
+    def _invalid_packet(reason: str):
+        d_packet = cp.full(3, -1, dtype=cp.int64)
+        return MortonSpanUpperPacket(
+            values=d_packet,
+            tree_count=tree_count,
+            query_count=query_count,
+            temporary_byte_count=int(d_packet.nbytes),
+        ), SpatialQueryExecution(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            implementation="owned_gpu_spatial_morton_span_upper",
+            reason=reason,
+        )
+
+    if getattr(flat_index, "regular_grid", None) is not None:
+        return None, SpatialQueryExecution(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.CPU,
+            implementation="owned_cpu_spatial_query",
+            reason="direct Morton span planning declines regular-grid identity keys",
+        )
+    if tree_count == 0 or query_count == 0:
+        d_packet = cp.zeros(3, dtype=cp.int64)
+        return MortonSpanUpperPacket(
+            values=d_packet,
+            tree_count=tree_count,
+            query_count=query_count,
+            temporary_byte_count=int(d_packet.nbytes),
+        ), SpatialQueryExecution(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            implementation="owned_gpu_spatial_morton_span_upper",
+            reason="empty input produced a zero Morton span upper packet",
+        )
+    finite_total_bounds = total_bounds is not None and np.isfinite(
+        np.asarray(total_bounds, dtype=np.float64)
+    ).all()
+    if not finite_total_bounds:
+        # Empty/null indexed rows have NaN bounds and cannot match.  Distinguish
+        # that semantic zero from corrupt partially-nonfinite state entirely on
+        # device, and do not search placeholder Morton keys.
+        runtime = get_cuda_runtime()
+        d_tree_bounds, temp_tree_bounds = _prepare_tree_bounds_device(
+            flat_index,
+            runtime,
+        )
+        d_tree_bounds = cp.asarray(d_tree_bounds, dtype=cp.float64).reshape(-1, 4)
+        d_all_nan = cp.all(cp.isnan(d_tree_bounds))
+        d_packet = cp.where(
+            d_all_nan,
+            cp.zeros(3, dtype=cp.int64),
+            cp.full(3, -1, dtype=cp.int64),
+        )
+        temporary_byte_count = (
+            int(getattr(temp_tree_bounds, "nbytes", 0))
+            + int(d_all_nan.nbytes)
+            + int(d_packet.nbytes)
+        )
+        runtime.free(temp_tree_bounds)
+        return MortonSpanUpperPacket(
+            values=d_packet,
+            tree_count=tree_count,
+            query_count=query_count,
+            temporary_byte_count=temporary_byte_count,
+        ), SpatialQueryExecution(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            implementation="owned_gpu_spatial_morton_span_upper",
+            reason=(
+                "nonfinite index extent reduced to an empty-or-invalid packet "
+                "without searching Morton keys"
+            ),
+        )
+    total_span_x = float(total_bounds[2]) - float(total_bounds[0])
+    total_span_y = float(total_bounds[3]) - float(total_bounds[1])
+    if (
+        total_span_x < 0.0
+        or total_span_y < 0.0
+        or not np.isfinite(total_span_x)
+        or not np.isfinite(total_span_y)
+    ):
+        return _invalid_packet(
+            "invalid or overflowing index extent produced a fail-closed packet"
+        )
+    has_morton = (
+        getattr(flat_index, "device_morton_keys", None) is not None
+        or (
+            getattr(flat_index, "_host_morton_keys", None) is not None
+            and getattr(flat_index, "_host_order", None) is not None
+        )
+    )
+    if not has_morton:
+        return None, SpatialQueryExecution(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.CPU,
+            implementation="owned_cpu_spatial_query",
+            reason="direct Morton span planning requires a finite non-grid Morton index",
+        )
+    max_int64 = int(np.iinfo(np.int64).max)
+    if tree_count < 0 or query_count < 0 or (
+        tree_count and query_count > max_int64 // tree_count
+    ):
+        return _invalid_packet(
+            "int64 relation cardinality overflow produced a fail-closed packet"
+        )
+    runtime = get_cuda_runtime()
+    d_query_flat, temp_query_bounds = _prepare_query_bounds_device(
+        query_bounds,
+        runtime,
+    )
+    d_tree_flat, temp_tree_bounds = _prepare_tree_bounds_device(
+        flat_index,
+        runtime,
+    )
+    try:
+        d_query = cp.asarray(d_query_flat, dtype=cp.float64).reshape(-1, 4)
+        d_tree = cp.asarray(d_tree_flat, dtype=cp.float64).reshape(-1, 4)
+        d_query_all_nan = cp.isnan(d_query).all(axis=1)
+        d_query_finite = cp.isfinite(d_query).all(axis=1)
+        d_query_ordered = (d_query[:, 0] <= d_query[:, 2]) & (
+            d_query[:, 1] <= d_query[:, 3]
+        )
+        d_query_valid = d_query_finite & d_query_ordered
+        d_query_invalid = cp.any(~(d_query_all_nan | d_query_valid))
+        d_tree_all_nan = cp.isnan(d_tree).all(axis=1)
+        d_tree_valid = cp.isfinite(d_tree).all(axis=1) & (
+            d_tree[:, 0] <= d_tree[:, 2]
+        ) & (d_tree[:, 1] <= d_tree[:, 3])
+        d_tree_invalid = cp.any(~(d_tree_all_nan | d_tree_valid))
+        d_width = d_tree[:, 2] - d_tree[:, 0]
+        d_height = d_tree[:, 3] - d_tree[:, 1]
+        d_center_x = (d_tree[:, 0] + d_tree[:, 2]) * cp.float64(0.5)
+        d_center_y = (d_tree[:, 1] + d_tree[:, 3]) * cp.float64(0.5)
+        d_extent_invalid = cp.any(
+            d_tree_valid
+            & (
+                ~cp.isfinite(d_width)
+                | ~cp.isfinite(d_height)
+                | ~cp.isfinite(d_center_x)
+                | ~cp.isfinite(d_center_y)
+            )
+        )
+        d_left_extent = cp.max(
+            cp.where(d_tree_valid, d_center_x - d_tree[:, 0], 0.0)
+        )
+        d_right_extent = cp.max(
+            cp.where(d_tree_valid, d_tree[:, 2] - d_center_x, 0.0)
+        )
+        d_bottom_extent = cp.max(
+            cp.where(d_tree_valid, d_center_y - d_tree[:, 1], 0.0)
+        )
+        d_top_extent = cp.max(
+            cp.where(d_tree_valid, d_tree[:, 3] - d_center_y, 0.0)
+        )
+        d_expanded = d_query.copy()
+        d_expanded[:, 0] = cp.nextafter(
+            d_expanded[:, 0] - d_right_extent,
+            -cp.inf,
+        )
+        d_expanded[:, 1] = cp.nextafter(
+            d_expanded[:, 1] - d_top_extent,
+            -cp.inf,
+        )
+        d_expanded[:, 2] = cp.nextafter(
+            d_expanded[:, 2] + d_left_extent,
+            cp.inf,
+        )
+        d_expanded[:, 3] = cp.nextafter(
+            d_expanded[:, 3] + d_bottom_extent,
+            cp.inf,
+        )
+        d_expanded_valid = cp.isfinite(d_expanded).all(axis=1) & (
+            d_expanded[:, 0] <= d_expanded[:, 2]
+        ) & (d_expanded[:, 1] <= d_expanded[:, 3])
+        d_expansion_invalid = cp.any(d_query_valid & ~d_expanded_valid)
+
+        device_order = getattr(flat_index, "device_order", None)
+        if device_order is None:
+            device_order = cp.asarray(flat_index.order, dtype=cp.int32)
+            object.__setattr__(flat_index, "device_order", device_order)
+        d_order = cp.asarray(device_order, dtype=cp.int32)
+        device_morton_keys = getattr(flat_index, "device_morton_keys", None)
+        if device_morton_keys is None:
+            device_morton_keys = cp.asarray(flat_index.morton_keys, dtype=cp.uint64)
+            object.__setattr__(flat_index, "device_morton_keys", device_morton_keys)
+        d_unsorted_keys = cp.asarray(device_morton_keys, dtype=cp.uint64)
+        d_sorted_keys = cp.ascontiguousarray(d_unsorted_keys[d_order])
+        d_key_invalid = cp.any(
+            d_tree_valid & (d_unsorted_keys > cp.uint64(_MORTON_KEY_MAX))
+        )
+        d_key_order_invalid = cp.any(d_sorted_keys[1:] < d_sorted_keys[:-1])
+
+        (
+            d_range_low,
+            d_range_high,
+            d_cell_valid,
+            cover_temporary_bytes,
+        ) = _morton_prefix_cover_ranges_device(
+            d_expanded,
+            total_bounds=tuple(float(value) for value in total_bounds),
+            active_rows=d_query_valid & d_expanded_valid,
+        )
+        d_starts = lower_bound(
+            d_sorted_keys,
+            d_range_low.reshape(-1),
+            synchronize=False,
+        ).astype(cp.int64, copy=False)
+        d_ends = upper_bound(
+            d_sorted_keys,
+            d_range_high.reshape(-1),
+            synchronize=False,
+        ).astype(cp.int64, copy=False)
+        d_range_invalid = cp.any(
+            (d_starts < 0)
+            | (d_ends < d_starts)
+            | (d_ends > cp.int64(tree_count))
+        )
+        d_invalid = (
+            d_query_invalid
+            | d_tree_invalid
+            | d_extent_invalid
+            | d_expansion_invalid
+            | d_key_invalid
+            | d_key_order_invalid
+            | d_range_invalid
+        )
+        d_cell_spans = cp.where(
+            d_cell_valid.reshape(-1),
+            cp.maximum(d_ends - d_starts, cp.int64(0)),
+            cp.int64(0),
+        ).reshape(query_count, _MORTON_PREFIX_COVER_BUDGET)
+        d_spans = cp.sum(d_cell_spans, axis=1, dtype=cp.int64)
+        d_packet = cp.stack(
+            (
+                cp.sum(d_spans, dtype=cp.int64),
+                cp.count_nonzero(d_spans).astype(cp.int64),
+                cp.max(d_spans),
+            )
+        ).astype(cp.int64, copy=False)
+        d_packet = cp.where(d_invalid, cp.int64(-1), d_packet).astype(
+            cp.int64,
+            copy=False,
+        )
+        # Explicitly-live packet reduction arrays. Cached index columns and
+        # caller-owned query bounds are excluded; the bounded cover contributes
+        # O(Q * B) scratch and sorted keys contribute O(M) structural state.
+        packet_temporary_bytes = (
+            int(getattr(temp_tree_bounds, "nbytes", 0))
+            + int(getattr(temp_query_bounds, "nbytes", 0))
+            + int(d_sorted_keys.nbytes)
+            + int(d_expanded.nbytes)
+            + int(d_starts.nbytes)
+            + int(d_ends.nbytes)
+            + int(d_cell_spans.nbytes)
+            + int(d_spans.nbytes)
+            + int(d_query_all_nan.nbytes)
+            + int(d_query_finite.nbytes)
+            + int(d_query_ordered.nbytes)
+            + int(d_query_valid.nbytes)
+            + int(d_tree_all_nan.nbytes)
+            + int(d_tree_valid.nbytes)
+            + int(d_width.nbytes)
+            + int(d_height.nbytes)
+            + int(d_center_x.nbytes)
+            + int(d_center_y.nbytes)
+            + int(d_left_extent.nbytes)
+            + int(d_right_extent.nbytes)
+            + int(d_bottom_extent.nbytes)
+            + int(d_top_extent.nbytes)
+            + int(d_query_invalid.nbytes)
+            + int(d_tree_invalid.nbytes)
+            + int(d_extent_invalid.nbytes)
+            + int(d_expansion_invalid.nbytes)
+            + int(d_key_invalid.nbytes)
+            + int(d_key_order_invalid.nbytes)
+            + int(d_range_invalid.nbytes)
+            + int(d_invalid.nbytes)
+            + int(d_packet.nbytes)
+            + int(cover_temporary_bytes)
+        )
+        packet = MortonSpanUpperPacket(
+            values=d_packet,
+            tree_count=tree_count,
+            query_count=query_count,
+            temporary_byte_count=packet_temporary_bytes,
+        )
+    finally:
+        runtime.free(temp_query_bounds)
+        runtime.free(temp_tree_bounds)
+    return packet, SpatialQueryExecution(
+        requested=ExecutionMode.GPU,
+        selected=ExecutionMode.GPU,
+        implementation="owned_gpu_spatial_morton_span_upper",
+        reason=(
+            "full-population disjoint Morton-prefix cover reduced to one device "
+            "packet without candidate scan or predicate refinement"
+        ),
     )
 
 

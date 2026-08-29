@@ -1505,7 +1505,7 @@ def test_device_broadcast_polygon_intersection_uses_row_indirected_right() -> No
 
 
 @requires_gpu
-def test_exact_broadcast_polygon_topology_keeps_one_physical_mask(
+def test_exact_broadcast_polygon_topology_uses_bounded_complete_ring_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vibespatial.constructive.binary_constructive import (
@@ -1514,10 +1514,14 @@ def test_exact_broadcast_polygon_topology_keeps_one_physical_mask(
     from vibespatial.geometry.owned import OwnedGeometryArray
     from vibespatial.overlay import gpu as overlay_gpu
     from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+    from vibespatial.spatial.prepared_polygon_mask import (
+        PreparedPolygonMask,
+        prepared_polygon_mask_fp64_plan,
+    )
 
     left_geoms = [
         box(0.0, 0.0, 3.0, 3.0),
-        box(4.2, 2.2, 5.2, 3.8),
+        box(3.8, 1.8, 4.2, 2.2),
         box(8.0, 0.0, 9.0, 1.0),
     ]
     mask = Polygon(
@@ -1540,11 +1544,20 @@ def test_exact_broadcast_polygon_topology_keeps_one_physical_mask(
         lambda: 120,
     )
     clear_dispatch_events()
-    result = _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
-        left,
+    prepared = PreparedPolygonMask.from_owned(
         right,
-        dispatch_mode=ExecutionMode.GPU,
+        precision_plan=prepared_polygon_mask_fp64_plan(),
     )
+    assert prepared is not None
+    try:
+        result = _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
+            left,
+            right,
+            dispatch_mode=ExecutionMode.GPU,
+            _prepared_mask=prepared,
+        )
+    finally:
+        prepared.close()
 
     assert result is not None
     expected = shapely.intersection(np.asarray(left_geoms, dtype=object), mask)
@@ -1559,14 +1572,13 @@ def test_exact_broadcast_polygon_topology_keeps_one_physical_mask(
     event = next(
         event
         for event in events
-        if event.implementation == "broadcast_right_virtual_segment_topology_gpu"
+        if event.implementation == "broadcast_right_ring_local_winding_topology_gpu"
     )
-    assert "physical_right_segments=6" in event.detail
-    assert "logical_right_segments=18" in event.detail
-    assert any(
-        event.implementation == "broadcast_right_complete_row_topology_pages_gpu"
-        for event in events
-    )
+    assert "physical_mask_segments=6" in event.detail
+    assert "candidate_rings=2" in event.detail
+    assert "logical_right_segments=12" in event.detail
+    assert "complete_ring_candidates_plus_ancestor_shell_baseline" in event.detail
+    assert 12 < 3 * 6
 
 
 @requires_gpu
@@ -1677,6 +1689,81 @@ def test_prepared_broadcast_mask_partitions_contained_exterior_and_boundary_rows
         and "precision_reason=" in event.detail
         for event in get_dispatch_events(clear=True)
     )
+    prepared.close()
+
+
+@requires_gpu
+def test_prepared_broadcast_exact_topology_is_complete_ring_local_with_shell_baselines() -> None:
+    from vibespatial.api._native_relation import NativeRelation
+    from vibespatial.constructive.binary_constructive import (
+        _dispatch_polygon_intersection_overlay_broadcast_right_gpu,
+    )
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+    from vibespatial.spatial.prepared_polygon_mask import (
+        PreparedPolygonMask,
+        prepared_polygon_mask_fp64_plan,
+    )
+
+    first = Polygon(
+        [(0, 0), (20, 0), (20, 20), (0, 20), (0, 0)],
+        holes=[
+            [(4, 4), (8, 4), (8, 8), (4, 8), (4, 4)],
+            [(12, 12), (16, 12), (16, 16), (12, 16), (12, 12)],
+        ],
+    )
+    second = Polygon(
+        [(100, 0), (120, 0), (120, 20), (100, 20), (100, 0)],
+        holes=[[(104, 4), (108, 4), (108, 8), (104, 8), (104, 4)]],
+    )
+    third = Polygon(
+        [(200, 0), (220, 0), (220, 20), (200, 20), (200, 0)],
+    )
+    mask = MultiPolygon([first, second, third])
+    left_geoms = [
+        box(3, 5, 5, 7),
+        box(103, 5, 105, 7),
+        box(199, 9, 201, 11),
+    ]
+    left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+    right = from_shapely_geometries([mask], residency=Residency.DEVICE)
+    prepared = PreparedPolygonMask.from_owned(
+        right,
+        precision_plan=prepared_polygon_mask_fp64_plan(),
+    )
+    assert prepared is not None
+    ring_local = prepared.complete_ring_relation(left)
+    assert isinstance(ring_local.ring_relation, NativeRelation)
+    assert hasattr(ring_local.ring_relation.left_indices, "__cuda_array_interface__")
+    assert hasattr(ring_local.ring_relation.right_indices, "__cuda_array_interface__")
+    assert ring_local.candidate_ring_count == 5
+
+    clear_dispatch_events()
+    try:
+        result = _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
+            left,
+            right,
+            dispatch_mode=ExecutionMode.GPU,
+            _prepared_mask=prepared,
+        )
+    finally:
+        prepared.close()
+
+    assert result is not None
+    expected = shapely.intersection(np.asarray(left_geoms, dtype=object), mask)
+    for actual, oracle in zip(result.to_shapely(), expected, strict=True):
+        assert actual is not None
+        assert shapely.normalize(actual).equals(shapely.normalize(oracle))
+
+    event = next(
+        event
+        for event in get_dispatch_events(clear=True)
+        if event.implementation == "broadcast_right_ring_local_winding_topology_gpu"
+    )
+    assert "physical_mask_segments=24" in event.detail
+    assert "candidate_rings=5" in event.detail
+    assert "logical_right_segments=20" in event.detail
+    assert "complete_ring_candidates_plus_ancestor_shell_baseline" in event.detail
+    assert 20 < 3 * 24
 
 
 def test_prepared_mask_shape_bounds_virtual_candidate_capacity_by_live_memory() -> None:
@@ -1731,7 +1818,9 @@ def test_prepared_mask_classification_does_not_materialize_candidate_relations()
     )
 
     assert not any(isinstance(node, (ast.For, ast.While)) for node in ast.walk(classify))
-    assert "generate_bounds_pairs" not in source
+    classify_source = ast.get_source_segment(source, classify)
+    assert classify_source is not None
+    assert "generate_bounds_pairs" not in classify_source
     assert "boundary_pairs" not in source
     assert "ray_pairs" not in source
     assert "cp.bincount" not in source

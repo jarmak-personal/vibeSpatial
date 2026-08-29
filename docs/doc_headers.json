@@ -216,7 +216,7 @@
       "readIf": "You are choosing or updating a Native* adoption slice, classifying host transfers, or adding carrier canary coverage.",
       "stopIf": "You only need the high-level program plan or one operation-local implementation detail.",
       "sourceOfTruth": "Phase-0 inventory for Native* carrier adoption across GPU-capable vibeSpatial surfaces.",
-      "maxBodyLines": 220
+      "maxBodyLines": 240
     },
     "docs/dev/native-full-coverage-prd.md": {
       "scope": "Repository-wide PRD and feature hold for reaching complete Native* functionality across carriers, boundaries, kernels, workflows, and verification gates.",
@@ -224,6 +224,27 @@
       "stopIf": "You only need the completed carrier-substrate plan or one operation-local implementation detail already routed by intake.",
       "sourceOfTruth": "Active PRD for the Native* feature hold and full native coverage completion mandate.",
       "maxBodyLines": 280
+    },
+    "docs/dev/native-consolidation-execution-plan.md": {
+      "scope": "Scale-aware execution plan for closing the Native feature hold, generalizing pylibcudf tabular execution, and restoring trustworthy delivery gates.",
+      "readIf": "You are choosing the next Native completion task, removing public-workflow host composition, setting 10K/100K/1M/SF100 gates, or deciding whether the feature hold can lift.",
+      "stopIf": "You only need an operation-local kernel detail or the completed historical SF100 implementation record.",
+      "sourceOfTruth": "Ordered execution plan for the final Native consolidation push beneath the Native full-coverage PRD.",
+      "maxBodyLines": 300
+    },
+    "docs/dev/native-tabular-execution-ledger.md": {
+      "scope": "Producer-to-consumer ledger for Native tabular, relation, rowset, grouped, attribute, and index execution boundaries.",
+      "readIf": "You are removing pandas-shaped work from a Native workflow, choosing pylibcudf versus CCCL, or classifying an internal host conversion.",
+      "stopIf": "You only need an SF100 query record or geometry-kernel physical-shape detail.",
+      "sourceOfTruth": "Current disposition of private tabular execution boundaries under Native carriers.",
+      "maxBodyLines": 240
+    },
+    "docs/dev/native-strict-coverage-ledger.md": {
+      "scope": "Disposition ledger for broad strict-native upstream GeoPandas coverage during the Native consolidation hold.",
+      "readIf": "You are reconciling strict-native failures, changing WKB/WKT admission, deciding whether an upstream failure is in the native contract, or closing M1 of the Native consolidation plan.",
+      "stopIf": "You only need a focused operation implementation or ordinary non-strict upstream compatibility result.",
+      "sourceOfTruth": "Current classification and resolution evidence for every failure in the broad strict-native grouped sweep.",
+      "maxBodyLines": 180
     },
     "docs/dev/io-zero-execution-plan.md": {
       "scope": "Execution plan for removing avoidable host-side churn from public read paths and making GPU-first IO the default shape.",
@@ -272,7 +293,7 @@
       "readIf": "You are changing pipeline benchmarks, regression gates, or CPU/GPU movement profiling in CI.",
       "stopIf": "You already have the benchmark scripts open and only need a local implementation detail.",
       "sourceOfTruth": "Phase-1 pipeline benchmark and regression-gate workflow for end-to-end performance tracking.",
-      "maxBodyLines": 220
+      "maxBodyLines": 230
     },
     "docs/testing/adr0044-rich-baseline-2026-04-25.md": {
       "scope": "Post-ADR0044/0045 performance baseline for non-IO workflows, operations, and pipelines.",

@@ -195,7 +195,7 @@ class NativeIndexPlan:
         embedded_plan = getattr(index_array, "index_plan", None)
         if isinstance(embedded_plan, cls):
             embedded_plan.validate_length(len(index))
-            return replace(embedded_plan, name=index.name)
+            return embedded_plan.with_name(index.name)
         if isinstance(index, pd.RangeIndex):
             return cls(
                 kind="range",
@@ -219,6 +219,26 @@ class NativeIndexPlan:
             raise ValueError(
                 f"NativeIndexPlan length mismatch: expected {self.length}, got {length}"
             )
+
+    def with_name(self, name: Any | None) -> NativeIndexPlan:
+        """Return a single-level plan with renamed public index metadata.
+
+        Deferred host-label takes retain their source index, so the public name
+        must be applied there as well as on the logical plan. This is metadata
+        only and never materializes device labels or row positions.
+        """
+        if self.nlevels != 1:
+            raise ValueError("NativeIndexPlan.with_name requires a single-level index")
+        index = None if self.index is None else self.index.rename(name)
+        source_index = (
+            None if self.source_index is None else self.source_index.rename(name)
+        )
+        return replace(
+            self,
+            index=index,
+            source_index=source_index,
+            name=name,
+        )
 
     def take_public_index(
         self,

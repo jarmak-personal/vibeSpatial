@@ -73,6 +73,36 @@ def _default_index_runtime_selection() -> RuntimeSelection:
     )
 
 
+def compact_indexed_spatial_input(
+    owned: OwnedGeometryArray,
+) -> OwnedGeometryArray:
+    """Compact variable-width row views at a spatial-consumer boundary.
+
+    Polygonal and other variable-width selections deliberately remain cheap
+    row-indirection views through ordinary dataframe operations.  Spatial
+    indexing and exact predicate preparation, however, are shaped by the
+    selected rows rather than by the ancestral coordinate capacity.  Resolve
+    that row map once on device before those consumers size coordinate-shaped
+    work.  Fixed-width carriers keep their row-indirection form.
+    """
+    if (
+        owned.residency is Residency.DEVICE
+        and owned.is_indexed_view
+        and owned._device_take_prefers_row_indirection()
+    ):
+        from vibespatial.geometry.owned import device_physicalize_owned_row_selections_exact
+
+        (compacted,) = device_physicalize_owned_row_selections_exact(
+            [(owned, None)],
+            reason="spatial input exact-allocation packet",
+            materialize_all_null=True,
+        )
+        if compacted is None:  # pragma: no cover - guaranteed by the option above
+            raise RuntimeError("spatial input exact physicalization returned no carrier")
+        return compacted
+    return owned
+
+
 from vibespatial.spatial.indexing_kernels import (  # noqa: E402
     _INDEXING_KERNEL_NAMES,
     _INDEXING_KERNEL_SOURCE,

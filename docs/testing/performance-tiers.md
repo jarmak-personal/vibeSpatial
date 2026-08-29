@@ -5,7 +5,7 @@ Scope: Performance tier gates, reference datasets, and benchmark acceptance poli
 Read If: You are defining kernel success criteria, benchmark rails, or performance gates.
 STOP IF: Your task is limited to a single benchmark implementation detail already routed elsewhere.
 Source Of Truth: Phase-0 performance gate policy for GPU kernel work.
-Body Budget: 158/240 lines
+Body Budget: 190/240 lines
 Document: docs/testing/performance-tiers.md
 
 Section Map (Body Lines)
@@ -18,13 +18,14 @@ Section Map (Body Lines)
 | 30-34 | Verify |
 | 35-40 | Risks |
 | 41-51 | Denominator |
-| 52-70 | Reference Scale |
-| 71-83 | Tier Table |
-| 84-108 | Transient Latency Gates |
-| 109-122 | Tier Rules |
-| 123-134 | Mapping To Roadmap |
-| 135-150 | Acceptance Policy |
-| 151-158 | Verification |
+| 52-75 | Reference Scale |
+| 76-102 | Public Workflow Scale Contract |
+| 103-115 | Tier Table |
+| 116-140 | Transient Latency Gates |
+| 141-154 | Tier Rules |
+| 155-166 | Mapping To Roadmap |
+| 167-182 | Acceptance Policy |
+| ... | (1 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
 Define the minimum performance gates for GPU-first kernel work before the
@@ -84,6 +85,11 @@ rules so each kernel can declare success against the same denominator.
 - `10K` exists to observe crossover behavior and dispatch thresholds.
 - `1M` exists to catch memory-pressure and batching regressions once kernels
   move beyond smoke status.
+- Workload-specific correctness verifiers may use a tighter numeric contract
+  than the generic fingerprint, but must keep schema, identity, attributes,
+  index, ordering, and CRS exact; derive every numeric tolerance from the
+  operation and reject the first value outside it. A timing is not comparable
+  unless that verifier matches.
 
 Use these reference dataset families:
 
@@ -94,6 +100,33 @@ Use these reference dataset families:
 
 `o17.1.8` should generate license-free versions of these families instead of
 checking in sourced benchmark data.
+
+## Public Workflow Scale Contract
+
+Kernel tiers and public workflow gates answer different questions. Kernel
+tiers measure reusable primitive quality. Public shootouts include dispatch,
+composition, IO, and terminal compatibility costs and therefore must always
+name their scale.
+
+- `10K` is the crossover and overhead gate. Aim for per-workflow parity and
+  require aggregate parity, but do not describe a loss here as a large-scale
+  scaling failure. In `auto`, a faster exact CPU choice is valid when it is
+  selected observably; silent fallback remains forbidden.
+- `100K` is the default crossover gate for reusable GPU shapes. Require exact
+  aggregate and geomean wins, with every individual loss explained by the
+  physical profile or backend decision.
+- `1M` is the throughput and capacity gate. Require bounded memory and a clear
+  aggregate win whenever the public output itself fits. The core-suite target
+  is at least `5x`; report output-cardinality limits separately from compute
+  failures.
+- `SF100` keeps its frozen plan-specific suite contract. Sub-second work such
+  as Q9 remains in correctness, suite-total, dispatch, and no-regression gates
+  without forcing a per-query GPU or 10x result.
+
+Every scale report must include requested mode, actual backend, correctness,
+capacity status, transfers, materializations, fallbacks, and per-workload
+timings. Reuse comparator timing only when its full identity packet remains
+valid; always remeasure the changed implementation.
 
 ## Tier Table
 

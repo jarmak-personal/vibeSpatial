@@ -2824,6 +2824,7 @@ def test_geoseries_to_arrow_mixed_family_uses_owned_wkb_bridge_without_fallback(
 
     assert arrow_array is not None
     assert field.metadata[b"ARROW:extension:name"] == b"geoarrow.wkb"
+    assert field.metadata[b"ARROW:extension:metadata"] == b"{}"
     assert fallbacks == []
     assert any(
         event.surface == "geopandas.geoseries.to_arrow"
@@ -2851,6 +2852,18 @@ def test_geoseries_to_arrow_mixed_family_owned_wkb_bridge_succeeds_in_strict_nat
     field = pa.Field._import_from_c_capsule(schema_capsule)
 
     assert field.metadata[b"ARROW:extension:name"] == b"geoarrow.wkb"
+    assert field.metadata[b"ARROW:extension:metadata"] == b"{}"
+    assert geopandas.get_fallback_events(clear=True) == []
+
+
+def test_empty_wkb_constructor_is_repo_owned_in_strict_native() -> None:
+    from vibespatial.testing import strict_native_environment
+
+    geopandas.clear_fallback_events()
+    with strict_native_environment():
+        result = geopandas.GeoSeries.from_wkb([])
+
+    assert result.empty
     assert geopandas.get_fallback_events(clear=True) == []
 
 
@@ -6820,6 +6833,87 @@ def test_geodataframe_to_parquet_native_device_attrs_and_index_skip_public_expor
     assert list(result["value"]) == [101, 202]
     assert list(result["score"]) == [1.5, 2.5]
     assert list(result.geometry.astype(str)) == ["POINT (0 0)", "POINT (1 1)"]
+
+
+@pytest.mark.parametrize("export_kind", ["arrow", "parquet"])
+def test_chained_sjoin_sort_dedup_writer_keeps_index_indirection_device_native(
+    export_kind,
+    tmp_path,
+) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    left_index = pd.RangeIndex(10, 13, name="site")
+    left = geopandas.GeoDataFrame(
+        {
+            "key": [2, 1, 1],
+            "geometry": geopandas.GeoSeries(
+                [Point(0, 0), Point(1, 0), Point(2, 0)],
+                index=left_index,
+            ),
+        },
+        index=left_index,
+    )
+    right = geopandas.GeoDataFrame(
+        {
+            "rank": [0, 1, 2],
+            "geometry": geopandas.GeoSeries(
+                [Point(0, 0), Point(1, 0), Point(2, 0)],
+            ),
+        }
+    )
+    shaped = (
+        geopandas.sjoin(left, right, how="inner")
+        .sort_values(["key", "index_right"], kind="stable")
+        .drop_duplicates("key", keep="first")
+    )
+    shaped_state = get_native_state(shaped)
+
+    assert shaped.index.tolist() == [11, 10]
+    assert shaped.index.name == "site"
+    assert shaped_state is not None
+    assert shaped_state.index_plan.device_labels is not None
+    assert shaped_state.index_plan.take_positions is not None
+
+    geopandas.clear_materialization_events()
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    if export_kind == "arrow":
+        result = pa.table(shaped.to_arrow()).to_pandas()
+    else:
+        path = tmp_path / "chained-relation-selection.parquet"
+        shaped.to_parquet(path)
+        result = geopandas.read_parquet(path)
+    materializations = geopandas.get_materialization_events(clear=True)
+    d2h_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
+
+    assert not any(
+        event.operation == "index_plan_take_positions_to_host"
+        for event in materializations
+    )
+    assert not any(
+        reason.endswith("::index_plan_take_positions_to_host")
+        for reason in d2h_reasons
+    )
+    if export_kind == "arrow":
+        assert any(
+            event.operation == "device_index_labels_to_arrow"
+            for event in materializations
+        )
+    else:
+        assert not any(
+            event.operation == "device_index_labels_to_arrow"
+            for event in materializations
+        )
+    assert result.index.tolist() == [11, 10]
+    assert result.index.name == "site"
+    assert result["key"].tolist() == [1, 2]
+    assert result["rank"].tolist() == [1, 0]
 
 
 @pytest.mark.skipif(

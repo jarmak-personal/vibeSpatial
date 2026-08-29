@@ -4,7 +4,9 @@ import ast
 import importlib
 import math
 import warnings
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -1059,7 +1061,9 @@ def test_clip_homogeneous_polygon_device_candidates_skip_candidate_rows_export()
         "vibespatial.api.tools.clip.polygon_mask_inside_rows::rowset_to_host" not in runtime_reasons
     )
     assert not any(reason.startswith("owned geometry host metadata") for reason in runtime_reasons)
-    materialization_surfaces = {event.surface for event in get_materialization_events(clear=True)}
+    materialization_surfaces = {
+        event.surface for event in get_materialization_events(clear=True)
+    }
     assert not any("candidate" in surface for surface in materialization_surfaces)
     assert "vibespatial.api.tools.clip.polygon_mask_exact_rows" not in materialization_surfaces
     assert "vibespatial.api.tools.clip.polygon_mask_inside_rows" not in materialization_surfaces
@@ -1296,6 +1300,8 @@ def test_clip_geometrycollection_ingress_uses_native_grouped_union() -> None:
     assert all(part.collection_position is None for part in composition.parts)
     d2h_events = get_d2h_transfer_events(clear=True)
     assert [event.reason for event in d2h_events] == [
+        "overlay compact topology page-weight planning packet",
+        "overlay compact topology work-summary planning packet",
         "fused multi-root capacity scatter exact allocation packet",
     ]
     assert sum(event.bytes_transferred for event in d2h_events) <= 440
@@ -1923,7 +1929,9 @@ def test_clip_homogeneous_polygon_device_candidates_keep_geom_type_skips_candida
         "vibespatial.api.tools.clip.polygon_single_mask_exact_local_rows::rowset_to_host"
         not in runtime_reasons
     )
-    materialization_surfaces = {event.surface for event in get_materialization_events(clear=True)}
+    materialization_surfaces = {
+        event.surface for event in get_materialization_events(clear=True)
+    }
     assert not any("candidate" in surface for surface in materialization_surfaces)
 
     exported = native_result.to_geodataframe()
@@ -6769,13 +6777,22 @@ def test_lazy_grouped_mask_clip_keeps_relation_and_group_capacity() -> None:
     coverage_start = source.index("def _clip_lazy_grouped_union_coverage_rows_device(")
     coverage_end = source.index("\ndef ", coverage_start + 1)
     coverage_source = source[coverage_start:coverage_end]
+    packet_start = source.index("def _clip_grouped_mask_morton_span_planning_packet(")
+    packet_end = source.index("\ndef ", packet_start + 1)
+    packet_source = source[packet_start:packet_end]
+    state_start = source.index("def _clip_grouped_relation_execution_state(")
+    state_end = source.index("\ndef ", state_start + 1)
+    state_source = source[state_start:state_end]
+    refined_start = source.index("def _clip_grouped_relation_refined_plan(")
+    refined_end = source.index("\ndef ", refined_start + 1)
+    refined_source = source[refined_start:refined_end]
 
-    assert "relation_pair_selection = NativeDeviceSelection.from_mask(" in function_source
-    assert "d_unresolved_pair_active," in function_source
-    assert "clip grouped-mask physical-plan aggregate admission counts" in function_source
+    assert "relation_pair_selection = NativeDeviceSelection.from_mask(" in refined_source
+    assert "d_unresolved_pair_active," in refined_source
+    assert "clip grouped-mask physical-plan aggregate admission counts" in refined_source
     assert "clip grouped-mask partition planner aggregate counts" not in function_source
-    assert "relation_pair_selection.gather_capacity(" in function_source
-    assert "relation_pair_selection.positions" not in function_source
+    assert "relation_pair_selection.gather_capacity(" in state_source
+    assert "relation_pair_selection.positions" not in state_source
     assert ")[:relation_pair_count]" not in function_source
     assert ".device_take_capacity(" in function_source
     assert "_clip_grouped_polygon_pair_capacity(" in function_source
@@ -6793,6 +6810,37 @@ def test_lazy_grouped_mask_clip_keeps_relation_and_group_capacity() -> None:
     assert "cp.flatnonzero(" not in grouped_source
     assert "NativeDeviceSelection.from_mask(" in coverage_source
     assert "cp.flatnonzero(" not in coverage_source
+    assert "_materialize_collective_coverage" in function_source
+    assert "query_right_match_count_expression(" not in function_source
+    assert function_source.count("query_morton_span_upper_packet(") == 1
+    assert "_clip_try_exact_grouped_relation(" in function_source
+    assert "_clip_grouped_mask_morton_span_planning_packet(" in function_source
+    assert "clip grouped-mask Morton span upper planning packet" in packet_source
+    assert 'getattr(d_packet, "nbytes", -1)) != 24' in packet_source
+    assert "sample" not in function_source.lower()
+    assert "except CandidateRelationCapacityError" in source[
+        source.index("def _clip_try_exact_grouped_relation(") : source.index(
+            "\ndef ", source.index("def _clip_try_exact_grouped_relation(") + 1
+        )
+    ]
+    assert function_source.count("_structural_relation_plan(") == 3
+    coverage_materialization = function_source.index("_materialize_collective_coverage")
+    original_relation_attempt = function_source.index(
+        "_clip_try_exact_grouped_relation("
+    )
+    tiled_relation_attempt = function_source.index(
+        "_clip_try_exact_grouped_relation(",
+        original_relation_attempt + 1,
+    )
+    assert original_relation_attempt < coverage_materialization < tiled_relation_attempt
+    assert function_source.count("cp.bincount(") == 0
+    assert function_source.count("sort_pairs(") == 0
+    assert function_source.count("_clip_grouped_relation_refined_plan(") == 1
+    assert "d_unresolved_pair_active" not in function_source
+    assert "d_source_pair_bounds" not in function_source
+    assert "d_mask_pair_bounds" not in function_source
+    assert "d_positive_area_pairs" not in function_source
+    assert "d_plan_counts" not in function_source
 
 
 def test_clip_admissions_do_not_materialize_rejected_row_vectors() -> None:
@@ -7139,7 +7187,9 @@ def test_clip_multi_mask_relation_device_candidates_feed_polygon_native_without_
     assert exported["value"].tolist() == [10, 20]
 
 
-def test_clip_consumes_lazy_grouped_union_mask_without_materializing_union() -> None:
+def test_clip_structural_work_decline_materializes_union_without_exact_relation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if not vibespatial.has_gpu_runtime():
         pytest.skip("GPU runtime not available")
     pytest.importorskip("cupy")
@@ -7183,24 +7233,34 @@ def test_clip_consumes_lazy_grouped_union_mask_without_materializing_union() -> 
     reset_d2h_transfer_count()
     get_d2h_transfer_events(clear=True)
     clear_materialization_events()
+    spatial_index = source.sindex
+    original_relation_query = spatial_index.query_relation
+    relation_calls = []
+
+    def _capture_relation_query(geometry, **kwargs):
+        relation_calls.append(geometry)
+        return original_relation_query(geometry, **kwargs)
+
+    monkeypatch.setattr(spatial_index, "query_relation", _capture_relation_query)
 
     result = clip(source, dissolved_mask, sort=False)
     dispatch_events = vibespatial.get_dispatch_events(clear=True)
     runtime_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
-    materialization_surfaces = {event.surface for event in get_materialization_events(clear=True)}
+    get_materialization_events(clear=True)
 
     assert result["value"].tolist() == list(range(len(source_geoms)))
+    assert relation_calls == []
     assert any(
-        event.implementation == "lazy_grouped_union_mask_relation_clip_gpu"
+        event.implementation == "lazy_grouped_union_mask_union_plan_gpu"
+        and "semantic_pair_refinement=skipped" in event.detail
         for event in dispatch_events
     )
-    assert not any(
+    assert any(
         event.surface == "vibespatial.overlay.dissolve.LazyGroupedUnionOwned"
         and event.operation == "materialize_grouped_union"
         for event in dispatch_events
     )
     assert "clip native-relation candidate rows host export" not in runtime_reasons
-    assert not any("LazyGroupedUnionOwned" in surface for surface in materialization_surfaces)
 
     mask_union = shapely.union_all(np.asarray(mask_geoms, dtype=object))
     expected = shapely.intersection(np.asarray(source_geoms, dtype=object), mask_union)
@@ -7212,7 +7272,7 @@ def test_clip_consumes_lazy_grouped_union_mask_without_materializing_union() -> 
     )
 
 
-def test_clip_consumes_tiled_collective_coverage_without_union_materialization(
+def test_clip_plans_original_group_members_before_collective_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not vibespatial.has_gpu_runtime():
@@ -7266,6 +7326,10 @@ def test_clip_consumes_tiled_collective_coverage_without_union_materialization(
 
     assert result["value"].tolist() == [0, 1]
     assert any(
+        event.implementation == "lazy_grouped_union_mask_relation_clip_gpu"
+        for event in dispatch_events
+    )
+    assert not any(
         event.implementation == "gpu_single_group_tiled_collective_coverage"
         for event in dispatch_events
     )
@@ -7282,6 +7346,123 @@ def test_clip_consumes_tiled_collective_coverage_without_union_materialization(
     assert all(
         shapely.area(shapely.symmetric_difference(got, want)) == pytest.approx(0.0)
         for got, want in zip(actual, expected, strict=True)
+    )
+
+
+@pytest.mark.gpu
+def test_clip_original_relation_capacity_rejection_selects_tiled_relation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+    pytest.importorskip("cupy")
+    from vibespatial.constructive import tiled_union
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    monkeypatch.setattr(tiled_union, "_DIRECT_COLLECTIVE_SEGMENT_PEER_PRESSURE", 1)
+    source_geoms = [
+        box(0.25, 0.25, 2.75, 0.75),
+        box(4.25, 0.25, 6.75, 0.75),
+        box(20.0, 20.0, 21.0, 21.0),
+    ]
+    source = vibespatial.GeoDataFrame(
+        {
+            "value": np.arange(len(source_geoms), dtype=np.int32),
+            "geometry": DeviceGeometryArray._from_owned(
+                from_shapely_geometries(source_geoms, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+        },
+        crs="EPSG:3857",
+    )
+    mask_geoms = [box(float(i), 0.0, float(i) + 1.0, 1.0) for i in range(8)]
+    mask_frame = vibespatial.GeoDataFrame(
+        {
+            "group": np.zeros(len(mask_geoms), dtype=np.int32),
+            "geometry": DeviceGeometryArray._from_owned(
+                from_shapely_geometries(mask_geoms, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+        },
+        crs="EPSG:3857",
+    )
+    dissolved_mask = mask_frame.dissolve(
+        by="group",
+        aggfunc="first",
+        method="unary",
+    ).reset_index()
+
+    original_admission = clip_module._clip_collective_grouped_mask_prefers_relation
+    preference_calls = []
+
+    def _force_tiled_structural_admission(*args, **kwargs):
+        _selected, relation, union = original_admission(*args, **kwargs)
+        call_index = len(preference_calls)
+        preference_calls.append((args[1], kwargs["relation_pair_count"]))
+        forced = (True, True, True)
+        return forced[min(call_index, len(forced) - 1)], relation, union
+
+    monkeypatch.setattr(
+        clip_module,
+        "_clip_collective_grouped_mask_prefers_relation",
+        _force_tiled_structural_admission,
+    )
+    spatial_index = source.sindex
+    original_span_query = spatial_index.query_morton_span_upper_packet
+    original_relation_query = spatial_index.query_relation
+    span_query_geometries = []
+    relation_query_geometries = []
+    relation_query_predicates = []
+
+    def _capture_span_query(geometry, **kwargs):
+        span_query_geometries.append(geometry)
+        return original_span_query(geometry, **kwargs)
+
+    def _capture_relation_query(geometry, **kwargs):
+        relation_query_geometries.append(geometry)
+        relation_query_predicates.append(kwargs.get("predicate"))
+        if geometry is span_query_geometries[0]:
+            from vibespatial.spatial.query_types import CandidateRelationCapacityError
+
+            raise CandidateRelationCapacityError("original relation capacity")
+        return original_relation_query(geometry, **kwargs)
+
+    monkeypatch.setattr(
+        spatial_index,
+        "query_morton_span_upper_packet",
+        _capture_span_query,
+    )
+    monkeypatch.setattr(spatial_index, "query_relation", _capture_relation_query)
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    vibespatial.clear_dispatch_events()
+
+    result = clip(source, dissolved_mask, sort=False)
+    packet_events = [
+        event
+        for event in get_d2h_transfer_events(clear=True)
+        if event.reason == "clip grouped-mask Morton span upper planning packet"
+    ]
+    dispatch_events = vibespatial.get_dispatch_events(clear=True)
+
+    assert result["value"].tolist() == [0, 1]
+    assert len(span_query_geometries) == 2
+    assert len(relation_query_geometries) == 2
+    assert relation_query_predicates == ["intersects", "intersects"]
+    assert len(preference_calls) == 3
+    assert preference_calls[1][0] is preference_calls[2][0]
+    assert preference_calls[1][0] is not preference_calls[0][0]
+    assert relation_query_geometries[0] is span_query_geometries[0]
+    assert relation_query_geometries[1] is span_query_geometries[1]
+    assert len(packet_events) == 2
+    assert sum(event.bytes_transferred for event in packet_events) == 48
+    assert any(
+        event.implementation == "lazy_grouped_union_mask_relation_plan_gpu"
+        and "strategy=tiled_coverage_relation" in event.detail
+        for event in dispatch_events
     )
 
 
@@ -7474,15 +7655,16 @@ def test_clip_collective_lazy_grouped_union_mask_physicalizes_once(monkeypatch) 
         False,
     )
 
-    def _fail_pair_coverage(**_kwargs):
-        raise AssertionError("union-first admission must precede exact pair coverage")
-
-    monkeypatch.setattr(
-        clip_module,
-        "_clip_lazy_grouped_union_coverage_rows_device",
-        _fail_pair_coverage,
-    )
     monkeypatch.setattr(clip_module, "_clip_available_device_bytes", lambda: 1)
+    spatial_index = source.sindex
+    original_relation_query = spatial_index.query_relation
+    relation_calls = []
+
+    def _capture_relation_query(geometry, **kwargs):
+        relation_calls.append(geometry)
+        return original_relation_query(geometry, **kwargs)
+
+    monkeypatch.setattr(spatial_index, "query_relation", _capture_relation_query)
 
     vibespatial.clear_dispatch_events()
     reset_d2h_transfer_count()
@@ -7493,9 +7675,11 @@ def test_clip_collective_lazy_grouped_union_mask_physicalizes_once(monkeypatch) 
     runtime_reasons = [event.reason for event in get_d2h_transfer_events(clear=True)]
 
     assert result["value"].tolist() == [10, 20]
+    assert relation_calls == [mask_frame.geometry.values.cached_owned()]
     assert any(
         event.implementation == "lazy_grouped_union_mask_union_plan_gpu"
-        and "semantic_pair_refinement=skipped" in event.detail
+        and "persistent_relation_bytes=" in event.detail
+        and "largest_source_group=" in event.detail
         for event in dispatch_events
     )
     assert any(
@@ -7546,7 +7730,7 @@ def test_collective_grouped_mask_shape_estimate_prefers_sparse_relation() -> Non
     assert relation.dispatch_unit_count() < union.dispatch_unit_count()
 
 
-def test_collective_grouped_mask_shape_pages_relation_over_memory_budget() -> None:
+def test_collective_grouped_mask_shape_rejects_relation_over_memory_budget() -> None:
     source_owned = from_shapely_geometries(
         [box(float(i), 0.0, float(i) + 3.0, 1.0) for i in range(10)],
         residency=Residency.HOST,
@@ -7566,7 +7750,346 @@ def test_collective_grouped_mask_shape_pages_relation_over_memory_budget() -> No
 
     assert relation.dispatch_unit_count() < union.dispatch_unit_count()
     assert not relation.is_device_memory_admissible(1)
-    assert prefers_relation
+    assert not prefers_relation
+
+
+def test_exact_grouped_relation_attempt_is_structural_and_capacity_specific() -> None:
+    from vibespatial.spatial.query_types import CandidateRelationCapacityError
+
+    candidate = SimpleNamespace(row_count=7)
+    retained_relation = object()
+    calls = []
+
+    def _query(geometry, **kwargs):
+        calls.append((geometry, kwargs))
+        return retained_relation, object()
+
+    relation, capacity_rejected = clip_module._clip_try_exact_grouped_relation(
+        _query,
+        candidate,
+        relation_work_preferred=False,
+        source_token="source",
+    )
+    assert relation is None
+    assert not capacity_rejected
+    assert calls == []
+
+    relation, capacity_rejected = clip_module._clip_try_exact_grouped_relation(
+        _query,
+        candidate,
+        relation_work_preferred=True,
+        source_token="source",
+    )
+    assert relation is retained_relation
+    assert not capacity_rejected
+    assert len(calls) == 1
+    assert calls[0][0] is candidate
+    assert calls[0][1]["predicate"] == "intersects"
+
+    def _capacity_reject(*_args, **_kwargs):
+        raise CandidateRelationCapacityError("sealed candidate capacity")
+
+    relation, capacity_rejected = clip_module._clip_try_exact_grouped_relation(
+        _capacity_reject,
+        candidate,
+        relation_work_preferred=True,
+        source_token="source",
+    )
+    assert relation is None
+    assert capacity_rejected
+
+    def _unrelated_failure(*_args, **_kwargs):
+        raise RuntimeError("not capacity")
+
+    with pytest.raises(RuntimeError, match="not capacity"):
+        clip_module._clip_try_exact_grouped_relation(
+            _unrelated_failure,
+            candidate,
+            relation_work_preferred=True,
+            source_token="source",
+        )
+
+
+@pytest.mark.skipif(not vibespatial.has_gpu_runtime(), reason="GPU runtime required")
+def test_grouped_relation_page_admission_checks_persistent_bytes_and_largest_group() -> None:
+    cp = pytest.importorskip("cupy")
+    from vibespatial.runtime.crossover import PhysicalWorkEstimate
+
+    estimate = PhysicalWorkEstimate(
+        row_count=1,
+        relation_pair_count=3,
+        output_byte_count=3,
+        temporary_byte_count=3,
+    )
+    oversized_group_state = clip_module._ClipGroupedRelationExecutionState(
+        sorted_source_rows=cp.asarray([0, 0, 0], dtype=cp.int64),
+        sorted_mask_rows=cp.asarray([0, 1, 2], dtype=cp.int64),
+        sorted_active=cp.ones(3, dtype=cp.bool_),
+        source_pair_counts=cp.asarray([3], dtype=cp.int64),
+        pair_offsets=cp.asarray([0, 3], dtype=cp.int64),
+        pair_capacity=3,
+        persistent_byte_count=0,
+    )
+    admitted, pair_budget, largest_group, bytes_per_pair, page_bytes = (
+        clip_module._clip_grouped_relation_page_admission(
+            oversized_group_state,
+            estimate,
+            relation_pair_count=3,
+            available_device_bytes=2_560,
+        )
+    )
+    assert not admitted
+    assert pair_budget == 2
+    assert largest_group == 3
+    assert bytes_per_pair == 256
+    assert page_bytes == 512
+
+    persistent_state = replace(
+        oversized_group_state,
+        source_pair_counts=cp.asarray([1, 1, 1], dtype=cp.int64),
+        persistent_byte_count=2_100,
+    )
+    admitted, pair_budget, largest_group, _bytes_per_pair, page_bytes = (
+        clip_module._clip_grouped_relation_page_admission(
+            persistent_state,
+            estimate,
+            relation_pair_count=3,
+            available_device_bytes=2_560,
+        )
+    )
+    assert admitted
+    assert pair_budget == 1
+    assert largest_group == 1
+    assert page_bytes == 460
+
+    rejected_persistent_state = replace(
+        persistent_state,
+        persistent_byte_count=2_400,
+    )
+    admitted, pair_budget, largest_group, _bytes_per_pair, page_bytes = (
+        clip_module._clip_grouped_relation_page_admission(
+            rejected_persistent_state,
+            estimate,
+            relation_pair_count=3,
+            available_device_bytes=2_560,
+        )
+    )
+    assert not admitted
+    assert pair_budget == 0
+    assert largest_group == 1
+    assert page_bytes == 160
+
+
+def test_grouped_relation_pages_stop_before_shrinking_memory_launch_and_cleanup() -> None:
+    available = iter((4_096, 512))
+    launches = []
+
+    def _available_bytes():
+        return next(available)
+
+    def _execute_page(**page):
+        launches.append(page)
+        return object()
+
+    page_run = clip_module._clip_run_grouped_relation_pages(
+        ((0, 1), (1, 2)),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        page_bytes_per_pair=256,
+        available_bytes=_available_bytes,
+        execute_page=_execute_page,
+    )
+
+    assert page_run.aborted
+    assert page_run.launched_page_count == 1
+    assert page_run.partitions == ()
+    assert page_run.rejected_required_bytes == 512
+    assert page_run.rejected_reserved_bytes == 256
+    assert launches == [
+        {
+            "source_start": 0,
+            "source_end": 1,
+            "pair_start": 0,
+            "pair_end": 2,
+        }
+    ]
+
+    source = Path("src/vibespatial/api/tools/clip.py").read_text()
+    function_start = source.index("def _clip_gdf_with_lazy_grouped_union_mask_native(")
+    function_end = source.index("\ndef _clip_lazy_grouped_union_coverage_rows_device(")
+    function_source = source[function_start:function_end]
+    abort_start = function_source.index("if page_run.aborted:")
+    abort_source = function_source[abort_start:]
+    assert abort_source.index("result_partitions.clear()") < abort_source.index(
+        "_append_physicalized_source_rows("
+    )
+    assert 'implementation="lazy_grouped_union_mask_union_physicalized_gpu"' in abort_source
+
+
+def test_tiled_collective_shape_cartesian_rejects_but_structural_sparse_admits() -> None:
+    source_owned = from_shapely_geometries(
+        [box(float(i), 0.0, float(i) + 1.0, 1.0) for i in range(10)],
+        residency=Residency.HOST,
+    )
+    tiled_owned = from_shapely_geometries(
+        [box(float(i), 0.0, float(i) + 1.0, 1.0) for i in range(40)],
+        residency=Residency.HOST,
+    )
+
+    cartesian_selected, cartesian_relation, _cartesian_union = (
+        clip_module._clip_collective_grouped_mask_prefers_relation(
+            source_owned,
+            tiled_owned,
+            relation_pair_count=400,
+            collective_source_count=10,
+        )
+    )
+    structural_selected, structural_relation, _structural_union = (
+        clip_module._clip_collective_grouped_mask_relation_is_memory_admissible(
+            source_owned,
+            tiled_owned,
+            relation_pair_count=10,
+            collective_source_count=10,
+            available_device_bytes=1_000_000,
+        )
+    )
+
+    assert not cartesian_selected
+    assert structural_selected
+    assert cartesian_relation.relation_pair_count == 400
+    assert structural_relation.relation_pair_count == 10
+    assert structural_relation.live_device_byte_count() < cartesian_relation.live_device_byte_count()
+
+
+def test_native_spatial_index_direct_only_right_count_never_allocates_relation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.api._native_metadata import NativeSpatialIndex
+
+    indexed_owned = from_shapely_geometries([Point(0.0, 0.0)])
+    native_index = NativeSpatialIndex(
+        kind="test",
+        row_count=1,
+        geometry=indexed_owned,
+        residency=Residency.HOST,
+    )
+    lowered_queries = []
+
+    def _decline_direct(self, query_owned, **_kwargs):
+        lowered_queries.append(query_owned)
+        return None, None
+
+    def _forbid_relation(*_args, **_kwargs):
+        raise AssertionError("direct-only planning must not allocate a relation")
+
+    monkeypatch.setattr(NativeSpatialIndex, "_query_device_reduction", _decline_direct)
+    monkeypatch.setattr(NativeSpatialIndex, "query_relation", _forbid_relation)
+
+    expression, execution = native_index.query_right_match_count_expression(
+        Point(0.0, 0.0),
+        predicate=None,
+        return_metadata=True,
+        allow_relation_fallback=False,
+    )
+
+    assert expression is None
+    assert execution is None
+    assert len(lowered_queries) == 1
+    assert lowered_queries[0].row_count == 1
+    assert lowered_queries[0].residency is Residency.HOST
+
+
+def test_native_spatial_index_morton_packet_is_direct_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.api._native_metadata import NativeSpatialIndex
+
+    native_index = NativeSpatialIndex(
+        kind="test",
+        row_count=1,
+        geometry=from_shapely_geometries([Point(0.0, 0.0)]),
+        residency=Residency.HOST,
+    )
+
+    def _forbid_relation(*_args, **_kwargs):
+        raise AssertionError("Morton structural planning must never allocate a relation")
+
+    monkeypatch.setattr(NativeSpatialIndex, "query_relation", _forbid_relation)
+    packet, execution = native_index.query_morton_span_upper_packet(
+        Point(0.0, 0.0),
+        return_metadata=True,
+    )
+
+    assert packet is None
+    assert execution is None
+
+
+def test_structural_planning_scratch_participates_in_memory_admission() -> None:
+    source_owned = from_shapely_geometries(
+        [box(float(i), 0.0, float(i) + 1.0, 1.0) for i in range(4)],
+        residency=Residency.HOST,
+    )
+    mask_owned = from_shapely_geometries(
+        [box(0.0, 0.0, 1.0, 1.0)],
+        residency=Residency.HOST,
+    )
+    without_scratch, _relation, _union = (
+        clip_module._clip_collective_grouped_mask_relation_is_memory_admissible(
+            source_owned,
+            mask_owned,
+            relation_pair_count=1,
+            collective_source_count=1,
+            available_device_bytes=1_000_000,
+        )
+    )
+    with_scratch, scratch_relation, _union = (
+        clip_module._clip_collective_grouped_mask_relation_is_memory_admissible(
+            source_owned,
+            mask_owned,
+            relation_pair_count=1,
+            collective_source_count=1,
+            available_device_bytes=1_000_000,
+            planning_temporary_byte_count=1_000_000,
+        )
+    )
+
+    assert without_scratch
+    assert not with_scratch
+    assert scratch_relation.temporary_byte_count >= 1_000_000
+
+
+@pytest.mark.skipif(not vibespatial.has_gpu_runtime(), reason="GPU runtime required")
+def test_grouped_clip_morton_span_packet_exports_exactly_24_bytes() -> None:
+    cp = pytest.importorskip("cupy")
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    packet = SimpleNamespace(
+        values=cp.asarray([1_000, 1, 17], dtype=cp.int64),
+        tree_count=4,
+        query_count=40,
+        temporary_byte_count=12_345,
+    )
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+
+    total_pairs, candidate_rows, max_fanout, max_query_span, temporary_bytes = (
+        clip_module._clip_grouped_mask_morton_span_planning_packet(packet)
+    )
+    packet_events = [
+        event
+        for event in get_d2h_transfer_events(clear=True)
+        if event.reason == "clip grouped-mask Morton span upper planning packet"
+    ]
+
+    assert (total_pairs, candidate_rows, max_fanout) == (1_000, 4, 1)
+    assert max_query_span == 17
+    assert temporary_bytes == 12_345
+    assert len(packet_events) == 1
+    assert packet_events[0].item_count == 3
+    assert packet_events[0].bytes_transferred == 24
 
 
 def test_collective_grouped_mask_shape_estimate_prefers_dense_union() -> None:

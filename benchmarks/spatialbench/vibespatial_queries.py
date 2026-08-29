@@ -16,12 +16,15 @@
 #  under the License.
 """Optimized SpatialBench implementation using public vibeSpatial APIs."""
 
+import gc
+
 import pandas as pd
+from shapely.geometry import Polygon
 
 try:
-    from .geoparquet_public_api_queries import GeoParquetPublicApiQueries
+    from .geoparquet_public_api_queries import CRS, GeoParquetPublicApiQueries
 except ImportError:  # SpatialBench loads this entrypoint as a standalone module.
-    from geoparquet_public_api_queries import GeoParquetPublicApiQueries
+    from geoparquet_public_api_queries import CRS, GeoParquetPublicApiQueries
 
 import vibespatial as gpd
 
@@ -30,6 +33,46 @@ gpd.set_execution_mode(gpd.ExecutionMode.AUTO)
 
 class VibeSpatialQueries(GeoParquetPublicApiQueries):
     """Public hybrid plan selected by physical workload shape."""
+
+    def _candidate_zones_for_q6(self, data_paths):
+        """Apply Q6's selective zone predicate before table concatenation."""
+        bbox = Polygon(
+            [
+                (-112.2110, 34.4197),
+                (-111.3110, 34.4197),
+                (-111.3110, 35.3197),
+                (-112.2110, 35.3197),
+                (-112.2110, 34.4197),
+            ]
+        )
+        accumulated = None
+        for zones in self._spatial_frames(
+            data_paths["zone"],
+            ["z_zonekey", "z_name", "z_boundary"],
+            "z_boundary",
+            batch_rows=250_000,
+        ):
+            mask = zones.geometry.notna() & zones.geometry.intersects(bbox)
+            selected = zones.loc[mask].reset_index(drop=True)
+            if not selected.empty:
+                accumulated = (
+                    selected
+                    if accumulated is None
+                    else self.gpd.GeoDataFrame(
+                        pd.concat([accumulated, selected], ignore_index=True),
+                        geometry="z_boundary",
+                        crs=CRS,
+                    )
+                )
+            del mask, selected, zones
+            gc.collect()
+        if accumulated is None:
+            return self.gpd.GeoDataFrame(
+                columns=["z_zonekey", "z_name", "z_boundary"],
+                geometry="z_boundary",
+                crs=CRS,
+            )
+        return accumulated.reset_index(drop=True)
 
     def q2(self, data_paths):
         target = None

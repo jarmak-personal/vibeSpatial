@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -9,7 +10,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pandas as pd
-from _common import fingerprint, get_scale, require_asset
+from _common import (
+    fingerprint,
+    get_scale,
+    power_nearest_correctness_packet,
+    require_asset,
+)
 
 import geopandas as gpd
 
@@ -42,3 +48,7 @@ nearest.to_parquet(output_path)
 
 check = gpd.read_parquet(output_path)
 print(f"SHOOTOUT_FINGERPRINT: {fingerprint(check)}")
+print(
+    "SHOOTOUT_CORRECTNESS: "
+    + json.dumps(power_nearest_correctness_packet(check), separators=(",", ":"))
+)

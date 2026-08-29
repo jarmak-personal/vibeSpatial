@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "kind": "native_consolidation_capacity_evidence",
+  "status": "capacity_limited_controlled_stop",
+  "recorded_date": "2026-08-28",
+  "host": "picard-4090",
+  "workload": {
+    "path": "benchmarks/shootout/redevelopment_screening.py",
+    "scale": "1m",
+    "engine": "geopandas",
+    "requested_repeat": 3,
+    "completed_samples": 0
+  },
+  "source": {
+    "git_revision": "78ec943445113fb8720a584ee7ef60a1814ace7a",
+    "worktree_source_sha256": "ebb9ac6c6d3bc66a188f59eaec409c7d051985af21aaf48e076effd07a4986c7"
+  },
+  "isolation": {
+    "service_unit": "vibespatial-redevelopment-1m.service",
+    "memory_high_gib": 28,
+    "memory_max_gib": 36,
+    "memory_swap_max_gib": 4,
+    "managed_oom_memory_pressure": "kill",
+    "managed_oom_memory_pressure_limit_percent": 40
+  },
+  "observation": {
+    "started_local": "2026-08-28T12:13:22-04:00",
+    "stopped_local": "2026-08-28T12:40:17-04:00",
+    "elapsed_minutes": 27.0,
+    "peak_observed_cgroup_memory_gib": 30.06,
+    "peak_observed_cgroup_swap_mib": 558,
+    "memory_high_events": 252,
+    "termination": "controlled_stop_before_memory_max"
+  },
+  "classification": {
+    "timing_valid": false,
+    "correctness_valid": false,
+    "vibespatial_failure": false,
+    "reason": "The GeoPandas comparator could not complete one sample inside the approved safe host-memory envelope. This is capacity evidence, not a performance timing.",
+    "retry_policy": "Do not retry repeat three inside the editor or agent scope. A larger envelope requires explicit maintainer disposition and the same isolated-service monitoring contract."
+  },
+  "system_evidence": {
+    "journal_command": "journalctl --user -u vibespatial-redevelopment-1m.service",
+    "related_host_incident": "Three prior editor/agent scopes were killed by systemd-oomd under sustained memory pressure; no CUDA crash signature was observed."
+  }
+}

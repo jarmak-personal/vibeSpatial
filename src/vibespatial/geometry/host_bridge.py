@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import shapely
 from shapely.geometry import (
+    GeometryCollection,
     LineString,
     MultiLineString,
     MultiPoint,
@@ -656,4 +657,20 @@ def owned_to_shapely(
             buffer,
             family_row_offsets[family_mask],
         )
+    empty_collection_mask = getattr(
+        owned,
+        "_grouped_union_empty_geometry_collection_mask",
+        None,
+    )
+    if empty_collection_mask is not None:
+        if hasattr(empty_collection_mask, "__cuda_array_interface__"):
+            from vibespatial.cuda._runtime import get_cuda_runtime
+
+            empty_collection_mask = get_cuda_runtime().copy_device_to_host(
+                empty_collection_mask,
+                reason="grouped union empty GeometryCollection terminal export",
+                terminal_export=True,
+            )
+        selected_empty = np.asarray(empty_collection_mask, dtype=bool)[rows]
+        result[selected_empty] = GeometryCollection()
     return result

@@ -844,6 +844,9 @@ class TestSerialization:
         data = pickle.dumps(dga_points)
         restored = pickle.loads(data)
         assert len(restored) == len(dga_points)
+        assert restored._selection_source_owned is None
+        assert restored._selection_positions is None
+        assert len(restored.view()) == len(restored)
         for i in range(len(dga_points)):
             assert restored[i].equals(dga_points[i])
 

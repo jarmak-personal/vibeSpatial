@@ -2178,6 +2178,70 @@ def test_nearest_spatial_index_gpu_unbounded_avoids_bruteforce_candidate_generat
     assert impl == "owned_gpu_nearest"
 
 
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for indexed nearest")
+def test_nearest_spatial_index_indexed_point_path_does_not_emit_near_ties() -> None:
+    base = 10_000_000.0
+    query_owned = from_shapely_geometries(
+        [Point(base, base)],
+        residency=Residency.DEVICE,
+    )
+    tree_owned = from_shapely_geometries(
+        [
+            Point(base + 10_000.0, base),
+            Point(base + 10_000.05, base),
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    (indices, distances), impl = nearest_spatial_index(
+        None,
+        None,
+        tree_query_nearest=lambda *args, **kwargs: pytest.fail(
+            "indexed nearest should not hit STRtree fallback"
+        ),
+        return_all=True,
+        max_distance=20_000.0,
+        return_distance=True,
+        exclusive=False,
+        tree_owned=tree_owned,
+        query_owned=query_owned,
+    )
+
+    assert impl == "owned_gpu_nearest"
+    assert indices.tolist() == [[0], [0]]
+    np.testing.assert_allclose(distances, [10_000.0], rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for grid nearest")
+def test_nearest_spatial_index_grid_point_path_does_not_emit_near_ties() -> None:
+    base = 10_000_000.0
+    query = np.asarray([Point(base, base)], dtype=object)
+    tree = np.asarray(
+        [
+            Point(base - 50_000.0, base),
+            Point(base + 10_000.0, base),
+            Point(base + 10_000.05, base),
+        ],
+        dtype=object,
+    )
+
+    (indices, distances), impl = nearest_spatial_index(
+        tree,
+        query,
+        tree_query_nearest=lambda *args, **kwargs: pytest.fail(
+            "grid nearest should not hit STRtree fallback"
+        ),
+        return_all=True,
+        max_distance=20_000.0,
+        return_distance=True,
+        exclusive=False,
+    )
+
+    assert impl == "owned_gpu_nearest"
+    assert indices.tolist() == [[0], [1]]
+    np.testing.assert_allclose(distances, [10_000.0], rtol=0.0, atol=0.0)
+
+
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
 class TestMixedFamilyNearest:
     """GPU nearest refinement for arrays with mixed geometry families."""
@@ -3053,6 +3117,86 @@ def test_sindex_query_return_device_false_default() -> None:
     gs = GeoSeries([box(0, 0, 1, 1), box(2, 2, 3, 3)])
     result = gs.sindex.query(box(0.5, 0.5, 1.5, 1.5))
     assert isinstance(result, np.ndarray)
+
+
+def test_sindex_query_forced_cpu_bypasses_native_owned_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.api import GeoSeries
+
+    spatial_index = GeoSeries([Point(0, 0), Point(10, 0)]).sindex
+
+    def _forbid_device_preparation(*_args, **_kwargs):
+        raise AssertionError("explicit CPU query must use the host STRtree path")
+
+    monkeypatch.setattr(
+        spatial_index,
+        "_query_native_relation_for_public_output",
+        _forbid_device_preparation,
+    )
+    monkeypatch.setattr(
+        spatial_index,
+        "_query_owned_public",
+        _forbid_device_preparation,
+    )
+    monkeypatch.setattr(
+        spatial_index,
+        "_owned_flat_sindex",
+        _forbid_device_preparation,
+    )
+
+    with set_requested_mode(ExecutionMode.CPU):
+        result = spatial_index.query(
+            np.asarray([box(-1, -1, 1, 1), box(20, 20, 21, 21)], dtype=object),
+            predicate="intersects",
+        )
+
+    np.testing.assert_array_equal(result, np.asarray([[0], [0]], dtype=np.int64))
+
+
+def test_native_spatial_index_auto_without_gpu_uses_observable_host_relation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibespatial.runtime as runtime_module
+    from vibespatial.api._native_metadata import NativeSpatialIndex
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+
+    tree_owned = from_shapely_geometries([Point(0, 0), Point(10, 0)])
+    query_owned = from_shapely_geometries(
+        [box(-1, -1, 1, 1), box(20, 20, 21, 21)]
+    )
+    native_index = NativeSpatialIndex(
+        kind="test",
+        row_count=2,
+        geometry=tree_owned,
+        residency=Residency.HOST,
+    )
+
+    def _forbid_generic_query(*_args, **_kwargs):
+        raise AssertionError("AUTO without a GPU must decline before device preparation")
+
+    monkeypatch.setattr(runtime_module, "has_gpu_runtime", lambda: False)
+    monkeypatch.setattr(spatial_query_module, "query_spatial_index", _forbid_generic_query)
+    clear_fallback_events()
+
+    with set_requested_mode(ExecutionMode.AUTO):
+        relation, execution = native_index.query_relation(
+            query_owned,
+            predicate="intersects",
+            sort=True,
+            return_device=False,
+            return_metadata=True,
+        )
+
+    assert execution.selected is ExecutionMode.CPU
+    np.testing.assert_array_equal(relation.left_indices, np.asarray([0]))
+    np.testing.assert_array_equal(relation.right_indices, np.asarray([0]))
+    assert any(
+        event.surface == "vibespatial.api.NativeSpatialIndex.query_relation"
+        and event.requested is ExecutionMode.AUTO
+        and event.selected is ExecutionMode.CPU
+        for event in get_fallback_events(clear=True)
+    )
 
 
 def test_sindex_query_any_is_eager_index_aligned_and_cpu_fallback_is_observable() -> None:

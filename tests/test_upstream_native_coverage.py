@@ -92,6 +92,16 @@ def test_ensure_strict_native_process_env_requires_launch_env(monkeypatch) -> No
     ensure_strict_native_process_env()
 
 
+def test_main_help_renders_percentage_literal(monkeypatch, capsys) -> None:
+    monkeypatch.setenv(STRICT_NATIVE_ENV_VAR, "1")
+
+    with pytest.raises(SystemExit) as exc_info:
+        coverage.main(["--help"])
+
+    assert exc_info.value.code == 0
+    assert "not 100%." in capsys.readouterr().out
+
+
 def test_discover_group_targets_splits_upstream_tree_by_top_level_area() -> None:
     grouped = discover_group_targets(("tests/upstream/geopandas",), cwd=Path.cwd())
 

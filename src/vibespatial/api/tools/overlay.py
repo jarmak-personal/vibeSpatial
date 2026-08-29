@@ -31,6 +31,7 @@ from vibespatial.api._native_results import (
     _left_constructive_to_native_tabular_result,
     _pairwise_constructive_result_to_native_tabular_result,  # noqa: F401
     _pairwise_constructive_to_native_tabular_result,
+    _relation_join_source_state,
     _relation_selection_constructive_to_native_tabular_result,
     _rename_native_tabular_result,
     _symmetric_difference_native_tabular_results,
@@ -1278,8 +1279,13 @@ def _overlay_relation_selection_intersection_native(
     from vibespatial.geometry.owned import FAMILY_TAGS
     from vibespatial.runtime.residency import Residency
 
+    relation = relation_selection.relation
+    cached_subset = relation.origin == "intersection-pair-cache-subset"
     left_state = get_native_state(df1)
     right_state = get_native_state(df2)
+    if cached_subset:
+        left_state = left_state or _relation_join_source_state(df1)
+        right_state = right_state or _relation_join_source_state(df2)
     if left_state is None or right_state is None:
         return None
     result = _relation_selection_constructive_to_native_tabular_result(
@@ -4136,16 +4142,43 @@ def _grouped_overlay_difference_owned(
         left_was_indexed = bool(getattr(left_batch, "is_indexed_view", False))
         right_was_indexed = bool(getattr(right_batch, "is_indexed_view", False))
         if left_was_indexed or right_was_indexed:
-            topology_left = (
-                left_batch.physicalize_device_rows(allow_capacity_allocation=True)
-                if left_was_indexed
-                else left_batch
+            from vibespatial.geometry.owned import (
+                build_null_owned_array,
+                device_physicalize_owned_row_selections_exact,
             )
-            topology_right = (
-                right_batch.physicalize_device_rows(allow_capacity_allocation=True)
-                if right_was_indexed
-                else right_batch
+            from vibespatial.runtime.residency import Residency
+
+            sources = (left_batch, right_batch)
+            indexed_positions = tuple(
+                index
+                for index, is_indexed in enumerate((left_was_indexed, right_was_indexed))
+                if is_indexed
             )
+            exact_inputs = device_physicalize_owned_row_selections_exact(
+                [
+                    (
+                        sources[index],
+                        cp.ones(sources[index].row_count, dtype=cp.bool_),
+                    )
+                    for index in indexed_positions
+                ],
+                reason="grouped overlay topology input exact-allocation packet",
+            )
+            topology_inputs = list(sources)
+            for index, physicalized in zip(
+                indexed_positions,
+                exact_inputs,
+                strict=True,
+            ):
+                topology_inputs[index] = (
+                    build_null_owned_array(
+                        sources[index].row_count,
+                        residency=Residency.DEVICE,
+                    )
+                    if physicalized is None
+                    else physicalized
+                )
+            topology_left, topology_right = topology_inputs
             record_dispatch_event(
                 surface="geopandas.array.difference",
                 operation="difference",

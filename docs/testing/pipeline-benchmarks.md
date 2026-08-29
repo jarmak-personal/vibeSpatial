@@ -5,7 +5,7 @@ Scope: End-to-end pipeline benchmark suites, regression thresholds, and CI artif
 Read If: You are changing pipeline benchmarks, regression gates, or CPU/GPU movement profiling in CI.
 STOP IF: You already have the benchmark scripts open and only need a local implementation detail.
 Source Of Truth: Phase-1 pipeline benchmark and regression-gate workflow for end-to-end performance tracking.
-Body Budget: 220/220 lines
+Body Budget: 224/230 lines
 Document: docs/testing/pipeline-benchmarks.md
 
 Section Map (Body Lines)
@@ -22,7 +22,7 @@ Section Map (Body Lines)
 | 135-152 | Suites |
 | 153-161 | Regression Rules |
 | 162-201 | Trace Contract |
-| 202-220 | CI Workflow |
+| 202-224 | Automation State |
 DOC_HEADER:END -->
 
 This repo now has a dedicated end-to-end pipeline benchmark rail for regression
@@ -224,22 +224,26 @@ Each stage may also carry:
 That makes CPU<->GPU movement visible in the same artifact as the wall-clock
 timing.
 
-## CI Workflow
+## Automation State
 
-`.github/workflows/pipeline-benchmarks.yml` runs the suite in two modes:
+`.github/workflows/pipeline-benchmarks.yml` runs base/current comparison on pull
+requests, pushes to `main`, and manual dispatches. The GitHub-hosted CPU rail is
+deliberately restricted to the three pipelines whose exact public/reference
+implementations are CPU-capable: `constructive`, `predicate-heavy`, and
+`predicate-heavy-geopandas`. Pull requests use the `ci` 100K scale; push and
+manual runs use `full` at 100K and 1M. Both revisions must report actual runtime
+`cpu`, matching result sets, successful statuses, and source-revision
+provenance before `uv run vsbench compare` gates them.
 
-- CPU job
-  - PRs: `ci` suite
-  - `main` / manual: `full` suite
-- optional GPU job on a self-hosted NVIDIA runner
-  - `full` suite with `--nvtx`
+The complete Native suite is compared only on a self-hosted NVIDIA runner. It
+runs automatically for pushes and same-repository pull requests when the
+repository variable `VIBESPATIAL_GPU_RUNNER_AVAILABLE` is `true`, or for an
+explicit manual `run_gpu` dispatch. Fork pull requests never execute on the
+self-hosted runner. The GPU rail records hardware identity, full sparklines,
+actual GPU/hybrid runtime, and base/current comparison artifacts.
 
-The workflow runs the current commit, attempts the same suite on the base
-commit in a detached worktree, stores both artifacts, and diffs them with
-`uv run vsbench compare`.
-
-Bootstrap note:
-
-- if the base commit predates these scripts, the workflow uploads the current
-  artifact and records the baseline comparison as unavailable instead of
-  pretending the gate ran
+GitHub Actions cannot discover whether a labeled self-hosted runner is online,
+so runner availability remains an explicit repository contract. If a base
+revision predates source-provenance support or otherwise cannot enter the
+comparison contract, the workflow writes an `unavailable` comparison artifact
+with the reason instead of claiming that a regression gate ran.

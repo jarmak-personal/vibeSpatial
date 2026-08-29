@@ -42,8 +42,9 @@ Precision (ADR-0002):
 from __future__ import annotations
 
 import ctypes
+import warnings
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
@@ -79,6 +80,14 @@ except ModuleNotFoundError:  # pragma: no cover
 # ctypes for int64 kernel params (files > 2 GB)
 KERNEL_PARAM_I64 = ctypes.c_longlong
 _WKT_TOKEN_POSITION_DTYPE = np.int64
+
+
+class _GpuWktOnInvalidError(ValueError):
+    """A native WKT semantic failure that must reach the public caller."""
+
+
+class _GpuWktCompatibilityDecline(_GpuWktOnInvalidError):
+    """A WKT grammar/family failure requiring public compatibility parsing."""
 
 
 def _wkt_device_to_host(device_array: object, *, reason: str) -> np.ndarray:
@@ -395,6 +404,8 @@ def _read_wkt_gpu_capacity(
     d_bytes: cp.ndarray,
     *,
     row_count_hint: int | None,
+    on_invalid: Literal["raise", "warn", "ignore"] = "raise",
+    input_validity: cp.ndarray | None = None,
 ) -> OwnedGeometryArray:
     """Parse WKT with one explicit semantic/allocation planning packet.
 
@@ -623,18 +634,29 @@ def _read_wkt_gpu_capacity(
 
     d_rows = cp.arange(row_capacity, dtype=cp.int64)
     d_active = d_rows < d_actual_rows
+    if input_validity is None:
+        d_input_validity = cp.ones(row_capacity, dtype=cp.bool_)
+    else:
+        if int(input_validity.size) != row_capacity:
+            raise ValueError("WKT input_validity must match the row capacity")
+        d_input_validity = cp.asarray(input_validity, dtype=cp.bool_)
     row_offsets: dict[int, cp.ndarray] = {}
     coordinate_offsets: dict[int, cp.ndarray] = {}
     first_offsets: dict[int, cp.ndarray | None] = {}
     second_offsets: dict[int, cp.ndarray | None] = {}
     packet_scalars: list[cp.ndarray] = [d_actual_rows]
-    for code in (-2, -3, -4, -5, -6):
+    for code in (-2, -3, -4, -5, -6, -7):
         packet_scalars.append(
             cp.any(d_active & (d_status == code)).astype(cp.int64, copy=False)
         )
 
     for tag in _WKT_TAG_TO_FAMILY:
-        d_family = d_active & (d_family_tags == tag)
+        d_family = (
+            d_active
+            & d_input_validity
+            & (d_status == 0)
+            & (d_family_tags == tag)
+        )
         d_rows_for_family = d_family.astype(cp.int32, copy=False)
         d_coords_for_family = cp.where(d_family, d_pair_counts, 0).astype(
             cp.int32,
@@ -690,29 +712,46 @@ def _read_wkt_gpu_capacity(
         raise ValueError(
             "WKT row_count_hint does not match newline-delimited device input"
         )
-    invalid = h_packet[1:6]
-    if invalid[1]:
-        raise ValueError(
+    invalid = h_packet[1:7]
+    invalid_message = None
+    if invalid[5]:
+        invalid_message = "point array must contain 0 or >1 elements"
+    elif invalid[1]:
+        invalid_message = (
             "2D WKT coordinate stream contains an odd number of values in a geometry"
         )
-    if invalid[2]:
-        raise ValueError(
+    elif invalid[2]:
+        invalid_message = (
             "WKT geometry has unbalanced parentheses or unexpected trailing structure"
         )
-    if invalid[3]:
-        raise ValueError(
-            "WKT geometry violates family coordinate cardinality or nesting"
-        )
-    if invalid[4]:
-        raise ValueError("WKT polygon ring is not closed")
-    if invalid[0]:
-        raise ValueError(
+    elif invalid[3]:
+        invalid_message = "WKT geometry violates family coordinate cardinality or nesting"
+    elif invalid[4]:
+        invalid_message = "WKT polygon ring is not closed"
+    elif invalid[0]:
+        invalid_message = (
             "GPU WKT parsing supports 2D Point, LineString, Polygon, and Multi* families"
         )
+    if invalid_message is not None:
+        if on_invalid == "raise":
+            error_type = (
+                _GpuWktOnInvalidError
+                if invalid[5]
+                else _GpuWktCompatibilityDecline
+            )
+            raise error_type(invalid_message)
+        if on_invalid == "warn":
+            warnings.warn(invalid_message, UserWarning, stacklevel=3)
 
-    totals = h_packet[6:].reshape(len(_WKT_TAG_TO_FAMILY), 4)
+    totals = h_packet[7:].reshape(len(_WKT_TAG_TO_FAMILY), 4)
     d_source_rows = cp.arange(n_geoms, dtype=cp.int64)
-    d_tags = d_family_tags[:n_geoms]
+    d_validity = (
+        (d_status[:n_geoms] == 0) & d_input_validity[:n_geoms]
+    ).astype(cp.bool_, copy=False)
+    d_tags = cp.where(d_validity, d_family_tags[:n_geoms], np.int8(-1)).astype(
+        cp.int8,
+        copy=False,
+    )
     d_family_row_offsets = cp.full(n_geoms, -1, dtype=cp.int32)
     family_devices: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
     dummy_i32 = cp.zeros(1, dtype=cp.int32)
@@ -741,7 +780,7 @@ def _read_wkt_gpu_capacity(
                 (
                     ptr(d_bytes),
                     ptr(d_geom_starts),
-                    ptr(d_family_tags),
+                    ptr(d_tags),
                     ptr(d_empty_flags),
                     ptr(d_row_offsets),
                     ptr(d_coordinate_offsets),
@@ -817,11 +856,23 @@ def _read_wkt_gpu_capacity(
             ring_offsets=d_ring_offsets,
         )
 
+    all_valid = invalid_message is None and input_validity is None
+    if not family_devices:
+        return _build_device_single_family_owned(
+            family=GeometryFamily.POINT,
+            validity_device=d_validity,
+            x_device=cp.empty(0, dtype=cp.float64),
+            y_device=cp.empty(0, dtype=cp.float64),
+            geometry_offsets_device=cp.zeros(1, dtype=cp.int32),
+            empty_mask_device=cp.empty(0, dtype=cp.bool_),
+            detail="GPU WKT parse (all rows invalid, capacity-backed)",
+            valid_count=0,
+        )
     if len(family_devices) == 1:
         family, buffer = next(iter(family_devices.items()))
         return _build_device_single_family_owned(
             family=family,
-            validity_device=cp.ones(n_geoms, dtype=cp.bool_),
+            validity_device=d_validity,
             x_device=buffer.x,
             y_device=buffer.y,
             geometry_offsets_device=buffer.geometry_offsets,
@@ -829,16 +880,16 @@ def _read_wkt_gpu_capacity(
             part_offsets_device=buffer.part_offsets,
             ring_offsets_device=buffer.ring_offsets,
             detail=f"GPU WKT parse ({family.value}, capacity-backed)",
-            all_valid=True,
+            all_valid=all_valid,
         )
 
     return _build_device_mixed_owned(
-        validity_device=cp.ones(n_geoms, dtype=cp.bool_),
+        validity_device=d_validity,
         tags_device=d_tags.astype(cp.int8, copy=False),
         family_row_offsets_device=d_family_row_offsets,
         family_devices=family_devices,
         detail="GPU WKT parse (mixed, capacity-backed)",
-        all_valid=True,
+        all_valid=all_valid,
     )
 
 
@@ -851,6 +902,8 @@ def read_wkt_gpu(
     d_bytes: cp.ndarray,
     *,
     row_count_hint: int | None = None,
+    on_invalid: Literal["raise", "warn", "ignore"] = "raise",
+    input_validity: cp.ndarray | None = None,
 ) -> OwnedGeometryArray:
     """Parse WKT bytes on GPU and return device-resident geometry.
 
@@ -911,7 +964,12 @@ def read_wkt_gpu(
     >>> owned.row_count
     2
     """
-    return _read_wkt_gpu_capacity(d_bytes, row_count_hint=row_count_hint)
+    return _read_wkt_gpu_capacity(
+        d_bytes,
+        row_count_hint=row_count_hint,
+        on_invalid=on_invalid,
+        input_validity=input_validity,
+    )
 
 
 def _build_empty_owned() -> OwnedGeometryArray:

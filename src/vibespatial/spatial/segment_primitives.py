@@ -262,6 +262,104 @@ class DeviceBroadcastSegmentRelation:
         return self.physical_count * int(self.logical_row_count)
 
 
+@dataclass(frozen=True)
+class DeviceRingLocalSegmentRelation:
+    """Complete mask rings related to only their local logical rows.
+
+    ``ring_relation`` maps target geometry rows to source ring ids.  Every
+    source ring is represented by one contiguous span in ``source_segments``.
+    Hole candidates must be accompanied by their ancestor shell in the
+    relation; that complete shell is the winding baseline consumed by the
+    existing exact face walk.  Materialization therefore scales with complete
+    candidate-ring segments, never ``logical_rows * all_mask_segments``.
+    """
+
+    source_segments: DeviceSegmentTable
+    ring_relation: object
+    ring_starts: DeviceArray
+    ring_ends: DeviceArray
+    ancestor_shell_ring_ids: DeviceArray
+
+    def __post_init__(self) -> None:
+        ring_count = int(getattr(self.ring_starts, "size", 0))
+        if int(getattr(self.ring_ends, "size", 0)) != ring_count:
+            raise ValueError("ring-local segment spans must align")
+        if int(getattr(self.ancestor_shell_ring_ids, "size", 0)) != ring_count:
+            raise ValueError("ring-local winding baselines must align with rings")
+        left = getattr(self.ring_relation, "left_indices", None)
+        right = getattr(self.ring_relation, "right_indices", None)
+        if left is None or right is None or int(left.size) != int(right.size):
+            raise ValueError("ring-local relation indices must align")
+
+    @property
+    def candidate_ring_count(self) -> int:
+        return int(self.ring_relation.left_indices.size)
+
+    def materialize_segments(self) -> DeviceSegmentTable:
+        """Gather complete candidate rings into row-local topology storage."""
+        import cupy as cp
+
+        d_ring_ids = cp.asarray(self.ring_relation.right_indices, dtype=cp.int64)
+        d_target_rows = cp.asarray(self.ring_relation.left_indices, dtype=cp.int32)
+        if int(d_ring_ids.size) == 0:
+            empty_i32 = cp.empty(0, dtype=cp.int32)
+            empty_f64 = cp.empty(0, dtype=cp.float64)
+            return DeviceSegmentTable(
+                row_indices=empty_i32,
+                segment_indices=empty_i32.copy(),
+                x0=empty_f64,
+                y0=empty_f64.copy(),
+                x1=empty_f64.copy(),
+                y1=empty_f64.copy(),
+                count=0,
+                max_segments_per_row=0,
+                part_indices=empty_i32.copy(),
+                ring_indices=empty_i32.copy(),
+            )
+
+        d_starts = cp.asarray(self.ring_starts, dtype=cp.int64)[d_ring_ids]
+        d_lengths = (
+            cp.asarray(self.ring_ends, dtype=cp.int64)[d_ring_ids] - d_starts
+        ).astype(cp.int64, copy=False)
+        d_relation_offsets = cp.zeros(d_ring_ids.size + 1, dtype=cp.int64)
+        cp.cumsum(d_lengths, out=d_relation_offsets[1:])
+        runtime = get_cuda_runtime()
+        logical_count = int(
+            runtime.copy_device_to_host(
+                d_relation_offsets[-1:],
+                reason="ring-local topology exact allocation packet",
+            )[0]
+        )
+        d_segment_lanes = cp.arange(logical_count, dtype=cp.int64)
+        d_relation_lanes = cp.searchsorted(
+            d_relation_offsets[1:],
+            d_segment_lanes,
+            side="right",
+        ).astype(cp.int64, copy=False)
+        d_source_ids = (
+            d_starts[d_relation_lanes]
+            + d_segment_lanes
+            - d_relation_offsets[d_relation_lanes]
+        )
+        source = self.source_segments
+        d_source_parts = cp.asarray(source.part_indices, dtype=cp.int32)
+        d_source_rings = cp.asarray(source.ring_indices, dtype=cp.int32)
+        return DeviceSegmentTable(
+            row_indices=d_target_rows[d_relation_lanes],
+            segment_indices=cp.asarray(source.segment_indices, dtype=cp.int32)[
+                d_source_ids
+            ],
+            x0=cp.asarray(source.x0, dtype=cp.float64)[d_source_ids],
+            y0=cp.asarray(source.y0, dtype=cp.float64)[d_source_ids],
+            x1=cp.asarray(source.x1, dtype=cp.float64)[d_source_ids],
+            y1=cp.asarray(source.y1, dtype=cp.float64)[d_source_ids],
+            count=logical_count,
+            max_segments_per_row=int(source.count),
+            part_indices=d_source_parts[d_source_ids],
+            ring_indices=d_source_rings[d_source_ids],
+        )
+
+
 @dataclass
 class SegmentIntersectionResult:
     """Segment intersection results with lazy host materialization.
@@ -791,6 +889,12 @@ def _host_segment_total_for_family(
     only needs the family total.  Reusing already-known offsets avoids a scalar
     D2H fence without changing the device execution shape.
     """
+    # A device activity mask is part of the logical row contract but is not
+    # reflected in the retained host validity/tags.  Host offsets therefore
+    # describe capacity, not the live segment total, and must not size a
+    # scatter allocation for the masked view.
+    if geometry_array._row_active_mask is not None:
+        return None
     validity = geometry_array._validity
     tags = geometry_array._tags
     family_row_offsets = geometry_array._family_row_offsets
@@ -887,6 +991,8 @@ def _host_max_segment_count_for_family(
     expected_rows: int,
 ) -> int | None:
     """Return an exact host-known maximum row span when offsets are retained."""
+    if geometry_array._row_active_mask is not None:
+        return None
     validity = geometry_array._validity
     tags = geometry_array._tags
     family_row_offsets = geometry_array._family_row_offsets
@@ -1120,6 +1226,127 @@ def _device_segment_capacity_for_family(
     return None, unit_capacity
 
 
+def _count_segments_per_row_gpu(
+    geometry_array: OwnedGeometryArray,
+    compute_type: str = "double",
+):
+    """Count live source segments by logical row without scattering coordinates.
+
+    Overlay page planning needs exact row weights before it decides which
+    coordinate spans to materialize.  Capacity-backed constructive buffers can
+    retain coordinate allocations far larger than their logical geometry, so
+    calling :func:`_extract_segments_gpu` merely to obtain row counts gives the
+    planner the very global allocation it is meant to avoid.
+    """
+    import cupy as cp
+
+    runtime = get_cuda_runtime()
+    d_state = geometry_array._ensure_device_state(preserve_indexed_view=True)
+    d_family_codes = (
+        d_state.tags.astype(cp.int32)
+        if d_state.tags.dtype != cp.int32
+        else d_state.tags
+    )
+    d_family_row_offsets = d_state.family_row_offsets
+    d_row_counts = cp.zeros(geometry_array.row_count, dtype=cp.int64)
+    d_activity = (
+        None
+        if geometry_array._row_active_mask is None
+        else cp.asarray(geometry_array._row_active_mask, dtype=cp.bool_)
+    )
+    kernels = _extract_kernels(compute_type)
+    ptr = runtime.pointer
+
+    for family_enum, family_tag in (
+        (GeometryFamily.LINESTRING, _FAMILY_LINESTRING),
+        (GeometryFamily.POLYGON, _FAMILY_POLYGON),
+        (GeometryFamily.MULTILINESTRING, _FAMILY_MULTILINESTRING),
+        (GeometryFamily.MULTIPOLYGON, _FAMILY_MULTIPOLYGON),
+    ):
+        if family_enum not in d_state.families:
+            continue
+        d_buf = d_state.families[family_enum]
+        d_family_mask = d_state.validity & (d_state.tags == family_tag)
+        if d_activity is not None:
+            d_family_mask &= d_activity
+        d_family_rows = cp.flatnonzero(d_family_mask).astype(cp.int32, copy=False)
+        family_row_count = int(d_family_rows.size)
+        if family_row_count == 0:
+            continue
+
+        dense_width = (
+            int(d_buf.dense_single_ring_width)
+            if (
+                family_enum is GeometryFamily.POLYGON
+                and d_buf.dense_single_ring_width is not None
+            )
+            else 0
+        )
+        if dense_width > 1:
+            d_row_counts[d_family_rows] = np.int64(dense_width - 1)
+            continue
+
+        d_family_buffer_rows = d_family_row_offsets[d_family_rows].astype(
+            cp.int64,
+            copy=False,
+        )
+        d_family_empty = d_buf.empty_mask[d_family_buffer_rows].astype(
+            cp.uint8,
+            copy=True,
+        )
+        d_geometry_offsets = d_buf.geometry_offsets
+        d_part_offsets = (
+            d_buf.part_offsets
+            if d_buf.part_offsets is not None
+            else d_buf.geometry_offsets
+        )
+        d_ring_offsets = (
+            d_buf.ring_offsets
+            if d_buf.ring_offsets is not None
+            else d_buf.geometry_offsets
+        )
+        d_family_counts = runtime.allocate((family_row_count,), np.int32, zero=True)
+        grid, block = runtime.launch_config(
+            kernels["count_segments"],
+            family_row_count,
+        )
+        runtime.launch(
+            kernels["count_segments"],
+            grid=grid,
+            block=block,
+            params=(
+                (
+                    ptr(d_family_rows),
+                    ptr(d_family_codes),
+                    ptr(d_family_row_offsets),
+                    ptr(d_geometry_offsets),
+                    ptr(d_part_offsets),
+                    ptr(d_ring_offsets),
+                    ptr(d_family_empty),
+                    ptr(d_family_counts),
+                    family_row_count,
+                ),
+                (KERNEL_PARAM_PTR,) * 8 + (KERNEL_PARAM_I32,),
+            ),
+        )
+        d_row_counts[d_family_rows] = cp.asarray(
+            d_family_counts,
+            dtype=cp.int32,
+        ).astype(cp.int64, copy=False)
+        runtime.free(d_family_counts)
+        get_cuda_completion_retainer().defer(
+            cp.cuda.get_current_stream(),
+            (
+                d_family_rows,
+                d_family_buffer_rows,
+                d_family_empty,
+            ),
+            lambda _owners: None,
+        )
+
+    return d_row_counts
+
+
 # Kernel 1 dispatch: GPU Segment Extraction
 # ---------------------------------------------------------------------------
 
@@ -1207,6 +1434,11 @@ def _extract_segments_gpu(
         # device; segment extraction is a hot overlay primitive and must not
         # materialize row metadata just to decide per-family launch spans.
         fam_valid_mask = d_state.validity & (d_state.tags == family_tag)
+        if geometry_array._row_active_mask is not None:
+            fam_valid_mask &= cp.asarray(
+                geometry_array._row_active_mask,
+                dtype=cp.bool_,
+            )
         d_fam_valid = cp.flatnonzero(fam_valid_mask).astype(cp.int32, copy=False)
         n_fam = int(d_fam_valid.size)
         if n_fam == 0:

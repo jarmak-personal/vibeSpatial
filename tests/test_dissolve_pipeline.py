@@ -43,6 +43,7 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.fallbacks import StrictNativeFallbackError
 from vibespatial.runtime.fusion import IntermediateDisposition
 from vibespatial.runtime.materialization import (
+    MaterializationBoundary,
     clear_materialization_events,
     get_materialization_events,
 )
@@ -1744,6 +1745,118 @@ def test_reduce_native_grouped_dissolve_attributes_uses_device_non_numeric_take_
         pd.Timestamp("2020-01-03"),
     ]
     reset_d2h_transfer_count()
+
+
+def test_public_dissolve_mixed_device_reducers_stay_native_until_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for mixed device grouped reducers")
+
+    plc = pytest.importorskip("pylibcudf")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    geoms = [
+        box(0, 0, 1, 1),
+        box(1, 0, 2, 1),
+        box(0, 2, 1, 3),
+        box(1, 2, 2, 3),
+    ]
+    reference = geopandas.GeoDataFrame(
+        {
+            "group": [0, 0, 1, 1],
+            "value": [1, 2, 3, 4],
+            "label": [None, "alpha", "bravo", None],
+            "geometry": geoms,
+        }
+    )
+    expected = reference.dissolve(
+        by="group",
+        aggfunc={"value": "sum", "label": "first"},
+        method="coverage",
+    )
+    frame = reference.copy(deep=True)
+    attribute_arrow = pa.table(
+        {
+            "group": pa.array([0, 0, 1, 1], type=pa.int64()),
+            "value": pa.array([1, 2, 3, 4], type=pa.int64()),
+            "label": pa.array([None, "alpha", "bravo", None], type=pa.string()),
+        }
+    )
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    attach_native_state(
+        frame,
+        NativeFrameState.from_native_tabular_result(
+            NativeTabularResult(
+                attributes=NativeAttributeTable(
+                    device_table=plc.Table.from_arrow(attribute_arrow),
+                    index_override=frame.index,
+                    column_override=tuple(attribute_arrow.column_names),
+                    schema_override=attribute_arrow.schema,
+                ),
+                geometry=GeometryNativeResult.from_owned(owned, crs=frame.crs),
+                geometry_name="geometry",
+                column_order=tuple(frame.columns),
+            )
+        ),
+    )
+    real_take = NativeAttributeTable.grouped_device_take_columns
+    take_calls = []
+
+    def _record_take(self, grouped, reducers):
+        reset_d2h_transfer_count()
+        with assert_zero_d2h_transfers():
+            reduced = real_take(self, grouped, reducers)
+        take_calls.append((dict(reducers), reduced))
+        return reduced
+
+    def _fail_groupby(*_args, **_kwargs):
+        raise AssertionError("mixed device reducers must not call pandas groupby")
+
+    monkeypatch.setattr(
+        NativeAttributeTable,
+        "grouped_device_take_columns",
+        _record_take,
+    )
+    monkeypatch.setattr(pd.DataFrame, "groupby", _fail_groupby)
+    clear_materialization_events()
+
+    with strict_native_environment():
+        result = evaluate_geopandas_dissolve(
+            frame,
+            by="group",
+            aggfunc={"value": "sum", "label": "first"},
+            as_index=True,
+            level=None,
+            sort=True,
+            observed=False,
+            dropna=True,
+            method="coverage",
+            grid_size=None,
+            agg_kwargs={},
+        )
+    events = get_materialization_events(clear=True)
+
+    assert [reducers for reducers, _reduced in take_calls] == [
+        {"value": "sum", "label": "first"},
+        {"label": "first"},
+    ]
+    reducers, reduced = take_calls[-1]
+    assert reducers == {"label": "first"}
+    assert reduced is not None
+    assert reduced.device_table is not None
+    result_state = get_native_state(result)
+    assert result_state is not None
+    assert result_state.attributes.is_device_backed
+    assert not any(
+        event.boundary is MaterializationBoundary.INTERNAL_HOST_CONVERSION
+        and event.strict_disallowed
+        for event in events
+    )
+    assert_geodataframe_equal(result, expected)
 
 
 def test_evaluate_geopandas_dissolve_uses_native_grouped_min_max_reducers(
@@ -4497,7 +4610,10 @@ def test_execute_native_grouped_union_all_invalid_capacity_stays_device_native()
     assert bool(cp.all(state.validity))
     assert not bool(cp.any(device_valid_nonempty_mask(result.owned)))
     assert get_materialization_events(clear=True) == []
-    assert d2h_events == []
+    assert len(d2h_events) == 4
+    reasons = [event.reason for event in d2h_events]
+    assert reasons.count("overlay compact topology page-weight planning packet") == 2
+    assert reasons.count("overlay compact topology work-summary planning packet") == 2
     assert sum(event.bytes_transferred for event in d2h_events) <= 2040
 
 
@@ -5219,7 +5335,10 @@ def test_execute_native_grouped_union_rectangle_strips_use_direct_carrier() -> N
     assert result is not None
     assert result.owned is not None
     assert result.owned.residency is Residency.DEVICE
-    assert d2h_events == []
+    assert len(d2h_events) == 8
+    reasons = [event.reason for event in d2h_events]
+    assert reasons.count("overlay compact topology page-weight planning packet") == 4
+    assert reasons.count("overlay compact topology work-summary planning packet") == 4
     assert sum(event.bytes_transferred for event in d2h_events) <= 2040
     assert any(
         event.implementation
@@ -5589,6 +5708,157 @@ def test_public_grouped_point_dissolve_convex_hull_matches_shapely_oracle() -> N
         event.implementation == "grouped_dissolve_convex_hull_gpu"
         for event in events
     )
+
+
+@pytest.mark.gpu
+def test_native_grouped_point_union_excludes_dropped_nonfinite_rows() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    values = [
+        Point(10.0, 10.0),
+        Point(0.0, 0.0),
+        Point(99.0, 99.0),
+        Point(2.0, 2.0),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    assert owned.device_state is not None
+    point_buffer = owned.device_state.families[GeometryFamily.POINT]
+    point_buffer.x[2] = np.inf
+    owned.device_state.trusted_all_finite_coordinates = False
+    grouped = NativeGrouped.from_dense_codes(
+        np.asarray([1, 0, -1, 0], dtype=np.int32),
+        group_count=2,
+    )
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=pytest.fail,
+        method="unary",
+        owned=owned,
+    )
+    transfer_reasons = {event.reason for event in get_d2h_transfer_events(clear=True)}
+
+    assert result is not None
+    assert result.owned is not None
+    assert result.non_empty_groups == 2
+    assert result.empty_groups == 0
+    assert (
+        result.owned._native_grouped_union_implementation
+        == "native_segmented_point_set_union"
+    )
+    assert "grouped Point union finite-coordinate admission scalar fence" in transfer_reasons
+    assert owned.device_state.trusted_all_finite_coordinates is False
+    actual = np.asarray(result.owned.to_shapely(), dtype=object)
+    assert bool(shapely.equals(actual[0], shapely.MultiPoint([values[1], values[3]])))
+    assert bool(shapely.equals(actual[1], values[0]))
+
+
+@pytest.mark.gpu
+def test_native_grouped_point_union_emits_unobserved_groups_as_empty_collections() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    values = [Point(0.0, 0.0), Point(1.0, 1.0), Point(2.0, 2.0), Point(3.0, 3.0)]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    grouped = NativeGrouped.from_dense_codes(
+        np.asarray([0, 0, 2, 3], dtype=np.int32),
+        group_count=4,
+    )
+
+    clear_materialization_events()
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=pytest.fail,
+        method="unary",
+        owned=owned,
+    )
+
+    assert result is not None
+    assert result.owned is not None
+    assert result.non_empty_groups == 3
+    assert result.empty_groups == 1
+    assert result.owned.residency is Residency.DEVICE
+    assert result.owned.device_state is not None
+    assert result.owned.device_state.trusted_all_non_empty is False
+    empty_mask = result.owned._grouped_union_empty_geometry_collection_mask
+    assert hasattr(empty_mask, "__cuda_array_interface__")
+    assert get_materialization_events(clear=True) == []
+
+    actual = np.asarray(result.owned.to_shapely(), dtype=object)
+    assert bool(shapely.equals(actual[0], shapely.MultiPoint(values[:2])))
+    assert actual[1].geom_type == "GeometryCollection"
+    assert actual[1].is_empty
+    assert bool(shapely.equals(actual[2], values[2]))
+    assert bool(shapely.equals(actual[3], values[3]))
+
+
+@pytest.mark.gpu
+def test_public_strict_grouped_point_dissolve_preserves_level_sort_and_dropna() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    values = [
+        Point(10.0, 10.0),
+        Point(0.0, 0.0),
+        Point(99.0, 99.0),
+        Point(2.0, 2.0),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    assert owned.device_state is not None
+    owned.device_state.trusted_all_finite_coordinates = None
+    geometry = geopandas.GeoSeries(DeviceGeometryArray._from_owned(owned))
+    frame = geopandas.GeoDataFrame(
+        {"a": [2.0, 1.0, np.nan, 1.0]},
+        geometry=geometry,
+    )
+    level_frame = frame.drop(columns="a").copy()
+    level_frame.index = pd.MultiIndex.from_arrays(
+        [frame["a"], [3, 4, 5, 6]],
+        names=["a", "b"],
+    )
+
+    with strict_native_environment():
+        sorted_result = frame.dissolve("a", dropna=False)
+        unsorted_result = frame.dissolve("a", sort=False, dropna=False)
+        dropped_result = frame.dissolve("a", dropna=True)
+        level_result = level_frame.dissolve(level="a", dropna=False)
+
+        pd.testing.assert_index_equal(
+            sorted_result.index,
+            pd.Index([1.0, 2.0, np.nan], name="a"),
+        )
+        pd.testing.assert_index_equal(
+            unsorted_result.index,
+            pd.Index([2.0, 1.0, np.nan], name="a"),
+        )
+        pd.testing.assert_index_equal(
+            dropped_result.index,
+            pd.Index([1.0, 2.0], name="a"),
+        )
+        pd.testing.assert_index_equal(level_result.index, sorted_result.index)
+
+        expected_by_group = {
+            1.0: shapely.MultiPoint([values[1], values[3]]),
+            2.0: values[0],
+            "null": values[2],
+        }
+        for result in (sorted_result, unsorted_result, level_result):
+            actual = np.asarray(result.geometry.array, dtype=object)
+            for index_value, geometry_value in zip(result.index, actual, strict=True):
+                key = "null" if pd.isna(index_value) else float(index_value)
+                assert bool(shapely.equals(geometry_value, expected_by_group[key]))
+        dropped_actual = np.asarray(dropped_result.geometry.array, dtype=object)
+        assert bool(shapely.equals(dropped_actual[0], expected_by_group[1.0]))
+        assert bool(shapely.equals(dropped_actual[1], expected_by_group[2.0]))
 
 
 @pytest.mark.gpu

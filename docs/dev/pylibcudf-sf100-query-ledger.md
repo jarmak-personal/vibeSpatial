@@ -5,7 +5,7 @@ Scope: Per-query semantic, physical-shape, memory, correctness, and benchmark ev
 Read If: You are changing an SF100 query path, native tabular primitive, memory estimate, export boundary, or performance claim.
 STOP IF: You only need the program milestones or architecture; open the execution plan instead.
 Source Of Truth: Query-level evidence ledger required by the pylibcudf SF100 execution plan.
-Body Budget: 214/260 lines
+Body Budget: 217/260 lines
 Document: docs/dev/pylibcudf-sf100-query-ledger.md
 
 Section Map (Body Lines)
@@ -15,13 +15,13 @@ Section Map (Body Lines)
 | 3-7 | Intent |
 | 8-14 | Request Signals |
 | 15-22 | Open First |
-| 23-28 | Verify |
-| 29-35 | Risks |
-| 36-69 | Measurement Contract And Shared Evidence |
-| 70-183 | Q1-Q12 Ledger |
-| 184-191 | Public Shootout Capacity Closure |
-| 192-203 | Rejected Physical Shapes |
-| 204-214 | Artifact Map |
+| 23-30 | Verify |
+| 31-37 | Risks |
+| 38-71 | Measurement Contract And Shared Evidence |
+| 72-185 | Q1-Q12 Ledger |
+| 186-193 | Public Shootout Capacity Closure |
+| 194-205 | Rejected Physical Shapes |
+| 206-217 | Artifact Map |
 DOC_HEADER:END -->
 
 ## Intent
@@ -49,6 +49,8 @@ reproducible evidence for the SF100 pylibcudf performance program.
 - `uv run python scripts/check_docs.py --check`
 - `uv run python scripts/intake.py "pylibcudf SF100 query evidence ledger"`
 - `uv run python scripts/benchmark_pipelines.py --suite full --repeat 1 --gpu-sparkline`
+- `uv run python -m benchmarks.spatialbench.sf100_evidence check-comparator`
+- `uv run python -m benchmarks.spatialbench.sf100_evidence verify-candidate --candidate <candidate-json> --result-dir <candidate-results> --dataset-dir <sf100-geoparquet> --report <acceptance-json>`
 
 ## Risks
 
@@ -143,10 +145,10 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 ### Q6: Sedona-Radius Zone Statistics
 
 - Semantics/schema/order: pickups inside zones whose geometry intersects the 0.45-degree Sedona circle; `z_zonekey, z_name, total_pickups, avg_distance, avg_duration`; count descending/key ascending; 19 rows.
-- Projection/pushdown: trip key, pickup geometry, distance, pickup/dropoff timestamps; zone key/name/boundary; zone bounds prefilter applies before 8M point batches.
-- Shapes/chain/export: point-grid/location `NativeRelation` -> pylibcudf joined reductions -> terminal pandas.
+- Projection/pushdown: trip key, pickup geometry, distance, pickup/dropoff timestamps; zone key/name/boundary; the selective zone-bounds predicate streams before zone concatenation and 8M point batches.
+- Shapes/chain/export: compact selected polygon rows -> point-grid/location `NativeRelation` -> pylibcudf joined reductions -> terminal pandas.
 - Primitive/budget: point grid `192*N + 96*C + 1 MiB`, exact fp64 refinement, bounded relation and shard-local sum/count state; resize below remaining query budget.
-- Measured after: public relation reduction plus device-backed Series accumulation profiles at 17.07 s; D2H 0.3129 s / 15.51 MB; peak 19.59 GiB; clean GPD 371.42 s versus VS 16.32 s (22.76x).
+- Measured after: final current-source repeat-3 median 13.24 s (`13.14, 13.29, 13.24`) versus frozen GPD 371.42 s, or 28.05x; fail-closed SF100 verification passes all 19 ordered rows.
 - Correctness/fallback: exact zone/pickup predicate, duration/decimal averages, null exclusion and stable order pass SF1/SF100; no fallback.
 
 ### Q7: Detour Ratio Top 100
@@ -216,7 +218,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 ## Rejected Physical Shapes
 
 - A 32M Q2 relation requested a single 12-GiB block; 8M batches retain exactness and fit the planner.
-- A 16M Q6 batch exceeded remaining budget by 28.3 MiB; deterministic 8M resizing is used.
+- A 16M Q6 batch exceeded remaining budget by 28.3 MiB; deterministic 8M resizing is used. A later repeat-only OOM was traced to concatenating all 28,320,312 zone coordinates and retaining a variable-width indexed selection. Selective streaming plus exact spatial-consumer compaction removes that wrong physical shape. The compactor admits row/family-shaped count scratch before flattening, then admits the exact selected output and gather workspace after the count packet; all-null carriers are materialized inside the same admitted boundary.
 - An eager Q5 32M grouped sort estimated 44.44 GiB; segmented grouped hulls replace it.
 - One-pass Q5 externalization wrote every row into 64 partitions: 307.37 s, 17.34 GB peak, and 4.15 GB D2H. A count-first eligible-row scan is the reusable bounded shape.
 - Eager Q10 zone-partition consolidation reserved 20.71 GB; five streamed partitions retain 5.474 GB.
@@ -227,6 +229,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 
 ## Artifact Map
 
+- Frozen optimized-GeoPandas comparator and oracle manifest: `benchmark_results/spatialbench/sf100/accepted-geopandas-comparator.json`. Its 8,086.00-second total derives from the original accepted twelve-query JSON plus only the checked-in Q5 replacement packet; the verifier replays that derivation and hashes all twelve same-data output CSVs.
 - Before-stage evidence: `docs/dev/pylibcudf-sf100-execution-plan.md#locked-sf100-baseline-2026-08-13`.
 - Final medians: `benchmark_results/spatialbench/sf100/2026-08-14-final-median/final_benchmark.json`.
 - Runtime telemetry: `benchmark_results/spatialbench/sf100/2026-08-14-final-median/final_telemetry.json` and `telemetry_summary.json`.

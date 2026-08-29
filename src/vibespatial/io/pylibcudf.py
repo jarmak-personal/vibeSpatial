@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
@@ -265,6 +266,7 @@ def _scan_pylibcudf_wkb_headers(column) -> DeviceWKBHeaderScan:
     family_tags = cp.full(row_count, -1, dtype=cp.int8)
     native_mask = cp.zeros(row_count, dtype=cp.bool_)
     point_mask = cp.zeros(row_count, dtype=cp.bool_)
+    semantic_invalid_mask = cp.zeros(row_count, dtype=cp.bool_)
 
     if int(header_rows.size):
         starts = offsets[:-1][header_rows]
@@ -298,6 +300,24 @@ def _scan_pylibcudf_wkb_headers(column) -> DeviceWKBHeaderScan:
         ]
         if int(point_rows.size):
             point_mask[point_rows] = True
+        linestring_rows = header_rows[
+            little_endian
+            & (type_values == WKB_TYPE_IDS[GeometryFamily.LINESTRING])
+            & (lengths[header_rows] >= 9)
+        ]
+        if int(linestring_rows.size):
+            linestring_starts = offsets[:-1][linestring_rows]
+            linestring_point_counts = _pylibcudf_unpack_le_uint32(
+                payload,
+                linestring_starts + 5,
+            )
+            canonical_lengths = 9 + linestring_point_counts.astype(cp.int64) * 16
+            invalid_linestring_rows = linestring_rows[
+                (linestring_point_counts == 1)
+                & (lengths[linestring_rows] == canonical_lengths)
+            ]
+            if int(invalid_linestring_rows.size):
+                semantic_invalid_mask[invalid_linestring_rows] = True
 
     fallback_mask = validity & ~native_mask
     return DeviceWKBHeaderScan(
@@ -320,6 +340,7 @@ def _scan_pylibcudf_wkb_headers(column) -> DeviceWKBHeaderScan:
         native_mask=native_mask,
         fallback_mask=fallback_mask,
         point_mask=point_mask,
+        semantic_invalid_mask=semantic_invalid_mask,
     )
 
 
@@ -1036,10 +1057,41 @@ def _decode_pylibcudf_wkb_general_column_to_owned(
     column,
     *,
     scan: DeviceWKBHeaderScan | None = None,
+    on_invalid: str = "raise",
 ) -> OwnedGeometryArray:
     """GPU WKB decode for any supported homogeneous or mixed-family column."""
 
+    import cupy as cp
+
     header_scan = _scan_pylibcudf_wkb_headers(column) if scan is None else scan
+    semantic_invalid_count = _device_mask_count(header_scan.semantic_invalid_mask)
+    if semantic_invalid_count:
+        message = "point array must contain 0 or >1 elements"
+        if on_invalid == "raise":
+            from .wkb import _GpuWkbOnInvalidError
+
+            raise _GpuWkbOnInvalidError(message)
+        if on_invalid == "warn":
+            warnings.warn(message, UserWarning, stacklevel=3)
+        semantic_validity = header_scan.validity & ~header_scan.semantic_invalid_mask
+        semantic_native = header_scan.native_mask & ~header_scan.semantic_invalid_mask
+        header_scan = DeviceWKBHeaderScan(
+            row_count=header_scan.row_count,
+            valid_count=header_scan.valid_count - semantic_invalid_count,
+            native_count=header_scan.native_count - semantic_invalid_count,
+            fallback_count=header_scan.fallback_count,
+            validity=semantic_validity,
+            type_ids=header_scan.type_ids,
+            family_tags=cp.where(
+                semantic_validity,
+                header_scan.family_tags,
+                np.int8(-1),
+            ).astype(cp.int8, copy=False),
+            native_mask=semantic_native,
+            fallback_mask=header_scan.fallback_mask,
+            point_mask=header_scan.point_mask,
+            semantic_invalid_mask=header_scan.semantic_invalid_mask,
+        )
     if header_scan.native_count != header_scan.valid_count:
         raise NotImplementedError(
             "pylibcudf device WKB decode requires all valid rows to be native supported types"

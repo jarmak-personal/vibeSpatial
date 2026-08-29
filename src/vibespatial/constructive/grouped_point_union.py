@@ -84,18 +84,18 @@ def supports_grouped_point_union(owned: OwnedGeometryArray) -> bool:
 def _grouped_point_union_semantically_admissible(owned: OwnedGeometryArray) -> bool:
     """Check exact Point-union semantics after device execution is selected.
 
-    Trusted device metadata, including a producer-supplied finite-coordinate
-    proof, is the admissibility contract for a device carrier; inspecting
-    coordinates or routing columns on host would violate the native boundary.
-    Host carriers retain the conservative finite, non-null, and non-empty scan
-    used by the original implementation.
+    Trusted device metadata is the preferred admissibility contract.  A
+    missing proof, or a source-wide negative proof when grouping dropped some
+    rows, is resolved over the observed Point rows inside the device executor;
+    it is not a reason to decline an otherwise exact native carrier.  Host
+    carriers retain the conservative finite, non-null, and non-empty scan used
+    by the original implementation.
     """
     state = owned.device_state
     if state is not None:
         return bool(
             state.trusted_all_valid is True
             and state.trusted_all_non_empty is True
-            and state.trusted_all_finite_coordinates is True
             and state.trusted_homogeneous_family is GeometryFamily.POINT
             and GeometryFamily.POINT in state.families
         )
@@ -138,9 +138,11 @@ def _segmented_point_union_gpu(
     group_count = grouped.resolved_group_count
     if group_count <= 0 or int(grouped.row_count or -1) != int(owned.row_count):
         return None
-    if int(grouped.sorted_order.size) != int(owned.row_count):
+    observed_row_count = int(grouped.sorted_order.size)
+    if observed_row_count <= 0 or observed_row_count > int(owned.row_count):
         return None
-    if int(grouped.group_ids.size) != group_count:
+    observed_group_count = int(grouped.group_ids.size)
+    if observed_group_count <= 0 or observed_group_count > group_count:
         return None
 
     physical = (
@@ -153,7 +155,7 @@ def _segmented_point_union_gpu(
     if point_buffer is None:
         return None
 
-    row_count = int(physical.row_count)
+    source_row_count = int(physical.row_count)
     if hasattr(grouped.group_codes, "__cuda_array_interface__"):
         d_codes = cp.asarray(grouped.group_codes, dtype=cp.int32)
     else:
@@ -169,16 +171,56 @@ def _segmented_point_union_gpu(
             trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST.value,
             reason="grouped Point union dense group-code ingress",
             source="cuda_runtime",
-            item_count=row_count,
+            item_count=source_row_count,
             bytes_transferred=int(host_codes.nbytes),
         )
-    if int(d_codes.size) != row_count:
+    if int(d_codes.size) != source_row_count:
         return None
     d_family_rows = cp.asarray(state.family_row_offsets, dtype=cp.int64)
+    if observed_row_count != source_row_count:
+        if hasattr(grouped.sorted_order, "__cuda_array_interface__"):
+            d_observed_rows = cp.asarray(grouped.sorted_order, dtype=cp.int64)
+        else:
+            host_observed_rows = np.ascontiguousarray(
+                grouped.sorted_order,
+                dtype=np.int64,
+            )
+            d_observed_rows = get_cuda_runtime().from_host(host_observed_rows)
+            notify_transfer(
+                direction="h2d",
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST.value,
+                reason="grouped Point union observed-row ingress",
+                source="cuda_runtime",
+                item_count=observed_row_count,
+                bytes_transferred=int(host_observed_rows.nbytes),
+            )
+        d_codes = d_codes[d_observed_rows]
+        d_family_rows = d_family_rows[d_observed_rows]
     d_point_offsets = cp.asarray(point_buffer.geometry_offsets, dtype=cp.int64)
     d_coord_rows = d_point_offsets[d_family_rows]
     d_x = cp.asarray(point_buffer.x, dtype=cp.float64)[d_coord_rows]
     d_y = cp.asarray(point_buffer.y, dtype=cp.float64)[d_coord_rows]
+
+    if (
+        state.trusted_all_finite_coordinates is False
+        and observed_row_count == source_row_count
+    ):
+        return None
+    if state.trusted_all_finite_coordinates is not True:
+        finite_device = (
+            cp.all(cp.isfinite(d_x)) & cp.all(cp.isfinite(d_y))
+        ).reshape(1)
+        finite_host = get_cuda_runtime().copy_device_to_host(
+            finite_device,
+            reason="grouped Point union finite-coordinate admission scalar fence",
+        )
+        all_finite = bool(np.asarray(finite_host).reshape(-1)[0])
+        if observed_row_count == source_row_count:
+            state.trusted_all_finite_coordinates = all_finite
+        if not all_finite:
+            return None
+
+    row_count = observed_row_count
 
     # GEOS treats negative and positive zero as the same coordinate. Normalize
     # before radix key creation so equivalent zeros cannot land in separated
@@ -263,10 +305,11 @@ def _segmented_point_union_gpu(
         ),
         execution_mode="gpu",
     )
+    all_groups_observed = observed_group_count == group_count
     result_state = result.device_state
     if result_state is not None:
         result_state.trusted_all_valid = True
-        result_state.trusted_all_non_empty = True
+        result_state.trusted_all_non_empty = all_groups_observed
         result_state.trusted_family_domain = (
             GeometryFamily.POINT,
             GeometryFamily.MULTIPOINT,
@@ -274,6 +317,7 @@ def _segmented_point_union_gpu(
         result_state.trusted_unique_family_rows = False
     seed_all_validity_cache(result)
     result._native_grouped_union_implementation = "native_segmented_point_set_union"
+    result._grouped_union_empty_geometry_collection_mask = counts == 0
     return result
 
 
@@ -295,17 +339,19 @@ def grouped_point_union_owned(
         return None
     if grouped.sorted_order is None or grouped.group_ids is None:
         return None
-    if int(grouped.sorted_order.size) != int(owned.row_count):
+    observed_row_count = int(grouped.sorted_order.size)
+    if observed_row_count <= 0 or observed_row_count > int(owned.row_count):
         return None
-    if int(grouped.group_ids.size) != group_count:
+    observed_group_count = int(grouped.group_ids.size)
+    if observed_group_count <= 0 or observed_group_count > group_count:
         return None
 
     estimate = estimate_grouped_work_from_owned(
         owned,
         grouped=grouped,
         output_row_count=group_count,
-        output_byte_count=int(owned.row_count) * 16 + group_count * 40,
-        temporary_byte_count=int(owned.row_count) * 48 + group_count * 8,
+        output_byte_count=observed_row_count * 16 + group_count * 40,
+        temporary_byte_count=observed_row_count * 48 + group_count * 8,
         primary_unit_name="grouped-point",
     )
     plan = plan_dispatch_selection(

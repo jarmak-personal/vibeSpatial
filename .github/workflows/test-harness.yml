@@ -28,6 +28,8 @@ jobs:
         run: uv sync --group dev
       - name: Lint
         run: uv run ruff check
+      - name: Verify CPU-only test collection
+        run: uv run pytest --collect-only -m "not gpu" --ignore=tests/upstream -qq
       - name: Run tests (non-GPU)
         run: uv run pytest -m "not gpu" --ignore=tests/upstream -q
       - name: Collect bootstrap health report

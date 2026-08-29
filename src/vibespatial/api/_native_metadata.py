@@ -754,7 +754,10 @@ class NativeSpatialIndex:
         carrier is ``NativeRelation`` with query rows on the left and indexed
         rows on the right.
         """
-        query_owned = _query_owned_geometry(query_geometry)
+        query_owned = _query_owned_geometry(
+            query_geometry,
+            residency=self.residency,
+        )
         resolved_query_token = (
             getattr(query_geometry, "lineage_token", None)
             if query_token is None
@@ -772,23 +775,41 @@ class NativeSpatialIndex:
             NativeRelation,
             NativeRelationSelection,
         )
+        from vibespatial.runtime import ExecutionMode, get_requested_mode, has_gpu_runtime
         from vibespatial.spatial.query import query_spatial_index
 
-        query_result, execution = query_spatial_index(
-            self.geometry,
-            self.to_flat_index(),
-            query_owned,
-            native_index=self,
-            predicate=predicate,
-            sort=sort,
-            distance=distance,
-            output_format="indices",
-            return_metadata=True,
-            return_device=return_device,
-            tree_shapely=tree_shapely,
-            query_shapely=query_shapely,
-            precomputed_query_bounds=precomputed_query_bounds,
-        )
+        requested_mode = get_requested_mode()
+        if requested_mode is ExecutionMode.CPU or (
+            requested_mode is ExecutionMode.AUTO and not has_gpu_runtime()
+        ):
+            query_result, execution = _query_relation_host(
+                self.geometry,
+                query_owned,
+                predicate=predicate,
+                sort=sort,
+                distance=distance,
+                requested_mode=requested_mode,
+                tree_shapely=tree_shapely,
+                query_shapely=query_shapely,
+                tree_row_count=self.row_count,
+                query_row_count=int(resolved_query_row_count),
+            )
+        else:
+            query_result, execution = query_spatial_index(
+                self.geometry,
+                self.to_flat_index(),
+                query_owned,
+                native_index=self,
+                predicate=predicate,
+                sort=sort,
+                distance=distance,
+                output_format="indices",
+                return_metadata=True,
+                return_device=return_device,
+                tree_shapely=tree_shapely,
+                query_shapely=query_shapely,
+                precomputed_query_bounds=precomputed_query_bounds,
+            )
         if isinstance(query_result, NativeRelationSelection):
             query_relation = query_result.relation
             relation = NativeRelation(
@@ -959,7 +980,10 @@ class NativeSpatialIndex:
         """
         from vibespatial.api._native_rowset import NativeDeviceSelection
 
-        query_owned = _query_owned_geometry(query_geometry)
+        query_owned = _query_owned_geometry(
+            query_geometry,
+            residency=self.residency,
+        )
         resolved_query_token = (
             getattr(query_geometry, "lineage_token", None)
             if query_token is None
@@ -1060,7 +1084,10 @@ class NativeSpatialIndex:
         """Return matched indexed rows without materializing relation pairs."""
         from vibespatial.api._native_rowset import NativeDeviceSelection
 
-        query_owned = _query_owned_geometry(query_geometry)
+        query_owned = _query_owned_geometry(
+            query_geometry,
+            residency=self.residency,
+        )
         resolved_query_row_count = (
             getattr(query_owned, "row_count", None)
             if query_row_count is None
@@ -1121,7 +1148,10 @@ class NativeSpatialIndex:
         """Return exact per-query match counts without a relation carrier."""
         from vibespatial.api._native_expression import NativeExpression
 
-        query_owned = _query_owned_geometry(query_geometry)
+        query_owned = _query_owned_geometry(
+            query_geometry,
+            residency=self.residency,
+        )
         resolved_query_token = (
             getattr(query_geometry, "lineage_token", None)
             if query_token is None
@@ -1179,11 +1209,20 @@ class NativeSpatialIndex:
         query_row_count: int | None = None,
         return_metadata: bool = False,
         precomputed_query_bounds: Any | None = None,
+        allow_relation_fallback: bool = True,
     ):
-        """Return exact per-indexed-row match counts without pair export."""
+        """Return exact per-indexed-row match counts without pair export.
+
+        ``allow_relation_fallback=False`` is the planning-safe contract: when
+        the direct device reduction is unavailable, return ``None`` instead of
+        allocating a relation merely to recover its per-row counts.
+        """
         from vibespatial.api._native_expression import NativeExpression
 
-        query_owned = _query_owned_geometry(query_geometry)
+        query_owned = _query_owned_geometry(
+            query_geometry,
+            residency=self.residency,
+        )
         resolved_query_row_count = (
             getattr(query_owned, "row_count", None)
             if query_row_count is None
@@ -1205,6 +1244,9 @@ class NativeSpatialIndex:
             reduction="right_count",
         )
 
+        if direct_counts is None and not allow_relation_fallback:
+            result = None
+            return (result, execution) if return_metadata else result
         if direct_counts is None:
             relation, execution = self.query_relation(
                 query_geometry,
@@ -1228,6 +1270,70 @@ class NativeSpatialIndex:
             )
         return (expression, execution) if return_metadata else expression
 
+    def query_morton_span_upper_packet(
+        self,
+        query_geometry: Any,
+        *,
+        query_row_count: int | None = None,
+        return_metadata: bool = False,
+        precomputed_query_bounds: Any | None = None,
+    ):
+        """Return a direct-only structural upper packet for relation planning.
+
+        This path is intentionally narrower than a relation reduction: it
+        prepares full-population Morton intervals and reduces only their spans.
+        It never allocates candidate pairs, refines a predicate, or falls back
+        through ``query_relation``.
+        """
+        query_owned = _query_owned_geometry(
+            query_geometry,
+            residency=self.residency,
+        )
+        resolved_query_row_count = (
+            getattr(query_owned, "row_count", None)
+            if query_row_count is None
+            else query_row_count
+        )
+        if resolved_query_row_count is None:
+            raise ValueError(
+                "NativeSpatialIndex.query_morton_span_upper_packet requires "
+                "query row count"
+            )
+        if int(resolved_query_row_count) != int(getattr(query_owned, "row_count", -1)):
+            raise ValueError("Morton span query row count must match query geometry")
+        if not (
+            self.is_device
+            and _is_device_array(self.order)
+            and _is_device_array(self.morton_keys)
+            and self.metadata is not None
+            and self.metadata.bounds is not None
+            and self.regular_grid is None
+        ):
+            result = None
+            return (result, None) if return_metadata else result
+
+        from vibespatial.kernels.core.geometry_analysis import (
+            compute_geometry_bounds_device,
+        )
+        from vibespatial.spatial.spatial_index_device import (
+            spatial_index_device_morton_span_upper_packet,
+        )
+
+        query_bounds = (
+            precomputed_query_bounds
+            if precomputed_query_bounds is not None
+            else compute_geometry_bounds_device(
+                query_owned,
+                preserve_indexed_view=True,
+            )
+        )
+        packet, execution = spatial_index_device_morton_span_upper_packet(
+            self.to_flat_index(),
+            query_bounds,
+            native_index=self,
+        )
+        return (packet, execution) if return_metadata else packet
+
     def query_right_pair_match_count_expressions(
         self,
         query_geometry: Any,
@@ -1241,7 +1347,10 @@ class NativeSpatialIndex:
         """Return first and shared aligned indexed-row match counts."""
         from vibespatial.api._native_expression import NativeExpression
 
-        query_owned = _query_owned_geometry(query_geometry)
+        query_owned = _query_owned_geometry(
+            query_geometry,
+            residency=self.residency,
+        )
         resolved_query_row_count = (
             getattr(query_owned, "row_count", None)
             if query_row_count is None
@@ -1281,13 +1390,114 @@ class NativeSpatialIndex:
         return (expressions, execution) if return_metadata else expressions
 
 
-def _query_owned_geometry(value: Any):
+def _query_owned_geometry(
+    value: Any,
+    *,
+    residency: Residency = Residency.HOST,
+):
     geometry = getattr(value, "geometry", None)
     if geometry is not None and getattr(geometry, "owned", None) is not None:
         return geometry.owned
     if getattr(value, "owned", None) is not None:
         return value.owned
+    # Direct native reducers require an owned row carrier even for a public
+    # scalar.  Lower a scalar Shapely geometry to a one-row device array here,
+    # where the native index has already selected the device physical shape,
+    # instead of passing an object with no ``row_count`` into device bounds.
+    from shapely.geometry.base import BaseGeometry
+
+    if isinstance(value, BaseGeometry):
+        from vibespatial.geometry.owned import from_shapely_geometries
+
+        return from_shapely_geometries([value], residency=residency)
     return value
+
+
+def _query_relation_host(
+    tree_owned: Any,
+    query_owned: Any,
+    *,
+    predicate: str | None,
+    sort: bool,
+    distance: float | np.ndarray | None,
+    requested_mode,
+    tree_shapely: np.ndarray | None,
+    query_shapely: np.ndarray | None,
+    tree_row_count: int,
+    query_row_count: int,
+):
+    """Execute a native relation query without entering device preparation."""
+    import shapely
+
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.dispatch import record_dispatch_event
+    from vibespatial.runtime.fallbacks import record_fallback_event
+    from vibespatial.spatial.query import SpatialQueryExecution
+
+    tree_values = np.asarray(
+        tree_owned.to_shapely() if tree_shapely is None else tree_shapely,
+        dtype=object,
+    ).reshape(-1)
+    query_values = np.asarray(
+        query_owned.to_shapely() if query_shapely is None else query_shapely,
+        dtype=object,
+    ).reshape(-1)
+    if int(tree_values.size) != int(tree_row_count):
+        raise ValueError("native host relation tree geometry must align with index rows")
+    if int(query_values.size) != int(query_row_count):
+        raise ValueError("native host relation query geometry must align with query rows")
+
+    kwargs = {}
+    if distance is not None:
+        kwargs["distance"] = distance
+    pair_indices = np.asarray(
+        shapely.STRtree(tree_values).query(
+            query_values,
+            predicate=predicate,
+            **kwargs,
+        ),
+        dtype=np.int64,
+    ).reshape(2, -1)
+    if sort and int(pair_indices.shape[1]) > 1:
+        order = np.lexsort((pair_indices[1], pair_indices[0]))
+        pair_indices = pair_indices[:, order]
+
+    reason = (
+        "explicit CPU request selected host STRtree relation execution"
+        if requested_mode is ExecutionMode.CPU
+        else "AUTO selected host STRtree relation execution because no GPU is available"
+    )
+    if requested_mode is ExecutionMode.AUTO:
+        record_fallback_event(
+            surface="vibespatial.api.NativeSpatialIndex.query_relation",
+            requested=requested_mode,
+            selected=ExecutionMode.CPU,
+            reason="native spatial relation has no available GPU runtime",
+            detail=(
+                f"predicate={predicate!r}, query_rows={query_row_count}, "
+                f"tree_rows={tree_row_count}"
+            ),
+            pipeline="native_spatial_query_relation",
+            d2h_transfer=False,
+        )
+    record_dispatch_event(
+        surface="vibespatial.api.NativeSpatialIndex.query_relation",
+        operation="query_relation",
+        implementation="strtree_host",
+        reason=reason,
+        detail=(
+            f"predicate={predicate!r}, query_rows={query_row_count}, "
+            f"tree_rows={tree_row_count}"
+        ),
+        requested=requested_mode,
+        selected=ExecutionMode.CPU,
+    )
+    return pair_indices, SpatialQueryExecution(
+        requested=requested_mode,
+        selected=ExecutionMode.CPU,
+        implementation="owned_cpu_spatial_query",
+        reason=reason,
+    )
 
 
 def _relation_pair_arrays_from_query_result(
