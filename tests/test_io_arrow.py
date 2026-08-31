@@ -3955,6 +3955,10 @@ def test_clustered_partition_manifest_rejects_replaced_parquet_file(tmp_path) ->
     ) is None
 
 
+def test_partition_manifest_path_declines_empty_sink_name() -> None:
+    assert io_geoparquet._native_partition_manifest_path("") is None
+
+
 @pytest.mark.skipif(
     not has_gpu_runtime() or not has_pylibcudf_support(),
     reason="GPU pylibcudf runtime unavailable",

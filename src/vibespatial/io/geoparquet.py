@@ -91,6 +91,8 @@ def _native_partition_manifest_path(path) -> Path | None:
     if not isinstance(path, (str, PathLike)):
         return None
     parquet_path = Path(path)
+    if not parquet_path.name:
+        return None
     return parquet_path.with_suffix(parquet_path.suffix + ".partitions.json")
 
 
