@@ -11,24 +11,31 @@ from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_I64,
     KERNEL_PARAM_PTR,
+    DeviceMemoryAdmission,
     get_cuda_runtime,
 )
 from vibespatial.geometry.buffers import GeometryFamily
+from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.predicates.point_location_index import (
     _point_location_preparation_metrics,
+    point_location_bin_policy,
     point_location_part_y_index_profile_kernels,
+    prepare_polygon_part_y_index,
 )
 from vibespatial.predicates.point_location_index_kernels import (
     _POINT_LOCATION_PART_Y_INDEX_PROFILE_SOURCE,
     _POINT_LOCATION_PART_Y_INDEX_SOURCE,
+    coverage_grid_width_for_bin_count,
 )
 from vibespatial.predicates.point_region_profile import profile_point_region
 from vibespatial.predicates.point_relations import (
     _point_region_level0_packet,
     _sync_hotpath,
+    classify_point_region_gpu,
 )
 from vibespatial.runtime import has_gpu_runtime
 from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+from vibespatial.runtime.residency import Residency
 from vibespatial.spatial.point_grid_index import (
     _point_grid_preparation_metrics,
 )
@@ -63,8 +70,12 @@ def test_level0_preparation_packets_use_host_carrier_metadata() -> None:
         geometry_count=224_676,
         part_count=288_955,
         bin_count=8,
+        target_bin_count=128,
+        nominal_vram_class_gib=100,
         edge_membership_count=78_341_756,
         device_bytes=345_729_984,
+        peak_build_bytes=702_000_000,
+        coverage_grid_width=8,
     )
     part_y_sums, part_y_maxima, part_y_unavailable = (
         _point_location_preparation_metrics(
@@ -82,8 +93,14 @@ def test_level0_preparation_packets_use_host_carrier_metadata() -> None:
         "source_geometries": 224_676,
         "source_parts": 288_955,
         "part_y_bin_slots": 2_311_640,
+        "target_bin_count": 128,
+        "admitted_bin_count": 8,
+        "nominal_vram_class_gib": 100,
         "edge_memberships": 78_341_756,
         "persistent_bytes": 345_729_984,
+        "peak_build_bytes": 702_000_000,
+        "coverage_grid_width": 8,
+        "coverage_cells": 288_955 * 64,
     }
     assert "avoidable_rebuild_seconds" in part_y_unavailable
 
@@ -114,6 +131,33 @@ def test_level0_preparation_packets_use_host_carrier_metadata() -> None:
     assert "source_parts" in declined_part_y_unavailable
 
 
+@pytest.mark.parametrize(
+    ("reported_gib", "expected_nominal_gib", "expected_bins"),
+    [
+        (7.7, 8, 8),
+        (8.1, 8, 16),
+        (15.3, 16, 16),
+        (17.0, 17, 32),
+        (22.0, 22, 32),
+        (22.9, 24, 64),
+        (24.0, 24, 64),
+        (45.7, 48, 128),
+        (48.0, 48, 128),
+        (95.1, 100, 256),
+        (100.0, 100, 256),
+    ],
+)
+def test_point_location_bin_policy_uses_tolerant_nominal_vram_classes(
+    reported_gib,
+    expected_nominal_gib,
+    expected_bins,
+) -> None:
+    nominal_gib, bins = point_location_bin_policy(int(reported_gib * (1 << 30)))
+
+    assert nominal_gib == expected_nominal_gib
+    assert bins == expected_bins
+
+
 def test_point_region_profiler_is_absent_from_production_kernel_source() -> None:
     """Disabled profiling must not add counters or atomics to production code."""
     assert "VS_PROFILE_COUNTER_COUNT" not in _POINT_LOCATION_PART_Y_INDEX_SOURCE
@@ -122,6 +166,256 @@ def test_point_region_profiler_is_absent_from_production_kernel_source() -> None
     assert "point_in_multipolygon_prepared_part_y_index_profiled" in (
         _POINT_LOCATION_PART_Y_INDEX_PROFILE_SOURCE
     )
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+@pytest.mark.parametrize("bin_count", [8, 16, 32, 64, 128, 256])
+@pytest.mark.parametrize(
+    ("family", "as_region"),
+    [
+        (GeometryFamily.POLYGON, lambda polygon: polygon),
+        (GeometryFamily.MULTIPOLYGON, lambda polygon: MultiPolygon([polygon])),
+    ],
+)
+def test_uniform_part_y_width_variants_preserve_exact_point_location(
+    monkeypatch,
+    bin_count,
+    family,
+    as_region,
+) -> None:
+    polygon = Polygon(
+        [(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)],
+        holes=[[(1, 1), (3, 1), (3, 3), (1, 3), (1, 1)]],
+    )
+    regions = from_shapely_geometries(
+        np.asarray([as_region(polygon)] * 4, dtype=object),
+        residency=Residency.DEVICE,
+    )
+    points = from_shapely_geometries(
+        np.asarray(
+            [Point(0.5, 0.5), Point(2, 2), Point(0, 2), Point(10, 10)],
+            dtype=object,
+        ),
+        residency=Residency.DEVICE,
+    )
+    monkeypatch.setattr(
+        "vibespatial.predicates.point_location_index._MIN_PREPARED_COORDINATES",
+        0,
+    )
+
+    prepared = prepare_polygon_part_y_index(
+        regions,
+        family,
+        _target_bin_count=bin_count,
+    )
+    relation = classify_point_region_gpu(
+        np.arange(4, dtype=np.int32),
+        points,
+        regions,
+        region_family=family,
+    )
+
+    assert prepared is not None
+    assert prepared.bin_count == bin_count
+    assert prepared.coverage_grid_width == coverage_grid_width_for_bin_count(bin_count)
+    assert relation.tolist() == [2, 0, 1, 0]
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+@pytest.mark.parametrize(
+    ("family", "as_region"),
+    [
+        (GeometryFamily.POLYGON, lambda polygon: polygon),
+        (GeometryFamily.MULTIPOLYGON, lambda polygon: MultiPolygon([polygon])),
+    ],
+)
+def test_conservative_coverage_grid_matches_dense_shapely_point_locations(
+    monkeypatch,
+    family,
+    as_region,
+) -> None:
+    polygon = Polygon(
+        [(0, 0), (5, 0), (5, 1), (2, 1), (2, 5), (0, 5), (0, 0)],
+        holes=[[(0.5, 2), (1.5, 2), (1.5, 4), (0.5, 4), (0.5, 2)]],
+    )
+    axis = np.linspace(-0.5, 5.5, 49)
+    point_values = [Point(x, y) for y in axis for x in axis]
+    point_values.extend(
+        [
+            Point(0, 0),
+            Point(5, 0.5),
+            Point(2, 3),
+            Point(1, 2),
+            Point(0.5, 3),
+            Point(1, 3),
+        ]
+    )
+    expected = np.asarray(
+        [
+            1 if polygon.touches(point) else 2 if polygon.contains(point) else 0
+            for point in point_values
+        ],
+        dtype=np.uint8,
+    )
+    regions = from_shapely_geometries(
+        np.asarray([as_region(polygon)] * len(point_values), dtype=object),
+        residency=Residency.DEVICE,
+    )
+    points = from_shapely_geometries(
+        np.asarray(point_values, dtype=object),
+        residency=Residency.DEVICE,
+    )
+    monkeypatch.setattr(
+        "vibespatial.predicates.point_location_index._MIN_PREPARED_COORDINATES",
+        0,
+    )
+
+    prepared = prepare_polygon_part_y_index(
+        regions,
+        family,
+        _target_bin_count=64,
+    )
+    actual = classify_point_region_gpu(
+        np.arange(len(point_values), dtype=np.int32),
+        points,
+        regions,
+        region_family=family,
+    )
+
+    assert prepared is not None
+    assert prepared.coverage_grid_width == 8
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_part_y_capacity_declines_to_the_next_compiled_width(monkeypatch) -> None:
+    regions = from_shapely_geometries(
+        np.asarray([box(0, 0, 4, 4)], dtype=object),
+        residency=Residency.DEVICE,
+    )
+    monkeypatch.setattr(
+        "vibespatial.predicates.point_location_index._MIN_PREPARED_COORDINATES",
+        0,
+    )
+    runtime = get_cuda_runtime()
+    original_admit = runtime.admit_device_memory
+
+    def _decline_128(*, stage, required_bytes, requested_units=0):
+        if stage.endswith(".b128.structural"):
+            return DeviceMemoryAdmission(
+                stage=stage,
+                required_bytes=required_bytes,
+                remaining_bytes=required_bytes - 1,
+                budget_bytes=required_bytes - 1,
+                admitted=False,
+                requested_units=requested_units,
+                admitted_units=0,
+                bytes_per_unit=1,
+            )
+        return original_admit(
+            stage=stage,
+            required_bytes=required_bytes,
+            requested_units=requested_units,
+        )
+
+    monkeypatch.setattr(runtime, "admit_device_memory", _decline_128)
+    prepared = prepare_polygon_part_y_index(
+        regions,
+        GeometryFamily.POLYGON,
+        _target_bin_count=128,
+    )
+
+    assert prepared is not None
+    assert prepared.target_bin_count == 128
+    assert prepared.bin_count == 64
+    assert prepared.decline_reason is not None
+    assert "b128: structural peak" in prepared.decline_reason
+    decision = regions.device_state.point_location_index_decisions[
+        GeometryFamily.POLYGON
+    ]
+    assert decision.admitted_bin_count == 64
+    assert decision.cache_hit is False
+
+    assert (
+        prepare_polygon_part_y_index(
+            regions,
+            GeometryFamily.POLYGON,
+            _target_bin_count=128,
+        )
+        is prepared
+    )
+    assert regions.device_state.point_location_index_decisions[
+        GeometryFamily.POLYGON
+    ].cache_hit is True
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_coverage_capacity_decline_retains_exact_part_y_index(monkeypatch) -> None:
+    regions = from_shapely_geometries(
+        np.asarray([box(0, 0, 4, 4)] * 4, dtype=object),
+        residency=Residency.DEVICE,
+    )
+    points = from_shapely_geometries(
+        np.asarray(
+            [Point(1, 1), Point(0, 2), Point(5, 5), Point(3, 3)],
+            dtype=object,
+        ),
+        residency=Residency.DEVICE,
+    )
+    monkeypatch.setattr(
+        "vibespatial.predicates.point_location_index._MIN_PREPARED_COORDINATES",
+        0,
+    )
+    runtime = get_cuda_runtime()
+    original_admit = runtime.admit_device_memory
+
+    def _decline_coverage(*, stage, required_bytes, requested_units=0):
+        if stage.endswith(".coverage_grid"):
+            return DeviceMemoryAdmission(
+                stage=stage,
+                required_bytes=required_bytes,
+                remaining_bytes=required_bytes - 1,
+                budget_bytes=required_bytes - 1,
+                admitted=False,
+                requested_units=requested_units,
+                admitted_units=0,
+                bytes_per_unit=1,
+            )
+        return original_admit(
+            stage=stage,
+            required_bytes=required_bytes,
+            requested_units=requested_units,
+        )
+
+    monkeypatch.setattr(runtime, "admit_device_memory", _decline_coverage)
+    prepared = prepare_polygon_part_y_index(
+        regions,
+        GeometryFamily.POLYGON,
+        _target_bin_count=64,
+    )
+    actual = classify_point_region_gpu(
+        np.arange(4, dtype=np.int32),
+        points,
+        regions,
+        region_family=GeometryFamily.POLYGON,
+    )
+
+    assert prepared is not None
+    assert prepared.bin_count == 64
+    assert prepared.coverage_grid_width == 0
+    assert prepared.coverage is None
+    assert prepared.coverage_decline_reason is not None
+    assert actual.tolist() == [2, 1, 0, 2]
+
+
+def test_part_y_builder_has_no_width_sized_per_thread_cursor_array() -> None:
+    assert "cursors[VS_PART_Y_BIN_COUNT]" not in _POINT_LOCATION_PART_Y_INDEX_SOURCE
+    assert "atomicAdd(cursors + key, 1u)" in _POINT_LOCATION_PART_Y_INDEX_SOURCE
+    assert "count_polygon_edge_y_bin_memberships" in _POINT_LOCATION_PART_Y_INDEX_SOURCE
+    assert "initialize_polygon_part_coverage_cells" in (
+        _POINT_LOCATION_PART_Y_INDEX_SOURCE
+    )
+    assert "mark_polygon_edge_coverage_cells" in _POINT_LOCATION_PART_Y_INDEX_SOURCE
 
 
 def test_point_region_level0_packet_uses_only_host_known_structure() -> None:
@@ -257,11 +551,12 @@ def test_point_region_profile_observes_public_pair_aggregate_boundedly(
     assert len(snapshot["groups"]) == 1
     group = snapshot["groups"][0]
     assert group["family"] == "multipolygon"
+    assert group["coverage_grid_width"] == 8
     assert group["launches"] == 3
     assert group["counters"]["candidates"] == 4
     assert group["counters"]["parts_considered"] == 6
     assert group["counters"]["active_parts"] == 4
-    assert group["counters"]["edges_visited"] == 8
+    assert group["counters"]["edges_visited"] == 0
     assert group["counters"]["sample_reservations"] == 2
     assert group["counters"]["sampled_candidates"] == 2
     assert group["parts_considered_percentiles"] == {

@@ -50,6 +50,8 @@ class _ProfileGroup:
     family: str
     geometry_count: int
     part_count: int
+    bin_count: int
+    coverage_grid_width: int
     edge_membership_count: int
     index_device_bytes: int
     summary: Any
@@ -109,6 +111,15 @@ class PointRegionProfileSession:
             key,
             {
                 "family": prepared.family.value,
+                "nominal_vram_class_gib": int(prepared.nominal_vram_class_gib),
+                "target_bin_count": int(prepared.target_bin_count),
+                "admitted_bin_count": int(prepared.bin_count),
+                "coverage_grid_width": int(prepared.coverage_grid_width),
+                "coverage_decline_reason": prepared.coverage_decline_reason,
+                "decline_reason": prepared.decline_reason,
+                "edge_membership_count": int(prepared.edge_membership_count),
+                "persistent_bytes": int(prepared.device_bytes),
+                "peak_build_bytes": int(prepared.peak_build_bytes),
                 "build_count": 0,
                 "cache_hits": 0,
                 "build_wall_seconds": 0.0,
@@ -122,6 +133,15 @@ class PointRegionProfileSession:
             key,
             {
                 "family": prepared.family.value,
+                "nominal_vram_class_gib": int(prepared.nominal_vram_class_gib),
+                "target_bin_count": int(prepared.target_bin_count),
+                "admitted_bin_count": int(prepared.bin_count),
+                "coverage_grid_width": int(prepared.coverage_grid_width),
+                "coverage_decline_reason": prepared.coverage_decline_reason,
+                "decline_reason": prepared.decline_reason,
+                "edge_membership_count": int(prepared.edge_membership_count),
+                "persistent_bytes": int(prepared.device_bytes),
+                "peak_build_bytes": int(prepared.peak_build_bytes),
                 "build_count": 0,
                 "cache_hits": 0,
                 "build_wall_seconds": 0.0,
@@ -142,6 +162,8 @@ class PointRegionProfileSession:
                 family=prepared.family.value,
                 geometry_count=int(prepared.geometry_count),
                 part_count=int(prepared.part_count),
+                bin_count=int(prepared.bin_count),
+                coverage_grid_width=int(prepared.coverage_grid_width),
                 edge_membership_count=int(prepared.edge_membership_count),
                 index_device_bytes=int(prepared.device_bytes),
                 summary=cp.zeros(len(_COUNTER_NAMES), dtype=cp.uint64),
@@ -165,7 +187,7 @@ class PointRegionProfileSession:
         key = (id(prepared), prepared.family.value)
         group = self._groups[key]
         runtime = get_cuda_runtime()
-        reserve_kernel = point_location_part_y_index_profile_kernels()[
+        reserve_kernel = point_location_part_y_index_profile_kernels(prepared.bin_count)[
             "reserve_point_region_profile_samples"
         ]
         grid, block = runtime.launch_config(reserve_kernel, 1)
@@ -255,6 +277,8 @@ class PointRegionProfileSession:
                     "family": group.family,
                     "geometry_count": group.geometry_count,
                     "part_count": group.part_count,
+                    "bin_count": group.bin_count,
+                    "coverage_grid_width": group.coverage_grid_width,
                     "mean_parts_per_geometry": (
                         group.part_count / group.geometry_count
                         if group.geometry_count
@@ -262,7 +286,8 @@ class PointRegionProfileSession:
                     ),
                     "edge_membership_count": group.edge_membership_count,
                     "mean_edge_memberships_per_part_bin": (
-                        group.edge_membership_count / (group.part_count * 8)
+                        group.edge_membership_count
+                        / (group.part_count * group.bin_count)
                         if group.part_count
                         else 0.0
                     ),
@@ -285,7 +310,7 @@ class PointRegionProfileSession:
                 }
             )
         return {
-            "schema_version": 2,
+            "schema_version": 4,
             "label": self.label,
             "profile_wall_seconds": perf_counter() - self._started_at,
             "sample_limit": self.sample_limit,

@@ -17,7 +17,10 @@
 """Optimized SpatialBench implementation using public vibeSpatial APIs."""
 
 import gc
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
+import numpy as np
 import pandas as pd
 from shapely.geometry import Polygon
 
@@ -33,6 +36,12 @@ gpd.set_execution_mode(gpd.ExecutionMode.AUTO)
 
 class VibeSpatialQueries(GeoParquetPublicApiQueries):
     """Public hybrid plan selected by physical workload shape."""
+
+    _Q5_NATIVE_SPILL_GROUP_DOMAIN_THRESHOLD = 1_000_000_000
+
+    @classmethod
+    def _q5_uses_native_spill(cls, group_domain: int) -> bool:
+        return int(group_domain) >= cls._Q5_NATIVE_SPILL_GROUP_DOMAIN_THRESHOLD
 
     def _candidate_zones_for_q6(self, data_paths):
         """Apply Q6's selective zone predicate before table concatenation."""
@@ -106,6 +115,214 @@ class VibeSpatialQueries(GeoParquetPublicApiQueries):
         return (
             frame.datetime_component(column, "year") * 12
             + frame.datetime_component(column, "month")
+        )
+
+    def q5(self, data_paths):
+        """Run Q5 with a bounded, device-native partition-clustered spill.
+
+        The public workload stays on ordinary frame, sort, GeoParquet write,
+        filtered GeoParquet read, and dissolve APIs.  On vibeSpatial those
+        operations retain Native* state, so the spill uses device WKB columns
+        instead of the inherited Arrow-host partition writer.  One clustered
+        file is written per bounded scan batch and Parquet statistics prune
+        every unrelated partition during readback.
+        """
+        customer = pd.read_parquet(
+            data_paths["customer"],
+            columns=["c_custkey", "c_name"],
+        )
+        max_customer = int(customer["c_custkey"].max()) if len(customer) else -1
+        month_width = 128
+        group_domain = (max_customer + 1) * month_width
+        if not self._q5_uses_native_spill(group_domain):
+            # At SF100 (384M dense group slots), the existing Arrow-clustered
+            # spill is still materially faster. The native sink becomes the
+            # bounded plan once the group domain enters the scale where host
+            # externalization and allocator churn dominated the saved run.
+            return super().q5(data_paths)
+        group_counts = None
+        min_month = np.iinfo(np.int64).max
+        max_month = np.iinfo(np.int64).min
+
+        for trips in self._spatial_frames(
+            data_paths["trip"],
+            ["t_custkey", "t_pickuptime", "t_dropoffloc"],
+            "t_dropoffloc",
+        ):
+            month_code = self._month_code(trips, "t_pickuptime")
+            min_month = min(min_month, int(month_code.min()))
+            max_month = max(max_month, int(month_code.max()))
+            packed = trips["t_custkey"] * month_width + month_code % month_width
+            batch_counts = self.gpd.dense_count(
+                packed,
+                size=group_domain,
+                dtype=np.uint32,
+                name="dropoff_count",
+            )
+            group_counts = (
+                batch_counts if group_counts is None else group_counts + batch_counts
+            )
+            del batch_counts, month_code, packed, trips
+
+        if max_month - min_month >= month_width:
+            raise RuntimeError("Q5 month packing width is smaller than the data span")
+        eligible_count = int((group_counts > 5).sum())
+        if eligible_count == 0:
+            return pd.DataFrame(
+                columns=[
+                    "c_custkey",
+                    "customer_name",
+                    "pickup_month",
+                    "monthly_travel_hull_area",
+                    "dropoff_count",
+                ]
+            )
+
+        groups_per_partition = 4_000_000
+        required_partitions = max(
+            1,
+            int(np.ceil(eligible_count / groups_per_partition)),
+        )
+        partition_count = min(
+            1 << int(np.ceil(np.log2(required_partitions))),
+            64,
+        )
+        source_columns = ["t_custkey", "t_pickuptime", "t_dropoffloc"]
+        spill_columns = [
+            "t_custkey",
+            "_month_code",
+            "t_dropoffloc",
+            "_q5_partition",
+        ]
+        candidate_parts = []
+
+        with TemporaryDirectory(prefix="spatialbench-q5-native-") as temporary:
+            temporary_path = Path(temporary)
+            spill_path = temporary_path / "q5-clustered.parquet"
+
+            def _selected_batches():
+                for trips in self._spatial_frames(
+                    data_paths["trip"], source_columns, "t_dropoffloc"
+                ):
+                    month_code = self._month_code(trips, "t_pickuptime")
+                    trips = trips.assign(_month_code=month_code)
+                    packed = (
+                        trips["t_custkey"] * month_width
+                        + trips["_month_code"] % month_width
+                    )
+                    row_counts = self.gpd.numeric_take(group_counts, packed)
+                    mask = row_counts > 5
+                    selected = trips.loc[mask]
+                    if selected.empty:
+                        del mask, month_code, packed, row_counts, selected, trips
+                        continue
+                    selected = selected.assign(
+                        _q5_partition=selected["t_custkey"] % partition_count,
+                    )[spill_columns].reset_index(drop=True)
+                    yield selected
+                    del mask, month_code, packed, row_counts, selected, trips
+
+            self.gpd.write_geoparquet(
+                _selected_batches(),
+                spill_path,
+                index=False,
+                geometry_encoding="WKB",
+                partition_column="_q5_partition",
+                partition_count=partition_count,
+                max_row_group_rows=1_000_000,
+                row_group_size=1_000_000,
+            )
+
+            partition_columns = [
+                "t_custkey",
+                "_month_code",
+                "t_dropoffloc",
+            ]
+            for partition in range(partition_count):
+                partition_frame = self.gpd.read_parquet(
+                    spill_path,
+                    columns=partition_columns,
+                    filters=[("_q5_partition", "=", partition)],
+                ).set_geometry("t_dropoffloc")
+                if partition_frame.empty:
+                    del partition_frame
+                    continue
+                dissolved = partition_frame.dissolve(
+                    by=["t_custkey", "_month_code"],
+                    method="unary",
+                )
+                rank_source = dissolved.assign(
+                    monthly_travel_hull_area=dissolved.geometry.convex_hull.area,
+                ).drop(columns=dissolved.geometry.name)
+                ranked = rank_source.nlargest(100, ["monthly_travel_hull_area"])
+                candidate_parts.append(
+                    pd.DataFrame(
+                        {
+                            "t_custkey": ranked.index.get_level_values(
+                                "t_custkey"
+                            ).to_numpy(dtype=np.int64),
+                            "pickup_month_code": ranked.index.get_level_values(
+                                "_month_code"
+                            ).to_numpy(dtype=np.int64),
+                            "monthly_travel_hull_area": ranked[
+                                "monthly_travel_hull_area"
+                            ].to_numpy(dtype=np.float64),
+                        }
+                    )
+                )
+                del dissolved, partition_frame, ranked
+
+        if not candidate_parts:
+            return pd.DataFrame(
+                columns=[
+                    "c_custkey",
+                    "customer_name",
+                    "pickup_month",
+                    "monthly_travel_hull_area",
+                    "dropoff_count",
+                ]
+            )
+        result = (
+            pd.concat(candidate_parts, ignore_index=True)
+            .sort_values(
+                ["monthly_travel_hull_area", "t_custkey", "pickup_month_code"],
+                ascending=[False, True, True],
+            )
+            .head(100)
+        )
+        month_codes = result.pop("pickup_month_code").to_numpy(dtype=np.int64)
+        customer_keys = result["t_custkey"].to_numpy(dtype=np.int64)
+        top_group_codes = pd.Series(
+            customer_keys * month_width + month_codes % month_width,
+        )
+        result["dropoff_count"] = self.gpd.numeric_take(
+            group_counts,
+            top_group_codes,
+        ).to_numpy(dtype=np.int64)
+        years, months = np.divmod(month_codes - 1, 12)
+        result["pickup_month"] = pd.to_datetime(
+            pd.DataFrame({"year": years, "month": months + 1, "day": 1})
+        ).to_numpy()
+        customer_names = customer.set_index("c_custkey")["c_name"]
+        result["c_custkey"] = customer_keys
+        result["c_name"] = customer_names.reindex(customer_keys).to_numpy()
+        result = result[result["c_name"].notna()]
+        return (
+            result.sort_values(
+                ["monthly_travel_hull_area", "c_custkey", "pickup_month"],
+                ascending=[False, True, True],
+            )[
+                [
+                    "c_custkey",
+                    "c_name",
+                    "pickup_month",
+                    "monthly_travel_hull_area",
+                    "dropoff_count",
+                ]
+            ]
+            .rename(columns={"c_name": "customer_name"})
+            .head(100)
+            .reset_index(drop=True)
         )
 
     def _topk_frame(self, frame, k, *, by, ascending):

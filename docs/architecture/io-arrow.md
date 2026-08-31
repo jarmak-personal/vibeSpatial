@@ -5,7 +5,7 @@ Scope: Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and 
 Read If: You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.
 STOP IF: Your task already has the specific IO adapter open and only needs local implementation detail.
 Source Of Truth: IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.
-Body Budget: 258/260 lines
+Body Budget: 260/260 lines
 Document: docs/architecture/io-arrow.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 32-37 | Risks |
 | 38-53 | Decision |
 | 54-75 | Performance Notes |
-| 76-220 | Current Behavior |
-| 221-258 | Measured Local Baseline |
+| 76-222 | Current Behavior |
+| 223-260 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -213,6 +213,11 @@ geometry buffers while keeping GPU-native formats as the design center.
 - The `pylibcudf` GeoParquet device path now also decodes canonical WKB point,
   linestring, polygon, multipoint, multilinestring, and multipolygon columns
   into device-resident owned buffers without a Shapely round-trip.
+- Legacy binary-WKB Parquet can be transcoded metadata-only to GeoParquet 1.1:
+  pylibcudf preserves typed columns/WKB while adding geometry and CRS metadata.
+- `NativePartitionedParquetSink` orders bounded device-clustered batches onto one
+  writer stream; its file-identity-bound sidecar routes equality reads to exact row groups.
+  Empty filtered WKB scans synthesize device offsets instead of using the host decoder.
 - Mixed canonical WKB columns now keep the same GPU-first contract too:
   point-only, linestring-only, and point/linestring columns still use the
   lightweight `pylibcudf` helpers, while heavier or broader family mixes route
@@ -221,13 +226,10 @@ geometry buffers while keeping GPU-native formats as the design center.
   big-endian 2D records, EWKB SRID-annotated 2D rows, Z/M/ZM or other non-2D
   type ids, and families outside the owned native result model now classify
   into explicit compatibility buckets instead of silently hiding a host decode.
-- Repo-owned native GeoArrow codecs now provide family-specialized encode and
-  decode for homogeneous geometry columns:
+- Repo-owned native GeoArrow codecs provide family-specialized homogeneous IO:
   - point, linestring, polygon, multilinestring, and multipolygon extension
     arrays decode through dedicated family builders
-  - device-backed homogeneous exports now rebuild public Arrow arrays directly
-    from the repo-owned device codec instead of routing through the generic host
-    bridge first
+  - device-backed homogeneous exports rebuild Arrow arrays from the device codec
   - low-level/native-tabular unsupported host- and device-backed mixes drop to
     the repo-owned WKB bridge instead of forcing `construct_wkb_array(...)`
   - public unsupported mixed GeoArrow exports preserve GeoPandas `ValueError`

@@ -1059,6 +1059,8 @@ def sort_pairs(
     strategy: PairSortStrategy | str = PairSortStrategy.AUTO,
     synchronize: bool = False,
     stream=None,
+    out_keys: DeviceArray | None = None,
+    out_values: DeviceArray | None = None,
 ) -> PairSortResult:
     cp_module, cccl_algorithms = _require_cccl_primitives()
     stream = _effective_stream(cp_module, stream)
@@ -1070,8 +1072,21 @@ def sort_pairs(
 
     val_dtype = values.dtype if values is not None else np.dtype(np.int32)
     resolved = select_pair_sort_strategy(keys.dtype, val_dtype, strategy=strategy)
-    out_keys = cp_module.empty_like(keys)
-    out_values = None if values is None else cp_module.empty_like(values)
+    if out_keys is None:
+        out_keys = cp_module.empty_like(keys)
+    else:
+        _validate_vector("out_keys", out_keys)
+        if out_keys.shape != keys.shape or out_keys.dtype != keys.dtype:
+            raise ValueError("out_keys must match keys shape and dtype")
+    if values is None:
+        if out_values is not None:
+            raise ValueError("out_values requires values")
+    elif out_values is None:
+        out_values = cp_module.empty_like(values)
+    else:
+        _validate_vector("out_values", out_values)
+        if out_values.shape != values.shape or out_values.dtype != values.dtype:
+            raise ValueError("out_values must match values shape and dtype")
     item_count = int(keys.size)
     if item_count == 0:
         return PairSortResult(keys=out_keys, values=out_values, strategy=resolved)
@@ -1083,8 +1098,9 @@ def sort_pairs(
                 idx = cp_module.argsort(-keys)
             else:
                 idx = cp_module.argsort(keys)
-            out_keys = keys[idx]
-            out_values = values[idx] if values is not None else None
+            cp_module.take(keys, idx, out=out_keys)
+            if values is not None:
+                cp_module.take(values, idx, out=out_values)
         if synchronize:
             _stream_synchronize(cp_module, stream)
         return PairSortResult(keys=out_keys, values=out_values, strategy=resolved)

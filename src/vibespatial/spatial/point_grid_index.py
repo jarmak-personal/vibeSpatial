@@ -603,7 +603,12 @@ def _point_grid_query_counts(prepared, bounds):
     return bounds, counts
 
 
-def point_grid_relation_superset_query(native_index, query_bounds):
+def point_grid_relation_superset_query(
+    native_index,
+    query_bounds,
+    *,
+    candidate_output=None,
+):
     """Materialize one admitted full relation candidate superset.
 
     Relation-producing public APIs are pair-shaped by contract.  They retain a
@@ -699,7 +704,11 @@ def point_grid_relation_superset_query(native_index, query_bounds):
         pair_budget=total_pairs,
         relation_admission=relation_admission,
     )
-    candidates = point_grid_superset_query(native_index, next(plan.slices()))
+    candidates = point_grid_superset_query(
+        native_index,
+        next(plan.slices()),
+        candidate_output=candidate_output,
+    )
     retain_point_partition_completion(native_index, prepared, plan, bounds, counts)
     return candidates, None
 
@@ -707,6 +716,8 @@ def point_grid_relation_superset_query(native_index, query_bounds):
 def point_grid_superset_query(
     native_index,
     query_slice: PointPartitionQuerySlice,
+    *,
+    candidate_output=None,
 ) -> _DeviceCandidates | None:
     """Return cell-conservative pairs for immediate exact refinement."""
     prepared = query_slice.plan.prepared
@@ -751,6 +762,7 @@ def point_grid_superset_query(
     query_cursors = None
     out_left = None
     out_right = None
+    workspace_owned_output = candidate_output is not None
     kernels = point_grid_index_kernels()
     ptr = runtime.pointer
     try:
@@ -760,8 +772,25 @@ def point_grid_superset_query(
                 pair_capacity,
                 relation_name="capacity-backed point-grid candidate tile",
             )
-        out_left = cp.zeros(pair_capacity, dtype=cp.int32)
-        out_right = cp.zeros(pair_capacity, dtype=cp.int32)
+        if workspace_owned_output:
+            out_left, out_right = candidate_output(pair_capacity)
+            out_left = cp.asarray(out_left)
+            out_right = cp.asarray(out_right)
+            if (
+                out_left.dtype != cp.int32
+                or out_right.dtype != cp.int32
+                or int(out_left.size) < pair_capacity
+                or int(out_right.size) < pair_capacity
+            ):
+                raise ValueError(
+                    "point-grid candidate output requires int32 buffers with "
+                    "at least the sealed pair capacity"
+                )
+            out_left = out_left[:pair_capacity]
+            out_right = out_right[:pair_capacity]
+        else:
+            out_left = cp.empty(pair_capacity, dtype=cp.int32)
+            out_right = cp.empty(pair_capacity, dtype=cp.int32)
         total_pairs = pair_capacity
         if total_pairs == 0:
             return _DeviceCandidates(
@@ -836,14 +865,16 @@ def point_grid_superset_query(
             out_left,
             out_right,
         )
-        out_left = None
-        out_right = None
+        if not workspace_owned_output:
+            out_left = None
+            out_right = None
         return result
     finally:
         runtime.free(query_offsets)
         runtime.free(query_cursors)
-        runtime.free(out_left)
-        runtime.free(out_right)
+        if not workspace_owned_output:
+            runtime.free(out_left)
+            runtime.free(out_right)
 
 
 def point_grid_query_row_partitions(

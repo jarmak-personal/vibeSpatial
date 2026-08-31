@@ -938,10 +938,12 @@ def test_point_grid_superset_is_exactly_refined_before_public_export(monkeypatch
     assert {
         key.variant for key in native_index.point_partition_cache
     } == {point_grid_index.PointPartitionVariant.GRID}
-    assert set(query_owned.device_state.point_location_indexes) == {
+    prepared_keys = set(query_owned.device_state.point_location_indexes)
+    assert {key.family for key in prepared_keys} == {
         GeometryFamily.POLYGON,
         GeometryFamily.MULTIPOLYGON,
     }
+    assert {key.bin_count for key in prepared_keys} == {64}
     assert "point-grid relation candidate allocation fence" in reasons
     assert not any("candidate" in reason and "host export" in reason for reason in reasons)
     assert "runtime.synchronize" not in inspect.getsource(
@@ -1254,12 +1256,20 @@ def test_point_grid_clamps_extreme_finite_query_before_normalization(
     assert decline is None
     assert plan is not None
     assert cp.asnumpy(plan.query_counts).tolist() == [2]
+    output_left = cp.empty(2, dtype=cp.int32)
+    output_right = cp.empty(2, dtype=cp.int32)
     candidates = point_grid_index.point_grid_superset_query(
         native_index,
         next(plan.slices()),
+        candidate_output=lambda capacity: (
+            output_left[:capacity],
+            output_right[:capacity],
+        ),
     )
     assert candidates is not None
     candidates.validate_error_flag()
+    assert candidates.d_left.data.ptr == output_left.data.ptr
+    assert candidates.d_right.data.ptr == output_right.data.ptr
     assert sorted(cp.asnumpy(candidates.d_right).tolist()) == [0, 1]
 
 

@@ -1583,10 +1583,22 @@ def _decode_pylibcudf_wkb_device_pipeline_column_to_owned(column) -> OwnedGeomet
     from vibespatial.kernels.core.wkb_decode import decode_wkb_device_pipeline
 
     _require_pylibcudf_zero_offset(column, "WKB")
+    row_count = int(column.size())
+    if row_count == 0:
+        import cupy as cp
+
+        # libcudf is allowed to omit the strings offsets child for an empty
+        # filtered result. The decoder still needs the canonical empty
+        # ``[0]`` offsets carrier, but no host materialization is required.
+        return decode_wkb_device_pipeline(
+            cp.empty(0, dtype=cp.uint8),
+            cp.zeros(1, dtype=cp.int32),
+            0,
+        )
     return decode_wkb_device_pipeline(
         _pylibcudf_wkb_payload(column),
         _pylibcudf_wkb_offsets(column),
-        int(column.size()),
+        row_count,
     )
 
 

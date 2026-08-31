@@ -69,4 +69,5 @@ examples/data/
 cuda-learnings/
 
 # Audit reports
-reports/
+reports/*
+!reports/SF1000-optimization.md

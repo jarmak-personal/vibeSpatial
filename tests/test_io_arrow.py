@@ -3596,6 +3596,426 @@ def test_read_geoparquet_table_with_pylibcudf_preserves_source_schema(tmp_path) 
     assert arrow_table.schema.field(0).type.num_fields == 2
 
 
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU pylibcudf runtime unavailable",
+)
+def test_legacy_wkb_transcode_preserves_complete_table_and_adds_geoparquet_metadata(
+    tmp_path,
+) -> None:
+    import json
+
+    import pyarrow.parquet as pq
+    import shapely
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    source_path = tmp_path / "legacy-wkb.parquet"
+    output_path = tmp_path / "wkb-geoparquet.parquet"
+    pickup = pa.array(
+        [
+            shapely.to_wkb(Point(0, 0)),
+            None,
+            shapely.to_wkb(Point(2, 2)),
+        ],
+        type=pa.binary(),
+    )
+    dropoff = pa.array(
+        [
+            shapely.to_wkb(Point(3, 3)),
+            shapely.to_wkb(Point(4, 4)),
+            None,
+        ],
+        type=pa.binary(),
+    )
+    tags = pa.array(
+        [[{"key": "a", "value": "1"}], None, []],
+        type=pa.list_(pa.struct([pa.field("key", pa.string()), pa.field("value", pa.string())])),
+    )
+    source_table = pa.Table.from_arrays(
+        [
+            pa.array([30, 10, 20], type=pa.int64()),
+            pickup,
+            dropoff,
+            pa.array([1.5, None, -3.0], type=pa.float64()),
+            tags,
+        ],
+        names=["id", "pickup", "dropoff", "value", "tags"],
+    ).replace_schema_metadata({b"source-contract": b"preserve-me"})
+    pq.write_table(source_table, source_path, row_group_size=2)
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    result = io_geoparquet.transcode_legacy_wkb_parquet_to_geoparquet(
+        source_path,
+        output_path,
+        geometry_columns={
+            "pickup": {"crs": "EPSG:4326", "geometry_types": ["Point"]},
+            "dropoff": {"crs": "EPSG:4326", "geometry_types": ["Point"]},
+        },
+        primary_geometry="pickup",
+        row_group_size=2,
+    )
+    transfers = get_d2h_transfer_events(clear=True)
+
+    output_table = pq.read_table(output_path)
+    output_schema = pq.read_schema(output_path)
+    geo_metadata = json.loads(output_schema.metadata[b"geo"])
+    assert result.row_count == 3
+    assert result.column_count == 5
+    assert result.geometry_columns == ("pickup", "dropoff")
+    assert transfers == []
+    assert output_table.column_names == source_table.column_names
+    for column_name in source_table.column_names:
+        assert output_table[column_name].to_pylist() == source_table[column_name].to_pylist()
+        assert output_schema.field(column_name).type == source_table.schema.field(column_name).type
+    assert output_schema.metadata[b"source-contract"] == b"preserve-me"
+    assert geo_metadata["version"] == "1.1.0"
+    assert geo_metadata["primary_column"] == "pickup"
+    assert set(geo_metadata["columns"]) == {"pickup", "dropoff"}
+    assert geo_metadata["columns"]["pickup"]["encoding"] == "WKB"
+    assert geo_metadata["columns"]["pickup"]["geometry_types"] == ["Point"]
+    assert geo_metadata["columns"]["pickup"]["crs"]["id"] == {
+        "authority": "EPSG",
+        "code": 4326,
+    }
+    for geometry_name in ("pickup", "dropoff"):
+        field_metadata = output_schema.field(geometry_name).metadata
+        assert field_metadata[b"ARROW:extension:name"] == b"geoarrow.wkb"
+
+    public = geopandas.read_parquet(output_path)
+    assert public.geometry.name == "pickup"
+    assert public.crs.to_epsg() == 4326
+    assert public["pickup"].isna().tolist() == [False, True, False]
+    assert public["dropoff"].isna().tolist() == [False, False, True]
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU pylibcudf runtime unavailable",
+)
+def test_native_partitioned_parquet_sink_clusters_and_pushes_partition_row_groups(
+    tmp_path,
+) -> None:
+    import json
+
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+    import pylibcudf as plc
+    import shapely
+
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    path = tmp_path / "clustered-spill.parquet"
+    geometry_field = pa.field(
+        "geometry",
+        pa.binary(),
+        metadata={
+            b"ARROW:extension:name": b"geoarrow.wkb",
+            b"ARROW:extension:metadata": b"{}",
+        },
+    )
+    schema = pa.schema(
+        [
+            pa.field("row_id", pa.int64(), nullable=False),
+            pa.field("partition", pa.int32(), nullable=False),
+            geometry_field,
+            pa.field("value", pa.float64()),
+            pa.field("label", pa.string()),
+        ],
+        metadata={
+            b"geo": json.dumps(
+                {
+                    "version": "1.1.0",
+                    "primary_column": "geometry",
+                    "columns": {
+                        "geometry": {
+                            "encoding": "WKB",
+                            "crs": None,
+                            "geometry_types": ["Point"],
+                        }
+                    },
+                }
+            ).encode()
+        },
+    )
+    batches = [
+        pa.Table.from_arrays(
+            [
+                pa.array([10, 11, 12, 13], type=pa.int64()),
+                pa.array([2, 0, 1, 2], type=pa.int32()),
+                pa.array(
+                    [shapely.to_wkb(Point(value, value)) for value in range(4)],
+                    type=pa.binary(),
+                ),
+                pa.array([1.0, None, 3.0, 4.0], type=pa.float64()),
+                pa.array(["a", "b", None, "d"], type=pa.string()),
+            ],
+            schema=schema,
+        ),
+        pa.Table.from_arrays(
+            [
+                pa.array([20, 21, 22, 23], type=pa.int64()),
+                pa.array([1, 0, 2, 0], type=pa.int32()),
+                pa.array(
+                    [shapely.to_wkb(Point(value, -value)) for value in range(4, 8)],
+                    type=pa.binary(),
+                ),
+                pa.array([5.0, 6.0, None, 8.0], type=pa.float64()),
+                pa.array(["e", None, "g", "h"], type=pa.string()),
+            ],
+            schema=schema,
+        ),
+    ]
+    device_tables = []
+    for batch_index, batch in enumerate(batches):
+        device_geometry = from_shapely_geometries(
+            [
+                Point(value, value if batch_index == 0 else -value)
+                for value in range(batch_index * 4, batch_index * 4 + 4)
+            ],
+            residency=Residency.DEVICE,
+        )
+        device_tables.append(
+            plc.Table(
+                [
+                    plc.Column.from_arrow(batch["row_id"].combine_chunks()),
+                    plc.Column.from_arrow(batch["partition"].combine_chunks()),
+                    io_wkb._encode_owned_wkb_column_device(device_geometry),
+                    plc.Column.from_arrow(batch["value"].combine_chunks()),
+                    plc.Column.from_arrow(batch["label"].combine_chunks()),
+                ]
+            )
+        )
+
+    reset_d2h_transfer_count()
+    get_d2h_transfer_events(clear=True)
+    sink = io_geoparquet.NativePartitionedParquetSink(
+        path,
+        arrow_schema=schema,
+        partition_column="partition",
+        partition_count=3,
+        max_row_group_rows=2,
+    )
+    for device_table in device_tables:
+        sink.append(device_table)
+    layout = sink.close()
+    transfers = get_d2h_transfer_events(clear=True)
+
+    expected_by_partition = {
+        partition: pa.concat_tables(batches).filter(
+            pc.equal(
+                pa.concat_tables(batches)["partition"],
+                pa.scalar(partition, type=pa.int32()),
+            )
+        )
+        for partition in range(3)
+    }
+    assert transfers == []
+    assert layout.row_count == 8
+    assert path.is_file()
+    assert layout.manifest_path.is_file()
+    assert pq.ParquetFile(path).num_row_groups == len(layout.segments)
+    assert pq.read_schema(path).names == schema.names
+    assert sum(segment.row_count for segment in layout.segments) == 8
+    for partition, expected in expected_by_partition.items():
+        selected_device = io_geoparquet.read_native_partitioned_parquet_partitions(
+            path,
+            [partition],
+            columns=["row_id", "partition"],
+        ).to_arrow()
+        assert selected_device.column(0).to_pylist() == expected["row_id"].to_pylist()
+        assert selected_device.column(1).to_pylist() == expected[
+            "partition"
+        ].to_pylist()
+        selected = pq.ParquetFile(path).read_row_groups(
+            list(layout.row_groups_for([partition]))
+        )
+        for column_name in expected.column_names:
+            assert selected[column_name].to_pylist() == expected[column_name].to_pylist()
+
+
+@pytest.mark.gpu
+def test_native_partitioned_parquet_sink_orders_cross_stream_batches(tmp_path) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        pytest.skip("pylibcudf and a GPU runtime are required")
+
+    import cupy as cp
+    import pyarrow.parquet as pq
+    import pylibcudf as plc
+
+    from vibespatial.cuda._runtime import pylibcudf_column_from_device
+
+    delay = cp.RawKernel(
+        r'''
+        extern "C" __global__ void partition_sink_delay(unsigned long long ticks) {
+            unsigned long long start = clock64();
+            while (clock64() - start < ticks) {}
+        }
+        ''',
+        "partition_sink_delay",
+    )
+    path = tmp_path / "cross-stream-clustered.parquet"
+    schema = pa.schema(
+        [
+            pa.field("row_id", pa.int64(), nullable=False),
+            pa.field("partition", pa.int32(), nullable=False),
+        ]
+    )
+    writer_stream = cp.cuda.Stream(non_blocking=True)
+    producer_stream = cp.cuda.Stream(non_blocking=True)
+    blocker_stream = cp.cuda.Stream(non_blocking=True)
+    sink = io_geoparquet.NativePartitionedParquetSink(
+        path,
+        arrow_schema=schema,
+        partition_column="partition",
+        partition_count=2,
+    )
+
+    with writer_stream:
+        first = plc.Table(
+            [
+                pylibcudf_column_from_device(
+                    cp.asarray([10, 11], dtype=cp.int64)
+                ),
+                pylibcudf_column_from_device(
+                    cp.asarray([0, 1], dtype=cp.int32)
+                ),
+            ]
+        )
+        sink.append(first)
+
+    ready = cp.cuda.Event(disable_timing=True)
+    delayed_rows = cp.zeros(2, dtype=cp.int64)
+    delayed_partitions = cp.zeros(2, dtype=cp.int32)
+    with blocker_stream:
+        delay((1,), (1,), (100_000_000,))
+        ready.record(blocker_stream)
+    with producer_stream:
+        producer_stream.wait_event(ready)
+        cp.copyto(delayed_rows, cp.asarray([20, 21], dtype=cp.int64))
+        cp.copyto(delayed_partitions, cp.asarray([1, 0], dtype=cp.int32))
+        second = plc.Table(
+            [
+                pylibcudf_column_from_device(delayed_rows),
+                pylibcudf_column_from_device(delayed_partitions),
+            ]
+        )
+        sink.append(second)
+
+    sink.close()
+    result = pq.read_table(path)
+    assert result["row_id"].to_pylist() == [10, 11, 21, 20]
+    assert result["partition"].to_pylist() == [0, 1, 0, 1]
+
+
+def test_clustered_partition_manifest_rejects_replaced_parquet_file(tmp_path) -> None:
+    import json
+
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "replaced-clustered.parquet"
+    pq.write_table(pa.table({"partition": [0], "value": [1]}), path)
+    manifest_path = path.with_suffix(".parquet.partitions.json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "file": path.name,
+                "file_identity": io_geoparquet._native_partition_file_identity(path),
+                "partition_column": "partition",
+                "partition_count": 1,
+                "row_count": 1,
+                "segments": [
+                    {
+                        "partition": 0,
+                        "row_group": 0,
+                        "batch": 0,
+                        "row_count": 1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    pq.write_table(pa.table({"partition": [0], "value": [999]}), path)
+
+    with pytest.raises(ValueError, match="does not match"):
+        io_geoparquet.load_native_partitioned_parquet_layout(path)
+    assert io_geoparquet._clustered_partition_filter_row_groups(
+        path,
+        [("partition", "=", 0)],
+    ) is None
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU pylibcudf runtime unavailable",
+)
+def test_public_partitioned_geoparquet_batches_use_one_native_clustered_file(
+    tmp_path,
+) -> None:
+    from vibespatial.testing import strict_native_environment
+
+    batches = []
+    for start in (0, 4):
+        batch, _ = _make_device_dga_gdf(
+            [Point(value, -value) for value in range(start, start + 4)]
+        )
+        batch["value"] = np.arange(start, start + 4, dtype=np.int64)
+        batch["partition"] = np.asarray([0, 1, 0, 1], dtype=np.int64)
+        batches.append(batch[["value", "partition", "geometry"]])
+
+    path = tmp_path / "public-clustered-spill.parquet"
+    geopandas.clear_fallback_events()
+    with strict_native_environment():
+        write_geoparquet(
+            iter(batches),
+            path,
+            index=False,
+            geometry_encoding="WKB",
+            partition_column="partition",
+            partition_count=2,
+            max_row_group_rows=2,
+            row_group_size=2,
+        )
+        selected = geopandas.read_parquet(
+            path,
+            columns=["value", "partition", "geometry"],
+            filters=[("partition", "=", 1)],
+        )
+
+    assert path.is_file()
+    assert path.with_suffix(".parquet.partitions.json").is_file()
+    assert selected["value"].tolist() == [1, 3, 5, 7]
+    assert selected["partition"].tolist() == [1, 1, 1, 1]
+    assert geopandas.get_fallback_events(clear=True) == []
+
+    replacement, _ = _make_device_dga_gdf([Point(100, 100), Point(101, 101)])
+    replacement["value"] = np.asarray([100, 101], dtype=np.int64)
+    replacement["partition"] = np.asarray([1, 1], dtype=np.int64)
+    write_geoparquet(
+        replacement[["value", "partition", "geometry"]],
+        path,
+        index=False,
+        geometry_encoding="WKB",
+    )
+    assert not path.with_suffix(".parquet.partitions.json").exists()
+    overwritten = geopandas.read_parquet(
+        path,
+        columns=["value", "partition", "geometry"],
+        filters=[("partition", "=", 1)],
+    )
+    assert overwritten["value"].tolist() == [100, 101]
+
+
 def test_read_geoparquet_table_with_pylibcudf_disables_unneeded_schema_metadata() -> None:
     calls: list[tuple[str, object]] = []
 
@@ -6210,6 +6630,30 @@ def test_write_geoparquet_device_wkb_has_no_transfer_or_materialization(tmp_path
     assert result.geometry.iloc[3].equals(Point(3, 6))
     assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.TRANSFER] == []
     assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.MATERIALIZATION] == []
+
+
+def test_read_geoparquet_empty_filtered_wkb_stays_strict_native(tmp_path) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    from vibespatial.testing import strict_native_environment
+
+    gdf, _ = _make_device_dga_gdf([Point(0, 0), Point(1, 1)])
+    gdf["partition"] = [0, 1]
+    path = tmp_path / "empty-filtered-wkb.parquet"
+    write_geoparquet(gdf, path, geometry_encoding="WKB", index=False)
+    geopandas.clear_fallback_events()
+
+    with strict_native_environment():
+        result = geopandas.read_parquet(
+            path,
+            columns=["partition", "geometry"],
+            filters=[("partition", "=", 2)],
+        )
+
+    assert result.empty
+    assert get_native_state(result) is not None
+    assert geopandas.get_fallback_events(clear=True) == []
 
 
 def test_read_parquet_pylibcudf_keeps_device_geometry_unmaterialized(tmp_path) -> None:

@@ -3935,6 +3935,63 @@ def test_sindex_query_pair_aggregate_reduces_candidate_tiles_before_export(
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_component_parent_packed_keys_remain_exact_above_fp64_integer_range() -> None:
+    cp = pytest.importorskip("cupy")
+    from vibespatial.spatial import component_parent_reduction
+
+    point_rows = cp.asarray([3_900_000, 3_900_000], dtype=cp.int32)
+    component_rows = cp.asarray([12_345, 12_346], dtype=cp.int32)
+    parents = cp.asarray([999_999, 999_999], dtype=cp.uint64)
+    parent_keys = cp.empty(2, dtype=cp.uint64)
+    ordered_keys = cp.empty(2, dtype=cp.uint64)
+
+    component_parent_reduction._write_component_parent_ordered_keys(
+        point_rows,
+        component_rows,
+        parents,
+        parent_count=1_000_000,
+        component_capacity=3_000_000,
+        parent_keys=parent_keys,
+        ordered_keys=ordered_keys,
+    )
+
+    expected = [
+        ((3_900_000 * 1_000_000 + 999_999) * 3_000_000 + component)
+        for component in (12_345, 12_346)
+    ]
+    assert expected[0] > 2**53
+    assert ordered_keys.get().tolist() == expected
+
+
+def test_component_parent_workspace_admission_only_charges_persistent_growth() -> None:
+    from vibespatial.spatial import component_parent_reduction
+
+    assert component_parent_reduction._parent_key_admission_bytes(
+        capacity=100,
+        persistent_capacity=0,
+    ) == 100 * 160
+    assert component_parent_reduction._parent_key_admission_bytes(
+        capacity=100,
+        persistent_capacity=100,
+    ) == 100 * 103
+    assert component_parent_reduction._parent_key_admission_bytes(
+        capacity=150,
+        persistent_capacity=100,
+    ) == 150 * 103 + 50 * 57
+
+    assert component_parent_reduction._reduction_admission_bytes(
+        tree_count=100,
+        persistent_tree_capacity=0,
+        candidate_capacity=25,
+    ) == 100 * 48 + 25 * 64
+    assert component_parent_reduction._reduction_admission_bytes(
+        tree_count=100,
+        persistent_tree_capacity=100,
+        candidate_capacity=25,
+    ) == 100 * 24 + 25 * 64
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
 @pytest.mark.parametrize("predicate", ["contains", "contains_properly"])
 def test_sindex_query_pair_aggregate_component_parent_matches_distinct_parts(
     tmp_path,
@@ -3946,6 +4003,7 @@ def test_sindex_query_pair_aggregate_component_parent_matches_distinct_parts(
     from vibespatial.api import GeoDataFrame, GeoSeries, points_from_xy, read_parquet
     from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
     from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+    from vibespatial.runtime.hotpath_trace import get_hotpath_trace, reset_hotpath_trace
     from vibespatial.spatial import component_parent_reduction
 
     source = GeoDataFrame(
@@ -3983,9 +4041,11 @@ def test_sindex_query_pair_aggregate_component_parent_matches_distinct_parts(
         "_COMPONENT_PARENT_MIN_AVERAGE_EXTRA_PART_LANES",
         0,
     )
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "timing")
 
     clear_dispatch_events()
     clear_fallback_events()
+    reset_hotpath_trace()
     result = pickup.sindex.query_pair_aggregate(
         dropoff.sindex,
         zones,
@@ -4005,6 +4065,32 @@ def test_sindex_query_pair_aggregate_component_parent_matches_distinct_parts(
         in event.implementation
         for event in dispatch
     )
+    timed_stages = {
+        stage.name: stage.metadata
+        for stage in get_hotpath_trace()
+        if stage.name.startswith("spatial.component_parent.")
+    }
+    expected_timed_stages = {
+        f"spatial.component_parent.{side}.{stage}"
+        for side in ("left", "right")
+        for stage in (
+            "candidate_generation",
+            "exact_classification",
+            "parent_key_construction",
+            "radix_sort",
+            "deduplication",
+        )
+    }
+    assert expected_timed_stages <= timed_stages.keys()
+    assert "spatial.component_parent.pair_intersection_reduce" in timed_stages
+    for stage_name in (
+        *expected_timed_stages,
+        "spatial.component_parent.pair_intersection_reduce",
+    ):
+        assert timed_stages[stage_name]["gpu_timing_source"] == (
+            "cuda_event_non_overlapping"
+        )
+        assert timed_stages[stage_name]["gpu_event_elapsed_seconds"] >= 0.0
     cached = getattr(
         zones.array._owned,
         "_component_parent_capacity_cache",
@@ -4012,6 +4098,15 @@ def test_sindex_query_pair_aggregate_component_parent_matches_distinct_parts(
     )
     assert cached is not None
     first_components = cached.geometry
+    workspace = zones.array._owned._component_parent_workspace
+    first_workspace_buffers = {
+        side: {
+            name: id(values)
+            for name, values in getattr(workspace, side).buffers.items()
+        }
+        for side in ("left", "right")
+    }
+    first_reduction_counts = tuple(id(values) for values in workspace.reduction_counts)
     repeated = pickup.sindex.query_pair_aggregate(
         dropoff.sindex,
         zones,
@@ -4021,6 +4116,16 @@ def test_sindex_query_pair_aggregate_component_parent_matches_distinct_parts(
     assert (
         zones.array._owned._component_parent_capacity_cache.geometry
         is first_components
+    )
+    assert {
+        side: {
+            name: id(values)
+            for name, values in getattr(workspace, side).buffers.items()
+        }
+        for side in ("left", "right")
+    } == first_workspace_buffers
+    assert tuple(id(values) for values in workspace.reduction_counts) == (
+        first_reduction_counts
     )
 
 

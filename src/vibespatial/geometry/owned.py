@@ -659,7 +659,10 @@ class OwnedGeometryDeviceState:
     trusted_polygonal_only: bool | None = None
     trusted_unique_family_rows: bool | None = None
     trusted_family_domain: tuple[GeometryFamily, ...] | None = None
-    point_location_indexes: dict[GeometryFamily, Any] = field(default_factory=dict)
+    point_location_indexes: dict[Any, Any] = field(default_factory=dict)
+    point_location_index_decisions: dict[GeometryFamily, Any] = field(
+        default_factory=dict
+    )
     polygon_certificates: dict[tuple[str, GeometryFamily, int], Any] = field(
         default_factory=dict
     )

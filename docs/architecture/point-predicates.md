@@ -5,7 +5,7 @@ Scope: Point-versus-bounds and point-in-polygon pipeline shape, stage boundaries
 Read If: You are changing point predicates, candidate refinement, or the first exact spatial query path.
 STOP IF: Your task already has the staged point-predicate contract open and only needs local implementation detail.
 Source Of Truth: Phase-4 point predicate architecture policy before sindex and join assembly.
-Body Budget: 122/220 lines
+Body Budget: 175/220 lines
 Document: docs/architecture/point-predicates.md
 
 Section Map (Body Lines)
@@ -22,7 +22,10 @@ Section Map (Body Lines)
 | 76-89 | CCCL Mapping |
 | 90-96 | Semantics |
 | 97-106 | Consequences |
-| 107-122 | Bounded Point-Partition Providers |
+| 107-123 | Bounded Point-Partition Providers |
+| 124-144 | Prepared Part-Y Directory |
+| 145-159 | Conservative Part Coverage |
+| ... | (1 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
 ## Request Signals
@@ -145,3 +148,56 @@ the complete relation allocation is admitted and exactly refined. `dwithin`,
 derivatives and bounded
 query tokens are private `NativeSpatialIndex` state; public APIs expose no
 provider or tuning control.
+
+## Prepared Part-Y Directory
+
+Reusable Polygon and MultiPolygon refinement may build one immutable part-Y
+edge directory. Production variants use uniform widths of
+`8/16/32/64/128/256`; width is part of kernel source, warmup, prepared-cache,
+readiness, and telemetry identity. The builder is edge/bin-membership shaped,
+not one serial thread with width-sized local cursor state per polygon part.
+
+The initial width comes from reported device capacity, not a product name:
+up to 8 GiB selects 8, then 16, 32, 64, 128, and 256 at the 16, 24, 48, 100
+GiB boundaries. Capacity within five percent below a nominal boundary snaps to
+that boundary so marketed 24/48/100 GiB devices do not fall into a lower class.
+The 48 GiB class therefore attempts 128 first.
+
+Selection is only a target. Admission reserves the live query envelope and a
+future-operation margin, computes the exact structural and membership build
+peaks, and descends deterministically through narrower variants before any
+prepared state is published. If no width fits, the existing exact tiled GPU
+refiner remains authoritative; the policy never substitutes CPU fallback,
+managed-memory oversubscription, or a predicted runtime model.
+
+## Conservative Part Coverage
+
+An admitted prepared directory may also cache a conservative square coverage
+grid per polygon part. The width follows the selected y-directory tier:
+`4x4` for 8/16 bins, `8x8` for 32/64 bins, and `16x16` for 128/256 bins.
+Coverage memory is admitted separately; decline retains the exact part-Y
+directory instead of changing execution mode.
+
+Each cell center is classified by the exact fp64 part-Y predicate. Every cell
+touched by any closed polygon edge is then marked ambiguous with robust fp64
+segment/cell tests. Only certified interior or exterior cells bypass edge
+traversal. Ambiguous cells, non-finite coordinates, degenerate part bounds,
+and unsupported state always execute the existing exact predicate. The grid
+therefore changes physical work but cannot introduce an approximate answer.
+
+## Persistent Component-Parent Workspace
+
+Heavy-tail MultiPolygon pair aggregation retains one capacity-sized workspace
+on the immutable query geometry owner. Left and right point-grid candidate
+scatters write directly into the workspace's component/point row buffers;
+exact classifications, packed parent keys, radix outputs, deduplication masks,
+and terminal reduction counts reuse the same owner-lifetime allocation on
+later batches. The lease is serialized, stream readiness is recorded before
+release, and growth is admitted against the complete simultaneously-live
+envelope before allocation.
+
+Timing mode records non-overlapping CUDA-event intervals for candidate
+generation, exact classification, parent-key construction, radix sort,
+deduplication, and pair intersection. Those events synchronize only in
+profiling mode. Production execution remains asynchronous and does not select
+a different reducer until those general stage measurements justify it.

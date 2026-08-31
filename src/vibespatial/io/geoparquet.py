@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import io
 import json
@@ -59,9 +60,13 @@ from .pylibcudf import (
 )
 from .support import IOFormat, IOOperation, IOPathKind, plan_io_support
 from .wkb import (
+    _apply_arrow_nested_child_metadata,
+    _compression_type_from_name,
     _encode_owned_wkb_array,
+    _pylibcudf_sink,
     _write_geoparquet_native_device,
     _write_geoparquet_native_device_payload,
+    _write_pylibcudf_parquet_table,
     has_pyarrow_support,
     has_pylibcudf_support,
 )
@@ -80,6 +85,402 @@ _REGULAR_GRID_RECT_PROOF_VERSION = 1
 _GEOPARQUET_SCAN_DECODE_MULTIPLIER = 5
 _GEOPARQUET_SCAN_ROW_SCRATCH_BYTES = 16
 _GEOPARQUET_EAGER_SIZE_PROOF_MIN_BYTES = 1 << 20
+
+
+def _native_partition_manifest_path(path) -> Path | None:
+    if not isinstance(path, (str, PathLike)):
+        return None
+    parquet_path = Path(path)
+    return parquet_path.with_suffix(parquet_path.suffix + ".partitions.json")
+
+
+def _native_partition_file_identity(path: Path) -> dict[str, int | str]:
+    stat = path.stat()
+    sample_bytes = 64 * 1024
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        head = source.read(sample_bytes)
+        digest.update(head)
+        if stat.st_size > sample_bytes:
+            source.seek(max(stat.st_size - sample_bytes, sample_bytes))
+            digest.update(source.read(sample_bytes))
+    return {
+        "device": int(stat.st_dev),
+        "inode": int(stat.st_ino),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "ctime_ns": int(stat.st_ctime_ns),
+        "sample_sha256": digest.hexdigest(),
+    }
+
+
+def _remove_native_partition_manifest(path) -> None:
+    manifest_path = _native_partition_manifest_path(path)
+    if manifest_path is not None:
+        manifest_path.unlink(missing_ok=True)
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyWKBGeoParquetTranscodeResult:
+    """Bounded evidence from a metadata-only device-native transcode."""
+
+    row_count: int
+    column_count: int
+    geometry_columns: tuple[str, ...]
+    primary_geometry: str
+    source_bytes: int
+    output_bytes: int
+    backend: str = "pylibcudf"
+
+
+@dataclass(frozen=True, slots=True)
+class NativePartitionedParquetSegment:
+    """One partition-homogeneous row group in a clustered spill."""
+
+    partition: int
+    row_group: int
+    batch: int
+    row_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class NativePartitionedParquetLayout:
+    """Host-sized routing metadata for one device-clustered Parquet spill."""
+
+    path: Path
+    manifest_path: Path
+    partition_column: str
+    partition_count: int
+    row_count: int
+    segments: tuple[NativePartitionedParquetSegment, ...]
+
+    def row_groups_for(self, partitions: set[int] | tuple[int, ...] | list[int]):
+        selected = {int(value) for value in partitions}
+        invalid = sorted(value for value in selected if not 0 <= value < self.partition_count)
+        if invalid:
+            raise ValueError(f"partition ids are outside the clustered spill: {invalid}")
+        return tuple(
+            segment.row_group
+            for segment in self.segments
+            if segment.partition in selected
+        )
+
+
+class NativePartitionedParquetSink:
+    """Persistent device writer for partition-clustered Parquet row groups.
+
+    This is an internal dynamic-output carrier. Each appended pylibcudf table
+    is clustered by a device partition map, and each bounded homogeneous slice
+    becomes one row group in one persistent output file. A small JSON manifest
+    maps logical partitions to row groups for exact projection/pushdown reads.
+    """
+
+    def __init__(
+        self,
+        path,
+        *,
+        arrow_schema=None,
+        partition_column: str,
+        partition_count: int,
+        compression: str | None = "snappy",
+        max_row_group_rows: int = 1_000_000,
+        max_input_chunk_rows: int = 32_000_000,
+    ) -> None:
+        self.path = Path(path)
+        self.manifest_path = self.path.with_suffix(self.path.suffix + ".partitions.json")
+        self.arrow_schema = None
+        self.partition_column = str(partition_column)
+        self.partition_count = int(partition_count)
+        self.compression = compression
+        self.max_row_group_rows = int(max_row_group_rows)
+        self.max_input_chunk_rows = int(max_input_chunk_rows)
+        if self.partition_count <= 0:
+            raise ValueError("partition_count must be positive")
+        if self.max_row_group_rows <= 0:
+            raise ValueError("max_row_group_rows must be positive")
+        if self.max_input_chunk_rows <= 0:
+            raise ValueError("max_input_chunk_rows must be positive")
+        self._partition_column_index = -1
+        self._writer = None
+        self._stream = None
+        self._cupy_stream = None
+        self._batch_count = 0
+        self._row_count = 0
+        self._segments: list[NativePartitionedParquetSegment] = []
+        self._footer_metadata: dict[str, str] = {}
+        if arrow_schema is not None:
+            self._bind_arrow_schema(arrow_schema)
+
+    def _bind_arrow_schema(self, arrow_schema) -> None:
+        import base64
+
+        schema_metadata = dict(arrow_schema.metadata or {})
+        geo_metadata_bytes = schema_metadata.get(b"geo")
+        if geo_metadata_bytes is not None:
+            geo_metadata = json.loads(geo_metadata_bytes)
+            for column_metadata in geo_metadata.get("columns", {}).values():
+                # Each appended batch only knows its own bounds. Publishing
+                # the first batch's bbox as the file-wide bbox would be false.
+                column_metadata.pop("bbox", None)
+            schema_metadata[b"geo"] = json.dumps(
+                geo_metadata,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            arrow_schema = arrow_schema.with_metadata(schema_metadata)
+        if self.arrow_schema is not None:
+            if not self.arrow_schema.equals(arrow_schema, check_metadata=True):
+                raise ValueError("device spill batches do not share one Arrow schema")
+            return
+        if self.partition_column not in arrow_schema.names:
+            raise ValueError("partition column is missing from the declared Arrow schema")
+        self.arrow_schema = arrow_schema
+        self._partition_column_index = arrow_schema.get_field_index(self.partition_column)
+        self._footer_metadata = {
+            (key.decode() if isinstance(key, bytes) else str(key)): (
+                value.decode() if isinstance(value, bytes) else str(value)
+            )
+            for key, value in (arrow_schema.metadata or {}).items()
+        }
+        self._footer_metadata["ARROW:schema"] = base64.b64encode(
+            arrow_schema.serialize().to_pybytes()
+        ).decode()
+
+    def _ensure_writer(self, table) -> None:
+        if self._writer is not None:
+            return
+        import cupy as cp
+        import pylibcudf as plc
+
+        from vibespatial.cuda._runtime import pylibcudf_current_stream
+
+        if self.arrow_schema is None:
+            raise ValueError("device spill schema must be bound before the first append")
+        if int(table.num_columns()) != len(self.arrow_schema):
+            raise ValueError("device spill table does not match the declared column count")
+        metadata = plc.io.types.TableInputMetadata(table)
+        for index, field in enumerate(self.arrow_schema):
+            column_metadata = metadata.column_metadata[index]
+            column_metadata.set_name(field.name)
+            if field.metadata and field.metadata.get(b"ARROW:extension:name") == b"geoarrow.wkb":
+                column_metadata.set_output_as_binary(True)
+            else:
+                _apply_arrow_nested_child_metadata(column_metadata, field)
+        _remove_native_partition_manifest(self.path)
+        self._cupy_stream = cp.cuda.get_current_stream()
+        self._stream = pylibcudf_current_stream(table)
+        builder = plc.io.parquet.ChunkedParquetWriterOptions.builder(
+            plc.io.types.SinkInfo([str(self.path)])
+        )
+        builder.metadata(metadata)
+        builder.key_value_metadata([self._footer_metadata])
+        builder.write_arrow_schema(False)
+        builder.compression(_compression_type_from_name(self.compression))
+        builder.row_group_size_rows(self.max_row_group_rows)
+        self._writer = plc.io.parquet.ChunkedParquetWriter.from_options(
+            builder.build(),
+            stream=self._stream,
+        )
+
+    def append(self, table, *, partition_map=None, arrow_schema=None) -> None:
+        """Cluster and append one device table without materializing its rows."""
+        import cupy as cp
+        import pylibcudf as plc
+
+        from vibespatial.cuda._runtime import (
+            cuda_stream_identity,
+            get_cuda_completion_retainer,
+            pylibcudf_current_stream,
+        )
+
+        row_count = int(table.num_rows())
+        if row_count == 0:
+            return
+        if arrow_schema is not None:
+            self._bind_arrow_schema(arrow_schema)
+        if self.arrow_schema is None:
+            raise ValueError("arrow_schema is required for the first device spill batch")
+        if int(table.num_columns()) != len(self.arrow_schema):
+            raise ValueError("device spill table does not match the declared column count")
+        self._ensure_writer(table)
+        assert self._stream is not None
+        assert self._cupy_stream is not None
+        mapping = (
+            table.columns()[self._partition_column_index]
+            if partition_map is None
+            else partition_map
+        )
+        if int(mapping.size()) != row_count or int(mapping.null_count()) != 0:
+            raise ValueError("partition map must be non-null and row-aligned")
+        producer_stream = cp.cuda.get_current_stream()
+        pylibcudf_current_stream(table, mapping)
+        producer_event = None
+        if cuda_stream_identity(producer_stream) != cuda_stream_identity(
+            self._cupy_stream
+        ):
+            producer_event = cp.cuda.Event(disable_timing=True)
+            producer_event.record(producer_stream)
+            self._cupy_stream.wait_event(producer_event)
+        clustered, offsets = plc.partitioning.partition(
+            table,
+            mapping,
+            self.partition_count,
+            stream=self._stream,
+        )
+        completion_owners = [table, mapping, clustered, producer_event]
+        for partition in range(self.partition_count):
+            start = int(offsets[partition])
+            stop = int(offsets[partition + 1])
+            for chunk_start in range(start, stop, self.max_row_group_rows):
+                chunk_stop = min(chunk_start + self.max_row_group_rows, stop)
+                chunk = plc.copying.slice(
+                    clustered,
+                    [chunk_start, chunk_stop],
+                    stream=self._stream,
+                )[0]
+                row_group = len(self._segments)
+                assert self._writer is not None
+                self._writer.write(chunk)
+                self._segments.append(
+                    NativePartitionedParquetSegment(
+                        partition=partition,
+                        row_group=row_group,
+                        batch=self._batch_count,
+                        row_count=chunk_stop - chunk_start,
+                    )
+                )
+                completion_owners.append(chunk)
+        get_cuda_completion_retainer().defer(
+            self._cupy_stream,
+            tuple(completion_owners),
+            lambda _owners: None,
+        )
+        self._row_count += row_count
+        self._batch_count += 1
+
+    def _append_native_table(self, table, *, arrow_schema) -> None:
+        """Consume one native writer chunk through the clustered sink protocol."""
+        self.append(table, arrow_schema=arrow_schema)
+
+    def close(self) -> NativePartitionedParquetLayout:
+        """Close the persistent writer and publish the routing manifest."""
+        if self._writer is None:
+            raise ValueError("cannot close a clustered spill with no appended rows")
+        self._writer.close([])
+        self._writer = None
+        manifest = {
+            "schema_version": 2,
+            "file": self.path.name,
+            "file_identity": _native_partition_file_identity(self.path),
+            "partition_column": self.partition_column,
+            "partition_count": self.partition_count,
+            "row_count": self._row_count,
+            "segments": [
+                {
+                    "partition": segment.partition,
+                    "row_group": segment.row_group,
+                    "batch": segment.batch,
+                    "row_count": segment.row_count,
+                }
+                for segment in self._segments
+            ],
+        }
+        self.manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        return NativePartitionedParquetLayout(
+            path=self.path,
+            manifest_path=self.manifest_path,
+            partition_column=self.partition_column,
+            partition_count=self.partition_count,
+            row_count=self._row_count,
+            segments=tuple(self._segments),
+        )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if self._writer is not None:
+            self._writer.close([])
+            self._writer = None
+
+
+def load_native_partitioned_parquet_layout(path) -> NativePartitionedParquetLayout:
+    """Load a clustered-spill routing manifest without scanning table rows."""
+    parquet_path = Path(path)
+    manifest_path = parquet_path.with_suffix(parquet_path.suffix + ".partitions.json")
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if int(payload.get("schema_version", 0)) != 2:
+        raise ValueError("clustered-spill manifest schema is unsupported")
+    if payload.get("file") != parquet_path.name:
+        raise ValueError("clustered-spill manifest names a different Parquet file")
+    if payload.get("file_identity") != _native_partition_file_identity(parquet_path):
+        raise ValueError("clustered-spill manifest does not match the Parquet file")
+    return NativePartitionedParquetLayout(
+        path=parquet_path,
+        manifest_path=manifest_path,
+        partition_column=str(payload["partition_column"]),
+        partition_count=int(payload["partition_count"]),
+        row_count=int(payload["row_count"]),
+        segments=tuple(
+            NativePartitionedParquetSegment(
+                partition=int(segment["partition"]),
+                row_group=int(segment["row_group"]),
+                batch=int(segment["batch"]),
+                row_count=int(segment["row_count"]),
+            )
+            for segment in payload["segments"]
+        ),
+    )
+
+
+def _clustered_partition_filter_row_groups(path, filters):
+    """Resolve one exact partition equality predicate through the sidecar."""
+    if filters is None:
+        return None
+    predicate = filters
+    if isinstance(filters, list) and len(filters) == 1:
+        predicate = filters[0]
+    if (
+        not isinstance(predicate, tuple)
+        or len(predicate) != 3
+        or predicate[1] not in ("=", "==")
+    ):
+        return None
+    try:
+        layout = load_native_partitioned_parquet_layout(path)
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return None
+    if str(predicate[0]) != layout.partition_column:
+        return None
+    try:
+        partition = int(predicate[2])
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= partition < layout.partition_count:
+        return None
+    row_groups = layout.row_groups_for([partition])
+    # Preserve the ordinary filter path for a logically empty partition so
+    # the reader can still construct the projected zero-row schema.
+    return row_groups or None
+
+
+def read_native_partitioned_parquet_partitions(
+    path,
+    partitions,
+    *,
+    columns=None,
+):
+    """Read only row groups belonging to selected logical partitions."""
+    layout = load_native_partitioned_parquet_layout(path)
+    row_groups = layout.row_groups_for(partitions)
+    return _read_geoparquet_table_with_pylibcudf(
+        layout.path,
+        columns=columns,
+        row_groups=row_groups,
+    )
 
 
 def _regular_grid_rect_proof_from_column_metadata(
@@ -2722,6 +3123,25 @@ def _iter_geoparquet_native_impl(
         metadata_summary=metadata_summary,
     )
     row_groups = kwargs.pop("row_groups", None)
+    clustered_row_groups = None
+    if row_groups is None and bbox is None:
+        clustered_row_groups = _clustered_partition_filter_row_groups(
+            normalized_path,
+            kwargs.get("filters"),
+        )
+        if clustered_row_groups is not None:
+            row_groups = clustered_row_groups
+            kwargs.pop("filters", None)
+            record_dispatch_event(
+                surface=surface,
+                operation="partition_row_group_pushdown",
+                implementation="native_partitioned_parquet_manifest",
+                reason=(
+                    f"resolved one partition predicate to "
+                    f"{len(clustered_row_groups)} exact row groups"
+                ),
+                selected=ExecutionMode.GPU,
+            )
     read_kwargs = dict(kwargs)
     read_kwargs.pop("filesystem", None)
     selected_row_groups = (
@@ -3120,6 +3540,194 @@ def read_geoparquet_owned(
     return concatenate_owned_arrays(chunks)
 
 
+def _normalize_declared_wkb_geometry_metadata(
+    geometry_columns: dict[str, dict[str, Any]],
+    *,
+    source_schema,
+    primary_geometry: str,
+    schema_version: str,
+) -> tuple[dict[str, Any], Any]:
+    """Validate declarations and return GeoParquet plus Arrow field metadata."""
+    import pyarrow as pa
+
+    if not geometry_columns:
+        raise ValueError("at least one legacy WKB geometry column must be declared")
+    if primary_geometry not in geometry_columns:
+        raise ValueError("primary_geometry must name one declared geometry column")
+    source_names = set(source_schema.names)
+    missing = sorted(set(geometry_columns) - source_names)
+    if missing:
+        raise ValueError(f"declared geometry columns are missing from source: {missing}")
+
+    normalized_columns: dict[str, dict[str, Any]] = {}
+    replacement_fields = []
+    for field in source_schema:
+        declaration = geometry_columns.get(field.name)
+        if declaration is None:
+            replacement_fields.append(field)
+            continue
+        if not isinstance(declaration, dict) or "crs" not in declaration:
+            raise ValueError(
+                f"geometry column {field.name!r} must declare a 'crs' key; "
+                "use None for an explicitly absent CRS"
+            )
+        if not (pa.types.is_binary(field.type) or pa.types.is_large_binary(field.type)):
+            raise TypeError(
+                f"legacy WKB geometry column {field.name!r} must be binary, "
+                f"not {field.type}"
+            )
+
+        crs = declaration["crs"]
+        if crs is not None and not isinstance(crs, dict):
+            from pyproj import CRS
+
+            crs = CRS.from_user_input(crs).to_json_dict()
+        geometry_types = declaration.get("geometry_types")
+        if geometry_types is not None:
+            if isinstance(geometry_types, str):
+                geometry_types = [geometry_types]
+            geometry_types = [str(value) for value in geometry_types]
+        column_metadata = {
+            key: value
+            for key, value in declaration.items()
+            if key not in {"crs", "geometry_types", "encoding"}
+        }
+        column_metadata["encoding"] = "WKB"
+        column_metadata["crs"] = crs
+        if geometry_types is not None:
+            column_metadata["geometry_types"] = geometry_types
+        normalized_columns[field.name] = column_metadata
+
+        extension_metadata = {} if crs is None else {"crs": crs}
+        field_metadata = dict(field.metadata or {})
+        field_metadata.update(
+            {
+                b"ARROW:extension:name": b"geoarrow.wkb",
+                b"ARROW:extension:metadata": json.dumps(extension_metadata).encode(),
+            }
+        )
+        replacement_fields.append(field.with_metadata(field_metadata))
+
+    geo_metadata = {
+        "version": str(schema_version),
+        "primary_column": str(primary_geometry),
+        "columns": normalized_columns,
+    }
+    schema_metadata = dict(source_schema.metadata or {})
+    schema_metadata[b"geo"] = json.dumps(geo_metadata, separators=(",", ":")).encode()
+    return geo_metadata, pa.schema(replacement_fields, metadata=schema_metadata)
+
+
+def transcode_legacy_wkb_parquet_to_geoparquet(
+    source,
+    destination,
+    *,
+    geometry_columns: dict[str, dict[str, Any]],
+    primary_geometry: str,
+    compression: str | None = "snappy",
+    schema_version: str = "1.1.0",
+    row_group_size: int | None = None,
+) -> LegacyWKBGeoParquetTranscodeResult:
+    """Rewrite legacy binary-WKB Parquet as WKB GeoParquet on the GPU.
+
+    Geometry payloads and attributes remain in pylibcudf columns. PyArrow is
+    used only for source schema/footer metadata and the serialized Arrow schema
+    stored in the destination footer; no geometry is decoded or materialized.
+    """
+    import base64
+
+    import pyarrow.parquet as pq
+    import pylibcudf as plc
+
+    source_path = Path(source)
+    destination_path = Path(destination)
+    if source_path.resolve() == destination_path.resolve():
+        raise ValueError("legacy WKB transcode source and destination must differ")
+    if not source_path.is_file():
+        raise FileNotFoundError(source_path)
+    sink = _pylibcudf_sink(destination_path)
+    if sink is None:
+        raise TypeError("legacy WKB transcode destination must be a local path")
+    _remove_native_partition_manifest(destination_path)
+
+    source_file = pq.ParquetFile(source_path)
+    source_schema = source_file.schema_arrow
+    geo_metadata, output_schema = _normalize_declared_wkb_geometry_metadata(
+        geometry_columns,
+        source_schema=source_schema,
+        primary_geometry=primary_geometry,
+        schema_version=schema_version,
+    )
+    table = _read_geoparquet_table_with_pylibcudf(source_path)
+    row_count = int(source_file.metadata.num_rows)
+    if int(table.num_rows()) != row_count:
+        raise RuntimeError(
+            "pylibcudf legacy WKB scan row count does not match Parquet metadata"
+        )
+    if int(table.num_columns()) != len(source_schema):
+        raise RuntimeError(
+            "pylibcudf legacy WKB scan column count does not match Parquet schema"
+        )
+
+    metadata = plc.io.types.TableInputMetadata(table)
+    for index, field in enumerate(output_schema):
+        column_metadata = metadata.column_metadata[index]
+        column_metadata.set_name(field.name)
+        if field.name in geometry_columns:
+            column_metadata.set_output_as_binary(True)
+        else:
+            _apply_arrow_nested_child_metadata(column_metadata, field)
+
+    footer_metadata = {
+        (key.decode() if isinstance(key, bytes) else str(key)): (
+            value.decode() if isinstance(value, bytes) else str(value)
+        )
+        for key, value in (output_schema.metadata or {}).items()
+    }
+    footer_metadata["geo"] = json.dumps(geo_metadata, separators=(",", ":"))
+    footer_metadata["ARROW:schema"] = base64.b64encode(
+        output_schema.serialize().to_pybytes()
+    ).decode()
+    writer_kwargs = {}
+    if row_group_size is not None:
+        writer_kwargs["row_group_size"] = int(row_group_size)
+    _write_pylibcudf_parquet_table(
+        plc,
+        table,
+        sink=sink,
+        metadata=metadata,
+        footer_metadata=footer_metadata,
+        compression=compression,
+        writer_kwargs=writer_kwargs,
+    )
+    output_file = pq.ParquetFile(destination_path)
+    if int(output_file.metadata.num_rows) != row_count:
+        raise RuntimeError("transcoded GeoParquet footer row count does not match source")
+    output_metadata = output_file.schema_arrow.metadata or {}
+    if b"geo" not in output_metadata:
+        raise RuntimeError("transcoded output is missing GeoParquet metadata")
+
+    result = LegacyWKBGeoParquetTranscodeResult(
+        row_count=row_count,
+        column_count=len(source_schema),
+        geometry_columns=tuple(geometry_columns),
+        primary_geometry=str(primary_geometry),
+        source_bytes=source_path.stat().st_size,
+        output_bytes=destination_path.stat().st_size,
+    )
+    record_dispatch_event(
+        surface="vibespatial.io.geoparquet.transcode_legacy_wkb_parquet_to_geoparquet",
+        operation="transcode_wkb_geoparquet",
+        implementation="pylibcudf_metadata_only_wkb_transcode",
+        reason=(
+            f"rewrote {row_count} rows and {len(source_schema)} columns with "
+            f"GeoParquet metadata for {tuple(geometry_columns)} without geometry decode"
+        ),
+        selected=ExecutionMode.GPU,
+    )
+    return result
+
+
 def write_geoparquet(
     df,
     path,
@@ -3131,6 +3739,51 @@ def write_geoparquet(
     write_covering_bbox: bool = False,
     **kwargs,
 ) -> None:
+    partition_column = kwargs.pop("partition_column", None)
+    partition_count = kwargs.pop("partition_count", None)
+    if partition_column is not None or partition_count is not None:
+        if partition_column is None or partition_count is None:
+            raise ValueError(
+                "partition_column and partition_count must be provided together"
+            )
+        if index not in (None, False):
+            raise ValueError("partitioned GeoParquet batches do not support index export")
+        max_row_group_rows = kwargs.pop("max_row_group_rows", 1_000_000)
+        sink = NativePartitionedParquetSink(
+            path,
+            partition_column=partition_column,
+            partition_count=int(partition_count),
+            compression=compression,
+            max_row_group_rows=int(max_row_group_rows),
+        )
+        with sink:
+            for batch in df:
+                if len(batch) == 0:
+                    continue
+                write_geoparquet(
+                    batch,
+                    sink,
+                    index=False,
+                    compression=compression,
+                    geometry_encoding=geometry_encoding,
+                    schema_version=schema_version,
+                    write_covering_bbox=write_covering_bbox,
+                    **kwargs,
+                )
+            layout = sink.close()
+        record_dispatch_event(
+            surface="vibespatial.io.geoparquet.write_geoparquet",
+            operation="write_partitioned_batches",
+            implementation="native_partitioned_parquet_sink",
+            reason=(
+                f"clustered {layout.row_count} device rows into "
+                f"{len(layout.segments)} bounded partition-homogeneous row groups"
+            ),
+            selected=ExecutionMode.GPU,
+        )
+        return
+
+    _remove_native_partition_manifest(path)
     payload = to_native_tabular_result(df)
     if payload is not None:
         if isinstance(payload, NativeTabularSelection):

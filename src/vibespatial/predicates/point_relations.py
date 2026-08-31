@@ -494,7 +494,9 @@ def classify_point_region_gpu(
     region_state = regions._ensure_device_state(preserve_indexed_view=True)
     point_buffer = point_state.families[GeometryFamily.POINT]
     region_buffer = region_state.families[region_family]
-    prepared = region_state.point_location_indexes.get(region_family)
+    from .point_location_index import cached_polygon_part_y_index
+
+    prepared = cached_polygon_part_y_index(region_state, region_family)
     launch_profile = None
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
@@ -527,7 +529,10 @@ def classify_point_region_gpu(
         from .point_location_index import point_location_part_y_index_kernels
         from .point_region_profile import current_point_region_profile
 
-        kernel_dict_fn = point_location_part_y_index_kernels
+        def _prepared_point_location_kernels():
+            return point_location_part_y_index_kernels(prepared.bin_count)
+
+        kernel_dict_fn = _prepared_point_location_kernels
         kernel_name = (
             "point_in_polygon_prepared_part_y_index"
             if region_family is GeometryFamily.POLYGON
@@ -549,8 +554,11 @@ def classify_point_region_gpu(
                 ptr(region_buffer.ring_offsets),
                 ptr(region_buffer.x),
                 ptr(region_buffer.y),
+                ptr(prepared.part_xmin),
+                ptr(prepared.part_xmax),
                 ptr(prepared.part_ymin),
                 ptr(prepared.part_ymax),
+                ptr(prepared.coverage),
                 ptr(prepared.counts),
                 ptr(prepared.offsets),
                 ptr(prepared.entries),
@@ -565,7 +573,10 @@ def classify_point_region_gpu(
             summary, parts_histogram, edges_histogram, sample_plan = (
                 profile.launch_arguments(prepared)
             )
-            kernel_dict_fn = point_location_part_y_index_profile_kernels
+            def _profiled_prepared_point_location_kernels():
+                return point_location_part_y_index_profile_kernels(prepared.bin_count)
+
+            kernel_dict_fn = _profiled_prepared_point_location_kernels
             kernel_name += "_profiled"
             args.extend(
                 [
@@ -877,7 +888,9 @@ def _classify_indexed_point_region(
     region_state = region_owned._ensure_device_state(preserve_indexed_view=True)
     point_buffer = point_state.families[GeometryFamily.POINT]
     region_buffer = region_state.families[region_family]
-    prepared = region_state.point_location_indexes.get(region_family)
+    from .point_location_index import cached_polygon_part_y_index
+
+    prepared = cached_polygon_part_y_index(region_state, region_family)
     launch_profile = None
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
@@ -921,7 +934,10 @@ def _classify_indexed_point_region(
         from .point_location_index import point_location_part_y_index_kernels
         from .point_region_profile import current_point_region_profile
 
-        kernel_dict_fn = point_location_part_y_index_kernels
+        def _indexed_prepared_point_location_kernels():
+            return point_location_part_y_index_kernels(prepared.bin_count)
+
+        kernel_dict_fn = _indexed_prepared_point_location_kernels
         kernel_name = (
             "point_in_polygon_prepared_part_y_index"
             if region_family is GeometryFamily.POLYGON
@@ -943,8 +959,11 @@ def _classify_indexed_point_region(
                 ptr(region_buffer.ring_offsets),
                 ptr(region_buffer.x),
                 ptr(region_buffer.y),
+                ptr(prepared.part_xmin),
+                ptr(prepared.part_xmax),
                 ptr(prepared.part_ymin),
                 ptr(prepared.part_ymax),
+                ptr(prepared.coverage),
                 ptr(prepared.counts),
                 ptr(prepared.offsets),
                 ptr(prepared.entries),
@@ -959,7 +978,10 @@ def _classify_indexed_point_region(
             summary, parts_histogram, edges_histogram, sample_plan = (
                 profile.launch_arguments(prepared)
             )
-            kernel_dict_fn = point_location_part_y_index_profile_kernels
+            def _profiled_indexed_prepared_point_location_kernels():
+                return point_location_part_y_index_profile_kernels(prepared.bin_count)
+
+            kernel_dict_fn = _profiled_indexed_prepared_point_location_kernels
             kernel_name += "_profiled"
             args.extend(
                 [

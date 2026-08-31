@@ -5,7 +5,7 @@ Scope: Current-revision evidence for the point-region profiler and classificatio
 Read If: You are changing prepared point-region refinement, paired spatial aggregation, point-grid candidate reduction, or validating SF100 Q11 performance.
 STOP IF: You only need public predicate semantics or the superseded generic device-planning proposal.
 Source Of Truth: Measurement record for docs/dev/evidence-first-point-region-execution-plan.md.
-Body Budget: 232/260 lines
+Body Budget: 255/260 lines
 Document: docs/dev/point-region-execution-evidence.md
 
 Section Map (Body Lines)
@@ -23,7 +23,8 @@ Section Map (Body Lines)
 | 124-152 | E1 Attribution |
 | 153-167 | Alternatives Falsified |
 | 168-194 | Selected Alternative |
-| 195-232 | Validation Status |
+| 195-233 | Validation Status |
+| 234-255 | 2026-08-31 Wider Directory And Coverage Result |
 DOC_HEADER:END -->
 
 ## Intent
@@ -256,3 +257,26 @@ also shows that the 4090's 23.5% Q11 gain is not a universal device ratio.
 The implementation uses no product name, compute capability, SM count, or
 optional performance attribute for selection, so absent optional device facts
 leave the permanent baseline selection contract unchanged.
+
+## 2026-08-31 Wider Directory And Coverage Result
+
+The SF100 follow-up used the same RTX 4090 and strict-native public Q10/Q11
+paths. Device capacity selected 64 y bins and an admitted `8x8` conservative
+coverage grid for each of five prepared region groups. One warmup plus one
+measured profiled run produced:
+
+| Metric | Wider y only | With coverage | Change |
+|---|---:|---:|---:|
+| Q10 wall | 59.38 s | 56.13 s | -5.5% |
+| Q10 exact kernel | 24.60 s | 20.67 s | -16.0% |
+| Q10 edges visited | 288.58 B | 137.54 B | -52.3% |
+| Q11 wall | 89.53 s | 85.15 s | -4.9% |
+| Q11 exact kernel | 39.11 s | 34.07 s | -12.9% |
+| Q11 edges visited | 511.66 B | 274.92 B | -46.3% |
+
+Both runs reported zero fallback events. Q11 remained bit-exact at
+`1511054981`; Q10 keys, names, counts, and durations were exact, with four
+averaged-distance cells differing by at most `1.01e-16`. Profiler schema 4
+records y-bin and coverage-grid widths per prepared group. Dense concave,
+hole, boundary, every compiled width, and coverage-memory-decline tests remain
+exact against the Shapely oracle.

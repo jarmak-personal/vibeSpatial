@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from vibespatial.api._compat import PANDAS_GE_30
+from vibespatial.runtime.hotpath_trace import hotpath_stage
 from vibespatial.runtime.materialization import (
     MaterializationBoundary,
     NativeExportBoundary,
@@ -2265,8 +2266,12 @@ class NativeAttributeTable:
         The zero-row prototype preserves pandas' column naming and conflict
         checks while avoiding materializing full grouped reducer payloads.
         """
-        prototype = pd.DataFrame(columns=self.columns, index=self.index[:0])
-        reset_columns = tuple(prototype.reset_index().columns)
+        with hotpath_stage(
+            "native_attributes.reset_index.prototype",
+            category="setup",
+        ):
+            prototype = pd.DataFrame(columns=self.columns, index=self.index[:0])
+            reset_columns = tuple(prototype.reset_index().columns)
         leading_count = len(reset_columns) - len(self.columns)
         leading_columns = reset_columns[:leading_count]
         trailing_columns = reset_columns[leading_count:]
@@ -2288,24 +2293,30 @@ class NativeAttributeTable:
             except ModuleNotFoundError:
                 pass
             else:
-                if isinstance(self.index, pd.MultiIndex):
-                    index_frame = self.index.to_frame(index=False)
-                else:
-                    index_frame = pd.DataFrame(
-                        {leading_columns[0]: self.index},
-                        index=pd.RangeIndex(len(self)),
-                    )
-                index_columns = []
-                index_fields = []
-                for position, column_name in enumerate(leading_columns):
-                    series = index_frame.iloc[:, position]
-                    if not _is_admissible_pandas_numeric_series(series):
-                        index_columns = []
-                        break
-                    values = cp.asarray(series.to_numpy(copy=False))
-                    column = _pylibcudf_column_from_device(values)
-                    index_columns.append(column)
-                    index_fields.append(pa.field(str(column_name), column.type().to_arrow()))
+                with hotpath_stage(
+                    "native_attributes.reset_index.device_index_materialization",
+                    category="setup",
+                ):
+                    if isinstance(self.index, pd.MultiIndex):
+                        index_frame = self.index.to_frame(index=False)
+                    else:
+                        index_frame = pd.DataFrame(
+                            {leading_columns[0]: self.index},
+                            index=pd.RangeIndex(len(self)),
+                        )
+                    index_columns = []
+                    index_fields = []
+                    for position, column_name in enumerate(leading_columns):
+                        series = index_frame.iloc[:, position]
+                        if not _is_admissible_pandas_numeric_series(series):
+                            index_columns = []
+                            break
+                        values = cp.asarray(series.to_numpy(copy=False))
+                        column = _pylibcudf_column_from_device(values)
+                        index_columns.append(column)
+                        index_fields.append(
+                            pa.field(str(column_name), column.type().to_arrow())
+                        )
                 if index_columns:
                     source_columns = self.device_table.columns()
                     output_columns = [*index_columns, *source_columns]

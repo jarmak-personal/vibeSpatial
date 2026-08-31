@@ -5,7 +5,7 @@ Scope: Dual fp32/fp64 compute strategy, runtime precision dispatch, and canonica
 Read If: You are designing kernel arithmetic, precision selection, or numerical policy.
 STOP IF: Your task already has a settled precision plan and only needs implementation detail.
 Source Of Truth: Phase-1 precision dispatch policy before owned kernel expansion.
-Body Budget: 122/240 lines
+Body Budget: 128/240 lines
 Document: docs/architecture/precision.md
 
 Section Map (Body Lines)
@@ -20,9 +20,9 @@ Section Map (Body Lines)
 | 39-48 | Canonical Rule |
 | 49-56 | Precision Modes |
 | 57-68 | Kernel Classes |
-| 69-91 | Default Policy |
-| 92-112 | What Staged fp32 Means |
-| 113-122 | Buffer And Signature Implications |
+| 69-97 | Default Policy |
+| 98-118 | What Staged fp32 Means |
+| 119-128 | Buffer And Signature Implications |
 DOC_HEADER:END -->
 
 Use dual compute precision with one canonical storage precision.
@@ -113,6 +113,12 @@ registered `PrecisionPlan` is fp64 on every device. AUTO must not narrow these
 provider bounds because a rounded-in bbox can remove an exact-true predicate
 pair. The downstream exact predicate retains its own independent
 predicate-class plan.
+
+Prepared polygon-part coverage is also exact predicate metadata, not a coarse
+fp32 classifier. Cell-center classification and closed edge/cell intersection
+certification stay fp64; boundary-touched, degenerate, and non-finite cells are
+ambiguous and return to the exact part-Y predicate. No fp32 cell state is ever
+trusted as interior or exterior.
 
 ## What Staged fp32 Means
 

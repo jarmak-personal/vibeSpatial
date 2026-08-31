@@ -12,10 +12,21 @@ from __future__ import annotations
 from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
 
 PART_Y_BIN_COUNT = 8
+SUPPORTED_PART_Y_BIN_COUNTS = (8, 16, 32, 64, 128, 256)
+COVERAGE_GRID_WIDTH = 4
+_COVERAGE_GRID_WIDTH_BY_BIN_COUNT = {
+    8: 4,
+    16: 4,
+    32: 8,
+    64: 8,
+    128: 16,
+    256: 16,
+}
 
 _POINT_LOCATION_PART_Y_INDEX_SOURCE = (
     ORIENT2D_DEVICE
     + f"#define VS_PART_Y_BIN_COUNT {PART_Y_BIN_COUNT}\n"
+    + f"#define VS_COVERAGE_GRID_WIDTH {COVERAGE_GRID_WIDTH}\n"
     + r"""
 #define VS_RING_CLOSURE_FLAG 0x80000000u
 #define VS_EDGE_INDEX_MASK 0x7fffffffu
@@ -34,32 +45,17 @@ extern "C" __device__ __forceinline__ int vs_part_y_bin(
     return bin;
 }
 
-extern "C" __device__ __forceinline__ void vs_count_edge_bins(
-    double ay,
-    double by,
-    double minimum,
-    double maximum,
-    unsigned int* counts
-) {
-    int first = vs_part_y_bin(fmin(ay, by), minimum, maximum);
-    int last = vs_part_y_bin(fmax(ay, by), minimum, maximum);
-    for (int bin = first; bin <= last; ++bin) counts[bin] += 1u;
-}
-
-extern "C" __global__ void count_polygon_part_y_bins(
+extern "C" __global__ void compute_polygon_part_y_bounds(
     int part_count,
-    const int* part_ring_offsets,
-    const int* ring_offsets,
-    const double* y,
-    double* part_ymin,
-    double* part_ymax,
-    unsigned int* counts
+    const int* __restrict__ part_ring_offsets,
+    const int* __restrict__ ring_offsets,
+    const double* __restrict__ y,
+    double* __restrict__ part_ymin,
+    double* __restrict__ part_ymax
 ) {
     const int lane = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = blockDim.x * gridDim.x;
     for (int part = lane; part < part_count; part += stride) {
-        unsigned int* part_counts = counts + ((long long)part * VS_PART_Y_BIN_COUNT);
-        for (int bin = 0; bin < VS_PART_Y_BIN_COUNT; ++bin) part_counts[bin] = 0u;
         const int ring_start = part_ring_offsets[part];
         const int ring_end = part_ring_offsets[part + 1];
         double minimum = 1.7976931348623157e+308;
@@ -74,82 +70,166 @@ extern "C" __global__ void count_polygon_part_y_bins(
         }
         part_ymin[part] = minimum;
         part_ymax[part] = maximum;
-        if (!isfinite(minimum) || !isfinite(maximum)) continue;
-        for (int ring = ring_start; ring < ring_end; ++ring) {
-            const int coord_start = ring_offsets[ring];
-            const int coord_end = ring_offsets[ring + 1];
-            if (coord_end <= coord_start) continue;
-            vs_count_edge_bins(
-                y[coord_end - 1], y[coord_start], minimum, maximum, part_counts);
-            for (int coord = coord_start + 1; coord < coord_end; ++coord) {
-                vs_count_edge_bins(
-                    y[coord - 1], y[coord], minimum, maximum, part_counts);
-            }
-        }
     }
 }
 
-extern "C" __device__ __forceinline__ void vs_scatter_edge_bins(
-    unsigned int edge_code,
-    double ay,
-    double by,
-    double minimum,
-    double maximum,
-    unsigned long long* cursors,
-    unsigned int* entries
-) {
-    int first = vs_part_y_bin(fmin(ay, by), minimum, maximum);
-    int last = vs_part_y_bin(fmax(ay, by), minimum, maximum);
-    for (int bin = first; bin <= last; ++bin) {
-        entries[cursors[bin]++] = edge_code;
-    }
-}
-
-extern "C" __global__ void scatter_polygon_part_y_bins(
+extern "C" __global__ void compute_polygon_part_x_bounds(
     int part_count,
-    const int* part_ring_offsets,
-    const int* ring_offsets,
-    const double* y,
-    const double* part_ymin,
-    const double* part_ymax,
-    const long long* offsets,
-    unsigned int* entries
+    const int* __restrict__ part_ring_offsets,
+    const int* __restrict__ ring_offsets,
+    const double* __restrict__ x,
+    double* __restrict__ part_xmin,
+    double* __restrict__ part_xmax
 ) {
     const int lane = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = blockDim.x * gridDim.x;
     for (int part = lane; part < part_count; part += stride) {
-        const long long base = (long long)part * VS_PART_Y_BIN_COUNT;
-        unsigned long long cursors[VS_PART_Y_BIN_COUNT];
-        for (int bin = 0; bin < VS_PART_Y_BIN_COUNT; ++bin) {
-            cursors[bin] = (unsigned long long)offsets[base + bin];
-        }
-        const double minimum = part_ymin[part];
-        const double maximum = part_ymax[part];
-        if (!isfinite(minimum) || !isfinite(maximum)) continue;
         const int ring_start = part_ring_offsets[part];
         const int ring_end = part_ring_offsets[part + 1];
+        double minimum = 1.7976931348623157e+308;
+        double maximum = -1.7976931348623157e+308;
         for (int ring = ring_start; ring < ring_end; ++ring) {
             const int coord_start = ring_offsets[ring];
             const int coord_end = ring_offsets[ring + 1];
-            if (coord_end <= coord_start) continue;
-            vs_scatter_edge_bins(
-                VS_RING_CLOSURE_FLAG | (unsigned int)ring,
-                y[coord_end - 1],
-                y[coord_start],
-                minimum,
-                maximum,
-                cursors,
-                entries);
-            for (int coord = coord_start + 1; coord < coord_end; ++coord) {
-                vs_scatter_edge_bins(
-                    (unsigned int)coord,
-                    y[coord - 1],
-                    y[coord],
-                    minimum,
-                    maximum,
-                    cursors,
-                    entries);
+            for (int coord = coord_start; coord < coord_end; ++coord) {
+                minimum = fmin(minimum, x[coord]);
+                maximum = fmax(maximum, x[coord]);
             }
+        }
+        part_xmin[part] = minimum;
+        part_xmax[part] = maximum;
+    }
+}
+
+extern "C" __device__ __forceinline__ int vs_owner_from_offsets(
+    int child,
+    int owner_count,
+    const int* __restrict__ offsets
+) {
+    int low = 0;
+    int high = owner_count;
+    while (low < high) {
+        const int middle = low + ((high - low) >> 1);
+        if (offsets[middle + 1] <= child) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    return low < owner_count ? low : -1;
+}
+
+extern "C" __global__ void map_polygon_rings_to_parts(
+    int ring_count,
+    int part_count,
+    const int* __restrict__ part_ring_offsets,
+    int* __restrict__ ring_parts
+) {
+    const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    for (int ring = lane; ring < ring_count; ring += stride) {
+        ring_parts[ring] = vs_owner_from_offsets(
+            ring, part_count, part_ring_offsets);
+    }
+}
+
+extern "C" __device__ __forceinline__ bool vs_edge_context(
+    int coord,
+    int ring_count,
+    const int* __restrict__ ring_offsets,
+    const int* __restrict__ ring_parts,
+    const double* __restrict__ y,
+    int* ring,
+    int* part,
+    unsigned int* edge_code,
+    double* ay,
+    double* by
+) {
+    const int owner = vs_owner_from_offsets(coord, ring_count, ring_offsets);
+    if (owner < 0) return false;
+    const int coord_start = ring_offsets[owner];
+    const int coord_end = ring_offsets[owner + 1];
+    if (coord_end <= coord_start) return false;
+    *ring = owner;
+    *part = ring_parts[owner];
+    if (coord == coord_start) {
+        *edge_code = VS_RING_CLOSURE_FLAG | (unsigned int)owner;
+        *ay = y[coord_end - 1];
+        *by = y[coord_start];
+    } else {
+        *edge_code = (unsigned int)coord;
+        *ay = y[coord - 1];
+        *by = y[coord];
+    }
+    return *part >= 0;
+}
+
+extern "C" __global__ void count_polygon_edge_y_bin_memberships(
+    int coordinate_count,
+    int ring_count,
+    const int* __restrict__ ring_offsets,
+    const int* __restrict__ ring_parts,
+    const double* __restrict__ y,
+    const double* __restrict__ part_ymin,
+    const double* __restrict__ part_ymax,
+    unsigned int* __restrict__ counts
+) {
+    const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    for (int coord = lane; coord < coordinate_count; coord += stride) {
+        int ring;
+        int part;
+        unsigned int edge_code;
+        double ay;
+        double by;
+        if (!vs_edge_context(
+                coord, ring_count, ring_offsets, ring_parts, y,
+                &ring, &part, &edge_code, &ay, &by)) continue;
+        const double minimum = part_ymin[part];
+        const double maximum = part_ymax[part];
+        if (!isfinite(minimum) || !isfinite(maximum)) continue;
+        const int first = vs_part_y_bin(fmin(ay, by), minimum, maximum);
+        const int last = vs_part_y_bin(fmax(ay, by), minimum, maximum);
+        const long long base = (long long)part * VS_PART_Y_BIN_COUNT;
+        for (int bin = first; bin <= last; ++bin) {
+            atomicAdd(counts + base + bin, 1u);
+        }
+    }
+}
+
+extern "C" __global__ void scatter_polygon_edge_y_bin_memberships(
+    int coordinate_count,
+    int ring_count,
+    const int* __restrict__ ring_offsets,
+    const int* __restrict__ ring_parts,
+    const double* __restrict__ y,
+    const double* __restrict__ part_ymin,
+    const double* __restrict__ part_ymax,
+    const long long* __restrict__ offsets,
+    unsigned int* __restrict__ cursors,
+    unsigned int* __restrict__ entries
+) {
+    const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    for (int coord = lane; coord < coordinate_count; coord += stride) {
+        int ring;
+        int part;
+        unsigned int edge_code;
+        double ay;
+        double by;
+        if (!vs_edge_context(
+                coord, ring_count, ring_offsets, ring_parts, y,
+                &ring, &part, &edge_code, &ay, &by)) continue;
+        const double minimum = part_ymin[part];
+        const double maximum = part_ymax[part];
+        if (!isfinite(minimum) || !isfinite(maximum)) continue;
+        const int first = vs_part_y_bin(fmin(ay, by), minimum, maximum);
+        const int last = vs_part_y_bin(fmax(ay, by), minimum, maximum);
+        const long long base = (long long)part * VS_PART_Y_BIN_COUNT;
+        for (int bin = first; bin <= last; ++bin) {
+            const long long key = base + bin;
+            const unsigned int local = atomicAdd(cursors + key, 1u);
+            entries[offsets[key] + (long long)local] = edge_code;
         }
     }
 }
@@ -210,6 +290,254 @@ extern "C" __device__ __forceinline__ unsigned char vs_prepared_part_location(
     return inside ? 2 : 0;
 }
 
+extern "C" __device__ __forceinline__ bool vs_point_in_closed_rect(
+    double px,
+    double py,
+    double xmin,
+    double ymin,
+    double xmax,
+    double ymax
+) {
+    return px >= xmin && px <= xmax && py >= ymin && py <= ymax;
+}
+
+extern "C" __device__ __forceinline__ bool vs_point_on_closed_segment(
+    double ax,
+    double ay,
+    double bx,
+    double by,
+    double px,
+    double py
+) {
+    return px >= fmin(ax, bx) && px <= fmax(ax, bx)
+        && py >= fmin(ay, by) && py <= fmax(ay, by)
+        && vs_orient2d(ax, ay, bx, by, px, py) == 0;
+}
+
+extern "C" __device__ __forceinline__ bool vs_closed_segments_intersect(
+    double ax,
+    double ay,
+    double bx,
+    double by,
+    double cx,
+    double cy,
+    double dx,
+    double dy
+) {
+    if (fmax(ax, bx) < fmin(cx, dx) || fmax(cx, dx) < fmin(ax, bx)
+        || fmax(ay, by) < fmin(cy, dy) || fmax(cy, dy) < fmin(ay, by)) {
+        return false;
+    }
+    const int abc = vs_orient2d(ax, ay, bx, by, cx, cy);
+    const int abd = vs_orient2d(ax, ay, bx, by, dx, dy);
+    const int cda = vs_orient2d(cx, cy, dx, dy, ax, ay);
+    const int cdb = vs_orient2d(cx, cy, dx, dy, bx, by);
+    if (abc == 0 && vs_point_on_closed_segment(ax, ay, bx, by, cx, cy)) return true;
+    if (abd == 0 && vs_point_on_closed_segment(ax, ay, bx, by, dx, dy)) return true;
+    if (cda == 0 && vs_point_on_closed_segment(cx, cy, dx, dy, ax, ay)) return true;
+    if (cdb == 0 && vs_point_on_closed_segment(cx, cy, dx, dy, bx, by)) return true;
+    return (abc > 0) != (abd > 0) && (cda > 0) != (cdb > 0);
+}
+
+extern "C" __device__ __forceinline__ bool vs_segment_intersects_closed_cell(
+    double ax,
+    double ay,
+    double bx,
+    double by,
+    double xmin,
+    double ymin,
+    double xmax,
+    double ymax
+) {
+    if (vs_point_in_closed_rect(ax, ay, xmin, ymin, xmax, ymax)
+        || vs_point_in_closed_rect(bx, by, xmin, ymin, xmax, ymax)) {
+        return true;
+    }
+    return vs_closed_segments_intersect(
+            ax, ay, bx, by, xmin, ymin, xmax, ymin)
+        || vs_closed_segments_intersect(
+            ax, ay, bx, by, xmax, ymin, xmax, ymax)
+        || vs_closed_segments_intersect(
+            ax, ay, bx, by, xmax, ymax, xmin, ymax)
+        || vs_closed_segments_intersect(
+            ax, ay, bx, by, xmin, ymax, xmin, ymin);
+}
+
+extern "C" __global__ void initialize_polygon_part_coverage_cells(
+    int part_count,
+    const int* __restrict__ ring_offsets,
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const double* __restrict__ part_xmin,
+    const double* __restrict__ part_xmax,
+    const double* __restrict__ part_ymin,
+    const double* __restrict__ part_ymax,
+    const unsigned int* __restrict__ counts,
+    const long long* __restrict__ offsets,
+    const unsigned int* __restrict__ entries,
+    unsigned char* __restrict__ coverage
+) {
+    const int cells_per_part = VS_COVERAGE_GRID_WIDTH * VS_COVERAGE_GRID_WIDTH;
+    const long long cell_count = (long long)part_count * cells_per_part;
+    const long long lane = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long stride = (long long)blockDim.x * gridDim.x;
+    for (long long cell = lane; cell < cell_count; cell += stride) {
+        const int part = (int)(cell / cells_per_part);
+        const int local = (int)(cell - (long long)part * cells_per_part);
+        const int cell_x = local % VS_COVERAGE_GRID_WIDTH;
+        const int cell_y = local / VS_COVERAGE_GRID_WIDTH;
+        const double xmin = part_xmin[part];
+        const double xmax = part_xmax[part];
+        const double ymin = part_ymin[part];
+        const double ymax = part_ymax[part];
+        if (!isfinite(xmin) || !isfinite(xmax)
+            || !isfinite(ymin) || !isfinite(ymax)
+            || !(xmax > xmin) || !(ymax > ymin)) {
+            coverage[cell] = 0u;
+            continue;
+        }
+        const double px = xmin + ((double)cell_x + 0.5)
+            * ((xmax - xmin) / (double)VS_COVERAGE_GRID_WIDTH);
+        const double py = ymin + ((double)cell_y + 0.5)
+            * ((ymax - ymin) / (double)VS_COVERAGE_GRID_WIDTH);
+        const unsigned char location = vs_prepared_part_location(
+            px, py, part, ring_offsets, x, y,
+            part_ymin, part_ymax, counts, offsets, entries);
+        coverage[cell] = location == 1u ? 0u : (location == 2u ? 2u : 1u);
+    }
+}
+
+extern "C" __global__ void mark_polygon_edge_coverage_cells(
+    int coordinate_count,
+    int ring_count,
+    const int* __restrict__ ring_offsets,
+    const int* __restrict__ ring_parts,
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const double* __restrict__ part_xmin,
+    const double* __restrict__ part_xmax,
+    const double* __restrict__ part_ymin,
+    const double* __restrict__ part_ymax,
+    unsigned char* __restrict__ coverage
+) {
+    const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    const int cells_per_part = VS_COVERAGE_GRID_WIDTH * VS_COVERAGE_GRID_WIDTH;
+    for (int coord = lane; coord < coordinate_count; coord += stride) {
+        int ring;
+        int part;
+        unsigned int edge_code;
+        double ay;
+        double by;
+        if (!vs_edge_context(
+                coord, ring_count, ring_offsets, ring_parts, y,
+                &ring, &part, &edge_code, &ay, &by)) continue;
+        int i;
+        int j;
+        if ((edge_code & VS_RING_CLOSURE_FLAG) != 0u) {
+            i = ring_offsets[ring];
+            j = ring_offsets[ring + 1] - 1;
+        } else {
+            i = (int)edge_code;
+            j = i - 1;
+        }
+        const double ax = x[j];
+        const double bx = x[i];
+        const double xmin = part_xmin[part];
+        const double xmax = part_xmax[part];
+        const double ymin = part_ymin[part];
+        const double ymax = part_ymax[part];
+        const long long base = (long long)part * cells_per_part;
+        if (!isfinite(ax) || !isfinite(ay) || !isfinite(bx) || !isfinite(by)
+            || !isfinite(xmin) || !isfinite(xmax)
+            || !isfinite(ymin) || !isfinite(ymax)
+            || !(xmax > xmin) || !(ymax > ymin)) {
+            for (int cell = 0; cell < cells_per_part; ++cell) {
+                coverage[base + cell] = 0u;
+            }
+            continue;
+        }
+        const double xscale =
+            (double)VS_COVERAGE_GRID_WIDTH / (xmax - xmin);
+        const double yscale =
+            (double)VS_COVERAGE_GRID_WIDTH / (ymax - ymin);
+        int first_x = (int)floor((fmin(ax, bx) - xmin) * xscale) - 1;
+        int last_x = (int)floor((fmax(ax, bx) - xmin) * xscale);
+        int first_y = (int)floor((fmin(ay, by) - ymin) * yscale) - 1;
+        int last_y = (int)floor((fmax(ay, by) - ymin) * yscale);
+        first_x = max(0, min(VS_COVERAGE_GRID_WIDTH - 1, first_x));
+        last_x = max(0, min(VS_COVERAGE_GRID_WIDTH - 1, last_x));
+        first_y = max(0, min(VS_COVERAGE_GRID_WIDTH - 1, first_y));
+        last_y = max(0, min(VS_COVERAGE_GRID_WIDTH - 1, last_y));
+        const double cell_width =
+            (xmax - xmin) / (double)VS_COVERAGE_GRID_WIDTH;
+        const double cell_height =
+            (ymax - ymin) / (double)VS_COVERAGE_GRID_WIDTH;
+        for (int cell_y = first_y; cell_y <= last_y; ++cell_y) {
+            const double cell_ymin = ymin + (double)cell_y * cell_height;
+            const double cell_ymax = cell_y == VS_COVERAGE_GRID_WIDTH - 1
+                ? ymax : cell_ymin + cell_height;
+            for (int cell_x = first_x; cell_x <= last_x; ++cell_x) {
+                const double cell_xmin = xmin + (double)cell_x * cell_width;
+                const double cell_xmax = cell_x == VS_COVERAGE_GRID_WIDTH - 1
+                    ? xmax : cell_xmin + cell_width;
+                if (vs_segment_intersects_closed_cell(
+                        ax, ay, bx, by,
+                        cell_xmin, cell_ymin, cell_xmax, cell_ymax)) {
+                    coverage[
+                        base + cell_y * VS_COVERAGE_GRID_WIDTH + cell_x
+                    ] = 0u;
+                }
+            }
+        }
+    }
+}
+
+extern "C" __device__ __forceinline__ unsigned char
+vs_prepared_part_location_with_coverage(
+    double px,
+    double py,
+    int part,
+    const int* ring_offsets,
+    const double* x,
+    const double* y,
+    const double* part_xmin,
+    const double* part_xmax,
+    const double* part_ymin,
+    const double* part_ymax,
+    const unsigned char* coverage,
+    const unsigned int* counts,
+    const long long* offsets,
+    const unsigned int* entries
+) {
+    if (coverage != 0 && part_xmin != 0 && part_xmax != 0) {
+        const double xmin = part_xmin[part];
+        const double xmax = part_xmax[part];
+        const double ymin = part_ymin[part];
+        const double ymax = part_ymax[part];
+        if (isfinite(xmin) && isfinite(xmax)
+            && isfinite(ymin) && isfinite(ymax)
+            && xmax > xmin && ymax > ymin) {
+            if (px < xmin || px > xmax || py < ymin || py > ymax) return 0u;
+            int cell_x = (int)floor(
+                (px - xmin) * ((double)VS_COVERAGE_GRID_WIDTH / (xmax - xmin)));
+            int cell_y = (int)floor(
+                (py - ymin) * ((double)VS_COVERAGE_GRID_WIDTH / (ymax - ymin)));
+            cell_x = max(0, min(VS_COVERAGE_GRID_WIDTH - 1, cell_x));
+            cell_y = max(0, min(VS_COVERAGE_GRID_WIDTH - 1, cell_y));
+            const unsigned char state = coverage[
+                (long long)part * VS_COVERAGE_GRID_WIDTH * VS_COVERAGE_GRID_WIDTH
+                + cell_y * VS_COVERAGE_GRID_WIDTH + cell_x
+            ];
+            if (state == 1u) return 0u;
+            if (state == 2u) return 2u;
+        }
+    }
+    return vs_prepared_part_location(
+        px, py, part, ring_offsets, x, y,
+        part_ymin, part_ymax, counts, offsets, entries);
+}
+
 extern "C" __global__ void point_in_polygon_prepared_part_y_index(
     const int* candidate_rows,
     const int* candidate_rows_right,
@@ -223,8 +551,11 @@ extern "C" __global__ void point_in_polygon_prepared_part_y_index(
     const int* ring_offsets,
     const double* polygon_x,
     const double* polygon_y,
+    const double* part_xmin,
+    const double* part_xmax,
     const double* part_ymin,
     const double* part_ymax,
+    const unsigned char* coverage,
     const unsigned int* counts,
     const long long* offsets,
     const unsigned int* entries,
@@ -247,10 +578,11 @@ extern "C" __global__ void point_in_polygon_prepared_part_y_index(
             continue;
         }
         const int point_coord = point_geometry_offsets[point_row];
-        out[index] = vs_prepared_part_location(
+        out[index] = vs_prepared_part_location_with_coverage(
             point_x[point_coord], point_y[point_coord], polygon_row,
             ring_offsets, polygon_x, polygon_y,
-            part_ymin, part_ymax, counts, offsets, entries);
+            part_xmin, part_xmax, part_ymin, part_ymax, coverage,
+            counts, offsets, entries);
     }
 }
 
@@ -268,8 +600,11 @@ extern "C" __global__ void point_in_multipolygon_prepared_part_y_index(
     const int* ring_offsets,
     const double* polygon_x,
     const double* polygon_y,
+    const double* part_xmin,
+    const double* part_xmax,
     const double* part_ymin,
     const double* part_ymax,
+    const unsigned char* coverage,
     const unsigned int* counts,
     const long long* offsets,
     const unsigned int* entries,
@@ -298,9 +633,10 @@ extern "C" __global__ void point_in_multipolygon_prepared_part_y_index(
         const int part_start = polygon_geometry_offsets[polygon_row];
         const int part_end = polygon_geometry_offsets[polygon_row + 1];
         for (int part = part_start; part < part_end; ++part) {
-            const unsigned char location = vs_prepared_part_location(
+            const unsigned char location = vs_prepared_part_location_with_coverage(
                 px, py, part, ring_offsets, polygon_x, polygon_y,
-                part_ymin, part_ymax, counts, offsets, entries);
+                part_xmin, part_xmax, part_ymin, part_ymax, coverage,
+                counts, offsets, entries);
             if (location == 1) {
                 best = 1;
                 break;
@@ -374,8 +710,11 @@ vs_prepared_part_location_profiled(
     const int* ring_offsets,
     const double* x,
     const double* y,
+    const double* part_xmin,
+    const double* part_xmax,
     const double* part_ymin,
     const double* part_ymax,
+    const unsigned char* coverage,
     const unsigned int* counts,
     const long long* offsets,
     const unsigned int* entries,
@@ -387,6 +726,28 @@ vs_prepared_part_location_profiled(
     const double maximum = part_ymax[part];
     if (py < minimum || py > maximum) return 0;
     *active_parts += 1ull;
+    if (coverage != 0 && part_xmin != 0 && part_xmax != 0) {
+        const double xmin = part_xmin[part];
+        const double xmax = part_xmax[part];
+        if (isfinite(xmin) && isfinite(xmax)
+            && isfinite(minimum) && isfinite(maximum)
+            && xmax > xmin && maximum > minimum) {
+            if (px < xmin || px > xmax) return 0u;
+            int cell_x = (int)floor(
+                (px - xmin) * ((double)VS_COVERAGE_GRID_WIDTH / (xmax - xmin)));
+            int cell_y = (int)floor(
+                (py - minimum)
+                * ((double)VS_COVERAGE_GRID_WIDTH / (maximum - minimum)));
+            cell_x = max(0, min(VS_COVERAGE_GRID_WIDTH - 1, cell_x));
+            cell_y = max(0, min(VS_COVERAGE_GRID_WIDTH - 1, cell_y));
+            const unsigned char state = coverage[
+                (long long)part * VS_COVERAGE_GRID_WIDTH * VS_COVERAGE_GRID_WIDTH
+                + cell_y * VS_COVERAGE_GRID_WIDTH + cell_x
+            ];
+            if (state == 1u) return 0u;
+            if (state == 2u) return 2u;
+        }
+    }
     const int bin = vs_part_y_bin(py, minimum, maximum);
     const long long key = (long long)part * VS_PART_Y_BIN_COUNT + bin;
     const long long start = offsets[key];
@@ -465,8 +826,11 @@ extern "C" __global__ void point_in_polygon_prepared_part_y_index_profiled(
     const int* ring_offsets,
     const double* polygon_x,
     const double* polygon_y,
+    const double* part_xmin,
+    const double* part_xmax,
     const double* part_ymin,
     const double* part_ymax,
+    const unsigned char* coverage,
     const unsigned int* counts,
     const long long* offsets,
     const unsigned int* entries,
@@ -505,7 +869,8 @@ extern "C" __global__ void point_in_polygon_prepared_part_y_index_profiled(
             const int point_coord = point_geometry_offsets[point_row];
             result = vs_prepared_part_location_profiled(
                 point_x[point_coord], point_y[point_coord], polygon_row,
-                ring_offsets, polygon_x, polygon_y, part_ymin, part_ymax,
+                ring_offsets, polygon_x, polygon_y,
+                part_xmin, part_xmax, part_ymin, part_ymax, coverage,
                 counts, offsets, entries, &active, &edges, &orient);
         }
         out[index] = result;
@@ -546,8 +911,11 @@ extern "C" __global__ void point_in_multipolygon_prepared_part_y_index_profiled(
     const int* ring_offsets,
     const double* polygon_x,
     const double* polygon_y,
+    const double* part_xmin,
+    const double* part_xmax,
     const double* part_ymin,
     const double* part_ymax,
+    const unsigned char* coverage,
     const unsigned int* counts,
     const long long* offsets,
     const unsigned int* entries,
@@ -591,7 +959,8 @@ extern "C" __global__ void point_in_multipolygon_prepared_part_y_index_profiled(
                 parts += 1ull;
                 const unsigned char location = vs_prepared_part_location_profiled(
                     px, py, part, ring_offsets, polygon_x, polygon_y,
-                    part_ymin, part_ymax, counts, offsets, entries,
+                    part_xmin, part_xmax, part_ymin, part_ymax, coverage,
+                    counts, offsets, entries,
                     &active, &edges, &orient);
                 if (location == 1) {
                     best = 1;
@@ -644,8 +1013,13 @@ _POINT_LOCATION_PART_Y_INDEX_PROFILE_SOURCE = (
 )
 
 POINT_LOCATION_PART_Y_INDEX_KERNEL_NAMES = (
-    "count_polygon_part_y_bins",
-    "scatter_polygon_part_y_bins",
+    "compute_polygon_part_y_bounds",
+    "compute_polygon_part_x_bounds",
+    "map_polygon_rings_to_parts",
+    "count_polygon_edge_y_bin_memberships",
+    "scatter_polygon_edge_y_bin_memberships",
+    "initialize_polygon_part_coverage_cells",
+    "mark_polygon_edge_coverage_cells",
     "point_in_polygon_prepared_part_y_index",
     "point_in_multipolygon_prepared_part_y_index",
 )
@@ -656,3 +1030,46 @@ POINT_LOCATION_PART_Y_INDEX_PROFILE_KERNEL_NAMES = (
     "point_in_polygon_prepared_part_y_index_profiled",
     "point_in_multipolygon_prepared_part_y_index_profiled",
 )
+
+
+def _source_for_bin_count(source: str, bin_count: int) -> str:
+    """Return one compile-time-uniform width variant."""
+    width = int(bin_count)
+    if width not in SUPPORTED_PART_Y_BIN_COUNTS:
+        raise ValueError(
+            f"unsupported polygon part-y bin count {width}; "
+            f"expected one of {SUPPORTED_PART_Y_BIN_COUNTS}"
+        )
+    coverage_width = coverage_grid_width_for_bin_count(width)
+    source = source.replace(
+        f"#define VS_PART_Y_BIN_COUNT {PART_Y_BIN_COUNT}\n",
+        f"#define VS_PART_Y_BIN_COUNT {width}\n",
+        1,
+    )
+    return source.replace(
+        f"#define VS_COVERAGE_GRID_WIDTH {COVERAGE_GRID_WIDTH}\n",
+        f"#define VS_COVERAGE_GRID_WIDTH {coverage_width}\n",
+        1,
+    )
+
+
+def coverage_grid_width_for_bin_count(bin_count: int) -> int:
+    """Return the bounded conservative grid width paired with one y tier."""
+    width = int(bin_count)
+    try:
+        return _COVERAGE_GRID_WIDTH_BY_BIN_COUNT[width]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported polygon part-y bin count {width}; "
+            f"expected one of {SUPPORTED_PART_Y_BIN_COUNTS}"
+        ) from exc
+
+
+def point_location_part_y_index_source(bin_count: int) -> str:
+    """Return the production kernel source for ``bin_count`` bins per part."""
+    return _source_for_bin_count(_POINT_LOCATION_PART_Y_INDEX_SOURCE, bin_count)
+
+
+def point_location_part_y_index_profile_source(bin_count: int) -> str:
+    """Return the profiling kernel source for ``bin_count`` bins per part."""
+    return _source_for_bin_count(_POINT_LOCATION_PART_Y_INDEX_PROFILE_SOURCE, bin_count)

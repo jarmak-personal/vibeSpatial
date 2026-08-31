@@ -126,6 +126,27 @@ def test_sort_pairs_auto_routes_numeric_keys_to_radix() -> None:
     np.testing.assert_array_equal(result.values.get(), np.asarray([10, 11, 30, 40], dtype=np.int32))
 
 
+def test_sort_pairs_writes_into_reusable_output_buffers() -> None:
+    cp = _cupy()
+    keys = cp.asarray([4, 1, 3, 1], dtype=cp.uint64)
+    values = cp.asarray([40, 10, 30, 11], dtype=cp.int32)
+    out_keys = cp.empty_like(keys)
+    out_values = cp.empty_like(values)
+
+    result = sort_pairs(
+        keys,
+        values,
+        strategy=PairSortStrategy.RADIX,
+        out_keys=out_keys,
+        out_values=out_values,
+    )
+
+    assert result.keys is out_keys
+    assert result.values is out_values
+    np.testing.assert_array_equal(out_keys.get(), [1, 1, 3, 4])
+    np.testing.assert_array_equal(out_values.get(), [10, 11, 30, 40])
+
+
 def test_sort_pairs_merge_route_supports_descending() -> None:
     cp = _cupy()
     keys = cp.asarray([4, 1, 3, 1], dtype=cp.int32)

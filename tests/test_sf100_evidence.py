@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import shutil
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from benchmarks.spatialbench import sf100_evidence
+from benchmarks.spatialbench.vibespatial_queries import VibeSpatialQueries
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPARATOR = (
@@ -19,6 +21,17 @@ ACCEPTED_DIR = (
 )
 CANDIDATE = ACCEPTED_DIR / "vibespatial.json"
 RESULTS = ACCEPTED_DIR / "results"
+
+
+def test_q5_native_spill_crossover_is_shape_based_and_public() -> None:
+    assert VibeSpatialQueries._q5_uses_native_spill(384_000_128) is False
+    assert VibeSpatialQueries._q5_uses_native_spill(999_999_999) is False
+    assert VibeSpatialQueries._q5_uses_native_spill(1_000_000_000) is True
+
+    source = inspect.getsource(VibeSpatialQueries.q5)
+    assert "write_geoparquet" in source
+    assert "NativePartitionedParquetSink" not in source
+    assert "pylibcudf" not in source
 
 
 def _disable_machine_checks(monkeypatch: pytest.MonkeyPatch) -> None:

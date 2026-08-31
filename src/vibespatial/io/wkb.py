@@ -2865,6 +2865,7 @@ def _write_geoparquet_native_device_wkb_chunks(
         *([] if full_attribute_table is None else [full_attribute_table])
     )
     writer = None
+    append_native_table = getattr(sink, "_append_native_table", None)
     try:
         for start, stop, chunk_owned in _iter_bounded_native_wkb_owned_chunks(
             owned=owned,
@@ -2903,41 +2904,44 @@ def _write_geoparquet_native_device_wkb_chunks(
                 chunk_columns.append(plc.Column.struct_from_children(bbox_children))
 
             chunk_table = plc.Table(chunk_columns)
-            if writer is None:
-                metadata = plc.io.types.TableInputMetadata(chunk_table)
-                for index, column_name in enumerate(all_column_names):
-                    metadata.column_metadata[index].set_name(column_name)
-                    if column_name == geometry_name:
-                        metadata.column_metadata[index].set_output_as_binary(True)
-                    elif column_name == "bbox":
-                        for child_index, child_name in enumerate(
-                            ("xmin", "ymin", "xmax", "ymax")
-                        ):
-                            metadata.column_metadata[index].child(child_index).set_name(
-                                child_name
+            if append_native_table is not None:
+                append_native_table(chunk_table, arrow_schema=arrow_schema)
+            else:
+                if writer is None:
+                    metadata = plc.io.types.TableInputMetadata(chunk_table)
+                    for index, column_name in enumerate(all_column_names):
+                        metadata.column_metadata[index].set_name(column_name)
+                        if column_name == geometry_name:
+                            metadata.column_metadata[index].set_output_as_binary(True)
+                        elif column_name == "bbox":
+                            for child_index, child_name in enumerate(
+                                ("xmin", "ymin", "xmax", "ymax")
+                            ):
+                                metadata.column_metadata[index].child(
+                                    child_index
+                                ).set_name(child_name)
+                        else:
+                            _apply_arrow_nested_child_metadata(
+                                metadata.column_metadata[index],
+                                attribute_schema.field(column_name),
                             )
-                    else:
-                        _apply_arrow_nested_child_metadata(
-                            metadata.column_metadata[index],
-                            attribute_schema.field(column_name),
-                        )
-                builder = plc.io.parquet.ChunkedParquetWriterOptions.builder(
-                    plc.io.types.SinkInfo([sink])
-                )
-                builder.metadata(metadata)
-                builder.key_value_metadata([footer_metadata])
-                builder.write_arrow_schema(False)
-                builder.compression(_compression_type_from_name(compression))
-                builder.row_group_size_rows(
-                    requested_row_group_size or capacity_plan.max_chunk_rows
-                )
-                if "max_page_size" in writer_kwargs:
-                    builder.max_page_size_bytes(int(writer_kwargs["max_page_size"]))
-                writer = plc.io.parquet.ChunkedParquetWriter.from_options(
-                    builder.build(),
-                    stream=stream,
-                )
-            writer.write(chunk_table)
+                    builder = plc.io.parquet.ChunkedParquetWriterOptions.builder(
+                        plc.io.types.SinkInfo([sink])
+                    )
+                    builder.metadata(metadata)
+                    builder.key_value_metadata([footer_metadata])
+                    builder.write_arrow_schema(False)
+                    builder.compression(_compression_type_from_name(compression))
+                    builder.row_group_size_rows(
+                        requested_row_group_size or capacity_plan.max_chunk_rows
+                    )
+                    if "max_page_size" in writer_kwargs:
+                        builder.max_page_size_bytes(int(writer_kwargs["max_page_size"]))
+                    writer = plc.io.parquet.ChunkedParquetWriter.from_options(
+                        builder.build(),
+                        stream=stream,
+                    )
+                writer.write(chunk_table)
             # The chunk table owns the WKB payload and offset buffers consumed
             # asynchronously by libcudf.  Keep those owners alive until the
             # writer stream reaches this point instead of serializing the CUDA
@@ -3026,7 +3030,8 @@ def _write_geoparquet_native_device_payload(
                 f"compression={compression!r}"
             ),
         )
-    sink = _pylibcudf_sink(path)
+    append_native_table = getattr(path, "_append_native_table", None)
+    sink = path if append_native_table is not None else _pylibcudf_sink(path)
     if sink is None:
         return _NativeDeviceWriteStatus(
             written=False,
@@ -3093,10 +3098,18 @@ def _write_geoparquet_native_device_payload(
         requested_row_group_size = int(requested_row_group_size)
         if requested_row_group_size <= 0:
             raise ValueError("row_group_size must be greater than zero")
-    bounded_chunk_rows = min(
-        int(requested_row_group_size or _NATIVE_DEVICE_PARQUET_CHUNK_ROWS),
-        _NATIVE_DEVICE_PARQUET_CHUNK_ROWS,
-    )
+    clustered_input_rows = getattr(path, "max_input_chunk_rows", None)
+    if clustered_input_rows is None:
+        bounded_chunk_rows = min(
+            int(requested_row_group_size or _NATIVE_DEVICE_PARQUET_CHUNK_ROWS),
+            _NATIVE_DEVICE_PARQUET_CHUNK_ROWS,
+        )
+    else:
+        # The clustered sink partitions one admitted native input chunk before
+        # it applies its own bounded output row-group limit. Splitting by the
+        # terminal writer's row-group size here would multiply partitions by
+        # input chunks and create thousands of tiny writer calls.
+        bounded_chunk_rows = int(clustered_input_rows)
     wkb_capacity_plan = None
     capacity_chunk_rows = 0
     native_row_count = int(
@@ -3361,15 +3374,18 @@ def _write_geoparquet_native_device_payload(
         arrow_schema.serialize().to_pybytes()
     ).decode()
 
-    _write_pylibcudf_parquet_table(
-        plc,
-        plc_table,
-        sink=sink,
-        metadata=metadata,
-        footer_metadata=footer_metadata,
-        compression=compression,
-        writer_kwargs=recognized_kwargs,
-    )
+    if append_native_table is not None:
+        append_native_table(plc_table, arrow_schema=arrow_schema)
+    else:
+        _write_pylibcudf_parquet_table(
+            plc,
+            plc_table,
+            sink=sink,
+            metadata=metadata,
+            footer_metadata=footer_metadata,
+            compression=compression,
+            writer_kwargs=recognized_kwargs,
+        )
     record_dispatch_event(
         surface="vibespatial.io.geoparquet",
         operation="to_parquet",
@@ -3449,7 +3465,8 @@ def _write_geoparquet_native_device(
                 f"native device GeoParquet writer does not support compression={compression!r}"
             ),
         )
-    sink = _pylibcudf_sink(path)
+    append_native_table = getattr(path, "_append_native_table", None)
+    sink = path if append_native_table is not None else _pylibcudf_sink(path)
     if sink is None:
         return _NativeDeviceWriteStatus(
             written=False,
@@ -3671,15 +3688,18 @@ def _write_geoparquet_native_device(
         arrow_schema.serialize().to_pybytes()
     ).decode()
 
-    _write_pylibcudf_parquet_table(
-        plc,
-        plc_table,
-        sink=sink,
-        metadata=metadata,
-        footer_metadata=footer_metadata,
-        compression=compression,
-        writer_kwargs=recognized_kwargs,
-    )
+    if append_native_table is not None:
+        append_native_table(plc_table, arrow_schema=arrow_schema)
+    else:
+        _write_pylibcudf_parquet_table(
+            plc,
+            plc_table,
+            sink=sink,
+            metadata=metadata,
+            footer_metadata=footer_metadata,
+            compression=compression,
+            writer_kwargs=recognized_kwargs,
+        )
     record_dispatch_event(
         surface="vibespatial.io.geoparquet",
         operation="to_parquet",

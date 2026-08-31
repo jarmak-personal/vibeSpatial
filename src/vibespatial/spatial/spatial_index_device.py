@@ -328,6 +328,7 @@ def spatial_index_device_query(
     distance: np.ndarray | object | None = None,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
     allow_bbox_superset: bool = False,
+    candidate_output=None,
 ) -> tuple[_DeviceCandidates | None, SpatialQueryExecution]:
     """GPU-accelerated spatial index query — replaces CPU STRtree traversal.
 
@@ -423,6 +424,7 @@ def spatial_index_device_query(
         result, _decline = point_grid_relation_superset_query(
             native_index,
             effective_bounds,
+            candidate_output=candidate_output,
         )
         if result is not None:
             return result, SpatialQueryExecution(
