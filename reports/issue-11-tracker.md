@@ -1,7 +1,7 @@
 # Issue 11: Bounded Exact Fixed-k Nearest Tracker
 
 **Source:** `reports/issue-11`
-**Status:** Review complete; landing in progress
+**Status:** Complete; implementation landed on `origin/main`
 **Owner:** Codex
 **Machine constraint:** Do not run SF1000 on this machine. Use SF1, SF10, and
 SF100 only when required by the applicable correctness or performance gate.
@@ -158,8 +158,8 @@ than tuning around the problem.
 - [x] Run the mandatory pre-land review through the commit workflow.
 - [x] Mark every completed tracker item and record any intentionally
   non-applicable item with evidence.
-- [ ] Commit the reviewed diff.
-- [ ] Run `git pull --rebase` and push successfully.
+- [x] Commit the reviewed diff.
+- [x] Run `git pull --rebase` and push successfully.
 
 ## Completion Criteria
 
@@ -179,7 +179,7 @@ than tuning around the problem.
   transfers, and materialization boundaries.
 - [x] Cold and warm paths have registered specializations and no unknown
   warmup warning.
-- [ ] The reviewed commit is present on the remote branch.
+- [x] The reviewed commit is present on the remote branch.
 
 ## Evidence Log
 
@@ -209,3 +209,5 @@ than tuning around the problem.
 | 2026-09-01 | Fifth independent pre-land review | Fix required for omitted terminating loop-control fences and early-return D2H telemetry finalization |
 | 2026-09-01 | Telemetry finalization remediation | Transfer/materialization deltas now finalize in the operation wrapper on every result path, and every loop-control fence is counted |
 | 2026-09-01 | Sixth independent pre-land review | LAND with no findings; all prior findings, final4 artifacts, exact source identity, randomized oracles, and focused GPU tests verified |
+| 2026-09-01 | Reviewed implementation commit | `94b17da` (`Implement bounded exact fixed-k nearest`) created after the mandatory LAND verdict |
+| 2026-09-01 | Remote landing | `git pull --rebase && git push` completed successfully; `origin/main` advanced from `bc022fe` to `94b17da` after the contract and GPU health pre-push gate refreshed its cache |
