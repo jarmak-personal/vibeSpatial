@@ -2,7 +2,9 @@
 """Convert legacy SpatialBench WKB Parquet tables to GeoParquet 1.1.
 
 Preparation is intentionally outside benchmark timing. Each source shard maps
-to one output shard so query implementations can retain bounded streaming.
+to one output shard so query implementations can retain bounded streaming. The
+default output uses native GeoArrow. ``--preserve-wkb`` instead performs a
+device-native metadata-only transcode and preserves every source WKB byte.
 """
 
 from __future__ import annotations
@@ -24,7 +26,11 @@ GEOMETRY_COLUMNS = {
 }
 
 
-def _convert_file(source: Path, target: Path, geometry_columns: tuple[str, ...]) -> int:
+def _convert_file_native_geoarrow(
+    source: Path,
+    target: Path,
+    geometry_columns: tuple[str, ...],
+) -> int:
     table = pq.read_table(source)
     frame = table.to_pandas()
     for column in geometry_columns:
@@ -50,10 +56,57 @@ def _convert_file(source: Path, target: Path, geometry_columns: tuple[str, ...])
     return int(output_rows)
 
 
-def prepare(input_root: Path, output_root: Path, *, force: bool) -> dict:
+def _convert_file_preserved_wkb(
+    source: Path,
+    target: Path,
+    geometry_columns: tuple[str, ...],
+) -> tuple[int, dict[str, object]]:
+    from vibespatial.io.geoparquet import (
+        transcode_legacy_wkb_parquet_to_geoparquet,
+    )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source_file = pq.ParquetFile(source)
+    row_group_size = max(
+        (
+            int(source_file.metadata.row_group(index).num_rows)
+            for index in range(source_file.metadata.num_row_groups)
+        ),
+        default=None,
+    )
+    result = transcode_legacy_wkb_parquet_to_geoparquet(
+        source,
+        target,
+        geometry_columns={column: {"crs": None} for column in geometry_columns},
+        primary_geometry=geometry_columns[0],
+        compression="zstd",
+        row_group_size=row_group_size,
+    )
+    return result.row_count, {
+        "source_bytes": result.source_bytes,
+        "output_bytes": result.output_bytes,
+        "backend": result.backend,
+        "schema_validated": result.schema_validated,
+        "values_validated": result.values_validated,
+        "atomic_publication": result.atomic_publication,
+    }
+
+
+def prepare(
+    input_root: Path,
+    output_root: Path,
+    *,
+    force: bool,
+    preserve_wkb: bool = False,
+) -> dict:
     manifest = {
         "format": "GeoParquet 1.1",
-        "geometry_encoding": "native GeoArrow",
+        "geometry_encoding": "WKB" if preserve_wkb else "native GeoArrow",
+        "payload_policy": (
+            "device-native metadata-only byte-preserving transcode"
+            if preserve_wkb
+            else "host correctness conversion to native GeoArrow"
+        ),
         "source": str(input_root.resolve()),
         "tables": {},
     }
@@ -63,14 +116,44 @@ def prepare(input_root: Path, output_root: Path, *, force: bool) -> dict:
         if not files:
             raise FileNotFoundError(f"no Parquet shards found in {source_dir}")
         rows = 0
+        source_bytes = 0
+        output_bytes = 0
+        validation = {
+            "schema_validated": True,
+            "values_validated": True,
+            "atomic_publication": True,
+        }
         started = perf_counter()
         for position, source in enumerate(files, start=1):
             target = output_root / table_name / source.name
             if target.exists() and not force:
                 output_rows = pq.ParquetFile(target).metadata.num_rows
+                file_evidence = {
+                    "source_bytes": source.stat().st_size,
+                    "output_bytes": target.stat().st_size,
+                }
+            elif preserve_wkb:
+                output_rows, file_evidence = _convert_file_preserved_wkb(
+                    source,
+                    target,
+                    geometry_columns,
+                )
             else:
-                output_rows = _convert_file(source, target, geometry_columns)
+                output_rows = _convert_file_native_geoarrow(
+                    source,
+                    target,
+                    geometry_columns,
+                )
+                file_evidence = {
+                    "source_bytes": source.stat().st_size,
+                    "output_bytes": target.stat().st_size,
+                }
             rows += int(output_rows)
+            source_bytes += int(file_evidence["source_bytes"])
+            output_bytes += int(file_evidence["output_bytes"])
+            for key in validation:
+                if key in file_evidence:
+                    validation[key] = validation[key] and bool(file_evidence[key])
             print(
                 f"[{table_name} {position}/{len(files)}] {source.name}: "
                 f"{output_rows:,} rows",
@@ -80,6 +163,9 @@ def prepare(input_root: Path, output_root: Path, *, force: bool) -> dict:
             "files": len(files),
             "rows": rows,
             "geometry_columns": list(geometry_columns),
+            "source_bytes": source_bytes,
+            "output_bytes": output_bytes,
+            **(validation if preserve_wkb else {}),
             "elapsed_seconds": perf_counter() - started,
         }
 
@@ -105,9 +191,22 @@ def main() -> None:
         action="store_true",
         help="replace existing converted shards after validating the replacement",
     )
+    parser.add_argument(
+        "--preserve-wkb",
+        action="store_true",
+        help=(
+            "publish WKB GeoParquet with exact source payload bytes using the "
+            "device-native metadata-only transcode"
+        ),
+    )
     args = parser.parse_args()
     args.output_root.mkdir(parents=True, exist_ok=True)
-    manifest = prepare(args.input_root, args.output_root, force=args.force)
+    manifest = prepare(
+        args.input_root,
+        args.output_root,
+        force=args.force,
+        preserve_wkb=args.preserve_wkb,
+    )
     print(json.dumps(manifest, indent=2))
 
 

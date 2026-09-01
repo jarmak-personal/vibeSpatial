@@ -1122,6 +1122,7 @@ class CudaDriverRuntime:
         self._memory_backend: str = "none"
         self._rmm_mr = None
         self._rmm_pool = None
+        self._rmm_limit = None
         self._rmm_mr_chain: tuple[Any, ...] = ()
         self._memory_pool_configured: bool = False
         self._query_memory_budget: QueryDeviceMemoryBudget | None = None
@@ -1172,12 +1173,12 @@ class CudaDriverRuntime:
 
         * **Tier C** — ``VIBESPATIAL_GPU_MANAGED_MEMORY=1``: bare managed
           memory (automatic page migration, no pool).
-        * **Tier A** — ``VIBESPATIAL_GPU_OOM_SAFETY=0``: raw pool, no
-          failure callback.  Faster allocation but OOM is fatal.
-        * **Tier B** (default) — pool + ``FailureCallbackResourceAdaptor``
-          that runs ``gc.collect()`` on allocation failure, giving Python
-          a chance to free unreferenced CuPy arrays and return blocks to
-          the pool before the OOM propagates.
+        * **Tier A** — ``VIBESPATIAL_GPU_OOM_SAFETY=0``: bounded CUDA async
+          pool, no failure callback.
+        * **Tier B** (default) — bounded CUDA async pool plus
+          ``FailureCallbackResourceAdaptor`` that runs ``gc.collect()`` on
+          allocation failure, giving Python a chance to return unreferenced
+          CuPy arrays before the OOM propagates.
         """
         _driver_free, driver_total = cp.cuda.runtime.memGetInfo()
         managed = os.environ.get("VIBESPATIAL_GPU_MANAGED_MEMORY", "").strip()
@@ -1187,39 +1188,46 @@ class CudaDriverRuntime:
             # Tier C: bare managed memory (no pool wrapping)
             mr = rmm.mr.ManagedMemoryResource()
             pool = None
+            limiting = None
             chain = (mr,)
             self._memory_backend = "rmm-managed"
             logger.info("RMM memory backend: managed memory (Tier C)")
         else:
             pool_limit = _configured_pool_limit(int(driver_total))
-            initial_pool_size, maximum_pool_size = _rmm_pool_allocation_sizes(
+            initial_pool_size, _maximum_pool_size = _rmm_pool_allocation_sizes(
                 pool_limit
             )
-            if oom_safety in ("0", "false", "no"):
-                # Tier A: raw pool, no OOM callback (opt-in)
-                base = rmm.mr.CudaMemoryResource()
-                mr = rmm.mr.PoolMemoryResource(
-                    base,
-                    initial_pool_size=initial_pool_size,
-                    maximum_pool_size=maximum_pool_size,
-                )
-                pool = mr
-                chain = (base, pool)
-                self._memory_backend = "rmm-pool"
-                logger.info("RMM memory backend: pool without OOM safety (Tier A)")
+            pool = rmm.mr.CudaAsyncMemoryResource(
+                initial_pool_size=initial_pool_size,
+                release_threshold=pool_limit,
+            )
+            if pool_limit is None:
+                limiting = None
+                bounded = pool
+                chain = (pool,)
             else:
-                # Tier B: pool + OOM callback (default)
-                base = rmm.mr.CudaMemoryResource()
-                pool = rmm.mr.PoolMemoryResource(
-                    base,
-                    initial_pool_size=initial_pool_size,
-                    maximum_pool_size=maximum_pool_size,
+                limiting = rmm.mr.LimitingResourceAdaptor(
+                    pool,
+                    allocation_limit=pool_limit,
                 )
+                bounded = limiting
+                chain = (pool, limiting)
+            if oom_safety in ("0", "false", "no"):
+                # Tier A: bounded async pool, no OOM callback (opt-in).
+                mr = bounded
+                self._memory_backend = "rmm-async"
+                logger.info(
+                    "RMM memory backend: CUDA async without OOM safety (Tier A)"
+                )
+            else:
+                # Tier B: bounded async pool + OOM callback (default).
                 callback = _make_oom_callback(max_retries=3)
-                mr = rmm.mr.FailureCallbackResourceAdaptor(pool, callback)
-                chain = (base, pool, mr)
-                self._memory_backend = "rmm-safe"
-                logger.info("RMM memory backend: pool with OOM safety (Tier B, default)")
+                mr = rmm.mr.FailureCallbackResourceAdaptor(bounded, callback)
+                chain = (*chain, mr)
+                self._memory_backend = "rmm-async-safe"
+                logger.info(
+                    "RMM memory backend: CUDA async with OOM safety (Tier B, default)"
+                )
 
         rmm.mr.set_current_device_resource(mr)
         cp.cuda.set_allocator(rmm_cupy_allocator)
@@ -1231,6 +1239,7 @@ class CudaDriverRuntime:
             raise RuntimeError("CuPy rejected the configured RMM allocator")
         self._memory_pool = None  # CuPy pool is not used
         self._rmm_pool = pool
+        self._rmm_limit = limiting
         self._rmm_mr = active_mr
         self._rmm_mr_chain = (*chain, active_mr)
 
@@ -1296,7 +1305,24 @@ class CudaDriverRuntime:
         except (ImportError, AttributeError):
             pass
 
-        if self._rmm_pool is not None:
+        if self._memory_backend in {"rmm-async", "rmm-async-safe"}:
+            # RMM 26.02 does not expose the private cudaMemPool_t owned by
+            # CudaAsyncMemoryResource.  Report the measurable live lower bound
+            # instead of accidentally querying CUDA's unrelated default pool.
+            live_bytes = stats.get("used_bytes", 0)
+            stats["reserved_bytes"] = live_bytes
+            stats["free_bytes"] = 0
+            if self._rmm_limit is not None:
+                try:
+                    stats["allocation_limit_bytes"] = int(
+                        self._rmm_limit.get_allocation_limit()
+                    )
+                    stats["allocated_bytes"] = int(
+                        self._rmm_limit.get_allocated_bytes()
+                    )
+                except (AttributeError, RuntimeError):
+                    pass
+        elif self._rmm_pool is not None:
             try:
                 stats["reserved_bytes"] = int(self._rmm_pool.pool_size())
                 stats["free_bytes"] = max(
@@ -1365,6 +1391,17 @@ class CudaDriverRuntime:
         driver_free, driver_total = cp.cuda.runtime.memGetInfo()
         if self._memory_backend == "rmm-managed":
             return int(driver_free)
+        if self._memory_backend in {"rmm-async", "rmm-async-safe"}:
+            if self._rmm_limit is None:
+                return int(driver_free)
+            try:
+                return max(
+                    int(self._rmm_limit.get_allocation_limit())
+                    - int(self._rmm_limit.get_allocated_bytes()),
+                    0,
+                )
+            except (AttributeError, RuntimeError):
+                return 0
         pool_limit = _configured_pool_limit(int(driver_total))
         if pool_limit is None:
             return int(driver_free)
@@ -1372,7 +1409,12 @@ class CudaDriverRuntime:
         stats = self.memory_pool_stats()
         if self._memory_backend == "cupy":
             reserved = stats.get("total_bytes")
-        elif self._memory_backend in {"rmm-pool", "rmm-safe"}:
+        elif self._memory_backend in {
+            "rmm-pool",
+            "rmm-safe",
+            "rmm-async",
+            "rmm-async-safe",
+        }:
             reserved = stats.get("reserved_bytes")
         else:
             return int(driver_free)
@@ -1443,6 +1485,11 @@ class CudaDriverRuntime:
         if self._memory_backend == "cupy":
             if self._memory_pool is not None:
                 self._memory_pool.free_all_blocks()
+        elif self._memory_backend in {"rmm-async", "rmm-async-safe"}:
+            import gc
+
+            gc.collect()
+            self.synchronize()
         elif self._memory_backend.startswith("rmm"):
             # RMM pool coalesces freed blocks internally but Python GC
             # must run first so that unreferenced CuPy arrays actually

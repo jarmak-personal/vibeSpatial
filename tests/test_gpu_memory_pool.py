@@ -620,6 +620,59 @@ def test_pool_upstream_growth_honors_allocator_ceiling(monkeypatch) -> None:
     assert runtime.pool_upstream_growth_bytes() == 2 << 20
 
 
+def test_async_pool_growth_uses_live_allocation_limit(monkeypatch) -> None:
+    from vibespatial.cuda import _runtime as rt_mod
+
+    runtime = rt_mod.CudaDriverRuntime()
+    runtime._memory_backend = "rmm-async-safe"
+    runtime._rmm_limit = SimpleNamespace(
+        get_allocation_limit=lambda: 32 << 20,
+        get_allocated_bytes=lambda: 11 << 20,
+    )
+    monkeypatch.setattr(runtime, "_ensure_context", lambda: None)
+    monkeypatch.setattr(
+        rt_mod.cp.cuda.runtime,
+        "memGetInfo",
+        lambda: (3 << 20, 64 << 20),
+    )
+
+    assert runtime.pool_upstream_growth_bytes() == 21 << 20
+
+
+def test_async_pool_stats_report_measurable_live_bound() -> None:
+    import vibespatial.cuda._runtime as rt_mod
+
+    runtime = rt_mod.CudaDriverRuntime.__new__(rt_mod.CudaDriverRuntime)
+    runtime._memory_backend = "rmm-async-safe"
+    runtime._memory_pool = None
+    runtime._rmm_pool = object()
+    runtime._rmm_limit = SimpleNamespace(
+        get_allocation_limit=lambda: 32 << 20,
+        get_allocated_bytes=lambda: 7 << 20,
+    )
+    runtime._rmm_mr = object()
+    runtime._largest_admitted_allocation_bytes = 0
+
+    class _Stats:
+        current_bytes = 7 << 20
+        peak_bytes = 9 << 20
+        total_bytes = 12 << 20
+        total_count = 4
+
+    original = rt_mod.rmm.statistics.get_statistics
+    try:
+        rt_mod.rmm.statistics.get_statistics = lambda: _Stats()
+        stats = runtime.memory_pool_stats()
+    finally:
+        rt_mod.rmm.statistics.get_statistics = original
+
+    assert stats["used_bytes"] == 7 << 20
+    assert stats["reserved_bytes"] == 7 << 20
+    assert stats["free_bytes"] == 0
+    assert stats["allocation_limit_bytes"] == 32 << 20
+    assert stats["allocated_bytes"] == 7 << 20
+
+
 def test_pool_upstream_growth_ignores_pool_limit_for_managed_memory(
     monkeypatch,
 ) -> None:
@@ -792,7 +845,14 @@ def test_memory_backend_is_set_on_gpu() -> None:
     runtime = get_cuda_runtime()
     runtime._ensure_context()
 
-    assert runtime._memory_backend in ("cupy", "rmm-pool", "rmm-safe", "rmm-managed")
+    assert runtime._memory_backend in (
+        "cupy",
+        "rmm-pool",
+        "rmm-safe",
+        "rmm-async",
+        "rmm-async-safe",
+        "rmm-managed",
+    )
 
 
 @pytest.mark.gpu

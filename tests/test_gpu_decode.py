@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import numpy as np
 import pytest
 from shapely.geometry import (
@@ -42,6 +44,22 @@ def _assert_lazy_device_owned(owned) -> None:
         assert buffer.y.size == 0
         assert buffer.geometry_offsets.size == 0
         assert buffer.empty_mask.size == 0
+
+
+@contextmanager
+def _assert_only_wkb_summary_d2h():
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        get_d2h_transfer_profile,
+    )
+
+    start_count, start_bytes, _ = get_d2h_transfer_profile()
+    yield
+    end_count, end_bytes, _ = get_d2h_transfer_profile()
+    events = get_d2h_transfer_events()
+    assert end_count - start_count == 1
+    assert end_bytes - start_bytes == 376
+    assert events[-1].reason == "WKB decode bounded aggregate telemetry packet"
 
 
 @pytest.mark.parametrize(
@@ -155,7 +173,6 @@ def test_pylibcudf_wkb_header_scan_matches_mixed_family_reference(tmp_path) -> N
 
 def test_read_geoparquet_owned_gpu_wkb_point_decode_matches_cpu(tmp_path) -> None:
     _require_gpu_decode_runtime()
-    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
 
     path = tmp_path / "point-wkb.parquet"
     frame = geopandas.GeoDataFrame(
@@ -164,7 +181,7 @@ def test_read_geoparquet_owned_gpu_wkb_point_decode_matches_cpu(tmp_path) -> Non
     )
     frame.to_parquet(path, geometry_encoding="WKB")
 
-    with assert_zero_d2h_transfers():
+    with _assert_only_wkb_summary_d2h():
         gpu_owned = read_geoparquet_owned(path, backend="gpu")
     cpu_owned = read_geoparquet_owned(path, backend="cpu")
 
@@ -239,7 +256,6 @@ def test_read_geoparquet_owned_gpu_wkb_mixed_point_linestring_decode_matches_cpu
 
 def test_read_geoparquet_owned_gpu_wkb_polygon_decode_matches_cpu(tmp_path) -> None:
     _require_gpu_decode_runtime()
-    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
 
     path = tmp_path / "polygon-wkb.parquet"
     frame = geopandas.GeoDataFrame(
@@ -255,7 +271,7 @@ def test_read_geoparquet_owned_gpu_wkb_polygon_decode_matches_cpu(tmp_path) -> N
     )
     frame.to_parquet(path, geometry_encoding="WKB")
 
-    with assert_zero_d2h_transfers():
+    with _assert_only_wkb_summary_d2h():
         gpu_owned = read_geoparquet_owned(path, backend="gpu")
     cpu_owned = read_geoparquet_owned(path, backend="cpu")
 
@@ -327,7 +343,6 @@ def test_read_geoparquet_owned_gpu_wkb_multipoint_varied_part_counts(tmp_path) -
 
 def test_read_geoparquet_owned_gpu_wkb_multilinestring_decode_matches_cpu(tmp_path) -> None:
     _require_gpu_decode_runtime()
-    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
 
     path = tmp_path / "multilinestring-wkb.parquet"
     frame = geopandas.GeoDataFrame(
@@ -343,7 +358,7 @@ def test_read_geoparquet_owned_gpu_wkb_multilinestring_decode_matches_cpu(tmp_pa
     )
     frame.to_parquet(path, geometry_encoding="WKB")
 
-    with assert_zero_d2h_transfers():
+    with _assert_only_wkb_summary_d2h():
         gpu_owned = read_geoparquet_owned(path, backend="gpu")
     cpu_owned = read_geoparquet_owned(path, backend="cpu")
 
@@ -388,7 +403,6 @@ def test_read_geoparquet_owned_gpu_wkb_multilinestring_varied_part_counts(tmp_pa
 
 def test_read_geoparquet_owned_gpu_wkb_multipolygon_decode_matches_cpu(tmp_path) -> None:
     _require_gpu_decode_runtime()
-    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
 
     path = tmp_path / "multipolygon-wkb.parquet"
     frame = geopandas.GeoDataFrame(
@@ -404,7 +418,7 @@ def test_read_geoparquet_owned_gpu_wkb_multipolygon_decode_matches_cpu(tmp_path)
     )
     frame.to_parquet(path, geometry_encoding="WKB")
 
-    with assert_zero_d2h_transfers():
+    with _assert_only_wkb_summary_d2h():
         gpu_owned = read_geoparquet_owned(path, backend="gpu")
     cpu_owned = read_geoparquet_owned(path, backend="cpu")
 
@@ -525,7 +539,6 @@ def test_direct_pylibcudf_nested_wkb_helpers_use_staged_gpu_pipeline(
 
 def test_read_geoparquet_owned_gpu_wkb_mixed_all_families_decode_matches_cpu(tmp_path) -> None:
     _require_gpu_decode_runtime()
-    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
 
     path = tmp_path / "mixed-all-families-wkb.parquet"
     frame = geopandas.GeoDataFrame(
@@ -544,7 +557,7 @@ def test_read_geoparquet_owned_gpu_wkb_mixed_all_families_decode_matches_cpu(tmp
     )
     frame.to_parquet(path, geometry_encoding="WKB")
 
-    with assert_zero_d2h_transfers():
+    with _assert_only_wkb_summary_d2h():
         gpu_owned = read_geoparquet_owned(path, backend="gpu")
     cpu_owned = read_geoparquet_owned(path, backend="cpu")
 

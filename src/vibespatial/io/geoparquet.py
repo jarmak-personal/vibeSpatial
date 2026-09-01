@@ -57,6 +57,7 @@ from .geoparquet_planner import (
 from .pylibcudf import (
     _decode_pylibcudf_geoparquet_column_to_owned,
     _is_pylibcudf_table,
+    _pylibcudf_validity_mask,
 )
 from .support import IOFormat, IOOperation, IOPathKind, plan_io_support
 from .wkb import (
@@ -83,6 +84,7 @@ _VIBESPATIAL_SHAPE_PROOF_KEY = "shape_proof"
 _REGULAR_GRID_RECT_PROOF_KIND = "regular_grid_rect"
 _REGULAR_GRID_RECT_PROOF_VERSION = 1
 _GEOPARQUET_SCAN_DECODE_MULTIPLIER = 5
+_GEOPARQUET_WKB_SCAN_DECODE_MULTIPLIER = 8
 _GEOPARQUET_SCAN_ROW_SCRATCH_BYTES = 16
 _GEOPARQUET_EAGER_SIZE_PROOF_MIN_BYTES = 1 << 20
 
@@ -133,6 +135,9 @@ class LegacyWKBGeoParquetTranscodeResult:
     source_bytes: int
     output_bytes: int
     backend: str = "pylibcudf"
+    schema_validated: bool = True
+    values_validated: bool = True
+    atomic_publication: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,9 +167,7 @@ class NativePartitionedParquetLayout:
         if invalid:
             raise ValueError(f"partition ids are outside the clustered spill: {invalid}")
         return tuple(
-            segment.row_group
-            for segment in self.segments
-            if segment.partition in selected
+            segment.row_group for segment in self.segments if segment.partition in selected
         )
 
 
@@ -317,9 +320,7 @@ class NativePartitionedParquetSink:
         producer_stream = cp.cuda.get_current_stream()
         pylibcudf_current_stream(table, mapping)
         producer_event = None
-        if cuda_stream_identity(producer_stream) != cuda_stream_identity(
-            self._cupy_stream
-        ):
+        if cuda_stream_identity(producer_stream) != cuda_stream_identity(self._cupy_stream):
             producer_event = cp.cuda.Event(disable_timing=True)
             producer_event.record(producer_stream)
             self._cupy_stream.wait_event(producer_event)
@@ -445,11 +446,7 @@ def _clustered_partition_filter_row_groups(path, filters):
     predicate = filters
     if isinstance(filters, list) and len(filters) == 1:
         predicate = filters[0]
-    if (
-        not isinstance(predicate, tuple)
-        or len(predicate) != 3
-        or predicate[1] not in ("=", "==")
-    ):
+    if not isinstance(predicate, tuple) or len(predicate) != 3 or predicate[1] not in ("=", "=="):
         return None
     try:
         layout = load_native_partitioned_parquet_layout(path)
@@ -582,10 +579,7 @@ def _attach_device_geometry_planning_metadata(
     _attach_regular_grid_rect_proof_from_column_metadata(owned, column_meta)
     if owned.residency is not Residency.DEVICE or owned.device_state is None:
         return
-    if (
-        not isinstance(column_meta, dict)
-        or str(column_meta.get("encoding", "")).upper() != "WKB"
-    ):
+    if not isinstance(column_meta, dict) or str(column_meta.get("encoding", "")).upper() != "WKB":
         # GeoArrow keeps its nested physical layout explicit. WKB decode is the
         # boundary that otherwise loses all host-visible per-row width proof.
         return
@@ -1540,8 +1534,7 @@ def _device_attributes_from_pylibcudf_scan(
     missing_attributes = [name for name in attribute_columns if name not in positions]
     if missing_attributes:
         raise ValueError(
-            "pylibcudf GeoParquet scan omitted requested attribute columns: "
-            f"{missing_attributes!r}"
+            f"pylibcudf GeoParquet scan omitted requested attribute columns: {missing_attributes!r}"
         )
 
     index_override: pd.Index = _range_index_from_arrow_schema(
@@ -1811,11 +1804,7 @@ def plan_geoparquet_scan(
         uses_covering_bbox = "covering" in column_meta
         uses_point_encoding_pushdown = column_meta.get("encoding") == "point"
     prune_result = None
-    if (
-        metadata_summary is not None
-        and metadata_summary.has_spatial_bounds
-        and bbox is not None
-    ):
+    if metadata_summary is not None and metadata_summary.has_spatial_bounds and bbox is not None:
         prune_result = select_row_groups(metadata_summary, bbox, strategy=planner_strategy)
     return GeoParquetScanPlan(
         selected_path=plan.selected_path,
@@ -1915,11 +1904,7 @@ def _plan_geoparquet_chunks(
             else 0
         )
         estimated_bytes = (
-            int(
-                metadata_summary.row_group_uncompressed_bytes[list(row_groups)].sum(
-                    dtype=np.int64
-                )
-            )
+            int(metadata_summary.row_group_uncompressed_bytes[list(row_groups)].sum(dtype=np.int64))
             if metadata_summary is not None
             and metadata_summary.row_group_uncompressed_bytes is not None
             else 0
@@ -1992,22 +1977,67 @@ def _effective_geoparquet_chunk_rows(
     return None
 
 
-def _geoparquet_target_uncompressed_bytes(selected_backend: str) -> int | None:
+def _geoparquet_scan_decode_multiplier(
+    geo_metadata: dict[str, Any],
+    columns,
+) -> int:
+    requested = None if columns is None else set(columns)
+    geometry_columns = geo_metadata.get("columns", {})
+    wkb_column_count = sum(
+        (requested is None or name in requested)
+        and str(metadata.get("encoding", "")).upper() == "WKB"
+        for name, metadata in geometry_columns.items()
+    )
+    if not wkb_column_count:
+        return _GEOPARQUET_SCAN_DECODE_MULTIPLIER
+    # The base WKB envelope covers the Parquet scan plus one structural plan
+    # and owned decode. Every additional requested WKB geometry column has its
+    # own simultaneous plan/output state, so charge that incremental share per
+    # column instead of admitting a two-geometry scan as though it had one.
+    incremental_wkb_share = (
+        _GEOPARQUET_WKB_SCAN_DECODE_MULTIPLIER
+        - _GEOPARQUET_SCAN_DECODE_MULTIPLIER
+    )
+    return _GEOPARQUET_SCAN_DECODE_MULTIPLIER + (
+        incremental_wkb_share * wkb_column_count
+    )
+
+
+def _geoparquet_target_uncompressed_bytes(
+    selected_backend: str,
+    *,
+    decode_multiplier: int = _GEOPARQUET_SCAN_DECODE_MULTIPLIER,
+) -> int | None:
     if selected_backend != "pylibcudf" or not has_gpu_runtime():
         return None
     from vibespatial.cuda._runtime import get_cuda_runtime
 
     remaining = get_cuda_runtime().query_memory_remaining_bytes()
-    return max(remaining // (_GEOPARQUET_SCAN_DECODE_MULTIPLIER + 1), 1)
+    # WKB decode retains more simultaneous structural and owned state than
+    # native GeoArrow adoption, and Parquet row groups are indivisible. Reserve
+    # four planning shares: one for whole-row-group overshoot and the remainder
+    # for libcudf's large temporary allocations plus repeated-run pool
+    # fragmentation. SF100 profiling demonstrated that two shares could leave
+    # ample aggregate free bytes without a contiguous 1.5 GiB pool block.
+    reserve_shares = (
+        4
+        if int(decode_multiplier) >= _GEOPARQUET_WKB_SCAN_DECODE_MULTIPLIER
+        else 1
+    )
+    return max(remaining // (int(decode_multiplier) + reserve_shares), 1)
 
 
-def _admit_geoparquet_chunk(chunk: GeoParquetChunkPlan) -> None:
+def _admit_geoparquet_chunk(
+    chunk: GeoParquetChunkPlan,
+    *,
+    decode_multiplier: int = _GEOPARQUET_SCAN_DECODE_MULTIPLIER,
+) -> None:
     if chunk.estimated_uncompressed_bytes <= 0 or not has_gpu_runtime():
         return
     from vibespatial.cuda._runtime import get_cuda_runtime
 
     required = (
-        chunk.estimated_uncompressed_bytes * _GEOPARQUET_SCAN_DECODE_MULTIPLIER
+        chunk.estimated_uncompressed_bytes * int(decode_multiplier)
         + chunk.estimated_rows * _GEOPARQUET_SCAN_ROW_SCRATCH_BYTES
     )
     admission = get_cuda_runtime().admit_device_memory(
@@ -2709,11 +2739,7 @@ def _build_geoparquet_metadata_summary_from_pyarrow(
     source_paths: list[str] | None = None
     row_group_source_indices: list[int] | None = None
     row_group_source_row_groups: list[int] | None = None
-    required = (
-        None
-        if xmin_path is None
-        else (xmin_path, ymin_path, xmax_path, ymax_path)
-    )
+    required = None if xmin_path is None else (xmin_path, ymin_path, xmax_path, ymax_path)
     complete_spatial_bounds = required is not None
 
     def append_metadata(file_metadata, *, source_index: int | None = None) -> None:
@@ -2921,8 +2947,7 @@ def _read_geoparquet_table_with_pyarrow(
                 import pyarrow.fs as pafs
 
                 is_directory_dataset = (
-                    arrow_filesystem.get_file_info(normalized_path).type
-                    == pafs.FileType.Directory
+                    arrow_filesystem.get_file_info(normalized_path).type == pafs.FileType.Directory
                 )
     added_bbox_column = None
     row_group_columns = columns
@@ -3169,12 +3194,17 @@ def _iter_geoparquet_native_impl(
         chunk_rows,
         selected_backend=read_plan.selected_backend,
     )
+    scan_decode_multiplier = _geoparquet_scan_decode_multiplier(
+        geo_metadata,
+        columns,
+    )
     chunk_plans = _plan_geoparquet_chunks(
         metadata_summary=metadata_summary,
         selected_row_groups=selected_row_groups,
         target_chunk_rows=effective_chunk_rows,
         target_uncompressed_bytes=_geoparquet_target_uncompressed_bytes(
-            read_plan.selected_backend
+            read_plan.selected_backend,
+            decode_multiplier=scan_decode_multiplier,
         ),
     )
 
@@ -3273,7 +3303,10 @@ def _iter_geoparquet_native_impl(
             selected_row_groups=chunk_row_groups,
         )
         if read_plan.selected_backend == "pylibcudf":
-            _admit_geoparquet_chunk(chunk)
+            _admit_geoparquet_chunk(
+                chunk,
+                decode_multiplier=scan_decode_multiplier,
+            )
             table = _read_geoparquet_table_with_pylibcudf(
                 normalized_path,
                 columns=scan_projection,
@@ -3298,6 +3331,12 @@ def _iter_geoparquet_native_impl(
                 filters=read_kwargs.get("filters"),
                 sources=scan_sources,
             )
+            # Conversion establishes explicit ownership for every surviving
+            # attribute/GeoArrow carrier, while WKB geometry is decoded into
+            # independent owned buffers. Do not keep the source table (and its
+            # encoded WKB payload) live in the suspended generator throughout
+            # downstream spatial work on the yielded batch.
+            del table
             payload = _apply_native_bbox_filter(payload, bbox)
             yield replace(payload, provenance=provenance)
             continue
@@ -3458,12 +3497,17 @@ def read_geoparquet_owned(
         chunk_rows,
         selected_backend=read_plan.selected_backend,
     )
+    scan_decode_multiplier = _geoparquet_scan_decode_multiplier(
+        geo_metadata,
+        scan_columns,
+    )
     chunk_plans = _plan_geoparquet_chunks(
         metadata_summary=metadata_summary,
         selected_row_groups=selected_row_groups,
         target_chunk_rows=effective_chunk_rows,
         target_uncompressed_bytes=_geoparquet_target_uncompressed_bytes(
-            read_plan.selected_backend
+            read_plan.selected_backend,
+            decode_multiplier=scan_decode_multiplier,
         ),
     )
     engine_plan = plan_geoparquet_engine(
@@ -3512,7 +3556,10 @@ def read_geoparquet_owned(
             selected_row_groups=chunk.row_groups,
         )
         if use_pylibcudf:
-            _admit_geoparquet_chunk(chunk)
+            _admit_geoparquet_chunk(
+                chunk,
+                decode_multiplier=scan_decode_multiplier,
+            )
             table = _read_geoparquet_table_with_pylibcudf(
                 normalized_path,
                 columns=scan_columns,
@@ -3536,6 +3583,7 @@ def read_geoparquet_owned(
             geo_metadata,
             column_index=decode_column_index,
         )
+        del table
         if use_pylibcudf and bbox is not None:
             owned = _apply_owned_bbox_filter(owned, bbox)
         chunks.append(owned)
@@ -3573,9 +3621,14 @@ def _normalize_declared_wkb_geometry_metadata(
                 f"geometry column {field.name!r} must declare a 'crs' key; "
                 "use None for an explicitly absent CRS"
             )
-        if not (pa.types.is_binary(field.type) or pa.types.is_large_binary(field.type)):
+        if not (
+            pa.types.is_binary(field.type)
+            or pa.types.is_large_binary(field.type)
+            or pa.types.is_binary_view(field.type)
+        ):
             raise TypeError(
-                f"legacy WKB geometry column {field.name!r} must be binary, "
+                f"legacy WKB geometry column {field.name!r} must be binary, large_binary, "
+                "or binary_view, "
                 f"not {field.type}"
             )
 
@@ -3608,7 +3661,14 @@ def _normalize_declared_wkb_geometry_metadata(
                 b"ARROW:extension:metadata": json.dumps(extension_metadata).encode(),
             }
         )
-        replacement_fields.append(field.with_metadata(field_metadata))
+        replacement_fields.append(
+            pa.field(
+                field.name,
+                pa.binary(),
+                nullable=field.nullable,
+                metadata=field_metadata,
+            )
+        )
 
     geo_metadata = {
         "version": str(schema_version),
@@ -3618,6 +3678,86 @@ def _normalize_declared_wkb_geometry_metadata(
     schema_metadata = dict(source_schema.metadata or {})
     schema_metadata[b"geo"] = json.dumps(geo_metadata, separators=(",", ":")).encode()
     return geo_metadata, pa.schema(replacement_fields, metadata=schema_metadata)
+
+
+def _pylibcudf_scalar_bool(value) -> bool:
+    return bool(value.to_arrow().as_py())
+
+
+def _pylibcudf_columns_equal(plc, left, right) -> bool:
+    """Compare one column recursively on device, including null and offset state."""
+    import cupy as cp
+
+    if int(left.size()) != int(right.size()) or int(left.null_count()) != int(right.null_count()):
+        return False
+    if left.type() != right.type():
+        return False
+    if int(left.size()):
+        left_validity = _pylibcudf_validity_mask(left)
+        right_validity = _pylibcudf_validity_mask(right)
+        if not bool(cp.all(left_validity == right_validity)):
+            return False
+
+    bool_type = plc.types.DataType(plc.types.TypeId.BOOL8)
+    try:
+        equal = plc.binaryop.binary_operation(
+            left,
+            right,
+            plc.binaryop.BinaryOperator.NULL_EQUALS,
+            bool_type,
+        )
+    except TypeError:
+        if int(left.num_children()) != int(right.num_children()):
+            return False
+        return all(
+            _pylibcudf_columns_equal(plc, left.child(index), right.child(index))
+            for index in range(int(left.num_children()))
+        )
+    if int(equal.size()) == 0:
+        return True
+    return _pylibcudf_scalar_bool(plc.reduce.reduce(equal, plc.aggregation.all(), bool_type))
+
+
+def _validate_transcoded_wkb_table(
+    plc,
+    source_table,
+    output_table,
+    *,
+    source_schema,
+    output_schema,
+) -> None:
+    """Fail closed unless schema and every semantic column value are exact."""
+    if int(source_table.num_rows()) != int(output_table.num_rows()):
+        raise RuntimeError("transcoded device row count does not match source")
+    if int(source_table.num_columns()) != int(output_table.num_columns()):
+        raise RuntimeError("transcoded device column count does not match source")
+    for index, (source_column, output_column) in enumerate(
+        zip(source_table.columns(), output_table.columns(), strict=True)
+    ):
+        if not _pylibcudf_columns_equal(plc, source_column, output_column):
+            raise RuntimeError(
+                f"transcoded column values differ from source at column "
+                f"{source_schema.field(index).name!r}"
+            )
+
+    if output_schema.names != source_schema.names:
+        raise RuntimeError("transcoded Arrow field order or names differ from source")
+
+
+def _arrow_timestamp_utc_modes(arrow_type) -> set[bool]:
+    """Return physical UTC-adjustment modes required by nested Arrow timestamps."""
+    import pyarrow as pa
+
+    if pa.types.is_timestamp(arrow_type):
+        return {arrow_type.tz is not None}
+    if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
+        return _arrow_timestamp_utc_modes(arrow_type.value_type)
+    if pa.types.is_struct(arrow_type):
+        modes: set[bool] = set()
+        for field in arrow_type:
+            modes.update(_arrow_timestamp_utc_modes(field.type))
+        return modes
+    return set()
 
 
 def transcode_legacy_wkb_parquet_to_geoparquet(
@@ -3637,6 +3777,8 @@ def transcode_legacy_wkb_parquet_to_geoparquet(
     stored in the destination footer; no geometry is decoded or materialized.
     """
     import base64
+    import os
+    import tempfile
 
     import pyarrow.parquet as pq
     import pylibcudf as plc
@@ -3647,10 +3789,10 @@ def transcode_legacy_wkb_parquet_to_geoparquet(
         raise ValueError("legacy WKB transcode source and destination must differ")
     if not source_path.is_file():
         raise FileNotFoundError(source_path)
-    sink = _pylibcudf_sink(destination_path)
-    if sink is None:
+    if _pylibcudf_sink(destination_path) is None:
         raise TypeError("legacy WKB transcode destination must be a local path")
-    _remove_native_partition_manifest(destination_path)
+    if not destination_path.parent.is_dir():
+        raise FileNotFoundError(destination_path.parent)
 
     source_file = pq.ParquetFile(source_path)
     source_schema = source_file.schema_arrow
@@ -3663,13 +3805,9 @@ def transcode_legacy_wkb_parquet_to_geoparquet(
     table = _read_geoparquet_table_with_pylibcudf(source_path)
     row_count = int(source_file.metadata.num_rows)
     if int(table.num_rows()) != row_count:
-        raise RuntimeError(
-            "pylibcudf legacy WKB scan row count does not match Parquet metadata"
-        )
+        raise RuntimeError("pylibcudf legacy WKB scan row count does not match Parquet metadata")
     if int(table.num_columns()) != len(source_schema):
-        raise RuntimeError(
-            "pylibcudf legacy WKB scan column count does not match Parquet schema"
-        )
+        raise RuntimeError("pylibcudf legacy WKB scan column count does not match Parquet schema")
 
     metadata = plc.io.types.TableInputMetadata(table)
     for index, field in enumerate(output_schema):
@@ -3677,8 +3815,7 @@ def transcode_legacy_wkb_parquet_to_geoparquet(
         column_metadata.set_name(field.name)
         if field.name in geometry_columns:
             column_metadata.set_output_as_binary(True)
-        else:
-            _apply_arrow_nested_child_metadata(column_metadata, field)
+        _apply_arrow_nested_child_metadata(column_metadata, field)
 
     footer_metadata = {
         (key.decode() if isinstance(key, bytes) else str(key)): (
@@ -3693,21 +3830,95 @@ def transcode_legacy_wkb_parquet_to_geoparquet(
     writer_kwargs = {}
     if row_group_size is not None:
         writer_kwargs["row_group_size"] = int(row_group_size)
-    _write_pylibcudf_parquet_table(
-        plc,
-        table,
-        sink=sink,
-        metadata=metadata,
-        footer_metadata=footer_metadata,
-        compression=compression,
-        writer_kwargs=writer_kwargs,
+    timestamp_modes: set[bool] = set()
+    for field in output_schema:
+        timestamp_modes.update(_arrow_timestamp_utc_modes(field.type))
+    if len(timestamp_modes) > 1:
+        raise TypeError(
+            "pylibcudf cannot preserve mixed timezone-aware and timezone-naive "
+            "timestamps in one metadata-only Parquet transcode"
+        )
+    if timestamp_modes:
+        writer_kwargs["utc_timestamps"] = timestamp_modes.pop()
+
+    temporary_fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination_path.name}.",
+        suffix=".tmp",
+        dir=destination_path.parent,
     )
-    output_file = pq.ParquetFile(destination_path)
-    if int(output_file.metadata.num_rows) != row_count:
-        raise RuntimeError("transcoded GeoParquet footer row count does not match source")
-    output_metadata = output_file.schema_arrow.metadata or {}
-    if b"geo" not in output_metadata:
-        raise RuntimeError("transcoded output is missing GeoParquet metadata")
+    os.close(temporary_fd)
+    temporary_path = Path(temporary_name)
+    try:
+        _write_pylibcudf_parquet_table(
+            plc,
+            table,
+            sink=str(temporary_path),
+            metadata=metadata,
+            footer_metadata=footer_metadata,
+            compression=compression,
+            writer_kwargs=writer_kwargs,
+        )
+        output_file = pq.ParquetFile(temporary_path)
+        if int(output_file.metadata.num_rows) != row_count:
+            raise RuntimeError("transcoded GeoParquet footer row count does not match source")
+        actual_schema = output_file.schema_arrow
+        output_metadata = actual_schema.metadata or {}
+        if b"geo" not in output_metadata:
+            raise RuntimeError("transcoded output is missing GeoParquet metadata")
+        if actual_schema.names != output_schema.names:
+            raise RuntimeError("transcoded Arrow field names or order differ from source")
+        for expected_field, actual_field in zip(output_schema, actual_schema, strict=True):
+            if expected_field.type != actual_field.type:
+                raise TypeError(
+                    f"pylibcudf writer cannot preserve logical type for "
+                    f"{expected_field.name!r}: expected {expected_field.type}, "
+                    f"wrote {actual_field.type}"
+                )
+            if expected_field.nullable != actual_field.nullable:
+                raise TypeError(
+                    f"pylibcudf writer cannot preserve nullability for {expected_field.name!r}"
+                )
+            expected_field_metadata = expected_field.metadata or {}
+            actual_field_metadata = actual_field.metadata or {}
+            for key, value in expected_field_metadata.items():
+                if actual_field_metadata.get(key) != value:
+                    raise RuntimeError(
+                        f"transcoded field metadata differs for {expected_field.name!r}, "
+                        f"key={key!r}"
+                    )
+        for key, value in (output_schema.metadata or {}).items():
+            if output_metadata.get(key) != value:
+                raise RuntimeError(f"transcoded schema metadata differs for key {key!r}")
+        for geometry_name in geometry_columns:
+            parquet_column = next(
+                (
+                    output_file.schema.column(index)
+                    for index in range(len(output_file.schema.names))
+                    if output_file.schema.column(index).path.split(".", 1)[0] == geometry_name
+                ),
+                None,
+            )
+            if parquet_column is None:
+                raise RuntimeError(
+                    f"transcoded geometry {geometry_name!r} is missing from Parquet leaves"
+                )
+            if parquet_column.physical_type != "BYTE_ARRAY":
+                raise RuntimeError(
+                    f"transcoded geometry {geometry_name!r} is not Parquet BYTE_ARRAY"
+                )
+
+        output_table = _read_geoparquet_table_with_pylibcudf(temporary_path)
+        _validate_transcoded_wkb_table(
+            plc,
+            table,
+            output_table,
+            source_schema=source_schema,
+            output_schema=actual_schema,
+        )
+        os.replace(temporary_path, destination_path)
+        _remove_native_partition_manifest(destination_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
     result = LegacyWKBGeoParquetTranscodeResult(
         row_count=row_count,
@@ -3723,7 +3934,12 @@ def transcode_legacy_wkb_parquet_to_geoparquet(
         implementation="pylibcudf_metadata_only_wkb_transcode",
         reason=(
             f"rewrote {row_count} rows and {len(source_schema)} columns with "
-            f"GeoParquet metadata for {tuple(geometry_columns)} without geometry decode"
+            f"GeoParquet metadata for {tuple(geometry_columns)} without geometry decode; "
+            "schema, device values, WKB bytes, and footer validated before atomic publication"
+        ),
+        detail=(
+            "geometry_carriers=binary|large_binary|binary_view->binary; "
+            "schema_validated=1; values_validated=1; atomic_publication=1"
         ),
         selected=ExecutionMode.GPU,
     )
@@ -3745,9 +3961,7 @@ def write_geoparquet(
     partition_count = kwargs.pop("partition_count", None)
     if partition_column is not None or partition_count is not None:
         if partition_column is None or partition_count is None:
-            raise ValueError(
-                "partition_column and partition_count must be provided together"
-            )
+            raise ValueError("partition_column and partition_count must be provided together")
         if index not in (None, False):
             raise ValueError("partitioned GeoParquet batches do not support index export")
         max_row_group_rows = kwargs.pop("max_row_group_rows", 1_000_000)
@@ -4280,7 +4494,11 @@ def benchmark_geoparquet_scan_engine(
                 selected_row_groups=selected_row_groups,
                 target_chunk_rows=effective_chunk_rows,
                 target_uncompressed_bytes=_geoparquet_target_uncompressed_bytes(
-                    read_plan.selected_backend
+                    read_plan.selected_backend,
+                    decode_multiplier=_geoparquet_scan_decode_multiplier(
+                        geo_metadata,
+                        scan_columns,
+                    ),
                 ),
             )
             planning_elapsed += perf_counter() - planning_start
@@ -4289,7 +4507,13 @@ def benchmark_geoparquet_scan_engine(
             for chunk in chunk_plans:
                 scan_start = perf_counter()
                 if use_pylibcudf:
-                    _admit_geoparquet_chunk(chunk)
+                    _admit_geoparquet_chunk(
+                        chunk,
+                        decode_multiplier=_geoparquet_scan_decode_multiplier(
+                            geo_metadata,
+                            scan_columns,
+                        ),
+                    )
                     table = _read_geoparquet_table_with_pylibcudf(
                         normalized_path,
                         columns=scan_columns,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -33,6 +34,103 @@ def _empty_geometry_for_family(family: GeometryFamily):
 
 def _xy_view(buffer: FamilyGeometryBuffer, coord_count: int) -> np.ndarray:
     return np.column_stack((buffer.x[:coord_count], buffer.y[:coord_count]))
+
+
+def _has_nested_empty_component(
+    buffer: FamilyGeometryBuffer,
+    family_rows: np.ndarray,
+) -> bool:
+    if buffer.family is GeometryFamily.MULTIPOINT:
+        for family_row in family_rows:
+            start = int(buffer.geometry_offsets[family_row])
+            end = int(buffer.geometry_offsets[family_row + 1])
+            if np.any(np.isnan(buffer.x[start:end]) & np.isnan(buffer.y[start:end])):
+                return True
+        return False
+    if buffer.family is GeometryFamily.MULTILINESTRING:
+        for family_row in family_rows:
+            start = int(buffer.geometry_offsets[family_row])
+            end = int(buffer.geometry_offsets[family_row + 1])
+            if np.any(np.diff(buffer.part_offsets[start : end + 1]) == 0):
+                return True
+        return False
+    if buffer.family is GeometryFamily.MULTIPOLYGON:
+        for family_row in family_rows:
+            polygon_start = int(buffer.geometry_offsets[family_row])
+            polygon_end = int(buffer.geometry_offsets[family_row + 1])
+            part_offsets = buffer.part_offsets[polygon_start : polygon_end + 1]
+            if np.any(np.diff(part_offsets) == 0):
+                return True
+            ring_start = int(part_offsets[0])
+            ring_end = int(part_offsets[-1])
+            if np.any(np.diff(buffer.ring_offsets[ring_start : ring_end + 1]) == 0):
+                return True
+    return False
+
+
+def _materialize_nested_empty_multi_rows(
+    buffer: FamilyGeometryBuffer,
+    family_rows: np.ndarray,
+) -> np.ndarray:
+    """Export rare nested-empty multis through canonical WKB.
+
+    Shapely's vectorized indexed constructors cannot represent an empty child
+    component and may terminate in GEOS before raising a Python exception.
+    WKB is the lossless compatibility boundary for these valid structures.
+    """
+    payloads: list[bytes] = []
+    for family_row in family_rows:
+        part_start = int(buffer.geometry_offsets[family_row])
+        part_end = int(buffer.geometry_offsets[family_row + 1])
+        type_id = {
+            GeometryFamily.MULTIPOINT: 4,
+            GeometryFamily.MULTILINESTRING: 5,
+            GeometryFamily.MULTIPOLYGON: 6,
+        }[buffer.family]
+        payload = bytearray(b"\x01" + struct.pack("<II", type_id, part_end - part_start))
+        if buffer.family is GeometryFamily.MULTIPOINT:
+            for coord_index in range(part_start, part_end):
+                payload.extend(
+                    b"\x01"
+                    + struct.pack(
+                        "<Idd",
+                        1,
+                        float(buffer.x[coord_index]),
+                        float(buffer.y[coord_index]),
+                    )
+                )
+        elif buffer.family is GeometryFamily.MULTILINESTRING:
+            for part_index in range(part_start, part_end):
+                coord_start = int(buffer.part_offsets[part_index])
+                coord_end = int(buffer.part_offsets[part_index + 1])
+                payload.extend(b"\x01" + struct.pack("<II", 2, coord_end - coord_start))
+                for coord_index in range(coord_start, coord_end):
+                    payload.extend(
+                        struct.pack(
+                            "<dd",
+                            float(buffer.x[coord_index]),
+                            float(buffer.y[coord_index]),
+                        )
+                    )
+        else:
+            for polygon_index in range(part_start, part_end):
+                ring_start = int(buffer.part_offsets[polygon_index])
+                ring_end = int(buffer.part_offsets[polygon_index + 1])
+                payload.extend(b"\x01" + struct.pack("<II", 3, ring_end - ring_start))
+                for ring_index in range(ring_start, ring_end):
+                    coord_start = int(buffer.ring_offsets[ring_index])
+                    coord_end = int(buffer.ring_offsets[ring_index + 1])
+                    payload.extend(struct.pack("<I", coord_end - coord_start))
+                    for coord_index in range(coord_start, coord_end):
+                        payload.extend(
+                            struct.pack(
+                                "<dd",
+                                float(buffer.x[coord_index]),
+                                float(buffer.y[coord_index]),
+                            )
+                        )
+        payloads.append(bytes(payload))
+    return np.asarray(shapely.from_wkb(np.asarray(payloads, dtype=object)), dtype=object)
 
 
 def materialize_family_row(buffer: FamilyGeometryBuffer, row_index: int):
@@ -482,6 +580,12 @@ def _materialize_family_rows(buffer: FamilyGeometryBuffer, family_rows: np.ndarr
     family_rows = np.asarray(family_rows, dtype=np.int32)
     if family_rows.size == 0:
         return np.empty(0, dtype=object)
+    if buffer.family in {
+        GeometryFamily.MULTIPOINT,
+        GeometryFamily.MULTILINESTRING,
+        GeometryFamily.MULTIPOLYGON,
+    } and _has_nested_empty_component(buffer, family_rows):
+        return _materialize_nested_empty_multi_rows(buffer, family_rows)
     if _is_full_family_selection(buffer, family_rows):
         if buffer.family is GeometryFamily.POINT:
             return _materialize_full_point_family(buffer)

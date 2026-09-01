@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import warnings
 from typing import Any
 
 import numpy as np
@@ -19,7 +18,6 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime.residency import Residency
 
 from .wkb import (
-    WKB_TYPE_IDS,
     DeviceWKBHeaderScan,
 )
 
@@ -222,7 +220,12 @@ def _device_mask_count(mask) -> int:
 def _pylibcudf_wkb_offsets(column):
     if column.num_children() != 1:
         raise NotImplementedError("WKB binary columns must expose one offsets child")
-    return _pylibcudf_buffer_view(column.child(0), np.int32)
+    offsets_child = column.child(0)
+    element_count = int(offsets_child.size())
+    offsets32 = _pylibcudf_buffer_view(offsets_child, np.int32)
+    if offsets32.nbytes == element_count * 8:
+        return _pylibcudf_buffer_view(offsets_child, np.int64)[:element_count]
+    return offsets32[:element_count]
 
 
 def _pylibcudf_wkb_payload(column):
@@ -257,69 +260,21 @@ def _scan_pylibcudf_wkb_headers(column) -> DeviceWKBHeaderScan:
     _require_pylibcudf_zero_offset(column, "WKB")
     validity = _pylibcudf_validity_mask(column)
     row_count = int(column.size())
-    offsets = _pylibcudf_wkb_offsets(column)
-    payload = _pylibcudf_wkb_payload(column)
-    lengths = offsets[1:] - offsets[:-1]
-    header_ready = validity & (lengths >= 5)
-    header_rows = _device_select_true(header_ready)
-    type_ids = cp.full(row_count, -1, dtype=cp.int32)
-    family_tags = cp.full(row_count, -1, dtype=cp.int8)
-    native_mask = cp.zeros(row_count, dtype=cp.bool_)
-    point_mask = cp.zeros(row_count, dtype=cp.bool_)
-    semantic_invalid_mask = cp.zeros(row_count, dtype=cp.bool_)
+    from vibespatial.io.wkb_decode_status import WKBDecodeStatus
+    from vibespatial.kernels.core.wkb_decode import scan_wkb_device_structural_plan
 
-    if int(header_rows.size):
-        starts = offsets[:-1][header_rows]
-        byteorder = payload[starts]
-        type_values = _pylibcudf_unpack_le_uint32(payload, starts + 1)
-        little_endian = byteorder == 1
-        native_types = cp.isin(
-            type_values,
-            cp.asarray(
-                [
-                    WKB_TYPE_IDS[GeometryFamily.POINT],
-                    WKB_TYPE_IDS[GeometryFamily.LINESTRING],
-                    WKB_TYPE_IDS[GeometryFamily.POLYGON],
-                    WKB_TYPE_IDS[GeometryFamily.MULTIPOINT],
-                    WKB_TYPE_IDS[GeometryFamily.MULTILINESTRING],
-                    WKB_TYPE_IDS[GeometryFamily.MULTIPOLYGON],
-                ],
-                dtype=cp.uint32,
-            ),
-        )
-        native_rows = header_rows[little_endian & native_types]
-        type_ids[header_rows] = type_values.astype(cp.int32)
-        native_mask[native_rows] = True
-        for family, tag in FAMILY_TAGS.items():
-            type_id = WKB_TYPE_IDS[family]
-            family_rows = header_rows[little_endian & (type_values == type_id)]
-            if int(family_rows.size):
-                family_tags[family_rows] = np.int8(tag)
-        point_rows = header_rows[
-            little_endian & (type_values == WKB_TYPE_IDS[GeometryFamily.POINT])
-        ]
-        if int(point_rows.size):
-            point_mask[point_rows] = True
-        linestring_rows = header_rows[
-            little_endian
-            & (type_values == WKB_TYPE_IDS[GeometryFamily.LINESTRING])
-            & (lengths[header_rows] >= 9)
-        ]
-        if int(linestring_rows.size):
-            linestring_starts = offsets[:-1][linestring_rows]
-            linestring_point_counts = _pylibcudf_unpack_le_uint32(
-                payload,
-                linestring_starts + 5,
-            )
-            canonical_lengths = 9 + linestring_point_counts.astype(cp.int64) * 16
-            invalid_linestring_rows = linestring_rows[
-                (linestring_point_counts == 1)
-                & (lengths[linestring_rows] == canonical_lengths)
-            ]
-            if int(invalid_linestring_rows.size):
-                semantic_invalid_mask[invalid_linestring_rows] = True
-
+    plan = scan_wkb_device_structural_plan(
+        _pylibcudf_wkb_payload(column),
+        _pylibcudf_wkb_offsets(column),
+        row_count,
+        validity_device=validity,
+    )
+    semantic_invalid_mask = plan.statuses == int(WKBDecodeStatus.SEMANTIC_INVALID)
+    native_mask = plan.native_mask | semantic_invalid_mask
     fallback_mask = validity & ~native_mask
+    family_tags = plan.family_tags
+    type_ids = cp.where(family_tags >= 0, family_tags.astype(cp.int32) + 1, -1)
+    point_mask = native_mask & (family_tags == np.int8(FAMILY_TAGS[GeometryFamily.POINT]))
     return DeviceWKBHeaderScan(
         row_count=row_count,
         valid_count=_device_int_scalar(
@@ -1014,6 +969,7 @@ def _decode_pylibcudf_wkb_homogeneous_nested_column_to_owned(
         _pylibcudf_wkb_payload(column),
         _pylibcudf_wkb_offsets(column),
         header_scan.row_count,
+        validity_device=header_scan.validity,
     )
 
 
@@ -1059,64 +1015,158 @@ def _decode_pylibcudf_wkb_general_column_to_owned(
     scan: DeviceWKBHeaderScan | None = None,
     on_invalid: str = "raise",
 ) -> OwnedGeometryArray:
-    """GPU WKB decode for any supported homogeneous or mixed-family column."""
+    """Decode canonical rows natively and isolate only declined compatibility rows."""
+    import pyarrow as pa
+    import pylibcudf as plc
 
-    import cupy as cp
+    from vibespatial.cuda._runtime import (
+        pylibcudf_column_from_device,
+        pylibcudf_to_arrow,
+    )
+    from vibespatial.geometry.owned import device_concat_owned_scatter, from_wkb
+    from vibespatial.kernels.core.wkb_decode import (
+        DeviceWKBDecodeResult,
+        WKBDeviceDecodeDeclined,
+        decode_wkb_device_pipeline,
+        scan_wkb_device_structural_plan,
+        summarize_wkb_device_plan,
+    )
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.dispatch import record_dispatch_event
+    from vibespatial.runtime.fallbacks import (
+        record_fallback_event,
+        strict_native_mode_enabled,
+    )
 
-    header_scan = _scan_pylibcudf_wkb_headers(column) if scan is None else scan
-    semantic_invalid_count = _device_mask_count(header_scan.semantic_invalid_mask)
-    if semantic_invalid_count:
-        message = "point array must contain 0 or >1 elements"
-        if on_invalid == "raise":
-            from .wkb import _GpuWkbOnInvalidError
+    if int(column.size()) == 0:
+        import cupy as cp
 
-            raise _GpuWkbOnInvalidError(message)
-        if on_invalid == "warn":
-            warnings.warn(message, UserWarning, stacklevel=3)
-        semantic_validity = header_scan.validity & ~header_scan.semantic_invalid_mask
-        semantic_native = header_scan.native_mask & ~header_scan.semantic_invalid_mask
-        header_scan = DeviceWKBHeaderScan(
-            row_count=header_scan.row_count,
-            valid_count=header_scan.valid_count - semantic_invalid_count,
-            native_count=header_scan.native_count - semantic_invalid_count,
-            fallback_count=header_scan.fallback_count,
-            validity=semantic_validity,
-            type_ids=header_scan.type_ids,
-            family_tags=cp.where(
-                semantic_validity,
-                header_scan.family_tags,
-                np.int8(-1),
-            ).astype(cp.int8, copy=False),
-            native_mask=semantic_native,
-            fallback_mask=header_scan.fallback_mask,
-            point_mask=header_scan.point_mask,
-            semantic_invalid_mask=header_scan.semantic_invalid_mask,
-        )
-    if header_scan.native_count != header_scan.valid_count:
-        raise NotImplementedError(
-            "pylibcudf device WKB decode requires all valid rows to be native supported types"
+        return decode_wkb_device_pipeline(
+            cp.empty(0, dtype=cp.uint8),
+            cp.zeros(1, dtype=cp.int32),
+            0,
+            on_invalid=on_invalid,
         )
 
-    # Preserve the lightweight fast paths for point-only and point/linestring
-    # columns. Heavier polygon-family decode should use the staged kernel
-    # pipeline instead of the older Python-orchestrated pylibcudf helpers.
-    point_count = _device_mask_count(header_scan.point_mask)
-    linestring_mask = header_scan.family_tags == np.int8(FAMILY_TAGS[GeometryFamily.LINESTRING])
-    linestring_count = _device_mask_count(linestring_mask)
-    valid = header_scan.valid_count
-    if valid == point_count:
-        return _decode_pylibcudf_wkb_point_column_to_owned(column, scan=header_scan)
-    if valid == linestring_count:
-        return _decode_pylibcudf_wkb_linestring_column_to_owned(column, scan=header_scan)
-    if valid == point_count + linestring_count:
-        return _decode_pylibcudf_wkb_point_linestring_column_to_owned(column, scan=header_scan)
+    _require_pylibcudf_zero_offset(column, "WKB")
+    payload = _pylibcudf_wkb_payload(column)
+    offsets = _pylibcudf_wkb_offsets(column)
+    plan = scan_wkb_device_structural_plan(
+        payload,
+        offsets,
+        int(column.size()),
+        validity_device=_pylibcudf_validity_mask(column),
+    )
+    summary = summarize_wkb_device_plan(plan)
+    decoded = decode_wkb_device_pipeline(
+        payload,
+        offsets,
+        int(column.size()),
+        on_invalid=on_invalid,
+        allow_declined=True,
+        structural_plan=plan,
+        structural_summary=summary,
+    )
+    if not isinstance(decoded, DeviceWKBDecodeResult):  # pragma: no cover - type guard
+        return decoded
+    detail = "; ".join(
+        (
+            f"rows={summary['rows']}",
+            f"payload_bytes={summary['payload_bytes']}",
+            f"native_le={summary['native_little_endian_rows']}",
+            f"native_be={summary['native_big_endian_rows']}",
+            f"native_mixed_embedded={summary['native_mixed_endian_rows']}",
+            f"declined={summary['declined_rows']}",
+            f"coordinates={summary['coordinate_count']}",
+            f"rings={summary['ring_count']}",
+            f"parts={summary['part_count']}",
+        )
+    )
+    if int(decoded.declined_rows.size) == 0:
+        record_dispatch_event(
+            surface="vibespatial.io.pylibcudf",
+            operation="decode_wkb",
+            implementation="endian_aware_device_wkb_decode",
+            reason="byte-authoritative canonical 2D WKB structural plan",
+            detail=detail,
+            selected=ExecutionMode.GPU,
+        )
+        # The authoritative structural plan has served its admission and decode
+        # purpose. Retain only the bounded aggregate plus canonical owned
+        # metadata; row-sized byte-order/count arrays would otherwise remain
+        # live through downstream public operations and defeat scan batching.
+        decoded.owned._wkb_structural_summary = summary
+        decoded.owned.__dict__.pop("_wkb_structural_plan", None)
+        return decoded.owned
+    if summary["dimensional_rows"]:
+        # OwnedGeometryArray is deliberately an x/y carrier.  Sparse-merging
+        # dimensional rows into it would silently discard Z/M ordinates, so
+        # the whole decode must route to the public compatibility boundary.
+        from vibespatial.kernels.core.wkb_decode import _decline_detail
 
-    from vibespatial.kernels.core.wkb_decode import decode_wkb_device_pipeline
+        raise WKBDeviceDecodeDeclined(
+            _decline_detail(decoded.plan, decoded.declined_rows),
+            plan=decoded.plan,
+            declined_rows=decoded.declined_rows,
+        )
+    if strict_native_mode_enabled():
+        from vibespatial.kernels.core.wkb_decode import _decline_detail
 
-    return decode_wkb_device_pipeline(
-        _pylibcudf_wkb_payload(column),
-        _pylibcudf_wkb_offsets(column),
-        header_scan.row_count,
+        raise WKBDeviceDecodeDeclined(
+            _decline_detail(decoded.plan, decoded.declined_rows),
+            plan=decoded.plan,
+            declined_rows=decoded.declined_rows,
+        )
+
+    gather_map = pylibcudf_column_from_device(decoded.declined_rows)
+    gathered = plc.copying.gather(
+        plc.Table([column]),
+        gather_map,
+        plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+    )
+    arrow_column = pylibcudf_to_arrow(gathered).column(0).combine_chunks()
+    if pa.types.is_string(arrow_column.type):
+        arrow_column = pa.Array.from_buffers(
+            pa.binary(),
+            len(arrow_column),
+            arrow_column.buffers(),
+            null_count=arrow_column.null_count,
+        )
+    elif pa.types.is_large_string(arrow_column.type):
+        arrow_column = pa.Array.from_buffers(
+            pa.large_binary(),
+            len(arrow_column),
+            arrow_column.buffers(),
+            null_count=arrow_column.null_count,
+        )
+    fallback_owned = from_wkb(
+        arrow_column.to_pylist(),
+        on_invalid=on_invalid,
+        residency=Residency.DEVICE,
+    )
+    record_fallback_event(
+        surface="vibespatial.io.pylibcudf",
+        reason="explicit CPU compatibility decode for device-classified WKB declines",
+        detail=(
+            f"decoded {fallback_owned.row_count} declined rows while retaining "
+            f"{decoded.plan.row_count - fallback_owned.row_count} native rows on device"
+        ),
+        selected=ExecutionMode.CPU,
+        pipeline="io/wkb_decode",
+        d2h_transfer=True,
+    )
+    record_dispatch_event(
+        surface="vibespatial.io.pylibcudf",
+        operation="decode_wkb",
+        implementation="device_wkb_decode_with_sparse_compatibility_merge",
+        reason="native rows stayed device-resident while declined rows used compatibility decode",
+        detail=detail,
+        selected=ExecutionMode.GPU,
+    )
+    return device_concat_owned_scatter(
+        decoded.owned,
+        fallback_owned,
+        decoded.declined_rows,
     )
 
 
@@ -1557,28 +1607,6 @@ def _decode_pylibcudf_multipolygon_geoarrow_column_to_owned(column) -> OwnedGeom
     )
 
 
-_SUPPORTED_NATIVE_WKB_METADATA_TYPES = frozenset(
-    {
-        "point",
-        "linestring",
-        "polygon",
-        "multipoint",
-        "multilinestring",
-        "multipolygon",
-    }
-)
-
-
-def _metadata_declares_native_wkb(column_meta: dict[str, Any] | None) -> bool:
-    if not column_meta:
-        return False
-    raw_types = column_meta.get("geometry_types", column_meta.get("geometry_type", ()))
-    if isinstance(raw_types, str):
-        raw_types = (raw_types,)
-    normalized = {str(value).lower().replace(" ", "") for value in raw_types if value}
-    return normalized.issubset(_SUPPORTED_NATIVE_WKB_METADATA_TYPES)
-
-
 def _decode_pylibcudf_wkb_device_pipeline_column_to_owned(column) -> OwnedGeometryArray:
     from vibespatial.kernels.core.wkb_decode import decode_wkb_device_pipeline
 
@@ -1599,6 +1627,7 @@ def _decode_pylibcudf_wkb_device_pipeline_column_to_owned(column) -> OwnedGeomet
         _pylibcudf_wkb_payload(column),
         _pylibcudf_wkb_offsets(column),
         row_count,
+        validity_device=_pylibcudf_validity_mask(column),
     )
 
 
@@ -1625,8 +1654,7 @@ def _decode_pylibcudf_geoparquet_column_to_owned(
     if normalized_encoding == "multipolygon":
         return _decode_pylibcudf_multipolygon_geoarrow_column_to_owned(column)
     if normalized_encoding == "wkb":
-        if _metadata_declares_native_wkb(column_meta):
-            return _decode_pylibcudf_wkb_device_pipeline_column_to_owned(column)
+        # Family metadata is a hint, never proof of WKB byte layout.
         return _decode_pylibcudf_wkb_general_column_to_owned(column)
     raise NotImplementedError(
         f"pylibcudf device decode does not support GeoParquet encoding {encoding!r} yet"

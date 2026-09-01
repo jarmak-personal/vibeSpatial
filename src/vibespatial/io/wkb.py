@@ -196,6 +196,15 @@ def _plan_arrow_wkb_gpu_admission(
     )
 
 
+def _arrow_wkb_storage_bytes(array) -> int:
+    """Return a stable byte-work estimate for binary and binary-view carriers."""
+    import pyarrow as pa
+
+    if pa.types.is_binary_view(array.type):
+        return sum(int(buffer.size) for buffer in array.buffers() if buffer is not None)
+    return int(array.nbytes)
+
+
 @dataclass(frozen=True)
 class _NativeDeviceWriteStatus:
     written: bool
@@ -552,21 +561,9 @@ def _wkb_upper_bound_bytes(
         n_rows_family = row_indexes.shape[0]
         buf = state.families[family]
         fixed_size = getattr(buf, "fixed_size", None)
-        max_coords = (
-            None
-            if fixed_size is None
-            else fixed_size.max_coord_count_per_row
-        )
-        max_first = (
-            None
-            if fixed_size is None
-            else fixed_size.max_first_level_count_per_row
-        )
-        max_second = (
-            None
-            if fixed_size is None
-            else fixed_size.max_second_level_count_per_row
-        )
+        max_coords = None if fixed_size is None else fixed_size.max_coord_count_per_row
+        max_first = None if fixed_size is None else fixed_size.max_first_level_count_per_row
+        max_second = None if fixed_size is None else fixed_size.max_second_level_count_per_row
         n_coords = (
             int(max_coords) * n_rows_family
             if indexed_view and max_coords is not None
@@ -1571,6 +1568,9 @@ def _apply_arrow_nested_child_metadata(column_meta, field) -> None:
 
     column_meta.set_nullability(field.nullable)
     field_type = field.type
+    if pa.types.is_decimal(field_type):
+        column_meta.set_decimal_precision(field_type.precision)
+        return
     if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
         value_field = field_type.value_field
         value_meta = column_meta.child(1)
@@ -1925,10 +1925,12 @@ def _write_pylibcudf_parquet_table(
         if row_group_size <= 0:
             raise ValueError("row_group_size must be greater than zero")
 
-    if row_group_size is not None and row_group_size < row_count:
-        builder = plc.io.parquet.ChunkedParquetWriterOptions.builder(
-            plc.io.types.SinkInfo([sink])
-        )
+    if (
+        row_group_size is not None
+        and row_group_size < row_count
+        and "utc_timestamps" not in writer_kwargs
+    ):
+        builder = plc.io.parquet.ChunkedParquetWriterOptions.builder(plc.io.types.SinkInfo([sink]))
         builder.metadata(metadata)
         builder.key_value_metadata([footer_metadata])
         builder.write_arrow_schema(False)
@@ -1958,6 +1960,8 @@ def _write_pylibcudf_parquet_table(
     builder.key_value_metadata([footer_metadata])
     builder.write_arrow_schema(False)
     builder.compression(_compression_type_from_name(compression))
+    if "utc_timestamps" in writer_kwargs:
+        builder.utc_timestamps(bool(writer_kwargs["utc_timestamps"]))
     if row_group_size is not None:
         builder.row_group_size_rows(row_group_size)
     if "max_page_size" in writer_kwargs:
@@ -2004,11 +2008,7 @@ class _NativeWkbCapacityPlan:
         row_temporary_bytes = (
             _NATIVE_WKB_ROW_TEMPORARY_BYTES
             + self.metadata_bytes_per_row
-            + (
-                _NATIVE_WKB_BBOX_TEMPORARY_BYTES
-                if self.write_covering_bbox
-                else 0
-            )
+            + (_NATIVE_WKB_BBOX_TEMPORARY_BYTES if self.write_covering_bbox else 0)
         )
         # Reserve one output-sized scratch region for WKB assembly and
         # libcudf compression.  The encoded payload itself is accounted for
@@ -2017,9 +2017,7 @@ class _NativeWkbCapacityPlan:
         # Composition may first compact selected fragments and then allocate
         # a second contiguous owned carrier for concat.  Both are live when
         # encoding starts, so admission must cover the doubled geometry shape.
-        composition_bytes = (
-            2 * rows * self.max_owned_bytes_per_row if self.composition else 0
-        )
+        composition_bytes = 2 * rows * self.max_owned_bytes_per_row if self.composition else 0
         return _NativeWkbChunkEstimate(
             row_count=rows,
             output_bytes=output_bytes,
@@ -2056,9 +2054,7 @@ class _NativeWkbCapacityPlan:
 
         one_row = self.estimate(1)
         available_detail = (
-            "unknown"
-            if available_device_bytes is None
-            else f"{int(available_device_bytes):,}"
+            "unknown" if available_device_bytes is None else f"{int(available_device_bytes):,}"
         )
         raise MemoryError(
             "one native WKB export row exceeds the current device allocation "
@@ -2120,9 +2116,7 @@ def _device_family_size_packet(family: GeometryFamily, buffer):
         ring_starts = part_offsets[geometry_offsets[:-1]]
         ring_stops = part_offsets[geometry_offsets[1:]]
         second_maximum = _device_maximum_i64(ring_stops - ring_starts)
-    coordinate_maximum = _device_maximum_i64(
-        device_family_coordinate_counts(buffer)
-    )
+    coordinate_maximum = _device_maximum_i64(device_family_coordinate_counts(buffer))
     return cp.stack((first_maximum, second_maximum, coordinate_maximum))
 
 
@@ -2139,11 +2133,15 @@ def _fixed_or_maximum(fixed_size, field: str) -> int | None:
 def _family_size_proof_complete(family: GeometryFamily, fixed_size) -> bool:
     if _fixed_or_maximum(fixed_size, "coord_count_per_row") is None:
         return False
-    if family in {
-        GeometryFamily.POLYGON,
-        GeometryFamily.MULTILINESTRING,
-        GeometryFamily.MULTIPOLYGON,
-    } and _fixed_or_maximum(fixed_size, "first_level_count_per_row") is None:
+    if (
+        family
+        in {
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTILINESTRING,
+            GeometryFamily.MULTIPOLYGON,
+        }
+        and _fixed_or_maximum(fixed_size, "first_level_count_per_row") is None
+    ):
         return False
     return not (
         family is GeometryFamily.MULTIPOLYGON
@@ -2153,9 +2151,8 @@ def _family_size_proof_complete(family: GeometryFamily, fixed_size) -> bool:
 
 def _candidate_ordered_composition_parts(composition):
     """Return candidate contiguous parts and device-only certification checks."""
-    if (
-        composition.residency is not Residency.DEVICE
-        or any(part.collection_position is not None for part in composition.parts)
+    if composition.residency is not Residency.DEVICE or any(
+        part.collection_position is not None for part in composition.parts
     ):
         return _NativeWkbCompositionLayoutCandidate(None, (), ())
 
@@ -2242,12 +2239,7 @@ def _native_wkb_family_output_bytes(
     if family is GeometryFamily.MULTILINESTRING:
         return 9 + 9 * first_count + 16 * coordinate_count
     if family is GeometryFamily.MULTIPOLYGON:
-        return (
-            9
-            + 9 * first_count
-            + 4 * second_count
-            + 16 * coordinate_count
-        )
+        return 9 + 9 * first_count + 4 * second_count + 16 * coordinate_count
     raise ValueError(f"Unsupported geometry family for WKB capacity: {family}")
 
 
@@ -2343,9 +2335,7 @@ def _plan_native_wkb_capacity(
             pending_buffers.append((family, buffer))
             packet_arrays.append(_device_family_size_packet(family, buffer))
 
-    packet_arrays.extend(
-        cp.asarray(check, dtype=cp.int64).reshape(-1) for check in layout_checks
-    )
+    packet_arrays.extend(cp.asarray(check, dtype=cp.int64).reshape(-1) for check in layout_checks)
     planning_packet_scalars = sum(int(values.size) for values in packet_arrays)
     packet_values: list[int] = []
     if packet_arrays:
@@ -2355,18 +2345,14 @@ def _plan_native_wkb_capacity(
         packet_values = np.asarray(
             get_cuda_runtime().copy_device_to_host(
                 device_packet,
-                reason=(
-                    "native WKB capacity and contiguous composition allocation packet"
-                ),
+                reason=("native WKB capacity and contiguous composition allocation packet"),
             ),
             dtype=np.int64,
         ).tolist()
 
     cursor = 0
     for family, buffer in pending_buffers:
-        first_maximum, second_maximum, coordinate_maximum = packet_values[
-            cursor : cursor + 3
-        ]
+        first_maximum, second_maximum, coordinate_maximum = packet_values[cursor : cursor + 3]
         cursor += 3
         existing = buffer.fixed_size
         buffer.fixed_size = DeviceFixedGeometrySizeMetadata(
@@ -2376,9 +2362,7 @@ def _plan_native_wkb_capacity(
             second_level_count_per_row=(
                 None if existing is None else existing.second_level_count_per_row
             ),
-            coord_count_per_row=(
-                None if existing is None else existing.coord_count_per_row
-            ),
+            coord_count_per_row=(None if existing is None else existing.coord_count_per_row),
             max_first_level_count_per_row=max(
                 first_maximum,
                 _fixed_or_maximum(existing, "first_level_count_per_row") or 0,
@@ -2422,11 +2406,7 @@ def _plan_native_wkb_capacity(
                 direct_layout = False
                 continue
             stop = certified_start + int(valid_rows)
-            if not (
-                bool(contiguous)
-                and int(first) == certified_start
-                and int(last) == stop - 1
-            ):
+            if not (bool(contiguous) and int(first) == certified_start and int(last) == stop - 1):
                 layout_valid = False
                 break
             if bool(all_valid):
@@ -2463,18 +2443,27 @@ def _plan_native_wkb_capacity(
         source_owned_bytes = row_metadata_bytes
         for family, buffer in state.families.items():
             fixed_size = buffer.fixed_size
-            first_count = _fixed_or_maximum(
-                fixed_size,
-                "first_level_count_per_row",
-            ) or 0
-            second_count = _fixed_or_maximum(
-                fixed_size,
-                "second_level_count_per_row",
-            ) or 0
-            family_coordinate_count = _fixed_or_maximum(
-                fixed_size,
-                "coord_count_per_row",
-            ) or 0
+            first_count = (
+                _fixed_or_maximum(
+                    fixed_size,
+                    "first_level_count_per_row",
+                )
+                or 0
+            )
+            second_count = (
+                _fixed_or_maximum(
+                    fixed_size,
+                    "second_level_count_per_row",
+                )
+                or 0
+            )
+            family_coordinate_count = (
+                _fixed_or_maximum(
+                    fixed_size,
+                    "coord_count_per_row",
+                )
+                or 0
+            )
             source_output_bytes = max(
                 source_output_bytes,
                 _native_wkb_family_output_bytes(
@@ -2559,9 +2548,7 @@ def _physicalize_native_wkb_composition_span(composition, start: int, stop: int)
             assume_unique_indices=True,
         ).physicalize_device_rows(allow_capacity_allocation=True)
         selected_parts.append(selected)
-        selected_destinations.append(
-            output_rows[selected_lanes] - cp.int64(start)
-        )
+        selected_destinations.append(output_rows[selected_lanes] - cp.int64(start))
         selected_row_count += part_row_count
 
     if selected_row_count > span_rows:
@@ -2626,9 +2613,13 @@ def _iter_bounded_native_wkb_owned_chunks(*, owned, composition, capacity_plan):
             capacity_plan,
         ):
             d_rows = cp.arange(start, stop, dtype=cp.int64)
-            yield start, stop, owned._device_indexed_take(
-                d_rows,
-                assume_unique_indices=True,
+            yield (
+                start,
+                stop,
+                owned._device_indexed_take(
+                    d_rows,
+                    assume_unique_indices=True,
+                ),
             )
         return
 
@@ -2638,10 +2629,14 @@ def _iter_bounded_native_wkb_owned_chunks(*, owned, composition, capacity_plan):
             composition.row_count,
             capacity_plan,
         ):
-            yield start, stop, _physicalize_native_wkb_composition_span(
-                composition,
+            yield (
                 start,
                 stop,
+                _physicalize_native_wkb_composition_span(
+                    composition,
+                    start,
+                    stop,
+                ),
             )
         return
 
@@ -2678,9 +2673,7 @@ def _iter_bounded_native_wkb_owned_chunks(*, owned, composition, capacity_plan):
             local_stop = local_start + take_rows
             if local_start == 0 and local_stop == part_rows:
                 selected_owned = (
-                    part_owned.physicalize_device_rows(
-                        allow_capacity_allocation=True
-                    )
+                    part_owned.physicalize_device_rows(allow_capacity_allocation=True)
                     if part_owned.is_indexed_view
                     else part_owned
                 )
@@ -2706,9 +2699,7 @@ def _iter_bounded_native_wkb_owned_chunks(*, owned, composition, capacity_plan):
 
     if batch_rows:
         chunk_owned = (
-            batch_parts[0]
-            if len(batch_parts) == 1
-            else OwnedGeometryArray.concat(batch_parts)
+            batch_parts[0] if len(batch_parts) == 1 else OwnedGeometryArray.concat(batch_parts)
         )
         yield batch_start, batch_start + batch_rows, chunk_owned
 
@@ -2844,9 +2835,7 @@ def _write_geoparquet_native_device_wkb_chunks(
     ).decode()
 
     attribute_names = [
-        column_name
-        for column_name in ordered_column_names
-        if column_name != geometry_name
+        column_name for column_name in ordered_column_names if column_name != geometry_name
     ]
     if device_attribute_columns is not None:
         full_attribute_columns = [
@@ -2857,9 +2846,7 @@ def _write_geoparquet_native_device_wkb_chunks(
             _attribute_column_to_plc(host_table[column_name], column_name, plc=plc)
             for column_name in attribute_names
         ]
-    full_attribute_table = (
-        plc.Table(full_attribute_columns) if full_attribute_columns else None
-    )
+    full_attribute_table = plc.Table(full_attribute_columns) if full_attribute_columns else None
     completion_stream = cp.cuda.get_current_stream()
     stream = pylibcudf_current_stream(
         *([] if full_attribute_table is None else [full_attribute_table])
@@ -2917,9 +2904,9 @@ def _write_geoparquet_native_device_wkb_chunks(
                             for child_index, child_name in enumerate(
                                 ("xmin", "ymin", "xmax", "ymax")
                             ):
-                                metadata.column_metadata[index].child(
-                                    child_index
-                                ).set_name(child_name)
+                                metadata.column_metadata[index].child(child_index).set_name(
+                                    child_name
+                                )
                         else:
                             _apply_arrow_nested_child_metadata(
                                 metadata.column_metadata[index],
@@ -3112,9 +3099,7 @@ def _write_geoparquet_native_device_payload(
         bounded_chunk_rows = int(clustered_input_rows)
     wkb_capacity_plan = None
     capacity_chunk_rows = 0
-    native_row_count = int(
-        composition.row_count if composition is not None else owned.row_count
-    )
+    native_row_count = int(composition.row_count if composition is not None else owned.row_count)
     if geometry_encoding.lower() == "wkb":
         wkb_capacity_plan = _plan_native_wkb_capacity(
             owned=owned,
@@ -3129,10 +3114,7 @@ def _write_geoparquet_native_device_payload(
     if (
         wkb_capacity_plan is not None
         and native_row_count > 0
-        and (
-            composition is not None
-            or capacity_chunk_rows < native_row_count
-        )
+        and (composition is not None or capacity_chunk_rows < native_row_count)
     ):
         _write_geoparquet_native_device_wkb_chunks(
             plc,
@@ -3729,6 +3711,9 @@ class WKBPartitionPlan:
     family_counts: dict[str, int]
     fallback_indexes: tuple[int, ...]
     fallback_reason_counts: dict[str, int]
+    little_endian_rows: int
+    big_endian_rows: int
+    mixed_endian_rows: int
     reason: str
 
 
@@ -3902,8 +3887,6 @@ def _scan_wkb_value(value: bytes) -> tuple[GeometryFamily | None, str | None]:
         return None, "GeometryCollection rows fall outside the 2D owned native result model"
     if ewkb_srid and candidate_type_id in WKB_ID_FAMILIES:
         return None, "EWKB SRID-annotated 2D input routes through the explicit compatibility bridge"
-    if byteorder != 1:
-        return None, "big-endian 2D WKB input routes through the explicit compatibility bridge"
     family = WKB_ID_FAMILIES.get(candidate_type_id)
     if family is None:
         return None, f"unsupported WKB geometry type id {type_id}"
@@ -3920,6 +3903,8 @@ def _scan_wkb_partition_normalized(
     null_rows = 0
     valid_rows = 0
     native_rows = 0
+    little_endian_rows = 0
+    big_endian_rows = 0
     for index, value in enumerate(values):
         if value is None:
             null_rows += 1
@@ -3936,6 +3921,10 @@ def _scan_wkb_partition_normalized(
             continue
         family_counts[family.value] += 1
         native_rows += 1
+        if value[0] == 1:
+            little_endian_rows += 1
+        else:
+            big_endian_rows += 1
     return (
         tuple(scan_results),
         WKBPartitionPlan(
@@ -3947,9 +3936,13 @@ def _scan_wkb_partition_normalized(
             family_counts=family_counts,
             fallback_indexes=tuple(fallback_indexes),
             fallback_reason_counts=fallback_reason_counts,
+            little_endian_rows=little_endian_rows,
+            big_endian_rows=big_endian_rows,
+            mixed_endian_rows=0,
             reason=(
-                "Use one WKB header scan to separate native little-endian 2D families from the "
-                "explicit fallback pool before decode or encode work begins."
+                "Use one WKB header scan to separate native 2D families and root byte orders "
+                "from the explicit fallback pool before decode or encode work begins. Device "
+                "structural telemetry refines nested records into homogeneous or mixed endian."
             ),
         ),
     )
@@ -4241,6 +4234,8 @@ def _decode_native_wkb(
     states = {family: _new_wkb_family_state() for family in GeometryFamily}
     fallback_rows: list[int] = []
     fallback_values: list[bytes] = []
+    big_endian_rows: list[int] = []
+    big_endian_values: list[bytes] = []
     point_rows: list[int] = []
     point_values: list[bytes] = []
 
@@ -4251,6 +4246,10 @@ def _decode_native_wkb(
         if scan_reason is not None or family is None:
             fallback_rows.append(row_index)
             fallback_values.append(value)
+            continue
+        if value[0] == 0:
+            big_endian_rows.append(row_index)
+            big_endian_values.append(value)
             continue
         try:
             if family is GeometryFamily.POINT:
@@ -4281,6 +4280,26 @@ def _decode_native_wkb(
         point_locals = _decode_point_batch(point_values, states[GeometryFamily.POINT])
         for row_index, local_row in zip(point_rows, point_locals, strict=True):
             tags[row_index] = FAMILY_TAGS[GeometryFamily.POINT]
+            family_row_offsets[row_index] = local_row
+
+    # The host bridge is used only for explicit CPU execution. Keep its old
+    # little-endian unpackers simple, while parsing canonical big-endian rows
+    # through the correctness-oriented host compatibility parser. Big-endian
+    # remains native in the partition contract and is decoded directly by GPU
+    # kernels whenever device execution is selected.
+    if big_endian_rows:
+        big_endian_owned = from_wkb(big_endian_values, on_invalid=on_invalid)
+        for row_index, geometry in zip(
+            big_endian_rows,
+            big_endian_owned.to_shapely(),
+            strict=True,
+        ):
+            if geometry is None:
+                validity[row_index] = False
+                continue
+            family = _geometry_family_from_shapely_type(geometry.geom_type)
+            local_row = _append_shapely_geometry_state(family, geometry, states[family])
+            tags[row_index] = FAMILY_TAGS[family]
             family_row_offsets[row_index] = local_row
 
     if fallback_rows:
@@ -5137,6 +5156,9 @@ def _encode_native_wkb(
         },
         fallback_indexes=tuple(),
         fallback_reason_counts={},
+        little_endian_rows=int(array.validity.sum()),
+        big_endian_rows=0,
+        mixed_endian_rows=0,
         reason="Owned buffers already provide family tags and offsets, so encode can go straight to family-local WKB assembly.",
     )
     outputs: list[bytes | None] = [None] * array.row_count
@@ -5253,7 +5275,11 @@ def _try_gpu_wkb_list_decode(
         return _GpuWkbDecodeAttempt(result=None)
 
     # Avoid GPU staging for small WKB batches where host decode is cheaper.
-    if len(values) < DEVICE_WKB_LIST_DECODE_MIN_ROWS:
+    if (
+        len(values) < DEVICE_WKB_LIST_DECODE_MIN_ROWS
+        and get_requested_mode() is not ExecutionMode.GPU
+        and not strict_native_mode_enabled()
+    ):
         return _GpuWkbDecodeAttempt(result=None)
 
     normalized: list[bytes | None] = [_normalize_wkb_value(v) for v in values]
@@ -5361,7 +5387,7 @@ def decode_wkb_arrow_array_owned(
     requested = _resolve_arrow_wkb_decode_mode(requested_mode)
     admission = _plan_arrow_wkb_gpu_admission(
         rows=len(array),
-        payload_bytes=int(getattr(array, "nbytes", 0)),
+        payload_bytes=_arrow_wkb_storage_bytes(array),
         requested_mode=requested,
     )
     gpu_attempt: _GpuWkbDecodeAttempt | None = None
@@ -5471,6 +5497,14 @@ def _try_gpu_wkb_arrow_decode(
         import pyarrow as pa
 
         from .pylibcudf import _decode_pylibcudf_wkb_general_column_to_owned
+
+        if pa.types.is_binary_view(array.type):
+            array = array.cast(pa.binary())
+        if int(array.offset):
+            # Rebase a logical slice to zero so pylibcudf child offsets and
+            # validity are row-aligned. The source is already host Arrow; this
+            # is not a device-to-host boundary.
+            array = pa.concat_arrays([array])
 
         # pylibcudf does not support Arrow binary/large_binary types, but the
         # memory layout is identical to string/large_string (offsets + bytes).
@@ -5624,6 +5658,7 @@ def encode_wkb_owned(
         reason=plan.reason,
         selected=ExecutionMode.CPU,
     )
+    array._ensure_host_state(preserve_indexed_view=True)
     values, partition_plan = _encode_native_wkb(array, hex_output=hex)
     record_native_export_boundary(
         NativeExportBoundary(

@@ -3661,6 +3661,71 @@ def test_sindex_query_pair_aggregate_preserves_overlap_multiplicity() -> None:
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_sindex_query_pair_aggregate_mixed_polygon_query_stays_native(
+    monkeypatch,
+) -> None:
+    from shapely.geometry import MultiPolygon
+
+    from vibespatial.api import GeoSeries
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+    from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+    from vibespatial.spatial import component_parent_reduction
+
+    pickup = GeoSeries(
+        [Point(0, 0), Point(1, 1), Point(10, 10), Point(20, 20)]
+    )
+    dropoff = GeoSeries(
+        [Point(1, 1), Point(2.5, 2.5), Point(0, 0), Point(0, 0)]
+    )
+    zones = GeoSeries(
+        [
+            box(-1, -1, 2, 2),
+            MultiPolygon(
+                [
+                    box(0.5, 0.5, 3, 3),
+                    box(30, 30, 31, 31),
+                    box(40, 40, 41, 41),
+                ]
+            ),
+            box(9, 9, 11, 11),
+        ]
+    )
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_COMPONENT_PARENT_MIN_MAX_PARTS",
+        2,
+    )
+    monkeypatch.setattr(
+        component_parent_reduction,
+        "_COMPONENT_PARENT_MIN_AVERAGE_EXTRA_PART_LANES",
+        0,
+    )
+
+    clear_dispatch_events()
+    clear_fallback_events()
+    result = pickup.sindex.query_pair_aggregate(
+        dropoff.sindex,
+        zones,
+        predicate="contains",
+    )
+    dispatch = get_dispatch_events(clear=True)
+
+    assert get_fallback_events(clear=True) == []
+    assert any(
+        event.surface == "vibespatial.api.SpatialIndex.query_pair_aggregate"
+        and "owned_gpu_component_parent_pair_match_count" in event.implementation
+        for event in dispatch
+    )
+    assert all(
+        type(result[column].array).__name__ == "NativeNumericExpressionArray"
+        for column in result.columns
+    )
+    assert result["left_count"].to_numpy().tolist() == [1, 2, 1, 0]
+    assert result["right_count"].to_numpy().tolist() == [2, 1, 1, 1]
+    assert result["shared_count"].to_numpy().tolist() == [1, 1, 0, 0]
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
 def test_sindex_query_aggregate_consumes_native_relation_before_export(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3989,6 +4054,28 @@ def test_component_parent_workspace_admission_only_charges_persistent_growth() -
         persistent_tree_capacity=100,
         candidate_capacity=25,
     ) == 100 * 24 + 25 * 64
+
+
+def test_component_parent_work_admission_uses_independent_skew_signals() -> None:
+    from vibespatial.spatial import component_parent_reduction
+
+    threshold_parts = component_parent_reduction._COMPONENT_PARENT_MIN_MAX_PARTS
+    threshold_lanes = (
+        component_parent_reduction._COMPONENT_PARENT_MIN_AVERAGE_EXTRA_PART_LANES
+    )
+
+    assert component_parent_reduction._component_parent_work_admitted(
+        max_parts_per_parent=threshold_parts,
+        average_extra_part_lanes=0,
+    )
+    assert component_parent_reduction._component_parent_work_admitted(
+        max_parts_per_parent=1,
+        average_extra_part_lanes=threshold_lanes,
+    )
+    assert not component_parent_reduction._component_parent_work_admitted(
+        max_parts_per_parent=threshold_parts - 1,
+        average_extra_part_lanes=threshold_lanes - 1,
+    )
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")

@@ -5,7 +5,7 @@ Scope: Scaffolded kernel inventory, benchmark stubs, and generated test surfaces
 Read If: You are generating, reviewing, or extending owned kernel scaffolds.
 STOP IF: You already have the target kernel module and generated files open.
 Source Of Truth: Kernel scaffold inventory and generated surface map for repo-owned kernels.
-Body Budget: 50/220 lines
+Body Budget: 51/220 lines
 Document: docs/testing/kernel-inventory.md
 
 Section Map (Body Lines)
@@ -17,7 +17,7 @@ Section Map (Body Lines)
 | 15-20 | Open First |
 | 21-25 | Verify |
 | 26-30 | Risks |
-| 31-50 | Scaffolds |
+| 31-51 | Scaffolds |
 DOC_HEADER:END -->
 
 Generated kernel scaffolds land here first so agents can audit what exists and which tier gate applies.
@@ -68,3 +68,4 @@ Track scaffolded kernel modules, tests, and benchmark stubs.
 | `segmented_union_all` | `vibespatial.kernels.constructive` | Tier 3 | `polygon, multipolygon` | `src/vibespatial/kernels/constructive/segmented_union.py` | `tests/test_gpu_segmented_union_kernel.py` | `vsbench run constructive` |
 | `segmented_point_union` | `vibespatial.constructive` | Tier 3 | `point` | `src/vibespatial/constructive/grouped_point_union.py` | `tests/test_grouped_point_union.py` | `vsbench shootout benchmarks/shootout/corpora --scale 1m` |
 | `osm_varint_decode` | `vibespatial.io.osm_gpu` | Tier 1 | `point` | `src/vibespatial/io/osm_gpu.py` | `tests/test_osm_gpu.py` | -- |
+| `decode_wkb` | `vibespatial.kernels.core.wkb_decode` | Tier 1 | `point, linestring, polygon, multipoint, multilinestring, multipolygon` | `src/vibespatial/kernels/core/wkb_decode.py` | `tests/test_wkb_big_endian_gpu.py` | `uv run python scripts/benchmark_io_arrow.py --wkb-endian --scale 100000 --repeat 3` |

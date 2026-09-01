@@ -231,9 +231,7 @@ class GeometryDtype(ExtensionDtype):
     @classmethod
     def construct_from_string(cls, string):
         if not isinstance(string, str):
-            raise TypeError(
-                f"'construct_from_string' expects a string, got {type(string)}"
-            )
+            raise TypeError(f"'construct_from_string' expects a string, got {type(string)}")
         elif string == cls.name:
             return cls()
         else:
@@ -297,9 +295,7 @@ def _canonical_crs_identity(crs: Any) -> tuple[str, str] | None:
     return ("repr", str(crs))
 
 
-def _check_crs(
-    left: GeoPandasBase, right: GeoPandasBase, allow_none: bool = False
-) -> bool:
+def _check_crs(left: GeoPandasBase, right: GeoPandasBase, allow_none: bool = False) -> bool:
     """
     Check if the projection of both arrays is the same.
 
@@ -319,9 +315,7 @@ def _check_crs(
     return _canonical_crs_identity(left_crs) == _canonical_crs_identity(right_crs)
 
 
-def _crs_mismatch_warn(
-    left: GeoPandasBase, right: GeoPandasBase, stacklevel: int = 3
-) -> None:
+def _crs_mismatch_warn(left: GeoPandasBase, right: GeoPandasBase, stacklevel: int = 3) -> None:
     """Raise a CRS mismatch warning with the information on the assigned CRS."""
     if left.crs:
         left_srs = left.crs.to_string()
@@ -331,9 +325,7 @@ def _crs_mismatch_warn(
 
     if right.crs:
         right_srs = right.crs.to_string()
-        right_srs = (
-            right_srs if len(right_srs) <= 50 else " ".join([right_srs[:50], "..."])
-        )
+        right_srs = right_srs if len(right_srs) <= 50 else " ".join([right_srs[:50], "..."])
     else:
         right_srs = None
 
@@ -593,7 +585,9 @@ def _try_native_wkb_array(
     except (TypeError, ValueError, pa.ArrowException):
         arrow = None
     if arrow is not None and not (
-        pa.types.is_binary(arrow.type) or pa.types.is_large_binary(arrow.type)
+        pa.types.is_binary(arrow.type)
+        or pa.types.is_large_binary(arrow.type)
+        or pa.types.is_binary_view(arrow.type)
     ):
         if pa.types.is_null(arrow.type):
             return GeometryArray(np.full(rows, None, dtype=object), crs=crs)
@@ -680,11 +674,7 @@ def _try_native_wkb_array(
         implementation="arrow_wkb_owned_constructor",
         reason=admission.reason,
         detail=f"rows={admission.rows}, bytes={admission.payload_bytes}",
-        selected=(
-            ExecutionMode.GPU
-            if owned.residency.value == "device"
-            else ExecutionMode.CPU
-        ),
+        selected=(ExecutionMode.GPU if owned.residency.value == "device" else ExecutionMode.CPU),
     )
     return GeometryArray.from_owned(owned, crs=crs)
 
@@ -762,9 +752,7 @@ def _plan_wkt_gpu_admission(
         many_rows = rows >= 8_000
         enough_regular_text = text_bytes >= 192 * 1024 and max_row_bytes <= 64 * 1024
         enough_moderate_skew = (
-            rows >= 2_000
-            and text_bytes >= 1024 * 1024
-            and max_row_bytes * 4 <= text_bytes
+            rows >= 2_000 and text_bytes >= 1024 * 1024 and max_row_bytes * 4 <= text_bytes
         )
         selected = many_rows or enough_regular_text or enough_moderate_skew
         if many_rows:
@@ -824,10 +812,7 @@ def _try_large_wkt_gpu_array(
         is_missing = (
             item is None
             or item is pd.NA
-            or (
-                isinstance(item, (float, np.floating))
-                and bool(np.isnan(item))
-            )
+            or (isinstance(item, (float, np.floating)) and bool(np.isnan(item)))
         )
         if is_missing:
             encoded = b"POINT EMPTY"
@@ -906,9 +891,7 @@ def _try_large_wkt_gpu_array(
             row_count_hint=len(encoded_items),
             on_invalid=on_invalid,
             input_validity=(
-                None
-                if all(input_validity)
-                else cp.asarray(input_validity, dtype=cp.bool_)
+                None if all(input_validity) else cp.asarray(input_validity, dtype=cp.bool_)
             ),
         )
     except _GpuWktCompatibilityDecline as exc:
@@ -979,8 +962,10 @@ def _try_geometry_collection_wkt_compatibility(
 
     has_collection = False
     for item in values.tolist():
-        if item is None or item is pd.NA or (
-            isinstance(item, (float, np.floating)) and bool(np.isnan(item))
+        if (
+            item is None
+            or item is pd.NA
+            or (isinstance(item, (float, np.floating)) and bool(np.isnan(item)))
         ):
             continue
         if isinstance(item, bytes):
@@ -1156,7 +1141,12 @@ class GeometryArray(ExtensionArray):
             _source_provenance = data._provenance
             _source_readonly = bool(getattr(data, "_readonly", False))
             data = data._data
-        elif hasattr(data, "_data") and hasattr(data, "dtype") and hasattr(data.dtype, "name") and data.dtype.name == "device_geometry":
+        elif (
+            hasattr(data, "_data")
+            and hasattr(data, "dtype")
+            and hasattr(data.dtype, "name")
+            and data.dtype.name == "device_geometry"
+        ):
             # Accept DeviceGeometryArray by extracting its Shapely cache
             if not crs and hasattr(data, "crs"):
                 crs = data.crs
@@ -1167,9 +1157,7 @@ class GeometryArray(ExtensionArray):
                 "from_wkb, from_wkt functions to construct a GeometryArray."
             )
         elif not data.ndim == 1:
-            raise ValueError(
-                "'data' should be a 1-dimensional array of geometry objects."
-            )
+            raise ValueError("'data' should be a 1-dimensional array of geometry objects.")
         self._shapely_data = data
 
         self._crs = None
@@ -1297,12 +1285,7 @@ class GeometryArray(ExtensionArray):
     def __getitem__(self, idx) -> GeometryArray:
         if isinstance(idx, numbers.Integral):
             return self._data[idx]
-        elif (
-            isinstance(idx, slice)
-            and idx.start is None
-            and idx.stop is None
-            and idx.step is None
-        ):
+        elif isinstance(idx, slice) and idx.start is None and idx.stop is None and idx.step is None:
             # special case of a full slice -> preserve the sindex
             # (to ensure view() preserves it as well)
             if self._owned is not None and self._shapely_data is None:
@@ -1319,11 +1302,7 @@ class GeometryArray(ExtensionArray):
             result._readonly = self._readonly
             return result
 
-        if (
-            isinstance(idx, slice)
-            and self._owned is not None
-            and self._shapely_data is None
-        ):
+        if isinstance(idx, slice) and self._owned is not None and self._shapely_data is None:
             from vibespatial.runtime._runtime import has_gpu_runtime
             from vibespatial.runtime.residency import Residency
 
@@ -1437,9 +1416,7 @@ class GeometryArray(ExtensionArray):
             else:
                 self._data[key] = value
         else:
-            raise TypeError(
-                f"Value should be either a BaseGeometry or None, got {value!s}"
-            )
+            raise TypeError(f"Value should be either a BaseGeometry or None, got {value!s}")
 
         if preserve_owned:
             self._sindex = preserved_sindex
@@ -1577,9 +1554,7 @@ class GeometryArray(ExtensionArray):
 
     def invalid_coverage_edges(self, gap_width: float = 0.0):
         if not GEOS_GE_312:
-            raise ImportError(
-                "Method 'invalid_coverage_edges' requires and GEOS>=3.12."
-            )
+            raise ImportError("Method 'invalid_coverage_edges' requires and GEOS>=3.12.")
         return shapely.coverage_invalid_edges(self._data, gap_width=gap_width)
 
     @property
@@ -1742,9 +1717,7 @@ class GeometryArray(ExtensionArray):
         return shapely.concave_hull(self._data, ratio=ratio, allow_holes=allow_holes)
 
     def constrained_delaunay_triangles(self) -> GeometryArray:
-        return GeometryArray(
-            shapely.constrained_delaunay_triangles(self._data), crs=self.crs
-        )
+        return GeometryArray(shapely.constrained_delaunay_triangles(self._data), crs=self.crs)
 
     @property
     def convex_hull(self) -> GeometryArray:
@@ -1853,9 +1826,7 @@ class GeometryArray(ExtensionArray):
                     inner_rings.append(None)
                 elif hasattr(g, "geoms"):
                     # MultiLineString parts -> LinearRings
-                    inner_rings.append(
-                        [LinearRing(part.coords) for part in g.geoms]
-                    )
+                    inner_rings.append([LinearRing(part.coords) for part in g.geoms])
                 else:
                     inner_rings.append([])
             if has_non_poly:
@@ -1897,7 +1868,8 @@ class GeometryArray(ExtensionArray):
             )
 
             result_owned = remove_repeated_points_owned(
-                self._owned, tolerance,
+                self._owned,
+                tolerance,
             )
             return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
@@ -2041,16 +2013,16 @@ class GeometryArray(ExtensionArray):
 
             result_owned = line_merge_owned(self._owned, directed=directed)
             return GeometryArray.from_owned(result_owned, crs=self.crs)
-        return GeometryArray(
-            shapely.line_merge(self._data, directed=directed), crs=self.crs
-        )
+        return GeometryArray(shapely.line_merge(self._data, directed=directed), crs=self.crs)
 
     def set_precision(self, grid_size: float, mode="valid_output"):
         if self._owned is not None:
             from vibespatial.constructive.set_precision import set_precision_owned
 
             result_owned = set_precision_owned(
-                self._owned, grid_size=grid_size, mode=mode,
+                self._owned,
+                grid_size=grid_size,
+                mode=mode,
             )
             return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
@@ -2072,10 +2044,7 @@ class GeometryArray(ExtensionArray):
 
         if isinstance(right, GeometryArray):
             if len(left) != len(right):
-                msg = (
-                    "Lengths of inputs do not match. "
-                    f"Left: {len(left)}, Right: {len(right)}"
-                )
+                msg = f"Lengths of inputs do not match. Left: {len(left)}, Right: {len(right)}"
                 raise ValueError(msg)
             if not _check_crs(left, right):
                 _crs_mismatch_warn(left, right, stacklevel=7)
@@ -2130,10 +2099,7 @@ class GeometryArray(ExtensionArray):
         self.check_geographic_crs(stacklevel=6, operation="dwithin")
         if isinstance(other, GeometryArray):
             if len(self) != len(other):
-                msg = (
-                    "Lengths of inputs do not match. "
-                    f"Left: {len(self)}, Right: {len(other)}"
-                )
+                msg = f"Lengths of inputs do not match. Left: {len(self)}, Right: {len(other)}"
                 raise ValueError(msg)
             if not _check_crs(self, other):
                 _crs_mismatch_warn(self, other, stacklevel=7)
@@ -2201,7 +2167,12 @@ class GeometryArray(ExtensionArray):
                     )
 
         clipped, selected = evaluate_geopandas_clip_by_rect(
-            self._data, xmin, ymin, xmax, ymax, prebuilt_owned=prebuilt_owned,
+            self._data,
+            xmin,
+            ymin,
+            xmax,
+            ymax,
+            prebuilt_owned=prebuilt_owned,
         )
         if clipped is None:
             record_dispatch_event(
@@ -2244,7 +2215,9 @@ class GeometryArray(ExtensionArray):
 
     def symmetric_difference(self, other, grid_size=None) -> GeometryArray:
         return self._constructive_or_fallback(
-            "symmetric_difference", other, grid_size=grid_size,
+            "symmetric_difference",
+            other,
+            grid_size=grid_size,
         )
 
     def union(self, other, grid_size=None) -> GeometryArray:
@@ -2274,7 +2247,11 @@ class GeometryArray(ExtensionArray):
             if other_owned is not None:
                 try:
                     result_geometry = binary_constructive_native(
-                        op, self._owned, other_owned, workload_shape=workload_shape, **kwargs,
+                        op,
+                        self._owned,
+                        other_owned,
+                        workload_shape=workload_shape,
+                        **kwargs,
                     )
                     # The constructive dispatcher records its own dispatch event
                     # with the accurate selected mode (GPU or CPU).
@@ -2302,16 +2279,14 @@ class GeometryArray(ExtensionArray):
             selected=ExecutionMode.CPU,
         )
         return GeometryArray(
-            self._binary_method(op, self, other, **kwargs), crs=self.crs,
+            self._binary_method(op, self, other, **kwargs),
+            crs=self.crs,
         )
 
     def shortest_line(self, other) -> GeometryArray:
         if self._owned is not None and isinstance(other, GeometryArray):
             if len(self) != len(other):
-                msg = (
-                    "Lengths of inputs do not match. "
-                    f"Left: {len(self)}, Right: {len(other)}"
-                )
+                msg = f"Lengths of inputs do not match. Left: {len(self)}, Right: {len(other)}"
                 raise ValueError(msg)
             if not _check_crs(self, other):
                 _crs_mismatch_warn(self, other, stacklevel=7)
@@ -2323,17 +2298,12 @@ class GeometryArray(ExtensionArray):
                 return GeometryArray.from_owned(result, crs=self.crs)
             # CPU path returns numpy array of Shapely objects
             return GeometryArray(result, crs=self.crs)
-        return GeometryArray(
-            self._binary_method("shortest_line", self, other), crs=self.crs
-        )
+        return GeometryArray(self._binary_method("shortest_line", self, other), crs=self.crs)
 
     def snap(self, other, tolerance) -> GeometryArray:
         if self._owned is not None and isinstance(other, GeometryArray):
             if len(self) != len(other):
-                msg = (
-                    "Lengths of inputs do not match. "
-                    f"Left: {len(self)}, Right: {len(other)}"
-                )
+                msg = f"Lengths of inputs do not match. Left: {len(self)}, Right: {len(other)}"
                 raise ValueError(msg)
             if not _check_crs(self, other):
                 _crs_mismatch_warn(self, other, stacklevel=7)
@@ -2352,10 +2322,7 @@ class GeometryArray(ExtensionArray):
     def shared_paths(self, other) -> GeometryArray:
         if self._owned is not None and isinstance(other, GeometryArray):
             if len(self) != len(other):
-                msg = (
-                    "Lengths of inputs do not match. "
-                    f"Left: {len(self)}, Right: {len(other)}"
-                )
+                msg = f"Lengths of inputs do not match. Left: {len(self)}, Right: {len(other)}"
                 raise ValueError(msg)
             if not _check_crs(self, other):
                 _crs_mismatch_warn(self, other, stacklevel=7)
@@ -2371,9 +2338,7 @@ class GeometryArray(ExtensionArray):
                     name="geometry",
                 ).values
             return GeometryArray(result, crs=self.crs)
-        return GeometryArray(
-            self._binary_method("shared_paths", self, other), crs=self.crs
-        )
+        return GeometryArray(self._binary_method("shared_paths", self, other), crs=self.crs)
 
     #
     # Other operations
@@ -2383,10 +2348,7 @@ class GeometryArray(ExtensionArray):
         self.check_geographic_crs(stacklevel=6, operation="distance")
         if self._owned is not None and isinstance(other, GeometryArray):
             if len(self) != len(other):
-                msg = (
-                    "Lengths of inputs do not match. "
-                    f"Left: {len(self)}, Right: {len(other)}"
-                )
+                msg = f"Lengths of inputs do not match. Left: {len(self)}, Right: {len(other)}"
                 raise ValueError(msg)
             if not _check_crs(self, other):
                 _crs_mismatch_warn(self, other, stacklevel=7)
@@ -2406,7 +2368,9 @@ class GeometryArray(ExtensionArray):
             from vibespatial.spatial.distance_metrics import hausdorff_distance_owned
 
             return hausdorff_distance_owned(
-                self._owned, other._owned, densify=kwargs.get("densify"),
+                self._owned,
+                other._owned,
+                densify=kwargs.get("densify"),
             )
         return self._binary_method("hausdorff_distance", self, other, **kwargs)
 
@@ -2420,7 +2384,9 @@ class GeometryArray(ExtensionArray):
             from vibespatial.spatial.distance_metrics import frechet_distance_owned
 
             return frechet_distance_owned(
-                self._owned, other._owned, densify=kwargs.get("densify"),
+                self._owned,
+                other._owned,
+                densify=kwargs.get("densify"),
             )
         return self._binary_method("frechet_distance", self, other, **kwargs)
 
@@ -2524,7 +2490,9 @@ class GeometryArray(ExtensionArray):
                 result = GeometryArray.from_owned(buffer_result, crs=self.crs)
             else:
                 result = GeometryArray(np.asarray(buffer_result, dtype=object), crs=self.crs)
-            result._provenance = make_buffer_tag(self, distance, cap_style, join_style, single_sided, quad_segs)
+            result._provenance = make_buffer_tag(
+                self, distance, cap_style, join_style, single_sided, quad_segs
+            )
             return result
         record_dispatch_event(
             surface="geopandas.array.buffer",
@@ -2549,7 +2517,9 @@ class GeometryArray(ExtensionArray):
                 owned = _from_shapely_vectorized(buf_arr)
                 if owned is not None:
                     result._owned = owned
-        result._provenance = make_buffer_tag(self, distance, cap_style, join_style, single_sided, quad_segs)
+        result._provenance = make_buffer_tag(
+            self, distance, cap_style, join_style, single_sided, quad_segs
+        )
         return result
 
     def interpolate(self, distance, normalized: bool = False) -> GeometryArray:
@@ -2586,27 +2556,21 @@ class GeometryArray(ExtensionArray):
             from vibespatial.constructive.simplify import simplify_owned
 
             result_owned = simplify_owned(
-                self._owned, tolerance, preserve_topology=preserve_topology,
+                self._owned,
+                tolerance,
+                preserve_topology=preserve_topology,
             )
             return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
-            shapely.simplify(
-                self._data, tolerance, preserve_topology=preserve_topology
-            ),
+            shapely.simplify(self._data, tolerance, preserve_topology=preserve_topology),
             crs=self.crs,
         )
 
-    def simplify_coverage(
-        self, tolerance, simplify_boundary: bool = True
-    ) -> GeometryArray:
+    def simplify_coverage(self, tolerance, simplify_boundary: bool = True) -> GeometryArray:
         if not GEOS_GE_312:
-            raise ImportError(
-                "'simplify_coverage' requires shapely>=2.1 and GEOS>=3.12."
-            )
+            raise ImportError("'simplify_coverage' requires shapely>=2.1 and GEOS>=3.12.")
         return GeometryArray(
-            shapely.coverage_simplify(
-                self._data, tolerance, simplify_boundary=simplify_boundary
-            ),
+            shapely.coverage_simplify(self._data, tolerance, simplify_boundary=simplify_boundary),
             crs=self.crs,
         )
 
@@ -2739,8 +2703,7 @@ class GeometryArray(ExtensionArray):
 
     def unary_union(self):
         warnings.warn(
-            "The 'unary_union' attribute is deprecated, "
-            "use the 'union_all' method instead.",
+            "The 'unary_union' attribute is deprecated, use the 'union_all' method instead.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -2767,7 +2730,8 @@ class GeometryArray(ExtensionArray):
             # GPU path: union_all_gpu with optional grid_size.
             if self._owned is not None:
                 result = self._try_gpu_reduction(
-                    "union_all", grid_size=grid_size,
+                    "union_all",
+                    grid_size=grid_size,
                 )
                 if result is not None:
                     return result
@@ -2787,14 +2751,11 @@ class GeometryArray(ExtensionArray):
                         return result_geoms[0]
                 # None return means mixed families -- fall through to Shapely.
             if not GEOS_GE_312:
-                raise ImportError(
-                    "Method 'disjoin_subset' requires shapely>=2.1 and GEOS>=3.12."
-                )
+                raise ImportError("Method 'disjoin_subset' requires shapely>=2.1 and GEOS>=3.12.")
             return shapely.disjoint_subset_union_all(self._data)
         else:
             raise ValueError(
-                f"Method '{method}' not recognized. Use 'coverage', 'unary' or "
-                "'disjoint_subset'."
+                f"Method '{method}' not recognized. Use 'coverage', 'unary' or 'disjoint_subset'."
             )
 
     def intersection_all(self):
@@ -2826,14 +2787,10 @@ class GeometryArray(ExtensionArray):
         kwargs.setdefault("dispatch_mode", _native_strict_dispatch_mode())
         result_owned = fn(self._owned, **kwargs)
         if result_owned is None or result_owned.row_count != 1:
-            raise RuntimeError(
-                f"native global reduction {op!r} did not produce one output row"
-            )
+            raise RuntimeError(f"native global reduction {op!r} did not produce one output row")
         result_geoms = owned_to_shapely(result_owned)
         if result_geoms.size != 1:
-            raise RuntimeError(
-                f"native global reduction {op!r} exported an invalid row count"
-            )
+            raise RuntimeError(f"native global reduction {op!r} exported an invalid row count")
         return result_geoms[0]
 
     #
@@ -2868,9 +2825,7 @@ class GeometryArray(ExtensionArray):
             crs=self.crs,
         )
 
-    def translate(
-        self, xoff: float = 0.0, yoff: float = 0.0, zoff: float = 0.0
-    ) -> GeometryArray:
+    def translate(self, xoff: float = 0.0, yoff: float = 0.0, zoff: float = 0.0) -> GeometryArray:
         if self._owned is not None:
             from vibespatial.constructive.affine_transform import translate_owned
 
@@ -2881,14 +2836,15 @@ class GeometryArray(ExtensionArray):
             crs=self.crs,
         )
 
-    def rotate(
-        self, angle, origin="center", use_radians: bool = False
-    ) -> GeometryArray:
+    def rotate(self, angle, origin="center", use_radians: bool = False) -> GeometryArray:
         if self._owned is not None:
             from vibespatial.constructive.affine_transform import rotate_owned
 
             result_owned = rotate_owned(
-                self._owned, angle, origin=origin, use_radians=use_radians,
+                self._owned,
+                angle,
+                origin=origin,
+                use_radians=use_radians,
             )
             return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
@@ -2909,13 +2865,15 @@ class GeometryArray(ExtensionArray):
             from vibespatial.constructive.affine_transform import scale_owned
 
             result_owned = scale_owned(
-                self._owned, xfact, yfact, zfact, origin=origin,
+                self._owned,
+                xfact,
+                yfact,
+                zfact,
+                origin=origin,
             )
             return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
-            self._affinity_method(
-                "scale", self._data, xfact, yfact, zfact, origin=origin
-            ),
+            self._affinity_method("scale", self._data, xfact, yfact, zfact, origin=origin),
             crs=self.crs,
         )
 
@@ -2930,7 +2888,11 @@ class GeometryArray(ExtensionArray):
             from vibespatial.constructive.affine_transform import skew_owned
 
             result_owned = skew_owned(
-                self._owned, xs, ys, origin=origin, use_radians=use_radians,
+                self._owned,
+                xs,
+                ys,
+                origin=origin,
+                use_radians=use_radians,
             )
             return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
@@ -3013,8 +2975,7 @@ class GeometryArray(ExtensionArray):
 
         if self.crs is None:
             raise ValueError(
-                "Cannot transform naive geometries.  "
-                "Please set a crs on the object first."
+                "Cannot transform naive geometries.  Please set a crs on the object first."
             )
         if crs is not None:
             crs = CRS.from_user_input(crs)
@@ -3107,9 +3068,7 @@ class GeometryArray(ExtensionArray):
         # ensure using geographic coordinates
         else:
             t = _VibeTransformer.from_crs(self.crs, "EPSG:4326", always_xy=True)
-            minx, miny, maxx, maxy = t.transform_bounds(
-                minx, miny, maxx, maxy
-            )
+            minx, miny, maxx, maxy = t.transform_bounds(minx, miny, maxx, maxy)
             y_center = np.mean([miny, maxy])
             # crossed the antimeridian
             if minx > maxx:
@@ -3245,9 +3204,7 @@ class GeometryArray(ExtensionArray):
             return np.array(compute_total_bounds(self._owned, dispatch_mode=dispatch_mode))
         b = self.bounds
         with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore", r"All-NaN slice encountered", RuntimeWarning
-            )
+            warnings.filterwarnings("ignore", r"All-NaN slice encountered", RuntimeWarning)
             return np.array(
                 (
                     np.nanmin(b[:, 0]),  # minx
@@ -3341,9 +3298,7 @@ class GeometryArray(ExtensionArray):
         return GeometryArray(result, crs=self.crs)
 
     # compat for pandas < 3.0
-    def _pad_or_backfill(
-        self, method, limit=None, limit_area=None, copy=True, **kwargs
-    ):
+    def _pad_or_backfill(self, method, limit=None, limit_area=None, copy=True, **kwargs):
         kwargs["limit_area"] = limit_area
         return super()._pad_or_backfill(method=method, limit=limit, copy=copy, **kwargs)
 
@@ -3435,9 +3390,7 @@ class GeometryArray(ExtensionArray):
                 return self.copy()
             else:
                 return self
-        elif pd.api.types.is_string_dtype(dtype) and not pd.api.types.is_object_dtype(
-            dtype
-        ):
+        elif pd.api.types.is_string_dtype(dtype) and not pd.api.types.is_object_dtype(dtype):
             string_values = to_wkt(self)
             pd_dtype = pd.api.types.pandas_dtype(dtype)
             if isinstance(pd_dtype, pd.StringDtype):
@@ -3797,7 +3750,10 @@ class GeometryArray(ExtensionArray):
                 owned_arrays.append(owned)
             result_owned = OwnedGeometryArray.concat(owned_arrays)
             crs = _get_common_crs(to_concat)
-            if any(getattr(getattr(ga, "dtype", None), "name", None) == "device_geometry" for ga in to_concat):
+            if any(
+                getattr(getattr(ga, "dtype", None), "name", None) == "device_geometry"
+                for ga in to_concat
+            ):
                 return DeviceGeometryArray._from_owned(result_owned, crs=crs)
             return GeometryArray.from_owned(result_owned, crs=crs)
 
@@ -3810,8 +3766,7 @@ class GeometryArray(ExtensionArray):
         if name in ("any", "all"):
             return getattr(self._data, name)(keepdims=keepdims)
         raise TypeError(
-            f"'{type(self).__name__}' with dtype {self.dtype} "
-            f"does not support reduction '{name}'"
+            f"'{type(self).__name__}' with dtype {self.dtype} does not support reduction '{name}'"
         )
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
@@ -3829,18 +3784,20 @@ class GeometryArray(ExtensionArray):
                 record_native_export_boundary,
             )
 
-            record_native_export_boundary(NativeExportBoundary(
-                surface="vibespatial.api.GeometryArray.__array__",
-                operation="geometryarray_to_numpy",
-                target="numpy",
-                reason="native GeometryArray exported through NumPy array protocol",
-                detail=(
-                    "residency="
-                    f"{getattr(getattr(self._owned, 'residency', None), 'value', 'unknown')}"
-                ),
-                row_count=self._owned.row_count,
-                d2h_transfer=self._owned.device_state is not None,
-            ))
+            record_native_export_boundary(
+                NativeExportBoundary(
+                    surface="vibespatial.api.GeometryArray.__array__",
+                    operation="geometryarray_to_numpy",
+                    target="numpy",
+                    reason="native GeometryArray exported through NumPy array protocol",
+                    detail=(
+                        "residency="
+                        f"{getattr(getattr(self._owned, 'residency', None), 'value', 'unknown')}"
+                    ),
+                    row_count=self._owned.row_count,
+                    d2h_transfer=self._owned.device_state is not None,
+                )
+            )
         if copy and (dtype is None or dtype == np.dtype("object")):
             return self._data.copy()
         result = self._data
@@ -3891,11 +3848,7 @@ class GeometryArray(ExtensionArray):
     def __contains__(self, item) -> bool:
         """Return for `item in self`."""
         if isna(item):
-            if (
-                item is self.dtype.na_value
-                or isinstance(item, self.dtype.type)
-                or item is None
-            ):
+            if item is self.dtype.na_value or isinstance(item, self.dtype.type) or item is None:
                 return self.isna().any()
             else:
                 return False
@@ -3941,15 +3894,11 @@ def transform(data, func) -> np.ndarray:
 
     coords = shapely.get_coordinates(data[~has_z], include_z=False)
     new_coords_z = func(coords[:, 0], coords[:, 1])
-    result[~has_z] = shapely.set_coordinates(
-        data[~has_z].copy(), np.array(new_coords_z).T
-    )
+    result[~has_z] = shapely.set_coordinates(data[~has_z].copy(), np.array(new_coords_z).T)
 
     coords_z = shapely.get_coordinates(data[has_z], include_z=True)
     new_coords_z = func(coords_z[:, 0], coords_z[:, 1], coords_z[:, 2])
-    result[has_z] = shapely.set_coordinates(
-        data[has_z].copy(), np.array(new_coords_z).T
-    )
+    result[has_z] = shapely.set_coordinates(data[has_z].copy(), np.array(new_coords_z).T)
 
     return result
 

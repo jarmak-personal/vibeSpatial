@@ -5,7 +5,7 @@ Scope: Post-Phase-6b GPU-native IO execution model, staged decode policy, and fo
 Read If: You are changing GeoArrow, GeoParquet, WKB, GeoJSON, or Shapefile performance strategy or decode architecture.
 STOP IF: Your task already has the routed IO implementation files open and only needs local adapter detail.
 Source Of Truth: IO acceleration policy for turning repo-owned adapters into GPU-dominant ingest and emission paths.
-Body Budget: 193/260 lines
+Body Budget: 197/260 lines
 Document: docs/architecture/io-acceleration.md
 
 Section Map (Body Lines)
@@ -20,10 +20,10 @@ Section Map (Body Lines)
 | 37-43 | Risks |
 | 44-65 | Decision |
 | 66-79 | Execution Model |
-| 80-148 | Format Strategy |
-| 149-161 | CCCL Preference Order |
-| 162-180 | Performance Targets |
-| 181-193 | Non-Negotiable Constraints |
+| 80-151 | Format Strategy |
+| 152-164 | CCCL Preference Order |
+| 165-184 | Performance Targets |
+| 185-197 | Non-Negotiable Constraints |
 DOC_HEADER:END -->
 
 ## Purpose
@@ -131,9 +131,12 @@ The critical rule is that decode happens after pruning, not before it.
   constructor-only workflows. WKB and GeoArrow are the public object-free
   ingress surfaces.
 - Compact unsupported or ambiguous rows into an explicit fallback pool.
-- Classify big-endian 2D, EWKB SRID-annotated 2D, Z/M/ZM, and
-  `GeometryCollection` rows explicitly instead of letting those cases blur into
-  one generic fallback reason.
+- Decode canonical 2D little endian, big endian, and independently mixed
+  embedded-endian records through the same byte-authoritative structural plan.
+- Classify EWKB SRID-annotated 2D, Z/M/ZM, `GeometryCollection`, malformed, and
+  unsupported rows explicitly; compact only declined rows for compatibility.
+- GeoParquet family metadata can narrow work only after byte validation and is
+  never positive admission proof.
 
 ### WKT
 
@@ -198,6 +201,7 @@ host baseline for the same format, whichever is faster.
 | GeoParquet selective scan with bbox pushdown | decode `<= 15%` of rows at `< 10%` selectivity | decode `<= 5%` | row-group dataset with covering metadata |
 | GeoArrow native decode or encode | `4x` faster | `8x` faster | `10M` points / `1M` polygons |
 | WKB decode | `4x` faster | `8x` faster | `10M` points / `1M` polygons |
+| WKB big/little parity | big endian `>=80%` of little endian | parity | identical `100K+` physical shapes |
 | WKB encode | `3x` faster | `5x` faster | `10M` points / `1M` polygons |
 | GeoJSON public ingest + first GPU stage | parity at `10K`, `2x` faster at `1M` | `4x` faster | point/line public `read_file(...)` workloads |
 | GeoJSON polygon ingest | `1.25x` faster | `2x` faster | `250K` polygons |

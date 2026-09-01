@@ -299,5 +299,21 @@
     "variants": [
       "gpu-cuda-python"
     ]
+  },
+  {
+    "geom_types": [
+      "point",
+      "linestring",
+      "polygon",
+      "multipoint",
+      "multilinestring",
+      "multipolygon"
+    ],
+    "kernel": "decode_wkb",
+    "module": "vibespatial.kernels.core.wkb_decode",
+    "tier": 1,
+    "variants": [
+      "gpu-cuda-python"
+    ]
   }
 ]

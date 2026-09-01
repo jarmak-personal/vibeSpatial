@@ -5,7 +5,7 @@ Scope: Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and 
 Read If: You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.
 STOP IF: Your task already has the specific IO adapter open and only needs local implementation detail.
 Source Of Truth: IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.
-Body Budget: 260/260 lines
+Body Budget: 242/260 lines
 Document: docs/architecture/io-arrow.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 32-37 | Risks |
 | 38-53 | Decision |
 | 54-75 | Performance Notes |
-| 76-222 | Current Behavior |
-| 223-260 | Measured Local Baseline |
+| 76-228 | Current Behavior |
+| 229-242 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -104,14 +104,16 @@ geometry buffers while keeping GPU-native formats as the design center.
 - Owned GeoArrow and WKB bridge helpers exist as first-class repo APIs.
 - Dispatch and fallback events make the current host/device choice observable.
 - Repo-owned WKB bridges now use a staged native path for supported families:
-  - one header scan separates native rows from the explicit fallback pool
+  - one byte-authoritative structural scan validates root and embedded headers,
+    record bounds, counts, families, and independent byte order
   - point, linestring, polygon, multipoint, multilinestring, and multipolygon
-    rows use family-specialized native decode or encode
+    rows use endian-specialized GPU decode into device owned buffers
   - homogeneous Arrow WKB point, uniform-linestring, and uniform-polygon
     batches now take raw-buffer fast paths ahead of the generic GPU bridge and
     bulk-promote to device when a GPU runtime is available
-  - malformed, unsupported, or non-little-endian rows compact into explicit
-    fallback instead of forcing the whole batch through Shapely
+  - malformed, EWKB, dimensional, GeometryCollection, or otherwise unsupported
+    rows compact into an explicit sparse compatibility pool; strict-native
+    rejects before compatibility materialization
 - `geopandas.read_parquet(..., bbox=...)` now builds a repo-owned metadata
   summary when pyarrow metadata is available, selects row groups before the
   table read, and passes those row groups into the host read path instead of
@@ -214,7 +216,9 @@ geometry buffers while keeping GPU-native formats as the design center.
   linestring, polygon, multipoint, multilinestring, and multipolygon columns
   into device-resident owned buffers without a Shapely round-trip.
 - Legacy binary-WKB Parquet can be transcoded metadata-only to GeoParquet 1.1:
-  pylibcudf preserves typed columns/WKB while adding geometry and CRS metadata.
+  `binary`, `large_binary`, and `binary_view` geometry normalize to Arrow
+  `binary`; pylibcudf preserves exact WKB and typed attributes, validates the
+  complete result, then publishes atomically.
 - `NativePartitionedParquetSink` orders bounded device-clustered batches onto one
   writer stream; its file-identity-bound sidecar routes equality reads to exact row groups.
   Empty filtered WKB scans synthesize device offsets instead of using the host decoder.
@@ -222,10 +226,12 @@ geometry buffers while keeping GPU-native formats as the design center.
   point-only, linestring-only, and point/linestring columns still use the
   lightweight `pylibcudf` helpers, while heavier or broader family mixes route
   through the staged GPU WKB decode pipeline after the same header scan.
-- Non-canonical WKB is still explicit compatibility work:
-  big-endian 2D records, EWKB SRID-annotated 2D rows, Z/M/ZM or other non-2D
-  type ids, and families outside the owned native result model now classify
-  into explicit compatibility buckets instead of silently hiding a host decode.
+- Canonical 2D little endian, big endian, and mixed embedded-endian WKB are
+  native. EWKB SRID, Z/M/ZM, GeometryCollection, invalid order, malformed
+  structure, and families outside the owned model retain stable decline codes.
+- GeoParquet `geometry_types` is a planning hint only and never bypasses the
+  byte-derived structural proof. Successful native reads export only one
+  bounded aggregate telemetry packet, never payload or coordinate bytes.
 - Repo-owned native GeoArrow codecs provide family-specialized homogeneous IO:
   - point, linestring, polygon, multilinestring, and multipolygon extension
     arrays decode through dedicated family builders
@@ -245,39 +251,15 @@ geometry buffers while keeping GPU-native formats as the design center.
 
 ## Measured Local Baseline
 
-Host-only validation on this machine already shows why native GeoArrow decode
-must be the design center even before GPU throughput is measured:
+RTX 4090 synchronized repeat-3 measurements at `100K` identical records show
+the endian-aware decoder at `11.1x-34.4x` the Shapely comparator across all six
+families. Big-endian throughput is `0.98x-1.05x` little endian for identical
+physical shapes. The benchmark and machine-readable evidence come from:
 
-- `100K` point rows, GeoArrow GeoParquet decode: about `37.0M` rows/s
-- `100K` point rows, WKB GeoParquet decode: about `170K` rows/s
-- `20K` polygon rows, GeoArrow GeoParquet decode: about `3.05M` rows/s
-- `20K` polygon rows, WKB GeoParquet decode: about `64.6K` rows/s
+```bash
+uv run python scripts/benchmark_io_arrow.py --wkb-endian --scale 100000 --repeat 3
+```
 
-That is roughly `218x` better on the point case and `47x` better on the polygon
-case, which validates the native scan-engine direction before `pylibcudf`
-throughput is available locally.
-
-The new family-specialized codec benchmarks also show the bridge structure is
-paying off before device kernels land:
-
-- `100K` point rows, native GeoArrow encode: about `98.9M` rows/s
-- `100K` point rows, host bridge encode: about `11.2M` rows/s
-- `20K` polygon rows, native GeoArrow decode: about `5.68M` rows/s
-- `20K` polygon rows, host bridge decode: about `4.62M` rows/s
-
-That is about `8.8x` faster on point encode and about `1.23x` faster on polygon
-decode. The remaining bottleneck is the `pylibcudf -> pyarrow -> owned` bridge,
-which is now isolated behind the family codec boundary instead of being mixed
-into the public adapter layer.
-
-The staged WKB bridge now shows the same pattern on the compatibility path:
-
-- `1M` point rows, native WKB decode: about `1.54M` rows/s
-- `1M` point rows, host WKB decode bridge: about `177K` rows/s
-- `1M` point rows, native WKB encode: about `5.37M` rows/s
-- `1M` point rows, host WKB encode bridge: about `145K` rows/s
-
-That is about `8.7x` faster on decode and about `37x` faster on encode while
-keeping unsupported rows isolated in an explicit fallback pool. The remaining
-work for `o17.6.22` is no longer bridge shape; it is moving the same staged
-scan, partition, size, and scatter contract onto CCCL-backed device passes.
+The steady-state rail requires `>=4x` host speedup, big endian at `>=80%` of
+little endian, zero fallback, and zero payload/coordinate D2H. Ten-thousand-row
+results remain informational because fixed launch/allocation latency dominates.

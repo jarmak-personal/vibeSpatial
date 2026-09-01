@@ -53,10 +53,10 @@ request_warmup(["lower_bound_u64", "radix_sort_u64_i32"])
 
 
 # This is deliberately a conservative bootstrap admission, not the steady-state
-# device planner.  R3 evidence found a 1,404--18,933 part maximum in every SF100
-# Q11 zone frame, while ordinary multipart rows stay well below this boundary.
-# The work-amplification packet records the observed maximum so a later selector
-# can replace this floor with candidate-weighted evidence.
+# device planner.  A single heavy parent or enough aggregate component expansion
+# can independently make the parent-aware physical shape cheaper.  Requiring
+# both signals strands short tail batches on the generic family-partition path,
+# where launch capacity is unrelated to their smaller logical row count.
 _COMPONENT_PARENT_MIN_MAX_PARTS = 1_024
 _COMPONENT_PARENT_MIN_AVERAGE_EXTRA_PART_LANES = 500_000
 _U64_SENTINEL = (1 << 64) - 1
@@ -210,6 +210,19 @@ def _reduction_admission_bytes(
         tree_count * transient_per_tree
         + growth * _REDUCTION_COUNT_PERSISTENT_BYTES_PER_TREE
         + max(int(candidate_capacity), 0) * 64
+    )
+
+
+def _component_parent_work_admitted(
+    *,
+    max_parts_per_parent: int,
+    average_extra_part_lanes: int,
+) -> bool:
+    """Select the component shape from either independent skew signal."""
+    return (
+        int(max_parts_per_parent) >= _COMPONENT_PARENT_MIN_MAX_PARTS
+        or int(average_extra_part_lanes)
+        >= _COMPONENT_PARENT_MIN_AVERAGE_EXTRA_PART_LANES
     )
 
 
@@ -372,6 +385,22 @@ def _admitted_point_index(native_index) -> bool:
     )
 
 
+def _contiguous_coordinate_view(first, second):
+    """Return one zero-copy view when family coordinate slices share storage."""
+    if (
+        first.dtype == second.dtype
+        and first.flags.c_contiguous
+        and second.flags.c_contiguous
+        and int(first.data.ptr) + int(first.nbytes) == int(second.data.ptr)
+    ):
+        return cp.ndarray(
+            (int(first.size) + int(second.size),),
+            dtype=first.dtype,
+            memptr=first.data,
+        )
+    return cp.concatenate((first, second))
+
+
 def _admitted_multipolygon_components(
     query_owned,
     *,
@@ -411,33 +440,49 @@ def _admitted_multipolygon_components(
             average_extra_part_lanes = (
                 int(tree_count) * extra_parts // max(cached.parent_count, 1)
             )
-            if (
-                cached.max_parts_per_parent >= _COMPONENT_PARENT_MIN_MAX_PARTS
-                and average_extra_part_lanes
-                >= _COMPONENT_PARENT_MIN_AVERAGE_EXTRA_PART_LANES
+            if _component_parent_work_admitted(
+                max_parts_per_parent=cached.max_parts_per_parent,
+                average_extra_part_lanes=average_extra_part_lanes,
             ):
                 return cached
             return None
         state = query_owned._ensure_device_state(preserve_indexed_view=False)
-        if (
-            state.trusted_homogeneous_family is not GeometryFamily.MULTIPOLYGON
-            or state.trusted_all_valid is not True
-        ):
-            return None
-        buffer = state.families.get(GeometryFamily.MULTIPOLYGON)
-        if (
-            buffer is None
-            or buffer.part_offsets is None
-            or buffer.ring_offsets is None
-            or int(buffer.geometry_offsets.size) != int(query_owned.row_count) + 1
+        family_domain = {
+            family for family, buffer in state.families.items() if int(buffer.empty_mask.size)
+        }
+        homogeneous_multipolygon = (
+            state.trusted_homogeneous_family is GeometryFamily.MULTIPOLYGON
+            and family_domain == {GeometryFamily.MULTIPOLYGON}
+        )
+        mixed_polygonal = family_domain == {
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTIPOLYGON,
+        }
+        if state.trusted_all_valid is not True or not (
+            homogeneous_multipolygon or mixed_polygonal
         ):
             return None
 
         row_count = int(query_owned.row_count)
-        part_capacity = max(int(buffer.part_offsets.size) - 1, 0)
+        multipolygon = state.families.get(GeometryFamily.MULTIPOLYGON)
+        if (
+            multipolygon is None
+            or multipolygon.part_offsets is None
+            or multipolygon.ring_offsets is None
+        ):
+            return None
+        polygon = state.families.get(GeometryFamily.POLYGON)
+        if mixed_polygonal and (polygon is None or polygon.ring_offsets is None):
+            return None
+
+        multipolygon_part_capacity = max(int(multipolygon.part_offsets.size) - 1, 0)
+        polygon_capacity = 0 if polygon is None else int(polygon.empty_mask.size)
+        part_capacity = polygon_capacity + multipolygon_part_capacity
         if part_capacity == 0 or part_capacity > (1 << 31) - 1:
             return None
-        coordinate_capacity = int(buffer.x.size)
+        coordinate_capacity = int(multipolygon.x.size) + (
+            0 if polygon is None else int(polygon.x.size)
+        )
         # One complete pre-submission envelope: persistent component routing;
         # all heavy-tail/carrier temporaries; the prepared eight-bin part-y
         # directory (112 persistent + 64 scan bytes/part); conservative scan
@@ -453,14 +498,20 @@ def _admitted_multipolygon_components(
             ),
             requested_units=part_capacity,
         )
-        d_geometry_offsets = cp.asarray(buffer.geometry_offsets, dtype=cp.int64)
-        d_family_rows = cp.asarray(state.family_row_offsets, dtype=cp.int64)
-        d_identity = cp.all(d_family_rows == cp.arange(row_count, dtype=cp.int64))
+        d_geometry_offsets = cp.asarray(multipolygon.geometry_offsets, dtype=cp.int64)
         d_part_counts = d_geometry_offsets[1:] - d_geometry_offsets[:-1]
         d_max_parts = (
             cp.max(d_part_counts)
-            if row_count
+            if int(d_part_counts.size)
             else cp.asarray(0, dtype=cp.int64)
+        )
+        d_identity = (
+            cp.all(
+                cp.asarray(state.family_row_offsets, dtype=cp.int64)
+                == cp.arange(row_count, dtype=cp.int64)
+            )
+            if homogeneous_multipolygon
+            else cp.asarray(True)
         )
         proof = cp.stack(
             (
@@ -473,39 +524,103 @@ def _admitted_multipolygon_components(
             reason="component-parent heavy-tail admission planning packet",
         )
         max_parts = int(max_parts)
-        if not bool(identity) or max_parts < _COMPONENT_PARENT_MIN_MAX_PARTS:
+        if not bool(identity):
             return None
 
         extra_parts = max(part_capacity - row_count, 0)
         average_extra_part_lanes = (
             int(tree_count) * extra_parts // max(row_count, 1)
         )
-        if (
-            average_extra_part_lanes
-            < _COMPONENT_PARENT_MIN_AVERAGE_EXTRA_PART_LANES
+        if not _component_parent_work_admitted(
+            max_parts_per_parent=max_parts,
+            average_extra_part_lanes=average_extra_part_lanes,
         ):
             return None
-        d_part_rows = cp.arange(part_capacity, dtype=cp.int64)
+        d_part_rows = cp.arange(multipolygon_part_capacity, dtype=cp.int64)
         d_logical_parts = d_geometry_offsets[-1]
         d_active = d_part_rows < d_logical_parts
         d_safe_parts = cp.minimum(
             d_part_rows,
             cp.maximum(d_logical_parts - 1, cp.int64(0)),
         )
-        d_parent_rows = cp.searchsorted(
+        d_multipolygon_family_rows = cp.searchsorted(
             d_geometry_offsets[1:],
             d_safe_parts,
             side="right",
-        ).astype(cp.uint64, copy=False)
-        d_parent_rows = cp.where(d_active, d_parent_rows, cp.uint64(0))
+        ).astype(cp.int32, copy=False)
+
+        if mixed_polygonal:
+            d_tags = cp.asarray(state.tags, dtype=cp.int8)
+            d_family_rows = cp.asarray(state.family_row_offsets, dtype=cp.int32)
+            d_public_rows = cp.arange(row_count, dtype=cp.uint64)
+            d_polygon_parents = cp.empty(polygon_capacity, dtype=cp.uint64)
+            d_multipolygon_parents = cp.empty(
+                int(multipolygon.empty_mask.size),
+                dtype=cp.uint64,
+            )
+            polygon_mask = d_tags == FAMILY_TAGS[GeometryFamily.POLYGON]
+            multipolygon_mask = d_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
+            d_polygon_parents[d_family_rows[polygon_mask]] = d_public_rows[polygon_mask]
+            d_multipolygon_parents[d_family_rows[multipolygon_mask]] = d_public_rows[
+                multipolygon_mask
+            ]
+            d_multipolygon_part_parents = d_multipolygon_parents[
+                d_multipolygon_family_rows
+            ]
+            d_parent_rows = cp.concatenate(
+                (d_polygon_parents, d_multipolygon_part_parents)
+            )
+
+            polygon_ring_count = max(int(polygon.ring_offsets.size) - 1, 0)
+            polygon_coordinate_count = int(polygon.x.size)
+            component_geometry_offsets = cp.concatenate(
+                (
+                    cp.asarray(polygon.geometry_offsets, dtype=cp.int32),
+                    cp.asarray(multipolygon.part_offsets, dtype=cp.int32)[1:]
+                    + cp.int32(polygon_ring_count),
+                )
+            )
+            component_ring_offsets = cp.concatenate(
+                (
+                    cp.asarray(polygon.ring_offsets, dtype=cp.int32),
+                    cp.asarray(multipolygon.ring_offsets, dtype=cp.int32)[1:]
+                    + cp.int32(polygon_coordinate_count),
+                )
+            )
+            component_x = _contiguous_coordinate_view(polygon.x, multipolygon.x)
+            component_y = _contiguous_coordinate_view(polygon.y, multipolygon.y)
+            component_empty = cp.concatenate(
+                (
+                    cp.asarray(polygon.empty_mask, dtype=cp.bool_),
+                    ~d_active,
+                )
+            )
+            component_validity = cp.concatenate(
+                (
+                    cp.ones(polygon_capacity, dtype=cp.bool_),
+                    d_active,
+                )
+            )
+        else:
+            d_parent_rows = cp.where(
+                d_active,
+                d_multipolygon_family_rows.astype(cp.uint64, copy=False),
+                cp.uint64(0),
+            )
+            component_geometry_offsets = multipolygon.part_offsets
+            component_ring_offsets = multipolygon.ring_offsets
+            component_x = multipolygon.x
+            component_y = multipolygon.y
+            component_empty = ~d_active
+            component_validity = d_active
 
         polygon_buffer = DeviceFamilyGeometryBuffer(
             family=GeometryFamily.POLYGON,
-            x=buffer.x,
-            y=buffer.y,
-            geometry_offsets=buffer.part_offsets,
-            empty_mask=~d_active,
-            ring_offsets=buffer.ring_offsets,
+            x=component_x,
+            y=component_y,
+            geometry_offsets=component_geometry_offsets,
+            empty_mask=component_empty,
+            ring_offsets=component_ring_offsets,
             bounds=None,
         )
         parts = build_device_resident_owned(
@@ -516,7 +631,7 @@ def _admitted_multipolygon_components(
                 FAMILY_TAGS[GeometryFamily.POLYGON],
                 dtype=cp.int8,
             ),
-            validity=d_active,
+            validity=component_validity,
             family_row_offsets=cp.arange(part_capacity, dtype=cp.int32),
             execution_mode="gpu",
         )

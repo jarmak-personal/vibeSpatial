@@ -33,20 +33,28 @@ dependency and CuPy's pool as the fallback:
 
 | Tier | Activation | Allocator Stack |
 |------|------------|-----------------|
-| A | `VIBESPATIAL_GPU_OOM_SAFETY=0` | `PoolMemoryResource` → `CudaMemoryResource` |
-| B (default) | RMM installed and OOM safety not disabled | `FailureCallbackResourceAdaptor` → Pool → Cuda |
+| A | `VIBESPATIAL_GPU_OOM_SAFETY=0` | `LimitingResourceAdaptor` → `CudaAsyncMemoryResource` |
+| B (default) | RMM installed and OOM safety not disabled | `FailureCallbackResourceAdaptor` → Limiting → CudaAsync |
 | C (oversubscription) | `VIBESPATIAL_GPU_MANAGED_MEMORY=1` | Bare `ManagedMemoryResource` |
 | Fallback | RMM not installed | CuPy `MemoryPool` |
 
 ### Design choices
 
-- **Tiers A/B use an explicit 1 MiB initial pool** (or the configured ceiling
+- **Tiers A/B use an explicit 1 MiB initial async pool** (or the configured ceiling
   when smaller). Supported RMM releases interpret zero and sub-granularity
   seeds as unspecified and eagerly reserve half of `maximum_pool_size`; the
   explicit seed keeps idle orchestration processes small while retaining
-  on-demand growth. The default maximum preserves the larger of 1 GiB or 10%
-  of device memory for query-local allocations; `VIBESPATIAL_GPU_POOL_LIMIT=0`
-  explicitly opts into an unlimited pool.
+  on-demand growth. A limiting adaptor preserves the larger of 1 GiB or 10%
+  of device memory outside the allocator's live envelope;
+  `VIBESPATIAL_GPU_POOL_LIMIT=0` explicitly opts into an unlimited pool. The
+  same ceiling is the async release threshold, so cached memory above it is
+  returned at a CUDA synchronization boundary.
+- **The CUDA async resource replaces the original coalescing pool.** Repeated
+  SF100 WKB/GeoParquet reads left only about 81 MiB live but stranded about
+  19.9 GiB in non-contiguous pool blocks; a following 1.74 GiB coordinate
+  allocation failed below the live-memory ceiling. CUDA's stream-ordered pool
+  can reuse the freed pages without requiring one contiguous arena block while
+  the limiting adaptor retains the fail-closed capacity contract.
 - **Tier B's OOM callback** calls `gc.collect()` and retries up to 3 times
   per allocation attempt, with a time-based reset (>1 s gap) so independent
   OOM events each get the full retry budget.
@@ -71,8 +79,10 @@ dependency and CuPy's pool as the fallback:
   resilience without overhead (Tier B); ability to process datasets exceeding
   VRAM (Tier C, with documented 2-10× slowdown).
 - **Negative**: New optional dependency (rmm).  `memory_pool_stats()` returns
-  different key sets per backend.  `free_pool_memory()` becomes a no-op for
-  RMM backends (the pool retains its arena for reuse).
+  different key sets per backend. RMM 26.02 does not expose the private
+  `cudaMemPool_t`, so async-pool `reserved_bytes` is the measurable live lower
+  bound while the live ceiling is reported separately as
+  `allocation_limit_bytes`.
 - **Risk**: The SoA coordinate layout is worst-case for managed memory page
   faults.  The face-walk kernel's pointer-chasing through `next_edge_ids`
   can degrade 50-100× under Tier C oversubscription.  This is documented

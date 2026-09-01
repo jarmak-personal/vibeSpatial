@@ -3012,7 +3012,7 @@ def _spatial_index_device_relation_reduction(
         else ()
     )
     if pair_reduction and (
-        not homogeneous_family_pair or len(aligned_tree_families) != 1
+        len(tree_families) != 1 or len(aligned_tree_families) != 1
     ):
         return None, SpatialQueryExecution(
             requested=ExecutionMode.GPU,
@@ -3020,7 +3020,7 @@ def _spatial_index_device_relation_reduction(
             implementation="owned_cpu_spatial_query",
             reason=(
                 "native aligned right pair match count currently requires "
-                "homogeneous geometry families"
+                "homogeneous aligned tree families"
             ),
         )
     family_pairs = tuple(
@@ -3505,6 +3505,11 @@ def _spatial_index_device_relation_reduction(
                         )
                         family_partition_pass_count += 1
                         d_exact = cp.zeros(pair_capacity, dtype=cp.bool_)
+                        d_aligned_exact = (
+                            cp.zeros(pair_capacity, dtype=cp.bool_)
+                            if pair_reduction
+                            else None
+                        )
                         d_relation_scratch = cp.empty(pair_capacity, dtype=cp.uint8)
                         d_de9im_scratch = cp.empty(pair_capacity, dtype=cp.uint16)
                         family_launch_capacities = _family_group_launch_capacities(
@@ -3557,9 +3562,39 @@ def _spatial_index_device_relation_reduction(
                                         "partition refinement declined"
                                     ),
                                 )
+                            if pair_reduction:
+                                d_aligned_exact = _classify_homogeneous_reduction_tile(
+                                    predicate,
+                                    query_owned,
+                                    aligned_tree_owned,
+                                    partition.left_indices,
+                                    partition.right_indices,
+                                    query_family=query_family,
+                                    tree_family=aligned_tree_families[0],
+                                    precision_plan=indexed_point_precision_plan,
+                                    logical_count=d_partition_count_i32,
+                                    pair_capacity=pair_capacity,
+                                    source_offset=partition.source_offset,
+                                    launch_capacity=family_launch_capacity,
+                                    d_exact_out=d_aligned_exact,
+                                    d_relation_scratch=d_relation_scratch,
+                                    d_de9im_scratch=d_de9im_scratch,
+                                )
+                                if d_aligned_exact is None:
+                                    return None, SpatialQueryExecution(
+                                        requested=ExecutionMode.GPU,
+                                        selected=ExecutionMode.CPU,
+                                        implementation="owned_cpu_spatial_query",
+                                        reason=(
+                                            "native aligned right pair match count "
+                                            "exact family partition refinement declined"
+                                        ),
+                                    )
                         d_reduce_left = family_partition.left_indices
                         d_reduce_right = family_partition.right_indices
                         d_keep = d_exact
+                        if pair_reduction:
+                            d_shared_keep = d_exact & d_aligned_exact
                     if reduction == "right_exists":
                         cp.maximum.at(
                             d_reduced,
