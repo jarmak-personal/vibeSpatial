@@ -2193,6 +2193,8 @@ geometries}
             raise ValueError("k must be a positive integer")
         if k > 1 and return_all:
             raise ValueError("k > 1 requires return_all=False")
+        if max_distance is not None and max_distance <= 0:
+            raise ValueError("max_distance must be greater than 0")
         raw_geometry = geometry
 
         # Route through the owned nearest engine when inputs support it.
@@ -2481,6 +2483,20 @@ geometries}
         if not self._supports_owned_query_input(geometry):
             return None, ExecutionMode.CPU
 
+        if k > 1 and exclusive:
+            record_fallback_event(
+                surface="geopandas.sindex.nearest",
+                requested=ExecutionMode.GPU,
+                selected=ExecutionMode.CPU,
+                reason=(
+                    "bounded fixed-k nearest does not yet support geometric "
+                    "exclusion"
+                ),
+                detail=f"k={k}, return_all={return_all}, exclusive={exclusive}",
+                pipeline="native_spatial_index -> bounded_fixed_k_nearest",
+            )
+            return None, ExecutionMode.CPU
+
         def _existing_or_owned(values):
             if values is None:
                 return None
@@ -2506,6 +2522,13 @@ geometries}
         if tree_owned is None or query_owned is None:
             return None, ExecutionMode.CPU
 
+        native_spatial_index = None
+        if k > 1:
+            native_spatial_index = self._native_spatial_index_for_query(
+                source_token=source_token,
+            )
+            native_spatial_index.validate_row_count(tree_owned.row_count)
+
         result, impl = nearest_spatial_index(
             None,
             None,
@@ -2517,6 +2540,7 @@ geometries}
             k=k,
             tree_owned=tree_owned,
             query_owned=query_owned,
+            native_spatial_index=native_spatial_index,
             return_device=True,
         )
         selected_mode = ExecutionMode.GPU if "gpu" in impl else ExecutionMode.CPU

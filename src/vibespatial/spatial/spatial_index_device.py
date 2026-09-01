@@ -457,7 +457,12 @@ def spatial_index_device_query(
     )
 
     if has_morton and n_product >= _MORTON_RANGE_CROSSOVER:
-        result = _morton_range_query(flat_index, query_bounds, effective_bounds)
+        result = _morton_range_query(
+            flat_index,
+            query_bounds,
+            effective_bounds,
+            candidate_output=candidate_output,
+        )
         if result is not None:
             return result, SpatialQueryExecution(
                 requested=ExecutionMode.AUTO,
@@ -474,13 +479,24 @@ def spatial_index_device_query(
     # of the generic count/scan/scatter path that scalarizes total pairs for
     # allocation.
     if tree_count == 1 and query_count > 1:
-        result = _brute_force_single_tree_multi(effective_bounds, flat_index)
-    elif prefers_pair_mask_spatial_index_query(query_count, tree_count):
+        result = _brute_force_single_tree_multi(
+            effective_bounds,
+            flat_index,
+            candidate_output=candidate_output,
+        )
+    elif candidate_output is None and prefers_pair_mask_spatial_index_query(
+        query_count,
+        tree_count,
+    ):
         result = _brute_force_pair_mask_multi(effective_bounds, flat_index)
     elif query_count == 1 and not _is_device_array(effective_bounds):
         result = _brute_force_scalar(effective_bounds[0], flat_index)
     else:
-        result = _brute_force_multi(effective_bounds, flat_index)
+        result = _brute_force_multi(
+            effective_bounds,
+            flat_index,
+            candidate_output=candidate_output,
+        )
 
     if result is None:
         return None, SpatialQueryExecution(
@@ -600,6 +616,8 @@ def _brute_force_scalar(
 def _brute_force_multi(
     query_bounds,
     flat_index,
+    *,
+    candidate_output=None,
 ) -> _DeviceCandidates | None:
     """GPU brute-force for Q>1: count + exclusive_sum + scatter."""
     import cupy as cp
@@ -666,8 +684,25 @@ def _brute_force_multi(
         )
 
         # Pass 1: scatter matching pairs.
-        d_left = cp.empty(total_pairs, dtype=cp.int32)
-        d_right = cp.empty(total_pairs, dtype=cp.int32)
+        if candidate_output is None:
+            d_left = cp.empty(total_pairs, dtype=cp.int32)
+            d_right = cp.empty(total_pairs, dtype=cp.int32)
+        else:
+            d_left, d_right = candidate_output(total_pairs)
+            d_left = cp.asarray(d_left)
+            d_right = cp.asarray(d_right)
+            if (
+                d_left.dtype != cp.int32
+                or d_right.dtype != cp.int32
+                or int(d_left.size) < total_pairs
+                or int(d_right.size) < total_pairs
+            ):
+                raise ValueError(
+                    "device bbox candidate output requires int32 buffers "
+                    "with at least the sealed pair capacity"
+                )
+            d_left = d_left[:total_pairs]
+            d_right = d_right[:total_pairs]
         scatter_kernel = kernels["bbox_overlap_multi_scatter"]
         scatter_params = (
             (
@@ -696,9 +731,6 @@ def _brute_force_multi(
             block=scatter_block,
             params=scatter_params,
         )
-
-        # Sync before freeing input buffers (scatter kernel reads them).
-        runtime.synchronize()
 
         return _DeviceCandidates(
             d_left=d_left,
@@ -780,6 +812,8 @@ def _brute_force_pair_mask_multi(
 def _brute_force_single_tree_multi(
     query_bounds,
     flat_index,
+    *,
+    candidate_output=None,
 ) -> _DeviceCandidates | None:
     """GPU brute-force for M=1 using bounded mask compaction.
 
@@ -828,12 +862,30 @@ def _brute_force_single_tree_multi(
         compacted = compact_indices(d_counts)
         if compacted.values.size == 0:
             return _empty_device_candidates()
-        d_left = cp.asarray(compacted.values, dtype=cp.int32)
-        d_right = cp.zeros(d_left.size, dtype=cp.int32)
+        total_pairs = int(compacted.values.size)
+        if candidate_output is None:
+            d_left = cp.asarray(compacted.values, dtype=cp.int32)
+            d_right = cp.zeros(total_pairs, dtype=cp.int32)
+        else:
+            d_left, d_right = candidate_output(total_pairs)
+            if (
+                d_left.dtype != cp.int32
+                or d_right.dtype != cp.int32
+                or int(d_left.size) < total_pairs
+                or int(d_right.size) < total_pairs
+            ):
+                raise ValueError(
+                    "device bbox candidate output requires int32 buffers "
+                    "with at least the sealed pair capacity"
+                )
+            d_left = d_left[:total_pairs]
+            d_right = d_right[:total_pairs]
+            d_left[...] = compacted.values
+            d_right.fill(0)
         return _DeviceCandidates(
             d_left=d_left,
             d_right=d_right,
-            total_pairs=int(d_left.size),
+            total_pairs=total_pairs,
         )
     finally:
         runtime.free(temp_query_bounds)
@@ -1590,6 +1642,8 @@ def _morton_range_query(
     flat_index,
     original_bounds,
     effective_bounds,
+    *,
+    candidate_output=None,
 ) -> _DeviceCandidates | None:
     """Morton range query — O(N*log(M)+K).
 
@@ -1679,8 +1733,26 @@ def _morton_range_query(
         )
 
         # Step 5: Scatter matching pairs.
-        d_left = cp.empty(total_pairs, dtype=cp.int32)
-        d_right = cp.empty(total_pairs, dtype=cp.int32)
+        workspace_owned_output = candidate_output is not None
+        if workspace_owned_output:
+            d_left, d_right = candidate_output(total_pairs)
+            d_left = cp.asarray(d_left)
+            d_right = cp.asarray(d_right)
+            if (
+                d_left.dtype != cp.int32
+                or d_right.dtype != cp.int32
+                or int(d_left.size) < total_pairs
+                or int(d_right.size) < total_pairs
+            ):
+                raise ValueError(
+                    "device Morton candidate output requires int32 buffers "
+                    "with at least the sealed pair capacity"
+                )
+            d_left = d_left[:total_pairs]
+            d_right = d_right[:total_pairs]
+        else:
+            d_left = cp.empty(total_pairs, dtype=cp.int32)
+            d_right = cp.empty(total_pairs, dtype=cp.int32)
         scatter_kernel = kernels["morton_range_scatter"]
         scatter_params = (
             (
@@ -1713,9 +1785,6 @@ def _morton_range_query(
             block=scatter_block,
             params=scatter_params,
         )
-
-        # Sync before freeing input buffers.
-        runtime.synchronize()
 
         result = _DeviceCandidates(
             d_left=d_left,

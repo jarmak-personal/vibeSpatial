@@ -1898,6 +1898,39 @@ def test_device_query_accepts_device_bounds_without_d2h(strict_device_guard):
     assert gpu_right.tolist() == [0, 1]
 
 
+@requires_gpu
+def test_single_target_query_writes_into_supplied_candidate_workspace():
+    """The bounded M=1 fast path must not allocate relation output per call."""
+    cp = pytest.importorskip("cupy")
+    _tree_owned, flat_index = build_owned_spatial_index(
+        np.asarray([box(0.0, 0.0, 1.0, 1.0)], dtype=object)
+    )
+    query_owned = from_shapely_geometries(
+        [Point(0.25, 0.25), Point(0.75, 0.75)],
+        residency=Residency.DEVICE,
+    )
+    query_bounds = compute_geometry_bounds_device(query_owned)
+    output_left = cp.empty(2, dtype=cp.int32)
+    output_right = cp.empty(2, dtype=cp.int32)
+
+    candidates, execution = spatial_index_device_query(
+        flat_index,
+        query_bounds,
+        candidate_output=lambda capacity: (
+            output_left[:capacity],
+            output_right[:capacity],
+        ),
+    )
+
+    assert execution.selected is ExecutionMode.GPU
+    assert candidates is not None
+    assert candidates.d_left.data.ptr == output_left.data.ptr
+    assert candidates.d_right.data.ptr == output_right.data.ptr
+    left, right = candidates.to_host()
+    assert left.tolist() == [0, 1]
+    assert right.tolist() == [0, 0]
+
+
 # ---------------------------------------------------------------------------
 # Tests: Morton range strategy selection
 # ---------------------------------------------------------------------------
@@ -1906,6 +1939,7 @@ def test_device_query_accepts_device_bounds_without_d2h(strict_device_guard):
 @requires_gpu
 def test_device_query_uses_morton_range_for_large_input():
     """For large N*M, Morton range strategy is selected (detectable via execution reason)."""
+    cp = pytest.importorskip("cupy")
     # Create enough geometries to exceed the Morton range crossover (1M).
     # 1000 x 1000 = 1M.
     tree_geoms = _make_random_boxes(1000, seed=10, extent=200.0, size=2.0)
@@ -1916,9 +1950,26 @@ def test_device_query_uses_morton_range_for_large_input():
     query_bounds = compute_geometry_bounds(query_owned)
     tree_bounds = flat_index.bounds
 
-    cands, execution = spatial_index_device_query(flat_index, query_bounds)
+    candidate_buffers = []
+
+    def candidate_output(capacity):
+        buffers = (
+            cp.empty(capacity, dtype=cp.int32),
+            cp.empty(capacity, dtype=cp.int32),
+        )
+        candidate_buffers.append(buffers)
+        return buffers
+
+    cands, execution = spatial_index_device_query(
+        flat_index,
+        query_bounds,
+        candidate_output=candidate_output,
+    )
     assert execution.selected is ExecutionMode.GPU
     assert cands is not None
+    assert len(candidate_buffers) == 1
+    assert cands.d_left.data.ptr == candidate_buffers[0][0].data.ptr
+    assert cands.d_right.data.ptr == candidate_buffers[0][1].data.ptr
 
     # Verify correctness against CPU reference.
     gpu_left, gpu_right = cands.to_host()

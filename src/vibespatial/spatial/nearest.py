@@ -242,6 +242,8 @@ def _plan_device_resident_metric_precision(
     query_owned: OwnedGeometryArray,
     tree_owned: OwnedGeometryArray,
     pair_count: int,
+    *,
+    adaptive_plan=None,
 ) -> _NearestMetricPrecisionContext:
     """Resolve metric compute precision without crossing the device boundary.
 
@@ -251,19 +253,20 @@ def _plan_device_resident_metric_precision(
     needed to execute the selected plan safely; the decision envelope below is
     itself a device scalar.
     """
-    adaptive_plan = plan_dispatch_selection(
-        kernel_name="device_resident_point_family_distance",
-        kernel_class=KernelClass.METRIC,
-        row_count=query_owned.row_count,
-        requested_mode=ExecutionMode.GPU,
-        current_residency=combined_residency(query_owned, tree_owned),
-        gpu_available=True,
-        work_estimate=PhysicalWorkEstimate.for_candidate_pairs(
+    if adaptive_plan is None:
+        adaptive_plan = plan_dispatch_selection(
+            kernel_name="device_resident_point_family_distance",
+            kernel_class=KernelClass.METRIC,
             row_count=query_owned.row_count,
-            candidate_pair_count=pair_count,
-            primary_unit_name="device-distance-candidate-pair",
-        ),
-    )
+            requested_mode=ExecutionMode.GPU,
+            current_residency=combined_residency(query_owned, tree_owned),
+            gpu_available=True,
+            work_estimate=PhysicalWorkEstimate.for_candidate_pairs(
+                row_count=query_owned.row_count,
+                candidate_pair_count=pair_count,
+                primary_unit_name="device-distance-candidate-pair",
+            ),
+        )
     coarse_plan = adaptive_plan.precision_plan
     if coarse_plan.compute_precision is not PrecisionMode.FP32:
         return _NearestMetricPrecisionContext(
@@ -3577,6 +3580,7 @@ def nearest_spatial_index(
     k: int = 1,
     tree_owned: OwnedGeometryArray | None = None,
     query_owned: OwnedGeometryArray | None = None,
+    native_spatial_index: Any | None = None,
     return_device: bool = False,
 ) -> tuple[Any, str]:
     """Find nearest tree geometry for each query geometry.
@@ -3658,6 +3662,7 @@ def nearest_spatial_index(
             tree_owned,
             query_bounds_device,
             tree_bounds_device,
+            native_spatial_index=native_spatial_index,
             k=k,
             max_distance=max_distance,
             exclusive=exclusive,
@@ -3686,6 +3691,7 @@ def nearest_spatial_index(
             tree_owned,
             query_bounds,
             tree_bounds,
+            native_spatial_index=native_spatial_index,
             k=k,
             max_distance=max_distance,
             exclusive=exclusive,

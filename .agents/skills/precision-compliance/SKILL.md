@@ -260,7 +260,7 @@ Edit the "Current Compliance Status" section below:
 The compliance ledger file is at:
 `.agents/skills/precision-compliance/SKILL.md` (this file — the section below).
 
-## Current Compliance Status (as of 2026-08-20, updated during session)
+## Current Compliance Status (as of 2026-08-31, updated during session)
 
 ### Fully compliant (plan computed AND kernel respects it)
 
@@ -269,6 +269,7 @@ The compliance ledger file is at:
 - `src/vibespatial/kernels/predicates/point_in_polygon.py` (PREDICATE) — all 9 kernel entry points templated on compute_t with centering. Device helpers (point_on_segment, ring_contains_even_odd, polygon/multipolygon_contains_point) use centered fp32 arithmetic. Boundary tolerance widened from 1e-12 to 1e-7 for fp32 noise floor. Dispatch selects compute_type from cached device snapshot. All launcher functions accept compute_type/center params.
 
 - `src/vibespatial/constructive/make_valid_pipeline.py` (PREDICATE) — check_ring_validity kernel templated on compute_t with precision-dependent closure tolerance (1e-24 fp64, 1e-10 fp32). reduce_ring_to_polygon_validity is integer-only. PrecisionPlan wired through dispatch. Both fp32 and fp64 variants precompiled via NVRTC warmup.
+- `src/vibespatial/spatial/spatial_index_knn_device.py` (COARSE + METRIC candidate-refine) — candidate-producing bounds remain fp64, the dispatch-owned METRIC plan is reused by distance kernels, staged fp32 ranking, `max_distance` threshold ambiguity, and non-finite coarse outputs are recomputed before exact filtering through the existing fp64 refinement context, and final ordering is deterministic by `(distance, target_row)`.
 
 ### Plan wired at dispatch layer; kernel uses fp64 by design (CONSTRUCTIVE per ADR-0002)
 

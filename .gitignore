@@ -71,3 +71,5 @@ cuda-learnings/
 # Audit reports
 reports/*
 !reports/SF1000-optimization.md
+!reports/issue-11-tracker.md
+!reports/issue-11-profile-evidence.md
