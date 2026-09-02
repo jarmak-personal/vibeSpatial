@@ -10,10 +10,12 @@ from shapely.geometry.base import BaseGeometry
 from vibespatial.api import geometry_array as array
 from vibespatial.api import geoseries
 from vibespatial.geometry.api_registry import register_device_spatial_index_factory
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode, get_requested_mode
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
+from vibespatial.runtime.hotpath_trace import attach_work_amplification, hotpath_stage
 from vibespatial.runtime.materialization import (
     NativeExportBoundary,
     record_native_export_boundary,
@@ -1363,7 +1365,10 @@ class SpatialIndex:
         query_row_count: int,
         output_index,
     ):
-        if not self._supports_owned_query_input(geometry):
+        if (
+            get_requested_mode() is ExecutionMode.CPU
+            or not self._supports_owned_query_input(geometry)
+        ):
             return None, None
 
         from vibespatial.api._native_expression import NativeExpression
@@ -1400,7 +1405,11 @@ class SpatialIndex:
 
         query_state = _native_state_for_owner(geometry)
         query_token = None if query_state is None else query_state.lineage_token
-        query_input = self._owned_query_input(geometry)
+        query_input = self._owned_query_input(geometry, compact=False)
+        query_input = self._query_aggregate_owned_input(
+            query_input,
+            predicate=predicate,
+        )
         relation = None
         count_expression = None
         count_reduction_is_direct = False
@@ -1442,32 +1451,63 @@ class SpatialIndex:
             if execution.selected is not ExecutionMode.GPU:
                 return None, relation
 
-        reductions = {}
-        for name, (_values, reducer) in aggregations.items():
-            if reducer == "size":
-                expression = (
-                    count_expression
-                    if count_expression is not None
-                    else relation.left_match_count_expression(
-                        source_row_count=query_row_count,
+        with hotpath_stage(
+            "spatial.query_aggregate.grouped_reduction",
+            category="refine",
+        ) as reduction_metadata:
+            reductions = {}
+            for name, (_values, reducer) in aggregations.items():
+                if reducer == "size":
+                    expression = (
+                        count_expression
+                        if count_expression is not None
+                        else relation.left_match_count_expression(
+                            source_row_count=query_row_count,
+                        )
                     )
-                )
-                reductions[name] = NativeGroupedReduction(
-                    values=expression.values,
-                    reducer="count",
-                    group_count=query_row_count,
-                )
-            else:
-                reductions[name] = relation.left_reduce_right_numeric(
-                    expressions[name].values,
-                    reducer,
-                    left_row_count=query_row_count,
-                )
+                    reductions[name] = NativeGroupedReduction(
+                        values=expression.values,
+                        reducer="count",
+                        group_count=query_row_count,
+                    )
+                else:
+                    reductions[name] = relation.left_reduce_right_numeric(
+                        expressions[name].values,
+                        reducer,
+                        left_row_count=query_row_count,
+                    )
 
-        reduced = NativeGroupedAttributeReduction(
-            columns=reductions,
-            group_count=query_row_count,
-        )
+            reduced = NativeGroupedAttributeReduction(
+                columns=reductions,
+                group_count=query_row_count,
+            )
+            if reduction_metadata is not None:
+                relation_capacity = 0
+                if relation is not None:
+                    capacity = getattr(relation, "capacity", None)
+                    relation_capacity = int(
+                        len(relation) if capacity is None else capacity
+                    )
+                attach_work_amplification(
+                    reduction_metadata,
+                    operation="spatial_query_aggregate_grouped_reduction",
+                    metric_family="grouped-reduction",
+                    sums={
+                        "relation_capacity_lanes": relation_capacity,
+                        "reduction_columns": len(reductions),
+                        "output_groups": int(query_row_count),
+                    },
+                    maxima={
+                        "relation_capacity_lanes": relation_capacity,
+                        "output_groups": int(query_row_count),
+                    },
+                    physical_shape="native_relation_grouped_numeric_reduction",
+                    consumer_kind="query_aggregate_grouped_reduction",
+                    semantic_contract={
+                        "device_logical_counts_read": False,
+                        "terminal_export_deferred": True,
+                    },
+                )
         result_columns = {}
         for name, reduction in reduced.columns.items():
             values = reduction.values
@@ -2031,17 +2071,176 @@ class SpatialIndex:
             return geometry.supports_owned_spatial_input()
         return supports_owned_spatial_input(geometry)
 
+    def _query_aggregate_owned_input(self, owned, *, predicate):
+        """Choose the reusable point/region aggregate query carrier.
+
+        Physical shape: a selected variable-width region view consumed by a
+        candidate/refine relation and grouped numeric reductions.  When the
+        ancestral carrier can admit a reusable prepared point-location index,
+        retaining the row map avoids rebuilding exact state for every selected
+        derivative.  When preparation is not admitted, exact compaction remains
+        the bounded-memory carrier.
+        """
+        if not isinstance(owned, OwnedGeometryArray):
+            return owned
+        if not (
+            owned.residency is Residency.DEVICE
+            and owned.is_indexed_view
+            and owned._device_take_prefers_row_indirection()
+        ):
+            return owned
+
+        tree_owned, _flat_index = self._owned_flat_sindex()
+        query_state = owned._ensure_device_state(preserve_indexed_view=True)
+        tree_state = tree_owned._ensure_device_state(preserve_indexed_view=True)
+        query_families = set(
+            query_state.trusted_family_domain or tuple(query_state.families)
+        )
+        tree_families = set(
+            tree_state.trusted_family_domain or tuple(tree_state.families)
+        )
+        region_families = query_families & {
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTIPOLYGON,
+        }
+        point_tree = tree_families == {GeometryFamily.POINT}
+        polygon_query = bool(region_families) and query_families <= {
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTIPOLYGON,
+        }
+        shape_key = (
+            "query_aggregate",
+            predicate,
+            tuple(sorted(family.value for family in query_families)),
+            GeometryFamily.POINT.value if point_tree else "other",
+        )
+        use_count = query_state.spatial_aggregate_query_uses.get(shape_key, 0) + 1
+        query_state.spatial_aggregate_query_uses[shape_key] = use_count
+        coordinate_capacity = sum(
+            int(query_state.families[family].x.size)
+            for family in region_families
+            if family in query_state.families
+        )
+        candidate_work_upper_bound = int(owned.row_count) * int(tree_owned.row_count)
+        repeated_work_admitted = (
+            use_count > 1
+            and candidate_work_upper_bound >= coordinate_capacity
+        )
+        carrier = "compact_selected"
+        reason = "prepared ancestral-view execution is not applicable"
+
+        with hotpath_stage(
+            "spatial.query_aggregate.query_input",
+            category="setup",
+        ) as stage_metadata:
+            if (
+                predicate == "contains"
+                and polygon_query
+                and point_tree
+                and repeated_work_admitted
+            ):
+                from vibespatial.predicates.point_location_index import (
+                    cached_polygon_part_y_index,
+                    prepare_point_region_y_indexes,
+                )
+
+                prepare_point_region_y_indexes(owned, tree_owned)
+                prepared = {
+                    family: cached_polygon_part_y_index(query_state, family)
+                    for family in region_families
+                }
+                if all(value is not None for value in prepared.values()):
+                    carrier = "ancestral_indexed_view"
+                    reason = (
+                        "reusable prepared point-location state was admitted "
+                        "for every selected region family"
+                    )
+                    selected = owned
+                else:
+                    reason = (
+                        "prepared point-location state was not admitted for "
+                        "every selected region family"
+                    )
+                    selected = compact_indexed_spatial_input(owned)
+            else:
+                if predicate != "contains":
+                    reason = "predicate does not use the prepared contains shape"
+                elif not polygon_query or not point_tree:
+                    reason = "inputs are not a polygonal-query over a homogeneous point tree"
+                elif use_count <= 1:
+                    reason = "selected query owner has no repeated-consumer evidence yet"
+                else:
+                    reason = (
+                        "estimated candidate work does not amortize ancestral "
+                        "coordinate preparation"
+                    )
+                selected = compact_indexed_spatial_input(owned)
+
+            if stage_metadata is not None:
+                base_rows = (
+                    owned._base.row_count
+                    if owned.is_indexed_view and owned._base is not None
+                    else owned.row_count
+                )
+                attach_work_amplification(
+                    stage_metadata,
+                    operation="select_spatial_aggregate_query_carrier",
+                    metric_family="selection",
+                    sums={
+                        "selected_geometry_rows": int(owned.row_count),
+                        "ancestral_geometry_rows": int(base_rows),
+                        "query_owner_uses": int(use_count),
+                    },
+                    maxima={
+                        "selected_geometry_rows": int(owned.row_count),
+                        "ancestral_geometry_rows": int(base_rows),
+                        "ancestral_coordinate_capacity": int(coordinate_capacity),
+                        "candidate_work_upper_bound": int(candidate_work_upper_bound),
+                    },
+                    unavailable=(
+                        "selected_geometry_parts",
+                        "selected_geometry_edges",
+                        "selected_geometry_bytes",
+                        "transient_peak_bytes",
+                    ),
+                    physical_shape="prepared_selected_region_view",
+                    consumer_kind="query_aggregate_grouped_reduction",
+                    semantic_contract={
+                        "carrier": carrier,
+                        "selection_reason": reason,
+                        "device_logical_counts_read": False,
+                        "benchmark_identity_used": False,
+                        "repeated_work_admitted": bool(repeated_work_admitted),
+                    },
+                )
+
+        record_dispatch_event(
+            surface="vibespatial.api.SpatialIndex.query_aggregate",
+            operation="select_query_input_carrier",
+            implementation=carrier,
+            reason=reason,
+            detail=(
+                f"selected_rows={owned.row_count}, "
+                f"result_is_indexed_view={selected.is_indexed_view}"
+            ),
+            requested=get_requested_mode(),
+            selected=ExecutionMode.GPU,
+        )
+        return selected
+
     @staticmethod
-    def _owned_query_input(geometry):
+    def _owned_query_input(geometry, *, compact: bool = True):
         # Already-owned — pass through without any H->D conversion.
         if isinstance(geometry, OwnedGeometryArray):
-            return compact_indexed_spatial_input(geometry)
+            return compact_indexed_spatial_input(geometry) if compact else geometry
         if isinstance(geometry, geoseries.GeoSeries):
             values = geometry.values
             owned = values.to_owned() if hasattr(values, "to_owned") else (
                 values._owned if values._owned is not None else values._data
             )
             if isinstance(owned, OwnedGeometryArray):
+                if not compact:
+                    return owned
                 compacted = compact_indexed_spatial_input(owned)
                 if compacted is not owned and hasattr(values, "_owned"):
                     values._owned = compacted
@@ -2053,6 +2252,8 @@ class SpatialIndex:
             return owned
         if isinstance(geometry, array.GeometryArray):
             owned = geometry.to_owned()
+            if not compact:
+                return owned
             compacted = compact_indexed_spatial_input(owned)
             if compacted is not owned:
                 geometry._owned = compacted

@@ -663,6 +663,9 @@ class OwnedGeometryDeviceState:
     point_location_index_decisions: dict[GeometryFamily, Any] = field(
         default_factory=dict
     )
+    spatial_aggregate_query_uses: dict[tuple[Any, ...], int] = field(
+        default_factory=dict
+    )
     polygon_certificates: dict[tuple[str, GeometryFamily, int], Any] = field(
         default_factory=dict
     )

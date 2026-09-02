@@ -14839,6 +14839,19 @@
     },
     {
       "kind": "repo",
+      "path": "reports/SF1000-progress-and-regressions.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "md",
+        "progress",
+        "regressions",
+        "reports",
+        "sf1000"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": "reports/WKB-geoparquet.md",
       "referenced_by": [],
       "symbols": [],
@@ -51835,6 +51848,8 @@
         "test_point_region_hotpath_sync_is_full_timing_only",
         "test_point_region_profile_samples_across_the_full_logical_launch",
         "test_point_region_profile_observes_public_pair_aggregate_boundedly",
+        "test_public_query_aggregate_reuses_selected_region_preparation",
+        "test_public_query_aggregate_compacts_when_preparation_is_not_admitted",
         "test_public_pair_aggregate_retains_prepared_point_grid",
         "test_public_pair_aggregate_propagates_guarded_scatter_fault",
         "test_point_partition_mixed_nonfinite_rows_use_morton_oracle",
@@ -51844,6 +51859,7 @@
       "tokens": [
         "absent",
         "across",
+        "admitted",
         "aggregate",
         "array",
         "bin",
@@ -51855,6 +51871,7 @@
         "capacity",
         "carrier",
         "classes",
+        "compacts",
         "compiled",
         "conservative",
         "coverage",
@@ -51889,6 +51906,7 @@
         "no",
         "nominal",
         "nonfinite",
+        "not",
         "observes",
         "only",
         "oracle",
@@ -51909,12 +51927,15 @@
         "propagates",
         "public",
         "py",
+        "query",
         "reduction",
         "region",
         "retains",
+        "reuses",
         "rows",
         "samples",
         "scatter",
+        "selected",
         "shapely",
         "sized",
         "source",
@@ -51930,6 +51951,7 @@
         "uses",
         "variants",
         "vram",
+        "when",
         "width"
       ]
     },

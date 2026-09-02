@@ -570,6 +570,252 @@ def test_point_region_profile_observes_public_pair_aggregate_boundedly(
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_public_query_aggregate_reuses_selected_region_preparation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from vibespatial.api.geometry_array import GeometryArray
+    from vibespatial.predicates import point_location_index
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+    from vibespatial.runtime.hotpath_trace import get_hotpath_trace, reset_hotpath_trace
+
+    point_count = 4_096
+    x = np.linspace(-2.0, 12.0, point_count, dtype=np.float64)
+    y = np.mod(np.arange(point_count, dtype=np.float64), 97.0) / 10.0
+    source = GeoDataFrame(
+        {
+            "weight_a": np.linspace(0.25, 2.25, point_count, dtype=np.float64),
+            "weight_b": np.linspace(3.5, 9.5, point_count, dtype=np.float64),
+        },
+        geometry=points_from_xy(x, y),
+    )
+    path = tmp_path / "selected-region-aggregate.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    source = read_parquet(path)
+
+    regions = [
+        MultiPolygon([box(-1.0, -1.0, 3.0, 5.0), box(4.0, 4.0, 5.0, 6.0)]),
+        MultiPolygon([box(20.0, 20.0, 21.0, 21.0)]),
+        MultiPolygon([box(6.0, 2.0, 11.0, 8.0), box(0.0, 8.0, 2.0, 9.0)]),
+    ]
+    region_owned = from_shapely_geometries(regions, residency=Residency.DEVICE)
+    selected_array = GeometryArray.from_owned(region_owned)[np.asarray([2, 0])]
+    selected = GeoSeries(selected_array, index=["east", "west"])
+    assert selected.values._owned.is_indexed_view
+
+    expected = []
+    for region in (regions[2], regions[0]):
+        mask = np.asarray([region.contains(point) for point in source.geometry.to_numpy()])
+        expected.append(
+            (
+                int(mask.sum()),
+                float(source["weight_a"].to_numpy()[mask].sum()),
+                float(source["weight_b"].to_numpy()[mask].sum()),
+            )
+        )
+
+    clear_fallback_events()
+    clear_dispatch_events()
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
+    reset_hotpath_trace()
+    first = source.sindex.query_aggregate(
+        selected,
+        {
+            "match_count": "size",
+            "weight_a_sum": (source["weight_a"], "sum"),
+            "weight_b_sum": (source["weight_b"], "sum"),
+        },
+        predicate="contains",
+    )
+    # Keep the canary bounded while exercising the production preparation and
+    # reuse path. The SF100 Q6 gate below the unit suite exercises the ordinary
+    # production coordinate threshold.
+    monkeypatch.setattr(point_location_index, "_MIN_PREPARED_COORDINATES", 0)
+    with profile_point_region(
+        label="selected-region-query-aggregate",
+        sample_limit=16,
+        force_prepared_index=True,
+    ) as profile:
+        second = source.sindex.query_aggregate(
+            selected,
+            {
+                "match_count": "size",
+                "weight_a_sum": (source["weight_a"], "sum"),
+                "weight_b_sum": (source["weight_b"], "sum"),
+            },
+            predicate="contains",
+        )
+        third = source.sindex.query_aggregate(
+            selected,
+            {
+                "match_count": "size",
+                "weight_a_sum": (source["weight_a"], "sum"),
+                "weight_b_sum": (source["weight_b"], "sum"),
+            },
+            predicate="contains",
+        )
+        snapshot = profile.snapshot()
+
+    expected_counts = [item[0] for item in expected]
+    expected_a = [item[1] for item in expected]
+    expected_b = [item[2] for item in expected]
+    assert first["match_count"].to_numpy().tolist() == expected_counts
+    np.testing.assert_allclose(first["weight_a_sum"].to_numpy(), expected_a)
+    np.testing.assert_allclose(first["weight_b_sum"].to_numpy(), expected_b)
+    assert second["match_count"].to_numpy().tolist() == expected_counts
+    np.testing.assert_allclose(second["weight_a_sum"].to_numpy(), expected_a)
+    np.testing.assert_allclose(second["weight_b_sum"].to_numpy(), expected_b)
+    assert third["match_count"].to_numpy().tolist() == expected_counts
+    np.testing.assert_allclose(third["weight_a_sum"].to_numpy(), expected_a)
+    np.testing.assert_allclose(third["weight_b_sum"].to_numpy(), expected_b)
+    assert selected.values._owned.is_indexed_view
+    assert get_fallback_events(clear=True) == []
+    preparation = snapshot["index_preparation"]
+    assert len(preparation) == 1
+    assert preparation[0]["build_count"] == 1
+    assert preparation[0]["cache_hits"] >= 3
+    assert snapshot["groups"][0]["launches"] >= 2
+    assert snapshot["groups"][0]["counters"]["candidates"] > 0
+    trace = get_hotpath_trace()
+    carrier_stages = [
+        stage
+        for stage in trace
+        if stage.name == "spatial.query_aggregate.query_input"
+    ]
+    reduction_stages = [
+        stage
+        for stage in trace
+        if stage.name == "spatial.query_aggregate.grouped_reduction"
+    ]
+    assert len(carrier_stages) == 3
+    assert len(reduction_stages) == 3
+    carrier_packet = carrier_stages[-1].metadata["work_amplification"]
+    assert carrier_packet["physical_shape"] == "prepared_selected_region_view"
+    assert carrier_packet["semantic_contract"]["carrier"] == (
+        "ancestral_indexed_view"
+    )
+    assert carrier_packet["max"]["candidate_work_upper_bound"] == (
+        point_count * len(selected)
+    )
+    reduction_packet = reduction_stages[-1].metadata["work_amplification"]
+    assert reduction_packet["physical_shape"] == (
+        "native_relation_grouped_numeric_reduction"
+    )
+    assert reduction_packet["sum"]["reduction_columns"] == 3
+    carrier_events = [
+        event
+        for event in get_dispatch_events(clear=True)
+        if event.operation == "select_query_input_carrier"
+    ]
+    assert len(carrier_events) == 3
+    assert [event.implementation for event in carrier_events] == [
+        "compact_selected",
+        "ancestral_indexed_view",
+        "ancestral_indexed_view",
+    ]
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_public_query_aggregate_compacts_when_preparation_is_not_admitted(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from vibespatial.api.geometry_array import GeometryArray
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    source = GeoDataFrame(
+        {"weight": np.linspace(1.0, 2.0, 2_048, dtype=np.float64)},
+        geometry=points_from_xy(
+            np.linspace(-2.0, 12.0, 2_048, dtype=np.float64),
+            np.mod(np.arange(2_048, dtype=np.float64), 83.0) / 10.0,
+        ),
+    )
+    path = tmp_path / "constrained-selected-region-aggregate.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow", index=False)
+    source = read_parquet(path)
+    spatial_index = source.sindex
+
+    regions = [
+        MultiPolygon([box(-1.0, -1.0, 3.0, 5.0), box(4.0, 4.0, 5.0, 6.0)]),
+        MultiPolygon([box(20.0, 20.0, 21.0, 21.0)]),
+        MultiPolygon([box(6.0, 2.0, 11.0, 8.0)]),
+    ]
+    region_owned = from_shapely_geometries(regions, residency=Residency.DEVICE)
+    selected_array = GeometryArray.from_owned(region_owned)[np.asarray([2, 0])]
+    selected = GeoSeries(selected_array)
+    host_points = source.geometry.to_numpy()
+    host_weights = source["weight"].to_numpy()
+    expected_counts = []
+    expected_sums = []
+    for region in (regions[2], regions[0]):
+        mask = np.asarray([region.contains(point) for point in host_points])
+        expected_counts.append(int(mask.sum()))
+        expected_sums.append(float(host_weights[mask].sum()))
+    runtime = get_cuda_runtime()
+    original_admit = runtime.admit_device_memory
+
+    # The first consumer establishes reuse evidence while retaining the
+    # bounded compact carrier. The second consumer below exercises a rejected
+    # ancestral preparation under an explicitly constrained envelope.
+    first = spatial_index.query_aggregate(
+        selected,
+        {
+            "match_count": "size",
+            "weight_sum": (source["weight"], "sum"),
+        },
+        predicate="contains",
+    )
+    assert first["match_count"].to_numpy().tolist() == expected_counts
+    np.testing.assert_allclose(first["weight_sum"].to_numpy(), expected_sums)
+
+    def _constrained_admit(*, stage, required_bytes, requested_units=0):
+        if stage.startswith("predicate.point_location_part_y_index"):
+            return DeviceMemoryAdmission(
+                stage=stage,
+                required_bytes=required_bytes,
+                remaining_bytes=0,
+                budget_bytes=0,
+                admitted=False,
+                requested_units=requested_units,
+                admitted_units=0,
+                bytes_per_unit=max(int(required_bytes), 1),
+            )
+        return original_admit(
+            stage=stage,
+            required_bytes=required_bytes,
+            requested_units=requested_units,
+        )
+
+    monkeypatch.setattr(runtime, "admit_device_memory", _constrained_admit)
+    clear_fallback_events()
+    clear_dispatch_events()
+    with profile_point_region(
+        label="constrained-selected-region-query-aggregate",
+        force_prepared_index=True,
+    ):
+        result = spatial_index.query_aggregate(
+            selected,
+            {
+                "match_count": "size",
+                "weight_sum": (source["weight"], "sum"),
+            },
+            predicate="contains",
+        )
+
+    assert result["match_count"].to_numpy().tolist() == expected_counts
+    np.testing.assert_allclose(result["weight_sum"].to_numpy(), expected_sums)
+    assert selected.values._owned.is_indexed_view
+    assert get_fallback_events(clear=True) == []
+    carrier_events = [
+        event
+        for event in get_dispatch_events(clear=True)
+        if event.operation == "select_query_input_carrier"
+    ]
+    assert len(carrier_events) == 1
+    assert carrier_events[0].implementation == "compact_selected"
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
 def test_public_pair_aggregate_retains_prepared_point_grid(
     monkeypatch,
     tmp_path,
