@@ -4765,6 +4765,7 @@ def test_read_geoparquet_datetime_components_compose_as_device_integers(
     source = geopandas.GeoDataFrame(
         {
             "when": pd.to_datetime(["2023-12-31T23:59:58", "2024-02-29T01:02:03"]),
+            "later": pd.to_datetime(["2024-01-01T00:00:58", "2024-02-29T01:04:33"]),
             "geometry": [Point(0, 0), Point(1, 1)],
         },
         crs="EPSG:4326",
@@ -4778,15 +4779,89 @@ def test_read_geoparquet_datetime_components_compose_as_device_integers(
         year = frame.datetime_component("when", "year")
         month = frame.datetime_component("when", "month")
         packed = year * 12 + month
+        elapsed = frame.datetime_difference_seconds("when", "later")
 
     assert type(year.array).__name__ == "NativeNumericExpressionArray"
     assert type(month.array).__name__ == "NativeNumericExpressionArray"
     assert type(packed.array).__name__ == "NativeNumericExpressionArray"
+    assert type(elapsed.array).__name__ == "NativeNumericExpressionArray"
     assert np.issubdtype(packed.array.expression.values.dtype, np.integer)
     cp = pytest.importorskip("cupy")
     assert cp.asnumpy(year.array.expression.values).tolist() == [2023, 2024]
     assert cp.asnumpy(month.array.expression.values).tolist() == [12, 2]
     assert cp.asnumpy(packed.array.expression.values).tolist() == [24288, 24290]
+    assert cp.asnumpy(elapsed.array.expression.values).tolist() == [60.0, 150.0]
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="pylibcudf timestamp expressions unavailable",
+)
+def test_datetime_difference_mixed_units_avoids_epoch_float_cancellation() -> None:
+    import pylibcudf as plc
+
+    from vibespatial.api._native_state import NativeFrameState, attach_native_state
+
+    table = pa.table(
+        {
+            "start": pa.array(
+                [pd.Timestamp("2024-01-01T00:00:00.123456")],
+                type=pa.timestamp("us"),
+            ),
+            "end": pa.array(
+                [pd.Timestamp("2024-01-01T00:00:00.124000")],
+                type=pa.timestamp("ms"),
+            ),
+        }
+    )
+    public = table.to_pandas()
+    owned = from_shapely_geometries([Point(0, 0)], residency=Residency.DEVICE)
+    frame = geopandas.GeoDataFrame(
+        {
+            "start": public["start"].array,
+            "end": public["end"].array,
+            "geometry": geopandas.GeoSeries(DeviceGeometryArray._from_owned(owned)),
+        }
+    )
+    attributes = NativeAttributeTable(
+        device_table=plc.Table.from_arrow(table),
+        index_override=frame.index,
+        column_override=("start", "end"),
+        schema_override=table.schema,
+    )
+    attach_native_state(
+        frame,
+        NativeFrameState.from_native_tabular_result(
+            NativeTabularResult(
+                attributes=attributes,
+                geometry=GeometryNativeResult.from_owned(owned, crs=None),
+                geometry_name="geometry",
+                column_order=("start", "end", "geometry"),
+            )
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    with set_requested_mode(ExecutionMode.GPU):
+        elapsed = frame.datetime_difference_seconds("start", "end")
+    gpu_dispatch = geopandas.get_dispatch_events(clear=True)[-1]
+    expected = (public["end"] - public["start"]).dt.total_seconds().iloc[0]
+
+    assert type(elapsed.array).__name__ == "NativeNumericExpressionArray"
+    assert elapsed.tolist() == [expected]
+    assert gpu_dispatch.requested is ExecutionMode.GPU
+    assert gpu_dispatch.selected is ExecutionMode.GPU
+
+    geopandas.clear_fallback_events()
+    with set_requested_mode(ExecutionMode.CPU):
+        cpu_elapsed = frame.datetime_difference_seconds("start", "end")
+    cpu_fallback = geopandas.get_fallback_events(clear=True)[-1]
+
+    assert type(cpu_elapsed.array).__name__ == "NumpyExtensionArray"
+    assert cpu_elapsed.tolist() == [expected]
+    assert cpu_fallback.requested is ExecutionMode.CPU
+    assert cpu_fallback.selected is ExecutionMode.CPU
+    assert cpu_fallback.reason == "explicit CPU execution requested"
 
 
 @pytest.mark.skipif(

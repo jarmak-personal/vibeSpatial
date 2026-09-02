@@ -38,6 +38,10 @@ class VibeSpatialQueries(GeoParquetPublicApiQueries):
     """Public hybrid plan selected by physical workload shape."""
 
     _Q5_NATIVE_SPILL_GROUP_DOMAIN_THRESHOLD = 1_000_000_000
+    # pandas' nanosecond datetime range fits below this absolute year*12+month
+    # code. Keeping the whole legal domain dense avoids per-batch extrema
+    # exports while bounding each merged reduction vector to 256 KiB.
+    _DATETIME_MONTH_CODE_DOMAIN = 32_768
 
     @classmethod
     def _q5_uses_native_spill(cls, group_domain: int) -> bool:
@@ -116,6 +120,111 @@ class VibeSpatialQueries(GeoParquetPublicApiQueries):
             frame.datetime_component(column, "year") * 12
             + frame.datetime_component(column, "month")
         )
+
+    def q3(self, data_paths):
+        """Reduce filtered trip metrics into device-resident month vectors."""
+        polygon = Polygon(
+            [
+                (-111.9060, 34.7347),
+                (-111.6160, 34.7347),
+                (-111.6160, 35.0047),
+                (-111.9060, 35.0047),
+                (-111.9060, 34.7347),
+            ]
+        )
+        columns = [
+            "t_pickuptime",
+            "t_dropofftime",
+            "t_distance",
+            "t_fare",
+            "t_pickuploc",
+        ]
+        total_trips = None
+        distance_sum = None
+        duration_sum = None
+        fare_sum = None
+        group_count = self._DATETIME_MONTH_CODE_DOMAIN
+
+        for trips in self._spatial_frames(
+            data_paths["trip"],
+            columns,
+            "t_pickuploc",
+        ):
+            selected = trips.loc[trips.geometry.distance(polygon) <= 0.045]
+            month_code = self._month_code(selected, "t_pickuptime")
+            duration = selected.datetime_difference_seconds(
+                "t_pickuptime",
+                "t_dropofftime",
+            )
+            batch = self.gpd.dense_grouped_reduce(
+                month_code,
+                size=group_count,
+                count_name="total_trips",
+                sums={
+                    "_distance_sum": selected["t_distance"].astype(float),
+                    "_duration_sum": duration,
+                    "_fare_sum": selected["t_fare"].astype(float),
+                },
+            )
+            if total_trips is None:
+                total_trips = batch["total_trips"]
+                distance_sum = batch["_distance_sum"]
+                duration_sum = batch["_duration_sum"]
+                fare_sum = batch["_fare_sum"]
+            else:
+                total_trips = total_trips + batch["total_trips"]
+                distance_sum = distance_sum + batch["_distance_sum"]
+                duration_sum = duration_sum + batch["_duration_sum"]
+                fare_sum = fare_sum + batch["_fare_sum"]
+            del (
+                batch,
+                duration,
+                month_code,
+                selected,
+                trips,
+            )
+
+        if total_trips is None:
+            return pd.DataFrame(
+                columns=[
+                    "pickup_month",
+                    "total_trips",
+                    "avg_distance",
+                    "avg_duration",
+                    "avg_fare",
+                ]
+            )
+
+        # This is the single terminal host-export phase. Each transferred vector
+        # is either fixed datetime-domain capacity or observed-month capacity;
+        # no selected source rows cross it.
+        count_values = total_trips.to_numpy(dtype=np.uint64, copy=False)
+        observed = np.flatnonzero(count_values)
+        distance_values = self.gpd.numeric_take(
+            distance_sum,
+            observed,
+        ).to_numpy(dtype=np.float64, copy=False)
+        duration_values = self.gpd.numeric_take(
+            duration_sum,
+            observed,
+        ).to_numpy(dtype=np.float64, copy=False)
+        fare_values = self.gpd.numeric_take(
+            fare_sum,
+            observed,
+        ).to_numpy(dtype=np.float64, copy=False)
+        observed_counts = count_values[observed]
+        years, months = np.divmod(observed - 1, 12)
+        return pd.DataFrame(
+            {
+                "pickup_month": pd.to_datetime(
+                    {"year": years, "month": months + 1, "day": 1}
+                ),
+                "total_trips": observed_counts,
+                "avg_distance": distance_values / observed_counts,
+                "avg_duration": duration_values / observed_counts,
+                "avg_fare": fare_values / observed_counts,
+            }
+        ).reset_index(drop=True)
 
     def q5(self, data_paths):
         """Run Q5 with a bounded, device-native partition-clustered spill.

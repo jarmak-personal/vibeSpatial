@@ -427,7 +427,7 @@ unfinished items from this plan.
 
 ## Local implementation evidence
 
-Commit 1 candidate evidence was collected on 2026-09-02 on the RTX 4090 host.
+Commit 1 evidence was collected on 2026-09-02 on the RTX 4090 host.
 The imported source was base revision `03981d5` plus source-worktree digest
 `e63bfa61ff34b2e2f6917d679dcd9d686069bb2f91acc381466522b481bbb2bc`.
 The streamed query module, shared query module, lockfile, and SF100 GeoParquet
@@ -450,3 +450,65 @@ manifest digests were respectively `b34099f0`, `36e230f0`, `60942838`, and
   at 65.33ms, `small-grouped-constructive-reduce.native_grouped_union` at
   48.93ms, and `join-heavy.write_output` at 16.43ms. No unexpected CPU-heavy
   stage exceeded one second.
+
+Commit 2 evidence was collected on 2026-09-02 on the same RTX 4090 host, with
+Commit 1 (`282f89d`) as the pinned local baseline. The final full-profile
+source-worktree digest was
+`722aecb57029cb51cc8cadb48fb8049e236552e5b849f00d27fec42c58e368ce`.
+
+- The exact multi-key top-k path now prepares the primary key over the active
+  rowset and gathers later keys only for the boundary. An independent 2M-row,
+  three-key shape prepared 2M primary-key rows, gathered 300 selected-key rows,
+  and sorted 100 final rows. The corresponding allocation trace fell from
+  222,148,043 bytes and 99 allocations at `282f89d` to 209,655,882 bytes and
+  77 allocations. Current one-key and three-key volumes were 209,653,023 and
+  209,655,882 bytes, demonstrating that later discriminative keys no longer add
+  full-row allocation. The pandas semantic matrix passed for ascending and
+  descending selection, nulls, NaNs, signed zero, multi-key ties, and
+  `keep=first|last|all`.
+- Q3 now uses public native timestamp expressions and a fixed-domain grouped
+  count/sum reduction whose output remains device-backed across scan batches.
+  Mixed timestamp units retain exact integer subsecond deltas before conversion,
+  and fp64 grouped sums use stable segmented reduction rather than contended
+  atomics. An adversarial 1.2M-row cancellation case returned the exact pandas
+  result on three consecutive runs, and the declared admission bound covered
+  the measured 1M-row, three-sum operation peak. On SF100, the final
+  repeat-three median was 12.23s (12.35s, 12.23s, and 12.23s), with zero
+  fallback. Relative to
+  the `282f89d` same-plan baseline, materialization events fell from 100 to 24
+  and tracked D2H events from 80 to 27. The 24 materialization events comprise
+  20 device-backed public-frame assemblies with no host transfer and four
+  bounded terminal exports. Total D2H was 264,183 bytes: one 256 KiB count
+  vector, three 84-row sum vectors, and scalar domain-validation fences. Total
+  allocation stayed flat at 210.580 GB versus 210.518 GB, with zero selected
+  source-row export, host groupby, or timezone warning.
+- Paired SF100 medians against `282f89d` were Q1 12.49s versus 12.94s, Q3
+  12.23s versus 13.35s, and Q7 4.79s versus 4.78s. Q7's wider seven-run sample
+  was 4.81s, 4.82s, 4.80s, 4.79s, 4.79s, 4.78s, and 4.77s. Every rail is within
+  5%, while Q7 telemetry reduced cumulative allocation from 296.171 GB and
+  6,261 allocations to 292.425 GB and 5,821 allocations. The final hardened
+  Q1 and Q3 outputs separately passed the frozen oracle for all 100 and 84
+  rows, respectively.
+- The complete SF100 result set collected immediately before the reviewer
+  correctness hardening passed the frozen 12/12 oracle comparison. Its Q1,
+  Q3, and Q7 medians were 12.86s, 12.74s, and 4.79s. The remaining
+  strict-native medians were Q2 7.59s, Q4 7.88s, Q5 17.22s, Q6 13.47s, Q8
+  16.91s, Q9 0.14s, Q10 58.50s, Q11 79.46s, and Q12 25.17s. That packet's
+  assembled twelve-query total was 256.73s. All schemas, row order, exact
+  integer/text cells, and configured fp64 tolerances passed. The post-hardening
+  Q1/Q3 reruns above replace those two timings without claiming a second
+  complete twelve-query run.
+- The final full 1M pipeline profile completed with 22 active cases and two
+  expected raster deferrals. All 102 stages were reviewed, with zero fallback
+  and no stage above one second. The largest 1M stages were
+  `predicate-heavy.read_geojson` at 69.29ms,
+  `grouped-disjoint-constructive-reduce.build_device_disjoint_groups` at
+  67.21ms, `grouped-capacity-partitions.mixed_strip_exact_union` at 64.39ms,
+  and `small-grouped-constructive-reduce.native_grouped_union` at 45.74ms.
+- The final changed-surface suite passed 892 tests. The repository-wide run
+  immediately before the final review fixes passed 7,988 tests; its 11
+  failures were reproduced unchanged at `282f89d`: one upstream Arrow test
+  whose obsolete expectation requires a `TypeError`, and ten upstream CRS
+  cases for a projection-grid method not supported by the installed
+  `vibeproj`. The final fixes are covered by the changed-surface suite and do
+  not touch those failures.

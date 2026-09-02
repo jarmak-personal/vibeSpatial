@@ -1111,6 +1111,96 @@ def test_geodataframe_topk_refines_primary_skew_and_exact_ties_device_native(
     reset_d2h_transfer_count()
 
 
+def test_geodataframe_topk_prepares_later_keys_only_for_primary_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device top-k shape telemetry")
+    from vibespatial.runtime.hotpath_trace import (
+        reset_hotpath_trace,
+        summarize_hotpath_trace,
+    )
+
+    row_count = 250_000
+    table = pa.table(
+        {
+            "primary": pa.array(np.arange(row_count, dtype=np.float64)),
+            "secondary": pa.array(np.arange(row_count, dtype=np.float64) % 997),
+            "tertiary": pa.array(np.arange(row_count, dtype=np.int64)),
+            "source_position": pa.array(np.arange(row_count, dtype=np.int64)),
+        }
+    )
+    gdf = _device_topk_frame(table, composed=True)
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "counter")
+    reset_hotpath_trace()
+
+    selected = gdf.nlargest(100, ["primary", "secondary", "tertiary"])
+    stages = summarize_hotpath_trace()
+
+    assert selected["source_position"].tolist() == list(
+        range(row_count - 1, row_count - 101, -1)
+    )
+    prepare = next(
+        stage for stage in stages if stage["name"] == "tabular.topk.active_key_prepare"
+    )
+    assert prepare["calls"] == 1
+    assert prepare["metadata"]["work_amplification"]["sum"][
+        "prepared_key_rows"
+    ] == row_count
+    assert prepare["metadata"]["work_amplification"]["max"][
+        "active_rows"
+    ] == row_count
+    selected_gather = next(
+        stage for stage in stages if stage["name"] == "tabular.topk.selected_key_gather"
+    )
+    assert selected_gather["metadata"]["work_amplification"]["max"][
+        "selected_rows"
+    ] == 100
+    rowset_take = next(
+        stage for stage in stages if stage["name"] == "tabular.topk.rowset_take"
+    )
+    assert rowset_take["metadata"]["work_amplification"]["max"][
+        "output_rows"
+    ] == 100
+
+
+@pytest.mark.parametrize("method", ["nlargest", "nsmallest"])
+@pytest.mark.parametrize("keep", ["first", "last", "all"])
+def test_geodataframe_topk_float_semantic_matrix_matches_pandas(
+    method: str,
+    keep: str,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device top-k semantic matrix")
+    table = pa.table(
+        {
+            "primary": pa.array(
+                [np.nan, -0.0, 0.0, 2.0, 2.0, 1.0, 1.0, None],
+                type=pa.float64(),
+            ),
+            "secondary": pa.array([9, 2, 1, 0, 0, 3, 3, 8], type=pa.int64()),
+            "source_position": pa.array(range(8), type=pa.int64()),
+        }
+    )
+    gdf = _device_topk_frame(table, composed=True)
+    reference = table.to_pandas()
+
+    selected = getattr(gdf, method)(
+        4,
+        ["primary", "secondary"],
+        keep=keep,
+    )
+    expected = getattr(reference, method)(
+        4,
+        ["primary", "secondary"],
+        keep=keep,
+    )
+
+    assert selected["source_position"].tolist() == expected[
+        "source_position"
+    ].tolist()
+
+
 @pytest.mark.parametrize(
     ("columns", "n", "expected_positions"),
     [
@@ -1204,6 +1294,40 @@ def test_geodataframe_topk_nullable_fixed_width_matches_pandas(
     reset_d2h_transfer_count()
 
 
+@pytest.mark.parametrize("method", ["nlargest", "nsmallest"])
+@pytest.mark.parametrize("keep", ["first", "last", "all"])
+def test_geodataframe_topk_preserves_complete_missing_primary_bucket(
+    method: str,
+    keep: str,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for nullable device top-k")
+    table = pa.table(
+        {
+            "primary": pa.array([5.0, 4.0, 3.0, None, None]),
+            "secondary": pa.array([0.0, 0.0, 0.0, 2.0, 1.0]),
+            "source_position": pa.array(range(5), type=pa.int64()),
+        }
+    )
+    frame = _device_topk_frame(table)
+    expected = getattr(table.to_pandas(), method)(
+        4,
+        ["primary", "secondary"],
+        keep=keep,
+    )
+
+    selected = getattr(frame, method)(
+        4,
+        ["primary", "secondary"],
+        keep=keep,
+    )
+
+    assert get_native_state(selected) is not None
+    assert selected["source_position"].tolist() == expected[
+        "source_position"
+    ].tolist()
+
+
 @pytest.mark.parametrize("n", [0, 20])
 def test_geodataframe_topk_empty_and_full_selection_stay_device_native(n: int) -> None:
     if not has_gpu_runtime():
@@ -1288,6 +1412,7 @@ def test_datetime_component_host_fallback_is_observable_and_strict_rejects() -> 
     frame = geopandas.GeoDataFrame(
         {
             "when": pd.to_datetime(["2024-01-02", "2025-03-04"]),
+            "later": pd.to_datetime(["2024-01-02 00:01", "2025-03-04 00:02"]),
             "geometry": [Point(0, 0), Point(1, 1)],
         },
         crs="EPSG:4326",
@@ -1295,11 +1420,17 @@ def test_datetime_component_host_fallback_is_observable_and_strict_rejects() -> 
     geopandas.clear_fallback_events()
 
     result = frame.datetime_component("when", "month")
+    elapsed = frame.datetime_difference_seconds("when", "later")
     events = geopandas.get_fallback_events(clear=True)
 
     assert result.tolist() == [1, 3]
+    assert elapsed.tolist() == [60.0, 120.0]
     assert any(
         event.surface == "geopandas.geodataframe.datetime_component"
+        for event in events
+    )
+    assert any(
+        event.surface == "geopandas.geodataframe.datetime_difference_seconds"
         for event in events
     )
     with strict_native_environment(), pytest.raises(

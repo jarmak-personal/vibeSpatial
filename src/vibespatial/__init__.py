@@ -18,6 +18,8 @@ from vibespatial.api import (
 from vibespatial.api._config import options
 from vibespatial.api._shapely_dispatch import install_shapely_make_valid_dispatch
 from vibespatial.api.tabular import dense_count as dense_count
+from vibespatial.api.tabular import dense_grouped_reduce as dense_grouped_reduce
+from vibespatial.api.tabular import dense_sum as dense_sum
 from vibespatial.api.tabular import numeric_take as numeric_take
 from vibespatial.api.tools import clip, overlay, sjoin, sjoin_nearest
 
@@ -664,6 +666,8 @@ __all__ = [
     "overlay",
     "clip",
     "dense_count",
+    "dense_grouped_reduce",
+    "dense_sum",
     "numeric_take",
     "options",
     "__version__",

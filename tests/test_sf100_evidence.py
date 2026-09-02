@@ -5,8 +5,12 @@ import json
 import shutil
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
+from shapely.geometry import Point
 
+import vibespatial
 from benchmarks.spatialbench import sf100_evidence
 from benchmarks.spatialbench.vibespatial_queries import VibeSpatialQueries
 
@@ -31,6 +35,105 @@ def test_q5_native_spill_crossover_is_shape_based_and_public() -> None:
     source = inspect.getsource(VibeSpatialQueries.q5)
     assert "write_geoparquet" in source
     assert "NativePartitionedParquetSink" not in source
+    assert "pylibcudf" not in source
+
+
+@pytest.mark.gpu
+def test_q3_public_plan_merges_dense_month_reductions_before_terminal_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
+        reset_d2h_transfer_count,
+    )
+
+    batches = [
+        {
+            "t_pickuptime": pd.to_datetime(
+                ["2024-01-02", "2024-01-15", "2024-02-03"]
+            ),
+            "duration_seconds": [60, 120, 180],
+            "t_distance": [1.0, 2.0, 30.0],
+            "t_fare": [10.0, 20.0, 300.0],
+            "t_pickuploc": [
+                Point(-111.75, 34.80),
+                Point(-111.74, 34.81),
+                Point(-100.0, 0.0),
+            ],
+        },
+        {
+            "t_pickuptime": pd.to_datetime(
+                ["2024-02-04", "2024-01-20", "2024-03-05"]
+            ),
+            "duration_seconds": [240, 420, 300],
+            "t_distance": [4.0, 50.0, 5.0],
+            "t_fare": [40.0, 500.0, 50.0],
+            "t_pickuploc": [
+                Point(-111.73, 34.82),
+                Point(-100.0, 0.0),
+                Point(-111.72, 34.83),
+            ],
+        },
+    ]
+    native_batches = []
+    for batch_index, values in enumerate(batches):
+        pickup = values.pop("t_pickuptime")
+        duration = values.pop("duration_seconds")
+        source = vibespatial.GeoDataFrame(
+            {
+                "t_pickuptime": pickup,
+                "t_dropofftime": pickup + pd.to_timedelta(duration, unit="s"),
+                **values,
+            },
+            geometry="t_pickuploc",
+        )
+        path = tmp_path / f"q3-batch-{batch_index}.parquet"
+        source.to_parquet(path, index=False, geometry_encoding="geoarrow")
+        native_batches.append(vibespatial.read_parquet(path))
+
+    queries = VibeSpatialQueries(vibespatial)
+    monkeypatch.setattr(
+        queries,
+        "_spatial_frames",
+        lambda *_args, **_kwargs: iter(native_batches),
+    )
+    reset_d2h_transfer_count()
+    vibespatial.clear_fallback_events()
+    vibespatial.clear_materialization_events()
+
+    result = queries.q3({"trip": "unused"})
+    transfers = get_d2h_transfer_events(clear=True)
+
+    expected = pd.DataFrame(
+        {
+            "pickup_month": pd.to_datetime(
+                ["2024-01-01", "2024-02-01", "2024-03-01"]
+            ),
+            "total_trips": np.asarray([2, 1, 1], dtype=np.uint64),
+            "avg_distance": [1.5, 4.0, 5.0],
+            "avg_duration": [90.0, 240.0, 300.0],
+            "avg_fare": [15.0, 40.0, 50.0],
+        }
+    )
+    pd.testing.assert_frame_equal(result, expected)
+    assert vibespatial.get_fallback_events(clear=True) == []
+    assert len(vibespatial.get_materialization_events(clear=True)) == 4
+    bulk_transfers = [event for event in transfers if event.bytes_transferred > 8]
+    assert len(bulk_transfers) == 4
+    assert sum("native_series_arithmetic" in event.reason for event in bulk_transfers) == 1
+    assert sum("numeric_take_to_public_array" in event.reason for event in bulk_transfers) == 3
+    assert all(
+        event.bytes_transferred <= 8
+        for event in transfers
+        if event not in bulk_transfers
+    )
+
+    source = inspect.getsource(VibeSpatialQueries.q3)
+    assert ".groupby(" not in source
+    assert ".dt.to_period(" not in source
     assert "pylibcudf" not in source
 
 

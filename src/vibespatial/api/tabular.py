@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
@@ -54,6 +55,110 @@ def _device_any(values, *, reason: str) -> bool:
         reason=reason,
     )
     return bool(np.asarray(result, dtype=bool)[0])
+
+
+def _dense_grouped_device_required_bytes(
+    *,
+    row_count: int,
+    group_count: int,
+    code_dtype: np.dtype,
+    value_dtypes: tuple[np.dtype, ...],
+    output_dtype: np.dtype,
+    output_bytes: int,
+    upload_bytes: int,
+) -> int:
+    """Conservatively admit dense count or stable segmented-reduction workspace."""
+    rows = int(row_count)
+    groups = int(group_count)
+    index_conversion = 0 if code_dtype == np.dtype(np.int64) else rows * 8
+    value_conversion = sum(
+        0 if dtype == output_dtype else rows * int(output_dtype.itemsize)
+        for dtype in value_dtypes
+    )
+    if not value_dtypes:
+        # CuPy bincount owns a row-shaped primitive workspace plus an int64
+        # dense output before the requested count dtype is exposed. Both terms
+        # matter independently: many rows with few groups and few rows with a
+        # very wide fixed domain are valid public shapes.
+        bincount_workspace = max(1 << 20, rows * 96)
+        int64_count_output = groups * 8
+        return max(
+            1,
+            upload_bytes
+            + index_conversion
+            + rows
+            + bincount_workspace
+            + int64_count_output
+            + output_bytes,
+        )
+
+    # Stable code ordering owns one int64 permutation. The radix-sort and CCCL
+    # storage estimates deliberately exceed their observed allocator peaks;
+    # admission is a safety bound, not an allocation target. Only one gathered
+    # value column and NaN mask are live at a time.
+    stable_order = rows * 8
+    sort_workspace = rows * 64
+    segmented_workspace = max(1 << 20, rows * 8)
+    value_workspace = rows * (
+        max(int(dtype.itemsize) for dtype in value_dtypes) + 1
+    )
+    group_workspace = groups * 32
+    return max(
+        1,
+        upload_bytes
+        + index_conversion
+        + value_conversion
+        + rows
+        + stable_order
+        + sort_workspace
+        + segmented_workspace
+        + value_workspace
+        + group_workspace
+        + output_bytes,
+    )
+
+
+def _device_dense_grouped_plan(d_indices, *, group_count: int):
+    """Return stable ordering and dense segment offsets for deterministic sums."""
+    import cupy as cp
+
+    counts = cp.bincount(d_indices, minlength=int(group_count))[
+        : int(group_count)
+    ].astype(cp.int64, copy=False)
+    order = cp.argsort(d_indices, kind="stable")
+    ends = cp.cumsum(counts, dtype=cp.int64)
+    starts = ends - counts
+    return counts, order, starts, ends
+
+
+def _device_segmented_sum(
+    d_values,
+    *,
+    order,
+    starts,
+    ends,
+    output_dtype: np.dtype,
+):
+    """Stable grouped sum with explicit input order and no contended fp atomics."""
+    import cupy as cp
+
+    from vibespatial.cuda.cccl_primitives import segmented_reduce_sum
+
+    sorted_values = d_values[order]
+    if sorted_values.dtype.kind == "f":
+        cp.copyto(
+            sorted_values,
+            cp.zeros((), dtype=sorted_values.dtype),
+            where=cp.isnan(sorted_values),
+        )
+    sorted_values = sorted_values.astype(output_dtype, copy=False)
+    return segmented_reduce_sum(
+        sorted_values,
+        starts,
+        ends,
+        num_segments=int(starts.size),
+        synchronize=False,
+    ).values
 
 
 def dense_count(
@@ -173,6 +278,413 @@ def dense_count(
         selected=ExecutionMode.CPU,
     )
     return pd.Series(counts, index=pd.RangeIndex(group_count), name=name)
+
+
+def dense_sum(
+    codes,
+    values,
+    *,
+    size: int,
+    dtype: Any = np.float64,
+    name: Any = None,
+) -> pd.Series:
+    """Sum numeric values by fixed-domain non-negative integer codes.
+
+    This is the weighted counterpart of :func:`dense_count`. Missing floating
+    values are skipped, matching pandas grouped-sum behavior, and empty groups
+    contain zero. Device-backed expressions remain a device-backed real pandas
+    Series so bounded grouped states can be merged before terminal export.
+    """
+    group_count = int(size)
+    if group_count < 0:
+        raise ValueError("dense_sum size must be non-negative")
+    output_dtype = np.dtype(dtype)
+    if output_dtype.kind not in {"f", "i", "u"}:
+        raise TypeError("dense_sum dtype must be a real numeric dtype")
+    code_expression = _native_expression_from_public_series(codes)
+    value_expression = _native_expression_from_public_series(values)
+    requested = get_requested_mode()
+    use_device = requested is ExecutionMode.GPU or (
+        requested is not ExecutionMode.CPU
+        and any(
+            expression is not None and expression.is_device
+            for expression in (code_expression, value_expression)
+        )
+    )
+    if use_device:
+        import cupy as cp
+
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        source_codes = (
+            code_expression.values
+            if code_expression is not None
+            else np.asarray(codes)
+        )
+        source_values = (
+            value_expression.values
+            if value_expression is not None
+            else np.asarray(values)
+        )
+        if source_codes.ndim != 1 or source_codes.dtype.kind not in {"i", "u"}:
+            raise TypeError("dense_sum codes must be one-dimensional integers")
+        if source_values.ndim != 1 or source_values.dtype.kind not in {"f", "i", "u"}:
+            raise TypeError("dense_sum values must be one-dimensional real numeric values")
+        if int(source_codes.size) != int(source_values.size):
+            raise ValueError("dense_sum codes and values must have the same length")
+        output_bytes = group_count * int(output_dtype.itemsize)
+        upload_bytes = sum(
+            int(source.size) * int(source.dtype.itemsize)
+            for source, expression in (
+                (source_codes, code_expression),
+                (source_values, value_expression),
+            )
+            if expression is None or not expression.is_device
+        )
+        required_bytes = _dense_grouped_device_required_bytes(
+            row_count=int(source_codes.size),
+            group_count=group_count,
+            code_dtype=np.dtype(source_codes.dtype),
+            value_dtypes=(np.dtype(source_values.dtype),),
+            output_dtype=output_dtype,
+            output_bytes=output_bytes,
+            upload_bytes=upload_bytes,
+        )
+        runtime = get_cuda_runtime()
+        admission = runtime.admit_device_memory(
+            stage="tabular-dense-sum",
+            required_bytes=required_bytes,
+            requested_units=group_count,
+        )
+        if not admission.admitted:
+            raise MemoryError(
+                "dense_sum requires "
+                f"{required_bytes} device bytes with "
+                f"{admission.remaining_bytes} available"
+            )
+        d_codes = cp.asarray(source_codes)
+        d_values = cp.asarray(source_values)
+        invalid = (d_codes < 0) | (d_codes >= group_count)
+        if int(d_codes.size) and _device_any(
+            cp.any(invalid),
+            reason="public dense-sum code-domain validation fence",
+        ):
+            raise ValueError("dense_sum codes must be in [0, size)")
+        del invalid
+        d_indices = d_codes.astype(cp.int64, copy=False)
+        _, order, starts, ends = _device_dense_grouped_plan(
+            d_indices,
+            group_count=group_count,
+        )
+        d_sums = _device_segmented_sum(
+            d_values,
+            order=order,
+            starts=starts,
+            ends=ends,
+            output_dtype=output_dtype,
+        )
+        result_expression = NativeExpression(
+            operation="dense_sum",
+            values=d_sums,
+            source_token=None,
+            source_row_count=group_count,
+            dtype=str(output_dtype),
+            precision="fp64-grouped-sum" if output_dtype == np.dtype(np.float64) else "source",
+        )
+        record_dispatch_event(
+            surface="vibespatial.api.dense_sum",
+            operation="dense_sum",
+            implementation="cccl_stable_segmented_sum",
+            reason="stable code ordering feeds deterministic fixed-domain segmented sums",
+            detail=(
+                f"input_rows={int(d_codes.size)}, groups={group_count}, "
+                f"dtype={output_dtype.name}"
+            ),
+            requested=requested,
+            selected=ExecutionMode.GPU,
+        )
+        return _public_native_series(
+            result_expression,
+            index=pd.RangeIndex(group_count),
+            name=name,
+            operation="dense_sum_to_public_array",
+        )
+
+    host_codes = np.asarray(codes)
+    host_values = np.asarray(values)
+    if host_codes.ndim != 1 or host_codes.dtype.kind not in {"i", "u"}:
+        raise TypeError("dense_sum codes must be one-dimensional integers")
+    if host_values.ndim != 1 or host_values.dtype.kind not in {"f", "i", "u"}:
+        raise TypeError("dense_sum values must be one-dimensional real numeric values")
+    if host_codes.size != host_values.size:
+        raise ValueError("dense_sum codes and values must have the same length")
+    if np.any((host_codes < 0) | (host_codes >= group_count)):
+        raise ValueError("dense_sum codes must be in [0, size)")
+    if host_values.dtype.kind == "f":
+        host_values = np.where(
+            np.isnan(host_values),
+            np.zeros((), dtype=host_values.dtype),
+            host_values,
+        )
+    weights = host_values.astype(output_dtype, copy=False)
+    sums = np.zeros(group_count, dtype=output_dtype)
+    if host_codes.size:
+        np.add.at(sums, host_codes.astype(np.int64, copy=False), weights)
+    record_dispatch_event(
+        surface="vibespatial.api.dense_sum",
+        operation="dense_sum",
+        implementation="numpy_dense_scatter_sum",
+        reason="host integer codes reduced numeric values into a fixed-domain dense sum vector",
+        detail=(
+            f"input_rows={int(host_codes.size)}, groups={group_count}, "
+            f"dtype={output_dtype.name}"
+        ),
+        requested=requested,
+        selected=ExecutionMode.CPU,
+    )
+    return pd.Series(sums, index=pd.RangeIndex(group_count), name=name)
+
+
+def dense_grouped_reduce(
+    codes,
+    *,
+    size: int,
+    sums: Mapping[Any, Any],
+    count_name: Any | None = None,
+    count_dtype: Any = np.uint64,
+    sum_dtype: Any = np.float64,
+) -> pd.DataFrame:
+    """Reduce count and named numeric sums into one fixed-domain device state.
+
+    Code-domain validation and index conversion are shared across every output
+    column. The returned object is a real pandas DataFrame whose columns remain
+    device-backed until an explicit public export.
+    """
+    group_count = int(size)
+    if group_count < 0:
+        raise ValueError("dense_grouped_reduce size must be non-negative")
+    named_values = dict(sums)
+    if not named_values and count_name is None:
+        raise ValueError("dense_grouped_reduce requires a count or sum output")
+    if count_name is not None and count_name in named_values:
+        raise ValueError("dense_grouped_reduce output names must be unique")
+    resolved_count_dtype = _count_dtype(count_dtype)
+    resolved_sum_dtype = np.dtype(sum_dtype)
+    if resolved_sum_dtype.kind not in {"f", "i", "u"}:
+        raise TypeError("dense_grouped_reduce sum_dtype must be a real numeric dtype")
+
+    code_expression = _native_expression_from_public_series(codes)
+    value_expressions = {
+        name: _native_expression_from_public_series(values)
+        for name, values in named_values.items()
+    }
+    requested = get_requested_mode()
+    use_device = requested is ExecutionMode.GPU or (
+        requested is not ExecutionMode.CPU
+        and any(
+            expression is not None and expression.is_device
+            for expression in (code_expression, *value_expressions.values())
+        )
+    )
+    output_index = pd.RangeIndex(group_count)
+    if use_device:
+        import cupy as cp
+
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        source_codes = (
+            code_expression.values
+            if code_expression is not None
+            else np.asarray(codes)
+        )
+        if source_codes.ndim != 1 or source_codes.dtype.kind not in {"i", "u"}:
+            raise TypeError(
+                "dense_grouped_reduce codes must be one-dimensional integers"
+            )
+        source_values_by_name = {}
+        for name, values in named_values.items():
+            expression = value_expressions[name]
+            source_values = (
+                expression.values if expression is not None else np.asarray(values)
+            )
+            if source_values.ndim != 1 or source_values.dtype.kind not in {
+                "f",
+                "i",
+                "u",
+            }:
+                raise TypeError(
+                    "dense_grouped_reduce values must be one-dimensional real "
+                    "numeric values"
+                )
+            if int(source_values.size) != int(source_codes.size):
+                raise ValueError(
+                    "dense_grouped_reduce codes and values must have the same length"
+                )
+            source_values_by_name[name] = source_values
+
+        output_bytes = group_count * (
+            len(named_values) * int(resolved_sum_dtype.itemsize)
+            + (0 if count_name is None else int(resolved_count_dtype.itemsize))
+        )
+        upload_bytes = (
+            0
+            if code_expression is not None and code_expression.is_device
+            else int(source_codes.size) * int(source_codes.dtype.itemsize)
+        )
+        upload_bytes += sum(
+            int(source_values.size) * int(source_values.dtype.itemsize)
+            for name, source_values in source_values_by_name.items()
+            if (expression := value_expressions[name]) is None
+            or not expression.is_device
+        )
+        required_bytes = _dense_grouped_device_required_bytes(
+            row_count=int(source_codes.size),
+            group_count=group_count,
+            code_dtype=np.dtype(source_codes.dtype),
+            value_dtypes=tuple(
+                np.dtype(values.dtype) for values in source_values_by_name.values()
+            ),
+            output_dtype=resolved_sum_dtype,
+            output_bytes=output_bytes,
+            upload_bytes=upload_bytes,
+        )
+        runtime = get_cuda_runtime()
+        admission = runtime.admit_device_memory(
+            stage="tabular-dense-grouped-reduce",
+            required_bytes=required_bytes,
+            requested_units=group_count,
+        )
+        if not admission.admitted:
+            raise MemoryError(
+                "dense_grouped_reduce requires "
+                f"{required_bytes} device bytes with "
+                f"{admission.remaining_bytes} available"
+            )
+        d_codes = cp.asarray(source_codes)
+        d_values_by_name = {
+            name: cp.asarray(values)
+            for name, values in source_values_by_name.items()
+        }
+        invalid = (d_codes < 0) | (d_codes >= group_count)
+        if int(d_codes.size) and _device_any(
+            cp.any(invalid),
+            reason="public dense-grouped-reduce code-domain validation fence",
+        ):
+            raise ValueError("dense_grouped_reduce codes must be in [0, size)")
+        del invalid
+        d_indices = d_codes.astype(cp.int64, copy=False)
+        output: dict[Any, pd.Series] = {}
+        d_counts = None
+        order = starts = ends = None
+        if d_values_by_name:
+            d_counts, order, starts, ends = _device_dense_grouped_plan(
+                d_indices,
+                group_count=group_count,
+            )
+        if count_name is not None:
+            if d_counts is None:
+                d_counts = cp.bincount(d_indices, minlength=group_count)[
+                    :group_count
+                ]
+            d_counts = d_counts.astype(resolved_count_dtype, copy=False)
+            output[count_name] = _public_native_series(
+                NativeExpression(
+                    operation="dense_grouped_reduce.count",
+                    values=d_counts,
+                    source_token=None,
+                    source_row_count=group_count,
+                    dtype=str(resolved_count_dtype),
+                    precision="exact-integer-count",
+                ),
+                index=output_index,
+                name=count_name,
+                operation="dense_grouped_reduce_to_public_array",
+            )
+        for name, d_values in d_values_by_name.items():
+            d_sums = _device_segmented_sum(
+                d_values,
+                order=order,
+                starts=starts,
+                ends=ends,
+                output_dtype=resolved_sum_dtype,
+            )
+            output[name] = _public_native_series(
+                NativeExpression(
+                    operation="dense_grouped_reduce.sum",
+                    values=d_sums,
+                    source_token=None,
+                    source_row_count=group_count,
+                    dtype=str(resolved_sum_dtype),
+                    precision=(
+                        "fp64-grouped-sum"
+                        if resolved_sum_dtype == np.dtype(np.float64)
+                        else "source"
+                    ),
+                ),
+                index=output_index,
+                name=name,
+                operation="dense_grouped_reduce_to_public_array",
+            )
+        record_dispatch_event(
+            surface="vibespatial.api.dense_grouped_reduce",
+            operation="dense_grouped_reduce",
+            implementation="cccl_stable_dense_grouped_reduce",
+            reason="fixed-domain count and deterministic sums share stable code ordering",
+            detail=(
+                f"input_rows={int(d_codes.size)}, groups={group_count}, "
+                f"sum_columns={len(named_values)}, count={count_name is not None}"
+            ),
+            requested=requested,
+            selected=ExecutionMode.GPU,
+        )
+        return pd.DataFrame(output, index=output_index)
+
+    host_codes = np.asarray(codes)
+    if host_codes.ndim != 1 or host_codes.dtype.kind not in {"i", "u"}:
+        raise TypeError("dense_grouped_reduce codes must be one-dimensional integers")
+    if np.any((host_codes < 0) | (host_codes >= group_count)):
+        raise ValueError("dense_grouped_reduce codes must be in [0, size)")
+    host_indices = host_codes.astype(np.int64, copy=False)
+    host_output: dict[Any, Any] = {}
+    if count_name is not None:
+        counts = np.zeros(group_count, dtype=resolved_count_dtype)
+        if host_codes.size:
+            np.add.at(counts, host_indices, 1)
+        host_output[count_name] = counts
+    for name, values in named_values.items():
+        host_values = np.asarray(values)
+        if host_values.ndim != 1 or host_values.dtype.kind not in {"f", "i", "u"}:
+            raise TypeError(
+                "dense_grouped_reduce values must be one-dimensional real numeric values"
+            )
+        if host_values.size != host_codes.size:
+            raise ValueError(
+                "dense_grouped_reduce codes and values must have the same length"
+            )
+        if host_values.dtype.kind == "f":
+            host_values = np.where(
+                np.isnan(host_values),
+                np.zeros((), dtype=host_values.dtype),
+                host_values,
+            )
+        weights = host_values.astype(resolved_sum_dtype, copy=False)
+        reduced = np.zeros(group_count, dtype=resolved_sum_dtype)
+        if host_codes.size:
+            np.add.at(reduced, host_indices, weights)
+        host_output[name] = reduced
+    record_dispatch_event(
+        surface="vibespatial.api.dense_grouped_reduce",
+        operation="dense_grouped_reduce",
+        implementation="numpy_dense_grouped_reduce",
+        reason="host fixed-domain count and sums share one code validation",
+        detail=(
+            f"input_rows={int(host_codes.size)}, groups={group_count}, "
+            f"sum_columns={len(named_values)}, count={count_name is not None}"
+        ),
+        requested=requested,
+        selected=ExecutionMode.CPU,
+    )
+    return pd.DataFrame(host_output, index=output_index)
 
 
 def numeric_take(values, indices, *, name: Any = None) -> pd.Series:
@@ -304,4 +816,4 @@ def numeric_take(values, indices, *, name: Any = None) -> pd.Series:
     return pd.Series(result, index=output_index, name=output_name)
 
 
-__all__ = ["dense_count", "numeric_take"]
+__all__ = ["dense_count", "dense_grouped_reduce", "dense_sum", "numeric_take"]

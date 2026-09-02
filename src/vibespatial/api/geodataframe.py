@@ -40,6 +40,11 @@ from vibespatial.overlay.dissolve import (
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
+from vibespatial.runtime.hotpath_trace import (
+    attach_work_amplification,
+    hotpath_stage,
+    hotpath_timing_enabled,
+)
 from vibespatial.runtime.residency import Residency
 
 if PANDAS_GE_30:
@@ -1499,6 +1504,14 @@ def _native_topk_request_targets_device_attributes(owner, n, columns, keep) -> b
     )
 
 
+def _sync_native_topk_hotpath() -> None:
+    """Fence only synchronized diagnostic timing, never production execution."""
+    if hotpath_timing_enabled():
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        get_cuda_runtime().synchronize()
+
+
 def _native_topk_rowset(owner, n: int, columns, *, largest: bool, keep: str):
     """Return an exact bounded pylibcudf top-k rowset for sortable columns.
 
@@ -1593,17 +1606,8 @@ def _native_topk_rowset(owner, n: int, columns, *, largest: bool, keep: str):
         key_columns = _native_pylibcudf_columns(attributes, sort_columns)
         stream = pylibcudf_current_stream(*key_columns)
         direction = Order.DESCENDING if largest else Order.ASCENDING
-        sort_key_columns = []
-        sort_orders = []
-        rank_columns = []
-        missing_columns = []
-        for column_index, (column, key_column) in enumerate(
-            zip(sort_columns, key_columns, strict=True)
-        ):
-            policy = policies[column]
-            arrow_type = arrow_types[column_index]
+        def _normalize_key(key_column, *, arrow_type, nullable):
             floating = pa.types.is_floating(arrow_type)
-            nullable = int(policy.null_count) != 0
             normalized_key = key_column
             if floating:
                 normalized_key = _native_pylibcudf_missing_normalized_columns(
@@ -1622,17 +1626,13 @@ def _native_topk_rowset(owner, n: int, columns, *, largest: bool, keep: str):
                     neutral_scalar,
                     stream=stream,
                 )
-                sort_key_columns.extend((missing_mask, clean_key_column))
-                sort_orders.extend((Order.ASCENDING, direction))
-                rank_column = clean_key_column
-                missing_columns.append(missing_mask)
-            else:
-                clean_key_column = normalized_key
-                sort_key_columns.append(clean_key_column)
-                sort_orders.append(direction)
-                rank_column = normalized_key
-                missing_columns.append(None)
-            rank_columns.append(rank_column)
+                return (
+                    [missing_mask, clean_key_column],
+                    [Order.ASCENDING, direction],
+                    clean_key_column,
+                    missing_mask,
+                )
+            return [normalized_key], [direction], normalized_key, None
 
         position_dtype = cp.int32 if row_count <= np.iinfo(np.int32).max else cp.int64
         active_positions = pylibcudf_column_from_device(
@@ -1652,33 +1652,120 @@ def _native_topk_rowset(owner, n: int, columns, *, largest: bool, keep: str):
             )
 
         if n >= row_count:
-            full_order = plc.sorting.stable_sorted_order(
-                plc.Table(sort_key_columns),
-                sort_orders,
-                [NullOrder.AFTER] * len(sort_key_columns),
-                stream=stream,
-            )
+            sort_key_columns = []
+            sort_orders = []
+            _sync_native_topk_hotpath()
+            with hotpath_stage(
+                "tabular.topk.full_key_normalization",
+                category="setup",
+                metadata={
+                    "input_rows": row_count,
+                    "ordering_keys": len(sort_columns),
+                },
+            ) as stage_metadata:
+                attach_work_amplification(
+                    stage_metadata,
+                    operation="tabular_topk_full_key_normalization",
+                    metric_family="tabular",
+                    sums={"normalized_key_rows": row_count * len(sort_columns)},
+                    maxima={"input_rows": row_count, "ordering_keys": len(sort_columns)},
+                    physical_shape="full-row lexicographic sort",
+                    consumer_kind="ordered NativeRowSet",
+                )
+                for column_index, (column, key_column) in enumerate(
+                    zip(sort_columns, key_columns, strict=True)
+                ):
+                    normalized_columns, normalized_orders, _, _ = _normalize_key(
+                        key_column,
+                        arrow_type=arrow_types[column_index],
+                        nullable=int(policies[column].null_count) != 0,
+                    )
+                    sort_key_columns.extend(normalized_columns)
+                    sort_orders.extend(normalized_orders)
+                _sync_native_topk_hotpath()
+            _sync_native_topk_hotpath()
+            with hotpath_stage(
+                "tabular.topk.full_sort",
+                category="sort",
+                metadata={
+                    "input_rows": row_count,
+                    "output_rows": row_count,
+                    "ordering_keys": len(sort_columns),
+                },
+            ) as stage_metadata:
+                attach_work_amplification(
+                    stage_metadata,
+                    operation="tabular_topk_full_sort",
+                    metric_family="tabular",
+                    sums={"sorted_rows": row_count},
+                    maxima={"input_rows": row_count, "output_rows": row_count},
+                    physical_shape="full-row lexicographic sort",
+                    consumer_kind="ordered NativeRowSet",
+                )
+                full_order = plc.sorting.stable_sorted_order(
+                    plc.Table(sort_key_columns),
+                    sort_orders,
+                    [NullOrder.AFTER] * len(sort_key_columns),
+                    stream=stream,
+                )
+                _sync_native_topk_hotpath()
             positions = _pylibcudf_numeric_column_view(full_order)
         else:
             selected_position_tables = []
             remaining = n
-            for key_index, rank_column in enumerate(rank_columns):
+            for key_index, (column, key_column) in enumerate(
+                zip(sort_columns, key_columns, strict=True)
+            ):
                 active_count = int(active_positions.size())
                 final_key_keep_last_reversal = bool(
                     keep == "last"
-                    and len(rank_columns) > 1
-                    and key_index + 1 == len(rank_columns)
+                    and len(key_columns) > 1
+                    and key_index + 1 == len(key_columns)
                     and active_count > remaining
                 )
                 active_map = plc.Table([active_positions])
-                missing_column = missing_columns[key_index]
+                _sync_native_topk_hotpath()
+                with hotpath_stage(
+                    "tabular.topk.active_key_prepare",
+                    category="setup",
+                    metadata={
+                        "input_rows": row_count,
+                        "active_rows": active_count,
+                        "key_index": key_index,
+                        "ordering_keys": len(key_columns),
+                    },
+                ) as stage_metadata:
+                    attach_work_amplification(
+                        stage_metadata,
+                        operation="tabular_topk_active_key_prepare",
+                        metric_family="tabular",
+                        sums={"prepared_key_rows": active_count},
+                        maxima={
+                            "input_rows": row_count,
+                            "active_rows": active_count,
+                            "ordering_keys": len(key_columns),
+                        },
+                        physical_shape="boundary-refined lexicographic top-k",
+                        consumer_kind="ordered NativeRowSet",
+                    )
+                    active_key = (
+                        key_column
+                        if key_index == 0
+                        else plc.copying.gather(
+                            plc.Table([key_column]),
+                            active_positions,
+                            plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                            stream=stream,
+                        ).columns()[0]
+                    )
+                    _, _, active_rank, missing_column = _normalize_key(
+                        active_key,
+                        arrow_type=arrow_types[key_index],
+                        nullable=int(policies[column].null_count) != 0,
+                    )
+                    _sync_native_topk_hotpath()
                 if missing_column is not None:
-                    active_missing = plc.copying.gather(
-                        plc.Table([missing_column]),
-                        active_positions,
-                        plc.copying.OutOfBoundsPolicy.DONT_CHECK,
-                        stream=stream,
-                    ).columns()[0]
+                    active_missing = missing_column
                     active_valid = plc.unary.unary_operation(
                         active_missing,
                         plc.unary.UnaryOperator.NOT,
@@ -1704,97 +1791,150 @@ def _native_topk_rowset(owner, n: int, columns, *, largest: bool, keep: str):
                             active_missing,
                             stream=stream,
                         ).columns()[0]
-                        if key_index + 1 != len(rank_columns):
-                            continue
-                        boundary_count = int(active_positions.size())
+                        if key_index + 1 != len(key_columns):
+                            # pandas stops multi-key refinement at a missing
+                            # leading-key bucket and preserves the complete
+                            # bucket in original order once it is needed.
+                            selected_position_tables.append(
+                                plc.Table([active_positions])
+                            )
+                            break
                         if keep == "all":
                             selected_position_tables.append(
                                 plc.Table([active_positions])
                             )
                         else:
-                            start = (
-                                0
-                                if keep == "first"
-                                else boundary_count - remaining
-                            )
+                            # Missing rows are filled from their original
+                            # order for both keep='first' and keep='last'.
                             chosen = plc.copying.slice(
                                 plc.Table([active_positions]),
-                                [start, start + remaining],
+                                [0, remaining],
                                 stream=stream,
                             )[0]
-                            selected_position_tables.append(
-                                _reverse_position_table(chosen)
-                                if final_key_keep_last_reversal
-                                else chosen
-                            )
+                            selected_position_tables.append(chosen)
                         break
+                    active_rank = plc.stream_compaction.apply_boolean_mask(
+                        plc.Table([active_rank]),
+                        active_valid,
+                        stream=stream,
+                    ).columns()[0]
                     active_positions = valid_positions
                     active_map = plc.Table([active_positions])
-                active_rank = plc.copying.gather(
-                    plc.Table([rank_column]),
-                    active_positions,
-                    plc.copying.OutOfBoundsPolicy.DONT_CHECK,
-                    stream=stream,
-                ).columns()[0]
-                boundary_values = plc.sorting.top_k(
-                    active_rank,
-                    remaining,
-                    direction,
-                    stream=stream,
-                )
-                boundary = plc.reduce.reduce(
-                    boundary_values,
-                    (
-                        plc.aggregation.min()
-                        if largest
-                        else plc.aggregation.max()
-                    ),
-                    boundary_values.type(),
-                    stream=stream,
-                )
-                better_operator = (
-                    plc.binaryop.BinaryOperator.GREATER
-                    if largest
-                    else plc.binaryop.BinaryOperator.LESS
-                )
-                better_mask = plc.binaryop.binary_operation(
-                    active_rank,
-                    boundary,
-                    better_operator,
-                    plc.DataType(TypeId.BOOL8),
-                    stream=stream,
-                )
-                equal_mask = plc.binaryop.binary_operation(
-                    active_rank,
-                    boundary,
-                    plc.binaryop.BinaryOperator.EQUAL,
-                    plc.DataType(TypeId.BOOL8),
-                    stream=stream,
-                )
-                strict_winners = plc.stream_compaction.apply_boolean_mask(
-                    active_map,
-                    better_mask,
-                    stream=stream,
-                )
-                strict_count = int(strict_winners.columns()[0].size())
-                if strict_count:
-                    selected_position_tables.append(
-                        _reverse_position_table(strict_winners)
-                        if final_key_keep_last_reversal
-                        else strict_winners
+                _sync_native_topk_hotpath()
+                with hotpath_stage(
+                    "tabular.topk.boundary_select",
+                    category="sort",
+                    metadata={
+                        "input_rows": row_count,
+                        "active_rows": int(active_positions.size()),
+                        "requested_rows": remaining,
+                        "key_index": key_index,
+                    },
+                ) as stage_metadata:
+                    attach_work_amplification(
+                        stage_metadata,
+                        operation="tabular_topk_boundary_select",
+                        metric_family="tabular",
+                        sums={"selection_rows": int(active_positions.size())},
+                        maxima={
+                            "active_rows": int(active_positions.size()),
+                            "requested_rows": remaining,
+                        },
+                        physical_shape="boundary-refined lexicographic top-k",
+                        consumer_kind="ordered NativeRowSet",
                     )
-                    remaining -= strict_count
-                boundary_positions = plc.stream_compaction.apply_boolean_mask(
-                    active_map,
-                    equal_mask,
-                    stream=stream,
-                ).columns()[0]
+                    boundary_values = plc.sorting.top_k(
+                        active_rank,
+                        remaining,
+                        direction,
+                        stream=stream,
+                    )
+                    boundary = plc.reduce.reduce(
+                        boundary_values,
+                        (
+                            plc.aggregation.min()
+                            if largest
+                            else plc.aggregation.max()
+                        ),
+                        boundary_values.type(),
+                        stream=stream,
+                    )
+                    _sync_native_topk_hotpath()
+                _sync_native_topk_hotpath()
+                with hotpath_stage(
+                    "tabular.topk.boundary_partition",
+                    category="filter",
+                    metadata={
+                        "input_rows": row_count,
+                        "active_rows": int(active_positions.size()),
+                        "requested_rows": remaining,
+                        "key_index": key_index,
+                    },
+                ) as partition_metadata:
+                    attach_work_amplification(
+                        partition_metadata,
+                        operation="tabular_topk_boundary_partition",
+                        metric_family="tabular",
+                        sums={"partition_rows": int(active_positions.size())},
+                        maxima={
+                            "active_rows": int(active_positions.size()),
+                            "requested_rows": remaining,
+                        },
+                        physical_shape="boundary-refined lexicographic top-k",
+                        consumer_kind="ordered NativeRowSet",
+                    )
+                    better_operator = (
+                        plc.binaryop.BinaryOperator.GREATER
+                        if largest
+                        else plc.binaryop.BinaryOperator.LESS
+                    )
+                    better_mask = plc.binaryop.binary_operation(
+                        active_rank,
+                        boundary,
+                        better_operator,
+                        plc.DataType(TypeId.BOOL8),
+                        stream=stream,
+                    )
+                    equal_mask = plc.binaryop.binary_operation(
+                        active_rank,
+                        boundary,
+                        plc.binaryop.BinaryOperator.EQUAL,
+                        plc.DataType(TypeId.BOOL8),
+                        stream=stream,
+                    )
+                    strict_winners = plc.stream_compaction.apply_boolean_mask(
+                        active_map,
+                        better_mask,
+                        stream=stream,
+                    )
+                    strict_count = int(strict_winners.columns()[0].size())
+                    if strict_count:
+                        selected_position_tables.append(
+                            _reverse_position_table(strict_winners)
+                            if final_key_keep_last_reversal
+                            else strict_winners
+                        )
+                        remaining -= strict_count
+                    boundary_positions = plc.stream_compaction.apply_boolean_mask(
+                        active_map,
+                        equal_mask,
+                        stream=stream,
+                    ).columns()[0]
+                    if partition_metadata is not None:
+                        partition_metadata["strict_winners"] = strict_count
+                        partition_metadata["boundary_rows"] = int(
+                            boundary_positions.size()
+                        )
+                    _sync_native_topk_hotpath()
 
-                if key_index + 1 != len(rank_columns):
+                boundary_count = int(boundary_positions.size())
+                if boundary_count <= remaining:
+                    selected_position_tables.append(plc.Table([boundary_positions]))
+                    break
+                if key_index + 1 != len(key_columns):
                     active_positions = boundary_positions
                     continue
 
-                boundary_count = int(boundary_positions.size())
                 if keep == "all":
                     selected_position_tables.append(plc.Table([boundary_positions]))
                 else:
@@ -1821,35 +1961,98 @@ def _native_topk_rowset(owner, n: int, columns, *, largest: bool, keep: str):
                 stream=stream,
             )
             selected_positions_column = selected_positions_table.columns()[0]
-            selected_keys = plc.copying.gather(
-                plc.Table(sort_key_columns),
-                selected_positions_column,
-                plc.copying.OutOfBoundsPolicy.DONT_CHECK,
-                stream=stream,
-            )
+            selected_sort_columns = []
+            selected_sort_orders = []
+            _sync_native_topk_hotpath()
+            with hotpath_stage(
+                "tabular.topk.selected_key_gather",
+                category="setup",
+                metadata={
+                    "input_rows": row_count,
+                    "selected_rows": int(selected_positions_column.size()),
+                    "ordering_keys": len(key_columns),
+                },
+            ) as stage_metadata:
+                attach_work_amplification(
+                    stage_metadata,
+                    operation="tabular_topk_selected_key_gather",
+                    metric_family="tabular",
+                    sums={
+                        "gathered_key_rows": int(selected_positions_column.size())
+                        * len(key_columns)
+                    },
+                    maxima={
+                        "input_rows": row_count,
+                        "selected_rows": int(selected_positions_column.size()),
+                        "ordering_keys": len(key_columns),
+                    },
+                    physical_shape="bounded selected-key gather",
+                    consumer_kind="ordered NativeRowSet",
+                )
+                for key_index, (column, key_column) in enumerate(
+                    zip(sort_columns, key_columns, strict=True)
+                ):
+                    selected_key = plc.copying.gather(
+                        plc.Table([key_column]),
+                        selected_positions_column,
+                        plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                        stream=stream,
+                    ).columns()[0]
+                    normalized_columns, normalized_orders, _, _ = _normalize_key(
+                        selected_key,
+                        arrow_type=arrow_types[key_index],
+                        nullable=int(policies[column].null_count) != 0,
+                    )
+                    selected_sort_columns.extend(normalized_columns)
+                    selected_sort_orders.extend(normalized_orders)
+                _sync_native_topk_hotpath()
             position_tiebreak_order = None
             if keep in {"first", "all"}:
                 position_tiebreak_order = Order.ASCENDING
-            elif len(rank_columns) == 1:
+            elif len(key_columns) == 1:
                 position_tiebreak_order = Order.DESCENDING
-            final_sort_columns = list(selected_keys.columns())
-            final_sort_orders = list(sort_orders)
+            final_sort_columns = list(selected_sort_columns)
+            final_sort_orders = list(selected_sort_orders)
             if position_tiebreak_order is not None:
                 final_sort_columns.append(selected_positions_column)
                 final_sort_orders.append(position_tiebreak_order)
             final_sort_table = plc.Table(final_sort_columns)
-            final_order = plc.sorting.stable_sorted_order(
-                final_sort_table,
-                final_sort_orders,
-                [NullOrder.AFTER] * len(final_sort_columns),
-                stream=stream,
-            )
-            ordered_positions = plc.copying.gather(
-                plc.Table([selected_positions_column]),
-                final_order,
-                plc.copying.OutOfBoundsPolicy.DONT_CHECK,
-                stream=stream,
-            ).columns()[0]
+            _sync_native_topk_hotpath()
+            with hotpath_stage(
+                "tabular.topk.final_sort",
+                category="sort",
+                metadata={
+                    "input_rows": row_count,
+                    "selected_rows": int(selected_positions_column.size()),
+                    "ordering_keys": len(key_columns),
+                },
+            ) as stage_metadata:
+                attach_work_amplification(
+                    stage_metadata,
+                    operation="tabular_topk_final_sort",
+                    metric_family="tabular",
+                    sums={"sorted_rows": int(selected_positions_column.size())},
+                    maxima={
+                        "input_rows": row_count,
+                        "selected_rows": int(selected_positions_column.size()),
+                        "ordering_keys": len(key_columns),
+                    },
+                    physical_shape="bounded selected-key sort",
+                    consumer_kind="ordered NativeRowSet",
+                )
+                final_order = plc.sorting.stable_sorted_order(
+                    final_sort_table,
+                    final_sort_orders,
+                    [NullOrder.AFTER] * len(final_sort_columns),
+                    stream=stream,
+                )
+                ordered_positions = plc.copying.gather(
+                    plc.Table([selected_positions_column]),
+                    final_order,
+                    plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+                    stream=stream,
+                ).columns()[0]
+                _sync_native_topk_hotpath()
             positions = _pylibcudf_numeric_column_view(ordered_positions)
     except Exception as exc:
         raise RuntimeError("admitted pylibcudf top-k execution failed") from exc
@@ -7888,6 +8091,139 @@ default 'snappy'
         values = pd.to_datetime(pd.DataFrame.__getitem__(self, column))
         return getattr(values.dt, normalized).rename(column)
 
+    def datetime_difference_seconds(self, start, end) -> Series:
+        """Return ``end - start`` in seconds without exporting native timestamps."""
+        for column in (start, end):
+            if column not in self.columns or column == self._geometry_column_name:
+                raise KeyError(column)
+
+        from vibespatial.api._native_state import get_native_state
+        from vibespatial.runtime import get_requested_mode
+
+        requested = get_requested_mode()
+        native_state = get_native_state(self)
+        rejection_reason = (
+            "explicit CPU execution requested"
+            if requested is ExecutionMode.CPU
+            else "datetime attributes have no admitted native timestamp payload"
+        )
+        if native_state is not None and requested is not ExecutionMode.CPU:
+            policies = native_state.attributes.device_column_policies((start, end))
+            start_policy = policies.get(start)
+            end_policy = policies.get(end)
+
+            def _timestamp_unit(policy):
+                arrow_type = "" if policy is None else policy.arrow_type
+                if not arrow_type.startswith("timestamp["):
+                    return None
+                return arrow_type[len("timestamp[") :].split(",", 1)[0].rstrip("]")
+
+            start_unit = _timestamp_unit(start_policy)
+            end_unit = _timestamp_unit(end_policy)
+            seconds_per_tick = {
+                "s": 1.0,
+                "ms": 1.0e-3,
+                "us": 1.0e-6,
+                "ns": 1.0e-9,
+            }
+            ticks_per_second = {
+                "s": 1,
+                "ms": 1_000,
+                "us": 1_000_000,
+                "ns": 1_000_000_000,
+            }
+            if (
+                start_policy is not None
+                and end_policy is not None
+                and int(start_policy.null_count) == 0
+                and int(end_policy.null_count) == 0
+                and start_unit in seconds_per_tick
+                and end_unit in seconds_per_tick
+            ):
+                try:
+                    import cupy as cp
+
+                    from vibespatial.api._native_expression import NativeExpression
+
+                    start_column, end_column = (
+                        native_state.attributes.to_pylibcudf_columns((start, end))
+                    )
+                    d_start = cp.asarray(start_column.data()).view(cp.int64)[
+                        : int(start_column.size())
+                    ]
+                    d_end = cp.asarray(end_column.data()).view(cp.int64)[
+                        : int(end_column.size())
+                    ]
+                    if start_unit == end_unit:
+                        d_result = (d_end - d_start).astype(cp.float64) * (
+                            seconds_per_tick[start_unit]
+                        )
+                    else:
+                        start_rate = ticks_per_second[start_unit]
+                        end_rate = ticks_per_second[end_unit]
+                        common_rate = max(start_rate, end_rate)
+                        # Split epoch-scale ticks into integral seconds and a
+                        # bounded exact common-unit remainder. Converting each
+                        # complete timestamp (or each remainder) independently
+                        # to float loses small mixed-unit deltas through
+                        # cancellation and extra rounding.
+                        d_subsecond_ticks = (
+                            (d_end % end_rate) * (common_rate // end_rate)
+                            - (d_start % start_rate) * (common_rate // start_rate)
+                        )
+                        d_result = (
+                            (d_end // end_rate - d_start // start_rate).astype(
+                                cp.float64
+                            )
+                            + d_subsecond_ticks.astype(cp.float64) / common_rate
+                        )
+                    record_dispatch_event(
+                        surface="geopandas.geodataframe.datetime_difference_seconds",
+                        operation="datetime_difference_seconds",
+                        implementation="native_timestamp_expression",
+                        reason=(
+                            "timestamp difference retained as a device numeric "
+                            "expression"
+                        ),
+                        detail=(
+                            f"rows={len(self)}, start_unit={start_unit}, "
+                            f"end_unit={end_unit}"
+                        ),
+                        requested=requested,
+                        selected=ExecutionMode.GPU,
+                    )
+                    return _native_expression_assignment_public_series(
+                        start,
+                        NativeExpression(
+                            operation="datetime_difference_seconds",
+                            values=d_result,
+                            source_token=native_state.lineage_token,
+                            source_row_count=native_state.row_count,
+                            dtype="float64",
+                            precision="exact-ticks-fp64-seconds",
+                        ),
+                        index=self.index,
+                        surface="GeoDataFrame.datetime_difference_seconds",
+                    )
+                except (ImportError, AttributeError, NotImplementedError):
+                    rejection_reason = (
+                        "native timestamp tick buffers are not device-accessible"
+                    )
+            else:
+                rejection_reason = (
+                    "native timestamp difference requires all-valid s/ms/us/ns attributes"
+                )
+
+        record_fallback_event(
+            surface="geopandas.geodataframe.datetime_difference_seconds",
+            reason=rejection_reason,
+            requested=requested,
+            selected=ExecutionMode.CPU,
+        )
+        start_values = pd.to_datetime(pd.DataFrame.__getitem__(self, start))
+        end_values = pd.to_datetime(pd.DataFrame.__getitem__(self, end))
+        return (end_values - start_values).dt.total_seconds()
+
     @doc(pd.DataFrame)
     def drop_duplicates(
         self,
@@ -8187,13 +8523,33 @@ default 'snappy'
         if native_rowset is not None:
             from vibespatial.api._native_state import get_native_state
 
-            result = _take_public_frame_with_native_state(
-                self,
-                native_rowset,
-                source_native_state=get_native_state(self),
-                geometry_column=self._geometry_column_name,
-                preserve_index=True,
-            )
+            _sync_native_topk_hotpath()
+            with hotpath_stage(
+                "tabular.topk.rowset_take",
+                category="emit",
+                metadata={
+                    "input_rows": len(self),
+                    "output_rows": len(native_rowset),
+                    "ordering_keys": len(_normalize_sort_columns(columns) or ()),
+                },
+            ) as stage_metadata:
+                attach_work_amplification(
+                    stage_metadata,
+                    operation="tabular_topk_rowset_take",
+                    metric_family="tabular",
+                    sums={"output_rows": len(native_rowset)},
+                    maxima={"input_rows": len(self), "output_rows": len(native_rowset)},
+                    physical_shape="bounded ordered rowset take",
+                    consumer_kind="public frame export",
+                )
+                result = _take_public_frame_with_native_state(
+                    self,
+                    native_rowset,
+                    source_native_state=get_native_state(self),
+                    geometry_column=self._geometry_column_name,
+                    preserve_index=True,
+                )
+                _sync_native_topk_hotpath()
             if result is not None:
                 record_dispatch_event(
                     surface="geopandas.geodataframe.nlargest",
@@ -8236,13 +8592,33 @@ default 'snappy'
         if native_rowset is not None:
             from vibespatial.api._native_state import get_native_state
 
-            result = _take_public_frame_with_native_state(
-                self,
-                native_rowset,
-                source_native_state=get_native_state(self),
-                geometry_column=self._geometry_column_name,
-                preserve_index=True,
-            )
+            _sync_native_topk_hotpath()
+            with hotpath_stage(
+                "tabular.topk.rowset_take",
+                category="emit",
+                metadata={
+                    "input_rows": len(self),
+                    "output_rows": len(native_rowset),
+                    "ordering_keys": len(_normalize_sort_columns(columns) or ()),
+                },
+            ) as stage_metadata:
+                attach_work_amplification(
+                    stage_metadata,
+                    operation="tabular_topk_rowset_take",
+                    metric_family="tabular",
+                    sums={"output_rows": len(native_rowset)},
+                    maxima={"input_rows": len(self), "output_rows": len(native_rowset)},
+                    physical_shape="bounded ordered rowset take",
+                    consumer_kind="public frame export",
+                )
+                result = _take_public_frame_with_native_state(
+                    self,
+                    native_rowset,
+                    source_native_state=get_native_state(self),
+                    geometry_column=self._geometry_column_name,
+                    preserve_index=True,
+                )
+                _sync_native_topk_hotpath()
             if result is not None:
                 record_dispatch_event(
                     surface="geopandas.geodataframe.nsmallest",
