@@ -381,16 +381,21 @@ class VibeSpatialQueries(GeoParquetPublicApiQueries):
             min_month = min(min_month, int(month_code.min()))
             max_month = max(max_month, int(month_code.max()))
             packed = trips["t_custkey"] * month_width + month_code % month_width
-            batch_counts = self.gpd.dense_count(
-                packed,
-                size=group_domain,
-                dtype=np.uint32,
-                name="dropoff_count",
-            )
-            group_counts = (
-                batch_counts if group_counts is None else group_counts + batch_counts
-            )
-            del batch_counts, month_code, packed, trips
+            if group_counts is None:
+                group_counts = self.gpd.dense_count(
+                    packed,
+                    size=group_domain,
+                    dtype=np.uint32,
+                    name="dropoff_count",
+                )
+            else:
+                group_counts = self.gpd.dense_count(
+                    packed,
+                    size=group_domain,
+                    dtype=np.uint32,
+                    out=group_counts,
+                )
+            del month_code, packed, trips
 
         if max_month - min_month >= month_width:
             raise RuntimeError("Q5 month packing width is smaller than the data span")

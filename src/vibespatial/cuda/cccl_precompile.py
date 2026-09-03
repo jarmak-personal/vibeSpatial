@@ -1612,6 +1612,7 @@ def _warm_device_centroid_buffer_route(timeout: float = 60.0) -> None:
 
 # Modules whose import triggers request_nvrtc_warmup() at module scope.
 _NVRTC_CONSUMER_MODULES: tuple[str, ...] = (
+    "vibespatial.api.tabular",
     "vibespatial.api._native_grouped",
     "vibespatial.api._native_rowset",
     "vibespatial.spatial.indexing",

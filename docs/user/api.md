@@ -44,7 +44,7 @@ For the complete module-by-module reference, see the
 
 | Function | Description |
 |----------|-------------|
-| {py:func}`~vibespatial.api.tabular.dense_count` | Count integer codes into a fixed-size, device-preserving pandas Series |
+| {py:func}`~vibespatial.api.tabular.dense_count` | Count integer codes into a fixed-size, device-preserving pandas Series, with optional in-place streaming updates |
 | {py:func}`~vibespatial.api.tabular.numeric_take` | Gather numeric values by integer positions while preserving device-backed Series |
 
 ### Runtime

@@ -154,6 +154,72 @@ def test_dense_count_empty_uint64_and_empty_take_contract() -> None:
     assert gathered.empty
     assert gathered.name == "values"
 
+    updated = gpd.dense_count(
+        pd.Series([], dtype=np.int64),
+        size=0,
+        dtype=np.uint64,
+        out=counts,
+    )
+    assert updated is counts
+
+
+@pytest.mark.parametrize("dtype", [np.uint32, np.uint64])
+def test_dense_count_updates_host_accumulator_transactionally_in_place(dtype) -> None:
+    counts = gpd.dense_count(pd.Series([0, 2, 2]), size=4, dtype=dtype)
+
+    updated = gpd.dense_count(
+        pd.Series([1, 2, 3, 2]),
+        size=4,
+        dtype=dtype,
+        out=counts,
+    )
+
+    assert updated is counts
+    assert counts.tolist() == [1, 1, 4, 1]
+    assert gpd.get_dispatch_events(clear=True)[-1].implementation == (
+        "numpy_dense_scatter_count_update"
+    )
+
+
+@pytest.mark.parametrize("dtype", [np.uint32, np.uint64])
+def test_dense_count_host_overflow_leaves_entire_accumulator_unchanged(dtype) -> None:
+    maximum = np.iinfo(dtype).max
+    counts = pd.Series(np.asarray([maximum, 4], dtype=dtype))
+    before = counts.copy()
+
+    with pytest.raises(OverflowError, match="exceeds"):
+        gpd.dense_count(
+            pd.Series([0, 1]),
+            size=2,
+            dtype=dtype,
+            out=counts,
+        )
+
+    pd.testing.assert_series_equal(counts, before)
+
+
+@pytest.mark.parametrize(
+    ("out", "error", "message"),
+    [
+        (np.zeros(2, dtype=np.uint32), TypeError, "pandas Series"),
+        (pd.Series([0], dtype=np.uint32), ValueError, "length"),
+        (
+            pd.Series([0, 0], dtype=np.uint32, index=pd.Index([1, 2])),
+            ValueError,
+            "RangeIndex",
+        ),
+        (pd.Series([0, 0], dtype=np.uint64), TypeError, "dtype"),
+    ],
+)
+def test_dense_count_rejects_incompatible_host_accumulator(out, error, message) -> None:
+    with pytest.raises(error, match=message):
+        gpd.dense_count(
+            pd.Series([0]),
+            size=2,
+            dtype=np.uint32,
+            out=out,
+        )
+
 
 @pytest.mark.gpu
 def test_dense_count_and_numeric_take_keep_native_series_on_device() -> None:
@@ -248,6 +314,285 @@ def test_dense_count_and_numeric_take_keep_native_series_on_device() -> None:
         event.stage == "tabular-numeric-take" and event.admitted
         for event in admissions
     )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [np.uint32, np.uint64])
+def test_dense_count_updates_device_accumulator_transactionally_in_place(dtype) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    import cupy as cp
+
+    def native_codes(values, operation):
+        array = cp.asarray(values, dtype=cp.int64)
+        return pd.Series(
+            NativeNumericExpressionArray(
+                NativeExpression(
+                    operation=operation,
+                    values=array,
+                    source_token="rows",
+                    source_row_count=int(array.size),
+                    dtype="int64",
+                    precision="exact-integer",
+                )
+            )
+        )
+
+    counts = gpd.dense_count(
+        native_codes([0, 2, 2], "test.dense_count.first"),
+        size=4,
+        dtype=dtype,
+    )
+    storage = counts.array.expression.values
+    gpd.clear_dispatch_events()
+    updated = gpd.dense_count(
+        native_codes([1, 2, 3, 2], "test.dense_count.second"),
+        size=4,
+        dtype=dtype,
+        out=counts,
+    )
+    gathered = gpd.numeric_take(
+        counts,
+        native_codes([2, 0], "test.dense_count.take"),
+    )
+
+    assert updated is counts
+    assert counts.array.expression.values is storage
+    assert isinstance(counts.array, NativeNumericExpressionArray)
+    assert cp.asnumpy(storage).tolist() == [1, 1, 4, 1]
+    assert cp.asnumpy(gathered.array.expression.values).tolist() == [4, 1]
+    assert any(
+        event.implementation == "cuda_dense_scatter_count_update"
+        for event in gpd.get_dispatch_events(clear=True)
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [np.uint32, np.uint64])
+def test_dense_count_device_overflow_leaves_entire_accumulator_unchanged(dtype) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    import cupy as cp
+
+    maximum = np.iinfo(dtype).max
+    values = cp.asarray([maximum, 4], dtype=dtype)
+    counts = pd.Series(
+        NativeNumericExpressionArray(
+            NativeExpression(
+                operation="test.dense_count.saturated",
+                values=values,
+                source_token=None,
+                source_row_count=2,
+                dtype=np.dtype(dtype).name,
+                precision="exact-integer-count",
+            )
+        )
+    )
+    before = values.copy()
+
+    with pytest.raises(OverflowError, match="exceeds"):
+        gpd.dense_count(
+            pd.Series([0, 1]),
+            size=2,
+            dtype=dtype,
+            out=counts,
+        )
+
+    assert cp.array_equal(values, before)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [np.uint32, np.uint64])
+def test_dense_count_updates_strided_device_input_and_output(dtype) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    import cupy as cp
+
+    code_storage = cp.asarray([1, 99, 0, 99], dtype=cp.int64)
+    count_storage = cp.asarray([10, 99, 20, 99], dtype=dtype)
+    codes = pd.Series(
+        NativeNumericExpressionArray(
+            NativeExpression(
+                operation="test.dense_count.strided.codes",
+                values=code_storage[::2],
+                source_token="rows",
+                source_row_count=2,
+                dtype="int64",
+                precision="exact-integer",
+            )
+        )
+    )
+    counts = pd.Series(
+        NativeNumericExpressionArray(
+            NativeExpression(
+                operation="test.dense_count.strided.counts",
+                values=count_storage[::2],
+                source_token=None,
+                source_row_count=2,
+                dtype=np.dtype(dtype).name,
+                precision="exact-integer-count",
+            )
+        )
+    )
+
+    updated = gpd.dense_count(codes, size=2, dtype=dtype, out=counts)
+
+    assert updated is counts
+    assert cp.asnumpy(count_storage).tolist() == [11, 99, 21, 99]
+
+
+@pytest.mark.gpu
+def test_dense_count_rejects_aliased_device_input_and_output_before_mutation() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    import cupy as cp
+
+    storage = cp.asarray([0, 1, 1], dtype=cp.uint64)
+    codes = pd.Series(
+        NativeNumericExpressionArray(
+            NativeExpression(
+                operation="test.dense_count.aliased.codes",
+                values=storage.view(cp.int64),
+                source_token="rows",
+                source_row_count=3,
+                dtype="int64",
+                precision="exact-integer",
+            )
+        )
+    )
+    counts = pd.Series(
+        NativeNumericExpressionArray(
+            NativeExpression(
+                operation="test.dense_count.aliased.counts",
+                values=storage,
+                source_token=None,
+                source_row_count=3,
+                dtype="uint64",
+                precision="exact-integer-count",
+            )
+        )
+    )
+    before = storage.copy()
+
+    with pytest.raises(ValueError, match="must not share device storage"):
+        gpd.dense_count(codes, size=3, dtype=np.uint64, out=counts)
+
+    assert cp.array_equal(storage, before)
+
+
+@pytest.mark.gpu
+def test_dense_count_admits_host_upload_before_allocating_it(monkeypatch) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    host_codes = np.asarray([0, 1, 1], dtype=np.int64)
+    runtime = get_cuda_runtime()
+    original_admit = runtime.admit_device_memory
+    original_asarray = cp.asarray
+    admission_seen = False
+
+    def record_admission(**kwargs):
+        nonlocal admission_seen
+        admission_seen = True
+        return original_admit(**kwargs)
+
+    def require_admission_before_upload(values, *args, **kwargs):
+        if values is host_codes:
+            assert admission_seen
+        return original_asarray(values, *args, **kwargs)
+
+    monkeypatch.setattr(runtime, "admit_device_memory", record_admission)
+    monkeypatch.setattr(cp, "asarray", require_admission_before_upload)
+
+    with set_requested_mode(ExecutionMode.GPU):
+        counts = gpd.dense_count(host_codes, size=2, dtype=np.uint32)
+
+    assert admission_seen
+    assert cp.asnumpy(counts.array.expression.values).tolist() == [1, 2]
+
+
+@pytest.mark.gpu
+def test_dense_count_update_fits_envelope_that_rejects_second_domain_vector(
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.runtime.hotpath_trace import (
+        reset_hotpath_trace,
+        summarize_hotpath_trace,
+    )
+
+    group_count = 1_000_000
+    first = pd.Series(
+        NativeNumericExpressionArray(
+            NativeExpression(
+                operation="test.dense_count.envelope.first",
+                values=cp.asarray([0, 2, 2], dtype=cp.int64),
+                source_token="rows",
+                source_row_count=3,
+                dtype="int64",
+                precision="exact-integer",
+            )
+        )
+    )
+    second = pd.Series(
+        NativeNumericExpressionArray(
+            NativeExpression(
+                operation="test.dense_count.envelope.second",
+                values=cp.asarray([1, 2, 3], dtype=cp.int64),
+                source_token="rows",
+                source_row_count=3,
+                dtype="int64",
+                precision="exact-integer",
+            )
+        )
+    )
+    counts = gpd.dense_count(first, size=group_count, dtype=np.uint32)
+    storage = counts.array.expression.values
+    output_bytes = int(storage.nbytes)
+    runtime = get_cuda_runtime()
+    runtime.memory_admission_events(clear=True)
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "counter")
+    reset_hotpath_trace()
+    monkeypatch.setattr(
+        runtime,
+        "query_memory_remaining_bytes",
+        lambda: output_bytes - 1,
+    )
+
+    updated = gpd.dense_count(
+        second,
+        size=group_count,
+        dtype=np.uint32,
+        out=counts,
+    )
+    update_admission = runtime.memory_admission_events(clear=True)[-1]
+    update_stage = next(
+        stage
+        for stage in summarize_hotpath_trace()
+        if stage["name"] == "tabular.dense_count.update"
+    )
+    with pytest.raises(MemoryError, match="dense_count requires"):
+        gpd.dense_count(second, size=group_count, dtype=np.uint32)
+
+    assert updated is counts
+    assert counts.array.expression.values is storage
+    assert update_admission.stage == "tabular-dense-count-update"
+    assert update_admission.required_bytes < output_bytes
+    packet = update_stage["metadata"]["work_amplification"]
+    assert packet["max"]["persistent_output_bytes"] == output_bytes
+    assert packet["max"]["output_allocation_bytes"] == 0
+    assert packet["semantic_contract"] == {
+        "output_identity_reused": True,
+        "transactional_overflow": True,
+    }
+    assert cp.asnumpy(storage[:4]).tolist() == [1, 1, 3, 1]
 
 
 @pytest.mark.gpu
@@ -617,6 +962,17 @@ def test_tabular_operations_respect_explicit_execution_mode() -> None:
     assert gpu_counts.tolist() == [1, 2]
     assert gpu_event.requested is ExecutionMode.GPU
     assert gpu_event.selected is ExecutionMode.GPU
+
+    with set_requested_mode(ExecutionMode.CPU):
+        with pytest.raises(TypeError, match="host execution requires"):
+            gpd.dense_count(device_codes, size=2, out=gpu_counts)
+    with set_requested_mode(ExecutionMode.GPU):
+        with pytest.raises(TypeError, match="device execution requires"):
+            gpd.dense_count(
+                pd.Series([0, 1, 1]),
+                size=2,
+                out=pd.Series([0, 0], dtype=np.uint32),
+            )
 
 
 @pytest.mark.parametrize("codes", [[-1], [4]])

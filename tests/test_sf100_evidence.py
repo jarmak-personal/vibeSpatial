@@ -38,6 +38,8 @@ def test_q5_native_spill_crossover_is_shape_based_and_public() -> None:
 
     source = inspect.getsource(VibeSpatialQueries.q5)
     assert "write_geoparquet" in source
+    assert "out=group_counts" in source
+    assert "group_counts + batch_counts" not in source
     assert "NativePartitionedParquetSink" not in source
     assert "pylibcudf" not in source
 

@@ -15,6 +15,7 @@ from vibespatial.api.geo_base import (
     _native_expression_from_public_series,
 )
 from vibespatial.cuda.cccl_precompile import request_warmup
+from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 from vibespatial.runtime import ExecutionMode, get_requested_mode
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.hotpath_trace import (
@@ -23,7 +24,22 @@ from vibespatial.runtime.hotpath_trace import (
     hotpath_timing_enabled,
 )
 
+from ._dense_count_kernels import (
+    _DENSE_COUNT_UPDATE_KERNEL_NAMES,
+    _DENSE_COUNT_UPDATE_KERNEL_SOURCE,
+)
+
 request_warmup(["radix_sort_i64_i32", "segmented_reduce_sum_f64"])
+
+request_nvrtc_warmup(
+    [
+        (
+            "dense-count-update",
+            _DENSE_COUNT_UPDATE_KERNEL_SOURCE,
+            _DENSE_COUNT_UPDATE_KERNEL_NAMES,
+        )
+    ]
+)
 
 _SAFE_DIVIDE_KERNEL = None
 
@@ -436,6 +452,191 @@ def _count_dtype(dtype: Any) -> np.dtype:
     return normalized
 
 
+def _dense_count_update_kernels():
+    from vibespatial.cuda._runtime import compile_kernel_group
+
+    return compile_kernel_group(
+        "dense-count-update",
+        _DENSE_COUNT_UPDATE_KERNEL_SOURCE,
+        _DENSE_COUNT_UPDATE_KERNEL_NAMES,
+    )
+
+
+def _validate_dense_count_out(
+    out: pd.Series,
+    *,
+    group_count: int,
+    output_dtype: np.dtype,
+    use_device: bool,
+) -> NativeExpression | None:
+    if not isinstance(out, pd.Series):
+        raise TypeError("dense_count out must be a pandas Series")
+    if len(out) != group_count:
+        raise ValueError("dense_count out length must match size")
+    if not out.index.equals(pd.RangeIndex(group_count)):
+        raise ValueError("dense_count out index must be RangeIndex(size)")
+
+    expression = _native_expression_from_public_series(out)
+    if use_device:
+        if expression is None or not expression.is_device:
+            raise TypeError("dense_count device execution requires a device-backed out")
+        actual_dtype = np.dtype(expression.values.dtype)
+    else:
+        if expression is not None and expression.is_device:
+            raise TypeError("dense_count host execution requires a host-backed out")
+        try:
+            actual_dtype = np.dtype(out.dtype)
+        except TypeError as exc:
+            raise TypeError(
+                "dense_count out dtype must exactly match the requested dtype"
+            ) from exc
+    if actual_dtype != output_dtype:
+        raise TypeError("dense_count out dtype must exactly match the requested dtype")
+    return expression
+
+
+def _dense_count_host_update(
+    host_codes: np.ndarray,
+    out: pd.Series,
+    *,
+    output_dtype: np.dtype,
+) -> None:
+    if not host_codes.size:
+        return
+    unique_codes, increments = np.unique(host_codes, return_counts=True)
+    counts = out.to_numpy(copy=False)
+    current = counts[unique_codes]
+    headroom = np.asarray(np.iinfo(output_dtype).max, dtype=output_dtype) - current
+    if np.any(increments.astype(np.uint64, copy=False) > headroom):
+        raise OverflowError("dense_count update exceeds the requested count dtype")
+    out.iloc[unique_codes] = current + increments.astype(output_dtype, copy=False)
+
+
+def _dense_count_device_update(
+    d_indices,
+    d_counts,
+    *,
+    output_dtype: np.dtype,
+) -> tuple[Any, ...]:
+    """Transactionally add one code batch without domain-sized scratch."""
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import (
+        KERNEL_PARAM_I64,
+        KERNEL_PARAM_PTR,
+        get_cuda_runtime,
+    )
+
+    row_count = int(d_indices.size)
+    if row_count == 0:
+        return ()
+    code_stride_bytes = int(d_indices.strides[0])
+    count_stride_bytes = int(d_counts.strides[0])
+    code_itemsize = int(d_indices.dtype.itemsize)
+    count_itemsize = int(d_counts.dtype.itemsize)
+    if code_stride_bytes % code_itemsize or count_stride_bytes % count_itemsize:
+        raise ValueError("dense_count device vectors require element-aligned strides")
+    code_stride = code_stride_bytes // code_itemsize
+    count_stride = count_stride_bytes // count_itemsize
+    if int(d_counts.size) > 1 and count_stride == 0:
+        raise ValueError("dense_count out must not alias accumulator elements")
+    if cp.shares_memory(d_indices, d_counts):
+        raise ValueError("dense_count codes and out must not share device storage")
+    runtime = get_cuda_runtime()
+    suffix = "u32" if output_dtype == np.dtype(np.uint32) else "u64"
+    kernels = _dense_count_update_kernels()
+
+    def launch_config(kernel):
+        grid, block = runtime.launch_config(kernel, row_count)
+        multiprocessors = int(cp.cuda.Device().attributes["MultiProcessorCount"])
+        return (min(grid[0], multiprocessors * 4), 1, 1), block
+
+    risk = cp.zeros(1, dtype=cp.uint32)
+    preflight = kernels[f"dense_count_preflight_{suffix}"]
+    grid, block = launch_config(preflight)
+    runtime.launch(
+        preflight,
+        grid=grid,
+        block=block,
+        params=(
+            (
+                runtime.pointer(d_indices),
+                code_stride,
+                runtime.pointer(d_counts),
+                count_stride,
+                row_count,
+                runtime.pointer(risk),
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I64,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I64,
+                KERNEL_PARAM_I64,
+                KERNEL_PARAM_PTR,
+            ),
+        ),
+    )
+    update = kernels[f"dense_count_update_{suffix}"]
+    grid, block = launch_config(update)
+    runtime.launch(
+        update,
+        grid=grid,
+        block=block,
+        params=(
+            (
+                runtime.pointer(d_indices),
+                code_stride,
+                runtime.pointer(d_counts),
+                count_stride,
+                row_count,
+                runtime.pointer(risk),
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I64,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I64,
+                KERNEL_PARAM_I64,
+                KERNEL_PARAM_PTR,
+            ),
+        ),
+    )
+    exact_inputs: tuple[Any, ...] = ()
+    if _device_any(
+        risk,
+        reason="public dense-count transactional overflow preflight fence",
+    ):
+        exact_required_bytes = max(1, row_count * 112)
+        exact_admission = runtime.admit_device_memory(
+            stage="tabular-dense-count-update-exact-overflow",
+            required_bytes=exact_required_bytes,
+            requested_units=row_count,
+        )
+        if not exact_admission.admitted:
+            raise MemoryError(
+                "dense_count exact overflow validation requires "
+                f"{exact_required_bytes} device bytes with "
+                f"{exact_admission.remaining_bytes} available"
+            )
+        unique_codes, increments = cp.unique(d_indices, return_counts=True)
+        current = d_counts[unique_codes]
+        headroom = cp.asarray(np.iinfo(output_dtype).max, dtype=output_dtype) - current
+        unsafe = increments.astype(cp.uint64, copy=False) > headroom
+        if _device_any(
+            cp.any(unsafe),
+            reason="public dense-count exact overflow validation fence",
+        ):
+            raise OverflowError("dense_count update exceeds the requested count dtype")
+        cp.add.at(
+            d_counts,
+            unique_codes,
+            increments.astype(output_dtype, copy=False),
+        )
+        exact_inputs = (unique_codes, increments, current, headroom, unsafe)
+    return (risk, *exact_inputs)
+
+
 def _public_native_series(
     expression: NativeExpression,
     *,
@@ -592,47 +793,91 @@ def dense_count(
     size: int,
     dtype: Any = np.uint32,
     name: Any = None,
+    out: pd.Series | None = None,
 ) -> pd.Series:
     """Count non-negative integer codes into a fixed-size dense Series.
 
     This is the fixed-domain counterpart of ``numpy.bincount``. ``codes`` must
     be one-dimensional and every value must be in ``[0, size)``. Device-backed
-    vibeSpatial expressions produce a device-backed real pandas Series.
+    vibeSpatial expressions produce a device-backed real pandas Series. When
+    ``out`` is supplied, the batch is added transactionally to that same Series
+    without allocating another fixed-domain vector. The accumulator must have
+    exactly the requested unsigned dtype, length, and ``RangeIndex(size)``, and
+    its residency must match the selected execution mode. Overflow raises
+    before any counters from the batch are changed. Device-backed ``codes``
+    and ``out`` must not overlap because the update reads codes while mutating
+    counters.
     """
     group_count = int(size)
     if group_count < 0:
         raise ValueError("dense_count size must be non-negative")
     output_dtype = _count_dtype(dtype)
     expression = _native_expression_from_public_series(codes)
+    if out is not None and not isinstance(out, pd.Series):
+        raise TypeError("dense_count out must be a pandas Series")
+    out_expression = (
+        None if out is None else _native_expression_from_public_series(out)
+    )
     requested = get_requested_mode()
     use_device = requested is ExecutionMode.GPU or (
         requested is not ExecutionMode.CPU
-        and expression is not None
-        and expression.is_device
+        and any(
+            candidate is not None and candidate.is_device
+            for candidate in (expression, out_expression)
+        )
     )
+    if out is not None:
+        out_expression = _validate_dense_count_out(
+            out,
+            group_count=group_count,
+            output_dtype=output_dtype,
+            use_device=use_device,
+        )
     if use_device:
         import cupy as cp
 
         from vibespatial.cuda._runtime import get_cuda_runtime
 
-        d_codes = cp.asarray(
-            expression.values if expression is not None else np.asarray(codes)
-        )
-        if d_codes.ndim != 1 or d_codes.dtype.kind not in {"i", "u"}:
+        source_codes = expression.values if expression is not None else np.asarray(codes)
+        source_is_device = expression is not None and expression.is_device
+        if source_is_device:
+            source_shape = source_codes.shape
+            source_dtype = np.dtype(source_codes.dtype)
+            source_size = int(source_codes.size)
+            upload_bytes = 0
+        else:
+            source_codes = np.asarray(source_codes)
+            source_shape = source_codes.shape
+            source_dtype = source_codes.dtype
+            source_size = int(source_codes.size)
+            upload_bytes = int(source_codes.nbytes)
+        if len(source_shape) != 1 or source_dtype.kind not in {"i", "u"}:
             raise TypeError("dense_count codes must be one-dimensional integers")
-        if int(d_codes.size) > int(np.iinfo(output_dtype).max):
+        if source_size > int(np.iinfo(output_dtype).max):
             raise OverflowError("dense_count input exceeds the requested count dtype")
-        output_bytes = group_count * int(output_dtype.itemsize)
-        index_bytes = (
-            0 if d_codes.dtype == cp.dtype(cp.int64) else int(d_codes.size) * 8
+        output_bytes = (
+            0 if out is not None else group_count * int(output_dtype.itemsize)
         )
+        index_bytes = (
+            0 if source_dtype == np.dtype(np.int64) else source_size * 8
+        )
+        validation_bytes = source_size * 3
+        update_state_bytes = 2 * int(np.dtype(np.uint32).itemsize) if out is not None else 0
         required_bytes = max(
-            int(d_codes.size),
-            output_bytes + index_bytes,
+            1,
+            output_bytes
+            + upload_bytes
+            + index_bytes
+            + validation_bytes
+            + update_state_bytes,
         )
         runtime = get_cuda_runtime()
         admission = runtime.admit_device_memory(
-            stage="tabular-dense-count",
+            stage=(
+                "tabular-dense-count-update"
+                if out is not None
+                else "tabular-dense-count"
+            ),
             required_bytes=required_bytes,
             requested_units=group_count,
         )
@@ -642,6 +887,7 @@ def dense_count(
                 f"{required_bytes} device bytes with "
                 f"{admission.remaining_bytes} available"
             )
+        d_codes = cp.asarray(source_codes)
         invalid = (d_codes < 0) | (d_codes >= group_count)
         if int(d_codes.size) and _device_any(
             cp.any(invalid),
@@ -650,35 +896,95 @@ def dense_count(
             raise ValueError("dense_count codes must be in [0, size)")
         del invalid
         d_indices = d_codes.astype(cp.int64, copy=False)
-        d_counts = cp.zeros(group_count, dtype=output_dtype)
-        if int(d_codes.size):
-            cp.add.at(d_counts, d_indices, 1)
-        result_expression = NativeExpression(
-            operation="dense_count",
-            values=d_counts,
-            source_token=None,
-            source_row_count=group_count,
-            dtype=str(output_dtype),
-            precision="exact-integer-count",
-        )
+        retained_inputs: tuple[Any, ...] = (d_codes, d_indices)
+        if out is None:
+            d_counts = cp.zeros(group_count, dtype=output_dtype)
+            if int(d_codes.size):
+                cp.add.at(d_counts, d_indices, 1)
+            result_expression = NativeExpression(
+                operation="dense_count",
+                values=d_counts,
+                source_token=None,
+                source_row_count=group_count,
+                dtype=str(output_dtype),
+                precision="exact-integer-count",
+            )
+            result = _public_native_series(
+                result_expression,
+                index=pd.RangeIndex(group_count),
+                name=name,
+                operation="dense_count_to_public_array",
+            )
+        else:
+            d_counts = cp.asarray(out_expression.values)
+            _sync_tabular_hotpath()
+            with hotpath_stage(
+                "tabular.dense_count.update",
+                category="other",
+                metadata={
+                    "input_rows": int(d_indices.size),
+                    "group_domain": group_count,
+                    "persistent_output_bytes": int(d_counts.nbytes),
+                    "output_allocation_bytes": 0,
+                    "dtype": output_dtype.name,
+                },
+            ) as stage_metadata:
+                update_inputs = _dense_count_device_update(
+                    d_indices,
+                    d_counts,
+                    output_dtype=output_dtype,
+                )
+                attach_work_amplification(
+                    stage_metadata,
+                    operation="dense_count_update",
+                    metric_family="tabular",
+                    sums={"updated_input_rows": int(d_indices.size)},
+                    maxima={
+                        "batch_rows": int(d_indices.size),
+                        "group_domain": group_count,
+                        "persistent_output_bytes": int(d_counts.nbytes),
+                        "output_allocation_bytes": 0,
+                    },
+                    physical_shape="persistent fixed-domain integer scatter accumulator",
+                    consumer_kind="next streamed dense-count batch",
+                    semantic_contract={
+                        "transactional_overflow": True,
+                        "output_identity_reused": True,
+                    },
+                )
+                _sync_tabular_hotpath()
+            retained_inputs += update_inputs
+            result = out
+        if retained_inputs and int(d_codes.size):
+            from vibespatial.cuda._runtime import get_cuda_completion_retainer
+
+            get_cuda_completion_retainer().defer(
+                cp.cuda.get_current_stream(),
+                retained_inputs,
+                lambda _arrays: None,
+            )
         record_dispatch_event(
             surface="vibespatial.api.dense_count",
             operation="dense_count",
-            implementation="cupy_dense_scatter_count",
-            reason="fixed-domain integer codes reduced into a dense device count vector",
+            implementation=(
+                "cuda_dense_scatter_count_update"
+                if out is not None
+                else "cupy_dense_scatter_count"
+            ),
+            reason=(
+                "integer codes updated a persistent device count vector in place"
+                if out is not None
+                else "fixed-domain integer codes reduced into a dense device count vector"
+            ),
             detail=(
                 f"input_rows={int(d_codes.size)}, groups={group_count}, "
-                f"dtype={output_dtype.name}"
+                f"dtype={output_dtype.name}, mode={'update' if out is not None else 'create'}, "
+                f"output_allocation_bytes={output_bytes}"
             ),
             requested=requested,
             selected=ExecutionMode.GPU,
         )
-        return _public_native_series(
-            result_expression,
-            index=pd.RangeIndex(group_count),
-            name=name,
-            operation="dense_count_to_public_array",
-        )
+        return result
 
     host_codes = np.asarray(codes)
     if host_codes.ndim != 1 or host_codes.dtype.kind not in {"i", "u"}:
@@ -687,22 +993,40 @@ def dense_count(
         raise OverflowError("dense_count input exceeds the requested count dtype")
     if np.any((host_codes < 0) | (host_codes >= group_count)):
         raise ValueError("dense_count codes must be in [0, size)")
-    counts = np.zeros(group_count, dtype=output_dtype)
-    if host_codes.size:
-        np.add.at(counts, host_codes.astype(np.int64, copy=False), 1)
+    if out is None:
+        counts = np.zeros(group_count, dtype=output_dtype)
+        if host_codes.size:
+            np.add.at(counts, host_codes.astype(np.int64, copy=False), 1)
+        result = pd.Series(counts, index=pd.RangeIndex(group_count), name=name)
+    else:
+        _dense_count_host_update(
+            host_codes.astype(np.int64, copy=False),
+            out,
+            output_dtype=output_dtype,
+        )
+        result = out
     record_dispatch_event(
         surface="vibespatial.api.dense_count",
         operation="dense_count",
-        implementation="numpy_dense_scatter_count",
-        reason="host integer codes reduced into a fixed-domain dense count vector",
+        implementation=(
+            "numpy_dense_scatter_count_update"
+            if out is not None
+            else "numpy_dense_scatter_count"
+        ),
+        reason=(
+            "integer codes updated a persistent host count vector in place"
+            if out is not None
+            else "host integer codes reduced into a fixed-domain dense count vector"
+        ),
         detail=(
             f"input_rows={int(host_codes.size)}, groups={group_count}, "
-            f"dtype={output_dtype.name}"
+            f"dtype={output_dtype.name}, mode={'update' if out is not None else 'create'}, "
+            f"output_allocation_bytes={0 if out is not None else counts.nbytes}"
         ),
         requested=requested,
         selected=ExecutionMode.CPU,
     )
-    return pd.Series(counts, index=pd.RangeIndex(group_count), name=name)
+    return result
 
 
 def dense_sum(

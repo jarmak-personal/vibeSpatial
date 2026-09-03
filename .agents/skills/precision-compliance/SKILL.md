@@ -260,7 +260,7 @@ Edit the "Current Compliance Status" section below:
 The compliance ledger file is at:
 `.agents/skills/precision-compliance/SKILL.md` (this file — the section below).
 
-## Current Compliance Status (as of 2026-08-31, updated during session)
+## Current Compliance Status (as of 2026-09-01, updated during session)
 
 ### Fully compliant (plan computed AND kernel respects it)
 
@@ -285,6 +285,10 @@ The compliance ledger file is at:
 - `src/vibespatial/overlay/dissolve.py` (mixed) — delegates to lower-level GPU ops
 - `src/vibespatial/spatial/indexing.py` (COARSE) — dispatch via plan_dispatch_selection; no owned CUDA kernel to template
 - `src/vibespatial/constructive/make_valid_gpu.py` (CONSTRUCTIVE) — fp64 by design per ADR-0002; GPU repair kernels (close_rings, flag_duplicate_vertices, reverse_ring_coords, split event kernels) all use fp64 storage and compute
+
+### Exact byte codecs outside arithmetic precision dispatch
+
+- `src/vibespatial/kernels/core/wkb_decode.py` (IO decode) — integer fields and IEEE-754 coordinate bit patterns are decoded exactly in each owning record's byte order; output storage remains fp64 and a `PrecisionPlan` downcast is forbidden because the kernel performs no coordinate arithmetic.
 
 ### Priority order (highest performance impact first)
 
