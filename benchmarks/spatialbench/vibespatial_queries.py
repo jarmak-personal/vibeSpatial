@@ -17,12 +17,13 @@
 """Optimized SpatialBench implementation using public vibeSpatial APIs."""
 
 import gc
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
 import pandas as pd
-from shapely.geometry import Polygon
+from shapely.geometry import Point, Polygon
 
 try:
     from .geoparquet_public_api_queries import CRS, GeoParquetPublicApiQueries
@@ -30,6 +31,7 @@ except ImportError:  # SpatialBench loads this entrypoint as a standalone module
     from geoparquet_public_api_queries import CRS, GeoParquetPublicApiQueries
 
 import vibespatial as gpd
+from vibespatial.api.tabular import _numeric_divide, _streaming_topk
 
 gpd.set_execution_mode(gpd.ExecutionMode.AUTO)
 
@@ -46,6 +48,108 @@ class VibeSpatialQueries(GeoParquetPublicApiQueries):
     @classmethod
     def _q5_uses_native_spill(cls, group_domain: int) -> bool:
         return int(group_domain) >= cls._Q5_NATIVE_SPILL_GROUP_DOMAIN_THRESHOLD
+
+    @staticmethod
+    @contextmanager
+    def _terminal_export(*, rows: int, columns: int):
+        """Record one bounded terminal-export phase for a completed query."""
+        from vibespatial.runtime.hotpath_trace import (
+            attach_work_amplification,
+            hotpath_stage,
+            hotpath_timing_enabled,
+        )
+
+        timing = hotpath_timing_enabled()
+        if timing:
+            from vibespatial.cuda._runtime import get_cuda_runtime
+
+            get_cuda_runtime().synchronize()
+        with hotpath_stage(
+            "spatialbench.terminal_export",
+            category="emit",
+            metadata={"terminal_export": True},
+        ) as stage_metadata:
+            try:
+                yield
+            finally:
+                if timing:
+                    get_cuda_runtime().synchronize()
+                attach_work_amplification(
+                    stage_metadata,
+                    operation="spatialbench_terminal_export",
+                    metric_family="materialization",
+                    sums={
+                        "output_rows": int(rows),
+                        "output_columns": int(columns),
+                        "public_frame_materializations": 1,
+                        "diagnostic_synchronizations": 2 if timing else 0,
+                    },
+                    maxima={"output_rows": int(rows)},
+                    physical_shape="bounded terminal result export",
+                    consumer_kind="SpatialBench result serializer",
+                    semantic_contract={
+                        "selected_rows_bulk_exported": False,
+                        "single_terminal_export_phase": True,
+                    },
+                )
+
+    def _spatial_frames(self, path, columns, geometry, *, batch_rows=None):
+        """Expose a bounded scan/decode stage without claiming a GDS transport."""
+        from vibespatial.runtime.hotpath_trace import (
+            attach_work_amplification,
+            hotpath_stage,
+            hotpath_timing_enabled,
+        )
+
+        # Always select the budgeted dataset reader when it is available.  The
+        # inherited compatibility plan switches at 100 source files, which
+        # creates a physical-shape cliff at intermediate scale tiers.  Passing
+        # the configured upper row target keeps every tier on the same
+        # metadata- and live-memory-admitted chunk equations.
+        resolved_batch_rows = batch_rows or self.scan_batch_rows or 2_000_000
+        batches = iter(
+            super()._spatial_frames(
+                path,
+                columns,
+                geometry,
+                batch_rows=resolved_batch_rows,
+            )
+        )
+        while True:
+            if hotpath_timing_enabled():
+                from vibespatial.cuda._runtime import get_cuda_runtime
+
+                get_cuda_runtime().synchronize()
+            try:
+                with hotpath_stage(
+                    "spatialbench.scan_decode",
+                    category="setup",
+                    metadata={"projected_columns": len(columns)},
+                ) as stage_metadata:
+                    frame = next(batches)
+                    if hotpath_timing_enabled():
+                        from vibespatial.cuda._runtime import get_cuda_runtime
+
+                        get_cuda_runtime().synchronize()
+                    attach_work_amplification(
+                        stage_metadata,
+                        operation="spatialbench_scan_decode",
+                        metric_family="io",
+                        sums={"input_batches": 1, "input_rows": len(frame)},
+                        maxima={
+                            "batch_rows": len(frame),
+                            "projected_columns": len(columns),
+                        },
+                        physical_shape="bounded GeoParquet scan and GeoArrow decode",
+                        consumer_kind="native query batch",
+                        semantic_contract={
+                            "transport": "backend-reported-only",
+                            "direct_gds_inferred": False,
+                        },
+                    )
+            except StopIteration:
+                return
+            yield frame
 
     def _candidate_zones_for_q6(self, data_paths):
         """Apply Q6's selective zone predicate before table concatenation."""
@@ -139,10 +243,7 @@ class VibeSpatialQueries(GeoParquetPublicApiQueries):
             "t_fare",
             "t_pickuploc",
         ]
-        total_trips = None
-        distance_sum = None
-        duration_sum = None
-        fare_sum = None
+        accumulator = None
         group_count = self._DATETIME_MONTH_CODE_DOMAIN
 
         for trips in self._spatial_frames(
@@ -165,17 +266,9 @@ class VibeSpatialQueries(GeoParquetPublicApiQueries):
                     "_duration_sum": duration,
                     "_fare_sum": selected["t_fare"].astype(float),
                 },
+                out=accumulator,
             )
-            if total_trips is None:
-                total_trips = batch["total_trips"]
-                distance_sum = batch["_distance_sum"]
-                duration_sum = batch["_duration_sum"]
-                fare_sum = batch["_fare_sum"]
-            else:
-                total_trips = total_trips + batch["total_trips"]
-                distance_sum = distance_sum + batch["_distance_sum"]
-                duration_sum = duration_sum + batch["_duration_sum"]
-                fare_sum = fare_sum + batch["_fare_sum"]
+            accumulator = batch
             del (
                 batch,
                 duration,
@@ -184,7 +277,7 @@ class VibeSpatialQueries(GeoParquetPublicApiQueries):
                 trips,
             )
 
-        if total_trips is None:
+        if accumulator is None:
             return pd.DataFrame(
                 columns=[
                     "pickup_month",
@@ -198,33 +291,38 @@ class VibeSpatialQueries(GeoParquetPublicApiQueries):
         # This is the single terminal host-export phase. Each transferred vector
         # is either fixed datetime-domain capacity or observed-month capacity;
         # no selected source rows cross it.
-        count_values = total_trips.to_numpy(dtype=np.uint64, copy=False)
-        observed = np.flatnonzero(count_values)
-        distance_values = self.gpd.numeric_take(
-            distance_sum,
-            observed,
-        ).to_numpy(dtype=np.float64, copy=False)
-        duration_values = self.gpd.numeric_take(
-            duration_sum,
-            observed,
-        ).to_numpy(dtype=np.float64, copy=False)
-        fare_values = self.gpd.numeric_take(
-            fare_sum,
-            observed,
-        ).to_numpy(dtype=np.float64, copy=False)
-        observed_counts = count_values[observed]
-        years, months = np.divmod(observed - 1, 12)
-        return pd.DataFrame(
-            {
-                "pickup_month": pd.to_datetime(
-                    {"year": years, "month": months + 1, "day": 1}
-                ),
-                "total_trips": observed_counts,
-                "avg_distance": distance_values / observed_counts,
-                "avg_duration": duration_values / observed_counts,
-                "avg_fare": fare_values / observed_counts,
-            }
-        ).reset_index(drop=True)
+        with self._terminal_export(rows=group_count, columns=5):
+            total_trips = accumulator["total_trips"]
+            distance_sum = accumulator["_distance_sum"]
+            duration_sum = accumulator["_duration_sum"]
+            fare_sum = accumulator["_fare_sum"]
+            count_values = total_trips.to_numpy(dtype=np.uint64, copy=False)
+            observed = np.flatnonzero(count_values)
+            distance_values = self.gpd.numeric_take(
+                distance_sum,
+                observed,
+            ).to_numpy(dtype=np.float64, copy=False)
+            duration_values = self.gpd.numeric_take(
+                duration_sum,
+                observed,
+            ).to_numpy(dtype=np.float64, copy=False)
+            fare_values = self.gpd.numeric_take(
+                fare_sum,
+                observed,
+            ).to_numpy(dtype=np.float64, copy=False)
+            observed_counts = count_values[observed]
+            years, months = np.divmod(observed - 1, 12)
+            return pd.DataFrame(
+                {
+                    "pickup_month": pd.to_datetime(
+                        {"year": years, "month": months + 1, "day": 1}
+                    ),
+                    "total_trips": observed_counts,
+                    "avg_distance": distance_values / observed_counts,
+                    "avg_duration": duration_values / observed_counts,
+                    "avg_fare": fare_values / observed_counts,
+                }
+            ).reset_index(drop=True)
 
     def q5(self, data_paths):
         """Run Q5 with a bounded, device-native partition-clustered spill.
@@ -462,54 +560,105 @@ class VibeSpatialQueries(GeoParquetPublicApiQueries):
         selected = ranked.nlargest(k, rank_columns)
         return selected.drop(columns=derived_columns) if derived_columns else selected
 
-    def _q7_shard_topk(self, trips):
-        pickup = trips.geometry
-        dropoff = trips.set_geometry("t_dropoffloc").geometry
-        line_distance = pickup.distance(dropoff, align=False) / 0.000009
-        reported = trips["t_distance"].astype(float)
-        detour_ratio = (reported / line_distance) * (line_distance / line_distance)
-        metrics = trips.drop(columns=["t_dropoffloc"]).assign(
-            reported_distance_m=reported,
-            line_distance_m=line_distance,
-            detour_ratio=detour_ratio,
-            __vibespatial_topk_tie_2=0 - trips["t_tripkey"],
-        )
-        selected = metrics.nlargest(
-            100,
-            [
-                "detour_ratio",
-                "reported_distance_m",
-                "__vibespatial_topk_tie_2",
-            ],
-        )
+    def q1(self, data_paths):
+        """Keep distance-filtered winners resident across bounded scan batches."""
+        center = Point(-111.7610, 34.8697)
+        accumulator = None
+        source_columns = ["t_tripkey", "t_pickuptime", "t_pickuploc"]
+        rank_columns = ["__distance_rank", "__tripkey_rank"]
+        for trips in self._spatial_frames(
+            data_paths["trip"], source_columns, "t_pickuploc"
+        ):
+            distance = trips.geometry.distance(center)
+            metrics = trips.assign(
+                distance_to_center=distance,
+                __distance_rank=0 - distance,
+                __tripkey_rank=0 - trips["t_tripkey"],
+            )
+            candidates = metrics.loc[distance <= 0.45]
+            accumulator = _streaming_topk(
+                candidates,
+                100,
+                rank_columns,
+                largest=True,
+                out=accumulator,
+            )
+            del candidates, distance, metrics, trips
+
+        columns = [
+            "t_tripkey",
+            "pickup_lon",
+            "pickup_lat",
+            "t_pickuptime",
+            "distance_to_center",
+        ]
+        if accumulator is None:
+            return pd.DataFrame(columns=columns)
+        result = accumulator.drop(columns=rank_columns)
+        # One terminal export phase after the complete stream has been reduced.
+        with self._terminal_export(rows=len(result), columns=len(columns)):
+            return pd.DataFrame(
+                {
+                    "t_tripkey": result["t_tripkey"].to_numpy(),
+                    "pickup_lon": result.geometry.x.to_numpy(),
+                    "pickup_lat": result.geometry.y.to_numpy(),
+                    "t_pickuptime": result["t_pickuptime"].to_numpy(),
+                    "distance_to_center": result["distance_to_center"].to_numpy(),
+                },
+                columns=columns,
+            )
+
+    def q7(self, data_paths):
+        """Fuse ratio construction and retain only native top-k candidates."""
+        accumulator = None
+        source_columns = [
+            "t_tripkey",
+            "t_distance",
+            "t_pickuploc",
+            "t_dropoffloc",
+        ]
+        rank_columns = [
+            "detour_ratio",
+            "reported_distance_m",
+            "__tripkey_rank",
+        ]
+        for trips in self._spatial_frames(
+            data_paths["trip"], source_columns, "t_pickuploc"
+        ):
+            pickup = trips.geometry
+            dropoff = trips["t_dropoffloc"]
+            line_distance = pickup.distance(dropoff, align=False) / 0.000009
+            reported = trips["t_distance"].astype(float)
+            detour_ratio = _numeric_divide(reported, line_distance)
+            base = trips.drop(columns=["t_dropoffloc"])
+            candidates = base.assign(
+                reported_distance_m=reported,
+                line_distance_m=line_distance,
+                detour_ratio=detour_ratio,
+                __tripkey_rank=0 - trips["t_tripkey"],
+            )
+            accumulator = _streaming_topk(
+                candidates,
+                100,
+                rank_columns,
+                largest=True,
+                out=accumulator,
+            )
+            del base, candidates, detour_ratio, dropoff, line_distance, pickup, reported, trips
+
         columns = [
             "t_tripkey",
             "reported_distance_m",
             "line_distance_m",
             "detour_ratio",
         ]
-        return pd.DataFrame(
-            {column: selected[column].to_numpy() for column in columns}
-        )
-
-    def _q1_shard_topk(self, trips, center):
-        distance = trips.geometry.distance(center)
-        metrics = trips.assign(distance_to_center=distance)
-        selected = self._topk_frame(
-            metrics.loc[distance <= 0.45],
-            100,
-            by=["distance_to_center", "t_tripkey"],
-            ascending=[True, True],
-        )
-        return pd.DataFrame(
-            {
-                "t_tripkey": selected["t_tripkey"].to_numpy(),
-                "pickup_lon": selected.geometry.x.to_numpy(),
-                "pickup_lat": selected.geometry.y.to_numpy(),
-                "t_pickuptime": selected["t_pickuptime"].to_numpy(),
-                "distance_to_center": selected["distance_to_center"].to_numpy(),
-            }
-        )
+        if accumulator is None:
+            return pd.DataFrame(columns=columns)
+        with self._terminal_export(rows=len(accumulator), columns=len(columns)):
+            return pd.DataFrame(
+                {column: accumulator[column].to_numpy() for column in columns},
+                columns=columns,
+            )
 
     def _knn5_batch(self, pickups, buildings):
         import numpy as np

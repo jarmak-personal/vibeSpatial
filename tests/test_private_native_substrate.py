@@ -1164,6 +1164,134 @@ def test_geodataframe_topk_prepares_later_keys_only_for_primary_boundary(
     ] == 100
 
 
+def test_streaming_topk_compacts_device_row_views_without_runtime_d2h() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device streaming top-k")
+    from vibespatial.api.tabular import _streaming_topk
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    first = _device_topk_frame(
+        pa.table(
+            {
+                "primary": pa.array([4.0, 8.0, 8.0]),
+                "secondary": pa.array([9, 2, 1], type=pa.int64()),
+                "source_position": pa.array([0, 1, 2], type=pa.int64()),
+            }
+        )
+    )
+    second = _device_topk_frame(
+        pa.table(
+            {
+                "primary": pa.array([9.0, 8.0, 7.0]),
+                "secondary": pa.array([5, 3, 0], type=pa.int64()),
+                "source_position": pa.array([3, 4, 5], type=pa.int64()),
+            }
+        )
+    )
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        retained = _streaming_topk(first, 3, ["primary", "secondary"])
+        retained = _streaming_topk(
+            second,
+            3,
+            ["primary", "secondary"],
+            out=retained,
+        )
+    state = get_native_state(retained)
+
+    assert state is not None
+    assert state.row_count == 3
+    assert state.geometry.owned is not None
+    assert not state.geometry.owned.is_indexed_view
+    assert retained["source_position"].tolist() == [3, 4, 1]
+    reset_d2h_transfer_count()
+
+
+@pytest.mark.gpu
+def test_trusted_singular_composition_physicalizes_variable_width_without_d2h() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for singular composition physicalization")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    line = LineString([(0, 0), (1, 1), (2, 0), (3, 2)])
+    polygon = Polygon(
+        [
+            (10, 10),
+            (14, 10),
+            (14, 14),
+            (10, 14),
+            (10, 10),
+        ],
+        holes=[
+            [
+                (11, 11),
+                (12, 11),
+                (12, 12),
+                (11, 12),
+                (11, 11),
+            ]
+        ],
+    )
+    first = from_shapely_geometries(
+        [line, LineString(), None, None],
+        residency=Residency.DEVICE,
+    )
+    line_buffer = first.device_state.families[GeometryFamily.LINESTRING]
+    line_buffer.x = cp.concatenate((line_buffer.x, cp.full(10_000, 999.0)))
+    line_buffer.y = cp.concatenate((line_buffer.y, cp.full(10_000, 999.0)))
+    second = from_shapely_geometries(
+        [None, Point(5, 5), Polygon(), polygon],
+        residency=Residency.DEVICE,
+    )
+    rows = cp.arange(4, dtype=cp.int64)
+    geometry = GeometryNativeResult.from_composition(
+        NativeGeometryComposition(
+            parts=(
+                NativeGeometryCompositionPart(
+                    GeometryNativeResult.from_owned(first, crs=None),
+                    rows,
+                ),
+                NativeGeometryCompositionPart(
+                    GeometryNativeResult.from_owned(second, crs=None),
+                    rows,
+                ),
+            ),
+            row_count=4,
+            crs=None,
+            trusted_singular_rows=True,
+        ),
+        crs=None,
+    )
+    reset_d2h_transfer_count()
+
+    with assert_zero_d2h_transfers():
+        physical = geometry.physicalize_singular_device_rows()
+
+    assert physical is not None
+    assert physical.owned is not None
+    assert physical.owned.residency is Residency.DEVICE
+    assert not physical.owned.is_indexed_view
+    assert physical.owned._base is None
+    compact_line = physical.owned.device_state.families[GeometryFamily.LINESTRING]
+    assert int(compact_line.x.size) == len(line.coords)
+    assert int(compact_line.y.size) == len(line.coords)
+    actual = physical.owned.to_shapely()
+    assert actual[0].equals(line)
+    assert actual[1].equals(Point(5, 5))
+    assert actual[2].geom_type == "Polygon" and actual[2].is_empty
+    assert actual[3].equals(polygon)
+    reset_d2h_transfer_count()
+
+
 @pytest.mark.parametrize("method", ["nlargest", "nsmallest"])
 @pytest.mark.parametrize("keep", ["first", "last", "all"])
 def test_geodataframe_topk_float_semantic_matrix_matches_pandas(
@@ -3197,6 +3325,31 @@ def test_native_attribute_table_concat_preserves_device_payload_without_runtime_
     assert cp.asnumpy(arrays["score"]).tolist() == [1.5, 2.5, 3.5]
     assert cp.asnumpy(arrays["flag"]).tolist() == [True, False, True]
     reset_d2h_transfer_count()
+
+
+@pytest.mark.gpu
+def test_native_attribute_concat_physicalizes_device_row_views() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device attribute row-view concat")
+    cp = pytest.importorskip("cupy")
+    plc = pytest.importorskip("pylibcudf")
+
+    arrow = pa.table({"score": pa.array([1.0, 2.0, 3.0], type=pa.float64())})
+    source = NativeAttributeTable(
+        device_table=plc.Table.from_arrow(arrow),
+        index_override=pd.RangeIndex(3),
+        column_override=("score",),
+        schema_override=arrow.schema,
+    )
+    left = source.take(cp.asarray([2, 0], dtype=cp.int64), preserve_index=False)
+    right = source.take(cp.asarray([1], dtype=cp.int64), preserve_index=False)
+
+    concatenated = NativeAttributeTable.concat([left, right], ignore_index=True)
+    arrays = concatenated.numeric_column_arrays(("score",))
+
+    assert len(concatenated) == 3
+    assert arrays is not None
+    assert cp.asnumpy(arrays["score"]).tolist() == [3.0, 1.0, 2.0]
 
 
 def test_all_valid_single_family_owned_device_take_avoids_scalar_d2h_probes() -> None:
@@ -10719,6 +10872,37 @@ def test_native_frame_state_from_native_tabular_result() -> None:
     assert state.column_order == ("value", "geometry", "other_geometry")
     assert len(state.to_native_tabular_result().secondary_geometry) == 1
     assert state.index_plan.kind == "range"
+
+
+def test_native_frame_state_projection_removes_unrequested_secondary_geometry() -> None:
+    attrs = NativeAttributeTable(dataframe=pd.DataFrame({"value": [1, 2]}))
+    geometry = GeometryNativeResult.from_geoseries(
+        GeoSeries.from_wkt(["POINT (0 0)", "POINT (1 1)"], name="geometry")
+    )
+    secondary = GeometryNativeResult.from_geoseries(
+        GeoSeries.from_wkt(["POINT (2 2)", "POINT (3 3)"], name="other_geometry")
+    )
+    state = NativeFrameState.from_native_tabular_result(
+        NativeTabularResult(
+            attributes=attrs,
+            geometry=geometry,
+            geometry_name="geometry",
+            column_order=("value", "geometry", "other_geometry"),
+            secondary_geometry=(
+                NativeGeometryColumn("other_geometry", secondary),
+            ),
+        )
+    )
+
+    projected = state.project_columns(("value", "geometry"))
+
+    assert projected is not None
+    assert projected.column_order == ("value", "geometry")
+    assert projected.secondary_geometry == ()
+    assert projected.to_native_tabular_result().column_order == (
+        "value",
+        "geometry",
+    )
 
 
 def test_public_metadata_export_helper_preserves_cached_geometry_metadata() -> None:

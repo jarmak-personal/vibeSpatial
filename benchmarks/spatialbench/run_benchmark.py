@@ -428,6 +428,8 @@ def normalize(df):
                 if not str(col).endswith(DURATION_SUFFIX):
                     rename[col] = f"{col}{DURATION_SUFFIX}"
         elif pd.api.types.is_datetime64_any_dtype(s):
+            if isinstance(s.dtype, pd.DatetimeTZDtype):
+                s = s.dt.tz_convert("UTC").dt.tz_localize(None)
             df[col] = s.astype("datetime64[us]")
     return df.rename(columns=rename)
 

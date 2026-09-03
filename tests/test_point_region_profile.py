@@ -673,7 +673,7 @@ def test_public_query_aggregate_reuses_selected_region_preparation(
     preparation = snapshot["index_preparation"]
     assert len(preparation) == 1
     assert preparation[0]["build_count"] == 1
-    assert preparation[0]["cache_hits"] >= 3
+    assert preparation[0]["cache_hits"] >= 2
     assert snapshot["groups"][0]["launches"] >= 2
     assert snapshot["groups"][0]["counters"]["candidates"] > 0
     trace = get_hotpath_trace()
@@ -692,11 +692,25 @@ def test_public_query_aggregate_reuses_selected_region_preparation(
     carrier_packet = carrier_stages[-1].metadata["work_amplification"]
     assert carrier_packet["physical_shape"] == "prepared_selected_region_view"
     assert carrier_packet["semantic_contract"]["carrier"] == (
-        "ancestral_indexed_view"
+        "compact_prepared_derivative"
     )
     assert carrier_packet["max"]["candidate_work_upper_bound"] == (
         point_count * len(selected)
     )
+    assert carrier_packet["max"]["cumulative_candidate_work"] == (
+        3 * point_count * len(selected)
+    )
+    assert carrier_packet["max"]["compact_coordinate_capacity"] < (
+        carrier_packet["max"]["ancestral_coordinate_capacity"]
+    )
+    assert carrier_packet["sum"]["selected_geometry_parts"] == 4
+    assert carrier_packet["sum"]["selected_geometry_edges"] > 0
+    assert carrier_packet["max"]["selected_geometry_bytes"] > 0
+    assert carrier_packet["max"]["ancestral_geometry_bytes"] > (
+        carrier_packet["max"]["selected_geometry_bytes"]
+    )
+    assert carrier_packet["max"]["uses_to_amortize_preparation"] >= 1
+    assert carrier_packet["unavailable"] == ["transient_peak_bytes"]
     reduction_packet = reduction_stages[-1].metadata["work_amplification"]
     assert reduction_packet["physical_shape"] == (
         "native_relation_grouped_numeric_reduction"
@@ -710,9 +724,68 @@ def test_public_query_aggregate_reuses_selected_region_preparation(
     assert len(carrier_events) == 3
     assert [event.implementation for event in carrier_events] == [
         "compact_selected",
-        "ancestral_indexed_view",
-        "ancestral_indexed_view",
+        "compact_prepared_derivative",
+        "compact_prepared_derivative",
     ]
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+def test_query_aggregate_reuses_prepared_ancestor_before_compaction(
+    monkeypatch,
+) -> None:
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+    from vibespatial.predicates import point_location_index
+    from vibespatial.predicates.point_location_index import (
+        cached_polygon_part_y_index,
+        prepare_point_region_y_indexes,
+    )
+
+    points = GeoDataFrame(
+        {"weight": np.arange(64, dtype=np.float64)},
+        geometry=points_from_xy(
+            np.linspace(-1.0, 4.0, 64),
+            np.linspace(-1.0, 4.0, 64),
+        ),
+    )
+    regions_owned = from_shapely_geometries(
+        [
+            MultiPolygon([box(-2.0, -2.0, 2.0, 2.0)]),
+            MultiPolygon(
+                [box(1.0, 1.0, 5.0, 5.0), box(6.0, 6.0, 7.0, 7.0)]
+            ),
+        ],
+        residency=Residency.DEVICE,
+    )
+    monkeypatch.setattr(point_location_index, "_MIN_PREPARED_COORDINATES", 0)
+    prepare_point_region_y_indexes(regions_owned, points.geometry.values._owned)
+    ancestor_state = regions_owned._ensure_device_state(preserve_indexed_view=True)
+    assert cached_polygon_part_y_index(
+        ancestor_state,
+        GeometryFamily.MULTIPOLYGON,
+    ) is not None
+
+    selected = regions_owned._device_indexed_take(
+        cp.asarray([1], dtype=cp.int64),
+        assume_unique_indices=True,
+    )
+    assert selected.is_indexed_view
+    selected_state = selected._ensure_device_state(preserve_indexed_view=True)
+    assert selected_state.spatial_aggregate_compact_carriers == {}
+
+    with assert_zero_d2h_transfers():
+        carrier = points.sindex._query_aggregate_owned_input(
+            selected,
+            predicate="contains",
+        )
+
+    assert carrier is selected
+    assert selected_state.spatial_aggregate_compact_carriers == {}
+    assert cached_polygon_part_y_index(
+        selected_state,
+        GeometryFamily.MULTIPOLYGON,
+    ) is not None
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")

@@ -666,6 +666,12 @@ class OwnedGeometryDeviceState:
     spatial_aggregate_query_uses: dict[tuple[Any, ...], int] = field(
         default_factory=dict
     )
+    spatial_aggregate_candidate_work: dict[tuple[Any, ...], int] = field(
+        default_factory=dict
+    )
+    spatial_aggregate_compact_carriers: dict[tuple[Any, ...], Any] = field(
+        default_factory=dict
+    )
     polygon_certificates: dict[tuple[str, GeometryFamily, int], Any] = field(
         default_factory=dict
     )

@@ -13,6 +13,10 @@ from shapely.geometry import Point
 import vibespatial
 from benchmarks.spatialbench import sf100_evidence
 from benchmarks.spatialbench.vibespatial_queries import VibeSpatialQueries
+from vibespatial.runtime.hotpath_trace import (
+    reset_hotpath_trace,
+    summarize_hotpath_trace,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPARATOR = (
@@ -36,6 +40,34 @@ def test_q5_native_spill_crossover_is_shape_based_and_public() -> None:
     assert "write_geoparquet" in source
     assert "NativePartitionedParquetSink" not in source
     assert "pylibcudf" not in source
+
+
+def test_spatialbench_terminal_export_records_one_bounded_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "counter")
+    reset_hotpath_trace()
+
+    with VibeSpatialQueries._terminal_export(rows=100, columns=5):
+        pass
+
+    stage = next(
+        item
+        for item in summarize_hotpath_trace()
+        if item["name"] == "spatialbench.terminal_export"
+    )
+    packet = stage["metadata"]["work_amplification"]
+    assert stage["calls"] == 1
+    assert packet["sum"] == {
+        "diagnostic_synchronizations": 0,
+        "output_columns": 5,
+        "output_rows": 100,
+        "public_frame_materializations": 1,
+    }
+    assert packet["semantic_contract"] == {
+        "selected_rows_bulk_exported": False,
+        "single_terminal_export_phase": True,
+    }
 
 
 @pytest.mark.gpu
@@ -123,7 +155,9 @@ def test_q3_public_plan_merges_dense_month_reductions_before_terminal_export(
     assert len(vibespatial.get_materialization_events(clear=True)) == 4
     bulk_transfers = [event for event in transfers if event.bytes_transferred > 8]
     assert len(bulk_transfers) == 4
-    assert sum("native_series_arithmetic" in event.reason for event in bulk_transfers) == 1
+    assert not any(
+        "native_series_arithmetic" in event.reason for event in bulk_transfers
+    )
     assert sum("numeric_take_to_public_array" in event.reason for event in bulk_transfers) == 3
     assert all(
         event.bytes_transferred <= 8

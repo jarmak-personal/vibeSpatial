@@ -78,9 +78,16 @@ class NativeFrameState:
             return None
         if requested == self.column_order:
             return self
+        secondary_names = {
+            column.name for column in self.secondary_geometry
+        }
         projected_attributes = _project_attributes(
             self.attributes,
-            tuple(column for column in requested if column != self.geometry_name),
+            tuple(
+                column
+                for column in requested
+                if column != self.geometry_name and column not in secondary_names
+            ),
         )
         if projected_attributes is None:
             return None
@@ -88,6 +95,11 @@ class NativeFrameState:
             self,
             attributes=projected_attributes,
             column_order=requested,
+            secondary_geometry=tuple(
+                column
+                for column in self.secondary_geometry
+                if column.name in requested
+            ),
         )
 
     def _rowset_with_geometry_proofs(self, rowset: NativeRowSet) -> NativeRowSet:

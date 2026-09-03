@@ -2775,7 +2775,14 @@ class NativeAttributeTable:
                 if plc is not None:
                     from vibespatial.cuda._runtime import pylibcudf_current_stream
 
-                    sources = [table.device_table for table in tables]
+                    sources = [
+                        (
+                            table.device_table
+                            if table.row_positions is None
+                            else table._gathered_device_table()
+                        )
+                        for table in tables
+                    ]
                     concatenated = plc.concatenate.concatenate(
                         sources,
                         stream=pylibcudf_current_stream(*sources),
@@ -3084,6 +3091,25 @@ class GeometryNativeResult:
         if self.composition is not None:
             return self.composition._singular_owned_cache
         return None
+
+    def physicalize_singular_device_rows(self) -> GeometryNativeResult | None:
+        """Collapse a proven singular device result into one compact owner."""
+        if self.residency is not Residency.DEVICE:
+            return None
+        owned = self.owned
+        if owned is None and self.composition is not None:
+            if not self.composition.trusted_singular_rows:
+                return None
+            owned = self.composition._singular_owned_device()
+        if owned is None:
+            return None
+        if owned.is_indexed_view:
+            owned = owned.physicalize_device_rows(allow_capacity_allocation=True)
+        return type(self).from_owned(
+            owned,
+            crs=self.crs,
+            operation_provenance=self.operation_provenance,
+        )
 
     def apply_rowset_proofs(self, rowset) -> None:
         """Apply semantic row-selection proofs to existing owned storage."""
@@ -4090,22 +4116,27 @@ class NativeGeometryComposition:
             )
             concrete.append((owned, d_rows, d_valid, d_nonempty))
 
-        admission = _host_array(
-            cp.stack((cp.all(d_counts <= 1), cp.all(d_valid_counts > 0))),
-            dtype=np.bool_,
-            strict_disallowed=False,
-            surface="vibespatial.api.NativeGeometryComposition.to_geoseries",
-            operation="singular_owned_certification",
-            reason=(
-                "terminal geometry composition multiplicity certified before "
-                "device owned physicalization"
-            ),
-            detail=f"rows={self.row_count}, parts={len(self.parts)}",
-        )
-        if not bool(admission[0]):
-            return None
-
-        full_valid_coverage = bool(admission[1])
+        if self.trusted_singular_rows:
+            # A bounded native consumer may compact this carrier repeatedly.
+            # Preserve exact nulls with the all-null base below rather than
+            # synchronizing merely to prove that every row has coverage.
+            full_valid_coverage = False
+        else:
+            admission = _host_array(
+                cp.stack((cp.all(d_counts <= 1), cp.all(d_valid_counts > 0))),
+                dtype=np.bool_,
+                strict_disallowed=False,
+                surface="vibespatial.api.NativeGeometryComposition.to_geoseries",
+                operation="singular_owned_certification",
+                reason=(
+                    "terminal geometry composition multiplicity certified before "
+                    "device owned physicalization"
+                ),
+                detail=f"rows={self.row_count}, parts={len(self.parts)}",
+            )
+            if not bool(admission[0]):
+                return None
+            full_valid_coverage = bool(admission[1])
         selected_codes = cp.zeros(self.row_count, dtype=cp.uint64)
         part_codes = []
         high_bit = cp.uint64(1) << cp.uint64(63)
@@ -4129,21 +4160,47 @@ class NativeGeometryComposition:
                 strict=True,
             )
         ]
-        from vibespatial.geometry.owned import (
-            device_physicalize_owned_row_selections_exact,
-        )
+        if self.trusted_singular_rows:
+            from vibespatial.geometry.owned import (
+                device_physicalize_owned_row_selection_capacity,
+            )
 
-        physical_parts = device_physicalize_owned_row_selections_exact(
-            [
-                (owned, d_selected)
+            # The producer's singularity proof removes the only host-side
+            # decision this transition would otherwise need.  Give each part
+            # a structural-capacity allocation, mask it entirely on device,
+            # and let the final injective row map collapse those bounded
+            # carriers into one standalone owner.  Variable-width families
+            # retain exact offsets for active rows; unused allocation capacity
+            # is unreachable and never becomes logical geometry.
+            physical_parts = [
+                device_physicalize_owned_row_selection_capacity(
+                    owned,
+                    d_selected,
+                )
                 for (owned, _d_rows, _d_valid, _d_nonempty), d_selected in zip(
                     concrete,
                     selected_masks,
                     strict=True,
                 )
-            ],
-            reason="native geometry composition exact physicalization allocation packet",
-        )
+            ]
+        else:
+            from vibespatial.geometry.owned import (
+                device_physicalize_owned_row_selections_exact,
+            )
+
+            physical_parts = device_physicalize_owned_row_selections_exact(
+                [
+                    (owned, d_selected)
+                    for (owned, _d_rows, _d_valid, _d_nonempty), d_selected in zip(
+                        concrete,
+                        selected_masks,
+                        strict=True,
+                    )
+                ],
+                reason=(
+                    "native geometry composition exact physicalization allocation packet"
+                ),
+            )
 
         partitioned_parts = []
         for (

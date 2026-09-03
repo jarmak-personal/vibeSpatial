@@ -38,6 +38,66 @@ if compat.GEOS_GE_310:
     PREDICATES.update(["dwithin"])
 
 
+def _geometry_capacity_metrics(state, families) -> dict[str, int]:
+    """Summarize device allocation shape without reading logical counts."""
+    coordinate_lanes = 0
+    polygon_parts = 0
+    polygon_rings = 0
+    polygon_edges = 0
+    allocated_bytes = sum(
+        int(array.nbytes)
+        for array in (state.validity, state.tags, state.family_row_offsets)
+    )
+    for family in families:
+        buffer = state.families.get(family)
+        if buffer is None:
+            continue
+        coordinate_count = int(buffer.x.size)
+        coordinate_lanes += coordinate_count
+        allocated_bytes += int(buffer.x.nbytes) + int(buffer.y.nbytes)
+        allocated_bytes += int(buffer.geometry_offsets.nbytes)
+        allocated_bytes += int(buffer.empty_mask.nbytes)
+        if buffer.part_offsets is not None:
+            allocated_bytes += int(buffer.part_offsets.nbytes)
+        if buffer.ring_offsets is not None:
+            allocated_bytes += int(buffer.ring_offsets.nbytes)
+        if buffer.bounds is not None:
+            allocated_bytes += int(buffer.bounds.nbytes)
+
+        if family is GeometryFamily.POLYGON:
+            part_count = max(int(buffer.geometry_offsets.size) - 1, 0)
+            ring_count = max(int(buffer.ring_offsets.size) - 1, 0)
+        elif family is GeometryFamily.MULTIPOLYGON:
+            part_count = max(int(buffer.part_offsets.size) - 1, 0)
+            ring_count = max(int(buffer.ring_offsets.size) - 1, 0)
+        else:
+            continue
+        polygon_parts += part_count
+        polygon_rings += ring_count
+        # Canonical polygon rings are closed, so each ring's coordinate count
+        # includes one repeated endpoint that does not add another edge.
+        polygon_edges += max(coordinate_count - ring_count, 0)
+    return {
+        "coordinate_lanes": coordinate_lanes,
+        "polygon_parts": polygon_parts,
+        "polygon_rings": polygon_rings,
+        "polygon_edges": polygon_edges,
+        "allocated_bytes": allocated_bytes,
+    }
+
+
+def _share_prepared_point_location_state(target_state, source_state, families) -> None:
+    """Attach immutable ancestral prepared indexes to an indexed-view state."""
+    for family in families:
+        decision = source_state.point_location_index_decisions.get(family)
+        if decision is None or decision.admitted_bin_count is None:
+            continue
+        target_state.point_location_index_decisions[family] = decision
+        for key, prepared in source_state.point_location_indexes.items():
+            if getattr(key, "family", None) is family:
+                target_state.point_location_indexes[key] = prepared
+
+
 class SpatialIndex:
     """A simple wrapper around Shapely's STRTree.
 
@@ -2092,6 +2152,10 @@ class SpatialIndex:
 
         tree_owned, _flat_index = self._owned_flat_sindex()
         query_state = owned._ensure_device_state(preserve_indexed_view=True)
+        ancestral_owner = owned._base if owned._base is not None else owned
+        ancestral_state = ancestral_owner._ensure_device_state(
+            preserve_indexed_view=True,
+        )
         tree_state = tree_owned._ensure_device_state(preserve_indexed_view=True)
         query_families = set(
             query_state.trusted_family_domain or tuple(query_state.families)
@@ -2116,16 +2180,20 @@ class SpatialIndex:
         )
         use_count = query_state.spatial_aggregate_query_uses.get(shape_key, 0) + 1
         query_state.spatial_aggregate_query_uses[shape_key] = use_count
-        coordinate_capacity = sum(
-            int(query_state.families[family].x.size)
+        ancestral_coordinate_capacity = sum(
+            int(ancestral_state.families[family].x.size)
             for family in region_families
-            if family in query_state.families
+            if family in ancestral_state.families
         )
         candidate_work_upper_bound = int(owned.row_count) * int(tree_owned.row_count)
-        repeated_work_admitted = (
-            use_count > 1
-            and candidate_work_upper_bound >= coordinate_capacity
+        cumulative_candidate_work = (
+            query_state.spatial_aggregate_candidate_work.get(shape_key, 0)
+            + candidate_work_upper_bound
         )
+        query_state.spatial_aggregate_candidate_work[shape_key] = (
+            cumulative_candidate_work
+        )
+        repeated_work_admitted = False
         carrier = "compact_selected"
         reason = "prepared ancestral-view execution is not applicable"
 
@@ -2133,48 +2201,163 @@ class SpatialIndex:
             "spatial.query_aggregate.query_input",
             category="setup",
         ) as stage_metadata:
-            if (
-                predicate == "contains"
-                and polygon_query
-                and point_tree
-                and repeated_work_admitted
-            ):
+            ancestral_metrics = _geometry_capacity_metrics(
+                ancestral_state,
+                region_families,
+            )
+            compact = None
+            compact_state = None
+            selected_metrics = None
+            compact_coordinate_capacity = 0
+            selected = owned
+
+            if predicate == "contains" and polygon_query and point_tree:
                 from vibespatial.predicates.point_location_index import (
                     cached_polygon_part_y_index,
                     prepare_point_region_y_indexes,
                 )
 
-                prepare_point_region_y_indexes(owned, tree_owned)
-                prepared = {
-                    family: cached_polygon_part_y_index(query_state, family)
+                ancestral_prepared = {
+                    family: cached_polygon_part_y_index(ancestral_state, family)
                     for family in region_families
                 }
-                if all(value is not None for value in prepared.values()):
+                if all(value is not None for value in ancestral_prepared.values()):
+                    _share_prepared_point_location_state(
+                        query_state,
+                        ancestral_state,
+                        region_families,
+                    )
                     carrier = "ancestral_indexed_view"
                     reason = (
-                        "reusable prepared point-location state was admitted "
+                        "existing ancestral point-location state was reused "
                         "for every selected region family"
                     )
                     selected = owned
+                    repeated_work_admitted = True
                 else:
-                    reason = (
-                        "prepared point-location state was not admitted for "
-                        "every selected region family"
+                    compact = query_state.spatial_aggregate_compact_carriers.get(
+                        shape_key
                     )
-                    selected = compact_indexed_spatial_input(owned)
+                    if compact is None:
+                        compact = compact_indexed_spatial_input(owned)
+                        query_state.spatial_aggregate_compact_carriers[shape_key] = (
+                            compact
+                        )
+                    compact_state = compact._ensure_device_state(
+                        preserve_indexed_view=True,
+                    )
+                    selected_metrics = _geometry_capacity_metrics(
+                        compact_state,
+                        region_families,
+                    )
+                    compact_coordinate_capacity = selected_metrics[
+                        "coordinate_lanes"
+                    ]
+                    compact_prepared = {
+                        family: cached_polygon_part_y_index(compact_state, family)
+                        for family in region_families
+                    }
+                    compact_cache_hit = all(
+                        value is not None for value in compact_prepared.values()
+                    )
+                    if compact_cache_hit:
+                        carrier = "compact_prepared_derivative"
+                        reason = (
+                            "stable compact prepared derivative was reused for "
+                            "every selected region family"
+                        )
+                        selected = compact
+                        repeated_work_admitted = True
+                    else:
+                        prepare_compact = (
+                            compact_coordinate_capacity
+                            <= ancestral_coordinate_capacity
+                        )
+                        preparation_work = (
+                            compact_coordinate_capacity
+                            if prepare_compact
+                            else ancestral_coordinate_capacity
+                        )
+                        repeated_work_admitted = (
+                            use_count > 1
+                            and cumulative_candidate_work >= preparation_work
+                        )
+                        selected = compact
+                        if repeated_work_admitted:
+                            preparation_owner = (
+                                compact if prepare_compact else ancestral_owner
+                            )
+                            preparation_state = (
+                                compact_state
+                                if prepare_compact
+                                else ancestral_state
+                            )
+                            prepare_point_region_y_indexes(
+                                preparation_owner,
+                                tree_owned,
+                            )
+                            prepared = {
+                                family: cached_polygon_part_y_index(
+                                    preparation_state,
+                                    family,
+                                )
+                                for family in region_families
+                            }
+                            if all(
+                                value is not None for value in prepared.values()
+                            ):
+                                if prepare_compact:
+                                    carrier = "compact_prepared_derivative"
+                                    reason = (
+                                        "cumulative candidate work admitted a "
+                                        "stable compact prepared derivative"
+                                    )
+                                else:
+                                    _share_prepared_point_location_state(
+                                        query_state,
+                                        ancestral_state,
+                                        region_families,
+                                    )
+                                    carrier = "ancestral_indexed_view"
+                                    reason = (
+                                        "cumulative candidate work admitted reusable "
+                                        "ancestral point-location state"
+                                    )
+                                    selected = owned
+                            else:
+                                repeated_work_admitted = False
+                                reason = (
+                                    "prepared point-location state was declined by "
+                                    "the live memory envelope"
+                                )
+                        elif use_count <= 1:
+                            reason = (
+                                "selected query owner has no repeated-consumer "
+                                "evidence yet"
+                            )
+                        else:
+                            reason = (
+                                "cumulative candidate work does not amortize "
+                                "selected preparation"
+                            )
             else:
                 if predicate != "contains":
                     reason = "predicate does not use the prepared contains shape"
                 elif not polygon_query or not point_tree:
                     reason = "inputs are not a polygonal-query over a homogeneous point tree"
-                elif use_count <= 1:
-                    reason = "selected query owner has no repeated-consumer evidence yet"
-                else:
-                    reason = (
-                        "estimated candidate work does not amortize ancestral "
-                        "coordinate preparation"
-                    )
-                selected = compact_indexed_spatial_input(owned)
+                compact = query_state.spatial_aggregate_compact_carriers.get(shape_key)
+                if compact is None:
+                    compact = compact_indexed_spatial_input(owned)
+                    query_state.spatial_aggregate_compact_carriers[shape_key] = compact
+                compact_state = compact._ensure_device_state(
+                    preserve_indexed_view=True,
+                )
+                selected_metrics = _geometry_capacity_metrics(
+                    compact_state,
+                    region_families,
+                )
+                compact_coordinate_capacity = selected_metrics["coordinate_lanes"]
+                selected = compact
 
             if stage_metadata is not None:
                 base_rows = (
@@ -2182,27 +2365,91 @@ class SpatialIndex:
                     if owned.is_indexed_view and owned._base is not None
                     else owned.row_count
                 )
+                preparation_work_estimate = (
+                    ancestral_coordinate_capacity
+                    if selected_metrics is None
+                    else min(
+                        ancestral_coordinate_capacity,
+                        compact_coordinate_capacity,
+                    )
+                )
+                uses_to_amortize = (
+                    (preparation_work_estimate + candidate_work_upper_bound - 1)
+                    // candidate_work_upper_bound
+                    if candidate_work_upper_bound
+                    else 0
+                )
+                carrier_metrics = (
+                    ancestral_metrics
+                    if carrier == "ancestral_indexed_view"
+                    else selected_metrics
+                )
+                selection_sums = {
+                    "selected_geometry_rows": int(owned.row_count),
+                    "ancestral_geometry_rows": int(base_rows),
+                    "query_owner_uses": int(use_count),
+                    f"carrier_{carrier}_calls": 1,
+                    "prepared_admitted_calls": int(repeated_work_admitted),
+                    "compact_copy_coordinate_lanes": int(
+                        compact_coordinate_capacity
+                    ),
+                }
+                selection_maxima = {
+                    "selected_geometry_rows": int(owned.row_count),
+                    "ancestral_geometry_rows": int(base_rows),
+                    "ancestral_geometry_bytes": ancestral_metrics["allocated_bytes"],
+                    "ancestral_geometry_parts": ancestral_metrics["polygon_parts"],
+                    "ancestral_geometry_rings": ancestral_metrics["polygon_rings"],
+                    "ancestral_geometry_edges": ancestral_metrics["polygon_edges"],
+                    "chosen_carrier_bytes": carrier_metrics["allocated_bytes"],
+                    "ancestral_coordinate_capacity": int(
+                        ancestral_coordinate_capacity
+                    ),
+                    "compact_coordinate_capacity": int(
+                        compact_coordinate_capacity
+                    ),
+                    "candidate_work_upper_bound": int(candidate_work_upper_bound),
+                    "cumulative_candidate_work": int(cumulative_candidate_work),
+                    "preparation_work_estimate": int(preparation_work_estimate),
+                    "uses_to_amortize_preparation": int(uses_to_amortize),
+                    "compact_coordinate_bytes_estimate": int(
+                        compact_coordinate_capacity * 16
+                    ),
+                }
+                unavailable = ["transient_peak_bytes"]
+                if selected_metrics is None:
+                    unavailable.extend(
+                        (
+                            "selected_geometry_parts",
+                            "selected_geometry_rings",
+                            "selected_geometry_edges",
+                            "selected_geometry_bytes",
+                        )
+                    )
+                else:
+                    selection_sums.update(
+                        {
+                            "selected_geometry_parts": selected_metrics[
+                                "polygon_parts"
+                            ],
+                            "selected_geometry_rings": selected_metrics[
+                                "polygon_rings"
+                            ],
+                            "selected_geometry_edges": selected_metrics[
+                                "polygon_edges"
+                            ],
+                        }
+                    )
+                    selection_maxima["selected_geometry_bytes"] = selected_metrics[
+                        "allocated_bytes"
+                    ]
                 attach_work_amplification(
                     stage_metadata,
                     operation="select_spatial_aggregate_query_carrier",
                     metric_family="selection",
-                    sums={
-                        "selected_geometry_rows": int(owned.row_count),
-                        "ancestral_geometry_rows": int(base_rows),
-                        "query_owner_uses": int(use_count),
-                    },
-                    maxima={
-                        "selected_geometry_rows": int(owned.row_count),
-                        "ancestral_geometry_rows": int(base_rows),
-                        "ancestral_coordinate_capacity": int(coordinate_capacity),
-                        "candidate_work_upper_bound": int(candidate_work_upper_bound),
-                    },
-                    unavailable=(
-                        "selected_geometry_parts",
-                        "selected_geometry_edges",
-                        "selected_geometry_bytes",
-                        "transient_peak_bytes",
-                    ),
+                    sums=selection_sums,
+                    maxima=selection_maxima,
+                    unavailable=unavailable,
                     physical_shape="prepared_selected_region_view",
                     consumer_kind="query_aggregate_grouped_reduction",
                     semantic_contract={

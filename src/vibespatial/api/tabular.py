@@ -14,8 +14,406 @@ from vibespatial.api.geo_base import (
     _attach_native_expression,
     _native_expression_from_public_series,
 )
+from vibespatial.cuda.cccl_precompile import request_warmup
 from vibespatial.runtime import ExecutionMode, get_requested_mode
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.hotpath_trace import (
+    attach_work_amplification,
+    hotpath_stage,
+    hotpath_timing_enabled,
+)
+
+request_warmup(["radix_sort_i64_i32", "segmented_reduce_sum_f64"])
+
+_SAFE_DIVIDE_KERNEL = None
+
+
+def _sync_tabular_hotpath() -> None:
+    """Fence GPU work only when diagnostic stage timing is explicitly enabled."""
+    if hotpath_timing_enabled():
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        get_cuda_runtime().synchronize()
+
+
+def _compact_streaming_topk_state(result: pd.DataFrame) -> pd.DataFrame:
+    """Detach a bounded native winner set from batch ancestry on device."""
+    from vibespatial.api._native_result_core import (
+        NativeAttributeTable,
+        NativeGeometryColumn,
+        NativeTabularResult,
+    )
+    from vibespatial.api._native_rowset import NativeIndexPlan
+    from vibespatial.api._native_state import get_native_state
+
+    state = get_native_state(result)
+    if state is None:
+        return result
+    composition_parts = (
+        len(state.geometry.composition.parts)
+        if state.geometry.composition is not None
+        else 1
+    )
+    _sync_tabular_hotpath()
+    with hotpath_stage(
+        "tabular.streaming_topk.compact",
+        category="emit",
+        metadata={
+            "output_rows": state.row_count,
+            "source_geometry_parts": composition_parts,
+        },
+    ) as stage_metadata:
+        geometry = state.geometry.physicalize_singular_device_rows()
+        if geometry is None:
+            return result
+        secondary_geometry = []
+        for column in state.secondary_geometry:
+            compact = column.geometry.physicalize_singular_device_rows()
+            if compact is None:
+                return result
+            secondary_geometry.append(NativeGeometryColumn(column.name, compact))
+        attributes = NativeAttributeTable.from_value(
+            state.attributes
+        )._physicalize_device_row_view()
+        index = pd.RangeIndex(state.row_count)
+        compact_result = NativeTabularResult(
+            attributes=attributes.with_index(index),
+            geometry=geometry,
+            geometry_name=state.geometry_name,
+            column_order=state.column_order,
+            attrs=state.attrs,
+            secondary_geometry=tuple(secondary_geometry),
+            provenance=None,
+            geometry_metadata=None,
+            index_plan=NativeIndexPlan.from_index(index),
+        ).to_geodataframe()
+        attach_work_amplification(
+            stage_metadata,
+            operation="streaming_topk_compact",
+            metric_family="tabular",
+            sums={"compacted_rows": state.row_count},
+            maxima={
+                "output_rows": state.row_count,
+                "source_geometry_parts": composition_parts,
+            },
+            physical_shape="bounded winner rows -> standalone native carrier",
+            consumer_kind="next streaming top-k batch",
+        )
+        _sync_tabular_hotpath()
+    return compact_result
+
+
+def _safe_divide_device(left, right, fill_value, *, dtype):
+    """Launch one cached elementwise expression without a validity buffer."""
+    import cupy as cp
+
+    global _SAFE_DIVIDE_KERNEL
+    if _SAFE_DIVIDE_KERNEL is None:
+        _SAFE_DIVIDE_KERNEL = cp.ElementwiseKernel(
+            "T numerator, T denominator, T fill_value",
+            "T output",
+            "output = denominator != (T)0 "
+            "? numerator / denominator : fill_value;",
+            "vibespatial_safe_numeric_divide",
+        )
+    return _SAFE_DIVIDE_KERNEL(
+        left.astype(dtype, copy=False),
+        right.astype(dtype, copy=False),
+        dtype.type(fill_value),
+    )
+
+
+def _streaming_topk(
+    frame: pd.DataFrame,
+    n: int,
+    columns,
+    *,
+    largest: bool = True,
+    keep: str = "first",
+    out: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Merge one input batch into a bounded exact top-k frame.
+
+    Device-backed frames retain their native geometry, attributes, and row
+    references.  The accumulator owns at most one batch-local selection plus
+    the previous result.  Streaming currently admits ``keep='first'`` because
+    pandas' other tie modes are not compositionally bounded across batches;
+    use one-shot ``nlargest``/``nsmallest`` for those modes.
+    """
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("streaming_topk frame must be a pandas DataFrame")
+    if out is not None and not isinstance(out, pd.DataFrame):
+        raise TypeError("streaming_topk out must be a pandas DataFrame")
+    if isinstance(n, (bool, np.bool_)) or not isinstance(n, (int, np.integer)):
+        raise TypeError("streaming_topk n must be an integer")
+    n = int(n)
+    if n < 0:
+        raise ValueError("streaming_topk n must be non-negative")
+    if keep not in {"first", "last", "all"}:
+        raise ValueError("streaming_topk keep must be 'first', 'last', or 'all'")
+    if keep != "first":
+        raise NotImplementedError(
+            "streaming_topk currently supports only keep='first'; "
+            "use one-shot nlargest/nsmallest for keep='last' or keep='all'"
+        )
+    sort_columns = [columns] if isinstance(columns, (str, bytes)) else list(columns)
+    if not sort_columns:
+        raise ValueError("streaming_topk requires at least one ordering column")
+    missing = [column for column in sort_columns if column not in frame.columns]
+    if missing:
+        raise KeyError(missing)
+    if out is not None:
+        if not frame.columns.equals(out.columns):
+            raise ValueError("streaming_topk out columns must match frame columns")
+        missing = [column for column in sort_columns if column not in out.columns]
+        if missing:
+            raise KeyError(missing)
+
+    input_rows = len(frame)
+    operation = "nlargest" if largest else "nsmallest"
+    selector = getattr(frame, operation)
+    with hotpath_stage(
+        "tabular.streaming_topk.batch_select",
+        category="sort",
+        metadata={
+            "input_rows": input_rows,
+            "requested_rows": n,
+            "ordering_keys": len(sort_columns),
+        },
+    ) as stage_metadata:
+        batch = selector(n, sort_columns, keep=keep)
+        attach_work_amplification(
+            stage_metadata,
+            operation="streaming_topk_batch_select",
+            metric_family="tabular",
+            sums={"input_rows": input_rows, "selected_rows": len(batch)},
+            maxima={
+                "input_rows": input_rows,
+                "selected_rows": len(batch),
+                "requested_rows": n,
+            },
+            physical_shape="batch rowset -> bounded ordered NativeRowSet",
+            consumer_kind="streaming top-k accumulator",
+            semantic_contract={"keep": keep, "largest": bool(largest)},
+        )
+
+    if out is None or out.empty:
+        result = batch
+        merged_rows = len(batch)
+    elif batch.empty:
+        # ``out`` may have been created with a larger prior bound.  Reapply
+        # the requested bound even though this batch contributes no rows.
+        result = getattr(out, operation)(n, sort_columns, keep=keep)
+        merged_rows = len(out)
+    else:
+        merged_rows = len(out) + len(batch)
+        merge_inputs = (out, batch)
+        with hotpath_stage(
+            "tabular.streaming_topk.merge",
+            category="sort",
+            metadata={
+                "retained_rows": len(out),
+                "batch_rows": len(batch),
+                "requested_rows": n,
+            },
+        ) as stage_metadata:
+            from vibespatial.api._native_state import get_native_state
+
+            retained_state = get_native_state(out)
+            batch_state = get_native_state(batch)
+            if (
+                retained_state is not None
+                and batch_state is not None
+                and retained_state.geometry_name == batch_state.geometry_name
+                and retained_state.column_order == batch_state.column_order
+            ):
+                from vibespatial.api._native_result_core import NativeTabularResult
+                from vibespatial.api._native_results import (
+                    _concat_native_tabular_results,
+                )
+                from vibespatial.api._native_rowset import NativeIndexPlan
+
+                def _result_with_range_index(state):
+                    index = pd.RangeIndex(state.row_count)
+                    return NativeTabularResult(
+                        attributes=state.attributes.with_index(index),
+                        geometry=state.geometry,
+                        geometry_name=state.geometry_name,
+                        column_order=state.column_order,
+                        attrs=state.attrs,
+                        secondary_geometry=state.secondary_geometry,
+                        provenance=state.provenance,
+                        geometry_metadata=state.geometry_metadata_cache,
+                        index_plan=NativeIndexPlan.from_index(index),
+                    )
+
+                merge_states = (
+                    retained_state,
+                    batch_state,
+                )
+                merged_native = _concat_native_tabular_results(
+                    [
+                        _result_with_range_index(state) for state in merge_states
+                    ],
+                    geometry_name=retained_state.geometry_name,
+                    crs=getattr(out, "crs", None),
+                    ignore_index=True,
+                )
+                merged = merged_native.to_geodataframe()
+            else:
+                merged = pd.concat(merge_inputs, ignore_index=True)
+            result = getattr(merged, operation)(n, sort_columns, keep=keep)
+            attach_work_amplification(
+                stage_metadata,
+                operation="streaming_topk_merge",
+                metric_family="tabular",
+                sums={"merged_rows": merged_rows, "output_rows": len(result)},
+                maxima={
+                    "retained_rows": len(out),
+                    "batch_rows": len(batch),
+                    "merged_rows": merged_rows,
+                    "output_rows": len(result),
+                },
+                physical_shape="bounded NativeFrameState merge",
+                consumer_kind="persistent streaming top-k state",
+                semantic_contract={"keep": keep, "largest": bool(largest)},
+            )
+
+    from vibespatial.api._native_state import get_native_state
+
+    native = get_native_state(result) is not None
+    if native:
+        result = _compact_streaming_topk_state(result)
+    record_dispatch_event(
+        surface="vibespatial.api.tabular._streaming_topk",
+        operation="streaming_topk",
+        implementation=(
+            "native_bounded_streaming_topk" if native else "pandas_streaming_topk"
+        ),
+        reason=(
+            "batch-local winners merged into bounded device-resident state"
+            if native
+            else "host frame winners merged with pandas top-k semantics"
+        ),
+        detail=(
+            f"input_rows={input_rows}, merged_rows={merged_rows}, "
+            f"output_rows={len(result)}, n={n}, keep={keep!r}"
+        ),
+        requested=get_requested_mode(),
+        selected=ExecutionMode.GPU if native else ExecutionMode.CPU,
+    )
+    return result
+
+
+def _numeric_divide(
+    numerator,
+    denominator,
+    *,
+    fill_value: float = np.nan,
+    name: Any = None,
+) -> pd.Series:
+    """Divide positionally aligned vectors with zero fill in one native stage."""
+    if (
+        isinstance(numerator, pd.Series)
+        and isinstance(denominator, pd.Series)
+        and not numerator.index.equals(denominator.index)
+    ):
+        raise ValueError("numeric divide inputs must have identical indexes")
+    left_expression = _native_expression_from_public_series(numerator)
+    right_expression = _native_expression_from_public_series(denominator)
+    requested = get_requested_mode()
+    use_device = requested is ExecutionMode.GPU or (
+        requested is not ExecutionMode.CPU
+        and any(
+            expression is not None and expression.is_device
+            for expression in (left_expression, right_expression)
+        )
+    )
+    output_index = (
+        numerator.index.copy()
+        if isinstance(numerator, pd.Series)
+        else denominator.index.copy()
+        if isinstance(denominator, pd.Series)
+        else pd.RangeIndex(len(numerator))
+    )
+    output_name = getattr(numerator, "name", None) if name is None else name
+    if use_device:
+        import cupy as cp
+
+        left = cp.asarray(
+            left_expression.values
+            if left_expression is not None
+            else np.asarray(numerator)
+        )
+        right = cp.asarray(
+            right_expression.values
+            if right_expression is not None
+            else np.asarray(denominator)
+        )
+        if left.ndim != 1 or right.ndim != 1 or int(left.size) != int(right.size):
+            raise ValueError("numeric_divide inputs must be equal-length vectors")
+        dtype = np.result_type(left.dtype, right.dtype, np.float64)
+        with hotpath_stage(
+            "tabular.expression.safe_divide",
+            category="other",
+            metadata={"input_rows": int(left.size)},
+        ) as stage_metadata:
+            result = _safe_divide_device(
+                left,
+                right,
+                fill_value,
+                dtype=np.dtype(dtype),
+            )
+            attach_work_amplification(
+                stage_metadata,
+                operation="numeric_divide",
+                metric_family="tabular",
+                sums={"expression_rows": int(left.size)},
+                maxima={"input_rows": int(left.size), "output_rows": int(left.size)},
+                physical_shape="aligned fused elementwise expression",
+                consumer_kind="NativeExpression",
+            )
+        expression = NativeExpression(
+            operation="numeric_divide",
+            values=result,
+            source_token=None,
+            source_row_count=int(result.size),
+            dtype=str(result.dtype),
+            precision="fp64-derived-expression",
+        )
+        record_dispatch_event(
+            surface="vibespatial.api.tabular._numeric_divide",
+            operation="numeric_divide",
+            implementation="cupy_safe_divide",
+            reason="aligned division and zero-denominator fill remain device-native",
+            detail=f"input_rows={int(result.size)}, dtype={result.dtype}",
+            requested=requested,
+            selected=ExecutionMode.GPU,
+        )
+        return _public_native_series(
+            expression,
+            index=output_index,
+            name=output_name,
+            operation="numeric_divide_to_public_array",
+        )
+
+    left = np.asarray(numerator)
+    right = np.asarray(denominator)
+    if left.ndim != 1 or right.ndim != 1 or left.size != right.size:
+        raise ValueError("numeric_divide inputs must be equal-length vectors")
+    dtype = np.result_type(left.dtype, right.dtype, np.float64)
+    result = np.full(left.size, fill_value, dtype=dtype)
+    np.divide(left, right, out=result, where=right != 0)
+    record_dispatch_event(
+        surface="vibespatial.api.tabular._numeric_divide",
+        operation="numeric_divide",
+        implementation="numpy_safe_divide",
+        reason="host aligned division uses explicit zero-denominator fill",
+        detail=f"input_rows={int(result.size)}, dtype={result.dtype}",
+        requested=requested,
+        selected=ExecutionMode.CPU,
+    )
+    return pd.Series(result, index=output_index, name=output_name)
 
 
 def _count_dtype(dtype: Any) -> np.dtype:
@@ -122,10 +520,24 @@ def _device_dense_grouped_plan(d_indices, *, group_count: int):
     """Return stable ordering and dense segment offsets for deterministic sums."""
     import cupy as cp
 
+    from vibespatial.cuda.cccl_primitives import PairSortStrategy, sort_pairs
+
     counts = cp.bincount(d_indices, minlength=int(group_count))[
         : int(group_count)
     ].astype(cp.int64, copy=False)
-    order = cp.argsort(d_indices, kind="stable")
+    if int(d_indices.size) > int(np.iinfo(np.int32).max):
+        # The precompiled CCCL value carrier is int32. Preserve exact source
+        # ordering for exceptional wider rowsets instead of narrowing indexes.
+        order = cp.argsort(d_indices, kind="stable")
+        ends = cp.cumsum(counts, dtype=cp.int64)
+        return counts, order, ends - counts, ends
+    source_order = cp.arange(int(d_indices.size), dtype=cp.int32)
+    order = sort_pairs(
+        d_indices,
+        source_order,
+        strategy=PairSortStrategy.RADIX,
+        synchronize=False,
+    ).values
     ends = cp.cumsum(counts, dtype=cp.int64)
     starts = ends - counts
     return counts, order, starts, ends
@@ -453,12 +865,15 @@ def dense_grouped_reduce(
     count_name: Any | None = None,
     count_dtype: Any = np.uint64,
     sum_dtype: Any = np.float64,
+    out: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Reduce count and named numeric sums into one fixed-domain device state.
 
     Code-domain validation and index conversion are shared across every output
     column. The returned object is a real pandas DataFrame whose columns remain
-    device-backed until an explicit public export.
+    device-backed until an explicit public export. When ``out`` is an earlier
+    device-backed result with the same fixed domain and columns, reductions are
+    accumulated into its existing vectors and that same frame is returned.
     """
     group_count = int(size)
     if group_count < 0:
@@ -478,15 +893,64 @@ def dense_grouped_reduce(
         name: _native_expression_from_public_series(values)
         for name, values in named_values.items()
     }
+    if out is not None and not isinstance(out, pd.DataFrame):
+        raise TypeError("dense_grouped_reduce out must be a pandas DataFrame")
+    output_names = (
+        ([] if count_name is None else [count_name])
+        + list(named_values)
+    )
+    out_expressions = (
+        {}
+        if out is None
+        else {
+            name: _native_expression_from_public_series(out[name])
+            for name in out.columns
+        }
+    )
     requested = get_requested_mode()
     use_device = requested is ExecutionMode.GPU or (
         requested is not ExecutionMode.CPU
         and any(
             expression is not None and expression.is_device
-            for expression in (code_expression, *value_expressions.values())
+            for expression in (
+                code_expression,
+                *value_expressions.values(),
+                *out_expressions.values(),
+            )
         )
     )
     output_index = pd.RangeIndex(group_count)
+    if out is not None:
+        if list(out.columns) != output_names:
+            raise ValueError(
+                "dense_grouped_reduce out columns must match the requested outputs"
+            )
+        if not out.index.equals(output_index):
+            raise ValueError(
+                "dense_grouped_reduce out index must match the fixed group domain"
+            )
+        if not use_device or any(
+            expression is None or not expression.is_device
+            for expression in out_expressions.values()
+        ):
+            raise TypeError(
+                "dense_grouped_reduce out must contain device-backed native columns"
+            )
+        expected_dtypes = {
+            **(
+                {}
+                if count_name is None
+                else {count_name: resolved_count_dtype}
+            ),
+            **{name: resolved_sum_dtype for name in named_values},
+        }
+        if any(
+            np.dtype(out_expressions[name].values.dtype) != dtype
+            for name, dtype in expected_dtypes.items()
+        ):
+            raise TypeError(
+                "dense_grouped_reduce out column dtypes must match the requested dtypes"
+            )
     if use_device:
         import cupy as cp
 
@@ -522,9 +986,18 @@ def dense_grouped_reduce(
                 )
             source_values_by_name[name] = source_values
 
-        output_bytes = group_count * (
-            len(named_values) * int(resolved_sum_dtype.itemsize)
-            + (0 if count_name is None else int(resolved_count_dtype.itemsize))
+        output_bytes = (
+            0
+            if out is not None
+            else group_count
+            * (
+                len(named_values) * int(resolved_sum_dtype.itemsize)
+                + (
+                    0
+                    if count_name is None
+                    else int(resolved_count_dtype.itemsize)
+                )
+            )
         )
         upload_bytes = (
             0
@@ -574,62 +1047,174 @@ def dense_grouped_reduce(
         del invalid
         d_indices = d_codes.astype(cp.int64, copy=False)
         output: dict[Any, pd.Series] = {}
+        accumulation_inputs = []
         d_counts = None
         order = starts = ends = None
         if d_values_by_name:
-            d_counts, order, starts, ends = _device_dense_grouped_plan(
-                d_indices,
-                group_count=group_count,
-            )
+            _sync_tabular_hotpath()
+            with hotpath_stage(
+                "tabular.grouped_reduce.ordering",
+                category="sort",
+                metadata={
+                    "input_rows": int(d_indices.size),
+                    "group_domain": group_count,
+                    "reduction_columns": len(d_values_by_name),
+                    "algorithm": "cccl_int64_radix_sort",
+                    "workspace_bytes": required_bytes,
+                },
+            ) as stage_metadata:
+                d_counts, order, starts, ends = _device_dense_grouped_plan(
+                    d_indices,
+                    group_count=group_count,
+                )
+                attach_work_amplification(
+                    stage_metadata,
+                    operation="dense_grouped_reduce_ordering",
+                    metric_family="tabular",
+                    sums={"ordered_rows": int(d_indices.size)},
+                    maxima={
+                        "input_rows": int(d_indices.size),
+                        "group_domain": group_count,
+                        "reduction_columns": len(d_values_by_name),
+                        "workspace_bytes": required_bytes,
+                    },
+                    unavailable=("observed_group_cardinality",),
+                    physical_shape="integer-key radix ordering",
+                    consumer_kind="shared segmented grouped reduction plan",
+                    semantic_contract={
+                        "algorithm": "cccl_int64_radix_sort",
+                        "stable_source_order": True,
+                    },
+                )
+                _sync_tabular_hotpath()
         if count_name is not None:
             if d_counts is None:
                 d_counts = cp.bincount(d_indices, minlength=group_count)[
                     :group_count
                 ]
             d_counts = d_counts.astype(resolved_count_dtype, copy=False)
-            output[count_name] = _public_native_series(
-                NativeExpression(
-                    operation="dense_grouped_reduce.count",
-                    values=d_counts,
-                    source_token=None,
-                    source_row_count=group_count,
-                    dtype=str(resolved_count_dtype),
-                    precision="exact-integer-count",
-                ),
-                index=output_index,
-                name=count_name,
-                operation="dense_grouped_reduce_to_public_array",
-            )
-        for name, d_values in d_values_by_name.items():
-            d_sums = _device_segmented_sum(
-                d_values,
-                order=order,
-                starts=starts,
-                ends=ends,
-                output_dtype=resolved_sum_dtype,
-            )
-            output[name] = _public_native_series(
-                NativeExpression(
-                    operation="dense_grouped_reduce.sum",
-                    values=d_sums,
-                    source_token=None,
-                    source_row_count=group_count,
-                    dtype=str(resolved_sum_dtype),
-                    precision=(
-                        "fp64-grouped-sum"
-                        if resolved_sum_dtype == np.dtype(np.float64)
-                        else "source"
+            if out is not None:
+                cp.add(
+                    out_expressions[count_name].values,
+                    d_counts,
+                    out=out_expressions[count_name].values,
+                )
+                accumulation_inputs.append(d_counts)
+            else:
+                output[count_name] = _public_native_series(
+                    NativeExpression(
+                        operation="dense_grouped_reduce.count",
+                        values=d_counts,
+                        source_token=None,
+                        source_row_count=group_count,
+                        dtype=str(resolved_count_dtype),
+                        precision="exact-integer-count",
                     ),
-                ),
-                index=output_index,
-                name=name,
-                operation="dense_grouped_reduce_to_public_array",
+                    index=output_index,
+                    name=count_name,
+                    operation="dense_grouped_reduce_to_public_array",
+                )
+        for name, d_values in d_values_by_name.items():
+            _sync_tabular_hotpath()
+            with hotpath_stage(
+                "tabular.grouped_reduce.segmented_sum",
+                category="other",
+                metadata={
+                    "input_rows": int(d_indices.size),
+                    "group_domain": group_count,
+                    "column": str(name),
+                },
+            ) as stage_metadata:
+                d_sums = _device_segmented_sum(
+                    d_values,
+                    order=order,
+                    starts=starts,
+                    ends=ends,
+                    output_dtype=resolved_sum_dtype,
+                )
+                attach_work_amplification(
+                    stage_metadata,
+                    operation="dense_grouped_segmented_sum",
+                    metric_family="tabular",
+                    sums={"reduced_rows": int(d_indices.size)},
+                    maxima={
+                        "input_rows": int(d_indices.size),
+                        "group_domain": group_count,
+                    },
+                    unavailable=("observed_group_cardinality",),
+                    physical_shape="stable segmented fp64 reduction",
+                    consumer_kind="dense grouped output vector",
+                )
+                _sync_tabular_hotpath()
+            if out is not None:
+                _sync_tabular_hotpath()
+                with hotpath_stage(
+                    "tabular.grouped_reduce.accumulate",
+                    category="emit",
+                    metadata={
+                        "group_domain": group_count,
+                        "column": str(name),
+                    },
+                ) as stage_metadata:
+                    cp.add(
+                        out_expressions[name].values,
+                        d_sums,
+                        out=out_expressions[name].values,
+                    )
+                    attach_work_amplification(
+                        stage_metadata,
+                        operation="dense_grouped_reduce_accumulate",
+                        metric_family="tabular",
+                        sums={"merged_output_rows": group_count},
+                        maxima={
+                            "group_domain": group_count,
+                            "persistent_output_bytes": group_count
+                            * int(resolved_sum_dtype.itemsize),
+                        },
+                        physical_shape="persistent dense device accumulator",
+                        consumer_kind="next streamed reduction batch",
+                    )
+                    _sync_tabular_hotpath()
+                accumulation_inputs.append(d_sums)
+            else:
+                output[name] = _public_native_series(
+                    NativeExpression(
+                        operation="dense_grouped_reduce.sum",
+                        values=d_sums,
+                        source_token=None,
+                        source_row_count=group_count,
+                        dtype=str(resolved_sum_dtype),
+                        precision=(
+                            "fp64-grouped-sum"
+                            if resolved_sum_dtype == np.dtype(np.float64)
+                            else "source"
+                        ),
+                    ),
+                    index=output_index,
+                    name=name,
+                    operation="dense_grouped_reduce_to_public_array",
+                )
+        if accumulation_inputs:
+            from vibespatial.cuda._runtime import get_cuda_completion_retainer
+
+            get_cuda_completion_retainer().defer(
+                cp.cuda.get_current_stream(),
+                tuple(accumulation_inputs),
+                lambda _arrays: None,
             )
         record_dispatch_event(
             surface="vibespatial.api.dense_grouped_reduce",
             operation="dense_grouped_reduce",
-            implementation="cccl_stable_dense_grouped_reduce",
-            reason="fixed-domain count and deterministic sums share stable code ordering",
+            implementation=(
+                "cccl_stable_dense_grouped_reduce_accumulate"
+                if out is not None
+                else "cccl_stable_dense_grouped_reduce"
+            ),
+            reason=(
+                "fixed-domain reductions update persistent device output vectors"
+                if out is not None
+                else "fixed-domain count and deterministic sums share stable code ordering"
+            ),
             detail=(
                 f"input_rows={int(d_codes.size)}, groups={group_count}, "
                 f"sum_columns={len(named_values)}, count={count_name is not None}"
@@ -637,7 +1222,7 @@ def dense_grouped_reduce(
             requested=requested,
             selected=ExecutionMode.GPU,
         )
-        return pd.DataFrame(output, index=output_index)
+        return out if out is not None else pd.DataFrame(output, index=output_index)
 
     host_codes = np.asarray(codes)
     if host_codes.ndim != 1 or host_codes.dtype.kind not in {"i", "u"}:

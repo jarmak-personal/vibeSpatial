@@ -17,6 +17,11 @@ from vibespatial.api._native_public_arrays import (
     native_geometry_type_array_supported,
 )
 from vibespatial.api.geometry_array import GeometryDtype, points_from_xy
+from vibespatial.runtime.hotpath_trace import (
+    attach_work_amplification,
+    hotpath_stage,
+    hotpath_timing_enabled,
+)
 from vibespatial.runtime.residency import Residency
 
 from . import _compat as compat
@@ -60,6 +65,34 @@ def is_geometry_type(data):
 
 _NATIVE_BOOLEAN_ROWSET_ATTR = "_vibespatial_native_boolean_rowset"
 _NATIVE_EXPRESSION_ATTR = "_vibespatial_native_expression"
+
+
+def _native_distance_expression_with_trace(state, other, *, physical_shape: str):
+    if hotpath_timing_enabled():
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        get_cuda_runtime().synchronize()
+    with hotpath_stage(
+        "geometry.distance",
+        category="refine",
+        metadata={"input_rows": state.row_count},
+    ) as stage_metadata:
+        expression = state.geometry_distance_expression(other)
+        attach_work_amplification(
+            stage_metadata,
+            operation="geometry_distance_expression",
+            metric_family="geometry",
+            sums={"distance_rows": state.row_count},
+            maxima={"input_rows": state.row_count, "output_rows": state.row_count},
+            physical_shape=physical_shape,
+            consumer_kind="NativeExpression",
+            semantic_contract={"precision_owned_by_dispatch": True},
+        )
+        if hotpath_timing_enabled():
+            from vibespatial.cuda._runtime import get_cuda_runtime
+
+            get_cuda_runtime().synchronize()
+    return expression
 
 
 def _attach_native_boolean_rowset(series, rowset) -> None:
@@ -642,7 +675,11 @@ def _delegate_binary_method(
                 or getattr(right_geometry, "composition", None) is not None
             )
             if left_supported and right_supported:
-                native_distance = left_state.geometry_distance_expression(right_state)
+                native_distance = _native_distance_expression_with_trace(
+                    left_state,
+                    right_state,
+                    physical_shape="aligned geometry-pair metric",
+                )
     elif op == "distance" and isinstance(other, BaseGeometry):
         left_state = _native_state_for_owner(this)
         if left_state is not None:
@@ -651,7 +688,11 @@ def _delegate_binary_method(
                 getattr(left_geometry, "owned", None) is not None
                 or getattr(left_geometry, "composition", None) is not None
             ):
-                native_distance = left_state.geometry_distance_expression(other)
+                native_distance = _native_distance_expression_with_trace(
+                    left_state,
+                    other,
+                    physical_shape="geometry rows broadcast against scalar metric",
+                )
     if op == "dwithin" and isinstance(other, BaseGeometry):
         try:
             distance = kwargs["distance"] if "distance" in kwargs else args[0]

@@ -7,6 +7,7 @@ import pytest
 import vibespatial as gpd
 from vibespatial.api._native_expression import NativeExpression
 from vibespatial.api._native_public_arrays import NativeNumericExpressionArray
+from vibespatial.api.tabular import _numeric_divide, _streaming_topk
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime, set_requested_mode
 
 
@@ -50,6 +51,70 @@ def test_dense_count_and_numeric_take_host_contract() -> None:
     assert gathered.index.tolist() == [9, 8, 7]
     assert gathered.name == "count"
     assert gathered.tolist() == [3, 1, 0]
+
+
+def test_numeric_divide_fills_zero_denominators_on_host() -> None:
+    result = _numeric_divide(
+        pd.Series([6.0, 4.0, 9.0], index=[3, 4, 5], name="reported"),
+        pd.Series([2.0, 0.0, 3.0], index=[3, 4, 5]),
+    )
+
+    assert result.index.tolist() == [3, 4, 5]
+    assert result.name == "reported"
+    assert result.iloc[[0, 2]].tolist() == [3.0, 3.0]
+    assert np.isnan(result.iloc[1])
+
+
+def test_streaming_topk_matches_one_shot_pandas_across_tied_batches() -> None:
+    frame = pd.DataFrame(
+        {
+            "primary": [5.0, 4.0, 5.0, np.nan, 5.0, 3.0, 5.0],
+            "secondary": [2, 0, 1, 9, 1, 4, 0],
+            "payload": list("abcdefg"),
+        }
+    )
+    accumulator = None
+    for positions in ([0, 1, 2], [3, 4], [5, 6]):
+        accumulator = _streaming_topk(
+            frame.iloc[positions],
+            4,
+            ["primary", "secondary"],
+            largest=True,
+            out=accumulator,
+        )
+
+    expected = frame.nlargest(4, ["primary", "secondary"])
+    pd.testing.assert_frame_equal(
+        accumulator.reset_index(drop=True),
+        expected.reset_index(drop=True),
+    )
+
+
+@pytest.mark.parametrize("keep", ["last", "all"])
+def test_streaming_topk_rejects_noncompositional_tie_modes(keep: str) -> None:
+    frame = pd.DataFrame({"primary": [3, 3, 2], "payload": [0, 1, 2]})
+
+    with pytest.raises(NotImplementedError, match="only keep='first'"):
+        _streaming_topk(frame, 1, "primary", keep=keep)
+
+
+def test_streaming_topk_empty_batch_reapplies_smaller_bound() -> None:
+    retained = pd.DataFrame({"primary": [5, 4, 3], "payload": list("abc")})
+    empty = retained.iloc[:0]
+
+    reduced = _streaming_topk(empty, 1, "primary", out=retained)
+    zero = _streaming_topk(empty, 0, "primary", out=retained)
+
+    pd.testing.assert_frame_equal(reduced, retained.iloc[:1])
+    pd.testing.assert_frame_equal(zero, retained.iloc[:0])
+
+
+def test_numeric_divide_rejects_reordered_indexes() -> None:
+    numerator = pd.Series([6.0, 8.0], index=["a", "b"])
+    denominator = pd.Series([2.0, 4.0], index=["b", "a"])
+
+    with pytest.raises(ValueError, match="identical indexes"):
+        _numeric_divide(numerator, denominator)
 
 
 def test_dense_sums_skip_float_nan_before_integer_output_cast_on_host() -> None:
@@ -183,6 +248,129 @@ def test_dense_count_and_numeric_take_keep_native_series_on_device() -> None:
         event.stage == "tabular-numeric-take" and event.admitted
         for event in admissions
     )
+
+
+@pytest.mark.gpu
+def test_dense_grouped_reduce_accumulates_into_persistent_device_outputs() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    import cupy as cp
+
+    def native(values, *, operation, dtype):
+        array = cp.asarray(values, dtype=dtype)
+        return pd.Series(
+            NativeNumericExpressionArray(
+                NativeExpression(
+                    operation=operation,
+                    values=array,
+                    source_token="rows",
+                    source_row_count=int(array.size),
+                    dtype=str(array.dtype),
+                    precision="test",
+                )
+            )
+        )
+
+    first = gpd.dense_grouped_reduce(
+        native([0, 1, 0], operation="test.codes.first", dtype=cp.int64),
+        size=3,
+        count_name="count",
+        sums={
+            "total": native(
+                [1.5, 2.0, 3.5],
+                operation="test.values.first",
+                dtype=cp.float64,
+            )
+        },
+    )
+    count_values = first["count"].array.expression.values
+    total_values = first["total"].array.expression.values
+    gpd.clear_dispatch_events()
+    accumulated = gpd.dense_grouped_reduce(
+        native([2, 0, 2], operation="test.codes.second", dtype=cp.int64),
+        size=3,
+        count_name="count",
+        sums={
+            "total": native(
+                [4.0, 5.0, cp.nan],
+                operation="test.values.second",
+                dtype=cp.float64,
+            )
+        },
+        out=first,
+    )
+
+    assert accumulated is first
+    assert accumulated["count"].array.expression.values is count_values
+    assert accumulated["total"].array.expression.values is total_values
+    assert accumulated["count"].tolist() == [3, 1, 2]
+    assert accumulated["total"].tolist() == [10.0, 2.0, 4.0]
+    assert any(
+        event.implementation == "cccl_stable_dense_grouped_reduce_accumulate"
+        for event in gpd.get_dispatch_events(clear=True)
+    )
+
+
+@pytest.mark.gpu
+def test_dense_grouped_reduce_large_small_domain_uses_linear_radix_work(
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    import cupy as cp
+
+    from vibespatial.runtime.hotpath_trace import (
+        reset_hotpath_trace,
+        summarize_hotpath_trace,
+    )
+
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "counter")
+    group_count = 84
+    for row_count in (250_000, 1_000_000):
+        codes_array = cp.arange(row_count, dtype=cp.int64) % group_count
+        values_array = cp.ones(row_count, dtype=cp.float64)
+        codes = pd.Series(
+            NativeNumericExpressionArray(
+                NativeExpression(
+                    operation="test.large_small_domain.codes",
+                    values=codes_array,
+                    source_token="rows",
+                    source_row_count=row_count,
+                    dtype="int64",
+                    precision="exact-integer",
+                )
+            )
+        )
+        values = pd.Series(
+            NativeNumericExpressionArray(
+                NativeExpression(
+                    operation="test.large_small_domain.values",
+                    values=values_array,
+                    source_token="rows",
+                    source_row_count=row_count,
+                    dtype="float64",
+                    precision="fp64",
+                )
+            )
+        )
+        reset_hotpath_trace()
+        reduced = gpd.dense_grouped_reduce(
+            codes,
+            size=group_count,
+            count_name="count",
+            sums={"total": values},
+        )
+
+        ordering = next(
+            stage
+            for stage in summarize_hotpath_trace()
+            if stage["name"] == "tabular.grouped_reduce.ordering"
+        )
+        packet = ordering["metadata"]["work_amplification"]
+        assert packet["semantic_contract"]["algorithm"] == "cccl_int64_radix_sort"
+        assert packet["sum"]["ordered_rows"] == row_count
+        assert packet["max"]["group_domain"] == group_count
+        assert int(reduced["count"].sum()) == row_count
 
 
 @pytest.mark.gpu
