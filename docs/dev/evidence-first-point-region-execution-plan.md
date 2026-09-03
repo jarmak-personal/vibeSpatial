@@ -5,7 +5,7 @@ Scope: Evidence-first plan for proving one exact point-region execution alternat
 Read If: You are profiling or optimizing point-in-polygon refinement, prepared polygon traversal, Q11's dominant predicate stage, or cross-device point-region execution.
 STOP IF: You only need settled public predicate semantics or unrelated generic runtime behavior.
 Source Of Truth: Active execution plan for evidence-driven point-region optimization and the gate for any future reusable device planner.
-Body Budget: 468/500 lines
+Body Budget: 474/500 lines
 Document: docs/dev/evidence-first-point-region-execution-plan.md
 
 Section Map (Body Lines)
@@ -21,10 +21,10 @@ Section Map (Body Lines)
 | 103-124 | Starting Evidence |
 | 125-148 | Scope |
 | 149-167 | Ownership Boundaries |
-| 168-189 | Safety Contract |
-| 190-204 | Public API Boundary |
-| 205-222 | Evidence Questions |
-| 223-246 | Instrumentation Design |
+| 168-195 | Safety Contract |
+| 196-210 | Public API Boundary |
+| 211-228 | Evidence Questions |
+| 229-252 | Instrumentation Design |
 | ... | (6 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -208,6 +208,12 @@ All resource checks occur immediately before allocation and launch. A sampled
 allocator state is advisory unless bytes have actually been reserved or
 preallocated. The first implementation should use bounded tiles and allocate
 through the active pool rather than invent a reservation token.
+
+Prepared-index admission records its source explicitly. Observed repeated work
+and forced diagnostics may override the weaker one-shot size cutoff, but never
+memory, structural, integer-capacity, or exactness checks. If a compact selected
+carrier is rejected, its ancestor is considered only when that larger build is
+independently amortized and passes the current memory envelope.
 
 Specialized kernels write private outputs. Results become visible only after
 the required stream dependency or completion boundary. Fail-closed recovery is

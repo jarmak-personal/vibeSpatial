@@ -10,6 +10,7 @@ of the GPU to use without changing predicate semantics.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from time import perf_counter
 
 from vibespatial.api._native_state import NativeStreamReadiness
@@ -60,6 +61,32 @@ request_nvrtc_warmup(
 )
 
 
+class PointLocationPreparationAdmission(StrEnum):
+    """Why a caller is allowed to attempt persistent point-location state."""
+
+    ONE_SHOT_SIZE = "one_shot_size"
+    OBSERVED_REUSE = "observed_reuse"
+    FORCED_DIAGNOSTIC = "forced_diagnostic"
+
+
+class PointLocationPreparationOutcome(StrEnum):
+    """Host-visible result of one persistent-index preparation decision."""
+
+    ADMITTED = "admitted"
+    BELOW_ONE_SHOT_MINIMUM = "below_one_shot_minimum"
+    UNSUPPORTED_CAPACITY = "unsupported_capacity"
+    INVALID_STRUCTURE = "invalid_structure"
+    MEMORY_DECLINED = "memory_declined"
+    ALLOCATION_FAILED = "allocation_failed"
+
+
+_PREPARATION_ADMISSION_STRENGTH = {
+    PointLocationPreparationAdmission.ONE_SHOT_SIZE: 0,
+    PointLocationPreparationAdmission.OBSERVED_REUSE: 1,
+    PointLocationPreparationAdmission.FORCED_DIAGNOSTIC: 2,
+}
+
+
 @dataclass(frozen=True, slots=True)
 class PointLocationIndexCacheKey:
     """Exact identity of one compile-time-uniform prepared representation."""
@@ -84,6 +111,11 @@ class PointLocationIndexDecision:
     edge_membership_count: int
     persistent_bytes: int
     peak_build_bytes: int
+    admission: PointLocationPreparationAdmission
+    outcome: PointLocationPreparationOutcome
+    coordinate_count: int
+    minimum_coordinate_threshold: int
+    minimum_coordinate_bypassed: bool
     cache_hit: bool = False
 
 
@@ -102,6 +134,8 @@ class PreparedPolygonPartYIndex:
     decline_reason: str | None
     coverage_grid_width: int
     coverage_decline_reason: str | None
+    admission: PointLocationPreparationAdmission
+    minimum_coordinate_bypassed: bool
     part_xmin: object | None
     part_xmax: object | None
     coverage: object | None
@@ -241,6 +275,62 @@ def wait_for_polygon_part_y_index(readiness: NativeStreamReadiness) -> None:
     )
 
 
+def _publish_point_location_index_decision(state, decision) -> None:
+    """Retain the strongest attempted admission until a build succeeds."""
+    existing = state.point_location_index_decisions.get(decision.family)
+    if (
+        existing is None
+        or decision.outcome is PointLocationPreparationOutcome.ADMITTED
+        or _PREPARATION_ADMISSION_STRENGTH[decision.admission]
+        >= _PREPARATION_ADMISSION_STRENGTH[existing.admission]
+    ):
+        state.point_location_index_decisions[decision.family] = decision
+
+
+def _decline_point_location_index(
+    state,
+    family: GeometryFamily,
+    *,
+    admission: PointLocationPreparationAdmission,
+    outcome: PointLocationPreparationOutcome,
+    reason: str,
+    coordinate_count: int,
+    total_device_bytes: int,
+    nominal_vram_class_gib: int,
+    target_bin_count: int,
+    minimum_coordinate_bypassed: bool = False,
+) -> None:
+    decision = PointLocationIndexDecision(
+        family=family,
+        total_device_bytes=total_device_bytes,
+        nominal_vram_class_gib=nominal_vram_class_gib,
+        target_bin_count=target_bin_count,
+        admitted_bin_count=None,
+        coverage_grid_width=0,
+        coverage_decline_reason="part-y index was not admitted",
+        decline_reason=reason,
+        edge_membership_count=0,
+        persistent_bytes=0,
+        peak_build_bytes=0,
+        admission=admission,
+        outcome=outcome,
+        coordinate_count=coordinate_count,
+        minimum_coordinate_threshold=_MIN_PREPARED_COORDINATES,
+        minimum_coordinate_bypassed=minimum_coordinate_bypassed,
+    )
+    _publish_point_location_index_decision(state, decision)
+    record_dispatch_event(
+        surface="vibespatial.predicates.point_location_index",
+        operation="prepare_point_location",
+        implementation="exact_point_region_tiled_gpu",
+        reason=(
+            f"{admission.value} preparation declined: {reason}; "
+            "exact GPU refinement remains active"
+        ),
+        selected=ExecutionMode.GPU,
+    )
+
+
 def cached_polygon_part_y_index(state, family: GeometryFamily):
     """Return the selected completion-ready index for ``family`` if present."""
     decision = state.point_location_index_decisions.get(family)
@@ -265,6 +355,9 @@ def _point_location_preparation_metrics(
     cache_hit: bool,
     cache_miss: bool,
     declined: bool,
+    admission: PointLocationPreparationAdmission = (
+        PointLocationPreparationAdmission.ONE_SHOT_SIZE
+    ),
 ) -> tuple[dict[str, int], dict[str, int], tuple[str, ...]]:
     """Return bounded cache evidence from the prepared carrier's host fields."""
     max_metrics = {}
@@ -310,6 +403,21 @@ def _point_location_preparation_metrics(
             "cache_hits": int(cache_hit),
             "cache_misses": int(cache_miss),
             "declined_preparations": int(declined),
+            "one_shot_size_requests": int(
+                admission is PointLocationPreparationAdmission.ONE_SHOT_SIZE
+            ),
+            "observed_reuse_requests": int(
+                admission is PointLocationPreparationAdmission.OBSERVED_REUSE
+            ),
+            "forced_diagnostic_requests": int(
+                admission is PointLocationPreparationAdmission.FORCED_DIAGNOSTIC
+            ),
+            "minimum_coordinate_bypasses": int(
+                built
+                and bool(
+                    getattr(prepared, "minimum_coordinate_bypassed", False)
+                )
+            ),
         },
         max_metrics,
         tuple(unavailable),
@@ -340,10 +448,23 @@ def prepare_polygon_part_y_index(
     family: GeometryFamily,
     *,
     _target_bin_count: int | None = None,
+    _admission: PointLocationPreparationAdmission = (
+        PointLocationPreparationAdmission.ONE_SHOT_SIZE
+    ),
 ):
     """Build or return the cached exact part-y edge directory."""
     if family not in _INDEXABLE_FAMILIES:
         return None
+    if not isinstance(_admission, PointLocationPreparationAdmission):
+        raise TypeError("point-location preparation admission must be explicit")
+    from .point_region_profile import current_point_region_profile
+
+    profile = current_point_region_profile()
+    admission = (
+        PointLocationPreparationAdmission.FORCED_DIAGNOSTIC
+        if profile is not None and profile.force_prepared_index
+        else _admission
+    )
     state = owned._ensure_device_state(preserve_indexed_view=True)
     runtime = get_cuda_runtime()
     budget = runtime.query_memory_budget()
@@ -378,6 +499,8 @@ def prepare_polygon_part_y_index(
             cached=cached,
             nominal_vram_class_gib=nominal_class,
             target_bin_count=target,
+            total_device_bytes=int(budget.total_device_bytes),
+            admission=admission,
         )
         if stage_metadata is not None:
             cache_hit = cached is not None
@@ -388,7 +511,9 @@ def prepare_polygon_part_y_index(
                 cache_hit=cache_hit,
                 cache_miss=cached is None,
                 declined=prepared is None,
+                admission=admission,
             )
+            decision = state.point_location_index_decisions.get(family)
             attach_work_amplification(
                 stage_metadata,
                 operation="prepare_point_region_y_index",
@@ -402,6 +527,13 @@ def prepare_polygon_part_y_index(
                     "cache_scope": "OwnedGeometryDeviceState point-location indexes",
                     "cache_identity_exported": True,
                     "device_logical_counts_read": False,
+                    "requested_admission": admission.value,
+                    "build_admission": (
+                        None if decision is None else decision.admission.value
+                    ),
+                    "preparation_outcome": (
+                        None if decision is None else decision.outcome.value
+                    ),
                 },
             )
         return prepared
@@ -415,6 +547,8 @@ def _prepare_polygon_part_y_index_impl(
     cached,
     nominal_vram_class_gib: int,
     target_bin_count: int,
+    total_device_bytes: int,
+    admission: PointLocationPreparationAdmission,
 ):
     from .point_region_profile import current_point_region_profile
 
@@ -429,12 +563,60 @@ def _prepare_polygon_part_y_index_impl(
         return cached
 
     buffer = state.families.get(family)
-    force_prepared = profile is not None and profile.force_prepared_index
-    if buffer is None or (
-        int(buffer.x.size) < _MIN_PREPARED_COORDINATES and not force_prepared
-    ):
+    if buffer is None:
+        _decline_point_location_index(
+            state,
+            family,
+            admission=admission,
+            outcome=PointLocationPreparationOutcome.INVALID_STRUCTURE,
+            reason="polygon family buffer is unavailable",
+            coordinate_count=0,
+            total_device_bytes=total_device_bytes,
+            nominal_vram_class_gib=nominal_vram_class_gib,
+            target_bin_count=target_bin_count,
+        )
         return None
-    if int(buffer.x.size) >= (1 << 31) or int(buffer.ring_offsets.size - 1) >= (1 << 31):
+    coordinate_count = int(buffer.x.size)
+    minimum_coordinate_bypassed = (
+        coordinate_count < _MIN_PREPARED_COORDINATES
+        and admission is not PointLocationPreparationAdmission.ONE_SHOT_SIZE
+    )
+    if (
+        coordinate_count < _MIN_PREPARED_COORDINATES
+        and admission is PointLocationPreparationAdmission.ONE_SHOT_SIZE
+    ):
+        _decline_point_location_index(
+            state,
+            family,
+            admission=admission,
+            outcome=PointLocationPreparationOutcome.BELOW_ONE_SHOT_MINIMUM,
+            reason=(
+                f"{coordinate_count} coordinates are below the one-shot minimum "
+                f"of {_MIN_PREPARED_COORDINATES}"
+            ),
+            coordinate_count=coordinate_count,
+            total_device_bytes=total_device_bytes,
+            nominal_vram_class_gib=nominal_vram_class_gib,
+            target_bin_count=target_bin_count,
+            minimum_coordinate_bypassed=minimum_coordinate_bypassed,
+        )
+        return None
+    ring_count = (
+        0 if buffer.ring_offsets is None else int(buffer.ring_offsets.size - 1)
+    )
+    if coordinate_count >= (1 << 31) or ring_count >= (1 << 31):
+        _decline_point_location_index(
+            state,
+            family,
+            admission=admission,
+            outcome=PointLocationPreparationOutcome.UNSUPPORTED_CAPACITY,
+            reason="polygon coordinates or rings exceed int32 prepared-index capacity",
+            coordinate_count=coordinate_count,
+            total_device_bytes=total_device_bytes,
+            nominal_vram_class_gib=nominal_vram_class_gib,
+            target_bin_count=target_bin_count,
+            minimum_coordinate_bypassed=minimum_coordinate_bypassed,
+        )
         return None
 
     import cupy as cp
@@ -444,12 +626,22 @@ def _prepare_polygon_part_y_index_impl(
         buffer.geometry_offsets if family is GeometryFamily.POLYGON else buffer.part_offsets
     )
     if part_ring_offsets is None or buffer.ring_offsets is None:
+        _decline_point_location_index(
+            state,
+            family,
+            admission=admission,
+            outcome=PointLocationPreparationOutcome.INVALID_STRUCTURE,
+            reason="polygon part or ring offsets are unavailable",
+            coordinate_count=coordinate_count,
+            total_device_bytes=total_device_bytes,
+            nominal_vram_class_gib=nominal_vram_class_gib,
+            target_bin_count=target_bin_count,
+            minimum_coordinate_bypassed=minimum_coordinate_bypassed,
+        )
         return None
     part_count = int(part_ring_offsets.size - 1)
     ring_count = int(buffer.ring_offsets.size - 1)
-    coordinate_count = int(buffer.y.size)
     runtime = get_cuda_runtime()
-    total_device_bytes = int(runtime.query_memory_budget().total_device_bytes)
     ptr = runtime.pointer
     decline_reasons: list[str] = []
 
@@ -803,6 +995,8 @@ def _prepare_polygon_part_y_index_impl(
                 decline_reason=decline_reason,
                 coverage_grid_width=coverage_grid_width,
                 coverage_decline_reason=coverage_decline_reason,
+                admission=admission,
+                minimum_coordinate_bypassed=minimum_coordinate_bypassed,
                 part_xmin=part_xmin,
                 part_xmax=part_xmax,
                 coverage=coverage,
@@ -835,8 +1029,13 @@ def _prepare_polygon_part_y_index_impl(
                 edge_membership_count=int(prepared.edge_membership_count),
                 persistent_bytes=int(prepared.device_bytes),
                 peak_build_bytes=int(prepared.peak_build_bytes),
+                admission=admission,
+                outcome=PointLocationPreparationOutcome.ADMITTED,
+                coordinate_count=coordinate_count,
+                minimum_coordinate_threshold=_MIN_PREPARED_COORDINATES,
+                minimum_coordinate_bypassed=minimum_coordinate_bypassed,
             )
-            state.point_location_index_decisions[family] = decision
+            _publish_point_location_index_decision(state, decision)
             if profile is not None:
                 runtime.synchronize()
                 assert build_started is not None
@@ -846,7 +1045,8 @@ def _prepare_polygon_part_y_index_impl(
                 operation="prepare_point_location",
                 implementation="polygon_part_y_edge_directory_gpu",
                 reason=(
-                    f"VRAM class {nominal_vram_class_gib} GiB targeted "
+                    f"{admission.value} admission on VRAM class "
+                    f"{nominal_vram_class_gib} GiB targeted "
                     f"{target_bin_count} bins and admitted {prepared.bin_count}; "
                     f"prepared {part_count} parts with {membership_count} exact "
                     f"edge memberships, {prepared.device_bytes} persistent bytes, "
@@ -865,40 +1065,48 @@ def _prepare_polygon_part_y_index_impl(
             decline_reasons.append(f"b{bin_count}: device allocation failed before publication")
             continue
 
-    decision = PointLocationIndexDecision(
-        family=family,
+    outcome = (
+        PointLocationPreparationOutcome.ALLOCATION_FAILED
+        if any("allocation failed" in reason for reason in decline_reasons)
+        else PointLocationPreparationOutcome.MEMORY_DECLINED
+    )
+    _decline_point_location_index(
+        state,
+        family,
+        admission=admission,
+        outcome=outcome,
+        reason="; ".join(decline_reasons) or "no compiled width admitted",
+        coordinate_count=coordinate_count,
         total_device_bytes=total_device_bytes,
         nominal_vram_class_gib=nominal_vram_class_gib,
         target_bin_count=target_bin_count,
-        admitted_bin_count=None,
-        coverage_grid_width=0,
-        coverage_decline_reason="part-y index was not admitted",
-        decline_reason="; ".join(decline_reasons) or "no compiled width admitted",
-        edge_membership_count=0,
-        persistent_bytes=0,
-        peak_build_bytes=0,
-    )
-    state.point_location_index_decisions[family] = decision
-    record_dispatch_event(
-        surface="vibespatial.predicates.point_location_index",
-        operation="prepare_point_location",
-        implementation="exact_point_region_tiled_gpu",
-        reason=(
-            f"prepared index declined from target {target_bin_count}: "
-            f"{decision.decline_reason}; exact GPU refinement remains active"
-        ),
-        selected=ExecutionMode.GPU,
+        minimum_coordinate_bypassed=minimum_coordinate_bypassed,
     )
     return None
 
 
-def prepare_point_region_y_indexes(left_owned, right_owned) -> None:
+def prepare_point_region_y_indexes(
+    left_owned,
+    right_owned,
+    *,
+    _admission: PointLocationPreparationAdmission = (
+        PointLocationPreparationAdmission.ONE_SHOT_SIZE
+    ),
+) -> None:
     """Prepare large polygon sides before candidate arrays consume the budget."""
     left_families = set(left_owned.families)
     right_families = set(right_owned.families)
     if left_families & set(_POINT_FAMILIES):
         for family in right_families & set(_INDEXABLE_FAMILIES):
-            prepare_polygon_part_y_index(right_owned, family)
+            prepare_polygon_part_y_index(
+                right_owned,
+                family,
+                _admission=_admission,
+            )
     if right_families & set(_POINT_FAMILIES):
         for family in left_families & set(_INDEXABLE_FAMILIES):
-            prepare_polygon_part_y_index(left_owned, family)
+            prepare_polygon_part_y_index(
+                left_owned,
+                family,
+                _admission=_admission,
+            )

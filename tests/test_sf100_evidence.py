@@ -171,6 +171,129 @@ def test_q3_public_plan_merges_dense_month_reductions_before_terminal_export(
     assert "pylibcudf" not in source
 
 
+@pytest.mark.gpu
+def test_q1_profile_exposes_non_overlapping_dominant_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    batches = [
+        vibespatial.GeoDataFrame(
+            {
+                "t_tripkey": [3, 1],
+                "t_pickuptime": pd.to_datetime(["2024-01-03", "2024-01-01"]),
+            },
+            geometry=vibespatial.points_from_xy(
+                [-111.7610, -111.7600],
+                [34.8697, 34.8697],
+            ),
+        ).rename_geometry("t_pickuploc"),
+        vibespatial.GeoDataFrame(
+            {
+                "t_tripkey": [2, 4],
+                "t_pickuptime": pd.to_datetime(["2024-01-02", "2024-01-04"]),
+            },
+            geometry=vibespatial.points_from_xy(
+                [-111.7590, -100.0],
+                [34.8697, 0.0],
+            ),
+        ).rename_geometry("t_pickuploc"),
+    ]
+    queries = VibeSpatialQueries(vibespatial)
+    monkeypatch.setattr(
+        queries,
+        "_spatial_frames",
+        lambda *_args, **_kwargs: iter(batches),
+    )
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "counter")
+    reset_hotpath_trace()
+
+    result = queries.q1({"trip": "unused"})
+
+    assert result["t_tripkey"].tolist() == [3, 1, 2]
+    stages = {item["name"]: item for item in summarize_hotpath_trace()}
+    assert stages["spatialbench.q1.scalar_distance"]["calls"] == 2
+    assert stages["spatialbench.q1.threshold_filter"]["calls"] == 2
+    assert stages["tabular.streaming_topk.batch_select"]["calls"] == 2
+    assert stages["tabular.streaming_topk.merge"]["calls"] == 1
+    assert stages["spatialbench.q1.result_take"]["calls"] == 1
+    assert stages["spatialbench.terminal_export"]["calls"] == 1
+
+
+def test_q7_uses_bounded_public_batch_candidates_before_final_merge() -> None:
+    shard_source = inspect.getsource(VibeSpatialQueries._q7_shard_topk)
+    inherited_source = inspect.getsource(VibeSpatialQueries.q7)
+
+    assert ".nlargest(" in shard_source
+    assert "_streaming_topk" not in shard_source
+    assert "parts: list" in inherited_source
+    assert "_q7_shard_topk" in inherited_source
+
+
+@pytest.mark.gpu
+def test_q7_bounded_public_candidates_preserve_exact_global_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    def _batch(keys, reported, line_distance_units):
+        frame = vibespatial.GeoDataFrame(
+            {
+                "t_tripkey": keys,
+                "t_distance": reported,
+                "t_dropoffloc": vibespatial.points_from_xy(
+                    np.asarray(line_distance_units) * 0.000009,
+                    np.zeros(len(keys)),
+                ),
+            },
+            geometry=vibespatial.points_from_xy(
+                np.zeros(len(keys)),
+                np.zeros(len(keys)),
+            ),
+        )
+        return frame.rename_geometry("t_pickuploc")
+
+    background_1 = list(range(1000, 1101))
+    background_2 = list(range(2000, 2101))
+    batches = [
+        _batch(
+            [2, 3, 5, *background_1],
+            [10.0, 10.0, 99.0, *([1.0] * len(background_1))],
+            [1.0, 1.0, 0.0, *([10.0] * len(background_1))],
+        ),
+        _batch(
+            [4, 1, *background_2],
+            [20.0, 20.0, *([1.0] * len(background_2))],
+            [1.0, 2.0, *([10.0] * len(background_2))],
+        ),
+    ]
+    queries = VibeSpatialQueries(vibespatial)
+    monkeypatch.setattr(
+        queries,
+        "_spatial_frames",
+        lambda *_args, **_kwargs: iter(batches),
+    )
+
+    result = queries.q7({"trip": "unused"})
+
+    assert len(result) == 100
+    assert result["t_tripkey"].tolist() == [
+        4,
+        1,
+        2,
+        3,
+        *list(range(1000, 1096)),
+    ]
+    assert 5 not in result["t_tripkey"].tolist()
+    assert result.columns.tolist() == [
+        "t_tripkey",
+        "reported_distance_m",
+        "line_distance_m",
+        "detour_ratio",
+    ]
+
+
 def _disable_machine_checks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sf100_evidence, "_validate_dataset", lambda *_: None)
     monkeypatch.setattr(sf100_evidence, "_validate_host", lambda *_: None)

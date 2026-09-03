@@ -5,7 +5,7 @@ Scope: End-to-end pipeline benchmark suites, regression thresholds, and CI artif
 Read If: You are changing pipeline benchmarks, regression gates, or CPU/GPU movement profiling in CI.
 STOP IF: You already have the benchmark scripts open and only need a local implementation detail.
 Source Of Truth: Phase-1 pipeline benchmark and regression-gate workflow for end-to-end performance tracking.
-Body Budget: 224/230 lines
+Body Budget: 229/230 lines
 Document: docs/testing/pipeline-benchmarks.md
 
 Section Map (Body Lines)
@@ -20,9 +20,9 @@ Section Map (Body Lines)
 | 64-119 | Entry Points |
 | 120-134 | Pipelines |
 | 135-152 | Suites |
-| 153-161 | Regression Rules |
-| 162-201 | Trace Contract |
-| 202-224 | Automation State |
+| 153-166 | Regression Rules |
+| 167-206 | Trace Contract |
+| 207-229 | Automation State |
 DOC_HEADER:END -->
 
 This repo now has a dedicated end-to-end pipeline benchmark rail for regression
@@ -183,6 +183,11 @@ The regression checker currently fails when:
 - peak device memory grows by more than `10%`
 - CUDA-runtime D2H transfer count increases
 - host materialization count increases
+
+The SpatialBench scale-rail CLI normalizes exact refinement and aggregate D2H by
+input rows. Build/reuse transitions are categorical, not slope metrics. Q6 also
+requires a measured tier with an ancestor above the one-shot threshold, a
+compact derivative below it, and one build followed by reuse.
 
 ## Trace Contract
 

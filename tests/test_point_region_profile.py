@@ -551,7 +551,9 @@ def test_point_region_profile_observes_public_pair_aggregate_boundedly(
     assert len(snapshot["groups"]) == 1
     group = snapshot["groups"][0]
     assert group["family"] == "multipolygon"
-    assert group["coverage_grid_width"] == 8
+    assert group["coverage_grid_width"] == coverage_grid_width_for_bin_count(
+        group["bin_count"]
+    )
     assert group["launches"] == 3
     assert group["counters"]["candidates"] == 4
     assert group["counters"]["parts_considered"] == 6
@@ -602,6 +604,12 @@ def test_public_query_aggregate_reuses_selected_region_preparation(
     selected_array = GeometryArray.from_owned(region_owned)[np.asarray([2, 0])]
     selected = GeoSeries(selected_array, index=["east", "west"])
     assert selected.values._owned.is_indexed_view
+    ancestor_state = region_owned._ensure_device_state(preserve_indexed_view=True)
+    ancestor_coordinates = sum(
+        int(buffer.x.size) for buffer in ancestor_state.families.values()
+    )
+    monkeypatch.setattr(point_location_index, "_MIN_PREPARED_COORDINATES", 23)
+    assert ancestor_coordinates > point_location_index._MIN_PREPARED_COORDINATES
 
     expected = []
     for region in (regions[2], regions[0]):
@@ -618,24 +626,19 @@ def test_public_query_aggregate_reuses_selected_region_preparation(
     clear_dispatch_events()
     monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
     reset_hotpath_trace()
-    first = source.sindex.query_aggregate(
-        selected,
-        {
-            "match_count": "size",
-            "weight_a_sum": (source["weight_a"], "sum"),
-            "weight_b_sum": (source["weight_b"], "sum"),
-        },
-        predicate="contains",
-    )
-    # Keep the canary bounded while exercising the production preparation and
-    # reuse path. The SF100 Q6 gate below the unit suite exercises the ordinary
-    # production coordinate threshold.
-    monkeypatch.setattr(point_location_index, "_MIN_PREPARED_COORDINATES", 0)
     with profile_point_region(
         label="selected-region-query-aggregate",
         sample_limit=16,
-        force_prepared_index=True,
     ) as profile:
+        first = source.sindex.query_aggregate(
+            selected,
+            {
+                "match_count": "size",
+                "weight_a_sum": (source["weight_a"], "sum"),
+                "weight_b_sum": (source["weight_b"], "sum"),
+            },
+            predicate="contains",
+        )
         second = source.sindex.query_aggregate(
             selected,
             {
@@ -670,10 +673,26 @@ def test_public_query_aggregate_reuses_selected_region_preparation(
     np.testing.assert_allclose(third["weight_b_sum"].to_numpy(), expected_b)
     assert selected.values._owned.is_indexed_view
     assert get_fallback_events(clear=True) == []
+    compact = next(
+        iter(
+            selected.values._owned._ensure_device_state(
+                preserve_indexed_view=True
+            ).spatial_aggregate_compact_carriers.values()
+        )
+    )
+    compact_coordinates = sum(
+        int(buffer.x.size)
+        for buffer in compact._ensure_device_state(
+            preserve_indexed_view=True
+        ).families.values()
+    )
+    assert compact_coordinates < point_location_index._MIN_PREPARED_COORDINATES
     preparation = snapshot["index_preparation"]
     assert len(preparation) == 1
     assert preparation[0]["build_count"] == 1
     assert preparation[0]["cache_hits"] >= 2
+    assert preparation[0]["admission"] == "observed_reuse"
+    assert preparation[0]["minimum_coordinate_bypassed"] is True
     assert snapshot["groups"][0]["launches"] >= 2
     assert snapshot["groups"][0]["counters"]["candidates"] > 0
     trace = get_hotpath_trace()
@@ -690,6 +709,7 @@ def test_public_query_aggregate_reuses_selected_region_preparation(
     assert len(carrier_stages) == 3
     assert len(reduction_stages) == 3
     carrier_packet = carrier_stages[-1].metadata["work_amplification"]
+    admission_packet = carrier_stages[1].metadata["work_amplification"]
     assert carrier_packet["physical_shape"] == "prepared_selected_region_view"
     assert carrier_packet["semantic_contract"]["carrier"] == (
         "compact_prepared_derivative"
@@ -710,6 +730,16 @@ def test_public_query_aggregate_reuses_selected_region_preparation(
         carrier_packet["max"]["selected_geometry_bytes"]
     )
     assert carrier_packet["max"]["uses_to_amortize_preparation"] >= 1
+    assert carrier_packet["max"]["preparation_minimum_coordinates"] == 23
+    assert admission_packet["sum"]["observed_reuse_admission_calls"] == 1
+    assert admission_packet["sum"]["compact_preparation_attempts"] == 1
+    assert admission_packet["sum"]["ancestral_preparation_attempts"] == 0
+    assert admission_packet["semantic_contract"]["preparation_admission"] == (
+        "observed_reuse"
+    )
+    assert admission_packet["semantic_contract"]["preparation_outcomes"] == (
+        "admitted",
+    )
     assert carrier_packet["unavailable"] == ["transient_peak_bytes"]
     reduction_packet = reduction_stages[-1].metadata["work_amplification"]
     assert reduction_packet["physical_shape"] == (
@@ -794,6 +824,7 @@ def test_public_query_aggregate_compacts_when_preparation_is_not_admitted(
     tmp_path,
 ) -> None:
     from vibespatial.api.geometry_array import GeometryArray
+    from vibespatial.predicates import point_location_index
     from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
 
     source = GeoDataFrame(
@@ -816,6 +847,9 @@ def test_public_query_aggregate_compacts_when_preparation_is_not_admitted(
     region_owned = from_shapely_geometries(regions, residency=Residency.DEVICE)
     selected_array = GeometryArray.from_owned(region_owned)[np.asarray([2, 0])]
     selected = GeoSeries(selected_array)
+    ancestor_state = region_owned._ensure_device_state(preserve_indexed_view=True)
+    monkeypatch.setattr(point_location_index, "_MIN_PREPARED_COORDINATES", 18)
+    assert sum(int(buffer.x.size) for buffer in ancestor_state.families.values()) > 18
     host_points = source.geometry.to_numpy()
     host_weights = source["weight"].to_numpy()
     expected_counts = []
@@ -826,6 +860,7 @@ def test_public_query_aggregate_compacts_when_preparation_is_not_admitted(
         expected_sums.append(float(host_weights[mask].sum()))
     runtime = get_cuda_runtime()
     original_admit = runtime.admit_device_memory
+    preparation_admissions = []
 
     # The first consumer establishes reuse evidence while retaining the
     # bounded compact carrier. The second consumer below exercises a rejected
@@ -843,6 +878,7 @@ def test_public_query_aggregate_compacts_when_preparation_is_not_admitted(
 
     def _constrained_admit(*, stage, required_bytes, requested_units=0):
         if stage.startswith("predicate.point_location_part_y_index"):
+            preparation_admissions.append(stage)
             return DeviceMemoryAdmission(
                 stage=stage,
                 required_bytes=required_bytes,
@@ -864,7 +900,6 @@ def test_public_query_aggregate_compacts_when_preparation_is_not_admitted(
     clear_dispatch_events()
     with profile_point_region(
         label="constrained-selected-region-query-aggregate",
-        force_prepared_index=True,
     ):
         result = spatial_index.query_aggregate(
             selected,
@@ -879,6 +914,36 @@ def test_public_query_aggregate_compacts_when_preparation_is_not_admitted(
     np.testing.assert_allclose(result["weight_sum"].to_numpy(), expected_sums)
     assert selected.values._owned.is_indexed_view
     assert get_fallback_events(clear=True) == []
+    selected_state = selected.values._owned._ensure_device_state(
+        preserve_indexed_view=True
+    )
+    compact = next(iter(selected_state.spatial_aggregate_compact_carriers.values()))
+    compact_state = compact._ensure_device_state(preserve_indexed_view=True)
+    assert sum(int(buffer.x.size) for buffer in compact_state.families.values()) < 18
+    assert preparation_admissions
+    assert len(preparation_admissions) == 2 * len(set(preparation_admissions))
+    assert all(
+        preparation_admissions.count(stage) == 2
+        for stage in set(preparation_admissions)
+    )
+    assert {
+        decision.admission.value
+        for decision in (
+            *compact_state.point_location_index_decisions.values(),
+            *ancestor_state.point_location_index_decisions.values(),
+        )
+    } == {"observed_reuse"}
+    assert {
+        decision.outcome.value
+        for decision in (
+            *compact_state.point_location_index_decisions.values(),
+            *ancestor_state.point_location_index_decisions.values(),
+        )
+    } == {"memory_declined"}
+    assert all(
+        decision.minimum_coordinate_bypassed
+        for decision in compact_state.point_location_index_decisions.values()
+    )
     carrier_events = [
         event
         for event in get_dispatch_events(clear=True)
@@ -886,6 +951,68 @@ def test_public_query_aggregate_compacts_when_preparation_is_not_admitted(
     ]
     assert len(carrier_events) == 1
     assert carrier_events[0].implementation == "compact_selected"
+
+    # A later call still tries the smaller derivative first. If that attempt is
+    # declined while the independently amortized ancestor fits, the query must
+    # reuse the admitted ancestor instead of returning to exact compact work.
+    clear_dispatch_events()
+    target = point_location_index.point_location_bin_policy(
+        runtime.query_memory_budget().total_device_bytes
+    )[1]
+    compact_structural_attempts = len(point_location_index._admission_widths(target))
+    structural_attempts = 0
+
+    def _decline_compact_then_admit_ancestor(
+        *, stage, required_bytes, requested_units=0
+    ):
+        nonlocal structural_attempts
+        if stage.endswith(".structural"):
+            structural_attempts += 1
+            if structural_attempts <= compact_structural_attempts:
+                return DeviceMemoryAdmission(
+                    stage=stage,
+                    required_bytes=required_bytes,
+                    remaining_bytes=0,
+                    budget_bytes=0,
+                    admitted=False,
+                    requested_units=requested_units,
+                    admitted_units=0,
+                    bytes_per_unit=max(int(required_bytes), 1),
+                )
+        return original_admit(
+            stage=stage,
+            required_bytes=required_bytes,
+            requested_units=requested_units,
+        )
+
+    monkeypatch.setattr(
+        runtime,
+        "admit_device_memory",
+        _decline_compact_then_admit_ancestor,
+    )
+    recovered = spatial_index.query_aggregate(
+        selected,
+        {
+            "match_count": "size",
+            "weight_sum": (source["weight"], "sum"),
+        },
+        predicate="contains",
+    )
+
+    assert recovered["match_count"].to_numpy().tolist() == expected_counts
+    np.testing.assert_allclose(recovered["weight_sum"].to_numpy(), expected_sums)
+    assert get_fallback_events(clear=True) == []
+    recovered_events = [
+        event
+        for event in get_dispatch_events(clear=True)
+        if event.operation == "select_query_input_carrier"
+    ]
+    assert len(recovered_events) == 1
+    assert recovered_events[0].implementation == "ancestral_indexed_view"
+    assert all(
+        decision.outcome.value == "admitted"
+        for decision in ancestor_state.point_location_index_decisions.values()
+    )
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")

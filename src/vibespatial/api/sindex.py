@@ -2210,12 +2210,19 @@ class SpatialIndex:
             selected_metrics = None
             compact_coordinate_capacity = 0
             selected = owned
+            compact_preparation_attempts = 0
+            ancestral_preparation_attempts = 0
+            preparation_outcomes: list[str] = []
+            preparation_minimum_coordinates = 0
 
             if predicate == "contains" and polygon_query and point_tree:
                 from vibespatial.predicates.point_location_index import (
+                    _MIN_PREPARED_COORDINATES,
+                    PointLocationPreparationAdmission,
                     cached_polygon_part_y_index,
                     prepare_point_region_y_indexes,
                 )
+                preparation_minimum_coordinates = _MIN_PREPARED_COORDINATES
 
                 ancestral_prepared = {
                     family: cached_polygon_part_y_index(ancestral_state, family)
@@ -2292,9 +2299,16 @@ class SpatialIndex:
                                 if prepare_compact
                                 else ancestral_state
                             )
+                            if prepare_compact:
+                                compact_preparation_attempts += 1
+                            else:
+                                ancestral_preparation_attempts += 1
                             prepare_point_region_y_indexes(
                                 preparation_owner,
                                 tree_owned,
+                                _admission=(
+                                    PointLocationPreparationAdmission.OBSERVED_REUSE
+                                ),
                             )
                             prepared = {
                                 family: cached_polygon_part_y_index(
@@ -2303,6 +2317,56 @@ class SpatialIndex:
                                 )
                                 for family in region_families
                             }
+                            for family in region_families:
+                                decision = (
+                                    preparation_state.point_location_index_decisions.get(
+                                        family
+                                    )
+                                )
+                                if decision is not None:
+                                    preparation_outcomes.append(decision.outcome.value)
+                            if (
+                                prepare_compact
+                                and not all(
+                                    value is not None for value in prepared.values()
+                                )
+                                and use_count > 1
+                                and cumulative_candidate_work
+                                >= ancestral_coordinate_capacity
+                            ):
+                                ancestral_preparation_attempts += 1
+                                prepare_point_region_y_indexes(
+                                    ancestral_owner,
+                                    tree_owned,
+                                    _admission=(
+                                        PointLocationPreparationAdmission.OBSERVED_REUSE
+                                    ),
+                                )
+                                ancestral_prepared = {
+                                    family: cached_polygon_part_y_index(
+                                        ancestral_state,
+                                        family,
+                                    )
+                                    for family in region_families
+                                }
+                                for family in region_families:
+                                    decision = (
+                                        ancestral_state.point_location_index_decisions.get(
+                                            family
+                                        )
+                                    )
+                                    if decision is not None:
+                                        preparation_outcomes.append(
+                                            decision.outcome.value
+                                        )
+                                if all(
+                                    value is not None
+                                    for value in ancestral_prepared.values()
+                                ):
+                                    prepared = ancestral_prepared
+                                    preparation_state = ancestral_state
+                                    preparation_owner = ancestral_owner
+                                    prepare_compact = False
                             if all(
                                 value is not None for value in prepared.values()
                             ):
@@ -2327,8 +2391,9 @@ class SpatialIndex:
                             else:
                                 repeated_work_admitted = False
                                 reason = (
-                                    "prepared point-location state was declined by "
-                                    "the live memory envelope"
+                                    "observed-reuse point-location preparation was "
+                                    "declined: "
+                                    + ", ".join(preparation_outcomes)
                                 )
                         elif use_count <= 1:
                             reason = (
@@ -2390,6 +2455,17 @@ class SpatialIndex:
                     "query_owner_uses": int(use_count),
                     f"carrier_{carrier}_calls": 1,
                     "prepared_admitted_calls": int(repeated_work_admitted),
+                    "observed_reuse_admission_calls": int(
+                        compact_preparation_attempts
+                        + ancestral_preparation_attempts
+                        > 0
+                    ),
+                    "compact_preparation_attempts": int(
+                        compact_preparation_attempts
+                    ),
+                    "ancestral_preparation_attempts": int(
+                        ancestral_preparation_attempts
+                    ),
                     "compact_copy_coordinate_lanes": int(
                         compact_coordinate_capacity
                     ),
@@ -2407,6 +2483,9 @@ class SpatialIndex:
                     ),
                     "compact_coordinate_capacity": int(
                         compact_coordinate_capacity
+                    ),
+                    "preparation_minimum_coordinates": int(
+                        preparation_minimum_coordinates
                     ),
                     "candidate_work_upper_bound": int(candidate_work_upper_bound),
                     "cumulative_candidate_work": int(cumulative_candidate_work),
@@ -2458,6 +2537,13 @@ class SpatialIndex:
                         "device_logical_counts_read": False,
                         "benchmark_identity_used": False,
                         "repeated_work_admitted": bool(repeated_work_admitted),
+                        "preparation_admission": (
+                            "observed_reuse"
+                            if compact_preparation_attempts
+                            + ancestral_preparation_attempts
+                            else None
+                        ),
+                        "preparation_outcomes": tuple(preparation_outcomes),
                     },
                 )
 

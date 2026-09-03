@@ -1,0 +1,77 @@
+--- a/src/vibespatial/predicates/point_location_index.py
++++ b/src/vibespatial/predicates/point_location_index.py
+@@ -340,6 +340,7 @@ def prepare_polygon_part_y_index(
+     family: GeometryFamily,
+     *,
+     _target_bin_count: int | None = None,
++    _reuse_admitted: bool = False,
+ ):
+     """Build or return the cached exact part-y edge directory."""
+     if family not in _INDEXABLE_FAMILIES:
+@@ -378,6 +379,7 @@ def prepare_polygon_part_y_index(
+             cached=cached,
+             nominal_vram_class_gib=nominal_class,
+             target_bin_count=target,
++            reuse_admitted=_reuse_admitted,
+         )
+         if stage_metadata is not None:
+             cache_hit = cached is not None
+@@ -415,6 +417,7 @@ def _prepare_polygon_part_y_index_impl(
+     cached,
+     nominal_vram_class_gib: int,
+     target_bin_count: int,
++    reuse_admitted: bool,
+ ):
+     from .point_region_profile import current_point_region_profile
+ 
+@@ -431,7 +434,9 @@ def _prepare_polygon_part_y_index_impl(
+     buffer = state.families.get(family)
+     force_prepared = profile is not None and profile.force_prepared_index
+     if buffer is None or (
+-        int(buffer.x.size) < _MIN_PREPARED_COORDINATES and not force_prepared
++        int(buffer.x.size) < _MIN_PREPARED_COORDINATES
++        and not force_prepared
++        and not reuse_admitted
+     ):
+         return None
+     if int(buffer.x.size) >= (1 << 31) or int(buffer.ring_offsets.size - 1) >= (1 << 31):
+@@ -892,13 +897,26 @@ def _prepare_polygon_part_y_index_impl(
+     return None
+ 
+ 
+-def prepare_point_region_y_indexes(left_owned, right_owned) -> None:
++def prepare_point_region_y_indexes(
++    left_owned,
++    right_owned,
++    *,
++    _reuse_admitted: bool = False,
++) -> None:
+     """Prepare large polygon sides before candidate arrays consume the budget."""
+     left_families = set(left_owned.families)
+     right_families = set(right_owned.families)
+     if left_families & set(_POINT_FAMILIES):
+         for family in right_families & set(_INDEXABLE_FAMILIES):
+-            prepare_polygon_part_y_index(right_owned, family)
++            prepare_polygon_part_y_index(
++                right_owned,
++                family,
++                _reuse_admitted=_reuse_admitted,
++            )
+     if right_families & set(_POINT_FAMILIES):
+         for family in left_families & set(_INDEXABLE_FAMILIES):
+-            prepare_polygon_part_y_index(left_owned, family)
++            prepare_polygon_part_y_index(
++                left_owned,
++                family,
++                _reuse_admitted=_reuse_admitted,
++            )
+--- a/src/vibespatial/api/sindex.py
++++ b/src/vibespatial/api/sindex.py
+@@ -2295,6 +2295,7 @@ class SpatialIndex:
+                             prepare_point_region_y_indexes(
+                                 preparation_owner,
+                                 tree_owned,
++                                _reuse_admitted=True,
+                             )
+                             prepared = {
+                                 family: cached_polygon_part_y_index(

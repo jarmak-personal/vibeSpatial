@@ -19,12 +19,15 @@ class ScaleRailObservation:
     allocation_events: int
     materializations: int
     synchronizations: int
-    terminal_d2h_bytes: int
+    d2h_bytes: int
     fallback_count: int = 0
     prepared_builds: int = 0
     prepared_reuses: int = 0
     prepared_declines: int = 0
     exact_refinement_work: int = 0
+    ancestral_coordinate_capacity: int = 0
+    compact_coordinate_capacity: int = 0
+    preparation_minimum_coordinates: int = 0
 
 
 @dataclass(frozen=True)
@@ -45,7 +48,6 @@ class ScaleRailResult:
 
 def _normalized_metrics(observation: ScaleRailObservation) -> dict[str, float]:
     rows = max(int(observation.input_rows), 1)
-    selected_rows = max(int(observation.selected_rows), 1)
     batches = max(int(observation.batch_count), 1)
     return {
         "seconds_per_input_row": float(observation.elapsed_seconds) / rows,
@@ -53,13 +55,9 @@ def _normalized_metrics(observation: ScaleRailObservation) -> dict[str, float]:
         "allocation_events_per_input_row": float(observation.allocation_events) / rows,
         "materializations_per_batch": float(observation.materializations) / batches,
         "synchronizations_per_batch": float(observation.synchronizations) / batches,
-        "terminal_d2h_bytes_per_selected_row": (
-            float(observation.terminal_d2h_bytes) / selected_rows
-        ),
-        "prepared_declines_per_batch": float(observation.prepared_declines) / batches,
-        "prepared_builds_per_batch": float(observation.prepared_builds) / batches,
-        "exact_refinement_work_per_selected_row": (
-            float(observation.exact_refinement_work) / selected_rows
+        "d2h_bytes_per_input_row": float(observation.d2h_bytes) / rows,
+        "exact_refinement_work_per_input_row": (
+            float(observation.exact_refinement_work) / rows
         ),
     }
 
@@ -69,13 +67,14 @@ def evaluate_scale_rail(
     *,
     maximum_adjacent_growth: float = 1.15,
     minimum_tiers: int = 4,
+    require_reuse_admission_shape: bool = False,
 ) -> ScaleRailResult:
     """Check that normalized work remains stable across increasing tiers.
 
     The rail intentionally evaluates work and state slopes, not named scale
-    factors or device products. Fallbacks fail unconditionally. Terminal D2H
-    may remain constant or grow with the public output, but it must never exceed
-    the selected payload implied by the caller's recorded row counts.
+    factors or device products. Fallbacks fail unconditionally. The runner's
+    aggregate D2H counter includes setup and planning packets, so it is
+    normalized by input work rather than mislabeled as terminal output.
     """
     ordered = tuple(sorted(observations, key=lambda item: item.input_rows))
     if len(ordered) < int(minimum_tiers):
@@ -92,6 +91,45 @@ def evaluate_scale_rail(
         raise ValueError("maximum_adjacent_growth must be at least 1.0")
 
     violations: list[ScaleRailViolation] = []
+    if require_reuse_admission_shape:
+        proof_shapes = [
+            observation
+            for observation in ordered
+            if (
+                observation.batch_count > 1
+                and observation.preparation_minimum_coordinates > 0
+                and observation.ancestral_coordinate_capacity
+                >= observation.preparation_minimum_coordinates
+                and 0
+                < observation.compact_coordinate_capacity
+                < observation.preparation_minimum_coordinates
+            )
+        ]
+        if not proof_shapes:
+            violations.append(
+                ScaleRailViolation(
+                    metric="missing_reuse_admission_shape",
+                    previous_tier=ordered[0].name,
+                    current_tier=ordered[-1].name,
+                    previous_normalized=0.0,
+                    current_normalized=1.0,
+                )
+            )
+        elif not any(
+            observation.prepared_builds == 1
+            and observation.prepared_reuses >= 1
+            for observation in proof_shapes
+        ):
+            proof = proof_shapes[-1]
+            violations.append(
+                ScaleRailViolation(
+                    metric="reuse_admission_not_observed",
+                    previous_tier=proof.name,
+                    current_tier=proof.name,
+                    previous_normalized=1.0,
+                    current_normalized=float(proof.prepared_builds),
+                )
+            )
     for observation in ordered:
         if observation.fallback_count:
             violations.append(
@@ -212,6 +250,9 @@ def spatialbench_scale_observation(
     prepared_reuses = 0
     prepared_declines = 0
     exact_refinement_work = 0
+    ancestral_coordinate_capacity = 0
+    compact_coordinate_capacity = 0
+    preparation_minimum_coordinates = 0
     diagnostic_synchronizations = 0
     for stage in hotpath:
         packet = _work_packet(stage)
@@ -230,6 +271,22 @@ def spatialbench_scale_observation(
             prepared_declines += int(sums.get("declined_preparations", 0))
         if str(stage.get("name", "")).startswith("predicate.point_region."):
             exact_refinement_work += int(sums.get("candidate_lanes", 0))
+        if packet.get("operation") == "select_spatial_aggregate_query_carrier":
+            maxima = (
+                packet.get("max") if isinstance(packet.get("max"), dict) else {}
+            )
+            ancestral_coordinate_capacity = max(
+                ancestral_coordinate_capacity,
+                int(maxima.get("ancestral_coordinate_capacity", 0)),
+            )
+            compact_coordinate_capacity = max(
+                compact_coordinate_capacity,
+                int(maxima.get("compact_coordinate_capacity", 0)),
+            )
+            preparation_minimum_coordinates = max(
+                preparation_minimum_coordinates,
+                int(maxima.get("preparation_minimum_coordinates", 0)),
+            )
         diagnostic_synchronizations += int(
             sums.get("diagnostic_synchronizations", 0)
         )
@@ -241,11 +298,7 @@ def spatialbench_scale_observation(
     elapsed = result.get("time_seconds")
     if elapsed is None:
         raise ValueError("SpatialBench result is missing elapsed time")
-    selected_rows = max(
-        int(result.get("row_count") or 0),
-        exact_refinement_work,
-        1,
-    )
+    selected_rows = max(int(result.get("row_count") or 0), 1)
     allocation_bytes = telemetry.get("rmm_total_allocation_bytes")
     allocation_events = telemetry.get("rmm_allocation_count")
     if allocation_bytes is None or allocation_events is None:
@@ -262,14 +315,15 @@ def spatialbench_scale_observation(
         allocation_events=int(allocation_events),
         materializations=int(telemetry.get("materialization_event_count") or 0),
         synchronizations=d2h_count + diagnostic_synchronizations,
-        # The runner does not classify individual transfers by boundary, so
-        # count every D2H byte as terminal. This is a conservative rail bound.
-        terminal_d2h_bytes=int(telemetry.get("d2h_transfer_bytes") or 0),
+        d2h_bytes=int(telemetry.get("d2h_transfer_bytes") or 0),
         fallback_count=int(telemetry.get("fallback_event_count") or 0),
         prepared_builds=prepared_builds,
         prepared_reuses=prepared_reuses,
         prepared_declines=prepared_declines,
         exact_refinement_work=exact_refinement_work,
+        ancestral_coordinate_capacity=ancestral_coordinate_capacity,
+        compact_coordinate_capacity=compact_coordinate_capacity,
+        preparation_minimum_coordinates=preparation_minimum_coordinates,
     )
 
 
@@ -307,6 +361,7 @@ def main(argv=None) -> int:
     result = evaluate_scale_rail(
         observations,
         maximum_adjacent_growth=args.maximum_adjacent_growth,
+        require_reuse_admission_shape=args.query == "q6",
     )
     print(
         json.dumps(

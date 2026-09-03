@@ -5,7 +5,7 @@ Scope: Per-query semantic, physical-shape, memory, correctness, and benchmark ev
 Read If: You are changing an SF100 query path, native tabular primitive, memory estimate, export boundary, or performance claim.
 STOP IF: You only need the program milestones or architecture; open the execution plan instead.
 Source Of Truth: Query-level evidence ledger required by the pylibcudf SF100 execution plan.
-Body Budget: 217/260 lines
+Body Budget: 218/260 lines
 Document: docs/dev/pylibcudf-sf100-query-ledger.md
 
 Section Map (Body Lines)
@@ -18,10 +18,10 @@ Section Map (Body Lines)
 | 23-30 | Verify |
 | 31-37 | Risks |
 | 38-71 | Measurement Contract And Shared Evidence |
-| 72-185 | Q1-Q12 Ledger |
-| 186-193 | Public Shootout Capacity Closure |
-| 194-205 | Rejected Physical Shapes |
-| 206-217 | Artifact Map |
+| 72-186 | Q1-Q12 Ledger |
+| 187-194 | Public Shootout Capacity Closure |
+| 195-206 | Rejected Physical Shapes |
+| 207-218 | Artifact Map |
 DOC_HEADER:END -->
 
 ## Intent
@@ -99,7 +99,7 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 
 - Semantics/schema/order: trips within 0.45 degrees; `t_tripkey, pickup_lon, pickup_lat, t_pickuptime, distance_to_center`; distance then key ascending; 100 rows.
 - Projection/pushdown: trip key, pickup time, pickup geometry; distance predicate is evaluated after row-group scan.
-- Shapes/chain/export: trip rows -> distance `NativeExpression` -> filtered `NativeRowSet` -> bounded top-k -> one terminal pandas frame.
+- Shapes/chain/export: trip rows -> distance `NativeExpression` -> filtered `NativeRowSet` -> bounded top-k -> one terminal pandas frame. Timing mode fences scan/decode, scalar distance, threshold filtering, batch top-k, winner merge/compaction, result take, and terminal export as non-overlapping stages.
 - Primitive/budget: fused custom distance plus pylibcudf selection; scan decoded bytes + `N * (64 + source_width + 5 * expanded_key_width) + 1 MiB` top-k scratch, shard-local top-k merged to 100.
 - Measured after: profiled pipeline 13.07 s; D2H 0.0045 s / 96,000 B; 12.01 / 11.56 / 11.17 GiB; clean GPD 106.03 s versus VS 12.51 s (8.48x).
 - Correctness/fallback: finite fp64 distance, datetime/key dtype and exact tie order preserved; SF1 and SF100 pass; no fallback.
@@ -146,18 +146,19 @@ trip batches are 8M rows for Q2/Q6, 4M for Q10, and at most 32M otherwise.
 
 - Semantics/schema/order: pickups inside zones whose geometry intersects the 0.45-degree Sedona circle; `z_zonekey, z_name, total_pickups, avg_distance, avg_duration`; count descending/key ascending; 19 rows.
 - Projection/pushdown: trip key, pickup geometry, distance, pickup/dropoff timestamps; zone key/name/boundary; the selective zone-bounds predicate streams before zone concatenation and 8M point batches.
-- Shapes/chain/export: compact selected polygon rows -> point-grid/location `NativeRelation` -> pylibcudf joined reductions -> terminal pandas.
-- Primitive/budget: point grid `192*N + 96*C + 1 MiB`, exact fp64 refinement, bounded relation and shard-local sum/count state; resize below remaining query budget.
-- Measured after: final current-source repeat-3 median 13.24 s (`13.14, 13.29, 13.24`) versus frozen GPD 371.42 s, or 28.05x; fail-closed SF100 verification passes all 19 ordered rows.
+- Shapes/chain/export: compact selected polygon rows -> reusable point-location directory after observed repeated work -> point-grid/location `NativeRelation` -> pylibcudf joined reductions -> terminal pandas.
+- Primitive/budget: observed-reuse admission may bypass only the one-shot coordinate minimum. Width, membership, coverage, and live-memory admission remain authoritative; a rejected compact build tries the independently amortized ancestor before exact compact refinement. Point-grid work remains `192*N + 96*C + 1 MiB`, with bounded relation and shard-local sum/count state.
+- Current follow-up (2026-09-03): strict-native SF100 repeat-3 median 12.31 s (`12.36, 12.31, 12.20`) versus frozen GPD 371.42 s, or 30.17x; fail-closed verification passes all 19 ordered rows with zero fallback.
 - Correctness/fallback: exact zone/pickup predicate, duration/decimal averages, null exclusion and stable order pass SF1/SF100; no fallback.
 
 ### Q7: Detour Ratio Top 100
 
 - Semantics/schema/order: reported distance metres divided by nonzero line distance; `t_tripkey, reported_distance_m, line_distance_m, detour_ratio`; ratio descending/key ascending; 100 rows.
 - Projection/pushdown: trip key, reported decimal distance, pickup and dropoff geometry; zero geometric distances are excluded.
-- Shapes/chain/export: dual-geometry distance expression + decimal cast/ratio expression -> bounded top-k `NativeRowSet` -> pandas.
-- Primitive/budget: custom point distance and pylibcudf expression/top-k; decoded scan bytes plus the top-k formula, shard-local candidates merged to 100.
-- Measured after: profiled pipeline 4.71 s; D2H 0.0026 s / 64,000 B; 17.78 / 17.34 / 11.17 GiB; clean GPD 337.44 s versus VS 4.25 s (79.40x).
+- Shapes/chain/export: dual-geometry distance expression + decimal cast/ratio expression -> explicit nonzero-distance filter -> at most 100 public candidates per batch -> one exact final lexicographic top-k.
+- Primitive/budget: custom point distance and public `nlargest`; decoded scan bytes plus one bounded candidate frame per shard. The public candidate plan is retained until a dedicated streaming top-k carrier beats its allocation lifecycle cost.
+- Historical accepted profile: pipeline 4.71 s; D2H 0.0026 s / 64,000 B; 17.78 / 17.34 / 11.17 GiB; clean GPD 337.44 s versus VS 4.25 s (79.40x).
+- Current follow-up (2026-09-03): the filtered, single-division public plan has a strict-native SF100 repeat-3 median of 4.95 s (`4.96, 4.90, 4.95`), or 68.17x versus frozen GPD. Its 100 ordered rows are byte-identical to the previously verified same-data result. The supplied controlled SF1000 diagnostic remains historical evidence: the public plan completed in 84.09 s versus 97.44 s for the streaming accumulator.
 - Before/after stages: before read 127.14 s, decimal conversion 27.63 s, distance 6.84 s, host ratio/top-k 5.20 s; after total 4.50 s.
 - Correctness/fallback: decimal-cast lineage, division-by-zero null semantics, fp64 distances and ties pass SF1/SF100; no fallback.
 

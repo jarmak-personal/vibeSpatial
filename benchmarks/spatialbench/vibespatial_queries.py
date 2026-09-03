@@ -31,7 +31,7 @@ except ImportError:  # SpatialBench loads this entrypoint as a standalone module
     from geoparquet_public_api_queries import CRS, GeoParquetPublicApiQueries
 
 import vibespatial as gpd
-from vibespatial.api.tabular import _numeric_divide, _streaming_topk
+from vibespatial.api.tabular import _streaming_topk
 
 gpd.set_execution_mode(gpd.ExecutionMode.AUTO)
 
@@ -92,6 +92,27 @@ class VibeSpatialQueries(GeoParquetPublicApiQueries):
                         "single_terminal_export_phase": True,
                     },
                 )
+
+    @staticmethod
+    @contextmanager
+    def _profile_stage(name: str, *, category: str):
+        """Fence a diagnostic-only stage so queued GPU work cannot overlap it."""
+        from vibespatial.runtime.hotpath_trace import (
+            hotpath_stage,
+            hotpath_timing_enabled,
+        )
+
+        timing = hotpath_timing_enabled()
+        if timing:
+            from vibespatial.cuda._runtime import get_cuda_runtime
+
+            get_cuda_runtime().synchronize()
+        with hotpath_stage(name, category=category) as stage_metadata:
+            try:
+                yield stage_metadata
+            finally:
+                if timing:
+                    get_cuda_runtime().synchronize()
 
     def _spatial_frames(self, path, columns, geometry, *, batch_rows=None):
         """Expose a bounded scan/decode stage without claiming a GDS transport."""
@@ -569,13 +590,47 @@ class VibeSpatialQueries(GeoParquetPublicApiQueries):
         for trips in self._spatial_frames(
             data_paths["trip"], source_columns, "t_pickuploc"
         ):
-            distance = trips.geometry.distance(center)
-            metrics = trips.assign(
-                distance_to_center=distance,
-                __distance_rank=0 - distance,
-                __tripkey_rank=0 - trips["t_tripkey"],
-            )
-            candidates = metrics.loc[distance <= 0.45]
+            from vibespatial.runtime.hotpath_trace import attach_work_amplification
+
+            with self._profile_stage(
+                "spatialbench.q1.scalar_distance",
+                category="refine",
+            ) as stage_metadata:
+                distance = trips.geometry.distance(center)
+                attach_work_amplification(
+                    stage_metadata,
+                    operation="spatialbench_q1_scalar_distance",
+                    metric_family="metric",
+                    sums={"input_rows": len(trips)},
+                    maxima={"batch_rows": len(trips)},
+                    physical_shape="point rows -> scalar distance expression",
+                    consumer_kind="Q1 threshold predicate",
+                )
+            with self._profile_stage(
+                "spatialbench.q1.threshold_filter",
+                category="filter",
+            ) as stage_metadata:
+                metrics = trips.assign(
+                    distance_to_center=distance,
+                    __distance_rank=0 - distance,
+                    __tripkey_rank=0 - trips["t_tripkey"],
+                )
+                candidates = metrics.loc[distance <= 0.45]
+                attach_work_amplification(
+                    stage_metadata,
+                    operation="spatialbench_q1_threshold_filter",
+                    metric_family="filter",
+                    sums={
+                        "input_rows": len(trips),
+                        "selected_rows": len(candidates),
+                    },
+                    maxima={
+                        "batch_rows": len(trips),
+                        "selected_rows": len(candidates),
+                    },
+                    physical_shape="distance expression -> bounded candidate rowset",
+                    consumer_kind="batch-local top-k",
+                )
             accumulator = _streaming_topk(
                 candidates,
                 100,
@@ -594,71 +649,67 @@ class VibeSpatialQueries(GeoParquetPublicApiQueries):
         ]
         if accumulator is None:
             return pd.DataFrame(columns=columns)
-        result = accumulator.drop(columns=rank_columns)
-        # One terminal export phase after the complete stream has been reduced.
-        with self._terminal_export(rows=len(result), columns=len(columns)):
-            return pd.DataFrame(
-                {
-                    "t_tripkey": result["t_tripkey"].to_numpy(),
-                    "pickup_lon": result.geometry.x.to_numpy(),
-                    "pickup_lat": result.geometry.y.to_numpy(),
-                    "t_pickuptime": result["t_pickuptime"].to_numpy(),
-                    "distance_to_center": result["distance_to_center"].to_numpy(),
+        with self._profile_stage(
+            "spatialbench.q1.result_take",
+            category="emit",
+        ) as stage_metadata:
+            result = accumulator.drop(columns=rank_columns)
+            payload = {
+                "t_tripkey": result["t_tripkey"].to_numpy(),
+                "pickup_lon": result.geometry.x.to_numpy(),
+                "pickup_lat": result.geometry.y.to_numpy(),
+                "t_pickuptime": result["t_pickuptime"].to_numpy(),
+                "distance_to_center": result["distance_to_center"].to_numpy(),
+            }
+            attach_work_amplification(
+                stage_metadata,
+                operation="spatialbench_q1_result_take",
+                metric_family="materialization",
+                sums={
+                    "output_rows": len(result),
+                    "output_columns": len(columns),
                 },
-                columns=columns,
+                maxima={"output_rows": len(result)},
+                physical_shape="bounded winner state -> terminal column vectors",
+                consumer_kind="Q1 terminal public frame",
             )
+        with self._terminal_export(rows=len(result), columns=len(columns)):
+            return pd.DataFrame(payload, columns=columns)
 
-    def q7(self, data_paths):
-        """Fuse ratio construction and retain only native top-k candidates."""
-        accumulator = None
-        source_columns = [
-            "t_tripkey",
-            "t_distance",
-            "t_pickuploc",
-            "t_dropoffloc",
-        ]
-        rank_columns = [
-            "detour_ratio",
-            "reported_distance_m",
-            "__tripkey_rank",
-        ]
-        for trips in self._spatial_frames(
-            data_paths["trip"], source_columns, "t_pickuploc"
-        ):
-            pickup = trips.geometry
-            dropoff = trips["t_dropoffloc"]
-            line_distance = pickup.distance(dropoff, align=False) / 0.000009
-            reported = trips["t_distance"].astype(float)
-            detour_ratio = _numeric_divide(reported, line_distance)
-            base = trips.drop(columns=["t_dropoffloc"])
-            candidates = base.assign(
-                reported_distance_m=reported,
-                line_distance_m=line_distance,
-                detour_ratio=detour_ratio,
-                __tripkey_rank=0 - trips["t_tripkey"],
-            )
-            accumulator = _streaming_topk(
-                candidates,
-                100,
-                rank_columns,
-                largest=True,
-                out=accumulator,
-            )
-            del base, candidates, detour_ratio, dropoff, line_distance, pickup, reported, trips
-
+    def _q7_shard_topk(self, trips):
+        """Return one bounded public candidate set for the inherited final merge."""
+        pickup = trips.geometry
+        dropoff = trips.set_geometry("t_dropoffloc").geometry
+        line_distance = pickup.distance(dropoff, align=False) / 0.000009
+        reported = trips["t_distance"].astype(float)
+        metrics = trips.drop(columns=["t_dropoffloc"]).assign(
+            reported_distance_m=reported,
+            line_distance_m=line_distance,
+        )
+        metrics = metrics.loc[line_distance != 0.0]
+        metrics = metrics.assign(
+            detour_ratio=(
+                metrics["reported_distance_m"] / metrics["line_distance_m"]
+            ),
+            __vibespatial_topk_tie_2=0 - metrics["t_tripkey"],
+        )
+        selected = metrics.nlargest(
+            100,
+            [
+                "detour_ratio",
+                "reported_distance_m",
+                "__vibespatial_topk_tie_2",
+            ],
+        )
         columns = [
             "t_tripkey",
             "reported_distance_m",
             "line_distance_m",
             "detour_ratio",
         ]
-        if accumulator is None:
-            return pd.DataFrame(columns=columns)
-        with self._terminal_export(rows=len(accumulator), columns=len(columns)):
-            return pd.DataFrame(
-                {column: accumulator[column].to_numpy() for column in columns},
-                columns=columns,
-            )
+        return pd.DataFrame(
+            {column: selected[column].to_numpy() for column in columns}
+        )
 
     def _knn5_batch(self, pickups, buildings):
         import numpy as np

@@ -117,6 +117,10 @@ class PointRegionProfileSession:
                 "coverage_grid_width": int(prepared.coverage_grid_width),
                 "coverage_decline_reason": prepared.coverage_decline_reason,
                 "decline_reason": prepared.decline_reason,
+                "admission": prepared.admission.value,
+                "minimum_coordinate_bypassed": bool(
+                    prepared.minimum_coordinate_bypassed
+                ),
                 "edge_membership_count": int(prepared.edge_membership_count),
                 "persistent_bytes": int(prepared.device_bytes),
                 "peak_build_bytes": int(prepared.peak_build_bytes),
@@ -139,6 +143,10 @@ class PointRegionProfileSession:
                 "coverage_grid_width": int(prepared.coverage_grid_width),
                 "coverage_decline_reason": prepared.coverage_decline_reason,
                 "decline_reason": prepared.decline_reason,
+                "admission": prepared.admission.value,
+                "minimum_coordinate_bypassed": bool(
+                    prepared.minimum_coordinate_bypassed
+                ),
                 "edge_membership_count": int(prepared.edge_membership_count),
                 "persistent_bytes": int(prepared.device_bytes),
                 "peak_build_bytes": int(prepared.peak_build_bytes),

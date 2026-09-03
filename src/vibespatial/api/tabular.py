@@ -172,6 +172,8 @@ def _streaming_topk(
     input_rows = len(frame)
     operation = "nlargest" if largest else "nsmallest"
     selector = getattr(frame, operation)
+    timing = hotpath_timing_enabled()
+    _sync_tabular_hotpath()
     with hotpath_stage(
         "tabular.streaming_topk.batch_select",
         category="sort",
@@ -186,7 +188,11 @@ def _streaming_topk(
             stage_metadata,
             operation="streaming_topk_batch_select",
             metric_family="tabular",
-            sums={"input_rows": input_rows, "selected_rows": len(batch)},
+            sums={
+                "input_rows": input_rows,
+                "selected_rows": len(batch),
+                "diagnostic_synchronizations": 2 if timing else 0,
+            },
             maxima={
                 "input_rows": input_rows,
                 "selected_rows": len(batch),
@@ -196,6 +202,7 @@ def _streaming_topk(
             consumer_kind="streaming top-k accumulator",
             semantic_contract={"keep": keep, "largest": bool(largest)},
         )
+        _sync_tabular_hotpath()
 
     if out is None or out.empty:
         result = batch
@@ -208,6 +215,7 @@ def _streaming_topk(
     else:
         merged_rows = len(out) + len(batch)
         merge_inputs = (out, batch)
+        _sync_tabular_hotpath()
         with hotpath_stage(
             "tabular.streaming_topk.merge",
             category="sort",
@@ -267,7 +275,11 @@ def _streaming_topk(
                 stage_metadata,
                 operation="streaming_topk_merge",
                 metric_family="tabular",
-                sums={"merged_rows": merged_rows, "output_rows": len(result)},
+                sums={
+                    "merged_rows": merged_rows,
+                    "output_rows": len(result),
+                    "diagnostic_synchronizations": 2 if timing else 0,
+                },
                 maxima={
                     "retained_rows": len(out),
                     "batch_rows": len(batch),
@@ -278,6 +290,7 @@ def _streaming_topk(
                 consumer_kind="persistent streaming top-k state",
                 semantic_contract={"keep": keep, "largest": bool(largest)},
             )
+            _sync_tabular_hotpath()
 
     from vibespatial.api._native_state import get_native_state
 

@@ -24,7 +24,7 @@ def _observation(name: str, rows: int, *, allocation_multiplier: int = 24):
         allocation_events=batches * 4,
         materializations=1,
         synchronizations=batches,
-        terminal_d2h_bytes=800,
+        d2h_bytes=800,
     )
 
 
@@ -65,7 +65,7 @@ def test_scale_rail_rejects_superlinear_allocation_and_fallback() -> None:
     }
 
 
-def test_scale_rail_rejects_growing_terminal_and_refinement_work() -> None:
+def test_scale_rail_rejects_growing_d2h_and_refinement_work() -> None:
     observations = [
         _observation("tier-1", 10_000),
         _observation("tier-2", 100_000),
@@ -75,7 +75,7 @@ def test_scale_rail_rejects_growing_terminal_and_refinement_work() -> None:
     observations[-1] = ScaleRailObservation(
         **{
             **observations[-1].__dict__,
-            "terminal_d2h_bytes": 160_000,
+            "d2h_bytes": 16_000_000,
             "exact_refinement_work": 20_000_000,
         }
     )
@@ -84,8 +84,8 @@ def test_scale_rail_rejects_growing_terminal_and_refinement_work() -> None:
 
     assert not result.passed
     assert {
-        "terminal_d2h_bytes_per_selected_row",
-        "exact_refinement_work_per_selected_row",
+        "d2h_bytes_per_input_row",
+        "exact_refinement_work_per_input_row",
     }.issubset({violation.metric for violation in result.violations})
 
 
@@ -119,6 +119,26 @@ def test_scale_rail_rejects_per_batch_prepared_rebuilds() -> None:
     assert "prepared_rebuilds_without_reuse" in {
         violation.metric for violation in result.violations
     }
+
+
+def test_scale_rail_allows_one_reusable_build_after_no_build_tier() -> None:
+    observations = [
+        _observation("tier-1", 10_000),
+        _observation("tier-2", 100_000),
+        _observation("tier-3", 1_000_000),
+        _observation("tier-4", 10_000_000),
+    ]
+    observations[1] = ScaleRailObservation(
+        **{
+            **observations[1].__dict__,
+            "prepared_builds": 1,
+            "prepared_reuses": observations[1].batch_count - 1,
+        }
+    )
+
+    result = evaluate_scale_rail(observations)
+
+    assert result.passed
 
 
 def _write_spatialbench_artifact(path, *, input_rows: int, batch_count: int) -> None:
@@ -172,6 +192,21 @@ def _write_spatialbench_artifact(path, *, input_rows: int, batch_count: int) -> 
                                         },
                                     },
                                     {
+                                        "name": "spatial.query_aggregate.query_input",
+                                        "metadata": {
+                                            "work_amplification": {
+                                                "operation": (
+                                                    "select_spatial_aggregate_query_carrier"
+                                                ),
+                                                "max": {
+                                                    "ancestral_coordinate_capacity": 2_000_000,
+                                                    "compact_coordinate_capacity": 500_000,
+                                                    "preparation_minimum_coordinates": 1_000_000,
+                                                },
+                                            }
+                                        },
+                                    },
+                                    {
                                         "name": "predicate.point_region.contains",
                                         "metadata": {
                                             "work_amplification": {
@@ -212,8 +247,33 @@ def test_spatialbench_artifact_wires_real_telemetry_into_scale_rail(
     assert observation.prepared_builds == 1
     assert observation.prepared_reuses == 9
     assert observation.exact_refinement_work == 1_000
+    assert observation.ancestral_coordinate_capacity == 2_000_000
+    assert observation.compact_coordinate_capacity == 500_000
+    assert observation.preparation_minimum_coordinates == 1_000_000
 
     assert main(["--query", "q6", *(str(path) for path in paths)]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["passed"] is True
     assert len(report["observations"]) == 4
+
+
+def test_q6_scale_rail_requires_large_ancestor_small_derivative_proof() -> None:
+    observations = [
+        _observation(name, rows)
+        for name, rows in (
+            ("sf1", 10_000),
+            ("sf10", 100_000),
+            ("sf100", 1_000_000),
+            ("sf1000", 10_000_000),
+        )
+    ]
+
+    result = evaluate_scale_rail(
+        observations,
+        require_reuse_admission_shape=True,
+    )
+
+    assert not result.passed
+    assert {violation.metric for violation in result.violations} == {
+        "missing_reuse_admission_shape"
+    }
