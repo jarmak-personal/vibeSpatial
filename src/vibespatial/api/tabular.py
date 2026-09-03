@@ -540,7 +540,7 @@ def _dense_count_device_update(
     count_stride = count_stride_bytes // count_itemsize
     if int(d_counts.size) > 1 and count_stride == 0:
         raise ValueError("dense_count out must not alias accumulator elements")
-    if cp.shares_memory(d_indices, d_counts):
+    if cp.shares_memory(d_indices, d_counts, max_work="MAY_SHARE_BOUNDS"):
         raise ValueError("dense_count codes and out must not share device storage")
     runtime = get_cuda_runtime()
     suffix = "u32" if output_dtype == np.dtype(np.uint32) else "u64"
