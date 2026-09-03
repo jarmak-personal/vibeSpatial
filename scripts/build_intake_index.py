@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -176,7 +177,7 @@ def classify_file(relative_path: str) -> str:
 
 
 def should_index_file(path: Path, root: Path) -> bool:
-    if path.is_dir():
+    if not path.is_file():
         return False
     if any(part in EXCLUDED_DIRS for part in path.parts):
         return False
@@ -195,6 +196,26 @@ def should_index_file(path: Path, root: Path) -> bool:
     if "baseline_images" in relative_path:
         return False
     return True
+
+
+def _iter_repository_files(root: Path) -> list[Path]:
+    """Return tracked and non-ignored untracked files in repository order."""
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("intake indexing requires Git repository metadata") from exc
+
+    relative_paths = [
+        Path(raw_path.decode(errors="surrogateescape"))
+        for raw_path in completed.stdout.split(b"\0")
+        if raw_path
+    ]
+    return sorted(root / relative_path for relative_path in relative_paths)
 
 
 def build_doc_entries(root: Path) -> list[dict[str, Any]]:
@@ -250,7 +271,7 @@ def build_file_entries(root: Path, doc_entries: list[dict[str, Any]]) -> list[di
             referenced_by.setdefault(relative_path, set()).add(doc["path"])
 
     entries: list[dict[str, Any]] = []
-    for path in sorted(root.rglob("*")):
+    for path in _iter_repository_files(root):
         if not should_index_file(path, root):
             continue
 

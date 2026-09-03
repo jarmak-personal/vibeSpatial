@@ -1,9 +1,9 @@
 """Bounded, opt-in measurements for exact point/region GPU refinement.
 
 This module is deliberately private.  Public spatial APIs remain the workload
-entry point; a profiling session only substitutes instrumented copies of the
-prepared point-location kernels and exports one fixed-size control packet when
-the session is closed or snapshotted.
+entry point; a profiling session selects compile-time-instrumented entry points
+that share the production classifier and exports one fixed-size control packet
+when the session is closed or snapshotted.
 """
 
 from __future__ import annotations

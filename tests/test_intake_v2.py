@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from scripts.build_intake_index import build_intake_index, should_index_file
+import subprocess
+
+from scripts.build_intake_index import (
+    build_file_entries,
+    build_intake_index,
+    should_index_file,
+)
 from scripts.check_docs import _is_header_scan_excluded
 from scripts.intake import plan_request
 from scripts.update_doc_headers import evaluate_doc_headers
@@ -58,3 +64,39 @@ def test_repository_discovery_excludes_nested_worktrees(tmp_path) -> None:
 
     assert not should_index_file(nested_doc, tmp_path)
     assert _is_header_scan_excluded(".worktrees/branch/docs/plan.md")
+
+
+def test_repository_discovery_excludes_ignored_untracked_files(tmp_path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / ".gitignore").write_text("reports/*\n")
+    tracked_report = tmp_path / "reports" / "tracked.md"
+    ignored_report = tmp_path / "reports" / "local.md"
+    untracked_source = tmp_path / "local.py"
+    deleted_source = tmp_path / "deleted.py"
+    tracked_report.parent.mkdir()
+    tracked_report.write_text("# Tracked evidence\n")
+    ignored_report.write_text("# Local evidence\n")
+    untracked_source.write_text('"""Discoverable worktree source."""\n')
+    deleted_source.write_text('"""Deleted tracked source."""\n')
+    subprocess.run(
+        [
+            "git",
+            "add",
+            ".gitignore",
+            "-f",
+            tracked_report.relative_to(tmp_path),
+            deleted_source.relative_to(tmp_path),
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+    deleted_source.unlink()
+
+    indexed_paths = {
+        entry["path"] for entry in build_file_entries(tmp_path, doc_entries=[])
+    }
+
+    assert "reports/tracked.md" in indexed_paths
+    assert "reports/local.md" not in indexed_paths
+    assert "local.py" in indexed_paths
+    assert "deleted.py" not in indexed_paths

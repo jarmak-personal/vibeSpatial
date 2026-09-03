@@ -29,6 +29,8 @@ from vibespatial.predicates.point_location_index_kernels import (
 )
 from vibespatial.predicates.point_region_profile import profile_point_region
 from vibespatial.predicates.point_relations import (
+    _classify_indexed_point_region,
+    _plan_indexed_point_precision,
     _point_region_level0_packet,
     _sync_hotpath,
     classify_point_region_gpu,
@@ -162,10 +164,134 @@ def test_point_region_profiler_is_absent_from_production_kernel_source() -> None
     """Disabled profiling must not add counters or atomics to production code."""
     assert "VS_PROFILE_COUNTER_COUNT" not in _POINT_LOCATION_PART_Y_INDEX_SOURCE
     assert "_profiled" not in _POINT_LOCATION_PART_Y_INDEX_SOURCE
+    assert _POINT_LOCATION_PART_Y_INDEX_SOURCE.count(
+        "unsigned char vs_prepared_part_location_core("
+    ) == 1
+    assert "vs_prepared_part_location_core<false>(" in (
+        _POINT_LOCATION_PART_Y_INDEX_SOURCE
+    )
+    core_source = _POINT_LOCATION_PART_Y_INDEX_SOURCE.split(
+        "unsigned char vs_prepared_part_location_core(", maxsplit=1
+    )[1].split(
+        'extern "C" __device__ __forceinline__ unsigned char '
+        "vs_prepared_part_location(",
+        maxsplit=1,
+    )[0]
+    assert core_source.index("if (py < minimum || py > maximum)") < (
+        core_source.index("const double xmin = part_xmin[part]")
+    )
     assert "VS_PROFILE_COUNTER_COUNT" in _POINT_LOCATION_PART_Y_INDEX_PROFILE_SOURCE
+    assert _POINT_LOCATION_PART_Y_INDEX_PROFILE_SOURCE.count(
+        "unsigned char vs_prepared_part_location_core("
+    ) == 1
+    assert "vs_prepared_part_location_core<true>(" in (
+        _POINT_LOCATION_PART_Y_INDEX_PROFILE_SOURCE
+    )
     assert "point_in_multipolygon_prepared_part_y_index_profiled" in (
         _POINT_LOCATION_PART_Y_INDEX_PROFILE_SOURCE
     )
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")
+@pytest.mark.parametrize(
+    ("family", "regions"),
+    [
+        (
+            GeometryFamily.POLYGON,
+            [
+                Polygon([(0, 0), (4, 0), (4, 4), (0, 4)]),
+                Polygon(
+                    [(5, 0), (9, 0), (9, 4), (5, 4)],
+                    holes=[[(6, 1), (8, 1), (8, 3), (6, 3)]],
+                ),
+            ],
+        ),
+        (
+            GeometryFamily.MULTIPOLYGON,
+            [
+                MultiPolygon([box(0, 0, 2, 2), box(4, 0, 6, 2)]),
+                MultiPolygon([box(0, 4, 2, 6), box(4, 4, 6, 6)]),
+            ],
+        ),
+    ],
+)
+def test_profiled_and_production_prepared_classifiers_are_byte_identical(
+    monkeypatch,
+    family,
+    regions,
+) -> None:
+    """Direct and indexed wrappers instantiate one exact classification core."""
+    point_geometries = np.asarray(
+        [
+            Point(0.5, 0.5),
+            Point(1.0, 1.0),
+            Point(4.0, 1.0),
+            Point(7.0, 2.0),
+            Point(0.0, 5.0),
+            Point(5.0, 5.0),
+            Point(20.0, 20.0),
+            Point(-1.0, -1.0),
+        ],
+        dtype=object,
+    )
+    repeated_regions = np.asarray([regions[index % 2] for index in range(8)], dtype=object)
+    points_owned = from_shapely_geometries(
+        point_geometries,
+        residency=Residency.DEVICE,
+    )
+    direct_regions_owned = from_shapely_geometries(
+        repeated_regions,
+        residency=Residency.DEVICE,
+    )
+    indexed_regions_owned = from_shapely_geometries(
+        np.asarray(regions, dtype=object),
+        residency=Residency.DEVICE,
+    )
+    monkeypatch.setattr(
+        "vibespatial.predicates.point_location_index._MIN_PREPARED_COORDINATES",
+        0,
+    )
+    prepare_polygon_part_y_index(direct_regions_owned, family, _target_bin_count=64)
+    prepare_polygon_part_y_index(indexed_regions_owned, family, _target_bin_count=64)
+
+    candidate_rows = np.arange(8, dtype=np.int32)
+    production_direct = classify_point_region_gpu(
+        candidate_rows,
+        points_owned,
+        direct_regions_owned,
+        region_family=family,
+    )
+    with profile_point_region(label="shared-core-direct"):
+        profiled_direct = classify_point_region_gpu(
+            candidate_rows,
+            points_owned,
+            direct_regions_owned,
+            region_family=family,
+        )
+
+    point_indices = np.asarray([0, 1, 2, 3, 4, 5, 6, 7, 0, 7], dtype=np.int32)
+    region_indices = np.asarray([0, 0, 0, 0, 1, 1, 1, 1, 1, 0], dtype=np.int32)
+    precision_plan = _plan_indexed_point_precision()
+    production_indexed = _classify_indexed_point_region(
+        points_owned,
+        indexed_regions_owned,
+        point_indices,
+        region_indices,
+        region_family=family,
+        precision_plan=precision_plan,
+    )
+    with profile_point_region(label="shared-core-indexed"):
+        profiled_indexed = _classify_indexed_point_region(
+            points_owned,
+            indexed_regions_owned,
+            point_indices,
+            region_indices,
+            region_family=family,
+            precision_plan=precision_plan,
+        )
+
+    assert production_direct.tobytes() == profiled_direct.tobytes()
+    assert production_indexed.tobytes() == profiled_indexed.tobytes()
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required")

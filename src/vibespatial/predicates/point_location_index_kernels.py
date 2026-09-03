@@ -234,26 +234,59 @@ extern "C" __global__ void scatter_polygon_edge_y_bin_memberships(
     }
 }
 
-extern "C" __device__ __forceinline__ unsigned char vs_prepared_part_location(
+template <bool CollectMetrics>
+__device__ __forceinline__ unsigned char vs_prepared_part_location_core(
     double px,
     double py,
     int part,
-    const int* ring_offsets,
-    const double* x,
-    const double* y,
-    const double* part_ymin,
-    const double* part_ymax,
-    const unsigned int* counts,
-    const long long* offsets,
-    const unsigned int* entries
+    const int* __restrict__ ring_offsets,
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const double* __restrict__ part_xmin,
+    const double* __restrict__ part_xmax,
+    const double* __restrict__ part_ymin,
+    const double* __restrict__ part_ymax,
+    const unsigned char* __restrict__ coverage,
+    const unsigned int* __restrict__ counts,
+    const long long* __restrict__ offsets,
+    const unsigned int* __restrict__ entries,
+    unsigned long long* active_parts,
+    unsigned long long* edges_visited,
+    unsigned long long* orient2d_calls
 ) {
     const double minimum = part_ymin[part];
     const double maximum = part_ymax[part];
     if (py < minimum || py > maximum) return 0;
+    if (CollectMetrics) *active_parts += 1ull;
+    if (coverage != 0 && part_xmin != 0 && part_xmax != 0) {
+        const double xmin = part_xmin[part];
+        const double xmax = part_xmax[part];
+        if (isfinite(xmin) && isfinite(xmax)
+            && isfinite(minimum) && isfinite(maximum)
+            && xmax > xmin && maximum > minimum) {
+            if (px < xmin || px > xmax) return 0u;
+            int cell_x = (int)floor(
+                (px - xmin) * ((double)VS_COVERAGE_GRID_WIDTH / (xmax - xmin)));
+            int cell_y = (int)floor(
+                (py - minimum)
+                * ((double)VS_COVERAGE_GRID_WIDTH / (maximum - minimum)));
+            cell_x = max(0, min(VS_COVERAGE_GRID_WIDTH - 1, cell_x));
+            cell_y = max(0, min(VS_COVERAGE_GRID_WIDTH - 1, cell_y));
+            const unsigned char state = coverage[
+                (long long)part * VS_COVERAGE_GRID_WIDTH * VS_COVERAGE_GRID_WIDTH
+                + cell_y * VS_COVERAGE_GRID_WIDTH + cell_x
+            ];
+            if (state == 1u) return 0u;
+            if (state == 2u) return 2u;
+        }
+    }
     const int bin = vs_part_y_bin(py, minimum, maximum);
     const long long key = (long long)part * VS_PART_Y_BIN_COUNT + bin;
     const long long start = offsets[key];
     const long long end = start + (long long)counts[key];
+    if (CollectMetrics) {
+        *edges_visited += (unsigned long long)(end - start);
+    }
     bool inside = false;
     for (long long position = start; position < end; ++position) {
         const unsigned int code = entries[position];
@@ -283,11 +316,31 @@ extern "C" __device__ __forceinline__ unsigned char vs_prepared_part_location(
             continue;
         }
         if (crosses_ray && px > maxx) continue;
+        if (CollectMetrics) *orient2d_calls += 1ull;
         const int orientation = vs_orient2d(ax, ay, bx, by, px, py);
         if (boundary_bbox && orientation == 0) return 1;
         if (crosses_ray && ((orientation > 0) == (by > ay))) inside = !inside;
     }
     return inside ? 2 : 0;
+}
+
+extern "C" __device__ __forceinline__ unsigned char vs_prepared_part_location(
+    double px,
+    double py,
+    int part,
+    const int* ring_offsets,
+    const double* x,
+    const double* y,
+    const double* part_ymin,
+    const double* part_ymax,
+    const unsigned int* counts,
+    const long long* offsets,
+    const unsigned int* entries
+) {
+    return vs_prepared_part_location_core<false>(
+        px, py, part, ring_offsets, x, y,
+        0, 0, part_ymin, part_ymax, 0,
+        counts, offsets, entries, 0, 0, 0);
 }
 
 extern "C" __device__ __forceinline__ bool vs_point_in_closed_rect(
@@ -510,32 +563,10 @@ vs_prepared_part_location_with_coverage(
     const long long* offsets,
     const unsigned int* entries
 ) {
-    if (coverage != 0 && part_xmin != 0 && part_xmax != 0) {
-        const double xmin = part_xmin[part];
-        const double xmax = part_xmax[part];
-        const double ymin = part_ymin[part];
-        const double ymax = part_ymax[part];
-        if (isfinite(xmin) && isfinite(xmax)
-            && isfinite(ymin) && isfinite(ymax)
-            && xmax > xmin && ymax > ymin) {
-            if (px < xmin || px > xmax || py < ymin || py > ymax) return 0u;
-            int cell_x = (int)floor(
-                (px - xmin) * ((double)VS_COVERAGE_GRID_WIDTH / (xmax - xmin)));
-            int cell_y = (int)floor(
-                (py - ymin) * ((double)VS_COVERAGE_GRID_WIDTH / (ymax - ymin)));
-            cell_x = max(0, min(VS_COVERAGE_GRID_WIDTH - 1, cell_x));
-            cell_y = max(0, min(VS_COVERAGE_GRID_WIDTH - 1, cell_y));
-            const unsigned char state = coverage[
-                (long long)part * VS_COVERAGE_GRID_WIDTH * VS_COVERAGE_GRID_WIDTH
-                + cell_y * VS_COVERAGE_GRID_WIDTH + cell_x
-            ];
-            if (state == 1u) return 0u;
-            if (state == 2u) return 2u;
-        }
-    }
-    return vs_prepared_part_location(
+    return vs_prepared_part_location_core<false>(
         px, py, part, ring_offsets, x, y,
-        part_ymin, part_ymax, counts, offsets, entries);
+        part_xmin, part_xmax, part_ymin, part_ymax, coverage,
+        counts, offsets, entries, 0, 0, 0);
 }
 
 extern "C" __global__ void point_in_polygon_prepared_part_y_index(
@@ -722,72 +753,11 @@ vs_prepared_part_location_profiled(
     unsigned long long* edges_visited,
     unsigned long long* orient2d_calls
 ) {
-    const double minimum = part_ymin[part];
-    const double maximum = part_ymax[part];
-    if (py < minimum || py > maximum) return 0;
-    *active_parts += 1ull;
-    if (coverage != 0 && part_xmin != 0 && part_xmax != 0) {
-        const double xmin = part_xmin[part];
-        const double xmax = part_xmax[part];
-        if (isfinite(xmin) && isfinite(xmax)
-            && isfinite(minimum) && isfinite(maximum)
-            && xmax > xmin && maximum > minimum) {
-            if (px < xmin || px > xmax) return 0u;
-            int cell_x = (int)floor(
-                (px - xmin) * ((double)VS_COVERAGE_GRID_WIDTH / (xmax - xmin)));
-            int cell_y = (int)floor(
-                (py - minimum)
-                * ((double)VS_COVERAGE_GRID_WIDTH / (maximum - minimum)));
-            cell_x = max(0, min(VS_COVERAGE_GRID_WIDTH - 1, cell_x));
-            cell_y = max(0, min(VS_COVERAGE_GRID_WIDTH - 1, cell_y));
-            const unsigned char state = coverage[
-                (long long)part * VS_COVERAGE_GRID_WIDTH * VS_COVERAGE_GRID_WIDTH
-                + cell_y * VS_COVERAGE_GRID_WIDTH + cell_x
-            ];
-            if (state == 1u) return 0u;
-            if (state == 2u) return 2u;
-        }
-    }
-    const int bin = vs_part_y_bin(py, minimum, maximum);
-    const long long key = (long long)part * VS_PART_Y_BIN_COUNT + bin;
-    const long long start = offsets[key];
-    const long long end = start + (long long)counts[key];
-    *edges_visited += (unsigned long long)(end - start);
-    bool inside = false;
-    for (long long position = start; position < end; ++position) {
-        const unsigned int code = entries[position];
-        int i;
-        int j;
-        if ((code & VS_RING_CLOSURE_FLAG) != 0u) {
-            const int ring = (int)(code & VS_EDGE_INDEX_MASK);
-            i = ring_offsets[ring];
-            j = ring_offsets[ring + 1] - 1;
-        } else {
-            i = (int)code;
-            j = i - 1;
-        }
-        const double ax = x[j];
-        const double ay = y[j];
-        const double bx = x[i];
-        const double by = y[i];
-        const bool crosses_ray = (ay > py) != (by > py);
-        const double minx = fmin(ax, bx);
-        const double maxx = fmax(ax, bx);
-        const bool boundary_bbox =
-            py >= fmin(ay, by) && py <= fmax(ay, by)
-            && px >= minx && px <= maxx;
-        if (!crosses_ray && !boundary_bbox) continue;
-        if (crosses_ray && px < minx) {
-            inside = !inside;
-            continue;
-        }
-        if (crosses_ray && px > maxx) continue;
-        *orient2d_calls += 1ull;
-        const int orientation = vs_orient2d(ax, ay, bx, by, px, py);
-        if (boundary_bbox && orientation == 0) return 1;
-        if (crosses_ray && ((orientation > 0) == (by > ay))) inside = !inside;
-    }
-    return inside ? 2 : 0;
+    return vs_prepared_part_location_core<true>(
+        px, py, part, ring_offsets, x, y,
+        part_xmin, part_xmax, part_ymin, part_ymax, coverage,
+        counts, offsets, entries,
+        active_parts, edges_visited, orient2d_calls);
 }
 
 extern "C" __device__ __forceinline__ void vs_profile_commit_block(
