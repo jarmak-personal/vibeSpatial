@@ -3334,6 +3334,7 @@ class GeometryNativeResult:
                     geometry=part.geometry.mask_capacity(d_part_keep),
                     output_rows=part.output_rows,
                     collection_position=part.collection_position,
+                    collection_positions=part.collection_positions,
                 )
             )
 
@@ -3384,6 +3385,7 @@ class GeometryNativeResult:
                     ),
                     output_rows=part.output_rows,
                     collection_position=part.collection_position,
+                    collection_positions=part.collection_positions,
                 )
                 for part in self.composition.parts
             )
@@ -3428,6 +3430,7 @@ class GeometryNativeResult:
                             geometry=part.geometry,
                             output_rows=d_old_to_new[cp.asarray(part.output_rows, dtype=cp.int64)],
                             collection_position=part.collection_position,
+                            collection_positions=part.collection_positions,
                         )
                         for part in self.composition.parts
                     ),
@@ -3506,6 +3509,7 @@ class NativeGeometryCompositionPart:
     geometry: GeometryNativeResult
     output_rows: Any
     collection_position: int | None = None
+    collection_positions: Any | None = None
 
     def __post_init__(self) -> None:
         if self.geometry.composition is not None:
@@ -3514,10 +3518,21 @@ class NativeGeometryCompositionPart:
             raise ValueError("geometry composition part rows must match concrete geometry rows")
         if self.collection_position is not None and self.collection_position < 0:
             raise ValueError("geometry collection positions must be non-negative")
+        if self.collection_positions is not None:
+            if self.collection_position is not None:
+                raise ValueError("collection positions must be scalar or row-aligned, not both")
+            if _row_aligned_size(self.collection_positions) != self.geometry.row_count:
+                raise ValueError("collection positions must match concrete geometry rows")
+            if self.collection_positions.dtype.kind not in "iu":
+                raise TypeError("collection positions must be integer data")
+
+    @property
+    def is_collection_member(self) -> bool:
+        return self.collection_position is not None or self.collection_positions is not None
 
     @property
     def residency(self) -> Residency:
-        return combined_residency(self.geometry, self.output_rows)
+        return combined_residency(self.geometry, self.output_rows, self.collection_positions)
 
     def with_crs(self, crs) -> NativeGeometryCompositionPart:
         if self.geometry.crs == crs:
@@ -3526,6 +3541,7 @@ class NativeGeometryCompositionPart:
             self.geometry.with_crs(crs),
             self.output_rows,
             self.collection_position,
+            self.collection_positions,
         )
 
 
@@ -3679,6 +3695,10 @@ def _composition_part_take_unique_capacity(
         geometry=geometry,
         output_rows=output_rows,
         collection_position=part.collection_position,
+        collection_positions=(
+            part.collection_positions if _is_device_array(active) or part.collection_positions is None
+            else part.collection_positions[active]
+        ),
     )
 
 
@@ -3733,7 +3753,7 @@ class NativeGeometryComposition:
                     family_empty = state is not None and not state.families
                 else:
                     family_empty = not owned.families
-                if family_empty and part.collection_position is None:
+                if family_empty and not part.is_collection_member:
                     null_parts.append(part)
                     continue
             concrete_parts.append(part)
@@ -3805,7 +3825,7 @@ class NativeGeometryComposition:
         if (
             not self.trusted_singular_rows
             or self.residency is not Residency.DEVICE
-            or any(part.collection_position is not None for part in self.parts)
+            or any(part.is_collection_member for part in self.parts)
         ):
             return None
 
@@ -3900,6 +3920,7 @@ class NativeGeometryComposition:
                     geometry=taken_geometry,
                     output_rows=output_rows,
                     collection_position=part.collection_position,
+                    collection_positions=(None if part.collection_positions is None else part.collection_positions[concrete_positions]),
                 )
             )
         result = type(self)(
@@ -3934,7 +3955,7 @@ class NativeGeometryComposition:
             return cached
         if self.residency is not Residency.DEVICE:
             return None
-        if any(part.collection_position is not None for part in self.parts):
+        if any(part.is_collection_member for part in self.parts):
             return None
         if self.trusted_singular_rows and self.contiguous_row_partitions:
             return self
@@ -4048,7 +4069,7 @@ class NativeGeometryComposition:
             return cached
         if self.residency is not Residency.DEVICE:
             return None
-        if any(part.collection_position is not None for part in self.parts):
+        if any(part.is_collection_member for part in self.parts):
             return None
 
         import cupy as cp
@@ -4330,6 +4351,7 @@ class NativeGeometryComposition:
                             )
                             + xp.int64(row_offset),
                             collection_position=part.collection_position,
+                            collection_positions=part.collection_positions,
                         )
                     )
             row_offset += normalized.row_count
@@ -4439,18 +4461,30 @@ class NativeGeometryComposition:
             )
             missing = np.asarray(shapely.is_missing(values))
             empty = np.asarray(shapely.is_empty(values))
-            for output_row, value, is_missing, is_empty in zip(
+            positions = (
+                _host_array(
+                    part.collection_positions, dtype=np.int64, strict_disallowed=False,
+                    surface="vibespatial.api.NativeGeometryComposition.to_geoseries",
+                    operation="composition_positions_to_host",
+                    reason="geometry collection member order exported to GeoSeries",
+                    detail=f"parts={part.geometry.row_count}",
+                )
+                if part.collection_positions is not None
+                else np.full(part.geometry.row_count, part.collection_position or 0, dtype=np.int64)
+            )
+            for output_row, value, is_missing, is_empty, position in zip(
                 part_rows,
                 values,
                 missing,
                 empty,
+                positions,
                 strict=True,
             ):
                 row = int(output_row)
                 if bool(is_missing):
                     continue
-                if part.collection_position is not None:
-                    row_ordered_parts[row].append((int(part.collection_position), value))
+                if part.is_collection_member:
+                    row_ordered_parts[row].append((int(position), value))
                     continue
                 if bool(is_empty):
                     if row_empty_fallbacks[row] is None:

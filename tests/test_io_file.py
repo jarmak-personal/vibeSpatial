@@ -806,6 +806,8 @@ def test_osm_public_read_projects_compatibility_schema_from_bundle(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
+    # This compatibility-adapter unit test supplies a synthetic legacy bundle.
+    monkeypatch.setattr("vibespatial.io.file._try_osm_pbf_native_layer", lambda *args, **kwargs: None)
     import cupy as cp
 
     import vibespatial.io.osm_gpu as io_osm_gpu
@@ -904,6 +906,8 @@ def test_osm_public_read_projects_promoted_columns_and_other_tags(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
+    # This compatibility-adapter unit test supplies a synthetic legacy bundle.
+    monkeypatch.setattr("vibespatial.io.file._try_osm_pbf_native_layer", lambda *args, **kwargs: None)
     path = tmp_path / "sample.osm.pbf"
     path.write_bytes(b"")
     payload = _native_file_result_from_owned(
@@ -973,6 +977,8 @@ def test_osm_read_forwards_tags_and_geometry_only_kwargs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
+    # This compatibility-adapter unit test supplies a synthetic legacy bundle.
+    monkeypatch.setattr("vibespatial.io.file._try_osm_pbf_native_layer", lambda *args, **kwargs: None)
     path = tmp_path / "sample.osm.pbf"
     path.write_bytes(b"")
 
@@ -1012,6 +1018,8 @@ def test_osm_public_read_supports_points_layer(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
+    # This compatibility-adapter unit test supplies a synthetic legacy bundle.
+    monkeypatch.setattr("vibespatial.io.file._try_osm_pbf_native_layer", lambda *args, **kwargs: None)
     path = tmp_path / "sample.osm.pbf"
     path.write_bytes(b"")
     table = pa.table(
@@ -1056,6 +1064,8 @@ def test_osm_public_read_supports_multipolygons_layer(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
+    # This compatibility-adapter unit test supplies a synthetic legacy bundle.
+    monkeypatch.setattr("vibespatial.io.file._try_osm_pbf_native_layer", lambda *args, **kwargs: None)
     path = tmp_path / "sample.osm.pbf"
     path.write_bytes(b"")
     table = pa.table(

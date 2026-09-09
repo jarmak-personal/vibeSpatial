@@ -1654,6 +1654,7 @@ _NVRTC_CONSUMER_MODULES: tuple[str, ...] = (
     "vibespatial.io.shp_gpu",
     "vibespatial.io.gpu_parse.indexing",
     "vibespatial.io.osm_gpu",
+    "vibespatial.io.osm_pbf_native",
     "vibespatial.io.fgb_gpu",
 )
 

@@ -574,6 +574,20 @@
       "stopIf": "You only need the portfolio policy or acquisition commands.",
       "sourceOfTruth": "Identity-qualified archive of the initial RTX 4090 discovery.",
       "maxBodyLines": 180
+    },
+    "docs/architecture/osm-pbf-native.md": {
+      "scope": "GPU PBF byte decoding, relation topology, native carriers, and bounded-memory admission.",
+      "readIf": "You are changing OSM PBF performance, layer semantics, decompression, or relation memory use.",
+      "stopIf": "You only need a public read_file argument documented in io-files.md.",
+      "sourceOfTruth": "Native PBF implementation contract and measurement boundaries.",
+      "maxBodyLines": 220
+    },
+    "docs/testing/osm-pbf-performance.md": {
+      "scope": "Massachusetts PBF timings, native GeoParquet comparison, memory pressure, and regression evidence.",
+      "readIf": "You are comparing PBF performance or reproducing capacity and relation-shape measurements.",
+      "stopIf": "You only need the PBF API or implementation contract in osm-pbf-native.md.",
+      "sourceOfTruth": "Measured OSM PBF performance and validation evidence for the 4090 implementation.",
+      "maxBodyLines": 240
     }
   }
 }

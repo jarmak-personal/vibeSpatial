@@ -96,6 +96,7 @@ class NativeGeometryMetadataPart:
     output_rows: Any
     geometry: Any | None = None
     collection_position: int | None = None
+    collection_positions: Any | None = None
 
     def __post_init__(self) -> None:
         if _array_size(self.output_rows) != int(self.metadata.row_count):
@@ -288,6 +289,7 @@ class NativeGeometryMetadata:
                     output_rows=part.output_rows,
                     geometry=part.geometry,
                     collection_position=part.collection_position,
+                    collection_positions=part.collection_positions,
                 )
             )
         return cls(

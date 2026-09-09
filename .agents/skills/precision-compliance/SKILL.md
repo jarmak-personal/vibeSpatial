@@ -290,6 +290,8 @@ The compliance ledger file is at:
 
 - `src/vibespatial/kernels/core/wkb_decode.py` (IO decode) — integer fields and IEEE-754 coordinate bit patterns are decoded exactly in each owning record's byte order; output storage remains fp64 and a `PrecisionPlan` downcast is forbidden because the kernel performs no coordinate arithmetic.
 
+- `src/vibespatial/io/osm_pbf_native_kernels.py` (IO decode) — integer varints and fixed binary64 lattice conversion preserve GDAL coordinate semantics; the fused codec is warmed as `osm-pbf-native-fp64`. Ring reconstruction in `osm_pbf_rings.py` selects and records a CONSTRUCTIVE fp64 PrecisionPlan and rejects fp32 plans.
+
 ### Priority order (highest performance impact first)
 
 1. COARSE non-bounds filters and index helpers — usually safe staged fp32

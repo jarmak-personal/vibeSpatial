@@ -2152,7 +2152,7 @@ def _family_size_proof_complete(family: GeometryFamily, fixed_size) -> bool:
 def _candidate_ordered_composition_parts(composition):
     """Return candidate contiguous parts and device-only certification checks."""
     if composition.residency is not Residency.DEVICE or any(
-        part.collection_position is not None for part in composition.parts
+        part.is_collection_member for part in composition.parts
     ):
         return _NativeWkbCompositionLayoutCandidate(None, (), ())
 

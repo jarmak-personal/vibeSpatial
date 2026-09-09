@@ -1,0 +1,1073 @@
+{
+  "identity": {
+    "source_sha256": "d7f2220cf2d0ed6b6eeb432f1986c27799a7248bd5ec6f24746fdf1d53c17263",
+    "source_bytes": 310023499,
+    "host": "picard-4090",
+    "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.35",
+    "cpu": {
+      "Architecture:": "x86_64",
+      "CPU(s):": "32",
+      "Model name:": "13th Gen Intel(R) Core(TM) i9-13900K",
+      "Thread(s) per core:": "2",
+      "Core(s) per socket:": "24",
+      "Socket(s):": "1"
+    },
+    "gpu": "NVIDIA GeForce RTX 4090, 580.173.02, 24564 MiB",
+    "packages": {
+      "pyogrio": "0.12.1",
+      "pyarrow": "23.0.1",
+      "shapely": "2.1.2",
+      "numpy": "2.4.3",
+      "pandas": "3.0.1",
+      "pylibcudf-cu12": "26.2.1",
+      "nvidia-libnvcomp-cu12": "5.1.0.21"
+    },
+    "repeat": 3,
+    "statistic": "median",
+    "measurement": "filesystem-cache-warm; imports excluded; CUDA synchronized; native payload and public frame boundaries",
+    "encoding": "GeoParquet 1.1 native GeoArrow, snappy, row groups 1M; GeometryCollection has no native encoding",
+    "benchmark_sha256": "6855c41826f64b01c91225ff81affded165231ee496b567c5092757b6900d2de"
+  },
+  "baseline_path": "/tmp/vibespatial-osm/comparator-all/baseline.json",
+  "baseline_reused": true,
+  "source_revision": "ca2f9dd720321ae6673658bf7f2d802613452a08",
+  "candidate_sources": {
+    "src/vibespatial/io/osm_pbf_attributes.py": "35f36fdb012f1e574f06c9be29f7973cc457bc33055dd9831817470e87b2b8b4",
+    "src/vibespatial/io/osm_pbf_attributes_kernels.py": "901ef98b60706e06ff49599e36a369973c90b98f755d633a6ab4c8efea93d22c",
+    "src/vibespatial/io/osm_pbf_inflate.py": "a64ceb6a874358177c40a13c2bd57deaef71e7360261b226380a1ce6a2057277",
+    "src/vibespatial/io/osm_pbf_memory.py": "ee5e7b8b169412cf31b7844b75d7b511bf17caa9f4c8e2ab8969404c79fd1804",
+    "src/vibespatial/io/osm_pbf_native.py": "1a29085440b62886f241b7ed9b73b53e60071e27c22fef132c128759136bbfad",
+    "src/vibespatial/io/osm_pbf_native_kernels.py": "00f35a0f0cd0a0572963317803cdce9c4e2642023b4a61df42dc0cac4cff8b55",
+    "src/vibespatial/io/osm_pbf_relation_kernels.py": "6e7acf41fd5852f45da1a9da53814908ca410605f9775eba93b3a5841541a46a",
+    "src/vibespatial/io/osm_pbf_relations.py": "85c101b42d4f1658c9d05d5c889026ed0858e6159edeb9630bc652eaa399a0c2",
+    "src/vibespatial/io/osm_pbf_rings.py": "f3a700274e832aee04c5f7760a573b5a38d1ab6edb29c32231945b7cd9c1f849",
+    "src/vibespatial/io/osm_pbf_rings_kernels.py": "551ba8b5d40f8d405716b377701aee9b821347544a62694fd86d3353493ca9a9",
+    "src/vibespatial/io/file.py": "5dc0df4932e482e0cbd040a9f1666db4ac63720007b0ba22cdf03fb3c4e98b04",
+    "src/vibespatial/io/wkb.py": "8d1ceb67d7f9166f2d9be52ab63127b672af404c0c777868ab8af92cf842bdce",
+    "src/vibespatial/api/_native_result_core.py": "23e362b24d2de8a2998c94780d056ab541f9306a4e1e12154afd01177346ebc6",
+    "src/vibespatial/api/_native_metadata.py": "935c82fff40b1e07198de1a01837c96763e86884ce15df680e8cfbb05e8168a4",
+    "src/vibespatial/cuda/cccl_precompile.py": "c3f6fa6f22c7ed4bc04f861ce195303910147e5578b2f8e0ea4b08538d2ac678"
+  },
+  "baseline": {
+    "points": {
+      "fingerprint": "1ab439c08891e705a06d54aaf9cd415b297342d2b12445ee5c5e4ca2967e7483",
+      "parquet_sha256": "6116f3517687dd548494b08d13445a904bf7bbe172ef284c49d7fdc3c1965fc7",
+      "gdal": {
+        "pool_limit_bytes": null,
+        "native_first_seconds": 1.445895687211305,
+        "rows": 518420,
+        "native": {
+          "seconds": 1.283485580002889,
+          "samples": [
+            1.283485580002889,
+            1.3075297609902918,
+            1.2797256410121918
+          ],
+          "peak_device_bytes": 44584327,
+          "live_device_bytes": 13997535
+        },
+        "public_first_seconds": 1.2835944870021194,
+        "public": {
+          "seconds": 1.2813679478131235,
+          "samples": [
+            1.2813679478131235,
+            1.2731168048921973,
+            1.2895644148811698
+          ],
+          "peak_device_bytes": 44584136,
+          "live_device_bytes": 13997344
+        },
+        "fingerprint": "1ab439c08891e705a06d54aaf9cd415b297342d2b12445ee5c5e4ca2967e7483",
+        "process_peak_rss_bytes": 2050146304
+      },
+      "parquet": {
+        "pool_limit_bytes": null,
+        "native_first_seconds": 0.38608763297088444,
+        "rows": 518420,
+        "native": {
+          "seconds": 0.010804727906361222,
+          "samples": [
+            0.0282822388689965,
+            0.010454446077346802,
+            0.010804727906361222
+          ],
+          "peak_device_bytes": 152613135,
+          "live_device_bytes": 76347642
+        },
+        "public_first_seconds": 0.014807909959927201,
+        "public": {
+          "seconds": 0.014210104010999203,
+          "samples": [
+            0.014101712964475155,
+            0.014210104010999203,
+            0.015571905067190528
+          ],
+          "peak_device_bytes": 152613135,
+          "live_device_bytes": 72200282
+        },
+        "fingerprint": "1ab439c08891e705a06d54aaf9cd415b297342d2b12445ee5c5e4ca2967e7483",
+        "process_peak_rss_bytes": 1869766656
+      }
+    },
+    "lines": {
+      "fingerprint": "310aad892da6deaca2d1b101d548d387e5cb8bddda4405b331cd07a41b7aa926",
+      "parquet_sha256": "99409ab02e1234b3abdce05e88621b87aced440aced7649f197fad91789bd632",
+      "gdal": {
+        "pool_limit_bytes": null,
+        "native_first_seconds": 4.652975454926491,
+        "rows": 1168444,
+        "native": {
+          "seconds": 4.496274867095053,
+          "samples": [
+            4.514310242142528,
+            4.496274867095053,
+            4.442206432111561
+          ],
+          "peak_device_bytes": 489453612,
+          "live_device_bytes": 214931480
+        },
+        "public_first_seconds": 4.496165165910497,
+        "public": {
+          "seconds": 4.502070266986266,
+          "samples": [
+            4.523661687038839,
+            4.489907498005778,
+            4.502070266986266
+          ],
+          "peak_device_bytes": 489453612,
+          "live_device_bytes": 214931480
+        },
+        "fingerprint": "310aad892da6deaca2d1b101d548d387e5cb8bddda4405b331cd07a41b7aa926",
+        "process_peak_rss_bytes": 3353726976
+      },
+      "parquet": {
+        "pool_limit_bytes": null,
+        "native_first_seconds": 0.4354185501579195,
+        "rows": 1168444,
+        "native": {
+          "seconds": 0.04591162200085819,
+          "samples": [
+            0.04755134601145983,
+            0.04498601797968149,
+            0.04591162200085819
+          ],
+          "peak_device_bytes": 815983409,
+          "live_device_bytes": 374621405
+        },
+        "public_first_seconds": 0.060274549992755055,
+        "public": {
+          "seconds": 0.05969527689740062,
+          "samples": [
+            0.058935499051585793,
+            0.06034917593933642,
+            0.05969527689740062
+          ],
+          "peak_device_bytes": 815983409,
+          "live_device_bytes": 374621405
+        },
+        "fingerprint": "310aad892da6deaca2d1b101d548d387e5cb8bddda4405b331cd07a41b7aa926",
+        "process_peak_rss_bytes": 3333939200
+      }
+    },
+    "multilinestrings": {
+      "fingerprint": "18dc3e044a7afb34a6a37eb8d2fa9ac26381aef3eaa27f74a6b283731e024e73",
+      "parquet_sha256": "0d1e50b8b07a066b5d5e41a3ee1199cb6333842bd04747fb93f578cce5cbb19f",
+      "gdal": {
+        "pool_limit_bytes": null,
+        "native_first_seconds": 7.244029605994001,
+        "rows": 1935,
+        "native": {
+          "seconds": 6.975269658956677,
+          "samples": [
+            6.96649181493558,
+            6.975960267009214,
+            6.975269658956677
+          ],
+          "peak_device_bytes": 58438576,
+          "live_device_bytes": 26720189
+        },
+        "public_first_seconds": 7.025243090000004,
+        "public": {
+          "seconds": 7.017273832112551,
+          "samples": [
+            7.065030304947868,
+            6.9981201738119125,
+            7.017273832112551
+          ],
+          "peak_device_bytes": 58438576,
+          "live_device_bytes": 26720189
+        },
+        "fingerprint": "18dc3e044a7afb34a6a37eb8d2fa9ac26381aef3eaa27f74a6b283731e024e73",
+        "process_peak_rss_bytes": 3333939200
+      },
+      "parquet": {
+        "pool_limit_bytes": null,
+        "native_first_seconds": 0.38290338101796806,
+        "rows": 1935,
+        "native": {
+          "seconds": 0.01225867890752852,
+          "samples": [
+            0.030435968190431595,
+            0.01225867890752852,
+            0.011430402984842658
+          ],
+          "peak_device_bytes": 76074764,
+          "live_device_bytes": 27262417
+        },
+        "public_first_seconds": 0.013882806990295649,
+        "public": {
+          "seconds": 0.013624257175251842,
+          "samples": [
+            0.013683778000995517,
+            0.013242665911093354,
+            0.013624257175251842
+          ],
+          "peak_device_bytes": 76074764,
+          "live_device_bytes": 27262417
+        },
+        "fingerprint": "18dc3e044a7afb34a6a37eb8d2fa9ac26381aef3eaa27f74a6b283731e024e73",
+        "process_peak_rss_bytes": 3333939200
+      }
+    },
+    "multipolygons": {
+      "fingerprint": "6b4d466fe7da1b3d1be05d38a79b3a90004b6b215380eefe5372000e6d995ec4",
+      "parquet_sha256": "e1ed604780987719f8a512a206927a4ebff862c66fc434ce6095f7605b47eeb2",
+      "gdal": {
+        "pool_limit_bytes": null,
+        "native_first_seconds": 14.121212769998237,
+        "rows": 2953572,
+        "native": {
+          "seconds": 13.825463619083166,
+          "samples": [
+            13.825463619083166,
+            13.85269755590707,
+            13.796358517138287
+          ],
+          "peak_device_bytes": 1441112548,
+          "live_device_bytes": 578396200
+        },
+        "public_first_seconds": 13.9357868230436,
+        "public": {
+          "seconds": 14.019627491012216,
+          "samples": [
+            14.019627491012216,
+            13.986897653900087,
+            14.122481490019709
+          ],
+          "peak_device_bytes": 1441112548,
+          "live_device_bytes": 578396200
+        },
+        "fingerprint": "6b4d466fe7da1b3d1be05d38a79b3a90004b6b215380eefe5372000e6d995ec4",
+        "process_peak_rss_bytes": 9308864512
+      },
+      "parquet": {
+        "pool_limit_bytes": null,
+        "native_first_seconds": 0.5112129638437182,
+        "rows": 2953572,
+        "native": {
+          "seconds": 0.10758577613160014,
+          "samples": [
+            0.11462507909163833,
+            0.10758577613160014,
+            0.10687550506554544
+          ],
+          "peak_device_bytes": 1607736810,
+          "live_device_bytes": 1113861965
+        },
+        "public_first_seconds": 0.13419546210207045,
+        "public": {
+          "seconds": 0.13964005513116717,
+          "samples": [
+            0.14112746505998075,
+            0.13314939313568175,
+            0.13964005513116717
+          ],
+          "peak_device_bytes": 1607736810,
+          "live_device_bytes": 1113861965
+        },
+        "fingerprint": "6b4d466fe7da1b3d1be05d38a79b3a90004b6b215380eefe5372000e6d995ec4",
+        "process_peak_rss_bytes": 9308864512
+      }
+    },
+    "other_relations": {
+      "fingerprint": "f1d553a4405d834f0f66a39efa0b29922a9d7ff3f5de490fa733285d19f19b9e",
+      "parquet_sha256": null,
+      "gdal": {
+        "pool_limit_bytes": null,
+        "native_first_seconds": 14.077508765971288,
+        "rows": 13797,
+        "native": {
+          "seconds": 13.991860047914088,
+          "samples": [
+            14.027345436858013,
+            13.991860047914088,
+            13.903931024018675
+          ],
+          "peak_device_bytes": 0,
+          "live_device_bytes": 0
+        },
+        "public_first_seconds": 14.03473628894426,
+        "public": {
+          "seconds": 13.949905157089233,
+          "samples": [
+            13.965784273808822,
+            13.929338476853445,
+            13.949905157089233
+          ],
+          "peak_device_bytes": 0,
+          "live_device_bytes": 0
+        },
+        "fingerprint": "f1d553a4405d834f0f66a39efa0b29922a9d7ff3f5de490fa733285d19f19b9e",
+        "process_peak_rss_bytes": 1812901888
+      },
+      "parquet": null,
+      "parquet_note": "GeoParquet 1.1 has no native GeoArrow GeometryCollection encoding"
+    }
+  },
+  "current": {
+    "points": {
+      "pool_limit_bytes": null,
+      "native_first_seconds": 0.654720920138061,
+      "rows": 518420,
+      "native": {
+        "seconds": 0.5087007330730557,
+        "samples": [
+          0.5214554590638727,
+          0.5075762898195535,
+          0.5087007330730557
+        ],
+        "peak_device_bytes": 1197858042,
+        "live_device_bytes": 72200469,
+        "managed_workspace_events": [
+          0,
+          0,
+          0
+        ]
+      },
+      "public_first_seconds": 0.5132500091567636,
+      "public": {
+        "seconds": 0.5153419738635421,
+        "samples": [
+          0.5164724150672555,
+          0.5147211998701096,
+          0.5153419738635421
+        ],
+        "peak_device_bytes": 1197858042,
+        "live_device_bytes": 72200282,
+        "managed_workspace_events": [
+          0,
+          0,
+          0
+        ]
+      },
+      "fingerprint": "1ab439c08891e705a06d54aaf9cd415b297342d2b12445ee5c5e4ca2967e7483",
+      "process_peak_rss_bytes": 2103271424
+    },
+    "lines": {
+      "pool_limit_bytes": null,
+      "native_first_seconds": 1.016124150948599,
+      "rows": 1168444,
+      "native": {
+        "seconds": 0.7614937829785049,
+        "samples": [
+          0.7614937829785049,
+          0.7597795110195875,
+          0.7639084809925407
+        ],
+        "peak_device_bytes": 1306667559,
+        "live_device_bytes": 358410072,
+        "managed_workspace_events": [
+          0,
+          0,
+          0
+        ]
+      },
+      "public_first_seconds": 0.7670031730085611,
+      "public": {
+        "seconds": 0.7663548409473151,
+        "samples": [
+          0.7663548409473151,
+          0.7660600449889898,
+          0.7672004820778966
+        ],
+        "peak_device_bytes": 1306666280,
+        "live_device_bytes": 358408793,
+        "managed_workspace_events": [
+          0,
+          0,
+          0
+        ]
+      },
+      "fingerprint": "310aad892da6deaca2d1b101d548d387e5cb8bddda4405b331cd07a41b7aa926",
+      "process_peak_rss_bytes": 2707410944
+    },
+    "multilinestrings": {
+      "pool_limit_bytes": null,
+      "native_first_seconds": 1.1140987889375538,
+      "rows": 1935,
+      "native": {
+        "seconds": 0.9787479650694877,
+        "samples": [
+          0.9757116511464119,
+          0.9787479650694877,
+          0.9808371250983328
+        ],
+        "peak_device_bytes": 837256705,
+        "live_device_bytes": 27265439,
+        "managed_workspace_events": [
+          0,
+          0,
+          0
+        ]
+      },
+      "public_first_seconds": 0.9786644449923187,
+      "public": {
+        "seconds": 0.9748830981552601,
+        "samples": [
+          0.9748830981552601,
+          0.9742158269509673,
+          0.9789033650886267
+        ],
+        "peak_device_bytes": 837254147,
+        "live_device_bytes": 27262881,
+        "managed_workspace_events": [
+          0,
+          0,
+          0
+        ]
+      },
+      "fingerprint": "18dc3e044a7afb34a6a37eb8d2fa9ac26381aef3eaa27f74a6b283731e024e73",
+      "process_peak_rss_bytes": 2257666048
+    },
+    "multipolygons": {
+      "pool_limit_bytes": null,
+      "native_first_seconds": 2.2921037529595196,
+      "rows": 2953572,
+      "native": {
+        "seconds": 1.7842568720225245,
+        "samples": [
+          1.8046833309344947,
+          1.7842568720225245,
+          1.7775302559603006
+        ],
+        "peak_device_bytes": 3654280504,
+        "live_device_bytes": 1096140521,
+        "managed_workspace_events": [
+          0,
+          0,
+          0
+        ]
+      },
+      "public_first_seconds": 1.7942525239195675,
+      "public": {
+        "seconds": 1.792001506080851,
+        "samples": [
+          1.791354127926752,
+          1.792001506080851,
+          1.7952770891133696
+        ],
+        "peak_device_bytes": 3654280504,
+        "live_device_bytes": 1096140521,
+        "managed_workspace_events": [
+          0,
+          0,
+          0
+        ]
+      },
+      "fingerprint": "6b4d466fe7da1b3d1be05d38a79b3a90004b6b215380eefe5372000e6d995ec4",
+      "process_peak_rss_bytes": 8313806848
+    },
+    "other_relations": {
+      "pool_limit_bytes": null,
+      "native_first_seconds": 1.1602241671644151,
+      "rows": 13797,
+      "native": {
+        "seconds": 1.0385535270906985,
+        "samples": [
+          1.050316273001954,
+          1.0385535270906985,
+          1.03722259006463
+        ],
+        "peak_device_bytes": 809471871,
+        "live_device_bytes": 15203709,
+        "managed_workspace_events": [
+          0,
+          0,
+          0
+        ]
+      },
+      "public_first_seconds": 1.123890956863761,
+      "public": {
+        "seconds": 1.1176001848652959,
+        "samples": [
+          1.1176001848652959,
+          1.124574060086161,
+          1.1145589689258486
+        ],
+        "peak_device_bytes": 809469313,
+        "live_device_bytes": 15201151,
+        "managed_workspace_events": [
+          0,
+          0,
+          0
+        ]
+      },
+      "fingerprint": "f1d553a4405d834f0f66a39efa0b29922a9d7ff3f5de490fa733285d19f19b9e",
+      "process_peak_rss_bytes": 2260299776
+    }
+  },
+  "baseline_provenance": {
+    "created": "2026-09-09T15:45:23.471540+00:00",
+    "preparation_note": "Reused four validated comparator pairs after the initial preparation failed on GeometryCollection large-string fingerprint typing. String-width canonicalization changes only that missing layer; timed read boundaries are unchanged. Added resumable preparation and paging-event reporting after measured comparators completed.",
+    "initial_benchmark_sha256": "d110ebfd8b149f3b1996a0b6be55d43647b9d528afbe76662175b9f6a461b91f",
+    "sha256": "c3ad30b86654d88b20d20eeab13f09d7f3b53dd3db88ea9bd90eb108afd71158"
+  },
+  "capacity": {
+    "layer": "multipolygons",
+    "physical_free_before_bytes": 1340145664,
+    "reserved_bytes": 23444127744,
+    "seconds": 10.04543978604488,
+    "rows": 2953572,
+    "rmm_live_bytes": 53899309,
+    "rmm_peak_bytes": 426353290,
+    "managed_events": [
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1317258944, device_workspace_bytes=1273036800"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1319148608, device_workspace_bytes=1203830784"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1298874048, device_workspace_bytes=1262551040"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1298742656, device_workspace_bytes=1201733632"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1300534144, device_workspace_bytes=1153499136"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1306615296, device_workspace_bytes=1239482368"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1319052928, device_workspace_bytes=1193345024"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1279388800, device_workspace_bytes=1147207680"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1311498176, device_workspace_bytes=1231093760"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1314218624, device_workspace_bytes=1166082048"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1319205952, device_workspace_bytes=1243676672"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1317258944, device_workspace_bytes=1184956416"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1319148608, device_workspace_bytes=1249968128"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1298874048, device_workspace_bytes=1174470656"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1298742656, device_workspace_bytes=1247870976"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1300534144, device_workspace_bytes=1199636480"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1306615296, device_workspace_bytes=1151401984"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1319052928, device_workspace_bytes=1239482368"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1279388800, device_workspace_bytes=1193345024"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1311498176, device_workspace_bytes=1143013376"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1314218624, device_workspace_bytes=1212219392"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1319205952, device_workspace_bytes=1155596288"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1323368448, device_workspace_bytes=1163984896"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "output_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_output_workspace",
+        "reason": "The output work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=1013744864, device_workspace_bytes=813760512"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "blob_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_blob_workspace",
+        "reason": "The blob work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=159441880, device_workspace_bytes=65536"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "attribute_concatenate",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_attribute_concatenate",
+        "reason": "Final column assembly uses CUDA paging to avoid a second resident copy of the attributes",
+        "detail": "estimated_transient_bytes=951549609, available_device_bytes=73465856"
+      },
+      {
+        "surface": "vibespatial.io.osm_pbf",
+        "operation": "relation_workspace",
+        "requested": "auto",
+        "selected": "gpu",
+        "implementation": "cuda_managed_relation_workspace",
+        "reason": "The relation work unit exceeds the device workspace; CUDA pages its working set",
+        "detail": "estimated_work_bytes=951549609, device_workspace_bytes=73465856"
+      }
+    ],
+    "fingerprint": "6b4d466fe7da1b3d1be05d38a79b3a90004b6b215380eefe5372000e6d995ec4",
+    "source_sha256": "d7f2220cf2d0ed6b6eeb432f1986c27799a7248bd5ec6f24746fdf1d53c17263"
+  },
+  "junction": {
+    "shape": "one relation, all open ways sharing a single junction",
+    "results": [
+      {
+        "members": 10000,
+        "endpoints": 20000,
+        "seconds": 0.00967963901348412,
+        "samples": [
+          0.00967963901348412,
+          0.009679789887741208,
+          0.009602348087355494
+        ]
+      },
+      {
+        "members": 100000,
+        "endpoints": 200000,
+        "seconds": 0.07403971697203815,
+        "samples": [
+          0.07411154103465378,
+          0.07401800691150129,
+          0.07403971697203815
+        ]
+      },
+      {
+        "members": 1000000,
+        "endpoints": 2000000,
+        "seconds": 1.2027869410812855,
+        "samples": [
+          1.2029220322147012,
+          1.2027869410812855,
+          1.2026602230034769
+        ]
+      }
+    ]
+  },
+  "pipeline_profile_1m": [
+    {
+      "pipeline": "join-heavy",
+      "stage": "read_points",
+      "wall_ms": 3.55
+    },
+    {
+      "pipeline": "join-heavy",
+      "stage": "read_polygons",
+      "wall_ms": 6.11
+    },
+    {
+      "pipeline": "join-heavy",
+      "stage": "build_index",
+      "wall_ms": 0.28
+    },
+    {
+      "pipeline": "join-heavy",
+      "stage": "sjoin_query",
+      "wall_ms": 0.687
+    },
+    {
+      "pipeline": "join-heavy",
+      "stage": "assemble_join_rows",
+      "wall_ms": 0.595
+    },
+    {
+      "pipeline": "join-heavy",
+      "stage": "dissolve_groups",
+      "wall_ms": 2.35
+    },
+    {
+      "pipeline": "join-heavy",
+      "stage": "write_output",
+      "wall_ms": 16.13
+    },
+    {
+      "pipeline": "relation-semijoin",
+      "stage": "read_inputs",
+      "wall_ms": 10.14
+    },
+    {
+      "pipeline": "relation-semijoin",
+      "stage": "build_index",
+      "wall_ms": 0.229
+    },
+    {
+      "pipeline": "relation-semijoin",
+      "stage": "sjoin_relation",
+      "wall_ms": 0.596
+    },
+    {
+      "pipeline": "relation-semijoin",
+      "stage": "semijoin_rowset",
+      "wall_ms": 0.375
+    },
+    {
+      "pipeline": "relation-semijoin",
+      "stage": "subset_rows",
+      "wall_ms": 0.98
+    },
+    {
+      "pipeline": "relation-semijoin",
+      "stage": "write_output",
+      "wall_ms": 3.3
+    },
+    {
+      "pipeline": "small-grouped-constructive-reduce",
+      "stage": "build_device_grouped_polygons",
+      "wall_ms": 40.7
+    },
+    {
+      "pipeline": "small-grouped-constructive-reduce",
+      "stage": "native_grouped_union",
+      "wall_ms": 46.27
+    },
+    {
+      "pipeline": "small-grouped-constructive-reduce",
+      "stage": "native_reference_check",
+      "wall_ms": 0.028
+    },
+    {
+      "pipeline": "grouped-capacity-partitions",
+      "stage": "build_grouped_partition_fixtures",
+      "wall_ms": 47.15
+    },
+    {
+      "pipeline": "grouped-capacity-partitions",
+      "stage": "mixed_strip_exact_union",
+      "wall_ms": 64.49
+    },
+    {
+      "pipeline": "grouped-capacity-partitions",
+      "stage": "positive_degenerate_union",
+      "wall_ms": 61.73
+    },
+    {
+      "pipeline": "grouped-capacity-partitions",
+      "stage": "native_reference_check",
+      "wall_ms": 0.023
+    },
+    {
+      "pipeline": "grouped-disjoint-constructive-reduce",
+      "stage": "build_device_disjoint_groups",
+      "wall_ms": 64.63
+    },
+    {
+      "pipeline": "grouped-disjoint-constructive-reduce",
+      "stage": "native_grouped_disjoint_subset",
+      "wall_ms": 1.29
+    },
+    {
+      "pipeline": "grouped-disjoint-constructive-reduce",
+      "stage": "native_reference_check",
+      "wall_ms": 0.026
+    },
+    {
+      "pipeline": "grouped-difference-constructive",
+      "stage": "build_device_grouped_difference_inputs",
+      "wall_ms": 27.67
+    },
+    {
+      "pipeline": "grouped-difference-constructive",
+      "stage": "native_grouped_difference",
+      "wall_ms": 9.41
+    },
+    {
+      "pipeline": "grouped-difference-constructive",
+      "stage": "native_reference_check",
+      "wall_ms": 0.026
+    },
+    {
+      "pipeline": "constructive-output-native",
+      "stage": "build_device_pairwise_boxes",
+      "wall_ms": 3.73
+    },
+    {
+      "pipeline": "constructive-output-native",
+      "stage": "native_constructive_intersection",
+      "wall_ms": 3.59
+    },
+    {
+      "pipeline": "constructive-output-native",
+      "stage": "constructive_area_expression",
+      "wall_ms": 1.09
+    },
+    {
+      "pipeline": "constructive-output-native",
+      "stage": "constructive_expression_consumers",
+      "wall_ms": 1.51
+    },
+    {
+      "pipeline": "constructive-output-native",
+      "stage": "native_reference_check",
+      "wall_ms": 0.026
+    },
+    {
+      "pipeline": "overlay-relation-constructive",
+      "stage": "build_native_overlay_inputs",
+      "wall_ms": 6.62
+    },
+    {
+      "pipeline": "overlay-relation-constructive",
+      "stage": "build_spatial_index",
+      "wall_ms": 0.109
+    },
+    {
+      "pipeline": "overlay-relation-constructive",
+      "stage": "candidate_relation",
+      "wall_ms": 0.726
+    },
+    {
+      "pipeline": "overlay-relation-constructive",
+      "stage": "refine_relation",
+      "wall_ms": 0.201
+    },
+    {
+      "pipeline": "overlay-relation-constructive",
+      "stage": "constructive_intersection",
+      "wall_ms": 2.63
+    },
+    {
+      "pipeline": "overlay-relation-constructive",
+      "stage": "native_tabular_projection",
+      "wall_ms": 0.937
+    },
+    {
+      "pipeline": "overlay-relation-constructive",
+      "stage": "native_reference_check",
+      "wall_ms": 0.024
+    },
+    {
+      "pipeline": "constructive",
+      "stage": "read_points",
+      "wall_ms": 3.41
+    },
+    {
+      "pipeline": "constructive",
+      "stage": "clip_points",
+      "wall_ms": 0.489
+    },
+    {
+      "pipeline": "constructive",
+      "stage": "buffer_points",
+      "wall_ms": 1.47
+    },
+    {
+      "pipeline": "constructive",
+      "stage": "write_output",
+      "wall_ms": 19.75
+    },
+    {
+      "pipeline": "predicate-heavy",
+      "stage": "read_geojson",
+      "wall_ms": 70.54
+    },
+    {
+      "pipeline": "predicate-heavy",
+      "stage": "load_polygons",
+      "wall_ms": 7.36
+    },
+    {
+      "pipeline": "predicate-heavy",
+      "stage": "point_in_polygon",
+      "wall_ms": 0.4
+    },
+    {
+      "pipeline": "predicate-heavy",
+      "stage": "filter_points",
+      "wall_ms": 0.393
+    },
+    {
+      "pipeline": "predicate-heavy",
+      "stage": "write_output",
+      "wall_ms": 1.59
+    },
+    {
+      "pipeline": "zero-transfer",
+      "stage": "read_input",
+      "wall_ms": 7.24
+    },
+    {
+      "pipeline": "zero-transfer",
+      "stage": "predicate_filter",
+      "wall_ms": 0.412
+    },
+    {
+      "pipeline": "zero-transfer",
+      "stage": "subset_rows",
+      "wall_ms": 1.04
+    },
+    {
+      "pipeline": "zero-transfer",
+      "stage": "write_output",
+      "wall_ms": 3.17
+    }
+  ]
+}

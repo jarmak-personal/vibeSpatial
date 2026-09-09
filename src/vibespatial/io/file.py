@@ -480,6 +480,44 @@ def _read_osm_pbf_pyogrio_layer_native(
     return payload
 
 
+def _try_osm_pbf_native_layer(filename, *, layer, tags, geometry_only, target_crs):
+    """Admit the standard local PBF layer to the bounded native byte reader."""
+    import pyogrio
+
+    path = _resolve_named_file_source_path(filename)
+    if path is None or not path.is_file():
+        return None
+    if any(pyogrio.get_gdal_config_option(name) is not None for name in (
+        "OSM_CONFIG_FILE", "OSM_REPORT_ALL_NODES", "OSM_REPORT_ALL_WAYS", "OSM_REPORT_ALL_TAGS",
+        "OGR_ORGANIZE_POLYGONS", "OGR_DEBUG_ORGANIZE_POLYGONS", "OGR_GEOMETRY_ACCEPT_UNCLOSED_RING",
+    )):
+        return None
+    from .osm_pbf_native import read_osm_pbf_native
+
+    try:
+        payload = read_osm_pbf_native(path, layer=layer, tags=tags, geometry_only=geometry_only)
+    except NotImplementedError as exc:
+        record_fallback_event(
+            surface="vibespatial.io.osm_pbf", reason="PBF byte reader declined an unsupported source contract",
+            detail=str(exc), selected=ExecutionMode.CPU, pipeline="io/read_osm_pbf",
+            d2h_transfer=False,
+        )
+        return None
+    if target_crs is not None:
+        from dataclasses import replace
+
+        owners = (
+            [payload.geometry.owned] if payload.geometry.owned is not None
+            else [part.geometry.owned for part in payload.geometry.composition.parts]
+        )
+        for owned in owners:
+            _resolve_target_crs_for_owned(owned, source_crs="EPSG:4326", target_crs=target_crs)
+        payload = replace(payload, geometry=payload.geometry.with_crs(target_crs))
+        import cupy as cp
+        cp.cuda.get_current_stream().synchronize()
+    return payload
+
+
 def _read_osm_pbf_supported_layers_native(
     filename,
     *,
@@ -1662,9 +1700,9 @@ def plan_vector_file_io(
         io_format = IOFormat.OSM_PBF
         implementation = "osm_pbf_gpu_hybrid_adapter"
         reason = (
-            "OSM PBF uses CPU protobuf parsing with GPU varint decoding and "
-            "coordinate assembly, then projects tags through promoted columns "
-            "plus lossless other_tags at the public boundary."
+            "Eligible OSM PBF reads use GPU decompression, protobuf decoding, "
+            "relation assembly and native tag columns; unsupported requests "
+            "use the observable compatibility adapter."
         )
     elif normalized_driver == "GPKG":
         io_format = IOFormat.GEOPACKAGE
@@ -2549,6 +2587,25 @@ def _try_gpu_read_file_native(
         layer=osm_layer, tags=osm_tags
     )
 
+    if (
+        plan.format is IOFormat.OSM_PBF and engine is None and bbox is None
+        and mask is None and columns is None and rows is None
+        and set(kwargs) <= {"layer", "tags", "geometry_only"}
+        and _normalize_osm_layer(osm_layer) in {*_OSM_PYOGRIO_ARROW_LAYERS, "all"}
+    ):
+        native = _try_osm_pbf_native_layer(
+            filename, layer=_normalize_osm_layer(osm_layer), tags=osm_tags,
+            geometry_only=osm_geometry_only, target_crs=target_crs,
+        )
+        if native is not None:
+            record_dispatch_event(
+                surface="geopandas.read_file", operation="read_file",
+                implementation="osm_pbf_nvcomp_native",
+                reason="Native OSM PBF decode and assembly for standard geometry layers",
+                detail=dispatch_detail, selected=ExecutionMode.GPU,
+            )
+            return native
+
     if osm_pyogrio_default:
         payload = _read_osm_pbf_supported_layers_native(
             filename,
@@ -3219,10 +3276,11 @@ def read_vector_file(
     the repo-owned direct FlatBuffer decoder by default. CSV and KML now try
     the repo-owned GPU parser for eligible local unfiltered reads instead of
     demoting solely because of a static file-size gate. WKT and full-data OSM
-    PBF reads use the native GPU path. Standard OSM layers (``points``,
-    ``lines``, ``multipolygons``)
-    may use the pyogrio compatibility path when the native all-data parser
-    is not required.
+    PBF reads use the native GPU path. Eligible local standard OSM layers
+    (``points``, ``lines``, ``multipolygons``, ``multilinestrings``, and
+    ``other_relations``) use bounded nvCOMP decompression and GPU byte/topology
+    decoding. The default combines all five layers. Unsupported source or
+    request contracts use the observable compatibility path.
 
     ``mask`` now also stays on the shared native Arrow/WKB boundary for the
     promoted pyogrio-backed vector containers when the request shape stays
@@ -3259,7 +3317,7 @@ def read_vector_file(
         via vibeProj GPU transform (no separate pass required).  When the
         CPU path is used, the result is reprojected via ``gdf.to_crs()``
         as a post-read step.  For formats without an embedded CRS (WKT,
-        CSV, KML, OSM PBF), the target CRS is set as a label without
+        CSV, KML), the target CRS is set as a label without
         reprojection.
     build_index : bool, default False
         When True and the GPU path is used, build a GPU-resident packed
@@ -3397,7 +3455,8 @@ def read_vector_file(
             "GPU is available and CuPy is installed."
         )
 
-    # OSM PBF files have no CPU fallback (pyogrio/GDAL does not support PBF).
+    # Full-data PBF reads require the native GPU reader; standard layers
+    # also have an explicit GDAL compatibility path.
     if plan.format is IOFormat.OSM_PBF:
         gpu_failure = _latest_read_file_gpu_failure(fallback_start)
         if osm_pyogrio_default and gpu_failure is not None:

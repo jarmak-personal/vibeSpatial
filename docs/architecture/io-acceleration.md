@@ -5,7 +5,7 @@ Scope: Post-Phase-6b GPU-native IO execution model, staged decode policy, and fo
 Read If: You are changing GeoArrow, GeoParquet, WKB, GeoJSON, or Shapefile performance strategy or decode architecture.
 STOP IF: Your task already has the routed IO implementation files open and only needs local adapter detail.
 Source Of Truth: IO acceleration policy for turning repo-owned adapters into GPU-dominant ingest and emission paths.
-Body Budget: 197/260 lines
+Body Budget: 205/260 lines
 Document: docs/architecture/io-acceleration.md
 
 Section Map (Body Lines)
@@ -14,16 +14,17 @@ Section Map (Body Lines)
 | 1-2 | Preamble |
 | 3-8 | Purpose |
 | 9-13 | Intent |
-| 14-22 | Request Signals |
-| 23-30 | Open First |
-| 31-36 | Verify |
-| 37-43 | Risks |
-| 44-65 | Decision |
-| 66-79 | Execution Model |
-| 80-151 | Format Strategy |
-| 152-164 | CCCL Preference Order |
-| 165-184 | Performance Targets |
-| 185-197 | Non-Negotiable Constraints |
+| 14-23 | Request Signals |
+| 24-31 | Open First |
+| 32-37 | Verify |
+| 38-44 | Risks |
+| 45-66 | Decision |
+| 67-80 | Execution Model |
+| 81-152 | Format Strategy |
+| 153-165 | CCCL Preference Order |
+| 166-185 | Performance Targets |
+| 186-199 | Non-Negotiable Constraints |
+| 200-205 | OSM PBF |
 DOC_HEADER:END -->
 
 ## Purpose
@@ -45,6 +46,7 @@ shared decode architecture and explicit format-level floor targets.
 - wkb decode
 - geojson ingest
 - shapefile ingest
+- osm pbf acceleration
 
 ## Open First
 
@@ -221,3 +223,10 @@ host baseline for the same format, whichever is faster.
 - The current enforced local GeoParquet scan rail is `2x` on consumer GPUs.
   Higher datacenter and HBM-class targets remain aspirational, but the local
   floor should not assume 4090-class scan throughput matches those cards.
+
+## OSM PBF
+
+[Native PBF ingress](osm-pbf-native.md) decodes bounded nvCOMP Blob batches,
+attributes, ways and all standard relation layers directly into native
+carriers. Its same-data benchmark compares GDAL and preconverted native
+GeoArrow GeoParquet and includes constrained-pool measurements.
