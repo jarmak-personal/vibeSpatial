@@ -1,0 +1,1509 @@
+{
+  "identity": {
+    "fixture": {
+      "source_sha256": "d7f2220cf2d0ed6b6eeb432f1986c27799a7248bd5ec6f24746fdf1d53c17263",
+      "source_bytes": 310023499,
+      "crs": "EPSG:26986",
+      "filters": {
+        "lines": "highway IS NOT NULL",
+        "multipolygons": "building IS NOT NULL AND building <> 'no'"
+      },
+      "seed": 20260910,
+      "script_sha256": "bf6f9030dc5a0dadc4258d9cba23fa74f6ef4cb7f3fa725aa5f4ef43fb32b559",
+      "packages": {
+        "pyogrio": "0.12.1",
+        "pyproj": "3.7.2",
+        "shapely": "2.1.2",
+        "numpy": "2.4.3",
+        "pyarrow": "23.0.1"
+      }
+    },
+    "files": {
+      "roads": {
+        "rows": 991441,
+        "coordinates": 9719891,
+        "sha256": "f6a1ccd2632add25e26635b36675fedfc6c1c4bb42eab0fe7ff470655367b28d"
+      },
+      "segments": {
+        "rows": 8728450,
+        "coordinates": 17456900,
+        "sha256": "823f3fad68c7ed4a3711521526017334c3024c9708fd09c46e52f23b74ca619e"
+      },
+      "points": {
+        "rows": 2680339,
+        "coordinates": 2680339,
+        "sha256": "f3e83bb44b8a7642cc2c1f9be1eb77a76aa3231bfb17bc81ed2157ac54c75d3a"
+      }
+    },
+    "python": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+    "packages": {
+      "shapely": "2.1.2",
+      "numpy": "2.4.3",
+      "pyarrow": "23.0.1",
+      "pyogrio": "0.12.1",
+      "pyproj": "3.7.2"
+    },
+    "geos": "3.13.1",
+    "lock_sha256": "60942838f44a9792dfc8a49371e8a1367a59e8d858e39ed827dfa735e0d615fe",
+    "host": "picard-4090",
+    "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.35",
+    "cpu": {
+      "Architecture:": "x86_64",
+      "CPU(s):": "32",
+      "Model name:": "13th Gen Intel(R) Core(TM) i9-13900K",
+      "Thread(s) per core:": "2",
+      "Core(s) per socket:": "24",
+      "Socket(s):": "1"
+    },
+    "storage": "/tmp/vibespatial-osm/nearest-v2-baseline",
+    "repeat": 1,
+    "timeout_seconds": 240.0,
+    "scales": [
+      "1000",
+      "10000",
+      "100000",
+      "all"
+    ],
+    "layouts": [
+      "roads",
+      "segments"
+    ],
+    "measurement": "Imports and file reads excluded. One cold-process trial, then repeat fresh-input trials; each times WKB ingress, sindex accessor, first query, one repeated query on same index. CUDA synchronized before/after stages. Public pair/distance export included. Median of warm-process trials. No max_distance; all ties; k=1.",
+    "script_sha256": "bf6f9030dc5a0dadc4258d9cba23fa74f6ef4cb7f3fa725aa5f4ef43fb32b559"
+  },
+  "fixture": {
+    "identity": {
+      "source_sha256": "d7f2220cf2d0ed6b6eeb432f1986c27799a7248bd5ec6f24746fdf1d53c17263",
+      "source_bytes": 310023499,
+      "crs": "EPSG:26986",
+      "filters": {
+        "lines": "highway IS NOT NULL",
+        "multipolygons": "building IS NOT NULL AND building <> 'no'"
+      },
+      "seed": 20260910,
+      "script_sha256": "bf6f9030dc5a0dadc4258d9cba23fa74f6ef4cb7f3fa725aa5f4ef43fb32b559",
+      "packages": {
+        "pyogrio": "0.12.1",
+        "pyproj": "3.7.2",
+        "shapely": "2.1.2",
+        "numpy": "2.4.3",
+        "pyarrow": "23.0.1"
+      }
+    },
+    "created": "2026-09-10T13:25:18.394992+00:00",
+    "files": {
+      "roads": {
+        "rows": 991441,
+        "coordinates": 9719891,
+        "sha256": "f6a1ccd2632add25e26635b36675fedfc6c1c4bb42eab0fe7ff470655367b28d"
+      },
+      "segments": {
+        "rows": 8728450,
+        "coordinates": 17456900,
+        "sha256": "823f3fad68c7ed4a3711521526017334c3024c9708fd09c46e52f23b74ca619e"
+      },
+      "points": {
+        "rows": 2680339,
+        "coordinates": 2680339,
+        "sha256": "f3e83bb44b8a7642cc2c1f9be1eb77a76aa3231bfb17bc81ed2157ac54c75d3a"
+      }
+    },
+    "preparation_seconds": 30.53242320381105,
+    "stages": {
+      "read_filter_project_lines_seconds": 5.684012120123953,
+      "read_filter_project_multipolygons_seconds": 17.871698814909905,
+      "representative_points_seconds": 0.5715957349166274,
+      "segment_roads_seconds": 1.2371748299337924
+    },
+    "contract": "All highway-tagged line ways (including paths); building-tagged areas except no. Point-on-surface after projection. No topology repair. Parent rows reference filtered roads. Two-vertex segments retain zero-length edges. No segment-to-road deduplication in timing."
+  },
+  "baseline_path": "/tmp/vibespatial-osm/nearest-v2-baseline/baseline.json",
+  "baseline_reused": false,
+  "baseline_created": "2026-09-10T13:25:19.927547+00:00",
+  "created": "2026-09-10T13:25:19.927560+00:00",
+  "mode": "gpu",
+  "source_revision": "cd89cde21de4d61f21ee6a3e256023cff18ebe51",
+  "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "gpu": "NVIDIA GeForce RTX 4090, 580.173.02, 24564 MiB",
+  "runtime_environment": {},
+  "report_path": "/tmp/vibespatial-osm/nearest-v2-gpu/report.json",
+  "report_sha256": "c73bf3389acb4f5805ac16d84db26b670f021be583a2577f6311165a1b0fa6b8",
+  "interpretation": "Observed timings, not validated speedups: candidate all-match parity must pass before any speedup ratio is accepted.",
+  "cases": {
+    "roads-1000": {
+      "shapely": {
+        "status": "ok",
+        "mode": "cpu",
+        "tree_rows": 991441,
+        "query_rows": 1000,
+        "median_seconds": {
+          "ingress": 0.18462459929287434,
+          "index_access": 0.15410920791327953,
+          "first_query": 0.01885946001857519,
+          "warm_query": 0.01661895029246807,
+          "build_plus_query": 0.17296866793185472,
+          "ingress_build_query": 0.35759326722472906
+        },
+        "oracle_sha256": "470e735abc9d734857a8bba84c4568a26f3412aceeaafa363e9353214c808ae9",
+        "active_trial_completed_seconds": {},
+        "first_process_seconds": {
+          "ingress": 0.26517125871032476,
+          "index_access": 0.153579609002918,
+          "first_query": 0.018264954444020987,
+          "warm_query": 0.017606835812330246
+        },
+        "parity_by_trial": [
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1003,
+              "oracle_pairs": 1003,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1003,
+              "oracle_pairs": 1003,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          },
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1003,
+              "oracle_pairs": 1003,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1003,
+              "oracle_pairs": 1003,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          }
+        ]
+      },
+      "vibespatial": {
+        "status": "parity_failed",
+        "mode": "gpu",
+        "tree_rows": 991441,
+        "query_rows": 1000,
+        "median_seconds": {
+          "ingress": 0.1576986131258309,
+          "index_access": 1.0402873158454895e-05,
+          "first_query": 3.7686295709572732,
+          "warm_query": 3.7707669460214674,
+          "build_plus_query": 3.7686399738304317,
+          "ingress_build_query": 3.9263385869562626
+        },
+        "oracle_sha256": "470e735abc9d734857a8bba84c4568a26f3412aceeaafa363e9353214c808ae9",
+        "active_trial_completed_seconds": {},
+        "first_process_seconds": {
+          "ingress": 0.25333729200065136,
+          "index_access": 8.163973689079285e-06,
+          "first_query": 8.656736740842462,
+          "warm_query": 3.7895443541929126
+        },
+        "parity_by_trial": [
+          {
+            "first_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1004,
+              "oracle_pairs": 1003,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1004,
+              "oracle_pairs": 1003,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          },
+          {
+            "first_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1004,
+              "oracle_pairs": 1003,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1004,
+              "oracle_pairs": 1003,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          }
+        ],
+        "telemetry_trial_index": 1,
+        "warm_query_telemetry": {
+          "d2h_count": 8,
+          "d2h_bytes": 34316688,
+          "d2h_seconds": 0.002468977589160204,
+          "d2h_reasons": [
+            "geometry analysis cached row-bounds host export",
+            "spatial query candidate left-index host export",
+            "spatial query candidate right-index host export",
+            "spatial query candidate-pair allocation fence",
+            "vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output::nearest_relation_distances_to_host",
+            "vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output::nearest_relation_indices_to_host"
+          ],
+          "fallbacks": [],
+          "implementations": [
+            "gpu_nvrtc_bounds",
+            "gpu_nvrtc_bounds_device",
+            "native_relation_export",
+            "owned_gpu_nearest"
+          ]
+        }
+      }
+    },
+    "roads-10000": {
+      "shapely": {
+        "status": "ok",
+        "mode": "cpu",
+        "tree_rows": 991441,
+        "query_rows": 10000,
+        "median_seconds": {
+          "ingress": 0.17724828468635678,
+          "index_access": 0.15422932570800185,
+          "first_query": 0.17974394792690873,
+          "warm_query": 0.17794918222352862,
+          "build_plus_query": 0.3339732736349106,
+          "ingress_build_query": 0.5112215583212674
+        },
+        "oracle_sha256": "a3dfe996f612311bc2a8895ceeb57d0870fca207f9d858bbc0bd9bf820cbb659",
+        "active_trial_completed_seconds": {},
+        "first_process_seconds": {
+          "ingress": 0.2639716691337526,
+          "index_access": 0.15415964415296912,
+          "first_query": 0.17901295982301235,
+          "warm_query": 0.17379980813711882
+        },
+        "parity_by_trial": [
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10025,
+              "oracle_pairs": 10025,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10025,
+              "oracle_pairs": 10025,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          },
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10025,
+              "oracle_pairs": 10025,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10025,
+              "oracle_pairs": 10025,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          }
+        ]
+      },
+      "vibespatial": {
+        "status": "parity_failed",
+        "mode": "gpu",
+        "tree_rows": 991441,
+        "query_rows": 10000,
+        "median_seconds": {
+          "ingress": 0.15748926997184753,
+          "index_access": 9.435229003429413e-06,
+          "first_query": 3.783695749938488,
+          "warm_query": 3.821496405173093,
+          "build_plus_query": 3.7837051851674914,
+          "ingress_build_query": 3.941194455139339
+        },
+        "oracle_sha256": "a3dfe996f612311bc2a8895ceeb57d0870fca207f9d858bbc0bd9bf820cbb659",
+        "active_trial_completed_seconds": {},
+        "first_process_seconds": {
+          "ingress": 0.25191383995115757,
+          "index_access": 1.5904195606708527e-05,
+          "first_query": 8.644325573928654,
+          "warm_query": 3.7898507891222835
+        },
+        "parity_by_trial": [
+          {
+            "first_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10030,
+              "oracle_pairs": 10025,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10030,
+              "oracle_pairs": 10025,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          },
+          {
+            "first_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10030,
+              "oracle_pairs": 10025,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10030,
+              "oracle_pairs": 10025,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          }
+        ],
+        "telemetry_trial_index": 1,
+        "warm_query_telemetry": {
+          "d2h_count": 8,
+          "d2h_bytes": 56707080,
+          "d2h_seconds": 0.0038843946531414986,
+          "d2h_reasons": [
+            "geometry analysis cached row-bounds host export",
+            "spatial query candidate left-index host export",
+            "spatial query candidate right-index host export",
+            "spatial query candidate-pair allocation fence",
+            "vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output::nearest_relation_distances_to_host",
+            "vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output::nearest_relation_indices_to_host"
+          ],
+          "fallbacks": [],
+          "implementations": [
+            "gpu_nvrtc_bounds",
+            "gpu_nvrtc_bounds_device",
+            "native_relation_export",
+            "owned_gpu_nearest"
+          ]
+        }
+      }
+    },
+    "roads-100000": {
+      "shapely": {
+        "status": "ok",
+        "mode": "cpu",
+        "tree_rows": 991441,
+        "query_rows": 100000,
+        "median_seconds": {
+          "ingress": 0.18641834193840623,
+          "index_access": 0.1558194956742227,
+          "first_query": 1.7984241121448576,
+          "warm_query": 1.7788481349125504,
+          "build_plus_query": 1.9542436078190804,
+          "ingress_build_query": 2.1406619497574866
+        },
+        "oracle_sha256": "2f81e0a5318350b8ce9429403e5eaacdec3294784e3e0d9485bcb6f4de72b4f9",
+        "active_trial_completed_seconds": {},
+        "first_process_seconds": {
+          "ingress": 0.286108679138124,
+          "index_access": 0.1626226562075317,
+          "first_query": 1.770989007782191,
+          "warm_query": 1.7984896576963365
+        },
+        "parity_by_trial": [
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 100266,
+              "oracle_pairs": 100266,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 100266,
+              "oracle_pairs": 100266,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          },
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 100266,
+              "oracle_pairs": 100266,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 100266,
+              "oracle_pairs": 100266,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          }
+        ]
+      },
+      "vibespatial": {
+        "status": "parity_failed",
+        "mode": "gpu",
+        "tree_rows": 991441,
+        "query_rows": 100000,
+        "median_seconds": {
+          "ingress": 0.15913819521665573,
+          "index_access": 1.1747237294912338e-05,
+          "first_query": 5.54050743021071,
+          "warm_query": 5.51103369705379,
+          "build_plus_query": 5.5405191774480045,
+          "ingress_build_query": 5.69965737266466
+        },
+        "oracle_sha256": "2f81e0a5318350b8ce9429403e5eaacdec3294784e3e0d9485bcb6f4de72b4f9",
+        "active_trial_completed_seconds": {},
+        "first_process_seconds": {
+          "ingress": 0.2502879351377487,
+          "index_access": 1.309812068939209e-05,
+          "first_query": 8.662081708200276,
+          "warm_query": 5.532602134626359
+        },
+        "parity_by_trial": [
+          {
+            "first_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 100307,
+              "oracle_pairs": 100266,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 100307,
+              "oracle_pairs": 100266,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          },
+          {
+            "first_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 100307,
+              "oracle_pairs": 100266,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 100307,
+              "oracle_pairs": 100266,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          }
+        ],
+        "telemetry_trial_index": 1,
+        "warm_query_telemetry": {
+          "d2h_count": 8,
+          "d2h_bytes": 283253144,
+          "d2h_seconds": 0.03641363838687539,
+          "d2h_reasons": [
+            "geometry analysis cached row-bounds host export",
+            "spatial query candidate left-index host export",
+            "spatial query candidate right-index host export",
+            "spatial query candidate-pair allocation fence",
+            "vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output::nearest_relation_distances_to_host",
+            "vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output::nearest_relation_indices_to_host"
+          ],
+          "fallbacks": [],
+          "implementations": [
+            "gpu_nvrtc_bounds",
+            "gpu_nvrtc_bounds_device",
+            "native_relation_export",
+            "owned_gpu_nearest"
+          ]
+        }
+      }
+    },
+    "roads-all": {
+      "shapely": {
+        "status": "ok",
+        "mode": "cpu",
+        "tree_rows": 991441,
+        "query_rows": 2680339,
+        "median_seconds": {
+          "ingress": 0.5858666049316525,
+          "index_access": 0.1461230181157589,
+          "first_query": 48.19195863278583,
+          "warm_query": 48.11170457396656,
+          "build_plus_query": 48.338081650901586,
+          "ingress_build_query": 48.92394825583324
+        },
+        "oracle_sha256": "95fb17290445254ad1cfbde30aea9cfb75653dc26d436b814b228ada8d19e1b1",
+        "active_trial_completed_seconds": {},
+        "first_process_seconds": {
+          "ingress": 0.7723411805927753,
+          "index_access": 0.16203183075413108,
+          "first_query": 48.07911625877023,
+          "warm_query": 48.306016442365944
+        },
+        "parity_by_trial": [
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 2687152,
+              "oracle_pairs": 2687152,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 2687152,
+              "oracle_pairs": 2687152,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          },
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 2687152,
+              "oracle_pairs": 2687152,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 2687152,
+              "oracle_pairs": 2687152,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          }
+        ]
+      },
+      "vibespatial": {
+        "status": "error",
+        "mode": "gpu",
+        "tree_rows": 991441,
+        "query_rows": 2680339,
+        "active_stage": "first_query",
+        "active_iteration": 0,
+        "timeout_seconds": 240.0,
+        "log": "/tmp/vibespatial-osm/nearest-v2-gpu/vibespatial-roads-all.log",
+        "active_trial_completed_seconds": {
+          "ingress": 0.3376480438746512,
+          "index_access": 1.5289057046175003e-05
+        },
+        "first_process_seconds": null,
+        "completed_stages": {
+          "ingress": 0.3376480438746512,
+          "index_access": 1.5289057046175003e-05
+        },
+        "error_tail": "vibespatial.spatial.query_types.CandidateRelationCapacityError: spatial query candidate relation has 2,925,663,094 pairs and requires at least 21.80 GiB for its two int32 index columns and 0.00 GiB scratch; reserved allocation budget is 20.24 GiB from 20.24 GiB currently available; deterministic shard capacity is 2,716,984,884 pairs"
+      }
+    },
+    "segments-1000": {
+      "shapely": {
+        "status": "ok",
+        "mode": "cpu",
+        "tree_rows": 8728450,
+        "query_rows": 1000,
+        "median_seconds": {
+          "ingress": 1.7589971129782498,
+          "index_access": 1.3723672591149807,
+          "first_query": 0.008667811751365662,
+          "warm_query": 0.008620110806077719,
+          "build_plus_query": 1.3810350708663464,
+          "ingress_build_query": 3.140032183844596
+        },
+        "oracle_sha256": "02b09f0ddae58c3de1e564fa32b3744e0f1006dcfd690f4e37a18e9e82f80a95",
+        "active_trial_completed_seconds": {},
+        "first_process_seconds": {
+          "ingress": 2.1192799960263073,
+          "index_access": 1.3675955762155354,
+          "first_query": 0.00833396939560771,
+          "warm_query": 0.007670156192034483
+        },
+        "parity_by_trial": [
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1052,
+              "oracle_pairs": 1052,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1052,
+              "oracle_pairs": 1052,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          },
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1052,
+              "oracle_pairs": 1052,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1052,
+              "oracle_pairs": 1052,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          }
+        ]
+      },
+      "vibespatial": {
+        "status": "parity_failed",
+        "mode": "gpu",
+        "tree_rows": 8728450,
+        "query_rows": 1000,
+        "median_seconds": {
+          "ingress": 0.4254875690676272,
+          "index_access": 1.1160969734191895e-05,
+          "first_query": 16.997476565651596,
+          "warm_query": 17.004227083176374,
+          "build_plus_query": 16.99748772662133,
+          "ingress_build_query": 17.422975295688957
+        },
+        "oracle_sha256": "02b09f0ddae58c3de1e564fa32b3744e0f1006dcfd690f4e37a18e9e82f80a95",
+        "active_trial_completed_seconds": {},
+        "first_process_seconds": {
+          "ingress": 0.5386883961036801,
+          "index_access": 1.0041054338216782e-05,
+          "first_query": 17.250681133009493,
+          "warm_query": 16.99554326105863
+        },
+        "parity_by_trial": [
+          {
+            "first_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1059,
+              "oracle_pairs": 1052,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1059,
+              "oracle_pairs": 1052,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          },
+          {
+            "first_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1059,
+              "oracle_pairs": 1052,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 1059,
+              "oracle_pairs": 1052,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          }
+        ],
+        "telemetry_trial_index": 1,
+        "warm_query_telemetry": {
+          "d2h_count": 8,
+          "d2h_bytes": 281247368,
+          "d2h_seconds": 0.03756953403353691,
+          "d2h_reasons": [
+            "geometry analysis cached row-bounds host export",
+            "spatial query candidate left-index host export",
+            "spatial query candidate right-index host export",
+            "spatial query candidate-pair allocation fence",
+            "vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output::nearest_relation_distances_to_host",
+            "vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output::nearest_relation_indices_to_host"
+          ],
+          "fallbacks": [],
+          "implementations": [
+            "gpu_nvrtc_bounds",
+            "gpu_nvrtc_bounds_device",
+            "native_relation_export",
+            "owned_gpu_nearest"
+          ]
+        }
+      }
+    },
+    "segments-10000": {
+      "shapely": {
+        "status": "ok",
+        "mode": "cpu",
+        "tree_rows": 8728450,
+        "query_rows": 10000,
+        "median_seconds": {
+          "ingress": 1.7832419690676033,
+          "index_access": 1.4080132823437452,
+          "first_query": 0.08138425881043077,
+          "warm_query": 0.08011412201449275,
+          "build_plus_query": 1.489397541154176,
+          "ingress_build_query": 3.2726395102217793
+        },
+        "oracle_sha256": "f788a9db55006f25a241fb546875217260e3515804375919f3d548c08aa043a5",
+        "active_trial_completed_seconds": {},
+        "first_process_seconds": {
+          "ingress": 2.1142543591558933,
+          "index_access": 1.3883873298764229,
+          "first_query": 0.08328020153567195,
+          "warm_query": 0.07933480711653829
+        },
+        "parity_by_trial": [
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10554,
+              "oracle_pairs": 10554,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10554,
+              "oracle_pairs": 10554,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          },
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10554,
+              "oracle_pairs": 10554,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10554,
+              "oracle_pairs": 10554,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          }
+        ]
+      },
+      "vibespatial": {
+        "status": "parity_failed",
+        "mode": "gpu",
+        "tree_rows": 8728450,
+        "query_rows": 10000,
+        "median_seconds": {
+          "ingress": 0.4310056371614337,
+          "index_access": 1.0602176189422607e-05,
+          "first_query": 16.974768551066518,
+          "warm_query": 16.97840167209506,
+          "build_plus_query": 16.974779153242707,
+          "ingress_build_query": 17.40578479040414
+        },
+        "oracle_sha256": "f788a9db55006f25a241fb546875217260e3515804375919f3d548c08aa043a5",
+        "active_trial_completed_seconds": {},
+        "first_process_seconds": {
+          "ingress": 0.5372174773365259,
+          "index_access": 1.07581727206707e-05,
+          "first_query": 17.316447336692363,
+          "warm_query": 16.99921653792262
+        },
+        "parity_by_trial": [
+          {
+            "first_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10598,
+              "oracle_pairs": 10554,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10598,
+              "oracle_pairs": 10554,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          },
+          {
+            "first_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10598,
+              "oracle_pairs": 10554,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 10598,
+              "oracle_pairs": 10554,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          }
+        ],
+        "telemetry_trial_index": 1,
+        "warm_query_telemetry": {
+          "d2h_count": 8,
+          "d2h_bytes": 297930040,
+          "d2h_seconds": 0.042417156510055065,
+          "d2h_reasons": [
+            "geometry analysis cached row-bounds host export",
+            "spatial query candidate left-index host export",
+            "spatial query candidate right-index host export",
+            "spatial query candidate-pair allocation fence",
+            "vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output::nearest_relation_distances_to_host",
+            "vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output::nearest_relation_indices_to_host"
+          ],
+          "fallbacks": [],
+          "implementations": [
+            "gpu_nvrtc_bounds",
+            "gpu_nvrtc_bounds_device",
+            "native_relation_export",
+            "owned_gpu_nearest"
+          ]
+        }
+      }
+    },
+    "segments-100000": {
+      "shapely": {
+        "status": "ok",
+        "mode": "cpu",
+        "tree_rows": 8728450,
+        "query_rows": 100000,
+        "median_seconds": {
+          "ingress": 1.7776358141563833,
+          "index_access": 1.365871150046587,
+          "first_query": 0.7926985220983624,
+          "warm_query": 0.8003105907700956,
+          "build_plus_query": 2.1585696721449494,
+          "ingress_build_query": 3.9362054863013327
+        },
+        "oracle_sha256": "0b2772afcd38c7feaeb13c610ca91a7181d10921eacd3712b975b1e6b25e53d5",
+        "active_trial_completed_seconds": {},
+        "first_process_seconds": {
+          "ingress": 2.1433380846865475,
+          "index_access": 1.3672426510602236,
+          "first_query": 0.7847397923469543,
+          "warm_query": 0.792366961017251
+        },
+        "parity_by_trial": [
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 105748,
+              "oracle_pairs": 105748,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 105748,
+              "oracle_pairs": 105748,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          },
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 105748,
+              "oracle_pairs": 105748,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 105748,
+              "oracle_pairs": 105748,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          }
+        ]
+      },
+      "vibespatial": {
+        "status": "timeout",
+        "mode": "gpu",
+        "tree_rows": 8728450,
+        "query_rows": 100000,
+        "active_stage": "warm_query",
+        "active_iteration": 1,
+        "timeout_seconds": 240.0,
+        "log": "/tmp/vibespatial-osm/nearest-v2-gpu/vibespatial-segments-100000.log",
+        "active_trial_completed_seconds": {
+          "ingress": 0.4221333311870694,
+          "index_access": 1.1194031685590744e-05,
+          "first_query": 60.81572160869837
+        },
+        "first_process_seconds": {
+          "ingress": 0.5411784211173654,
+          "index_access": 1.1194031685590744e-05,
+          "first_query": 61.22313671186566,
+          "warm_query": 60.827058415394276
+        },
+        "parity_by_trial": [
+          {
+            "first_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 106194,
+              "oracle_pairs": 105748,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": false,
+              "pairs_equal": false,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 106194,
+              "oracle_pairs": 105748,
+              "max_distance_error_m": null,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          }
+        ],
+        "telemetry_trial_index": 0,
+        "warm_query_telemetry": {
+          "d2h_count": 11,
+          "d2h_bytes": 1159280688,
+          "d2h_seconds": 0.15442209457978606,
+          "d2h_reasons": [
+            "geometry analysis cached row-bounds host export",
+            "spatial query candidate left-index host export",
+            "spatial query candidate right-index host export",
+            "spatial query candidate-pair allocation fence",
+            "vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output::nearest_relation_distances_to_host",
+            "vibespatial.api.sindex.SpatialIndex._format_public_nearest_relation_output::nearest_relation_indices_to_host"
+          ],
+          "fallbacks": [],
+          "implementations": [
+            "gpu_nvrtc_bounds",
+            "gpu_nvrtc_bounds_device",
+            "native_relation_export",
+            "owned_gpu_nearest"
+          ]
+        },
+        "error_tail": ""
+      }
+    },
+    "segments-all": {
+      "shapely": {
+        "status": "ok",
+        "mode": "cpu",
+        "tree_rows": 8728450,
+        "query_rows": 2680339,
+        "median_seconds": {
+          "ingress": 2.286495203152299,
+          "index_access": 1.3705994999036193,
+          "first_query": 21.242341335862875,
+          "warm_query": 21.463823882862926,
+          "build_plus_query": 22.612940835766494,
+          "ingress_build_query": 24.899436038918793
+        },
+        "oracle_sha256": "7c7216b66c0ac800e7c204b631eea8bec6471f2cba3280f85480299058b97c15",
+        "active_trial_completed_seconds": {},
+        "first_process_seconds": {
+          "ingress": 2.726353860925883,
+          "index_access": 1.3581391349434853,
+          "first_query": 21.125756348017603,
+          "warm_query": 21.2239596741274
+        },
+        "parity_by_trial": [
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 2834045,
+              "oracle_pairs": 2834045,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 2834045,
+              "oracle_pairs": 2834045,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          },
+          {
+            "first_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 2834045,
+              "oracle_pairs": 2834045,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            },
+            "warm_query": {
+              "passed": true,
+              "pairs_equal": true,
+              "finite_nonnegative_distances": true,
+              "candidate_pairs": 2834045,
+              "oracle_pairs": 2834045,
+              "max_distance_error_m": 0.0,
+              "rtol": 1e-10,
+              "atol_m": 1e-06
+            }
+          }
+        ]
+      },
+      "vibespatial": {
+        "status": "timeout",
+        "mode": "gpu",
+        "tree_rows": 8728450,
+        "query_rows": 2680339,
+        "active_stage": "first_query",
+        "active_iteration": 0,
+        "timeout_seconds": 240.0,
+        "log": "/tmp/vibespatial-osm/nearest-v2-gpu/vibespatial-segments-all.log",
+        "active_trial_completed_seconds": {
+          "ingress": 0.6182991289533675,
+          "index_access": 1.3379380106925964e-05
+        },
+        "first_process_seconds": null,
+        "completed_stages": {
+          "ingress": 0.6182991289533675,
+          "index_access": 1.3379380106925964e-05
+        },
+        "error_tail": ""
+      }
+    }
+  },
+  "full_pipeline_profile": {
+    "command": "uv run python scripts/benchmark_pipelines.py --suite full --repeat 1 --gpu-sparkline",
+    "exit_code": 0,
+    "log_sha256": "15da1ba07fcb106710d6ec84817ef71fe5c662cc4a6baaf3b186f0f42e0e4b1f",
+    "review": "All 51 stages at 1M reviewed. No unexpected >1s CPU-heavy stages. Largest wall stage: predicate-heavy/read_geojson, 71.33 ms. This suite does not cover the OSM nearest failure.",
+    "stages_1m": [
+      {
+        "pipeline": "join-heavy",
+        "stage": "read_points",
+        "wall_seconds": 0.00365
+      },
+      {
+        "pipeline": "join-heavy",
+        "stage": "read_polygons",
+        "wall_seconds": 0.0056500000000000005
+      },
+      {
+        "pipeline": "join-heavy",
+        "stage": "build_index",
+        "wall_seconds": 0.000267
+      },
+      {
+        "pipeline": "join-heavy",
+        "stage": "sjoin_query",
+        "wall_seconds": 0.000643
+      },
+      {
+        "pipeline": "join-heavy",
+        "stage": "assemble_join_rows",
+        "wall_seconds": 0.000444
+      },
+      {
+        "pipeline": "join-heavy",
+        "stage": "dissolve_groups",
+        "wall_seconds": 0.00233
+      },
+      {
+        "pipeline": "join-heavy",
+        "stage": "write_output",
+        "wall_seconds": 0.01648
+      },
+      {
+        "pipeline": "relation-semijoin",
+        "stage": "read_inputs",
+        "wall_seconds": 0.01111
+      },
+      {
+        "pipeline": "relation-semijoin",
+        "stage": "build_index",
+        "wall_seconds": 0.000223
+      },
+      {
+        "pipeline": "relation-semijoin",
+        "stage": "sjoin_relation",
+        "wall_seconds": 0.000668
+      },
+      {
+        "pipeline": "relation-semijoin",
+        "stage": "semijoin_rowset",
+        "wall_seconds": 0.000385
+      },
+      {
+        "pipeline": "relation-semijoin",
+        "stage": "subset_rows",
+        "wall_seconds": 0.000895
+      },
+      {
+        "pipeline": "relation-semijoin",
+        "stage": "write_output",
+        "wall_seconds": 0.004030000000000001
+      },
+      {
+        "pipeline": "small-grouped-constructive-reduce",
+        "stage": "build_device_grouped_polygons",
+        "wall_seconds": 0.042280000000000005
+      },
+      {
+        "pipeline": "small-grouped-constructive-reduce",
+        "stage": "native_grouped_union",
+        "wall_seconds": 0.04614
+      },
+      {
+        "pipeline": "small-grouped-constructive-reduce",
+        "stage": "native_reference_check",
+        "wall_seconds": 2.6e-05
+      },
+      {
+        "pipeline": "grouped-capacity-partitions",
+        "stage": "build_grouped_partition_fixtures",
+        "wall_seconds": 0.04804
+      },
+      {
+        "pipeline": "grouped-capacity-partitions",
+        "stage": "mixed_strip_exact_union",
+        "wall_seconds": 0.06651
+      },
+      {
+        "pipeline": "grouped-capacity-partitions",
+        "stage": "positive_degenerate_union",
+        "wall_seconds": 0.06229
+      },
+      {
+        "pipeline": "grouped-capacity-partitions",
+        "stage": "native_reference_check",
+        "wall_seconds": 2.3e-05
+      },
+      {
+        "pipeline": "grouped-disjoint-constructive-reduce",
+        "stage": "build_device_disjoint_groups",
+        "wall_seconds": 0.06564
+      },
+      {
+        "pipeline": "grouped-disjoint-constructive-reduce",
+        "stage": "native_grouped_disjoint_subset",
+        "wall_seconds": 0.00122
+      },
+      {
+        "pipeline": "grouped-disjoint-constructive-reduce",
+        "stage": "native_reference_check",
+        "wall_seconds": 2.4e-05
+      },
+      {
+        "pipeline": "grouped-difference-constructive",
+        "stage": "build_device_grouped_difference_inputs",
+        "wall_seconds": 0.03334
+      },
+      {
+        "pipeline": "grouped-difference-constructive",
+        "stage": "native_grouped_difference",
+        "wall_seconds": 0.00956
+      },
+      {
+        "pipeline": "grouped-difference-constructive",
+        "stage": "native_reference_check",
+        "wall_seconds": 2.6e-05
+      },
+      {
+        "pipeline": "constructive-output-native",
+        "stage": "build_device_pairwise_boxes",
+        "wall_seconds": 0.0035800000000000003
+      },
+      {
+        "pipeline": "constructive-output-native",
+        "stage": "native_constructive_intersection",
+        "wall_seconds": 0.00364
+      },
+      {
+        "pipeline": "constructive-output-native",
+        "stage": "constructive_area_expression",
+        "wall_seconds": 0.0011
+      },
+      {
+        "pipeline": "constructive-output-native",
+        "stage": "constructive_expression_consumers",
+        "wall_seconds": 0.00163
+      },
+      {
+        "pipeline": "constructive-output-native",
+        "stage": "native_reference_check",
+        "wall_seconds": 2.9999999999999997e-05
+      },
+      {
+        "pipeline": "overlay-relation-constructive",
+        "stage": "build_native_overlay_inputs",
+        "wall_seconds": 0.00623
+      },
+      {
+        "pipeline": "overlay-relation-constructive",
+        "stage": "build_spatial_index",
+        "wall_seconds": 8.3e-05
+      },
+      {
+        "pipeline": "overlay-relation-constructive",
+        "stage": "candidate_relation",
+        "wall_seconds": 0.0007149999999999999
+      },
+      {
+        "pipeline": "overlay-relation-constructive",
+        "stage": "refine_relation",
+        "wall_seconds": 0.000208
+      },
+      {
+        "pipeline": "overlay-relation-constructive",
+        "stage": "constructive_intersection",
+        "wall_seconds": 0.00266
+      },
+      {
+        "pipeline": "overlay-relation-constructive",
+        "stage": "native_tabular_projection",
+        "wall_seconds": 0.0009119999999999999
+      },
+      {
+        "pipeline": "overlay-relation-constructive",
+        "stage": "native_reference_check",
+        "wall_seconds": 2.6e-05
+      },
+      {
+        "pipeline": "constructive",
+        "stage": "read_points",
+        "wall_seconds": 0.00331
+      },
+      {
+        "pipeline": "constructive",
+        "stage": "clip_points",
+        "wall_seconds": 0.000488
+      },
+      {
+        "pipeline": "constructive",
+        "stage": "buffer_points",
+        "wall_seconds": 0.00148
+      },
+      {
+        "pipeline": "constructive",
+        "stage": "write_output",
+        "wall_seconds": 0.01837
+      },
+      {
+        "pipeline": "predicate-heavy",
+        "stage": "read_geojson",
+        "wall_seconds": 0.07133
+      },
+      {
+        "pipeline": "predicate-heavy",
+        "stage": "load_polygons",
+        "wall_seconds": 0.0087
+      },
+      {
+        "pipeline": "predicate-heavy",
+        "stage": "point_in_polygon",
+        "wall_seconds": 0.000339
+      },
+      {
+        "pipeline": "predicate-heavy",
+        "stage": "filter_points",
+        "wall_seconds": 0.000365
+      },
+      {
+        "pipeline": "predicate-heavy",
+        "stage": "write_output",
+        "wall_seconds": 0.00133
+      },
+      {
+        "pipeline": "zero-transfer",
+        "stage": "read_input",
+        "wall_seconds": 0.007980000000000001
+      },
+      {
+        "pipeline": "zero-transfer",
+        "stage": "predicate_filter",
+        "wall_seconds": 0.000396
+      },
+      {
+        "pipeline": "zero-transfer",
+        "stage": "subset_rows",
+        "wall_seconds": 0.00107
+      },
+      {
+        "pipeline": "zero-transfer",
+        "stage": "write_output",
+        "wall_seconds": 0.0039
+      }
+    ]
+  }
+}

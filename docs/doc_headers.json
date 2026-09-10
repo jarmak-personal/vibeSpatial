@@ -588,6 +588,13 @@
       "stopIf": "You only need the PBF API or implementation contract in osm-pbf-native.md.",
       "sourceOfTruth": "Measured OSM PBF performance and validation evidence for the 4090 implementation.",
       "maxBodyLines": 240
+    },
+    "docs/testing/osm-nearest-performance.md": {
+      "scope": "Same-data Massachusetts building-to-road and segment nearest benchmark, public API timing boundaries, and STRtree comparison.",
+      "readIf": "You are comparing road snapping, query_nearest, all-match ties, or NativeSpatialIndex k=1 performance.",
+      "stopIf": "You only need the OSM reader or a nearest kernel implementation detail.",
+      "sourceOfTruth": "Reproducible public nearest benchmark contract and Massachusetts evidence.",
+      "maxBodyLines": 220
     }
   }
 }

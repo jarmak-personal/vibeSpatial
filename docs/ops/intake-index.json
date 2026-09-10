@@ -8723,6 +8723,105 @@
     },
     {
       "metadata": {
+        "maxBodyLines": 220,
+        "readIf": "You are comparing road snapping, query_nearest, all-match ties, or NativeSpatialIndex k=1 performance.",
+        "scope": "Same-data Massachusetts building-to-road and segment nearest benchmark, public API timing boundaries, and STRtree comparison.",
+        "sourceOfTruth": "Reproducible public nearest benchmark contract and Massachusetts evidence.",
+        "stopIf": "You only need the OSM reader or a nearest kernel implementation detail."
+      },
+      "open_first": [
+        "scripts/benchmark_osm_nearest.py",
+        "docs/testing/osm-nearest-evidence.json",
+        "tests/test_benchmark_osm_nearest.py",
+        "docs/architecture/spatial-joins.md",
+        "src/vibespatial/api/sindex.py",
+        "src/vibespatial/spatial/nearest.py"
+      ],
+      "path": "docs/testing/osm-nearest-performance.md",
+      "request_signals": [
+        "road snapping benchmark",
+        "building nearest road",
+        "Massachusetts query_nearest",
+        "Shapely STRtree comparison",
+        "NativeSpatialIndex k=1"
+      ],
+      "risks": [
+        "All-match ties and exactly-one-neighbor selection are different contracts.",
+        "Host query batches can trigger conversion even when the road input is native.",
+        "A lazy sindex accessor does not measure completed index construction.",
+        "Failed parity and timed-out cases are evidence, not validated speedups.",
+        "Segmentation trades tighter bounds for a larger index and more endpoint ties."
+      ],
+      "sections": [
+        "Intent",
+        "Interpretation",
+        "Measured Results",
+        "Measurement and Correctness",
+        "Open First",
+        "Reproduce",
+        "Request Signals",
+        "Risks",
+        "Verify",
+        "Workload Contract"
+      ],
+      "title": "OSM Building-to-Road Nearest Comparison",
+      "tokens": [
+        "api",
+        "are",
+        "benchmark",
+        "boundaries",
+        "building",
+        "comparing",
+        "comparison",
+        "contract",
+        "correctness",
+        "data",
+        "detail",
+        "evidence",
+        "first",
+        "implementation",
+        "intent",
+        "interpretation",
+        "kernel",
+        "massachusetts",
+        "match",
+        "measured",
+        "measurement",
+        "nativespatialindex",
+        "nearest",
+        "need",
+        "only",
+        "open",
+        "osm",
+        "performance",
+        "public",
+        "query",
+        "reader",
+        "reproduce",
+        "reproducible",
+        "request",
+        "results",
+        "risks",
+        "road",
+        "same",
+        "segment",
+        "shapely",
+        "signals",
+        "snapping",
+        "strtree",
+        "ties",
+        "timing",
+        "verify",
+        "workload",
+        "you"
+      ],
+      "verify": [
+        "uv run pytest tests/test_benchmark_osm_nearest.py -q",
+        "uv run python scripts/check_docs.py --check"
+      ]
+    },
+    {
+      "metadata": {
         "maxBodyLines": 240,
         "readIf": "You are comparing PBF performance or reproducing capacity and relation-shape measurements.",
         "scope": "Massachusetts PBF timings, native GeoParquet comparison, memory pressure, and regression evidence.",
@@ -12648,7 +12747,8 @@
       "path": "docs/architecture/spatial-joins.md",
       "referenced_by": [
         "docs/architecture/spatial-joins.md",
-        "docs/archive/2026-08-18-device-planning/adaptive-point-region-refinement-plan.md"
+        "docs/archive/2026-08-18-device-planning/adaptive-point-region-refinement-plan.md",
+        "docs/testing/osm-nearest-performance.md"
       ],
       "symbols": [],
       "tokens": [
@@ -14443,6 +14543,36 @@
     },
     {
       "kind": "doc",
+      "path": "docs/testing/osm-nearest-evidence.json",
+      "referenced_by": [
+        "docs/testing/osm-nearest-performance.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "docs",
+        "evidence",
+        "json",
+        "nearest",
+        "osm",
+        "testing"
+      ]
+    },
+    {
+      "kind": "doc",
+      "path": "docs/testing/osm-nearest-performance.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "docs",
+        "md",
+        "nearest",
+        "osm",
+        "performance",
+        "testing"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/testing/osm-pbf-evidence.json",
       "referenced_by": [
         "docs/testing/osm-pbf-performance.md"
@@ -15401,6 +15531,78 @@
         "mixed",
         "py",
         "scripts"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/benchmark_osm_nearest.py",
+      "referenced_by": [
+        "docs/testing/osm-nearest-performance.md"
+      ],
+      "symbols": [
+        "sha",
+        "write_json",
+        "segment_lines",
+        "canonical",
+        "compare",
+        "prepare",
+        "measurement_identity",
+        "worker",
+        "run_worker",
+        "main"
+      ],
+      "tokens": [
+        "are",
+        "artifacts",
+        "backend",
+        "benchmark",
+        "building",
+        "candidate",
+        "canonical",
+        "collection",
+        "comparator",
+        "compare",
+        "comparison",
+        "cprofile",
+        "cpu",
+        "data",
+        "deliberately",
+        "every",
+        "export",
+        "gpu",
+        "identity",
+        "immutable",
+        "json",
+        "lines",
+        "main",
+        "measurement",
+        "nearest",
+        "not",
+        "numpy",
+        "optional",
+        "oracles",
+        "osm",
+        "outside",
+        "parity",
+        "points",
+        "preparation",
+        "prepare",
+        "process",
+        "public",
+        "py",
+        "result",
+        "roads",
+        "run",
+        "runs",
+        "same",
+        "scripts",
+        "segment",
+        "segments",
+        "separate",
+        "sha",
+        "timed",
+        "worker",
+        "write"
       ]
     },
     {
@@ -19948,7 +20150,8 @@
       "path": "src/vibespatial/api/sindex.py",
       "referenced_by": [
         "docs/architecture/spatial-joins.md",
-        "docs/archive/2026-08-18-device-planning/adaptive-point-region-refinement-plan.md"
+        "docs/archive/2026-08-18-device-planning/adaptive-point-region-refinement-plan.md",
+        "docs/testing/osm-nearest-performance.md"
       ],
       "symbols": [
         "SpatialIndex",
@@ -39640,7 +39843,9 @@
     {
       "kind": "source",
       "path": "src/vibespatial/spatial/nearest.py",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/testing/osm-nearest-performance.md"
+      ],
       "symbols": [
         "DistanceStrategy",
         "PointPointDistanceStrategy",
@@ -42377,6 +42582,58 @@
         "tests",
         "uses",
         "writes"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_benchmark_osm_nearest.py",
+      "referenced_by": [
+        "docs/testing/osm-nearest-performance.md"
+      ],
+      "symbols": [
+        "test_segments_preserve_distance_and_parent_rows_without_bridging_roads",
+        "test_all_matches_comparison_is_order_independent_but_rejects_missing_ties",
+        "test_distance_errors_and_nonfinite_results_fail_parity",
+        "test_failed_worker_cannot_reuse_previous_candidate_timings"
+      ],
+      "tokens": [
+        "benchmark",
+        "bridging",
+        "but",
+        "candidate",
+        "cannot",
+        "comparison",
+        "contracts",
+        "correctness",
+        "distance",
+        "errors",
+        "fail",
+        "failed",
+        "independent",
+        "matches",
+        "missing",
+        "nearest",
+        "nonfinite",
+        "order",
+        "osm",
+        "parent",
+        "parity",
+        "preserve",
+        "previous",
+        "py",
+        "rejects",
+        "results",
+        "reuse",
+        "roads",
+        "rows",
+        "segments",
+        "test",
+        "tests",
+        "ties",
+        "timing",
+        "timings",
+        "without",
+        "worker"
       ]
     },
     {
