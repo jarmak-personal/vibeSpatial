@@ -638,6 +638,13 @@
       "sourceOfTruth": "Current complex-refinement and sindex integration work and evidence.",
       "maxBodyLines": 260
     },
+    "docs/dev/strtree-backend-landing-ledger.md": {
+      "scope": "Landing-time lazy spatial index admission, cache promotion and validation evidence.",
+      "readIf": "You are separating nearest bounds from flat-index construction or reviewing the final landing checks.",
+      "stopIf": "You need the earlier generalized STR algorithm experiments.",
+      "sourceOfTruth": "Chronological nearest backend admission corrections during landing.",
+      "maxBodyLines": 160
+    },
     "docs/testing/strtree-integration-results.md": {
       "scope": "Final public nearest timings, complex polygon canaries, correctness evidence and full pipeline profile.",
       "readIf": "You need current public STRtree integration performance or its verification limits.",

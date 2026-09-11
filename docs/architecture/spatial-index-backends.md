@@ -5,7 +5,7 @@ Scope: Operation capabilities, cache lineage and precision for native spatial in
 Read If: You are selecting spatial-index backends or changing public nearest integration.
 STOP IF: You only need historical experiment timings.
 Source Of Truth: Native spatial-index layout and query-strategy contracts.
-Body Budget: 157/200 lines
+Body Budget: 168/200 lines
 Document: docs/architecture/spatial-index-backends.md
 
 Section Map (Body Lines)
@@ -18,9 +18,9 @@ Section Map (Body Lines)
 | 25-30 | Verify |
 | 31-37 | Risks |
 | 38-68 | Public Contract |
-| 69-100 | Layouts and Strategies |
-| 101-147 | Physical Shape and Precision |
-| 148-157 | Evidence |
+| 69-109 | Layouts and Strategies |
+| 110-156 | Physical Shape and Precision |
+| 157-168 | Evidence |
 DOC_HEADER:END -->
 
 ## Intent
@@ -104,10 +104,19 @@ within those contracts. For example, a segment BVH refines an STR candidate; it
 is not a replacement for a feature index. Fixed-k exclusion remains explicitly
 unsupported by its existing native contract.
 
-`NativeSpatialIndex.kind` continues to identify its flat layout. Its backend
-cache can retain packed STR alongside that layout. GeometryArray invalidation
-replaces the flat index, which changes the native cache identity and discards
-all derived state together. A changed source token also invalidates reuse.
+`NativeSpatialIndex.kind` identifies its retained base layout. Nearest starts
+with `geometry-bounds`: FP64 feature envelopes, geometry ownership and stream
+readiness, without Morton keys/order or a host total-bounds reduction. An
+existing complete flat layout can also supply those envelopes.
+
+Predicate queries, reductions, spans and fixed-k search demand a complete flat
+layout through `with_flat_backend()`. Promotion caches the actual flat index
+and preserves the packed hierarchy and lock for the same geometry owner.
+Bounds-only state never enters the GeometryArray flat-index cache. Orphaned
+public-index reconstruction also stays lazy; `backend_info` reports only
+layouts actually retained. Geometry-owner changes invalidate derived state.
+Source-token relabeling updates lineage while retaining geometrically valid
+caches when the owner is unchanged.
 Packed state is keyed by bounds precision; fanout and tile sizes are private
 implementation constants rather than user-selected cache parameters.
 
@@ -178,3 +187,5 @@ must not be presented as a free index build. Reused-query timings include public
 index/distance export. Historical prototype timings are not public API claims.
 Current measurements and complete 1M profile stages are recorded in
 `docs/testing/strtree-integration-results.md` with a durable evidence manifest.
+The landing-time admission correction is recorded in
+`docs/dev/strtree-backend-landing-ledger.md`.

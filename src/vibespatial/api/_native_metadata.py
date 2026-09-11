@@ -650,6 +650,84 @@ class NativeSpatialIndex:
             raise ValueError("NativeSpatialIndex metadata row_count mismatch")
 
     @classmethod
+    def from_owned_device(
+        cls, owned, *, source_token: str | None = None,
+    ) -> NativeSpatialIndex:
+        """Prepare reusable feature bounds without selecting an index layout.
+
+        Physical shape: one fp64 bounds row per logical geometry, retained on
+        device. Packed STR consumes these bounds directly; Morton consumers
+        explicitly request a complete flat backend through ``with_flat_backend``.
+        """
+        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
+        from vibespatial.runtime.precision import PrecisionMode
+
+        bounds = compute_geometry_bounds_device(
+            owned, precision=PrecisionMode.FP64, preserve_indexed_view=True,
+        )
+        readiness = _record_native_device_readiness(Residency.DEVICE)
+        metadata = replace(
+            NativeGeometryMetadata.from_cached_owned(owned, source_token=source_token),
+            bounds=bounds, residency=Residency.DEVICE, readiness=readiness,
+        )
+        return cls(
+            kind="geometry-bounds", row_count=owned.row_count, geometry=owned,
+            metadata=metadata, source_token=source_token,
+            residency=Residency.DEVICE, readiness=readiness,
+        )
+
+    def with_source_token(self, source_token: str | None) -> NativeSpatialIndex:
+        """Relabel lineage while retaining layouts for the identical geometry."""
+        if self.source_token == source_token:
+            return self
+        return replace(
+            self, source_token=source_token,
+            metadata=None if self.metadata is None else self.metadata.with_source_token(source_token),
+        )
+
+    @property
+    def cached_flat_index(self):
+        """Return a retained complete flat layout without preparing one."""
+        from vibespatial.spatial.index_backends import SpatialIndexBackend
+
+        return self._flat_index or self.backend_cache.get((SpatialIndexBackend.FLAT,))
+
+    def with_flat_backend(self, flat_index=None) -> NativeSpatialIndex:
+        """Promote bounds state for a Morton consumer, retaining nearest caches."""
+        if self.kind != "geometry-bounds" and flat_index is None:
+            return self
+        from vibespatial.spatial.index_backends import SpatialIndexBackend
+
+        with self.backend_lock:
+            if flat_index is None:
+                flat_index = self.cached_flat_index
+            if flat_index is None:
+                import cupy as cp
+
+                from vibespatial.runtime._runtime import select_runtime
+                from vibespatial.spatial.indexing import build_flat_spatial_index
+
+                if self.readiness.event is not None:
+                    cp.cuda.get_current_stream().wait_event(self.readiness.event)
+                flat_index = build_flat_spatial_index(
+                    self.geometry, runtime_selection=select_runtime("gpu"),
+                )
+            if flat_index.geometry_array is not self.geometry:
+                raise ValueError("flat backend must retain the same geometry owner")
+            self.backend_cache[(SpatialIndexBackend.FLAT,)] = flat_index
+            with flat_index._native_spatial_index_lock:
+                prepared = flat_index._native_spatial_index
+                if prepared is None:
+                    prepared = type(self).from_flat_index(flat_index, source_token=self.source_token)
+                self.backend_cache.update(prepared.backend_cache)
+                promoted = replace(
+                    prepared.with_source_token(self.source_token),
+                    backend_cache=self.backend_cache, backend_lock=self.backend_lock,
+                )
+                object.__setattr__(flat_index, "_native_spatial_index", promoted)
+                return promoted
+
+    @classmethod
     def from_flat_index(
         cls,
         flat_index,
@@ -744,6 +822,8 @@ class NativeSpatialIndex:
 
     def to_flat_index(self):
         """Return a transitional flat-index view without rebuilding index state."""
+        if self.kind == "geometry-bounds":
+            return self.with_flat_backend().to_flat_index()
         if self._flat_index is not None:
             if int(self._flat_index.geometry_array.row_count) != int(self.row_count):
                 raise ValueError("retained flat spatial index row count mismatch")
@@ -836,11 +916,12 @@ class NativeSpatialIndex:
                 query_row_count=int(resolved_query_row_count),
             )
         else:
+            native_index = self.with_flat_backend()
             query_result, execution = query_spatial_index(
-                self.geometry,
-                self.to_flat_index(),
+                native_index.geometry,
+                native_index.to_flat_index(),
                 query_owned,
-                native_index=self,
+                native_index=native_index,
                 predicate=predicate,
                 sort=sort,
                 distance=distance,
@@ -902,6 +983,11 @@ class NativeSpatialIndex:
         precomputed_query_bounds: Any | None,
         reduction: str,
     ):
+        if self.kind == "geometry-bounds":
+            return self.with_flat_backend()._query_device_reduction(
+                query_owned, predicate=predicate, distance=distance,
+                precomputed_query_bounds=precomputed_query_bounds, reduction=reduction,
+            )
         if not (
             self.is_device
             and _is_device_array(self.order)
@@ -953,6 +1039,11 @@ class NativeSpatialIndex:
         predicate: str,
         precomputed_query_bounds: Any | None,
     ):
+        if self.kind == "geometry-bounds" or aligned_native_index.kind == "geometry-bounds":
+            return self.with_flat_backend()._query_device_pair_reduction(
+                query_owned, aligned_native_index.with_flat_backend(), predicate=predicate,
+                precomputed_query_bounds=precomputed_query_bounds,
+            )
         if not (
             self.is_device
             and _is_device_array(self.order)
@@ -1326,6 +1417,12 @@ class NativeSpatialIndex:
         It never allocates candidate pairs, refines a predicate, or falls back
         through ``query_relation``.
         """
+        if self.kind == "geometry-bounds":
+            return self.with_flat_backend().query_morton_span_upper_packet(
+                query_geometry, query_row_count=query_row_count,
+                return_metadata=return_metadata,
+                precomputed_query_bounds=precomputed_query_bounds,
+            )
         query_owned = _query_owned_geometry(
             query_geometry,
             residency=self.residency,

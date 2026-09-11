@@ -273,7 +273,7 @@ def test_geopandas_sindex_query_multipoint_uses_gpu_dispatch() -> None:
     assert dispatch_events[-1].implementation in OWNED_OR_NATIVE_QUERY_IMPLEMENTATIONS
 
 
-def test_geopandas_sindex_nearest_fallback_is_observable() -> None:
+def test_geopandas_sindex_nearest_dispatch_is_observable() -> None:
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
     series = geopandas.GeoSeries([Point(0, 0), Point(10, 10)])
@@ -286,4 +286,16 @@ def test_geopandas_sindex_nearest_fallback_is_observable() -> None:
     assert not events
     assert dispatch_events
     assert dispatch_events[-1].surface == "geopandas.sindex.nearest"
-    assert dispatch_events[-1].implementation in ("strtree_host", "owned_gpu_nearest", "owned_cpu_nearest")
+    nearest_events = [
+        event for event in dispatch_events if event.surface == "geopandas.sindex.nearest"
+    ]
+    if has_gpu_runtime():
+        assert nearest_events[-1].implementation == "native_relation_export"
+        assert any(
+            event.implementation == "owned_gpu_packed_str_nearest"
+            for event in nearest_events
+        )
+        assert all(event.selected is geopandas.ExecutionMode.GPU for event in nearest_events)
+    else:
+        assert nearest_events[-1].implementation in ("strtree_host", "owned_cpu_nearest")
+        assert nearest_events[-1].selected is geopandas.ExecutionMode.CPU

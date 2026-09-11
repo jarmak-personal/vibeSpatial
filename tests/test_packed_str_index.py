@@ -366,3 +366,173 @@ def test_nearest_resolves_nearparallel_and_nonzero_short_segments(precision, com
     assert (index._segment_refiner is not None) == complex_boundary
     np.testing.assert_array_equal(actual[0], expected[0])
     np.testing.assert_allclose(actual[1], expected[1], rtol=1e-12, atol=0)
+
+
+@pytest.mark.parametrize("from_wkb", [False, True])
+def test_nearest_admission_never_prepares_flat_backend_in_either_direction(from_wkb, monkeypatch):
+    import gc
+
+    import vibespatial as vs
+    from vibespatial.cuda._runtime import get_d2h_transfer_events
+    from vibespatial.runtime._runtime import set_requested_mode
+    from vibespatial.spatial import indexing
+
+    left = shapely.points([0.25, 5.25, 10.25], [0.0, 1.0, 2.0])
+    right = shapely.points([0.0, 5.0, 10.0], [0.0, 1.0, 2.0])
+
+    def forbid_flat(*args, **kwargs):
+        raise AssertionError("nearest-only input must not construct Morton state or total bounds")
+
+    with set_requested_mode("gpu"):
+        lhs, rhs = (
+            [vs.GeoSeries.from_wkb(shapely.to_wkb(rows)) for rows in (left, right)]
+            if from_wkb else [vs.GeoSeries(rows) for rows in (left, right)]
+        )
+        monkeypatch.setattr(indexing, "build_flat_spatial_index", forbid_flat)
+        monkeypatch.setattr(indexing, "_device_total_bounds", forbid_flat)
+        for query, tree, query_host, tree_host in ((lhs, rhs, left, right), (rhs, lhs, right, left)):
+            get_d2h_transfer_events(clear=True)
+            relation, mode = tree.sindex.nearest_relation(query)
+            assert mode.value == "gpu"
+            events = get_d2h_transfer_events(clear=True)
+            assert sum(event.bytes_transferred for event in events) <= 14
+            assert all("STR" in event.reason or "str" in event.reason for event in events)
+            assert_nearest(export(relation), shapely.STRtree(tree_host).query_nearest(query_host, return_distance=True))
+            assert tree.values._owned_flat_sindex is None
+            assert tree.sindex._native_spatial_index.kind == "geometry-bounds"
+            assert not tree.sindex.backend_info["flat-morton"]["cached"]
+            assert tree.sindex.backend_info["packed-str"]["cached"]
+        orphan = rhs.sindex
+        native = orphan._native_spatial_index
+        del rhs, query, tree
+        gc.collect()
+        assert_nearest(orphan.nearest(lhs, return_distance=True),
+                       shapely.STRtree(right).query_nearest(left, return_distance=True))
+        assert orphan._native_spatial_index is native
+        assert orphan._geometry_array._owned_flat_sindex is None
+
+
+def test_nearest_flat_promotion_retains_backend_and_preserves_predicate_and_fixed_k():
+    import cupy as cp
+
+    import vibespatial as vs
+    from vibespatial.runtime._runtime import set_requested_mode
+
+    tree = shapely.points([0.0, 4.0, 9.0], [0.0, 0.0, 0.0])
+    query = shapely.points([1.0, 7.0], [0.0, 0.0])
+    with set_requested_mode("gpu"):
+        series = vs.GeoSeries.from_wkb(shapely.to_wkb(tree))
+        queries = vs.GeoSeries.from_wkb(shapely.to_wkb(query))
+        index = series.sindex
+        with cp.cuda.Stream(non_blocking=True):
+            first = index.nearest(queries, return_distance=True)
+        before = index._native_spatial_index
+        cache, lock = before.backend_cache, before.backend_lock
+        packed = next(iter(cache.values()))
+        with cp.cuda.Stream(non_blocking=True):
+            relation, _execution = index.query_relation(queries, predicate="dwithin", distance=2.5, sort=True)
+        np.testing.assert_array_equal(export_query_pairs(relation),
+                                      shapely.STRtree(tree).query_nearest(query))
+        promoted = index._native_spatial_index
+        assert promoted.kind == "flat-morton"
+        assert promoted.order is not None and promoted.morton_keys is not None
+        assert promoted.backend_cache is cache and promoted.backend_lock is lock
+        assert index.backend_info["flat-morton"]["cached"]
+        assert index.backend_info["packed-str"]["cached"]
+        pairs, distances = index.nearest(queries, k=2, return_all=False, return_distance=True)
+        np.testing.assert_array_equal(pairs, [[0, 0, 1, 1], [0, 1, 2, 1]])
+        np.testing.assert_array_equal(distances, [1.0, 3.0, 2.0, 3.0])
+        assert_nearest(index.nearest(queries, return_distance=True), first)
+        assert any(backend is packed for backend in index._native_spatial_index.backend_cache.values())
+        retokened = index._native_spatial_index_for_nearest(series.values.to_owned(), source_token="new-lineage")
+        assert retokened.source_token == retokened.metadata.source_token == "new-lineage"
+        assert retokened.backend_cache is cache
+
+
+def test_bounds_native_direct_query_promotes_complete_layout_once(monkeypatch):
+    import vibespatial as vs
+    from vibespatial.api._native_metadata import NativeSpatialIndex
+    from vibespatial.runtime._runtime import set_requested_mode
+    from vibespatial.spatial import indexing
+
+    tree = shapely.points([0.0, 4.0, 9.0], [0.0, 0.0, 0.0])
+    query = shapely.points([1.0, 7.0], [0.0, 0.0])
+    builds = []
+    original = indexing.build_flat_spatial_index
+
+    def record_build(*args, **kwargs):
+        builds.append(1)
+        return original(*args, **kwargs)
+
+    with set_requested_mode("gpu"):
+        owned = vs.GeoSeries.from_wkb(shapely.to_wkb(tree)).values.to_owned()
+        queries = vs.GeoSeries.from_wkb(shapely.to_wkb(query)).values.to_owned()
+        native = NativeSpatialIndex.from_owned_device(owned)
+        assert native.cached_flat_index is None
+        monkeypatch.setattr(indexing, "build_flat_spatial_index", record_build)
+        for _ in range(2):
+            relation = native.query_relation(queries, predicate="dwithin", distance=2.5, sort=True)
+            np.testing.assert_array_equal(export_query_pairs(relation), shapely.STRtree(tree).query_nearest(query))
+        assert builds == [1]
+        prepared = native.with_flat_backend()
+        assert prepared.order is not None and prepared.morton_keys is not None
+        assert prepared.cached_flat_index is native.cached_flat_index
+
+
+def export_query_pairs(relation):
+    import cupy as cp
+
+    from vibespatial.api._native_relation import NativeRelationSelection
+
+    if isinstance(relation, NativeRelationSelection):
+        rows = relation.selection.compact_rowset().positions
+        return cp.asnumpy(cp.stack((relation.relation.left_indices[rows], relation.relation.right_indices[rows])))
+    return cp.asnumpy(cp.stack((relation.left_indices, relation.right_indices)))
+
+
+@pytest.mark.parametrize("consumer", ["query", "fixed-k"])
+def test_native_nearest_promotion_waits_on_bounds_producer_before_flat_build(consumer, monkeypatch):
+    import cupy as cp
+
+    import vibespatial as vs
+    from vibespatial.runtime._runtime import set_requested_mode
+    from vibespatial.spatial import indexing
+
+    class DependencyStream(cp.cuda.Stream):
+        def wait_event(self, event):
+            waits.append(event)
+            return super().wait_event(event)
+
+    waits = []
+    tree = shapely.points([0.0, 4.0, 9.0], [0.0, 0.0, 0.0])
+    query = shapely.points([1.0, 7.0], [0.0, 0.0])
+    with set_requested_mode("gpu"):
+        series = vs.GeoSeries.from_wkb(shapely.to_wkb(tree))
+        queries = vs.GeoSeries.from_wkb(shapely.to_wkb(query))
+        index = series.sindex
+        with cp.cuda.Stream(non_blocking=True):
+            first, _mode = index.nearest_relation(queries)
+        native = index._native_spatial_index
+        producer_event = native.readiness.event
+        build_flat = indexing.build_flat_spatial_index
+
+        def require_producer_dependency(*args, **kwargs):
+            assert producer_event in waits
+            return build_flat(*args, **kwargs)
+
+        monkeypatch.setattr(indexing, "build_flat_spatial_index", require_producer_dependency)
+        with DependencyStream(non_blocking=True):
+            if consumer == "query":
+                relation, _execution = index.query_relation(queries, predicate="dwithin", distance=2.5)
+            else:
+                relation, _mode = index.nearest_relation(queries, k=2, return_all=False)
+        # No public result export or explicit synchronization precedes promotion.
+        assert producer_event in waits
+        assert index._native_spatial_index.backend_cache is native.backend_cache
+        assert_nearest(export(first), shapely.STRtree(tree).query_nearest(query, return_distance=True))
+        if consumer == "query":
+            np.testing.assert_array_equal(export_query_pairs(relation), [[0, 1], [0, 2]])
+        else:
+            pairs, distances = export(relation)
+            np.testing.assert_array_equal(pairs, [[0, 0, 1, 1], [0, 1, 2, 1]])
+            np.testing.assert_array_equal(distances, [1.0, 3.0, 2.0, 3.0])

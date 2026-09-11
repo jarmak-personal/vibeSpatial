@@ -130,7 +130,7 @@ class SpatialIndex:
                 values = array.GeometryArray.from_owned(owner)
                 native = getattr(self, "_native_spatial_index", None)
                 if native is not None and native.geometry is owner:
-                    values._owned_flat_sindex = native.to_flat_index()
+                    values._owned_flat_sindex = native.cached_flat_index
             elif self.geometries is not None:
                 values = array.from_shapely(self.geometries)
             self._orphan_geometry_array = values
@@ -232,7 +232,8 @@ class SpatialIndex:
             retained.add(SpatialIndexBackend.HOST_STR)
         native = self._native_spatial_index
         if native is not None:
-            retained.add(SpatialIndexBackend.FLAT)
+            if native.cached_flat_index is not None:
+                retained.add(SpatialIndexBackend.FLAT)
             retained.update(key[0] for key in native.backend_cache)
             if native.point_partition_cache or native.index_parameters.get("bounded_knn_used", False):
                 retained.add(SpatialIndexBackend.FIXED_K)
@@ -1760,23 +1761,60 @@ class SpatialIndex:
             return self._geometry_array.owned_flat_sindex()
         return build_owned_spatial_index(np.asarray(self.geometries, dtype=object))
 
-    def _native_spatial_index_for_query(self, *, source_token: str | None = None):
-        """Return cached ``NativeSpatialIndex`` state for this public sindex.
+    def _native_spatial_index_for_nearest(self, tree_owned, *, source_token=None):
+        """Admit nearest from shared feature bounds, without preparing Morton."""
+        from vibespatial.api._native_metadata import NativeSpatialIndex
 
-        Physical shape: reusable spatial-index execution state.  Native input
-        carrier is the cached owned-backed ``FlatSpatialIndex``; native output
-        carrier is ``NativeSpatialIndex`` with source-lineage validation by
-        token.  Public callers still export through ``query()``.
-        """
-        _tree_owned, flat_index = self._owned_flat_sindex()
+        native = self._native_spatial_index
+        values = self._geometry_array
+        flat_index = getattr(values, "_owned_flat_sindex", None)
+        if flat_index is None:
+            flat_index = getattr(values, "_owned_flat_sindex_cache", None)
+        if flat_index is not None and flat_index.geometry_array is not tree_owned:
+            flat_index = None
+        if native is not None and native.geometry is tree_owned:
+            native = native.with_source_token(source_token)
+            if flat_index is not None and native.cached_flat_index is not flat_index:
+                native = native.with_flat_backend(flat_index)
+        elif flat_index is not None:
+            native = flat_index.to_native_spatial_index(source_token=source_token)
+        else:
+            native = NativeSpatialIndex.from_owned_device(tree_owned, source_token=source_token)
+        self._native_spatial_index = native
+        self._native_spatial_index_source_token = source_token
+        self._native_spatial_index_flat_index_id = (
+            None if native.cached_flat_index is None else id(native.cached_flat_index)
+        )
+        return native
+
+    def _native_spatial_index_for_query(self, *, source_token: str | None = None):
+        """Admit Morton consumers, retaining other layouts for the same owner."""
+        values = self._geometry_array
+        native = self._native_spatial_index
+        if native is not None and native.geometry is getattr(values, "_owned", None):
+            cache_attribute = (
+                "_owned_flat_sindex" if hasattr(values, "_owned_flat_sindex")
+                else "_owned_flat_sindex_cache"
+            )
+            if getattr(values, cache_attribute, None) is None:
+                setattr(values, cache_attribute, native.cached_flat_index)
+                if native.cached_flat_index is None and native.readiness.event is not None:
+                    import cupy as cp
+
+                    cp.cuda.get_current_stream().wait_event(native.readiness.event)
+        tree_owned, flat_index = self._owned_flat_sindex()
         flat_index_id = id(flat_index)
         if (
-            self._native_spatial_index is not None
-            and self._native_spatial_index_source_token == source_token
+            native is not None
+            and native.geometry is tree_owned
             and self._native_spatial_index_flat_index_id == flat_index_id
+            and native.kind != "geometry-bounds"
         ):
-            return self._native_spatial_index
-        native_index = flat_index.to_native_spatial_index(source_token=source_token)
+            native_index = native.with_source_token(source_token)
+        elif native is not None and native.geometry is tree_owned:
+            native_index = native.with_source_token(source_token).with_flat_backend(flat_index)
+        else:
+            native_index = flat_index.to_native_spatial_index(source_token=source_token)
         self._native_spatial_index = native_index
         self._native_spatial_index_source_token = source_token
         self._native_spatial_index_flat_index_id = flat_index_id
@@ -3161,7 +3199,11 @@ geometries}
 
         if get_requested_mode() is ExecutionMode.CPU or not has_gpu_runtime():
             return None, ExecutionMode.CPU
-        native_spatial_index = self._native_spatial_index_for_query(source_token=source_token)
+        native_spatial_index = (
+            self._native_spatial_index_for_nearest(tree_owned, source_token=source_token)
+            if k == 1
+            else self._native_spatial_index_for_query(source_token=source_token)
+        )
         native_spatial_index.validate_row_count(tree_owned.row_count)
 
         result, impl = nearest_spatial_index(

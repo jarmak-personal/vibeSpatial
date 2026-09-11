@@ -840,10 +840,27 @@ def test_nearest_relation_producer_pipeline_smoke() -> None:
         "build_right_nearest_relation",
         "public_reference_export",
     }
-    assert stage_by_name["build_nearest_relation"]["metadata"]["relation_storage"] == "device"
-    assert (
-        stage_by_name["build_nearest_relation"]["metadata"]["runtime_d2h_transfer_bytes_delta"] <= 8
-    )
+    allowed_fences = {
+        "packed STR candidate convergence fence": 1,
+        "packed STR tie-output allocation fence": 8,
+    }
+    for name in ("build_nearest_relation", "build_right_nearest_relation"):
+        metadata = stage_by_name[name]["metadata"]
+        assert metadata["producer_selected"] == "gpu"
+        assert metadata["relation_storage"] == "device"
+        assert metadata["distance_storage"] == "device"
+        assert metadata["materialization_count_delta"] == 0
+        assert metadata["owned_transfer_count_delta"] == 0
+        # This one-wave fixture admits only STR convergence/allocation scalars.
+        # Neither direction needs flat-Morton planning or geometry/pair export.
+        assert metadata["runtime_d2h_transfer_count_delta"] <= 7
+        assert metadata["runtime_d2h_transfer_bytes_delta"] <= 14
+        events = metadata.get("runtime_d2h_transfer_events", ())
+        assert len(events) == metadata["runtime_d2h_transfer_count_delta"]
+        for event in events:
+            assert event["reason"] in allowed_fences
+            assert event["item_count"] == 1
+            assert event["bytes_transferred"] == allowed_fences[event["reason"]]
     assert stage_by_name["native_distance_consume"]["metadata"]["expression_storage"] == "device"
     assert (
         stage_by_name["native_distance_consume"]["metadata"]["selection_storage"]
@@ -877,17 +894,6 @@ def test_nearest_relation_producer_pipeline_smoke() -> None:
         == 0
     )
     assert stage_by_name["native_attribute_match_filter"]["metadata"]["results_match"] is True
-    assert stage_by_name["build_right_nearest_relation"]["metadata"]["relation_storage"] == "device"
-    assert (
-        stage_by_name["build_right_nearest_relation"]["metadata"]["materialization_count_delta"]
-        == 0
-    )
-    assert (
-        stage_by_name["build_right_nearest_relation"]["metadata"][
-            "runtime_d2h_transfer_bytes_delta"
-        ]
-        <= 8
-    )
     assert stage_by_name["public_reference_export"]["metadata"]["results_match"] is True
     _assert_no_generic_runtime_d2h_reasons(trace)
     assert trace["metadata"]["admissible_shape"] == (

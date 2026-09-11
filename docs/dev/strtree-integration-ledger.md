@@ -5,7 +5,7 @@ Scope: Complex polygon refinement experiments and NativeSpatialIndex backend int
 Read If: You are accelerating complex geometry nearest or integrating spatial index backends.
 STOP IF: You only need historical MA or simple generalized STR screening results.
 Source Of Truth: Current complex-refinement and sindex integration work and evidence.
-Body Budget: 255/260 lines
+Body Budget: 258/260 lines
 Document: docs/dev/strtree-integration-ledger.md
 
 Section Map (Body Lines)
@@ -281,3 +281,6 @@ deferrals, zero fallbacks, maximum stage 75.540 ms. All seven deterministic
 checks pass. Detailed timings, 1M stages and validation limits are in
 `docs/testing/strtree-integration-results.md`; durable source/oracle fingerprints
 and review records are in `docs/testing/strtree-integration-evidence.json`.
+
+Landing-time backend admission corrections and refreshed evidence continue in
+`docs/dev/strtree-backend-landing-ledger.md`.

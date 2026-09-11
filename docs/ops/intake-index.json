@@ -7879,6 +7879,105 @@
     },
     {
       "metadata": {
+        "maxBodyLines": 160,
+        "readIf": "You are separating nearest bounds from flat-index construction or reviewing the final landing checks.",
+        "scope": "Landing-time lazy spatial index admission, cache promotion and validation evidence.",
+        "sourceOfTruth": "Chronological nearest backend admission corrections during landing.",
+        "stopIf": "You need the earlier generalized STR algorithm experiments."
+      },
+      "open_first": [
+        "docs/dev/strtree-integration-ledger.md",
+        "docs/architecture/spatial-index-backends.md",
+        "src/vibespatial/api/sindex.py",
+        "src/vibespatial/api/_native_metadata.py",
+        "tests/test_pipeline_benchmarks.py"
+      ],
+      "path": "docs/dev/strtree-backend-landing-ledger.md",
+      "request_signals": [
+        "nearest lazy index admission",
+        "geometry-bounds native index",
+        "flat backend promotion",
+        "nearest pipeline scalar fences"
+      ],
+      "risks": [
+        "Bounds alone must never masquerade as a complete flat-Morton layout.",
+        "Index promotion must preserve geometry lineage, stream readiness and caches.",
+        "Raising a transfer budget can conceal unnecessary backend construction."
+      ],
+      "sections": [
+        "E66 / Initial Commit and Host Environment",
+        "E67 / Backend Admission Finding",
+        "E68-E72 / Final Correction and Evidence",
+        "Intent",
+        "Open First",
+        "Request Signals",
+        "Risks",
+        "Verify"
+      ],
+      "title": "STRtree Backend Landing Ledger",
+      "tokens": [
+        "admission",
+        "algorithm",
+        "are",
+        "backend",
+        "bounds",
+        "cache",
+        "checks",
+        "chronological",
+        "commit",
+        "construction",
+        "correction",
+        "corrections",
+        "during",
+        "e66",
+        "e67",
+        "e68",
+        "e72",
+        "earlier",
+        "environment",
+        "evidence",
+        "experiments",
+        "fences",
+        "final",
+        "finding",
+        "first",
+        "flat",
+        "generalized",
+        "geometry",
+        "host",
+        "index",
+        "initial",
+        "intent",
+        "landing",
+        "lazy",
+        "ledger",
+        "native",
+        "nearest",
+        "need",
+        "open",
+        "pipeline",
+        "promotion",
+        "request",
+        "reviewing",
+        "risks",
+        "scalar",
+        "separating",
+        "signals",
+        "spatial",
+        "str",
+        "strtree",
+        "time",
+        "validation",
+        "verify",
+        "you"
+      ],
+      "verify": [
+        "uv run pytest tests/test_packed_str_index.py tests/test_pipeline_benchmarks.py tests/test_geopandas_fallbacks.py --run-gpu -q",
+        "uv run python scripts/benchmark_pipelines.py --suite full --repeat 1 --gpu-sparkline"
+      ]
+    },
+    {
+      "metadata": {
         "maxBodyLines": 260,
         "readIf": "You are accelerating complex geometry nearest or integrating spatial index backends.",
         "scope": "Complex polygon refinement experiments and NativeSpatialIndex backend integration ledger.",
@@ -13706,6 +13805,7 @@
       "kind": "doc",
       "path": "docs/architecture/spatial-index-backends.md",
       "referenced_by": [
+        "docs/dev/strtree-backend-landing-ledger.md",
         "docs/testing/strtree-integration-results.md"
       ],
       "symbols": [],
@@ -15330,9 +15430,25 @@
     },
     {
       "kind": "doc",
+      "path": "docs/dev/strtree-backend-landing-ledger.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "backend",
+        "dev",
+        "docs",
+        "landing",
+        "ledger",
+        "md",
+        "strtree"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/dev/strtree-integration-ledger.md",
       "referenced_by": [
         "docs/architecture/spatial-index-backends.md",
+        "docs/dev/strtree-backend-landing-ledger.md",
         "docs/testing/strtree-integration-results.md"
       ],
       "symbols": [],
@@ -15851,6 +15967,21 @@
         "md",
         "nsight",
         "spatialbench",
+        "testing"
+      ]
+    },
+    {
+      "kind": "doc",
+      "path": "docs/testing/strtree-backend-landing-evidence.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "backend",
+        "docs",
+        "evidence",
+        "json",
+        "landing",
+        "strtree",
         "testing"
       ]
     },
@@ -20294,6 +20425,7 @@
         "docs/architecture/spatial-index-backends.md",
         "docs/archive/2026-08-21-quadtree-experiments/adaptive-point-quadtree-production-plan.md",
         "docs/dev/convex-region-predicate-execution-plan.md",
+        "docs/dev/strtree-backend-landing-ledger.md",
         "docs/dev/strtree-integration-ledger.md"
       ],
       "symbols": [
@@ -21838,6 +21970,7 @@
         "docs/architecture/spatial-joins.md",
         "docs/archive/2026-08-18-device-planning/adaptive-point-region-refinement-plan.md",
         "docs/dev/nearest-index-experiment-ledger.md",
+        "docs/dev/strtree-backend-landing-ledger.md",
         "docs/dev/strtree-integration-ledger.md",
         "docs/testing/osm-nearest-performance.md"
       ],
@@ -48471,7 +48604,7 @@
         "test_geopandas_sindex_query_host_fallback_is_observable_for_unsupported_input",
         "test_geopandas_geometry_array_sindex_owned_backing_stays_lazy",
         "test_geopandas_sindex_query_multipoint_uses_gpu_dispatch",
-        "test_geopandas_sindex_nearest_fallback_is_observable"
+        "test_geopandas_sindex_nearest_dispatch_is_observable"
       ],
       "tokens": [
         "array",
@@ -54570,28 +54703,40 @@
         "test_gpu_index_is_lazy_and_counts_only_valid_nonempty_rows",
         "test_index_outlives_public_array_without_a_reference_cycle",
         "test_pair_aggregate_uses_logical_rows_including_nulls_and_empties",
-        "test_nearest_resolves_nearparallel_and_nonzero_short_segments"
+        "test_nearest_resolves_nearparallel_and_nonzero_short_segments",
+        "test_nearest_admission_never_prepares_flat_backend_in_either_direction",
+        "test_nearest_flat_promotion_retains_backend_and_preserves_predicate_and_fixed_k",
+        "test_bounds_native_direct_query_promotes_complete_layout_once",
+        "export_query_pairs",
+        "test_native_nearest_promotion_waits_on_bounds_producer_before_flat_build"
       ],
       "tokens": [
         "across",
+        "admission",
         "aggregate",
         "array",
         "assert",
         "backend",
+        "before",
         "bits",
         "boundary",
+        "bounds",
         "build",
         "cached",
         "chooses",
         "close",
+        "complete",
         "contracts",
         "counts",
         "cpu",
         "cycle",
         "diagnostics",
+        "direct",
+        "direction",
         "do",
         "does",
         "duplicate",
+        "either",
         "empties",
         "empty",
         "endpoint",
@@ -54601,6 +54746,8 @@
         "explicit",
         "export",
         "family",
+        "fixed",
+        "flat",
         "geometries",
         "gpu",
         "has",
@@ -54610,6 +54757,7 @@
         "index",
         "indexed",
         "interior",
+        "layout",
         "lazy",
         "logical",
         "losing",
@@ -54618,26 +54766,37 @@
         "matches",
         "mixed",
         "mutation",
+        "native",
         "nearest",
         "nearparallel",
+        "never",
         "no",
         "nonempty",
         "nonzero",
         "not",
         "nulls",
+        "once",
         "only",
         "outlives",
         "packed",
         "pair",
         "pairs",
+        "predicate",
+        "prepares",
         "preserve",
+        "preserves",
         "primitives",
+        "producer",
         "projection",
+        "promotes",
+        "promotion",
         "public",
         "py",
+        "query",
         "radix",
         "reference",
         "resolves",
+        "retains",
         "rows",
         "segments",
         "shared",
@@ -54655,6 +54814,7 @@
         "uses",
         "valid",
         "views",
+        "waits",
         "warmed",
         "waves",
         "without"
@@ -54664,7 +54824,8 @@
       "kind": "test",
       "path": "tests/test_pipeline_benchmarks.py",
       "referenced_by": [
-        "docs/dev/native-full-coverage-prd.md"
+        "docs/dev/native-full-coverage-prd.md",
+        "docs/dev/strtree-backend-landing-ledger.md"
       ],
       "symbols": [
         "test_pipeline_smoke_suite_runs_active_pipelines",
