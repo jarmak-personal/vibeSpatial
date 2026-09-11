@@ -633,6 +633,8 @@ class NativeSpatialIndex:
         repr=False,
         compare=False,
     )
+    backend_cache: dict[Any, Any] = field(default_factory=dict, repr=False, compare=False)
+    backend_lock: Any = field(default_factory=RLock, repr=False, compare=False)
     _flat_index: Any | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -691,6 +693,43 @@ class NativeSpatialIndex:
             readiness=readiness,
             _flat_index=flat_index,
         )
+
+    def nearest_relation(self, query, *, return_all=True, max_distance=None, exclusive=False):
+        """Consume a reusable nearest backend while retaining flat query state.
+
+        Layout choice belongs to the operation: flat envelopes serve predicates,
+        packed STR serves all-family k=1, point partitions continue to serve k>1.
+        Backend state shares this carrier's geometry lineage and lifetime.
+        """
+        import cupy as cp
+
+        from vibespatial.kernels.spatial.packed_str_index import packed_str_index
+        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime.adaptive import plan_dispatch_selection
+        from vibespatial.runtime.crossover import PhysicalWorkEstimate
+        from vibespatial.runtime.precision import KernelClass
+
+        plan = plan_dispatch_selection(
+            kernel_name="packed_str_index", kernel_class=KernelClass.COARSE,
+            row_count=query.row_count, requested_mode=ExecutionMode.GPU,
+            current_residency=self.residency,
+            work_estimate=PhysicalWorkEstimate.for_candidate_pairs(
+                row_count=query.row_count, candidate_pair_count=min(query.row_count,65536)*8,
+                primary_unit_name="nearest-candidate-slot",
+            ),
+        )
+        from vibespatial.spatial.index_backends import SpatialIndexBackend
+
+        key = (SpatialIndexBackend.PACKED_STR, plan.precision_plan.compute_precision)
+        with self.backend_lock:
+            backend = self.backend_cache.get(key)
+            if backend is None:
+                if self.readiness.event is not None:
+                    cp.cuda.get_current_stream().wait_event(self.readiness.event)
+                bounds = None if self.metadata is None else self.metadata.bounds
+                backend = packed_str_index(self.geometry, bounds=bounds, precision_plan=plan.precision_plan)
+                self.backend_cache[key] = backend
+        return backend.query_relation(query,return_all=return_all,max_distance=max_distance,exclusive=exclusive)
 
     @property
     def is_device(self) -> bool:

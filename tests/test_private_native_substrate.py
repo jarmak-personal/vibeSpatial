@@ -7899,6 +7899,7 @@ def test_sjoin_nearest_native_on_attribute_filters_device_relation_pairs() -> No
         pytest.skip("GPU runtime required for native nearest attribute filter probe")
     cp = pytest.importorskip("cupy")
     from vibespatial.cuda._runtime import (
+        get_d2h_transfer_events,
         get_d2h_transfer_stats,
         reset_d2h_transfer_count,
     )
@@ -7947,8 +7948,18 @@ def test_sjoin_nearest_native_on_attribute_filters_device_relation_pairs() -> No
     assert selected is ExecutionMode.GPU
     assert relation.left_rowset().is_device
     assert relation.right_rowset().is_device
-    assert d2h_count <= 1
-    assert d2h_bytes <= 8
+    # STR's three traversal passes expose bounded scalar control fences;
+    # attribute filtering must still consume the complete relation on device.
+    assert d2h_count <= 7
+    assert d2h_bytes <= 14
+    allowed_fences = {
+        "packed STR candidate convergence fence": 1,
+        "packed STR tie-output allocation fence": 8,
+    }
+    for event in get_d2h_transfer_events():
+        assert event.reason in allowed_fences
+        assert event.item_count == 1
+        assert event.bytes_transferred == allowed_fences[event.reason]
     assert get_materialization_events(clear=True) == []
     assert cp.asnumpy(relation.left_indices).tolist() == [0]
     assert cp.asnumpy(relation.right_indices).tolist() == [0]

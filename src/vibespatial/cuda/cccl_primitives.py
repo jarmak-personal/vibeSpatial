@@ -152,6 +152,7 @@ def _max_op(left, right):  # pragma: no cover - exercised through CCCL JIT
 _DTYPE_SUFFIX = {
     np.dtype(np.int32): "i32",
     np.dtype(np.int64): "i64",
+    np.dtype(np.uint32): "u32",
     np.dtype(np.uint64): "u64",
     np.dtype(np.float64): "f64",
 }

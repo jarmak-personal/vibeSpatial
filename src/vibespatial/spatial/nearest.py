@@ -3193,7 +3193,11 @@ def _compute_mixed_distances_gpu_device(
         family_count=family_count,
         source_positions=d_source_positions,
     )
-    group_count = family_count**2
+    # Partition storage covers the complete tag domain, but only family pairs
+    # present in these inputs launch refiners. Dividing homogeneous work by
+    # all 36 schema pairs can leave one block serially refining thousands of
+    # complex polygons. Size work for the dispatched groups instead.
+    group_count = max(1, len(query_families) * len(tree_families))
     launch_capacity = max(1, (pair_count + group_count - 1) // group_count)
     pointset_families = {GeometryFamily.POINT, GeometryFamily.MULTIPOINT}
     if center_device is None and (query_families | tree_families) & pointset_families:
@@ -3631,6 +3635,19 @@ def nearest_spatial_index(
     n_queries = query_owned.row_count
     n_tree = tree_owned.row_count
 
+    from vibespatial.spatial.index_backends import SpatialIndexBackend, nearest_backend
+
+    if return_device and nearest_backend(k=k, device=True) is SpatialIndexBackend.PACKED_STR and native_spatial_index is not None:
+        from vibespatial.runtime import get_requested_mode
+
+        if get_requested_mode() is not ExecutionMode.CPU and has_gpu_runtime():
+            relation = native_spatial_index.nearest_relation(
+                query_owned, return_all=return_all, max_distance=max_distance, exclusive=exclusive,
+            )
+            indices = (relation.left_indices, relation.right_indices)
+            result = (indices, relation.distances) if return_distance else indices
+            return result, "owned_gpu_packed_str_nearest"
+
     if return_device and not _supports_device_nearest_refinement(query_owned, tree_owned):
         return None, "owned_cpu_nearest"
 
@@ -3670,6 +3687,8 @@ def nearest_spatial_index(
         )
         if knn_result is None:
             return None, "owned_cpu_nearest"
+        if native_spatial_index is not None:
+            native_spatial_index.index_parameters["bounded_knn_used"] = True
         indices = (knn_result.d_query_idx, knn_result.d_target_idx)
         if return_distance:
             return (indices, knn_result.d_distances), "owned_gpu_nearest"

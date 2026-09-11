@@ -1,131 +1,9 @@
 """NVRTC kernel sources for segment-to-segment distance computation."""
-
 from __future__ import annotations
 
-from vibespatial.cuda.device_functions.point_in_ring import (
-    POINT_IN_RING_BOUNDARY_DEVICE,
-)
-from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
-from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
+from vibespatial.cuda.device_functions.segment_distance import SEGMENT_DISTANCE_DEVICE
 
-_SEGMENT_DISTANCE_KERNEL_SOURCE = (
-    POINT_ON_SEGMENT_DEVICE
-    + POINT_IN_RING_BOUNDARY_DEVICE
-    + SPATIAL_TOLERANCE_PREAMBLE
-    + """
-#if !defined(INFINITY)
-#define INFINITY __longlong_as_double(0x7FF0000000000000LL)
-#endif
-
-// ===================================================================
-// Level 0: segment-segment squared distance (Ericson's algorithm)
-// ===================================================================
-// Parametric closest-approach between two 2-D line segments.
-// Returns squared Euclidean distance; callers take sqrt() once at the end.
-extern "C" __device__ inline double segment_segment_sq_dist(
-    const double p1x, const double p1y, const double p2x, const double p2y,
-    const double q1x, const double q1y, const double q2x, const double q2y
-) {
-  const double d1x = p2x - p1x, d1y = p2y - p1y;
-  const double d2x = q2x - q1x, d2y = q2y - q1y;
-  const double rx  = p1x - q1x, ry  = p1y - q1y;
-
-  const double a = d1x * d1x + d1y * d1y;   // |d1|^2
-  const double e = d2x * d2x + d2y * d2y;   // |d2|^2
-  const double f = d2x * rx  + d2y * ry;    // d2 . r
-
-  double s, t;
-
-  if (a <= 1e-30 && e <= 1e-30) {
-    // Both degenerate to points.
-    return rx * rx + ry * ry;
-  }
-  if (a <= 1e-30) {
-    s = 0.0;
-    t = f / e;
-    if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;
-  } else {
-    const double c = d1x * rx + d1y * ry;  // d1 . r
-    if (e <= 1e-30) {
-      t = 0.0;
-      s = -c / a;
-      if (s < 0.0) s = 0.0; else if (s > 1.0) s = 1.0;
-    } else {
-      const double b = d1x * d2x + d1y * d2y;  // d1 . d2
-      const double denom = a * e - b * b;
-
-      if (denom > 1e-30) {
-        s = (b * f - c * e) / denom;
-        if (s < 0.0) s = 0.0; else if (s > 1.0) s = 1.0;
-      } else {
-        s = 0.0;  // Nearly parallel -- pick arbitrary s, solve for t.
-      }
-
-      t = (b * s + f) / e;
-
-      if (t < 0.0) {
-        t = 0.0;
-        s = -c / a;
-        if (s < 0.0) s = 0.0; else if (s > 1.0) s = 1.0;
-      } else if (t > 1.0) {
-        t = 1.0;
-        s = (b - c) / a;
-        if (s < 0.0) s = 0.0; else if (s > 1.0) s = 1.0;
-      }
-    }
-  }
-
-  const double dpx = rx + s * d1x - t * d2x;
-  const double dpy = ry + s * d1y - t * d2y;
-  return dpx * dpx + dpy * dpy;
-}
-
-// ===================================================================
-// Level 1a: min sq distance between all segment pairs in two coord ranges
-// ===================================================================
-extern "C" __device__ inline double coords_coords_min_sq_dist(
-    const double* __restrict__ x1, const double* __restrict__ y1, int cs1, int ce1,
-    const double* __restrict__ x2, const double* __restrict__ y2, int cs2, int ce2
-) {
-  double best = INFINITY;
-  for (int i = cs1 + 1; i < ce1; ++i) {
-    for (int j = cs2 + 1; j < ce2; ++j) {
-      const double d = segment_segment_sq_dist(
-          x1[i - 1], y1[i - 1], x1[i], y1[i],
-          x2[j - 1], y2[j - 1], x2[j], y2[j]);
-      if (d < best) best = d;
-      if (best <= 0.0) return 0.0;
-    }
-  }
-  return best;
-}
-
-// ===================================================================
-// Level 1b: even-odd point-in-rings containment check
-// ===================================================================
-extern "C" __device__ inline bool seg_point_in_rings(
-    const double px, const double py,
-    const double* __restrict__ x, const double* __restrict__ y,
-    const int* __restrict__ ring_offsets,
-    int ring_start, int ring_end
-) {
-  bool inside = false;
-  for (int ring = ring_start; ring < ring_end; ++ring) {
-    const int cs = ring_offsets[ring];
-    const int ce = ring_offsets[ring + 1];
-    if ((ce - cs) < 2) continue;
-    bool on_boundary = false;
-    // Distance must not collapse a positive gap into boundary contact. The
-    // fp64 metric path therefore uses exact on-segment classification.
-    bool ring_inside = vs_ring_contains_point_with_boundary(
-        px, py, x, y, cs, ce, 0.0, &on_boundary);
-    if (on_boundary) return true;
-    if (ring_inside) inside = !inside;
-  }
-  return inside;
-}
-
-// ===================================================================
+_SEGMENT_DISTANCE_KERNEL_SOURCE = SEGMENT_DISTANCE_DEVICE + r"""// ===================================================================
 // Level 2: composed distance helpers
 // ===================================================================
 
@@ -204,16 +82,16 @@ extern "C" __device__ inline double pg_pg_sq_dist(
 // Every kernel starts with the same thread-check / validity / tag / row
 // extraction.  Using macros keeps the 10 kernel bodies short.
 
-#define DIST_PREAMBLE(LEFT_TAG_VAR, RIGHT_TAG_VAR)                       \\
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;                   \\
-  if (i >= pair_count) return;                                            \\
-  const int li = left_idx[i], ri = right_idx[i];                         \\
-  if (!left_validity[li] || !right_validity[ri])                         \\
-    { out[i] = INFINITY; return; }                                       \\
-  if (left_tags[li] != LEFT_TAG_VAR || right_tags[ri] != RIGHT_TAG_VAR)  \\
-    { out[i] = INFINITY; return; }                                       \\
-  const int lr = left_fro[li], rr = right_fro[ri];                       \\
-  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr])                  \\
+#define DIST_PREAMBLE(LEFT_TAG_VAR, RIGHT_TAG_VAR)                       \
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;                   \
+  if (i >= pair_count) return;                                            \
+  const int li = left_idx[i], ri = right_idx[i];                         \
+  if (!left_validity[li] || !right_validity[ri])                         \
+    { out[i] = INFINITY; return; }                                       \
+  if (left_tags[li] != LEFT_TAG_VAR || right_tags[ri] != RIGHT_TAG_VAR)  \
+    { out[i] = INFINITY; return; }                                       \
+  const int lr = left_fro[li], rr = right_fro[ri];                       \
+  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr])                  \
     { out[i] = INFINITY; return; }
 
 // ===================================================================
@@ -492,65 +370,6 @@ extern "C" __global__ __launch_bounds__(256, 4) void distance_mpg_mpg_from_owned
   out[i] = sqrt(best);
 }
 
-extern "C" __device__ inline int boundary_range_count(
-    int kind, int row,
-    const int* __restrict__ geometry_offsets,
-    const int* __restrict__ part_offsets
-) {
-  if (kind == 0) return 1;
-  if (kind == 1 || kind == 2)
-    return geometry_offsets[row + 1] - geometry_offsets[row];
-  const int polygon_start = geometry_offsets[row];
-  const int polygon_end = geometry_offsets[row + 1];
-  return part_offsets[polygon_end] - part_offsets[polygon_start];
-}
-
-extern "C" __device__ inline void boundary_coord_range(
-    int kind, int row, int range_index,
-    const int* __restrict__ geometry_offsets,
-    const int* __restrict__ part_offsets,
-    const int* __restrict__ ring_offsets,
-    int* coord_start, int* coord_end
-) {
-  if (kind == 0) {
-    *coord_start = geometry_offsets[row];
-    *coord_end = geometry_offsets[row + 1];
-    return;
-  }
-  if (kind == 1) {
-    const int part = geometry_offsets[row] + range_index;
-    *coord_start = part_offsets[part];
-    *coord_end = part_offsets[part + 1];
-    return;
-  }
-  const int ring = kind == 2
-      ? geometry_offsets[row] + range_index
-      : part_offsets[geometry_offsets[row]] + range_index;
-  *coord_start = ring_offsets[ring];
-  *coord_end = ring_offsets[ring + 1];
-}
-
-extern "C" __device__ inline bool point_in_polygonal_family(
-    double px, double py, int kind, int row,
-    const int* __restrict__ geometry_offsets,
-    const int* __restrict__ part_offsets,
-    const int* __restrict__ ring_offsets,
-    const double* __restrict__ x,
-    const double* __restrict__ y
-) {
-  if (kind == 2) {
-    return seg_point_in_rings(
-        px, py, x, y, ring_offsets,
-        geometry_offsets[row], geometry_offsets[row + 1]);
-  }
-  for (int polygon = geometry_offsets[row]; polygon < geometry_offsets[row + 1]; ++polygon) {
-    if (seg_point_in_rings(
-            px, py, x, y, ring_offsets,
-            part_offsets[polygon], part_offsets[polygon + 1])) return true;
-  }
-  return false;
-}
-
 extern "C" __device__ inline double segment_family_sq_distance(
     int left_kind, int left_row,
     const int* __restrict__ left_go,
@@ -662,7 +481,6 @@ extern "C" __global__ __launch_bounds__(256, 4) void distance_family_partition_f
   }
 }
 """
-)
 
 _SEGMENT_DISTANCE_KERNEL_NAMES = (
     "distance_ls_ls_from_owned",

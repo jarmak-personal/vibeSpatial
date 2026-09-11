@@ -107,6 +107,45 @@ class SpatialIndex:
         Geometries from which to build the spatial index.
     """
 
+    @property
+    def _geometry_array(self):
+        """Borrow the public array while retaining an independent geometry owner.
+
+        GeometryArray caches its sindex. A strong back-reference here would
+        create a cycle containing GPU buffers and their allocation streams;
+        cyclic GC can clear the stream before RMM deallocation. An orphaned
+        index recreates only the Python wrapper around its retained geometry.
+        """
+        reference = getattr(self, "_geometry_array_ref", None)
+        values = None if reference is None else reference()
+        if values is not None:
+            owned = getattr(values, "_owned", None)
+            if owned is not None:
+                self._geometry_owner = owned
+            return values
+        values = getattr(self, "_orphan_geometry_array", None)
+        if values is None:
+            owner = getattr(self, "_geometry_owner", None)
+            if owner is not None:
+                values = array.GeometryArray.from_owned(owner)
+                native = getattr(self, "_native_spatial_index", None)
+                if native is not None and native.geometry is owner:
+                    values._owned_flat_sindex = native.to_flat_index()
+            elif self.geometries is not None:
+                values = array.from_shapely(self.geometries)
+            self._orphan_geometry_array = values
+        return values
+
+    @_geometry_array.setter
+    def _geometry_array(self, values):
+        from weakref import ref
+
+        self._geometry_array_ref = None if values is None else ref(values)
+        self._geometry_owner = getattr(values, "_owned", None)
+        if self._geometry_owner is None and values is not None and "DeviceGeometryArray" in type(values).__name__:
+            self._geometry_owner = values.to_owned()
+        self._orphan_geometry_array = None
+
     def __init__(self, geometry, geometry_array=None):
         # set empty geometries to None to avoid segfault on GEOS <= 3.6
         # see:
@@ -115,7 +154,12 @@ class SpatialIndex:
         non_empty = geometry.copy()
         non_empty[shapely.is_empty(non_empty)] = None
         # set empty geometries to None to maintain indexing
-        self._tree = shapely.STRtree(non_empty)
+        from vibespatial.runtime import has_gpu_runtime
+
+        self._size = int(np.count_nonzero(~shapely.is_missing(non_empty)))
+        self._tree = (shapely.STRtree(non_empty)
+                      if get_requested_mode() is ExecutionMode.CPU or not has_gpu_runtime()
+                      else None)
         # store geometries, including empty geometries for user access
         self.geometries = geometry.copy()
         self._geometry_array = geometry_array
@@ -131,6 +175,7 @@ class SpatialIndex:
         All owned-dispatch queries work without Shapely materialization.
         """
         obj = object.__new__(cls)
+        obj._size = None
         obj._tree = None          # lazy — built on first STRtree-fallback query
         obj.geometries = None     # lazy — populated alongside _tree
         obj._geometry_array = device_geometry_array
@@ -157,11 +202,48 @@ class SpatialIndex:
                 pipeline="spatial_index",
                 d2h_transfer=True,
             )
-        geometry = np.asarray(self._geometry_array._data, dtype=object)
+        geometry = (self.geometries if self.geometries is not None
+                    else np.asarray(self._geometry_array._data, dtype=object))
         non_empty = geometry.copy()
         non_empty[shapely.is_empty(non_empty)] = None
         self._tree = shapely.STRtree(non_empty)
         self.geometries = geometry.copy()
+
+    @property
+    def _row_count(self):
+        """Logical position domain, including null/empty rows, without a device fence."""
+        values = self._geometry_array
+        return len(values) if values is not None else len(self.geometries)
+
+    @property
+    def backend_info(self):
+        """Describe backend capabilities and currently retained execution state.
+
+        This diagnostic does not build an index or select a backend. Different
+        operations can retain different layouts under the same geometry lineage.
+        """
+        from vibespatial.spatial.index_backends import (
+            INDEX_BACKEND_CAPABILITIES,
+            SpatialIndexBackend,
+        )
+
+        retained = set()
+        if self._tree is not None:
+            retained.add(SpatialIndexBackend.HOST_STR)
+        native = self._native_spatial_index
+        if native is not None:
+            retained.add(SpatialIndexBackend.FLAT)
+            retained.update(key[0] for key in native.backend_cache)
+            if native.point_partition_cache or native.index_parameters.get("bounded_knn_used", False):
+                retained.add(SpatialIndexBackend.FIXED_K)
+        return {
+            backend.value: {"operations": capability.operations,
+                            "geometry_families": capability.geometry_families,
+                            "device": capability.device,
+                            "exact_ties": capability.exact_ties,
+                            "cached": backend in retained}
+            for backend, capability in INDEX_BACKEND_CAPABILITIES.items()
+        }
 
     @property
     def valid_query_predicates(self):
@@ -635,7 +717,7 @@ class SpatialIndex:
             ),
             detail=(
                 f"predicate={predicate!r}, query_rows={query_row_count}, "
-                f"tree_rows={self.size}"
+                f"tree_rows={self._row_count}"
             ),
             pipeline="spatial_query_aggregate",
             d2h_transfer=any(
@@ -707,7 +789,7 @@ class SpatialIndex:
             reason="query-any requires owned geometry for native row reduction",
             detail=(
                 f"predicate={predicate!r}, query_rows={query_row_count}, "
-                f"tree_rows={self.size}"
+                f"tree_rows={self._row_count}"
             ),
             pipeline="spatial_query_any",
             d2h_transfer=(
@@ -1022,7 +1104,7 @@ class SpatialIndex:
             reason="native spatial relation reduced directly to an input-sized mask",
             detail=(
                 f"predicate={predicate!r}, query_rows={query_row_count}, "
-                f"tree_rows={self.size}"
+                f"tree_rows={self._row_count}"
             ),
             requested=execution.requested,
             selected=execution.selected,
@@ -1059,11 +1141,11 @@ class SpatialIndex:
         """
         if not isinstance(other, SpatialIndex):
             raise TypeError("other must be a SpatialIndex")
-        if other.size != self.size:
+        if other._row_count != self._row_count:
             raise ValueError("query pair aggregate indexes must have equal size")
 
         query_row_count, scalar = self._query_cardinality(geometry)
-        output_index = pd.RangeIndex(self.size)
+        output_index = pd.RangeIndex(self._row_count)
         native, fallback_state = self._query_pair_aggregate_native(
             other,
             geometry,
@@ -1085,7 +1167,7 @@ class SpatialIndex:
             ),
             detail=(
                 f"predicate={predicate!r}, query_rows={query_row_count}, "
-                f"tree_rows={self.size}"
+                f"tree_rows={self._row_count}"
             ),
             pipeline="spatial_query_pair_aggregate",
             d2h_transfer=fallback_state is not None,
@@ -1197,7 +1279,7 @@ class SpatialIndex:
                 operation=f"spatial_query_pair_aggregate.{name}",
                 values=values,
                 source_token=None,
-                source_row_count=self.size,
+                source_row_count=self._row_count,
                 dtype=str(getattr(values, "dtype", "")) or None,
                 precision="relation-co-membership",
                 null_policy="nan-false",
@@ -1226,7 +1308,7 @@ class SpatialIndex:
             ),
             detail=(
                 f"predicate={predicate!r}, query_rows={query_row_count}, "
-                f"tree_rows={self.size}"
+                f"tree_rows={self._row_count}"
             ),
             requested=left_execution.requested,
             selected=ExecutionMode.GPU,
@@ -1312,7 +1394,7 @@ class SpatialIndex:
             )
             left_counts = np.bincount(
                 left_tree_rows,
-                minlength=self.size,
+                minlength=self._row_count,
             ).astype(np.int64, copy=False)
 
         right_query_rows, right_tree_rows = self._query_pair_host_pairs(
@@ -1325,7 +1407,7 @@ class SpatialIndex:
         )
         right_counts = np.bincount(
             right_tree_rows,
-            minlength=self.size,
+            minlength=self._row_count,
         ).astype(np.int64, copy=False)
         if shared_counts is None:
             left_structured = self._query_pair_host_structured_keys(
@@ -1339,7 +1421,7 @@ class SpatialIndex:
             shared = np.intersect1d(left_structured, right_structured)
             shared_counts = np.bincount(
                 shared["tree"],
-                minlength=self.size,
+                minlength=self._row_count,
             ).astype(np.int64, copy=False)
         return pd.DataFrame(
             {
@@ -1396,7 +1478,7 @@ class SpatialIndex:
                     "query aggregate values must be one-dimensional and aligned "
                     "with indexed tree geometries"
                 ) from exc
-            if value_count != self.size:
+            if value_count != self._row_count:
                 raise ValueError(
                     "query aggregate values must align with indexed tree geometries"
                 )
@@ -1453,7 +1535,7 @@ class SpatialIndex:
             if (
                 expression is None
                 or not expression.is_device
-                or len(expression) != self.size
+                or len(expression) != self._row_count
             ):
                 return None, None
             expressions[name] = expression
@@ -1652,7 +1734,7 @@ class SpatialIndex:
                 ).astype(np.int64, copy=False)
                 continue
             source = np.asarray(values)
-            if source.ndim != 1 or len(source) != self.size:
+            if source.ndim != 1 or len(source) != self._row_count:
                 raise ValueError(
                     "query aggregate values must align with indexed tree geometries"
                 )
@@ -2731,11 +2813,30 @@ geometries}
             raise ValueError("max_distance must be greater than 0")
         raw_geometry = geometry
 
+        from vibespatial.runtime import has_gpu_runtime
+
+        if (get_requested_mode() is not ExecutionMode.CPU and has_gpu_runtime()
+                and self._supports_owned_query_input(raw_geometry)):
+            if not isinstance(raw_geometry, (geoseries.GeoSeries, array.GeometryArray, OwnedGeometryArray)) and "DeviceGeometryArray" not in type(raw_geometry).__name__:
+                values = self._as_geometry_array(raw_geometry)
+                if isinstance(values, BaseGeometry) or values is None:
+                    values = [values]
+                raw_geometry = array.from_shapely(values)
+            if self._geometry_array is None:
+                self._geometry_array = array.from_shapely(self.geometries)
+            if hasattr(self._geometry_array, "to_owned"):
+                self._geometry_array.to_owned()
+            values = raw_geometry.values if isinstance(raw_geometry, geoseries.GeoSeries) else raw_geometry
+            if hasattr(values, "to_owned"):
+                values.to_owned()
+
         # Route through the owned nearest engine when inputs support it.
         if self._supports_owned_query_input(raw_geometry):
             def _existing_owned(values):
                 if values is None:
                     return None
+                if isinstance(values, OwnedGeometryArray):
+                    return values
                 owned = getattr(values, "_owned", None)
                 if owned is not None:
                     return owned
@@ -3056,12 +3157,12 @@ geometries}
         if tree_owned is None or query_owned is None:
             return None, ExecutionMode.CPU
 
-        native_spatial_index = None
-        if k > 1:
-            native_spatial_index = self._native_spatial_index_for_query(
-                source_token=source_token,
-            )
-            native_spatial_index.validate_row_count(tree_owned.row_count)
+        from vibespatial.runtime import has_gpu_runtime
+
+        if get_requested_mode() is ExecutionMode.CPU or not has_gpu_runtime():
+            return None, ExecutionMode.CPU
+        native_spatial_index = self._native_spatial_index_for_query(source_token=source_token)
+        native_spatial_index.validate_row_count(tree_owned.row_count)
 
         result, impl = nearest_spatial_index(
             None,
@@ -3217,9 +3318,22 @@ geometries}
         >>> s.sindex.size
         10
         """
-        if self._tree is None:
-            return len(self._geometry_array)
-        return len(self._tree)
+        if self._size is None:
+            from vibespatial.runtime import has_gpu_runtime
+
+            if get_requested_mode() is ExecutionMode.CPU or not has_gpu_runtime():
+                self._ensure_strtree()
+                self._size = len(self._tree)
+                return self._size
+            from vibespatial.cuda._runtime import get_cuda_runtime
+            from vibespatial.geometry.owned import device_valid_nonempty_mask
+
+            owned = self._geometry_array.to_owned()
+            count = device_valid_nonempty_mask(owned).sum().reshape(1)
+            self._size = int(get_cuda_runtime().copy_device_to_host(
+                count, reason="spatial index valid feature cardinality",
+            )[0])
+        return self._size
 
     @property
     def is_empty(self):
@@ -3249,14 +3363,10 @@ geometries}
         >>> s2.sindex.is_empty
         True
         """
-        if self._tree is None:
-            return len(self._geometry_array) == 0
-        return len(self._tree) == 0
+        return self.size == 0
 
     def __len__(self):
-        if self._tree is None:
-            return len(self._geometry_array)
-        return len(self._tree)
+        return self.size
 
 
 register_device_spatial_index_factory(SpatialIndex._from_device_geometry_array)

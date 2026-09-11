@@ -2060,7 +2060,7 @@ def _evaluate_gpu_de9im_candidates_device(
     return d_out
 
 
-def _evaluate_de9im_device(d_masks: object, predicate: str) -> object:
+def _evaluate_de9im_device(d_masks: object, predicate: str, *, logical_count=None) -> object:
     """Evaluate a spatial predicate from DE-9IM bitmasks on device.
 
     Native mirror of ``polygon.evaluate_predicate_from_de9im`` that keeps the
@@ -2075,7 +2075,18 @@ def _evaluate_de9im_device(d_masks: object, predicate: str) -> object:
     -------
     cupy bool array (device-resident)
     """
-    from .polygon import evaluate_predicate_from_de9im_device
+    from .polygon import evaluate_de9im_grouped_device, evaluate_predicate_from_de9im_device
+
+    if logical_count is not None:
+        import cupy as cp
+
+        # A capacity-sized producer initializes only its live prefix. Carry
+        # that count through decoding instead of reading inactive mask slots.
+        return evaluate_de9im_grouped_device(
+            d_masks, predicate, source_offset=cp.zeros(1, dtype=cp.int64),
+            logical_count=logical_count, launch_capacity=int(d_masks.size),
+            out=cp.zeros(d_masks.size, dtype=cp.bool_),
+        )
 
     return evaluate_predicate_from_de9im_device(d_masks, predicate)
 
@@ -2998,7 +3009,7 @@ def _fused_gpu_binary_predicates_device(
         if d_sub_result is None:
             return None
         for predicate, d_out in outputs.items():
-            d_values = _evaluate_de9im_device(d_sub_result, predicate)
+            d_values = _evaluate_de9im_device(d_sub_result, predicate, logical_count=d_sub_count)
             _scatter_de9im_predicate_output_device(
                 d_sub_cand,
                 d_sub_count,
@@ -3203,7 +3214,7 @@ def _binary_predicate_relation_pair_values_device(
             return None
         used_full_de9im = True
         for predicate, d_out in outputs.items():
-            d_values = _evaluate_de9im_device(d_masks, predicate)
+            d_values = _evaluate_de9im_device(d_masks, predicate, logical_count=d_sub_count)
             _scatter_de9im_predicate_output_device(
                 d_sub_idx,
                 d_sub_count,

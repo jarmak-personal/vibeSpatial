@@ -48,11 +48,13 @@ def build_spec_registry() -> dict[str, CCCLWarmupSpec]:
     if cp is not None:
         i32 = cp.dtype(cp.int32)
         i64 = cp.dtype(cp.int64)
+        u32 = cp.dtype(cp.uint32)
         u64 = cp.dtype(cp.uint64)
         f64 = cp.dtype(cp.float64)
     else:
         i32 = "int32"
         i64 = "int64"
+        u32 = "uint32"
         u64 = "uint64"
         f64 = "float64"
     return {
@@ -83,7 +85,9 @@ def build_spec_registry() -> dict[str, CCCLWarmupSpec]:
         "upper_bound_f64": S("upper_bound_f64", F.UPPER_BOUND, f64, None, "none"),
         "upper_bound_u64": S("upper_bound_u64", F.UPPER_BOUND, u64, None, "none"),
         "radix_sort_i32_i32": S("radix_sort_i32_i32", F.RADIX_SORT, i32, i32, "ascending"),
+        "radix_sort_u32_i32": S("radix_sort_u32_i32", F.RADIX_SORT, u32, i32, "ascending"),
         "radix_sort_i64_i32": S("radix_sort_i64_i32", F.RADIX_SORT, i64, i32, "ascending"),
+        "radix_sort_i64_i64": S("radix_sort_i64_i64", F.RADIX_SORT, i64, i64, "ascending"),
         "radix_sort_u64_i32": S("radix_sort_u64_i32", F.RADIX_SORT, u64, i32, "ascending"),
         "radix_sort_f64_i32": S("radix_sort_f64_i32", F.RADIX_SORT, f64, i32, "ascending"),
         "merge_sort_u64_i32": S("merge_sort_u64_i32", F.MERGE_SORT, u64, i32, "less_than"),

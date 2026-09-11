@@ -18,8 +18,6 @@ from typing import Any, TypeAlias
 import numpy as np
 
 logger = logging.getLogger(__name__)
-_PYLIBCUDF_STREAM_ATTRIBUTE = "_vibespatial_pylibcudf_stream"
-_PYLIBCUDF_STREAM_LOCK = threading.Lock()
 _DEFAULT_QUERY_MEMORY_RESERVE_BYTES = 1 << 30
 _DEFAULT_QUERY_MEMORY_RESERVE_FRACTION = 0.10
 # RMM treats sub-granularity initial sizes as its ``None`` default and eagerly
@@ -137,21 +135,52 @@ def pylibcudf_current_stream(*consumer_values):
     return _pylibcudf_stream_for_cupy(cupy_stream, Stream)
 
 
+class _RmmAllocationOwner:
+    """Keep native allocation dependencies reachable until CuPy releases them.
+
+    CuPy stream destruction uses a weakref finalizer. In an unreachable Python
+    cycle it can run before RMM frees buffers allocated on that stream, even
+    before a Python __del__ method. The allocation's own weakref finalizer roots
+    its original MemoryPointer (and hence RMM resource and stream) outside that
+    cycle. Releasing those roots restores ordinary native destructor ordering.
+    No device allocation, copy, stream creation, or synchronization is added.
+    """
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, pointer):
+        from weakref import finalize
+
+        finalize(self, _release_rmm_pointer, pointer)
+
+
+def _release_rmm_pointer(pointer):
+    # The finalizer's argument holds the complete native dependency chain until
+    # this callback returns. Dropping it then destroys the buffer before stream.
+    del pointer
+
+
+def _rmm_cupy_allocator_with_owned_lifetime(nbytes):
+    pointer = rmm_cupy_allocator(nbytes)
+    memory = cp.cuda.UnownedMemory(
+        ptr=pointer.ptr, size=nbytes,
+        owner=_RmmAllocationOwner(pointer), device_id=pointer.device_id,
+    )
+    return cp.cuda.MemoryPointer(memory, 0)
+
+
 def _pylibcudf_stream_for_cupy(cupy_stream, stream_type=None):
-    """Return a collectible pylibcudf wrapper for one CuPy stream."""
+    """Wrap a stream with one-way ownership from RMM to its CuPy owner.
+
+    RMM retains the CuPy stream. Caching that wrapper on the stream creates a
+    reference cycle; cyclic GC can clear the stream before an RMM buffer's
+    asynchronous deallocation. Fresh wrappers preserve destructor ordering and
+    cost no CUDA stream creation (they borrow the same handle).
+    """
     if stream_type is None:
         from rmm.pylibrmm.stream import Stream
 
         stream_type = Stream
-    with _PYLIBCUDF_STREAM_LOCK:
-        cached = getattr(cupy_stream, _PYLIBCUDF_STREAM_ATTRIBUTE, None)
-        if cached is None:
-            cached = stream_type(cupy_stream)
-            try:
-                setattr(cupy_stream, _PYLIBCUDF_STREAM_ATTRIBUTE, cached)
-            except (AttributeError, TypeError):
-                pass
-        return cached
+    return stream_type(cupy_stream)
 
 
 def pylibcudf_to_arrow(value, *, stream=None):
@@ -1230,12 +1259,12 @@ class CudaDriverRuntime:
                 )
 
         rmm.mr.set_current_device_resource(mr)
-        cp.cuda.set_allocator(rmm_cupy_allocator)
+        cp.cuda.set_allocator(_rmm_cupy_allocator_with_owned_lifetime)
         from rmm import statistics as rmm_stats
 
         rmm_stats.enable_statistics()
         active_mr = rmm.mr.get_current_device_resource()
-        if cp.cuda.get_allocator() is not rmm_cupy_allocator:
+        if cp.cuda.get_allocator() is not _rmm_cupy_allocator_with_owned_lifetime:
             raise RuntimeError("CuPy rejected the configured RMM allocator")
         self._memory_pool = None  # CuPy pool is not used
         self._rmm_pool = pool

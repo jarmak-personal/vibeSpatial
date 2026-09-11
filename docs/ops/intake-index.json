@@ -2824,6 +2824,97 @@
     },
     {
       "metadata": {
+        "maxBodyLines": 200,
+        "readIf": "You are selecting spatial-index backends or changing public nearest integration.",
+        "scope": "Operation capabilities, cache lineage and precision for native spatial index backends.",
+        "sourceOfTruth": "Native spatial-index layout and query-strategy contracts.",
+        "stopIf": "You only need historical experiment timings."
+      },
+      "open_first": [
+        "src/vibespatial/spatial/index_backends.py",
+        "src/vibespatial/api/sindex.py",
+        "src/vibespatial/api/_native_metadata.py",
+        "src/vibespatial/kernels/spatial/packed_str_index.py",
+        "src/vibespatial/kernels/spatial/segment_bvh.py",
+        "docs/dev/strtree-integration-ledger.md"
+      ],
+      "path": "docs/architecture/spatial-index-backends.md",
+      "request_signals": [
+        "sindex backends",
+        "packed STR nearest",
+        "native spatial index capabilities",
+        "nearest cache invalidation"
+      ],
+      "risks": [
+        "A single global backend switch obscures different operation contracts.",
+        "Segment boundaries alone do not capture polygon containment or holes.",
+        "Cached state must follow geometry lineage and producing CUDA streams.",
+        "Nearest ties require exact terminal distances, not a tolerance-based tie test."
+      ],
+      "sections": [
+        "Evidence",
+        "Intent",
+        "Layouts and Strategies",
+        "Open First",
+        "Physical Shape and Precision",
+        "Public Contract",
+        "Request Signals",
+        "Risks",
+        "Verify"
+      ],
+      "title": "Spatial Index Backends",
+      "tokens": [
+        "are",
+        "backends",
+        "cache",
+        "capabilities",
+        "changing",
+        "contract",
+        "contracts",
+        "evidence",
+        "experiment",
+        "first",
+        "historical",
+        "index",
+        "integration",
+        "intent",
+        "invalidation",
+        "layout",
+        "layouts",
+        "lineage",
+        "native",
+        "nearest",
+        "need",
+        "only",
+        "open",
+        "operation",
+        "packed",
+        "physical",
+        "precision",
+        "public",
+        "query",
+        "request",
+        "risks",
+        "selecting",
+        "shape",
+        "signals",
+        "sindex",
+        "spatial",
+        "str",
+        "strategies",
+        "strategy",
+        "timings",
+        "verify",
+        "you"
+      ],
+      "verify": [
+        "uv run pytest tests/test_packed_str_index.py tests/test_segment_bvh.py --run-gpu -q",
+        "uv run pytest tests/upstream/geopandas/tests/test_sindex.py tests/upstream/geopandas/tools/tests/test_sjoin.py -k nearest --run-gpu -q",
+        "uv run python scripts/benchmark_generalized_strtree.py --help"
+      ]
+    },
+    {
+      "metadata": {
         "maxBodyLines": 220,
         "readIf": "You are changing sindex query behavior, spatial join materialization, dwithin, or nearest result assembly.",
         "scope": "Spatial-index query assembly, sjoin result semantics, bounded nearest strategy, and output-format policy.",
@@ -4808,6 +4899,115 @@
     },
     {
       "metadata": {
+        "maxBodyLines": 260,
+        "readIf": "You are generalizing the nearest hierarchy across geometry families or testing bounded refinement.",
+        "scope": "Generalized GPU STR hierarchy experiments, bounded all-family refinement and measured regression evidence.",
+        "sourceOfTruth": "Local generalized STR experiment contracts, results and limitations.",
+        "stopIf": "You only need the initial MA segment performance comparison."
+      },
+      "open_first": [
+        "docs/dev/nearest-index-recommendation.md",
+        "scripts/experimental_strtree_bounds.py",
+        "scripts/experiment_generalized_strtree.py",
+        "scripts/experimental_strtree_kernels.py",
+        "scripts/experimental_strtree_bounds_kernels.py",
+        "scripts/benchmark_generalized_strtree.py",
+        "tests/test_generalized_strtree_experiment.py",
+        "scripts/experiment_nearest_strategies.py",
+        "src/vibespatial/spatial/nearest.py",
+        "src/vibespatial/spatial/distance_owned.py",
+        "docs/testing/generalized-strtree-evidence.json"
+      ],
+      "path": "docs/dev/generalized-strtree-experiment-ledger.md",
+      "request_signals": [
+        "generalized STR hierarchy",
+        "mixed geometry nearest",
+        "bounded nearest refinement"
+      ],
+      "risks": [
+        "Existing distance refiners may have different tie arithmetic from Shapely.",
+        "Broad envelopes increase traversal; high-complexity rows increase refinement.",
+        "GeometryCollection is not a canonical OwnedGeometryArray family today.",
+        "Prototype performance is not a public API performance claim."
+      ],
+      "sections": [
+        "2026-09-10 / E18 / Shared Construction and Bounded Refinement",
+        "E19-E24 / Independent Geometry Screening",
+        "Intent",
+        "Open First",
+        "Reproduction and Remaining Contracts",
+        "Request Signals",
+        "Risks",
+        "Verification and Full Pipeline Profile",
+        "Verify"
+      ],
+      "title": "Generalized STR Hierarchy Experiment Ledger",
+      "tokens": [
+        "09",
+        "10",
+        "2026",
+        "across",
+        "are",
+        "bounded",
+        "comparison",
+        "construction",
+        "contracts",
+        "e18",
+        "e19",
+        "e24",
+        "evidence",
+        "experiment",
+        "experiments",
+        "families",
+        "family",
+        "first",
+        "full",
+        "generalized",
+        "generalizing",
+        "geometry",
+        "gpu",
+        "hierarchy",
+        "independent",
+        "initial",
+        "intent",
+        "ledger",
+        "limitations",
+        "local",
+        "ma",
+        "measured",
+        "mixed",
+        "nearest",
+        "need",
+        "only",
+        "open",
+        "performance",
+        "pipeline",
+        "profile",
+        "refinement",
+        "regression",
+        "remaining",
+        "reproduction",
+        "request",
+        "results",
+        "risks",
+        "screening",
+        "segment",
+        "shared",
+        "signals",
+        "str",
+        "testing",
+        "verification",
+        "verify",
+        "you"
+      ],
+      "verify": [
+        "uv run python scripts/check_docs.py --check",
+        "uv run pytest tests/test_experimental_nearest_hierarchy.py --run-gpu -q",
+        "uv run pytest tests/test_generalized_strtree_experiment.py tests/test_segment_distance.py --run-gpu -q"
+      ]
+    },
+    {
+      "metadata": {
         "maxBodyLines": 220,
         "readIf": "You are changing grouped overlay followed by dissolve, buffer existential queries, or constructive fusion.",
         "scope": "Exact many-features by few-grouped-coverages execution, provenance continuity, and distributive constructive reduction.",
@@ -6285,6 +6485,483 @@
     },
     {
       "metadata": {
+        "maxBodyLines": 240,
+        "readIf": "You are optimizing nearest search, GPU STRtree alternatives, or road snapping at 100K and 1M scale.",
+        "scope": "Exact GPU nearest index experiments, hypotheses, timings, parity, and decisions.",
+        "sourceOfTruth": "Ongoing nearest index experiment ledger and production graduation criteria.",
+        "stopIf": "You need the original public API comparator contract rather than current experiments."
+      },
+      "open_first": [
+        "docs/dev/nearest-index-strategy-ledger.md",
+        "scripts/experiment_nearest_hierarchy.py",
+        "docs/testing/nearest-index-experiment-evidence.json",
+        "docs/testing/osm-nearest-performance.md",
+        "docs/testing/osm-nearest-evidence.json",
+        "src/vibespatial/spatial/nearest.py",
+        "src/vibespatial/spatial/spatial_index_knn_device.py",
+        "src/vibespatial/api/sindex.py"
+      ],
+      "path": "docs/dev/nearest-index-experiment-ledger.md",
+      "request_signals": [
+        "nearest index experiments",
+        "GPU STRtree",
+        "road snapping performance",
+        "nearest experiment ledger"
+      ],
+      "risks": [
+        "Segment tie identity differs from parent-road tie identity.",
+        "Floating-point parity on sampled fixtures is not a pruning-error proof.",
+        "Cached-compilation timings exclude clean-install startup.",
+        "Overlapping bounds and intrinsically large tie outputs can amplify work."
+      ],
+      "sections": [
+        "2026-09-10 / E0 / Starting Evidence",
+        "2026-09-10 / E1 / Competing Experiments",
+        "2026-09-10 / E2 / Packed Binary Hierarchy, FP64",
+        "2026-09-10 / E3 / Matched Repetitions and Host Output",
+        "2026-09-10 / E4 / Generalization and Graduation",
+        "Acceptance Contract",
+        "Intent",
+        "Open First",
+        "Request Signals",
+        "Risks",
+        "Verify"
+      ],
+      "title": "Nearest Index Experiment Ledger",
+      "tokens": [
+        "09",
+        "10",
+        "100k",
+        "1m",
+        "2026",
+        "acceptance",
+        "alternatives",
+        "api",
+        "are",
+        "at",
+        "binary",
+        "comparator",
+        "competing",
+        "contract",
+        "criteria",
+        "current",
+        "decisions",
+        "e0",
+        "e1",
+        "e2",
+        "e3",
+        "e4",
+        "evidence",
+        "exact",
+        "experiment",
+        "experiments",
+        "first",
+        "fp64",
+        "generalization",
+        "gpu",
+        "graduation",
+        "hierarchy",
+        "host",
+        "hypotheses",
+        "index",
+        "intent",
+        "ledger",
+        "matched",
+        "nearest",
+        "need",
+        "ongoing",
+        "open",
+        "optimizing",
+        "original",
+        "output",
+        "packed",
+        "parity",
+        "performance",
+        "production",
+        "public",
+        "rather",
+        "repetitions",
+        "request",
+        "risks",
+        "road",
+        "scale",
+        "search",
+        "signals",
+        "snapping",
+        "starting",
+        "strtree",
+        "than",
+        "timings",
+        "verify",
+        "you"
+      ],
+      "verify": [
+        "uv run pytest tests/test_experimental_nearest_hierarchy.py tests/test_benchmark_osm_nearest.py --run-gpu -q",
+        "uv run python scripts/experiment_nearest_hierarchy.py --smoke",
+        "uv run python scripts/check_docs.py --check"
+      ]
+    },
+    {
+      "metadata": {
+        "maxBodyLines": 240,
+        "readIf": "You need the conclusion of the nearest experiments or the implementation route for NativeSpatialIndex k=1.",
+        "scope": "Measured GPU nearest acceleration recommendation, build/reuse tradeoffs and public API graduation work.",
+        "sourceOfTruth": "Empirical nearest acceleration recommendation and limits on its production applicability.",
+        "stopIf": "You need individual experiment history rather than the final recommendation."
+      },
+      "open_first": [
+        "docs/dev/generalized-strtree-experiment-ledger.md",
+        "docs/dev/nearest-index-experiment-ledger.md",
+        "docs/dev/nearest-index-strategy-ledger.md",
+        "docs/dev/nearest-index-refinement-ledger.md",
+        "docs/testing/nearest-index-strategy-evidence.json",
+        "docs/testing/osm-nearest-performance.md"
+      ],
+      "path": "docs/dev/nearest-index-recommendation.md",
+      "request_signals": [
+        "nearest acceleration recommendation",
+        "GPU STRtree",
+        "road snapping",
+        "NativeSpatialIndex k=1",
+        "generalized STR hierarchy",
+        "mixed geometry nearest"
+      ],
+      "risks": [
+        "Public vS nearest dispatch has not been changed by these experiments.",
+        "Finite 2D LineStrings and points are the experimental admission domain.",
+        "One GPU and one real dataset do not establish a universal optimum.",
+        "Retained index bytes exclude construction scratch, input buffers and outputs."
+      ],
+      "sections": [
+        "2026-09-10 / E17 / General Geometry Direction",
+        "Alternatives and Generalization",
+        "Build, Reuse and Memory",
+        "Confirmed MA Results / E14",
+        "Intent",
+        "Open First",
+        "Production Graduation",
+        "Recommendation",
+        "Reproduction and Verification",
+        "Request Signals",
+        "Risks",
+        "Verify"
+      ],
+      "title": "Nearest Index Acceleration Recommendation",
+      "tokens": [
+        "09",
+        "10",
+        "2026",
+        "acceleration",
+        "alternatives",
+        "api",
+        "applicability",
+        "build",
+        "conclusion",
+        "confirmed",
+        "direction",
+        "e14",
+        "e17",
+        "empirical",
+        "experiment",
+        "experiments",
+        "final",
+        "first",
+        "general",
+        "generalization",
+        "generalized",
+        "geometry",
+        "gpu",
+        "graduation",
+        "hierarchy",
+        "history",
+        "implementation",
+        "index",
+        "individual",
+        "intent",
+        "limits",
+        "ma",
+        "measured",
+        "memory",
+        "mixed",
+        "nativespatialindex",
+        "nearest",
+        "need",
+        "open",
+        "production",
+        "public",
+        "rather",
+        "recommendation",
+        "reproduction",
+        "request",
+        "results",
+        "reuse",
+        "risks",
+        "road",
+        "route",
+        "signals",
+        "snapping",
+        "str",
+        "strtree",
+        "than",
+        "tradeoffs",
+        "verification",
+        "verify",
+        "work",
+        "you"
+      ],
+      "verify": [
+        "uv run pytest tests/test_experimental_nearest_hierarchy.py tests/test_benchmark_osm_nearest.py --run-gpu -q",
+        "uv run python scripts/check_docs.py --check"
+      ]
+    },
+    {
+      "metadata": {
+        "maxBodyLines": 260,
+        "readIf": "You are checking nearest precision, build/query tradeoffs or generalization beyond MA OSM.",
+        "scope": "Nearest shape tuning, conservative precision, virtual bounds and independent distribution evidence.",
+        "sourceOfTruth": "Late-stage nearest experiment evidence and unresolved graduation conditions.",
+        "stopIf": "You only need the original public performance gap or the initial algorithm comparison."
+      },
+      "open_first": [
+        "docs/dev/nearest-index-recommendation.md",
+        "docs/testing/nearest-index-strategy-evidence.json",
+        "scripts/experiment_nearest_strategies.py",
+        "scripts/nearest_strategy_kernels.py",
+        "scripts/experiment_nearest_distributions.py",
+        "docs/dev/nearest-index-strategy-ledger.md",
+        "tests/test_experimental_nearest_hierarchy.py"
+      ],
+      "path": "docs/dev/nearest-index-refinement-ledger.md",
+      "request_signals": [
+        "nearest precision experiments",
+        "nearest index experiments",
+        "conservative FP32 bounds",
+        "virtual segment bounds"
+      ],
+      "risks": [
+        "The fastest repeated query can require a larger, slower-building index.",
+        "Virtual bounds cover only part of the geometry used in exact refinement.",
+        "Coarse FP32 must enclose both stored boxes and query coordinates.",
+        "Dense synthetic overlap can make CPU oracle generation expensive.",
+        "Screening results need confirmation before setting a default."
+      ],
+      "sections": [
+        "2026-09-10 / E10 / Fresh Whole-Road Comparator",
+        "2026-09-10 / E11 / Virtual Bounds, Original Geometry",
+        "2026-09-10 / E12 / Independent Distributions",
+        "2026-09-10 / E13 / Conservative FP32 Coarse Search",
+        "2026-09-10 / E14 / Confirmed Build and Reuse Tradeoff",
+        "2026-09-10 / E15 / Independent Confirmation and Overlap Exception",
+        "2026-09-10 / E16 / Verification and Profile Review",
+        "2026-09-10 / E9 / Shape Parameter Screening",
+        "Intent",
+        "Open First",
+        "Request Signals",
+        "Risks",
+        "Verify"
+      ],
+      "title": "Nearest Index Refinement Ledger",
+      "tokens": [
+        "09",
+        "10",
+        "2026",
+        "algorithm",
+        "are",
+        "beyond",
+        "bounds",
+        "build",
+        "checking",
+        "coarse",
+        "comparator",
+        "comparison",
+        "conditions",
+        "confirmation",
+        "confirmed",
+        "conservative",
+        "distribution",
+        "distributions",
+        "e10",
+        "e11",
+        "e12",
+        "e13",
+        "e14",
+        "e15",
+        "e16",
+        "e9",
+        "evidence",
+        "exception",
+        "experiment",
+        "experiments",
+        "first",
+        "fp32",
+        "fresh",
+        "gap",
+        "generalization",
+        "geometry",
+        "graduation",
+        "independent",
+        "index",
+        "initial",
+        "intent",
+        "late",
+        "ledger",
+        "ma",
+        "nearest",
+        "need",
+        "only",
+        "open",
+        "original",
+        "osm",
+        "overlap",
+        "parameter",
+        "performance",
+        "precision",
+        "profile",
+        "public",
+        "query",
+        "refinement",
+        "request",
+        "reuse",
+        "review",
+        "risks",
+        "road",
+        "screening",
+        "search",
+        "segment",
+        "shape",
+        "signals",
+        "stage",
+        "tradeoff",
+        "tradeoffs",
+        "tuning",
+        "unresolved",
+        "verification",
+        "verify",
+        "virtual",
+        "whole",
+        "you"
+      ],
+      "verify": [
+        "uv run pytest tests/test_experimental_nearest_hierarchy.py tests/test_benchmark_osm_nearest.py --run-gpu -q",
+        "uv run python scripts/check_docs.py --check"
+      ]
+    },
+    {
+      "metadata": {
+        "maxBodyLines": 260,
+        "readIf": "You are identifying the best GPU nearest strategy or comparing index packing and traversal designs.",
+        "scope": "Comparative nearest acceleration experiments: Morton, STR, wide trees, grid seeds and whole-road provenance.",
+        "sourceOfTruth": "Continuation ledger for nearest algorithm comparison and empirical acceleration recommendation.",
+        "stopIf": "You need the initial public API gap measurement or isolated reference hierarchy only."
+      },
+      "open_first": [
+        "docs/dev/nearest-index-refinement-ledger.md",
+        "scripts/experiment_nearest_strategies.py",
+        "scripts/nearest_strategy_kernels.py",
+        "tests/test_experimental_nearest_hierarchy.py",
+        "docs/dev/nearest-index-experiment-ledger.md",
+        "docs/testing/nearest-index-experiment-evidence.json"
+      ],
+      "path": "docs/dev/nearest-index-strategy-ledger.md",
+      "request_signals": [
+        "nearest acceleration strategy",
+        "GPU STRtree alternatives",
+        "nearest index experiments",
+        "whole-road nearest"
+      ],
+      "risks": [
+        "Leaf tiling alone does not implement recursive STR packing.",
+        "An approximate seed is safe only when a complete traversal verifies it.",
+        "Parent-road ties require deduplication on original road IDs.",
+        "A packing winner can depend on query order, geometry overlap, and reuse.",
+        "Screening with one warm trial is weaker than the final three-trial evidence."
+      ],
+      "sections": [
+        "2026-09-10 / E5 / Search Matrix",
+        "2026-09-10 / E6 / Screening Results",
+        "2026-09-10 / E7 / Direct Grid, No Hierarchy",
+        "2026-09-10 / E8 / Whole Roads and Full State",
+        "Intent",
+        "Open First",
+        "Request Signals",
+        "Risks",
+        "Verify"
+      ],
+      "title": "Nearest Index Strategy Ledger",
+      "tokens": [
+        "09",
+        "10",
+        "2026",
+        "acceleration",
+        "algorithm",
+        "alternatives",
+        "api",
+        "are",
+        "best",
+        "comparative",
+        "comparing",
+        "comparison",
+        "continuation",
+        "designs",
+        "direct",
+        "e5",
+        "e6",
+        "e7",
+        "e8",
+        "empirical",
+        "experiments",
+        "first",
+        "full",
+        "gap",
+        "gpu",
+        "grid",
+        "hierarchy",
+        "identifying",
+        "index",
+        "initial",
+        "intent",
+        "isolated",
+        "ledger",
+        "matrix",
+        "measurement",
+        "morton",
+        "nearest",
+        "need",
+        "no",
+        "only",
+        "open",
+        "packing",
+        "provenance",
+        "public",
+        "recommendation",
+        "reference",
+        "request",
+        "results",
+        "risks",
+        "road",
+        "roads",
+        "screening",
+        "search",
+        "seeds",
+        "signals",
+        "state",
+        "str",
+        "strategy",
+        "strtree",
+        "traversal",
+        "trees",
+        "verify",
+        "whole",
+        "wide",
+        "you"
+      ],
+      "verify": [
+        "uv run pytest tests/test_experimental_nearest_hierarchy.py --run-gpu -q",
+        "uv run python scripts/check_docs.py --check"
+      ]
+    },
+    {
+      "metadata": {
         "maxBodyLines": 260,
         "readIf": "You are changing prepared point-region refinement, paired spatial aggregation, point-grid candidate reduction, or validating SF100 Q11 performance.",
         "scope": "Current-revision evidence for the point-region profiler and classification-once paired point-grid reduction.",
@@ -7198,6 +7875,150 @@
         "uv run python scripts/intake.py \"SF100 cross-device optimization audit\"",
         "(cd benchmark_results/nsight/sf100/2026-08-19-rtx4090-comparable && sha256sum --check SHA256SUMS)",
         "(cd benchmark_results/nsight/sf100/2026-08-20-h200-comparable/nsight-sf100 && sha256sum --check SHA256SUMS)"
+      ]
+    },
+    {
+      "metadata": {
+        "maxBodyLines": 260,
+        "readIf": "You are accelerating complex geometry nearest or integrating spatial index backends.",
+        "scope": "Complex polygon refinement experiments and NativeSpatialIndex backend integration ledger.",
+        "sourceOfTruth": "Current complex-refinement and sindex integration work and evidence.",
+        "stopIf": "You only need historical MA or simple generalized STR screening results."
+      },
+      "open_first": [
+        "docs/dev/generalized-strtree-experiment-ledger.md",
+        "scripts/experiment_segment_bvh.py",
+        "scripts/experimental_segment_bvh_kernels.py",
+        "src/vibespatial/api/sindex.py",
+        "src/vibespatial/api/_native_metadata.py",
+        "src/vibespatial/spatial/nearest.py",
+        "src/vibespatial/spatial/segment_distance.py"
+      ],
+      "path": "docs/dev/strtree-integration-ledger.md",
+      "request_signals": [
+        "complex polygon nearest",
+        "sindex backends",
+        "STRtree integration",
+        "segment hierarchy refinement"
+      ],
+      "risks": [
+        "Boundary distance alone misses polygon containment and hole semantics.",
+        "Small row counts can conceal millions of segment-pair tests.",
+        "A backend choice must preserve cache lineage, precision and query semantics.",
+        "Existing nullable Arrow ingestion has an independently reproduced cuDF initcheck issue."
+      ],
+      "sections": [
+        "E28 / Complex Refinement Shape",
+        "E28 / Hierarchy Beats Cooperative Cross-Products",
+        "E29-E32 / Large-Single, Skew, Holes and Dense Overlap",
+        "E33 / Native Integration and Stream Lifetime",
+        "E34-E41 / Public Nearest and MA Correctness",
+        "E42-E43 / Cyclic Allocation Ownership",
+        "E46-E50 / Complex Scale and Public Screening",
+        "E51-E55 / Fresh Review and Root Corrections",
+        "E56-E59 and E65 / Final Integration Evidence",
+        "E60-E64 / Initialization and Typed Primitive Contracts",
+        "Integration Sequence",
+        "Intent",
+        "Open First",
+        "Request Signals",
+        "Risks",
+        "Verify"
+      ],
+      "title": "STRtree Integration Ledger",
+      "tokens": [
+        "accelerating",
+        "allocation",
+        "are",
+        "backend",
+        "backends",
+        "beats",
+        "complex",
+        "contracts",
+        "cooperative",
+        "corrections",
+        "correctness",
+        "cross",
+        "current",
+        "cyclic",
+        "dense",
+        "e28",
+        "e29",
+        "e32",
+        "e33",
+        "e34",
+        "e41",
+        "e42",
+        "e43",
+        "e46",
+        "e50",
+        "e51",
+        "e55",
+        "e56",
+        "e59",
+        "e60",
+        "e64",
+        "e65",
+        "evidence",
+        "experiments",
+        "final",
+        "first",
+        "fresh",
+        "generalized",
+        "geometry",
+        "hierarchy",
+        "historical",
+        "holes",
+        "index",
+        "initialization",
+        "integrating",
+        "integration",
+        "intent",
+        "large",
+        "ledger",
+        "lifetime",
+        "ma",
+        "native",
+        "nativespatialindex",
+        "nearest",
+        "need",
+        "only",
+        "open",
+        "overlap",
+        "ownership",
+        "polygon",
+        "primitive",
+        "products",
+        "public",
+        "refinement",
+        "request",
+        "results",
+        "review",
+        "risks",
+        "root",
+        "scale",
+        "screening",
+        "segment",
+        "sequence",
+        "shape",
+        "signals",
+        "simple",
+        "sindex",
+        "single",
+        "skew",
+        "spatial",
+        "str",
+        "stream",
+        "strtree",
+        "typed",
+        "verify",
+        "work",
+        "you"
+      ],
+      "verify": [
+        "uv run pytest tests/test_generalized_strtree_experiment.py tests/test_spatial_query.py --run-gpu -q",
+        "uv run pytest tests/upstream/geopandas/tests/test_sindex.py -q",
+        "uv run python scripts/benchmark_pipelines.py --suite full --repeat 1 --gpu-sparkline"
       ]
     },
     {
@@ -9633,6 +10454,92 @@
     },
     {
       "metadata": {
+        "maxBodyLines": 200,
+        "readIf": "You need current public STRtree integration performance or its verification limits.",
+        "scope": "Final public nearest timings, complex polygon canaries, correctness evidence and full pipeline profile.",
+        "sourceOfTruth": "Final local public nearest integration measurements and validation summary.",
+        "stopIf": "You need implementation details rather than measured integration results."
+      },
+      "open_first": [
+        "docs/dev/strtree-integration-ledger.md",
+        "docs/architecture/spatial-index-backends.md",
+        "docs/testing/strtree-integration-evidence.json"
+      ],
+      "path": "docs/testing/strtree-integration-results.md",
+      "request_signals": [
+        "public nearest performance",
+        "complex polygon benchmark",
+        "STRtree integration profile"
+      ],
+      "risks": [
+        "First-query time includes lazy index preparation; accessor time is not build cost.",
+        "Single screening trials do not provide statistical confidence intervals.",
+        "Unfiltered initcheck retains a separately reproduced nullable Arrow dependency finding."
+      ],
+      "sections": [
+        "Full 1M Pipeline Profile",
+        "Intent",
+        "One-Shot WKB Comparison",
+        "Open First",
+        "Public Measurements",
+        "Request Signals",
+        "Risks",
+        "Verification",
+        "Verify"
+      ],
+      "title": "STRtree Integration Results",
+      "tokens": [
+        "1m",
+        "benchmark",
+        "canaries",
+        "comparison",
+        "complex",
+        "correctness",
+        "current",
+        "details",
+        "evidence",
+        "final",
+        "first",
+        "full",
+        "implementation",
+        "integration",
+        "intent",
+        "limits",
+        "local",
+        "measured",
+        "measurements",
+        "nearest",
+        "need",
+        "one",
+        "open",
+        "performance",
+        "pipeline",
+        "polygon",
+        "profile",
+        "public",
+        "rather",
+        "request",
+        "results",
+        "risks",
+        "shot",
+        "signals",
+        "strtree",
+        "summary",
+        "than",
+        "timings",
+        "validation",
+        "verification",
+        "verify",
+        "wkb",
+        "you"
+      ],
+      "verify": [
+        "uv run pytest tests/test_packed_str_index.py tests/test_segment_bvh.py --run-gpu -q",
+        "uv run python scripts/benchmark_pipelines.py --suite full --repeat 1 --gpu-sparkline"
+      ]
+    },
+    {
+      "metadata": {
         "maxBodyLines": 220,
         "readIf": "You are adding benchmark data, regression corpora, or synthetic geometry fixtures.",
         "scope": "Synthetic geometry dataset generator workflow, shapes, and verification guidance.",
@@ -10575,6 +11482,59 @@
       "tokens": [
         "md",
         "readme"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmarks/bench_packed_str_index.py",
+      "referenced_by": [],
+      "symbols": [
+        "run_benchmark"
+      ],
+      "tokens": [
+        "are",
+        "bench",
+        "benchmark",
+        "benchmarks",
+        "canary",
+        "fixtures",
+        "index",
+        "ingress",
+        "nearest",
+        "outside",
+        "packed",
+        "public",
+        "py",
+        "reported",
+        "run",
+        "str",
+        "timings"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmarks/bench_segment_bvh.py",
+      "referenced_by": [],
+      "symbols": [
+        "run_benchmark"
+      ],
+      "tokens": [
+        "are",
+        "bench",
+        "benchmark",
+        "benchmarks",
+        "bvh",
+        "canary",
+        "fixtures",
+        "ingress",
+        "nearest",
+        "outside",
+        "public",
+        "py",
+        "reported",
+        "run",
+        "segment",
+        "timings"
       ]
     },
     {
@@ -12744,6 +13704,22 @@
     },
     {
       "kind": "doc",
+      "path": "docs/architecture/spatial-index-backends.md",
+      "referenced_by": [
+        "docs/testing/strtree-integration-results.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "architecture",
+        "backends",
+        "docs",
+        "index",
+        "md",
+        "spatial"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/architecture/spatial-joins.md",
       "referenced_by": [
         "docs/architecture/spatial-joins.md",
@@ -13903,6 +14879,24 @@
     },
     {
       "kind": "doc",
+      "path": "docs/dev/generalized-strtree-experiment-ledger.md",
+      "referenced_by": [
+        "docs/dev/nearest-index-recommendation.md",
+        "docs/dev/strtree-integration-ledger.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "dev",
+        "docs",
+        "experiment",
+        "generalized",
+        "ledger",
+        "md",
+        "strtree"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/dev/grouped-constructive-distributive-execution-plan.md",
       "referenced_by": [
         "docs/dev/work-amplification-evidence.md",
@@ -14150,6 +15144,78 @@
     },
     {
       "kind": "doc",
+      "path": "docs/dev/nearest-index-experiment-ledger.md",
+      "referenced_by": [
+        "docs/dev/nearest-index-recommendation.md",
+        "docs/dev/nearest-index-strategy-ledger.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "dev",
+        "docs",
+        "experiment",
+        "index",
+        "ledger",
+        "md",
+        "nearest"
+      ]
+    },
+    {
+      "kind": "doc",
+      "path": "docs/dev/nearest-index-recommendation.md",
+      "referenced_by": [
+        "docs/dev/generalized-strtree-experiment-ledger.md",
+        "docs/dev/nearest-index-refinement-ledger.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "dev",
+        "docs",
+        "index",
+        "md",
+        "nearest",
+        "recommendation"
+      ]
+    },
+    {
+      "kind": "doc",
+      "path": "docs/dev/nearest-index-refinement-ledger.md",
+      "referenced_by": [
+        "docs/dev/nearest-index-recommendation.md",
+        "docs/dev/nearest-index-strategy-ledger.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "dev",
+        "docs",
+        "index",
+        "ledger",
+        "md",
+        "nearest",
+        "refinement"
+      ]
+    },
+    {
+      "kind": "doc",
+      "path": "docs/dev/nearest-index-strategy-ledger.md",
+      "referenced_by": [
+        "docs/dev/nearest-index-experiment-ledger.md",
+        "docs/dev/nearest-index-recommendation.md",
+        "docs/dev/nearest-index-refinement-ledger.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "dev",
+        "docs",
+        "index",
+        "ledger",
+        "md",
+        "nearest",
+        "strategy"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/dev/point-region-execution-evidence.md",
       "referenced_by": [
         "docs/archive/2026-08-21-quadtree-experiments/quadtree-scaling-evidence.md",
@@ -14260,6 +15326,23 @@
         "md",
         "optimization",
         "sf100"
+      ]
+    },
+    {
+      "kind": "doc",
+      "path": "docs/dev/strtree-integration-ledger.md",
+      "referenced_by": [
+        "docs/architecture/spatial-index-backends.md",
+        "docs/testing/strtree-integration-results.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "dev",
+        "docs",
+        "integration",
+        "ledger",
+        "md",
+        "strtree"
       ]
     },
     {
@@ -14447,6 +15530,22 @@
     },
     {
       "kind": "doc",
+      "path": "docs/testing/generalized-strtree-evidence.json",
+      "referenced_by": [
+        "docs/dev/generalized-strtree-experiment-ledger.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "docs",
+        "evidence",
+        "generalized",
+        "json",
+        "strtree",
+        "testing"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/testing/gpu-performance-checklist.md",
       "referenced_by": [
         "docs/testing/gpu-performance-checklist.md",
@@ -14543,8 +15642,45 @@
     },
     {
       "kind": "doc",
+      "path": "docs/testing/nearest-index-experiment-evidence.json",
+      "referenced_by": [
+        "docs/dev/nearest-index-experiment-ledger.md",
+        "docs/dev/nearest-index-strategy-ledger.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "docs",
+        "evidence",
+        "experiment",
+        "index",
+        "json",
+        "nearest",
+        "testing"
+      ]
+    },
+    {
+      "kind": "doc",
+      "path": "docs/testing/nearest-index-strategy-evidence.json",
+      "referenced_by": [
+        "docs/dev/nearest-index-recommendation.md",
+        "docs/dev/nearest-index-refinement-ledger.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "docs",
+        "evidence",
+        "index",
+        "json",
+        "nearest",
+        "strategy",
+        "testing"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/testing/osm-nearest-evidence.json",
       "referenced_by": [
+        "docs/dev/nearest-index-experiment-ledger.md",
         "docs/testing/osm-nearest-performance.md"
       ],
       "symbols": [],
@@ -14560,7 +15696,10 @@
     {
       "kind": "doc",
       "path": "docs/testing/osm-nearest-performance.md",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/dev/nearest-index-experiment-ledger.md",
+        "docs/dev/nearest-index-recommendation.md"
+      ],
       "symbols": [],
       "tokens": [
         "docs",
@@ -14712,6 +15851,36 @@
         "md",
         "nsight",
         "spatialbench",
+        "testing"
+      ]
+    },
+    {
+      "kind": "doc",
+      "path": "docs/testing/strtree-integration-evidence.json",
+      "referenced_by": [
+        "docs/testing/strtree-integration-results.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "docs",
+        "evidence",
+        "integration",
+        "json",
+        "strtree",
+        "testing"
+      ]
+    },
+    {
+      "kind": "doc",
+      "path": "docs/testing/strtree-integration-results.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "docs",
+        "integration",
+        "md",
+        "results",
+        "strtree",
         "testing"
       ]
     },
@@ -15446,6 +16615,66 @@
     },
     {
       "kind": "script",
+      "path": "scripts/benchmark_complex_strtree_scaling.py",
+      "referenced_by": [],
+      "symbols": [
+        "fixture",
+        "timed",
+        "main"
+      ],
+      "tokens": [
+        "api",
+        "benchmark",
+        "complex",
+        "cpu",
+        "fixture",
+        "holed",
+        "immutable",
+        "main",
+        "nearest",
+        "oracles",
+        "polygon",
+        "public",
+        "py",
+        "scale",
+        "scaling",
+        "scripts",
+        "strtree",
+        "through",
+        "timed"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/benchmark_generalized_strtree.py",
+      "referenced_by": [
+        "docs/dev/generalized-strtree-experiment-ledger.md"
+      ],
+      "symbols": [
+        "make_fixture",
+        "main"
+      ],
+      "tokens": [
+        "benchmark",
+        "comparison",
+        "cpu",
+        "fixture",
+        "fixtures",
+        "generalized",
+        "gpu",
+        "identity",
+        "independent",
+        "main",
+        "make",
+        "py",
+        "qualified",
+        "scripts",
+        "str",
+        "strtree"
+      ]
+    },
+    {
+      "kind": "script",
       "path": "scripts/benchmark_io_arrow.py",
       "referenced_by": [
         "docs/testing/io-performance-rails.md"
@@ -15803,6 +17032,33 @@
         "time",
         "transfer",
         "usage"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/benchmark_strtree_complex_shapes.py",
+      "referenced_by": [],
+      "symbols": [
+        "fixture",
+        "main"
+      ],
+      "tokens": [
+        "benchmark",
+        "canaries",
+        "complex",
+        "evidence",
+        "fixture",
+        "geometry",
+        "main",
+        "py",
+        "reusable",
+        "same",
+        "scripts",
+        "shape",
+        "shapely",
+        "shapes",
+        "strtree",
+        "wkb"
       ]
     },
     {
@@ -16879,6 +18135,412 @@
     },
     {
       "kind": "script",
+      "path": "scripts/experiment_generalized_strtree.py",
+      "referenced_by": [
+        "docs/dev/generalized-strtree-experiment-ledger.md"
+      ],
+      "symbols": [
+        "GeneralizedSTRtree"
+      ],
+      "tokens": [
+        "bounded",
+        "bounds",
+        "candidate",
+        "change",
+        "dispatch",
+        "does",
+        "exact",
+        "existing",
+        "experiment",
+        "family",
+        "generalized",
+        "generalizedstrtree",
+        "gpu",
+        "ledger",
+        "local",
+        "not",
+        "output",
+        "packing",
+        "pass",
+        "production",
+        "py",
+        "refiners",
+        "resumable",
+        "scripts",
+        "see",
+        "shared",
+        "str",
+        "strtree",
+        "three",
+        "tie",
+        "tiles"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/experiment_nearest_distributions.py",
+      "referenced_by": [
+        "docs/dev/nearest-index-refinement-ledger.md"
+      ],
+      "symbols": [
+        "main"
+      ],
+      "tokens": [
+        "checks",
+        "distribution",
+        "distributions",
+        "evidence",
+        "experiment",
+        "independent",
+        "main",
+        "nearest",
+        "performance",
+        "py",
+        "scripts",
+        "strategy"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/experiment_nearest_grid.py",
+      "referenced_by": [],
+      "symbols": [
+        "GridHierarchy"
+      ],
+      "tokens": [
+        "against",
+        "boundary",
+        "bounded",
+        "bounding",
+        "box",
+        "build",
+        "canonical",
+        "cell",
+        "cells",
+        "certify",
+        "count",
+        "direct",
+        "emit",
+        "every",
+        "expanding",
+        "experiment",
+        "grid",
+        "gridhierarchy",
+        "hierarchy",
+        "memory",
+        "minimum",
+        "nearest",
+        "no",
+        "once",
+        "overlapped",
+        "passes",
+        "per",
+        "py",
+        "query",
+        "replicated",
+        "rings",
+        "scripts",
+        "search",
+        "seeded",
+        "segment",
+        "str",
+        "tests",
+        "ties",
+        "tradeoff",
+        "two",
+        "uniform",
+        "unvisited",
+        "using"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/experiment_nearest_hierarchy.py",
+      "referenced_by": [
+        "docs/dev/nearest-index-experiment-ledger.md"
+      ],
+      "symbols": [
+        "owned",
+        "SegmentHierarchy",
+        "timed",
+        "smoke",
+        "main"
+      ],
+      "tokens": [
+        "2d",
+        "admitted",
+        "are",
+        "binary",
+        "bounds",
+        "computation",
+        "consumer",
+        "count",
+        "cpu",
+        "dispatch",
+        "experiment",
+        "experimental",
+        "explicit",
+        "finite",
+        "fixture",
+        "fp64",
+        "gpu",
+        "hierarchy",
+        "independent",
+        "index",
+        "intentionally",
+        "lines",
+        "main",
+        "morton",
+        "nearest",
+        "not",
+        "only",
+        "oracle",
+        "output",
+        "outside",
+        "owned",
+        "packed",
+        "physical",
+        "point",
+        "points",
+        "policy",
+        "precision",
+        "precisionplan",
+        "production",
+        "public",
+        "py",
+        "query",
+        "reference",
+        "scan",
+        "scatter",
+        "scripts",
+        "search",
+        "segment",
+        "segmenthierarchy",
+        "segments",
+        "shape",
+        "shapely",
+        "smoke",
+        "sorted",
+        "stays",
+        "tie",
+        "timed",
+        "traversals",
+        "two",
+        "used",
+        "vertex",
+        "work"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/experiment_nearest_strategies.py",
+      "referenced_by": [
+        "docs/dev/generalized-strtree-experiment-ledger.md",
+        "docs/dev/nearest-index-refinement-ledger.md",
+        "docs/dev/nearest-index-strategy-ledger.md"
+      ],
+      "symbols": [
+        "experiment_environment",
+        "StrategyHierarchy",
+        "main"
+      ],
+      "tokens": [
+        "2d",
+        "approximate",
+        "coherent",
+        "compare",
+        "cutoffs",
+        "deduplication",
+        "device",
+        "environment",
+        "expansion",
+        "experiment",
+        "experiments",
+        "finite",
+        "fixtures",
+        "fp64",
+        "gpu",
+        "grid",
+        "linestrings",
+        "ma",
+        "main",
+        "morton",
+        "nearest",
+        "no",
+        "nonempty",
+        "only",
+        "optional",
+        "ordering",
+        "output",
+        "packing",
+        "parent",
+        "points",
+        "policy",
+        "py",
+        "query",
+        "radius",
+        "reference",
+        "road",
+        "scripts",
+        "search",
+        "seeds",
+        "segment",
+        "spatial",
+        "strategies",
+        "strategyhierarchy",
+        "structures",
+        "tie",
+        "tile",
+        "traversal",
+        "unverified",
+        "using",
+        "validated",
+        "way",
+        "wkb"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/experiment_segment_bvh.py",
+      "referenced_by": [
+        "docs/dev/strtree-integration-ledger.md"
+      ],
+      "symbols": [
+        "RowSegmentBVH",
+        "SegmentBVHRefiner"
+      ],
+      "tokens": [
+        "bvh",
+        "changes",
+        "cooperative",
+        "dispatch",
+        "experiment",
+        "geometry",
+        "no",
+        "per",
+        "public",
+        "py",
+        "rowsegmentbvh",
+        "scripts",
+        "segment",
+        "segmentbvhrefiner"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/experimental_segment_bvh_kernels.py",
+      "referenced_by": [
+        "docs/dev/strtree-integration-ledger.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "binary",
+        "bounds",
+        "bvh",
+        "cooperative",
+        "experimental",
+        "kernels",
+        "local",
+        "per",
+        "py",
+        "refinement",
+        "row",
+        "scripts",
+        "segment",
+        "trees"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/experimental_strtree_bounds.py",
+      "referenced_by": [
+        "docs/dev/generalized-strtree-experiment-ledger.md"
+      ],
+      "symbols": [
+        "PackedBoundsBuilder"
+      ],
+      "tokens": [
+        "agnostic",
+        "bounds",
+        "builder",
+        "callers",
+        "changes",
+        "construction",
+        "device",
+        "dispatch",
+        "experimental",
+        "experiments",
+        "family",
+        "geometry",
+        "isolated",
+        "kernels",
+        "leaf",
+        "no",
+        "own",
+        "packed",
+        "packedboundsbuilder",
+        "packing",
+        "public",
+        "py",
+        "refinement",
+        "same",
+        "scripts",
+        "segment",
+        "semantics",
+        "share",
+        "shared",
+        "str",
+        "strtree"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/experimental_strtree_bounds_kernels.py",
+      "referenced_by": [
+        "docs/dev/generalized-strtree-experiment-ledger.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "aabb",
+        "bounds",
+        "construction",
+        "experimental",
+        "experiments",
+        "geometry",
+        "independent",
+        "kernels",
+        "packed",
+        "py",
+        "scripts",
+        "shared",
+        "str",
+        "strtree"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/experimental_strtree_kernels.py",
+      "referenced_by": [
+        "docs/dev/generalized-strtree-experiment-ledger.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "experimental",
+        "experiments",
+        "geometry",
+        "independent",
+        "kernels",
+        "local",
+        "nearest",
+        "py",
+        "resumable",
+        "scripts",
+        "strtree",
+        "traversal"
+      ]
+    },
+    {
+      "kind": "script",
       "path": "scripts/extract_vendor_to_api.py",
       "referenced_by": [],
       "symbols": [
@@ -17376,6 +19038,27 @@
         "scripts",
         "sha256",
         "verify"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/nearest_strategy_kernels.py",
+      "referenced_by": [
+        "docs/dev/nearest-index-refinement-ledger.md",
+        "docs/dev/nearest-index-strategy-ledger.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "dispatch",
+        "experiments",
+        "geometry",
+        "isolated",
+        "kernels",
+        "nearest",
+        "not",
+        "py",
+        "scripts",
+        "strategy"
       ]
     },
     {
@@ -18608,8 +20291,10 @@
       "kind": "source",
       "path": "src/vibespatial/api/_native_metadata.py",
       "referenced_by": [
+        "docs/architecture/spatial-index-backends.md",
         "docs/archive/2026-08-21-quadtree-experiments/adaptive-point-quadtree-production-plan.md",
-        "docs/dev/convex-region-predicate-execution-plan.md"
+        "docs/dev/convex-region-predicate-execution-plan.md",
+        "docs/dev/strtree-integration-ledger.md"
       ],
       "symbols": [
         "NativeGeometryMetadata",
@@ -20149,8 +21834,11 @@
       "kind": "source",
       "path": "src/vibespatial/api/sindex.py",
       "referenced_by": [
+        "docs/architecture/spatial-index-backends.md",
         "docs/architecture/spatial-joins.md",
         "docs/archive/2026-08-18-device-planning/adaptive-point-region-refinement-plan.md",
+        "docs/dev/nearest-index-experiment-ledger.md",
+        "docs/dev/strtree-integration-ledger.md",
         "docs/testing/osm-nearest-performance.md"
       ],
       "symbols": [
@@ -28190,6 +29878,9 @@
         "_free_cupy_pinned_memory_pool",
         "_check_driver",
         "_check_nvrtc",
+        "_RmmAllocationOwner",
+        "_release_rmm_pointer",
+        "_rmm_cupy_allocator_with_owned_lifetime",
         "_pylibcudf_stream_for_cupy",
         "_device_array_size",
         "_device_array_nbytes",
@@ -28205,13 +29896,10 @@
         "_delete_cached_cubin",
         "_make_oom_callback",
         "_configured_query_memory_reserve",
-        "_configured_pool_limit",
-        "_rmm_pool_allocation_sizes",
-        "_normalize_stream_handle",
-        "_CompletionRetirementBatch"
+        "_configured_pool_limit"
       ],
       "tokens": [
-        "allocation",
+        "allocator",
         "array",
         "arrays",
         "arrow",
@@ -28227,7 +29915,6 @@
         "compile",
         "compiledkernel",
         "completion",
-        "completionretirementbatch",
         "configured",
         "count",
         "cubin",
@@ -28253,23 +29940,24 @@
         "get",
         "gpu",
         "group",
-        "handle",
         "has",
         "identity",
         "increment",
         "kernel",
         "key",
+        "lifetime",
         "limit",
         "make",
         "mark",
         "maybe",
         "memory",
         "nbytes",
-        "normalize",
         "notify",
         "nvrtc",
         "oom",
+        "owned",
         "pinned",
+        "pointer",
         "pool",
         "produced",
         "profile",
@@ -28279,18 +29967,19 @@
         "querydevicememorybudget",
         "read",
         "record",
+        "release",
         "require",
         "reserve",
         "reset",
         "retainer",
         "rmm",
+        "rmmallocationowner",
         "runtime",
         "runtimed2htransferevent",
         "scalar",
         "scatter",
         "seconds",
         "size",
-        "sizes",
         "src",
         "stats",
         "stream",
@@ -29092,6 +30781,29 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/cuda/device_functions/point_segment_distance.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "cuda",
+        "device",
+        "distance",
+        "functions",
+        "metric",
+        "parametric",
+        "point",
+        "precision",
+        "py",
+        "relative",
+        "residuals",
+        "segment",
+        "shared",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/cuda/device_functions/segment_crossing.py",
       "referenced_by": [],
       "symbols": [
@@ -29104,6 +30816,27 @@
         "cuda",
         "device",
         "functions",
+        "py",
+        "segment",
+        "shared",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/cuda/device_functions/segment_distance.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "containment",
+        "cuda",
+        "device",
+        "distance",
+        "fp64",
+        "functions",
+        "metric",
+        "polygonal",
         "py",
         "segment",
         "shared",
@@ -29513,7 +31246,8 @@
         "_geom_equals_exact_cpu",
         "_geom_equals_exact_gpu",
         "_geom_equals_exact_gpu_device",
-        "_geom_equals_topological_gpu"
+        "_geom_equals_topological_gpu",
+        "_geom_equals_topological_gpu_device"
       ],
       "tokens": [
         "0002",
@@ -34308,7 +36042,8 @@
       "symbols": [
         "constructive",
         "core",
-        "predicates"
+        "predicates",
+        "spatial"
       ],
       "tokens": [
         "constructive",
@@ -34317,6 +36052,7 @@
         "kernels",
         "predicates",
         "py",
+        "spatial",
         "src",
         "vibespatial"
       ]
@@ -36246,6 +37982,134 @@
         "src",
         "vibespatial",
         "within"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/kernels/spatial/__init__.py",
+      "referenced_by": [],
+      "symbols": [
+        "packed_str_index",
+        "segment_bvh"
+      ],
+      "tokens": [
+        "bvh",
+        "index",
+        "init",
+        "kernels",
+        "packed",
+        "py",
+        "segment",
+        "spatial",
+        "src",
+        "str",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/kernels/spatial/packed_str_index.py",
+      "referenced_by": [
+        "docs/architecture/spatial-index-backends.md"
+      ],
+      "symbols": [
+        "PackedSTRtree",
+        "packed_str_index",
+        "_PackedBoundsBuilder"
+      ],
+      "tokens": [
+        "backend",
+        "candidate",
+        "device",
+        "family",
+        "index",
+        "kernels",
+        "nativerelation",
+        "nearest",
+        "packed",
+        "packedboundsbuilder",
+        "packedstrtree",
+        "py",
+        "refine",
+        "reusable",
+        "spatial",
+        "src",
+        "str",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/kernels/spatial/packed_str_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "bounded",
+        "code",
+        "construction",
+        "device",
+        "kernels",
+        "nearest",
+        "packed",
+        "py",
+        "spatial",
+        "src",
+        "str",
+        "traversal",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/kernels/spatial/segment_bvh.py",
+      "referenced_by": [
+        "docs/architecture/spatial-index-backends.md"
+      ],
+      "symbols": [
+        "RowSegmentBVH",
+        "SegmentBVHRefiner",
+        "segment_bvh"
+      ],
+      "tokens": [
+        "bvh",
+        "bvhs",
+        "cached",
+        "candidate",
+        "expensive",
+        "kernels",
+        "per",
+        "py",
+        "refinement",
+        "row",
+        "rowsegmentbvh",
+        "segment",
+        "segmentbvhrefiner",
+        "spatial",
+        "src",
+        "vibespatial",
+        "work"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/kernels/spatial/segment_bvh_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "bvh",
+        "conservative",
+        "cooperative",
+        "envelope",
+        "hierarchies",
+        "kernels",
+        "per",
+        "py",
+        "refinement",
+        "row",
+        "segment",
+        "spatial",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -39638,7 +41502,9 @@
     {
       "kind": "source",
       "path": "src/vibespatial/spatial/distance_owned.py",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/dev/generalized-strtree-experiment-ledger.md"
+      ],
       "symbols": [
         "distance_owned",
         "distance_expression_owned",
@@ -39705,6 +41571,57 @@
         "when",
         "wise",
         "zero"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/spatial/index_backends.py",
+      "referenced_by": [
+        "docs/architecture/spatial-index-backends.md"
+      ],
+      "symbols": [
+        "SpatialIndexBackend",
+        "IndexBackendCapability",
+        "nearest_backend"
+      ],
+      "tokens": [
+        "accelerators",
+        "api",
+        "are",
+        "backend",
+        "backends",
+        "bvhs",
+        "capabilities",
+        "chooses",
+        "coexisting",
+        "dispatch",
+        "events",
+        "execution",
+        "grids",
+        "implementation",
+        "index",
+        "indexbackendcapability",
+        "layouts",
+        "nearest",
+        "normal",
+        "operation",
+        "point",
+        "public",
+        "py",
+        "reports",
+        "reusable",
+        "segment",
+        "selected",
+        "spatial",
+        "spatialindexbackend",
+        "src",
+        "state",
+        "strategies",
+        "such",
+        "those",
+        "through",
+        "vibespatial",
+        "within"
       ]
     },
     {
@@ -39844,6 +41761,9 @@
       "kind": "source",
       "path": "src/vibespatial/spatial/nearest.py",
       "referenced_by": [
+        "docs/dev/generalized-strtree-experiment-ledger.md",
+        "docs/dev/nearest-index-experiment-ledger.md",
+        "docs/dev/strtree-integration-ledger.md",
         "docs/testing/osm-nearest-performance.md"
       ],
       "symbols": [
@@ -40513,7 +42433,9 @@
     {
       "kind": "source",
       "path": "src/vibespatial/spatial/segment_distance.py",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/dev/strtree-integration-ledger.md"
+      ],
       "symbols": [
         "compute_segment_distance_gpu",
         "supported_segment_distance_families",
@@ -40963,7 +42885,9 @@
     {
       "kind": "source",
       "path": "src/vibespatial/spatial/spatial_index_knn_device.py",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/dev/nearest-index-experiment-ledger.md"
+      ],
       "symbols": [
         "DeviceKnnResult",
         "DeviceKnnTelemetry",
@@ -45508,6 +47432,64 @@
     },
     {
       "kind": "test",
+      "path": "tests/test_experimental_nearest_hierarchy.py",
+      "referenced_by": [
+        "docs/dev/nearest-index-refinement-ledger.md",
+        "docs/dev/nearest-index-strategy-ledger.md"
+      ],
+      "symbols": [
+        "experiment",
+        "test_hierarchy_independent_100k_distributions",
+        "test_hierarchy_all_ties_and_single_leaf",
+        "test_hierarchy_rejects_leaf_width_that_overflows_kernel_indices",
+        "test_strategy_whole_road_ties",
+        "test_direct_grid_ownership_and_search_certificate",
+        "test_virtual_bounds_preserve_original_segment_metric"
+      ],
+      "tokens": [
+        "100k",
+        "bounds",
+        "canaries",
+        "certificate",
+        "direct",
+        "dispatch",
+        "distributions",
+        "experiment",
+        "experimental",
+        "grid",
+        "hierarchy",
+        "independent",
+        "indices",
+        "isolated",
+        "kernel",
+        "leaf",
+        "metric",
+        "nearest",
+        "not",
+        "oracle",
+        "original",
+        "overflows",
+        "ownership",
+        "preserve",
+        "public",
+        "py",
+        "rejects",
+        "road",
+        "search",
+        "segment",
+        "single",
+        "strategy",
+        "test",
+        "tests",
+        "that",
+        "ties",
+        "virtual",
+        "whole",
+        "width"
+      ]
+    },
+    {
+      "kind": "test",
       "path": "tests/test_extract_unique_points_gpu.py",
       "referenced_by": [],
       "symbols": [
@@ -45857,6 +47839,56 @@
         "stops",
         "test",
         "tests"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_generalized_strtree_experiment.py",
+      "referenced_by": [
+        "docs/dev/generalized-strtree-experiment-ledger.md"
+      ],
+      "symbols": [
+        "experiment",
+        "family_geometries",
+        "test_generalized_family_matrix",
+        "test_generalized_holes_nulls_mixed_ties",
+        "test_generalized_empty_inputs",
+        "test_generalized_ties_cross_frontier_tiles",
+        "test_generalized_zero_length_arrays",
+        "test_generalized_positive_ties_across_families"
+      ],
+      "tokens": [
+        "across",
+        "arrays",
+        "bounds",
+        "canaries",
+        "cross",
+        "empty",
+        "existing",
+        "experiment",
+        "families",
+        "family",
+        "frontier",
+        "generalized",
+        "geometries",
+        "holes",
+        "inputs",
+        "length",
+        "matrix",
+        "mixed",
+        "nulls",
+        "oracle",
+        "positive",
+        "py",
+        "refiner",
+        "same",
+        "shared",
+        "strtree",
+        "test",
+        "tests",
+        "ties",
+        "tiles",
+        "zero"
       ]
     },
     {
@@ -47056,7 +49088,8 @@
         "test_free_pool_memory_does_not_raise_on_gpu",
         "test_memory_backend_is_set_on_gpu",
         "test_cupy_and_pylibcudf_share_the_active_rmm_resource",
-        "test_unified_rmm_pool_reuses_fragmented_allocations_and_releases_live_bytes"
+        "test_unified_rmm_pool_reuses_fragmented_allocations_and_releases_live_bytes",
+        "test_rmm_allocation_cycle_releases_before_stream_destruction"
       ],
       "tokens": [
         "active",
@@ -47067,6 +49100,7 @@
         "allocator",
         "async",
         "backend",
+        "before",
         "bound",
         "boundary",
         "bytes",
@@ -47080,8 +49114,10 @@
         "context",
         "cupy",
         "current",
+        "cycle",
         "default",
         "deferred",
+        "destruction",
         "deterministic",
         "dict",
         "does",
@@ -52512,6 +54548,120 @@
     },
     {
       "kind": "test",
+      "path": "tests/test_packed_str_index.py",
+      "referenced_by": [],
+      "symbols": [
+        "assert_nearest",
+        "geometries",
+        "build",
+        "export",
+        "test_str_sort_primitives_use_warmed_radix_without_losing_high_bits",
+        "test_mixed_nearest",
+        "test_public_nearest_exclusion_and_ties",
+        "test_ties_across_waves_and_empty",
+        "test_cached_tree_across_streams_and_mutation",
+        "test_explicit_cpu_nearest_does_not_build_gpu_backend",
+        "test_public_all_family_pairs",
+        "test_indexed_views_preserve_logical_duplicate_rows",
+        "test_single_match_chooses_lowest_tree_id_across_waves",
+        "test_exclusive_all_equal_has_no_matches",
+        "test_backend_diagnostics_do_not_build_state",
+        "test_nearest_resolves_interior_projection_close_to_shared_endpoint",
+        "test_gpu_index_is_lazy_and_counts_only_valid_nonempty_rows",
+        "test_index_outlives_public_array_without_a_reference_cycle",
+        "test_pair_aggregate_uses_logical_rows_including_nulls_and_empties",
+        "test_nearest_resolves_nearparallel_and_nonzero_short_segments"
+      ],
+      "tokens": [
+        "across",
+        "aggregate",
+        "array",
+        "assert",
+        "backend",
+        "bits",
+        "boundary",
+        "build",
+        "cached",
+        "chooses",
+        "close",
+        "contracts",
+        "counts",
+        "cpu",
+        "cycle",
+        "diagnostics",
+        "do",
+        "does",
+        "duplicate",
+        "empties",
+        "empty",
+        "endpoint",
+        "equal",
+        "exclusion",
+        "exclusive",
+        "explicit",
+        "export",
+        "family",
+        "geometries",
+        "gpu",
+        "has",
+        "high",
+        "id",
+        "including",
+        "index",
+        "indexed",
+        "interior",
+        "lazy",
+        "logical",
+        "losing",
+        "lowest",
+        "match",
+        "matches",
+        "mixed",
+        "mutation",
+        "nearest",
+        "nearparallel",
+        "no",
+        "nonempty",
+        "nonzero",
+        "not",
+        "nulls",
+        "only",
+        "outlives",
+        "packed",
+        "pair",
+        "pairs",
+        "preserve",
+        "primitives",
+        "projection",
+        "public",
+        "py",
+        "radix",
+        "reference",
+        "resolves",
+        "rows",
+        "segments",
+        "shared",
+        "short",
+        "sindex",
+        "single",
+        "sort",
+        "state",
+        "str",
+        "streams",
+        "test",
+        "tests",
+        "ties",
+        "tree",
+        "uses",
+        "valid",
+        "views",
+        "warmed",
+        "waves",
+        "without"
+      ]
+    },
+    {
+      "kind": "test",
       "path": "tests/test_pipeline_benchmarks.py",
       "referenced_by": [
         "docs/dev/native-full-coverage-prd.md"
@@ -53222,6 +55372,8 @@
       "path": "tests/test_polygon_predicates.py",
       "referenced_by": [],
       "symbols": [
+        "test_device_counted_de9im_decodes_only_initialized_prefix",
+        "test_prefix_reduction_classifiers_define_inactive_mask_slots",
         "test_binary_predicate_expression_point_region_orientation_avoids_host_metadata",
         "test_multi_predicate_expressions_route_point_region_pairs_to_point_classifier",
         "test_point_region_expression_preserves_indexed_polygon_carrier",
@@ -53250,9 +55402,13 @@
         "capacity",
         "carrier",
         "classifier",
+        "classifiers",
         "compute",
+        "counted",
         "covered",
         "de9im",
+        "decodes",
+        "define",
         "device",
         "eval",
         "expression",
@@ -53260,12 +55416,14 @@
         "host",
         "inactive",
         "indexed",
+        "initialized",
         "intersects",
         "kernel",
         "logical",
         "mask",
         "metadata",
         "multi",
+        "only",
         "order",
         "orientation",
         "pair",
@@ -53275,10 +55433,12 @@
         "polygonal",
         "predicate",
         "predicates",
+        "prefix",
         "preserve",
         "preserves",
         "probe",
         "py",
+        "reduction",
         "region",
         "relation",
         "right",
@@ -54721,9 +56881,74 @@
     },
     {
       "kind": "test",
+      "path": "tests/test_segment_bvh.py",
+      "referenced_by": [],
+      "symbols": [
+        "test_segment_capacity_is_rejected_before_extraction",
+        "test_outlier_refinement_survives_unrelated_padding",
+        "test_complex_holes_and_multipart"
+      ],
+      "tokens": [
+        "acceleration",
+        "before",
+        "bvh",
+        "capacity",
+        "complex",
+        "extraction",
+        "family",
+        "holes",
+        "mixed",
+        "multipart",
+        "native",
+        "oracles",
+        "outlier",
+        "padding",
+        "polygon",
+        "py",
+        "refinement",
+        "rejected",
+        "segment",
+        "survives",
+        "test",
+        "tests",
+        "unrelated"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_segment_bvh_experiment.py",
+      "referenced_by": [],
+      "symbols": [
+        "module",
+        "test_segment_bvh_mixed_candidates",
+        "test_segment_bvh_complex_nearest"
+      ],
+      "tokens": [
+        "bvh",
+        "candidate",
+        "candidates",
+        "complex",
+        "distance",
+        "exact",
+        "experiment",
+        "geometry",
+        "mixed",
+        "module",
+        "nearest",
+        "oracles",
+        "py",
+        "segment",
+        "test",
+        "tests"
+      ]
+    },
+    {
+      "kind": "test",
       "path": "tests/test_segment_distance.py",
       "referenced_by": [],
       "symbols": [
+        "test_homogeneous_device_refinement_preserves_candidate_parallelism",
+        "test_device_refinement_without_present_families",
         "TestLsLsDistance",
         "TestLsPgDistance",
         "TestPgPgDistance",
@@ -54735,10 +56960,18 @@
         "_shapely_distances"
       ],
       "tokens": [
+        "candidate",
         "compute",
+        "device",
         "distance",
         "distances",
+        "families",
+        "homogeneous",
+        "parallelism",
+        "present",
+        "preserves",
         "py",
+        "refinement",
         "segment",
         "shapely",
         "test",
@@ -54749,7 +56982,8 @@
         "testmpgdistance",
         "testnearestpipelinesegmentdistance",
         "testpgpgdistance",
-        "tests"
+        "tests",
+        "without"
       ]
     },
     {

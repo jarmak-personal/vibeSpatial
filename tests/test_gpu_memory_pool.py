@@ -205,7 +205,7 @@ def test_pylibcudf_stream_wrapper_follows_transient_stream_lifetime() -> None:
     stream_ref = weakref.ref(stream)
     with stream:
         wrapper = pylibcudf_current_stream()
-        assert pylibcudf_current_stream() is wrapper
+        assert pylibcudf_current_stream() == wrapper
     stream.synchronize()
     del wrapper
     del stream
@@ -861,9 +861,7 @@ def test_cupy_and_pylibcudf_share_the_active_rmm_resource() -> None:
     pa = pytest.importorskip("pyarrow")
     plc = pytest.importorskip("pylibcudf")
     rmm = pytest.importorskip("rmm")
-    from rmm.allocators.cupy import rmm_cupy_allocator
-
-    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.cuda._runtime import _rmm_cupy_allocator_with_owned_lifetime, get_cuda_runtime
 
     runtime = get_cuda_runtime()
     runtime._ensure_context()
@@ -875,7 +873,7 @@ def test_cupy_and_pylibcudf_share_the_active_rmm_resource() -> None:
     table = plc.Table.from_arrow(pa.table({"value": np.arange(1024, dtype=np.int64)}))
     after = runtime.memory_pool_stats()
 
-    assert cp.cuda.get_allocator() is rmm_cupy_allocator
+    assert cp.cuda.get_allocator() is _rmm_cupy_allocator_with_owned_lifetime
     assert rmm.mr.get_current_device_resource() is runtime._rmm_mr
     assert after["total_allocations"] > before
     assert after["reserved_bytes"] >= after["used_bytes"]
@@ -924,3 +922,23 @@ def test_unified_rmm_pool_reuses_fragmented_allocations_and_releases_live_bytes(
         assert after_release["used_bytes"] <= baseline["used_bytes"] + (1 << 20)
 
     assert runtime.memory_pool_stats()["reserved_bytes"] <= reserved_high_water
+
+
+@pytest.mark.gpu
+def test_rmm_allocation_cycle_releases_before_stream_destruction():
+    """Bare RMM CuPy ownership can free on a GC-cleared transient stream."""
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    get_cuda_runtime()._ensure_context()
+    for _ in range(4):
+        stream = cp.cuda.Stream(non_blocking=True)
+        stream_ref = weakref.ref(stream)
+        with stream:
+            cycle = {"values": cp.ones(1024)}
+            cycle["self"] = cycle
+            stream.synchronize()
+        del cycle, stream
+        gc.collect()
+        assert stream_ref() is None

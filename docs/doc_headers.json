@@ -595,6 +595,62 @@
       "stopIf": "You only need the OSM reader or a nearest kernel implementation detail.",
       "sourceOfTruth": "Reproducible public nearest benchmark contract and Massachusetts evidence.",
       "maxBodyLines": 220
+    },
+    "docs/dev/nearest-index-experiment-ledger.md": {
+      "scope": "Exact GPU nearest index experiments, hypotheses, timings, parity, and decisions.",
+      "readIf": "You are optimizing nearest search, GPU STRtree alternatives, or road snapping at 100K and 1M scale.",
+      "stopIf": "You need the original public API comparator contract rather than current experiments.",
+      "sourceOfTruth": "Ongoing nearest index experiment ledger and production graduation criteria.",
+      "maxBodyLines": 240
+    },
+    "docs/dev/nearest-index-strategy-ledger.md": {
+      "scope": "Comparative nearest acceleration experiments: Morton, STR, wide trees, grid seeds and whole-road provenance.",
+      "readIf": "You are identifying the best GPU nearest strategy or comparing index packing and traversal designs.",
+      "stopIf": "You need the initial public API gap measurement or isolated reference hierarchy only.",
+      "sourceOfTruth": "Continuation ledger for nearest algorithm comparison and empirical acceleration recommendation.",
+      "maxBodyLines": 260
+    },
+    "docs/dev/nearest-index-refinement-ledger.md": {
+      "scope": "Nearest shape tuning, conservative precision, virtual bounds and independent distribution evidence.",
+      "readIf": "You are checking nearest precision, build/query tradeoffs or generalization beyond MA OSM.",
+      "stopIf": "You only need the original public performance gap or the initial algorithm comparison.",
+      "sourceOfTruth": "Late-stage nearest experiment evidence and unresolved graduation conditions.",
+      "maxBodyLines": 260
+    },
+    "docs/dev/nearest-index-recommendation.md": {
+      "scope": "Measured GPU nearest acceleration recommendation, build/reuse tradeoffs and public API graduation work.",
+      "readIf": "You need the conclusion of the nearest experiments or the implementation route for NativeSpatialIndex k=1.",
+      "stopIf": "You need individual experiment history rather than the final recommendation.",
+      "sourceOfTruth": "Empirical nearest acceleration recommendation and limits on its production applicability.",
+      "maxBodyLines": 240
+    },
+    "docs/dev/generalized-strtree-experiment-ledger.md": {
+      "scope": "Generalized GPU STR hierarchy experiments, bounded all-family refinement and measured regression evidence.",
+      "readIf": "You are generalizing the nearest hierarchy across geometry families or testing bounded refinement.",
+      "stopIf": "You only need the initial MA segment performance comparison.",
+      "sourceOfTruth": "Local generalized STR experiment contracts, results and limitations.",
+      "maxBodyLines": 260
+    },
+    "docs/dev/strtree-integration-ledger.md": {
+      "scope": "Complex polygon refinement experiments and NativeSpatialIndex backend integration ledger.",
+      "readIf": "You are accelerating complex geometry nearest or integrating spatial index backends.",
+      "stopIf": "You only need historical MA or simple generalized STR screening results.",
+      "sourceOfTruth": "Current complex-refinement and sindex integration work and evidence.",
+      "maxBodyLines": 260
+    },
+    "docs/testing/strtree-integration-results.md": {
+      "scope": "Final public nearest timings, complex polygon canaries, correctness evidence and full pipeline profile.",
+      "readIf": "You need current public STRtree integration performance or its verification limits.",
+      "stopIf": "You need implementation details rather than measured integration results.",
+      "sourceOfTruth": "Final local public nearest integration measurements and validation summary.",
+      "maxBodyLines": 200
+    },
+    "docs/architecture/spatial-index-backends.md": {
+      "scope": "Operation capabilities, cache lineage and precision for native spatial index backends.",
+      "readIf": "You are selecting spatial-index backends or changing public nearest integration.",
+      "stopIf": "You only need historical experiment timings.",
+      "sourceOfTruth": "Native spatial-index layout and query-strategy contracts.",
+      "maxBodyLines": 200
     }
   }
 }

@@ -1864,6 +1864,10 @@ def _classify_homogeneous_reduction_tile(
 
     polygonal = {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
     if predicate == "intersects" and query_family in polygonal and tree_family in polygonal:
+        if logical_count is not None and source_offset is None and d_exact_out is None:
+            # This consumer returns a full capacity mask, unlike its live-prefix
+            # classifier. Inactive candidate slots are defined as false.
+            d_exact_out = cp.zeros(d_left.size, dtype=cp.bool_)
         return compute_polygonal_intersects_gpu(
             query_owned,
             tree_owned,
@@ -1905,7 +1909,7 @@ def _classify_homogeneous_reduction_tile(
             launch_capacity=launch_capacity,
             out=d_exact_out,
         )
-    return _evaluate_de9im_device(d_masks, predicate)
+    return _evaluate_de9im_device(d_masks, predicate, logical_count=logical_count)
 
 
 def _family_group_launch_capacities(

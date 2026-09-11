@@ -336,12 +336,24 @@ def geom_equals_owned(
     return shapely.equals(left_geoms, right_geoms).astype(bool, copy=False)
 
 
-def _geom_equals_topological_gpu(
+def _geom_equals_topological_gpu(left, right, runtime_selection):
+    """Export the native topological-equality result at its public boundary."""
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    result = _geom_equals_topological_gpu_device(left, right, runtime_selection)
+    if result is None:
+        return None
+    return get_cuda_runtime().copy_device_to_host(
+        result, reason="geometry topological equality result host export", terminal_export=True,
+    ).astype(bool, copy=False)
+
+
+def _geom_equals_topological_gpu_device(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
     runtime_selection: AdaptivePlan,
-) -> np.ndarray | None:
-    """Evaluate topological equality with one terminal device-to-host export."""
+):
+    """Evaluate topological equality as a device boolean column."""
     from vibespatial.geometry.buffers import GeometryFamily
     from vibespatial.geometry.owned import (
         FAMILY_TAGS,
@@ -481,14 +493,4 @@ def _geom_equals_topological_gpu(
             left_difference,
         ) & ~device_valid_nonempty_mask(right_difference)
 
-    from vibespatial.cuda._runtime import get_cuda_runtime
-
-    return (
-        get_cuda_runtime()
-        .copy_device_to_host(
-            d_result,
-            reason="geometry topological equality result host export",
-            terminal_export=True,
-        )
-        .astype(bool, copy=False)
-    )
+    return d_result

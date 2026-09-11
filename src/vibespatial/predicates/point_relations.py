@@ -1328,20 +1328,31 @@ def classify_homogeneous_point_predicates_indexed_device(
     grouped = source_offset is not None
     if grouped and (launch_capacity is None or predicate_out is None or relation_out is None):
         raise ValueError("grouped point classification requires launch and output storage")
+    kernel_offset = source_offset
+    if kernel_offset is None and logical_count is not None:
+        # Direct indexed kernels guard reads with logical_count. The compacted
+        # mapping path would gather uninitialized row IDs outside this prefix.
+        kernel_offset = cp.zeros(1, dtype=cp.int64)
     grouped_kernel_args = {
-        "source_offset": source_offset,
+        "source_offset": kernel_offset,
         "launch_capacity": launch_capacity,
         "relation_out": relation_out,
     }
 
     def finish(relation, mode: int, *, target_family=None):
-        if grouped:
+        if grouped or logical_count is not None:
+            # Prefix producers leave relation capacity outside logical_count
+            # undefined. Decode only live entries; the returned fixed-capacity
+            # predicate mask represents inactive entries as false.
+            output = predicate_out
+            if output is None:
+                output = cp.zeros(relation.size, dtype=cp.bool_)
             return _evaluate_point_relation_grouped(
                 relation,
-                predicate_out,
-                source_offset=source_offset,
+                output,
+                source_offset=kernel_offset,
                 logical_count=logical_count,
-                launch_capacity=launch_capacity,
+                launch_capacity=relation.size if launch_capacity is None else launch_capacity,
                 predicate=predicate,
                 relation_mode=mode,
                 target_pointlike=target_family

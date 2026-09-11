@@ -58,6 +58,63 @@ def _eval_predicate_device(masks, predicate):
     )
 
 
+@pytest.mark.parametrize("count", [0, 1, 2])
+@pytest.mark.parametrize("swapped", [False, True])
+def test_device_counted_de9im_decodes_only_initialized_prefix(count, swapped):
+    """Initcheck must never read inactive candidate, mask, or transpose slots."""
+    import cupy as cp
+
+    from vibespatial.predicates.binary import _evaluate_de9im_device
+    from vibespatial.predicates.polygon import compute_polygon_de9im_gpu
+
+    lines = [LineString([(0.2, 0.2), (0.8, 0.8)]), LineString([(2, 2), (3, 3)])]
+    polygons = [box(0, 0, 1, 1)] * 2
+    lhs, rhs = (polygons, lines) if swapped else (lines, polygons)
+    left_family, right_family = (
+        (GeometryFamily.POLYGON, GeometryFamily.LINESTRING)
+        if swapped else (GeometryFamily.LINESTRING, GeometryFamily.POLYGON)
+    )
+    rows = cp.empty(4, dtype=cp.int32)
+    rows[:count] = cp.arange(count, dtype=cp.int32)
+    logical_count = cp.asarray([count], dtype=cp.int32)
+    masks = compute_polygon_de9im_gpu(
+        _make_owned(lhs), _make_owned(rhs), query_family=left_family, tree_family=right_family,
+        d_left=rows, d_right=rows, d_pair_count=logical_count, pair_capacity=4, return_device=True,
+    )
+    predicate = "contains" if swapped else "within"
+    values = _evaluate_de9im_device(masks, predicate, logical_count=logical_count)
+    np.testing.assert_array_equal(
+        cp.asnumpy(values[:count]), getattr(shapely, predicate)(lhs, rhs)[:count],
+    )
+
+
+@pytest.mark.parametrize("count", [0, 1, 2])
+@pytest.mark.parametrize("point_tree", [False, True])
+@pytest.mark.parametrize("predicate", ["contains", "intersects"])
+def test_prefix_reduction_classifiers_define_inactive_mask_slots(count, point_tree, predicate):
+    import cupy as cp
+
+    from vibespatial.predicates.point_relations import _resolve_indexed_point_precision_plan
+    from vibespatial.spatial.spatial_index_device import _classify_homogeneous_reduction_tile
+
+    queries = [box(0, 0, 1, 1)] * 2
+    tree = [Point(0.5, 0.5), Point(2, 2)] if point_tree else [
+        box(0.2, 0.2, 0.8, 0.8), box(2, 2, 3, 3),
+    ]
+    rows = cp.empty(4, dtype=cp.int32)
+    rows[:count] = cp.arange(count, dtype=cp.int32)
+    result = _classify_homogeneous_reduction_tile(
+        predicate, _make_owned(queries), _make_owned(tree), rows, rows,
+        query_family=GeometryFamily.POLYGON,
+        tree_family=GeometryFamily.POINT if point_tree else GeometryFamily.POLYGON,
+        precision_plan=_resolve_indexed_point_precision_plan(None),
+        logical_count=cp.asarray([count], dtype=cp.int32), pair_capacity=4,
+    )
+    expected = np.zeros(4, dtype=bool)
+    expected[:count] = getattr(shapely, predicate)(queries, tree)[:count]
+    np.testing.assert_array_equal(cp.asnumpy(result), expected)
+
+
 def test_binary_predicate_expression_point_region_orientation_avoids_host_metadata() -> None:
     from vibespatial import Residency, from_shapely_geometries
     from vibespatial.cuda._runtime import get_d2h_transfer_events, reset_d2h_transfer_count

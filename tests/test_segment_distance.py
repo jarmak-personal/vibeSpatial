@@ -50,9 +50,70 @@ def _shapely_distances(query_geoms, tree_geoms, left_idx, right_idx):
     ])
 
 
+def test_homogeneous_device_refinement_preserves_candidate_parallelism(make_owned, monkeypatch):
+    """A single family group must expose its full candidate work to launch sizing."""
+    from types import SimpleNamespace
+
+    import cupy as cp
+
+    from vibespatial.spatial import segment_distance
+    from vibespatial.spatial.nearest import _compute_mixed_distances_gpu_device
+
+    geometry = make_owned([LineString([(0.,0.), (1.,1.)])])
+    count = 4096
+    candidates = SimpleNamespace(d_left=cp.zeros(count, dtype=cp.int32),
+                                 d_right=cp.zeros(count, dtype=cp.int32), total_pairs=count)
+    launches = []
+    original = segment_distance.compute_segment_distance_partition_gpu
+
+    def observe(*args, **kwargs):
+        launches.append(args[5])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(segment_distance, "compute_segment_distance_partition_gpu", observe)
+    result = _compute_mixed_distances_gpu_device(geometry, geometry, None, None, candidates)
+    assert launches == [count]
+    assert not result[1]
+    assert bool(cp.all(result[0] == 0.))
+
+
+def test_device_refinement_without_present_families(make_owned):
+    from types import SimpleNamespace
+
+    import cupy as cp
+
+    from vibespatial.spatial.nearest import _compute_mixed_distances_gpu_device
+
+    geometry = make_owned([None])
+    candidates = SimpleNamespace(d_left=cp.zeros(3, dtype=cp.int32),
+                                 d_right=cp.zeros(3, dtype=cp.int32), total_pairs=3)
+    result = _compute_mixed_distances_gpu_device(geometry, geometry, None, None, candidates,
+                                               pair_active=cp.zeros(3, dtype=cp.bool_))
+    assert not result[1]
+    assert bool(cp.all(cp.isinf(result[0])))
+
+
 # ---- LS × LS ----
 
 class TestLsLsDistance:
+    def test_intersection_is_exact_zero_without_collapsing_positive_gaps(self, make_owned):
+        """Nearest ties require exact zero, not approximately zero distances."""
+        q = [LineString([(15.7, 2.041), (17.7, 2.041)]),
+             LineString([(0., 0.), (2., 2.)]),
+             LineString([(0., 0.), (2., 2.)]),
+             LineString([(0., 0.), (2., 0.)])]
+        t = [LineString([(17., 1.95), (17., 3.95)]),
+             LineString([(0., 2.), (2., 0.)]),
+             LineString([(0., 1e-10), (2., 2. + 1e-10)]),
+             LineString([(1., 0.), (3., 0.)])]
+        indices = np.arange(len(q), dtype=np.int32)
+        actual = _compute_distances(make_owned(q), make_owned(t), indices, indices,
+                                    GeometryFamily.LINESTRING, GeometryFamily.LINESTRING)
+        expected = shapely.distance(q, t)
+        assert np.array_equal(actual == 0., expected == 0.)
+        assert actual[2] > 0.
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-15)
+
     def test_parallel_lines(self, make_owned):
         """Parallel lines — distance is perpendicular gap."""
         q = [LineString([(0, 0), (10, 0)])]

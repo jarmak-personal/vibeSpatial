@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.point_segment_distance import POINT_SEGMENT_DISTANCE_DEVICE
 from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 
 _POINT_DISTANCE_KERNEL_SOURCE_TEMPLATE = (
@@ -11,32 +12,6 @@ _POINT_DISTANCE_KERNEL_SOURCE_TEMPLATE = (
 #if !defined(INFINITY)
 #define INFINITY __longlong_as_double(0x7FF0000000000000LL)
 #endif
-
-// ---------------------------------------------------------------------------
-// Tier 1 NVRTC: point-to-segment squared distance (device helper)
-// ---------------------------------------------------------------------------
-extern "C" __device__ inline compute_t point_segment_sq_distance(
-    compute_t px, compute_t py,
-    compute_t ax, compute_t ay,
-    compute_t bx, compute_t by
-) {{
-  const compute_t dx = bx - ax;
-  const compute_t dy = by - ay;
-  const compute_t len_sq = dx * dx + dy * dy;
-  compute_t t;
-  if (len_sq < (compute_t)1e-30) {{
-    t = (compute_t)0.0;
-  }} else {{
-    t = ((px - ax) * dx + (py - ay) * dy) / len_sq;
-    if (t < (compute_t)0.0) t = (compute_t)0.0;
-    else if (t > (compute_t)1.0) t = (compute_t)1.0;
-  }}
-  const compute_t cx = ax + t * dx;
-  const compute_t cy = ay + t * dy;
-  const compute_t ex = px - cx;
-  const compute_t ey = py - cy;
-  return ex * ex + ey * ey;
-}}
 
 // ---------------------------------------------------------------------------
 // Tier 1 NVRTC: min squared distance from a point to a coordinate range
@@ -578,7 +553,9 @@ _POINT_DISTANCE_KERNEL_NAMES = (
 
 def format_distance_kernel_source(compute_type: str = "double") -> str:
     """Format the point-distance kernel source with the given compute type."""
-    return _POINT_DISTANCE_KERNEL_SOURCE_TEMPLATE.format(compute_type=compute_type)
+    return POINT_SEGMENT_DISTANCE_DEVICE + _POINT_DISTANCE_KERNEL_SOURCE_TEMPLATE.format(
+        compute_type=compute_type
+    )
 
 
 # Pre-formatted default source for warmup

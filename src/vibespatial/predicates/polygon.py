@@ -1645,9 +1645,13 @@ def compute_polygon_de9im_gpu(
             # Return device-resident CuPy array — caller takes ownership.
             # No sync needed: CuPy ops on the same stream are ordered.
             if swap:
-                if d_pair_offset is None:
+                if d_pair_offset is None and d_pair_count is None:
                     d_mask = _transpose_de9im_device(d_mask)
                 else:
+                    if d_pair_offset is None:
+                        import cupy as cp
+
+                        d_pair_offset = cp.zeros(1, dtype=cp.int64)
                     transpose_kernel = _de9im_eval_kernels()[
                         "transpose_de9im_grouped_kernel"
                     ]

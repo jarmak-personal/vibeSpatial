@@ -1,0 +1,1668 @@
+{
+  "scope": "Isolated FP64 segment hierarchy experiment. Not a public API implementation or performance claim.",
+  "comparison": "Same WKB, all-match pairs, NumPy int64 indices / float64 distances. One first-process trial then three fresh-input warm trials; medians. Shapely refreshed once for 1M scale and repeat/boundary identity. Its unchanged comparator reused after candidate-only int64 export correction; exact source snapshots retained beside raw artifacts.",
+  "cases": {
+    "shapely-100k": {
+      "backend": "shapely",
+      "rows": 100000,
+      "segments": 8728450,
+      "leaf_width": 8,
+      "script_sha256": "d84249e4eb88c7b69afbf7cdd39925a50f5279538e45b190c9e4551dd711c679",
+      "fixture": {
+        "identity": {
+          "source_sha256": "d7f2220cf2d0ed6b6eeb432f1986c27799a7248bd5ec6f24746fdf1d53c17263",
+          "source_bytes": 310023499,
+          "crs": "EPSG:26986",
+          "filters": {
+            "lines": "highway IS NOT NULL",
+            "multipolygons": "building IS NOT NULL AND building <> 'no'"
+          },
+          "seed": 20260910,
+          "script_sha256": "bf6f9030dc5a0dadc4258d9cba23fa74f6ef4cb7f3fa725aa5f4ef43fb32b559",
+          "packages": {
+            "pyogrio": "0.12.1",
+            "pyproj": "3.7.2",
+            "shapely": "2.1.2",
+            "numpy": "2.4.3",
+            "pyarrow": "23.0.1"
+          }
+        },
+        "created": "2026-09-10T13:25:18.394992+00:00",
+        "files": {
+          "roads": {
+            "rows": 991441,
+            "coordinates": 9719891,
+            "sha256": "f6a1ccd2632add25e26635b36675fedfc6c1c4bb42eab0fe7ff470655367b28d"
+          },
+          "segments": {
+            "rows": 8728450,
+            "coordinates": 17456900,
+            "sha256": "823f3fad68c7ed4a3711521526017334c3024c9708fd09c46e52f23b74ca619e"
+          },
+          "points": {
+            "rows": 2680339,
+            "coordinates": 2680339,
+            "sha256": "f3e83bb44b8a7642cc2c1f9be1eb77a76aa3231bfb17bc81ed2157ac54c75d3a"
+          }
+        },
+        "preparation_seconds": 30.53242320381105,
+        "stages": {
+          "read_filter_project_lines_seconds": 5.684012120123953,
+          "read_filter_project_multipolygons_seconds": 17.871698814909905,
+          "representative_points_seconds": 0.5715957349166274,
+          "segment_roads_seconds": 1.2371748299337924
+        },
+        "contract": "All highway-tagged line ways (including paths); building-tagged areas except no. Point-on-surface after projection. No topology repair. Parent rows reference filtered roads. Two-vertex segments retain zero-length edges. No segment-to-road deduplication in timing."
+      },
+      "oracle_sha256": "7c7216b66c0ac800e7c204b631eea8bec6471f2cba3280f85480299058b97c15",
+      "status": "passed",
+      "trials": [
+        {
+          "ingress_s": 2.081139722838998,
+          "build_s": 1.3817689917050302,
+          "first_query_s": 0.797966733109206,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 0.8111450541764498,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          }
+        },
+        {
+          "ingress_s": 1.941078947391361,
+          "build_s": 1.3840134949423373,
+          "first_query_s": 0.792241099756211,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 0.8014489761553705,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          }
+        },
+        {
+          "ingress_s": 1.9353029620833695,
+          "build_s": 1.3753990400582552,
+          "first_query_s": 0.8053085999563336,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 0.800243214238435,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          }
+        },
+        {
+          "ingress_s": 1.992894222959876,
+          "build_s": 1.3663956802338362,
+          "first_query_s": 0.8126062457449734,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 0.8046298949047923,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          }
+        }
+      ],
+      "environment": {
+        "created": "2026-09-10T14:32:14.897142+00:00",
+        "python": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+        "host": "picard-4090",
+        "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.35",
+        "packages": {
+          "shapely": "2.1.2",
+          "numpy": "2.4.3",
+          "pyarrow": "23.0.1",
+          "cupy-cuda12x": "14.0.1"
+        },
+        "git_head": "6c09268cb8a629024b8efd288514e0f5754e511e",
+        "lock_sha256": "60942838f44a9792dfc8a49371e8a1367a59e8d858e39ed827dfa735e0d615fe",
+        "gpu": "NVIDIA GeForce RTX 4090, 580.173.02",
+        "cpu": "{\n   \"lscpu\": [\n      {\n         \"field\": \"Architecture:\",\n         \"data\": \"x86_64\"\n      },{\n         \"field\": \"CPU op-mode(s):\",\n         \"data\": \"32-bit, 64-bit\"\n      },{\n         \"field\": \"Address sizes:\",\n         \"data\": \"46 bits physical, 48 bits virtual\"\n      },{\n         \"field\": \"Byte Order:\",\n         \"data\": \"Little Endian\"\n      },{\n         \"field\": \"CPU(s):\",\n         \"data\": \"32\"\n      },{\n         \"field\": \"On-line CPU(s) list:\",\n         \"data\": \"0-31\"\n      },{\n         \"field\": \"Vendor ID:\",\n         \"data\": \"GenuineIntel\"\n      },{\n         \"field\": \"Model name:\",\n         \"data\": \"13th Gen Intel(R) Core(TM) i9-13900K\"\n      },{\n         \"field\": \"CPU family:\",\n         \"data\": \"6\"\n      },{\n         \"field\": \"Model:\",\n         \"data\": \"183\"\n      },{\n         \"field\": \"Thread(s) per core:\",\n         \"data\": \"2\"\n      },{\n         \"field\": \"Core(s) per socket:\",\n         \"data\": \"24\"\n      },{\n         \"field\": \"Socket(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"Stepping:\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"CPU max MHz:\",\n         \"data\": \"5800.0000\"\n      },{\n         \"field\": \"CPU min MHz:\",\n         \"data\": \"800.0000\"\n      },{\n         \"field\": \"BogoMIPS:\",\n         \"data\": \"5990.40\"\n      },{\n         \"field\": \"Flags:\",\n         \"data\": \"fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq tme rdpid movdiri movdir64b fsrm md_clear serialize pconfig arch_lbr ibt flush_l1d arch_capabilities ibpb_exit_to_user\"\n      },{\n         \"field\": \"Virtualization:\",\n         \"data\": \"VT-x\"\n      },{\n         \"field\": \"L1d cache:\",\n         \"data\": \"896 KiB (24 instances)\"\n      },{\n         \"field\": \"L1i cache:\",\n         \"data\": \"1.3 MiB (24 instances)\"\n      },{\n         \"field\": \"L2 cache:\",\n         \"data\": \"32 MiB (12 instances)\"\n      },{\n         \"field\": \"L3 cache:\",\n         \"data\": \"36 MiB (1 instance)\"\n      },{\n         \"field\": \"NUMA node(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"NUMA node0 CPU(s):\",\n         \"data\": \"0-31\"\n      },{\n         \"field\": \"Vulnerability Gather data sampling:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Indirect target selection:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Itlb multihit:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability L1tf:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Meltdown:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mmio stale data:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Reg file data sampling:\",\n         \"data\": \"Mitigation; Clear Register File\"\n      },{\n         \"field\": \"Vulnerability Retbleed:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec rstack overflow:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec store bypass:\",\n         \"data\": \"Mitigation; Speculative Store Bypass disabled via prctl\"\n      },{\n         \"field\": \"Vulnerability Spectre v1:\",\n         \"data\": \"Mitigation; usercopy/swapgs barriers and __user pointer sanitization\"\n      },{\n         \"field\": \"Vulnerability Spectre v2:\",\n         \"data\": \"Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\"\n      },{\n         \"field\": \"Vulnerability Srbds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsa:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsx async abort:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Vmscape:\",\n         \"data\": \"Mitigation; IBPB before exit to userspace\"\n      }\n   ]\n}\n"
+      },
+      "measurement": "File reads, imports, fixture/oracle validation excluded. First-process trial then repeat fresh-input trials. Each measures WKB ingress, completed index construction, first query, repeated query. CUDA synchronized. Host pairs/distances included; correctness and visit telemetry excluded. Hierarchy is experimental FP64 point/segment execution, not public dispatch. Fixed-k is exactly-one diagnostic; bounds preparation excluded. Disk compilation cache may be warm.",
+      "median_s": {
+        "ingress_s": 1.941078947391361,
+        "build_s": 1.3753990400582552,
+        "first_query_s": 0.8053085999563336,
+        "warm_query_s": 0.8014489761553705
+      },
+      "artifact_path": "/tmp/vibespatial-osm/nearest-experiments/e3-shapely-100k.json",
+      "combined_medians_s": {
+        "build_plus_first_query": 2.1790019259788096,
+        "ingress_build_first_query": 4.117333542089909
+      }
+    },
+    "hierarchy-100k": {
+      "backend": "hierarchy",
+      "rows": 100000,
+      "segments": 8728450,
+      "leaf_width": 8,
+      "script_sha256": "90e0f11ae99329931e6cab9ea705e409e5359a4e41ad34e923688d8edb08b333",
+      "fixture": {
+        "identity": {
+          "source_sha256": "d7f2220cf2d0ed6b6eeb432f1986c27799a7248bd5ec6f24746fdf1d53c17263",
+          "source_bytes": 310023499,
+          "crs": "EPSG:26986",
+          "filters": {
+            "lines": "highway IS NOT NULL",
+            "multipolygons": "building IS NOT NULL AND building <> 'no'"
+          },
+          "seed": 20260910,
+          "script_sha256": "bf6f9030dc5a0dadc4258d9cba23fa74f6ef4cb7f3fa725aa5f4ef43fb32b559",
+          "packages": {
+            "pyogrio": "0.12.1",
+            "pyproj": "3.7.2",
+            "shapely": "2.1.2",
+            "numpy": "2.4.3",
+            "pyarrow": "23.0.1"
+          }
+        },
+        "created": "2026-09-10T13:25:18.394992+00:00",
+        "files": {
+          "roads": {
+            "rows": 991441,
+            "coordinates": 9719891,
+            "sha256": "f6a1ccd2632add25e26635b36675fedfc6c1c4bb42eab0fe7ff470655367b28d"
+          },
+          "segments": {
+            "rows": 8728450,
+            "coordinates": 17456900,
+            "sha256": "823f3fad68c7ed4a3711521526017334c3024c9708fd09c46e52f23b74ca619e"
+          },
+          "points": {
+            "rows": 2680339,
+            "coordinates": 2680339,
+            "sha256": "f3e83bb44b8a7642cc2c1f9be1eb77a76aa3231bfb17bc81ed2157ac54c75d3a"
+          }
+        },
+        "preparation_seconds": 30.53242320381105,
+        "stages": {
+          "read_filter_project_lines_seconds": 5.684012120123953,
+          "read_filter_project_multipolygons_seconds": 17.871698814909905,
+          "representative_points_seconds": 0.5715957349166274,
+          "segment_roads_seconds": 1.2371748299337924
+        },
+        "contract": "All highway-tagged line ways (including paths); building-tagged areas except no. Point-on-surface after projection. No topology repair. Parent rows reference filtered roads. Two-vertex segments retain zero-length edges. No segment-to-road deduplication in timing."
+      },
+      "oracle_sha256": "7c7216b66c0ac800e7c204b631eea8bec6471f2cba3280f85480299058b97c15",
+      "status": "passed",
+      "trials": [
+        {
+          "ingress_s": 0.5328349419869483,
+          "build_s": 0.025437063071876764,
+          "first_query_s": 0.07235275488346815,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 0.0654008942656219,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "first_pass_mean_nodes": 685.24566,
+          "first_pass_mean_segments": 324.38608,
+          "retained_index_bytes": 448441928
+        },
+        {
+          "ingress_s": 0.43930110475048423,
+          "build_s": 0.013953040353953838,
+          "first_query_s": 0.06511165713891387,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 0.06555837905034423,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "first_pass_mean_nodes": 685.24566,
+          "first_pass_mean_segments": 324.38608,
+          "retained_index_bytes": 448441928
+        },
+        {
+          "ingress_s": 0.4296639380045235,
+          "build_s": 0.013907304964959621,
+          "first_query_s": 0.06527137290686369,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 0.06547541311010718,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "first_pass_mean_nodes": 685.24566,
+          "first_pass_mean_segments": 324.38608,
+          "retained_index_bytes": 448441928
+        },
+        {
+          "ingress_s": 0.42127316212281585,
+          "build_s": 0.01395453792065382,
+          "first_query_s": 0.06534450873732567,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 0.06533020315691829,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 105748,
+            "oracle_pairs": 105748,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "first_pass_mean_nodes": 685.24566,
+          "first_pass_mean_segments": 324.38608,
+          "retained_index_bytes": 448441928
+        }
+      ],
+      "environment": {
+        "created": "2026-09-10T14:33:03.681756+00:00",
+        "python": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+        "host": "picard-4090",
+        "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.35",
+        "packages": {
+          "shapely": "2.1.2",
+          "numpy": "2.4.3",
+          "pyarrow": "23.0.1",
+          "cupy-cuda12x": "14.0.1"
+        },
+        "git_head": "6c09268cb8a629024b8efd288514e0f5754e511e",
+        "lock_sha256": "60942838f44a9792dfc8a49371e8a1367a59e8d858e39ed827dfa735e0d615fe",
+        "gpu": "NVIDIA GeForce RTX 4090, 580.173.02",
+        "cpu": "{\n   \"lscpu\": [\n      {\n         \"field\": \"Architecture:\",\n         \"data\": \"x86_64\"\n      },{\n         \"field\": \"CPU op-mode(s):\",\n         \"data\": \"32-bit, 64-bit\"\n      },{\n         \"field\": \"Address sizes:\",\n         \"data\": \"46 bits physical, 48 bits virtual\"\n      },{\n         \"field\": \"Byte Order:\",\n         \"data\": \"Little Endian\"\n      },{\n         \"field\": \"CPU(s):\",\n         \"data\": \"32\"\n      },{\n         \"field\": \"On-line CPU(s) list:\",\n         \"data\": \"0-31\"\n      },{\n         \"field\": \"Vendor ID:\",\n         \"data\": \"GenuineIntel\"\n      },{\n         \"field\": \"Model name:\",\n         \"data\": \"13th Gen Intel(R) Core(TM) i9-13900K\"\n      },{\n         \"field\": \"CPU family:\",\n         \"data\": \"6\"\n      },{\n         \"field\": \"Model:\",\n         \"data\": \"183\"\n      },{\n         \"field\": \"Thread(s) per core:\",\n         \"data\": \"2\"\n      },{\n         \"field\": \"Core(s) per socket:\",\n         \"data\": \"24\"\n      },{\n         \"field\": \"Socket(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"Stepping:\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"CPU max MHz:\",\n         \"data\": \"5800.0000\"\n      },{\n         \"field\": \"CPU min MHz:\",\n         \"data\": \"800.0000\"\n      },{\n         \"field\": \"BogoMIPS:\",\n         \"data\": \"5990.40\"\n      },{\n         \"field\": \"Flags:\",\n         \"data\": \"fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq tme rdpid movdiri movdir64b fsrm md_clear serialize pconfig arch_lbr ibt flush_l1d arch_capabilities ibpb_exit_to_user\"\n      },{\n         \"field\": \"Virtualization:\",\n         \"data\": \"VT-x\"\n      },{\n         \"field\": \"L1d cache:\",\n         \"data\": \"896 KiB (24 instances)\"\n      },{\n         \"field\": \"L1i cache:\",\n         \"data\": \"1.3 MiB (24 instances)\"\n      },{\n         \"field\": \"L2 cache:\",\n         \"data\": \"32 MiB (12 instances)\"\n      },{\n         \"field\": \"L3 cache:\",\n         \"data\": \"36 MiB (1 instance)\"\n      },{\n         \"field\": \"NUMA node(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"NUMA node0 CPU(s):\",\n         \"data\": \"0-31\"\n      },{\n         \"field\": \"Vulnerability Gather data sampling:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Indirect target selection:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Itlb multihit:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability L1tf:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Meltdown:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mmio stale data:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Reg file data sampling:\",\n         \"data\": \"Mitigation; Clear Register File\"\n      },{\n         \"field\": \"Vulnerability Retbleed:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec rstack overflow:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec store bypass:\",\n         \"data\": \"Mitigation; Speculative Store Bypass disabled via prctl\"\n      },{\n         \"field\": \"Vulnerability Spectre v1:\",\n         \"data\": \"Mitigation; usercopy/swapgs barriers and __user pointer sanitization\"\n      },{\n         \"field\": \"Vulnerability Spectre v2:\",\n         \"data\": \"Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\"\n      },{\n         \"field\": \"Vulnerability Srbds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsa:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsx async abort:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Vmscape:\",\n         \"data\": \"Mitigation; IBPB before exit to userspace\"\n      }\n   ]\n}\n"
+      },
+      "measurement": "File reads, imports, fixture/oracle validation excluded. First-process trial then repeat fresh-input trials. Each measures WKB ingress, completed index construction, first query, repeated query. CUDA synchronized. Host pairs/distances included; correctness and visit telemetry excluded. Hierarchy is experimental FP64 point/segment execution, not public dispatch. Fixed-k is exactly-one diagnostic; bounds preparation excluded. Disk compilation cache may be warm.",
+      "median_s": {
+        "ingress_s": 0.4296639380045235,
+        "build_s": 0.013953040353953838,
+        "first_query_s": 0.06527137290686369,
+        "warm_query_s": 0.06547541311010718
+      },
+      "artifact_path": "/tmp/vibespatial-osm/nearest-experiments/e3-hierarchy-100k.json",
+      "combined_medians_s": {
+        "build_plus_first_query": 0.07917867787182331,
+        "ingress_build_first_query": 0.5088426158763468
+      }
+    },
+    "shapely-1m": {
+      "backend": "shapely",
+      "rows": 1000000,
+      "segments": 8728450,
+      "leaf_width": 8,
+      "script_sha256": "d84249e4eb88c7b69afbf7cdd39925a50f5279538e45b190c9e4551dd711c679",
+      "fixture": {
+        "identity": {
+          "source_sha256": "d7f2220cf2d0ed6b6eeb432f1986c27799a7248bd5ec6f24746fdf1d53c17263",
+          "source_bytes": 310023499,
+          "crs": "EPSG:26986",
+          "filters": {
+            "lines": "highway IS NOT NULL",
+            "multipolygons": "building IS NOT NULL AND building <> 'no'"
+          },
+          "seed": 20260910,
+          "script_sha256": "bf6f9030dc5a0dadc4258d9cba23fa74f6ef4cb7f3fa725aa5f4ef43fb32b559",
+          "packages": {
+            "pyogrio": "0.12.1",
+            "pyproj": "3.7.2",
+            "shapely": "2.1.2",
+            "numpy": "2.4.3",
+            "pyarrow": "23.0.1"
+          }
+        },
+        "created": "2026-09-10T13:25:18.394992+00:00",
+        "files": {
+          "roads": {
+            "rows": 991441,
+            "coordinates": 9719891,
+            "sha256": "f6a1ccd2632add25e26635b36675fedfc6c1c4bb42eab0fe7ff470655367b28d"
+          },
+          "segments": {
+            "rows": 8728450,
+            "coordinates": 17456900,
+            "sha256": "823f3fad68c7ed4a3711521526017334c3024c9708fd09c46e52f23b74ca619e"
+          },
+          "points": {
+            "rows": 2680339,
+            "coordinates": 2680339,
+            "sha256": "f3e83bb44b8a7642cc2c1f9be1eb77a76aa3231bfb17bc81ed2157ac54c75d3a"
+          }
+        },
+        "preparation_seconds": 30.53242320381105,
+        "stages": {
+          "read_filter_project_lines_seconds": 5.684012120123953,
+          "read_filter_project_multipolygons_seconds": 17.871698814909905,
+          "representative_points_seconds": 0.5715957349166274,
+          "segment_roads_seconds": 1.2371748299337924
+        },
+        "contract": "All highway-tagged line ways (including paths); building-tagged areas except no. Point-on-surface after projection. No topology repair. Parent rows reference filtered roads. Two-vertex segments retain zero-length edges. No segment-to-road deduplication in timing."
+      },
+      "oracle_sha256": "7c7216b66c0ac800e7c204b631eea8bec6471f2cba3280f85480299058b97c15",
+      "status": "passed",
+      "trials": [
+        {
+          "ingress_s": 2.448314448352903,
+          "build_s": 1.3702701730653644,
+          "first_query_s": 7.939013985916972,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 8.01907990500331,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          }
+        },
+        {
+          "ingress_s": 2.090248479973525,
+          "build_s": 1.3798590539954603,
+          "first_query_s": 7.896915447898209,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 7.987221899908036,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          }
+        },
+        {
+          "ingress_s": 2.20699414703995,
+          "build_s": 1.374893406406045,
+          "first_query_s": 8.008274576161057,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 7.966960001271218,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          }
+        },
+        {
+          "ingress_s": 2.0062709879130125,
+          "build_s": 1.3767118668183684,
+          "first_query_s": 7.958872745744884,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 7.997927188873291,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          }
+        }
+      ],
+      "environment": {
+        "created": "2026-09-10T14:30:30.372801+00:00",
+        "python": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+        "host": "picard-4090",
+        "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.35",
+        "packages": {
+          "shapely": "2.1.2",
+          "numpy": "2.4.3",
+          "pyarrow": "23.0.1",
+          "cupy-cuda12x": "14.0.1"
+        },
+        "git_head": "6c09268cb8a629024b8efd288514e0f5754e511e",
+        "lock_sha256": "60942838f44a9792dfc8a49371e8a1367a59e8d858e39ed827dfa735e0d615fe",
+        "gpu": "NVIDIA GeForce RTX 4090, 580.173.02",
+        "cpu": "{\n   \"lscpu\": [\n      {\n         \"field\": \"Architecture:\",\n         \"data\": \"x86_64\"\n      },{\n         \"field\": \"CPU op-mode(s):\",\n         \"data\": \"32-bit, 64-bit\"\n      },{\n         \"field\": \"Address sizes:\",\n         \"data\": \"46 bits physical, 48 bits virtual\"\n      },{\n         \"field\": \"Byte Order:\",\n         \"data\": \"Little Endian\"\n      },{\n         \"field\": \"CPU(s):\",\n         \"data\": \"32\"\n      },{\n         \"field\": \"On-line CPU(s) list:\",\n         \"data\": \"0-31\"\n      },{\n         \"field\": \"Vendor ID:\",\n         \"data\": \"GenuineIntel\"\n      },{\n         \"field\": \"Model name:\",\n         \"data\": \"13th Gen Intel(R) Core(TM) i9-13900K\"\n      },{\n         \"field\": \"CPU family:\",\n         \"data\": \"6\"\n      },{\n         \"field\": \"Model:\",\n         \"data\": \"183\"\n      },{\n         \"field\": \"Thread(s) per core:\",\n         \"data\": \"2\"\n      },{\n         \"field\": \"Core(s) per socket:\",\n         \"data\": \"24\"\n      },{\n         \"field\": \"Socket(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"Stepping:\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"CPU max MHz:\",\n         \"data\": \"5800.0000\"\n      },{\n         \"field\": \"CPU min MHz:\",\n         \"data\": \"800.0000\"\n      },{\n         \"field\": \"BogoMIPS:\",\n         \"data\": \"5990.40\"\n      },{\n         \"field\": \"Flags:\",\n         \"data\": \"fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq tme rdpid movdiri movdir64b fsrm md_clear serialize pconfig arch_lbr ibt flush_l1d arch_capabilities ibpb_exit_to_user\"\n      },{\n         \"field\": \"Virtualization:\",\n         \"data\": \"VT-x\"\n      },{\n         \"field\": \"L1d cache:\",\n         \"data\": \"896 KiB (24 instances)\"\n      },{\n         \"field\": \"L1i cache:\",\n         \"data\": \"1.3 MiB (24 instances)\"\n      },{\n         \"field\": \"L2 cache:\",\n         \"data\": \"32 MiB (12 instances)\"\n      },{\n         \"field\": \"L3 cache:\",\n         \"data\": \"36 MiB (1 instance)\"\n      },{\n         \"field\": \"NUMA node(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"NUMA node0 CPU(s):\",\n         \"data\": \"0-31\"\n      },{\n         \"field\": \"Vulnerability Gather data sampling:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Indirect target selection:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Itlb multihit:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability L1tf:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Meltdown:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mmio stale data:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Reg file data sampling:\",\n         \"data\": \"Mitigation; Clear Register File\"\n      },{\n         \"field\": \"Vulnerability Retbleed:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec rstack overflow:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec store bypass:\",\n         \"data\": \"Mitigation; Speculative Store Bypass disabled via prctl\"\n      },{\n         \"field\": \"Vulnerability Spectre v1:\",\n         \"data\": \"Mitigation; usercopy/swapgs barriers and __user pointer sanitization\"\n      },{\n         \"field\": \"Vulnerability Spectre v2:\",\n         \"data\": \"Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\"\n      },{\n         \"field\": \"Vulnerability Srbds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsa:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsx async abort:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Vmscape:\",\n         \"data\": \"Mitigation; IBPB before exit to userspace\"\n      }\n   ]\n}\n"
+      },
+      "measurement": "File reads, imports, fixture/oracle validation excluded. First-process trial then repeat fresh-input trials. Each measures WKB ingress, completed index construction, first query, repeated query. CUDA synchronized. Host pairs/distances included; correctness and visit telemetry excluded. Hierarchy is experimental FP64 point/segment execution, not public dispatch. Fixed-k is exactly-one diagnostic; bounds preparation excluded. Disk compilation cache may be warm.",
+      "median_s": {
+        "ingress_s": 2.090248479973525,
+        "build_s": 1.3767118668183684,
+        "first_query_s": 7.958872745744884,
+        "warm_query_s": 7.987221899908036
+      },
+      "artifact_path": "/tmp/vibespatial-osm/nearest-experiments/e3-shapely-1m.json",
+      "combined_medians_s": {
+        "build_plus_first_query": 9.335584612563252,
+        "ingress_build_first_query": 11.367022981867194
+      }
+    },
+    "hierarchy-1m": {
+      "backend": "hierarchy",
+      "rows": 1000000,
+      "segments": 8728450,
+      "leaf_width": 8,
+      "script_sha256": "90e0f11ae99329931e6cab9ea705e409e5359a4e41ad34e923688d8edb08b333",
+      "fixture": {
+        "identity": {
+          "source_sha256": "d7f2220cf2d0ed6b6eeb432f1986c27799a7248bd5ec6f24746fdf1d53c17263",
+          "source_bytes": 310023499,
+          "crs": "EPSG:26986",
+          "filters": {
+            "lines": "highway IS NOT NULL",
+            "multipolygons": "building IS NOT NULL AND building <> 'no'"
+          },
+          "seed": 20260910,
+          "script_sha256": "bf6f9030dc5a0dadc4258d9cba23fa74f6ef4cb7f3fa725aa5f4ef43fb32b559",
+          "packages": {
+            "pyogrio": "0.12.1",
+            "pyproj": "3.7.2",
+            "shapely": "2.1.2",
+            "numpy": "2.4.3",
+            "pyarrow": "23.0.1"
+          }
+        },
+        "created": "2026-09-10T13:25:18.394992+00:00",
+        "files": {
+          "roads": {
+            "rows": 991441,
+            "coordinates": 9719891,
+            "sha256": "f6a1ccd2632add25e26635b36675fedfc6c1c4bb42eab0fe7ff470655367b28d"
+          },
+          "segments": {
+            "rows": 8728450,
+            "coordinates": 17456900,
+            "sha256": "823f3fad68c7ed4a3711521526017334c3024c9708fd09c46e52f23b74ca619e"
+          },
+          "points": {
+            "rows": 2680339,
+            "coordinates": 2680339,
+            "sha256": "f3e83bb44b8a7642cc2c1f9be1eb77a76aa3231bfb17bc81ed2157ac54c75d3a"
+          }
+        },
+        "preparation_seconds": 30.53242320381105,
+        "stages": {
+          "read_filter_project_lines_seconds": 5.684012120123953,
+          "read_filter_project_multipolygons_seconds": 17.871698814909905,
+          "representative_points_seconds": 0.5715957349166274,
+          "segment_roads_seconds": 1.2371748299337924
+        },
+        "contract": "All highway-tagged line ways (including paths); building-tagged areas except no. Point-on-surface after projection. No topology repair. Parent rows reference filtered roads. Two-vertex segments retain zero-length edges. No segment-to-road deduplication in timing."
+      },
+      "oracle_sha256": "7c7216b66c0ac800e7c204b631eea8bec6471f2cba3280f85480299058b97c15",
+      "status": "passed",
+      "trials": [
+        {
+          "ingress_s": 0.5547977522946894,
+          "build_s": 0.02727211220189929,
+          "first_query_s": 0.5245037018321455,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 0.5107273049652576,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "first_pass_mean_nodes": 686.390448,
+          "first_pass_mean_segments": 324.694488,
+          "retained_index_bytes": 448441928
+        },
+        {
+          "ingress_s": 0.46427940111607313,
+          "build_s": 0.013910301961004734,
+          "first_query_s": 0.5083326222375035,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 0.5102010616101325,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "first_pass_mean_nodes": 686.390448,
+          "first_pass_mean_segments": 324.694488,
+          "retained_index_bytes": 448441928
+        },
+        {
+          "ingress_s": 0.4582405569963157,
+          "build_s": 0.01391493296250701,
+          "first_query_s": 0.5080497078597546,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 0.5101479417644441,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "first_pass_mean_nodes": 686.390448,
+          "first_pass_mean_segments": 324.694488,
+          "retained_index_bytes": 448441928
+        },
+        {
+          "ingress_s": 0.45959507301449776,
+          "build_s": 0.013908045832067728,
+          "first_query_s": 0.5081819966435432,
+          "first_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "warm_query_s": 0.5101347197778523,
+          "warm_query_s_parity": {
+            "passed": true,
+            "pairs_equal": true,
+            "finite_nonnegative_distances": true,
+            "candidate_pairs": 1057555,
+            "oracle_pairs": 1057555,
+            "max_distance_error_m": 0.0,
+            "rtol": 1e-10,
+            "atol_m": 1e-06
+          },
+          "first_pass_mean_nodes": 686.390448,
+          "first_pass_mean_segments": 324.694488,
+          "retained_index_bytes": 448441928
+        }
+      ],
+      "environment": {
+        "created": "2026-09-10T14:34:02.558642+00:00",
+        "python": "3.13.12 (main, Feb  3 2026, 22:52:12) [Clang 21.1.4 ]",
+        "host": "picard-4090",
+        "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.35",
+        "packages": {
+          "shapely": "2.1.2",
+          "numpy": "2.4.3",
+          "pyarrow": "23.0.1",
+          "cupy-cuda12x": "14.0.1"
+        },
+        "git_head": "6c09268cb8a629024b8efd288514e0f5754e511e",
+        "lock_sha256": "60942838f44a9792dfc8a49371e8a1367a59e8d858e39ed827dfa735e0d615fe",
+        "gpu": "NVIDIA GeForce RTX 4090, 580.173.02",
+        "cpu": "{\n   \"lscpu\": [\n      {\n         \"field\": \"Architecture:\",\n         \"data\": \"x86_64\"\n      },{\n         \"field\": \"CPU op-mode(s):\",\n         \"data\": \"32-bit, 64-bit\"\n      },{\n         \"field\": \"Address sizes:\",\n         \"data\": \"46 bits physical, 48 bits virtual\"\n      },{\n         \"field\": \"Byte Order:\",\n         \"data\": \"Little Endian\"\n      },{\n         \"field\": \"CPU(s):\",\n         \"data\": \"32\"\n      },{\n         \"field\": \"On-line CPU(s) list:\",\n         \"data\": \"0-31\"\n      },{\n         \"field\": \"Vendor ID:\",\n         \"data\": \"GenuineIntel\"\n      },{\n         \"field\": \"Model name:\",\n         \"data\": \"13th Gen Intel(R) Core(TM) i9-13900K\"\n      },{\n         \"field\": \"CPU family:\",\n         \"data\": \"6\"\n      },{\n         \"field\": \"Model:\",\n         \"data\": \"183\"\n      },{\n         \"field\": \"Thread(s) per core:\",\n         \"data\": \"2\"\n      },{\n         \"field\": \"Core(s) per socket:\",\n         \"data\": \"24\"\n      },{\n         \"field\": \"Socket(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"Stepping:\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"CPU max MHz:\",\n         \"data\": \"5800.0000\"\n      },{\n         \"field\": \"CPU min MHz:\",\n         \"data\": \"800.0000\"\n      },{\n         \"field\": \"BogoMIPS:\",\n         \"data\": \"5990.40\"\n      },{\n         \"field\": \"Flags:\",\n         \"data\": \"fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq tme rdpid movdiri movdir64b fsrm md_clear serialize pconfig arch_lbr ibt flush_l1d arch_capabilities ibpb_exit_to_user\"\n      },{\n         \"field\": \"Virtualization:\",\n         \"data\": \"VT-x\"\n      },{\n         \"field\": \"L1d cache:\",\n         \"data\": \"896 KiB (24 instances)\"\n      },{\n         \"field\": \"L1i cache:\",\n         \"data\": \"1.3 MiB (24 instances)\"\n      },{\n         \"field\": \"L2 cache:\",\n         \"data\": \"32 MiB (12 instances)\"\n      },{\n         \"field\": \"L3 cache:\",\n         \"data\": \"36 MiB (1 instance)\"\n      },{\n         \"field\": \"NUMA node(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"NUMA node0 CPU(s):\",\n         \"data\": \"0-31\"\n      },{\n         \"field\": \"Vulnerability Gather data sampling:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Indirect target selection:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Itlb multihit:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability L1tf:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Meltdown:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mmio stale data:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Reg file data sampling:\",\n         \"data\": \"Mitigation; Clear Register File\"\n      },{\n         \"field\": \"Vulnerability Retbleed:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec rstack overflow:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec store bypass:\",\n         \"data\": \"Mitigation; Speculative Store Bypass disabled via prctl\"\n      },{\n         \"field\": \"Vulnerability Spectre v1:\",\n         \"data\": \"Mitigation; usercopy/swapgs barriers and __user pointer sanitization\"\n      },{\n         \"field\": \"Vulnerability Spectre v2:\",\n         \"data\": \"Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\"\n      },{\n         \"field\": \"Vulnerability Srbds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsa:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsx async abort:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Vmscape:\",\n         \"data\": \"Mitigation; IBPB before exit to userspace\"\n      }\n   ]\n}\n"
+      },
+      "measurement": "File reads, imports, fixture/oracle validation excluded. First-process trial then repeat fresh-input trials. Each measures WKB ingress, completed index construction, first query, repeated query. CUDA synchronized. Host pairs/distances included; correctness and visit telemetry excluded. Hierarchy is experimental FP64 point/segment execution, not public dispatch. Fixed-k is exactly-one diagnostic; bounds preparation excluded. Disk compilation cache may be warm.",
+      "median_s": {
+        "ingress_s": 0.45959507301449776,
+        "build_s": 0.013910301961004734,
+        "first_query_s": 0.5081819966435432,
+        "warm_query_s": 0.5101479417644441
+      },
+      "artifact_path": "/tmp/vibespatial-osm/nearest-experiments/e3-hierarchy-1m.json",
+      "combined_medians_s": {
+        "build_plus_first_query": 0.522090042475611,
+        "ingress_build_first_query": 0.9816851154901087
+      }
+    }
+  },
+  "fixed_k_diagnostic": {
+    "status": "timeout",
+    "wrapper_exit_code": 124,
+    "whole_process_timeout_s": 90,
+    "artifact": "/tmp/vibespatial-osm/nearest-experiments/e1-fixed-k-1k.json",
+    "query_completed": false
+  },
+  "public_api_acceptance": "pending",
+  "verification": {
+    "targeted_tests": {
+      "passed": 10,
+      "seconds": 4.04,
+      "log": "/tmp/vibespatial-osm/nearest-experiments/pytest-final.log"
+    },
+    "smoke": {
+      "cases_passed": 6,
+      "pairs_per_case": 1010,
+      "maximum_distance_difference": 0
+    },
+    "compute_sanitizer": {
+      "tool": "memcheck",
+      "errors": 0,
+      "exit_code": 0,
+      "log": "/tmp/vibespatial-osm/nearest-experiments/memcheck.log"
+    },
+    "full_pipeline_profile": {
+      "command": "uv run python scripts/benchmark_pipelines.py --suite full --repeat 1 --gpu-sparkline",
+      "result_count": 24,
+      "stages": [
+        {
+          "pipeline": "join-heavy",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "read_points",
+          "device": "gpu",
+          "seconds": 0.019851560704410076
+        },
+        {
+          "pipeline": "join-heavy",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "read_polygons",
+          "device": "gpu",
+          "seconds": 0.004102148115634918
+        },
+        {
+          "pipeline": "join-heavy",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "build_index",
+          "device": "cpu",
+          "seconds": 0.00021544191986322403
+        },
+        {
+          "pipeline": "join-heavy",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "sjoin_query",
+          "device": "gpu",
+          "seconds": 0.0013599377125501633
+        },
+        {
+          "pipeline": "join-heavy",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "assemble_join_rows",
+          "device": "gpu",
+          "seconds": 0.0010888301767408848
+        },
+        {
+          "pipeline": "join-heavy",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "dissolve_groups",
+          "device": "gpu",
+          "seconds": 0.0036278250627219677
+        },
+        {
+          "pipeline": "join-heavy",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "write_output",
+          "device": "gpu",
+          "seconds": 0.003457262646406889
+        },
+        {
+          "pipeline": "relation-semijoin",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "read_inputs",
+          "device": "gpu",
+          "seconds": 0.016932640224695206
+        },
+        {
+          "pipeline": "relation-semijoin",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "build_index",
+          "device": "gpu",
+          "seconds": 0.00020822463557124138
+        },
+        {
+          "pipeline": "relation-semijoin",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "sjoin_relation",
+          "device": "gpu",
+          "seconds": 0.0005675326101481915
+        },
+        {
+          "pipeline": "relation-semijoin",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "semijoin_rowset",
+          "device": "gpu",
+          "seconds": 0.0003714771009981632
+        },
+        {
+          "pipeline": "relation-semijoin",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "subset_rows",
+          "device": "gpu",
+          "seconds": 0.0009332387708127499
+        },
+        {
+          "pipeline": "relation-semijoin",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "write_output",
+          "device": "gpu",
+          "seconds": 0.004133975133299828
+        },
+        {
+          "pipeline": "small-grouped-constructive-reduce",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "build_device_grouped_polygons",
+          "device": "gpu",
+          "seconds": 0.037444755900651217
+        },
+        {
+          "pipeline": "small-grouped-constructive-reduce",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "native_grouped_union",
+          "device": "gpu",
+          "seconds": 0.05312309321016073
+        },
+        {
+          "pipeline": "small-grouped-constructive-reduce",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "native_reference_check",
+          "device": "gpu",
+          "seconds": 4.230299964547157e-05
+        },
+        {
+          "pipeline": "grouped-capacity-partitions",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "build_grouped_partition_fixtures",
+          "device": "gpu",
+          "seconds": 0.05030456464737654
+        },
+        {
+          "pipeline": "grouped-capacity-partitions",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "mixed_strip_exact_union",
+          "device": "gpu",
+          "seconds": 0.06705857114866376
+        },
+        {
+          "pipeline": "grouped-capacity-partitions",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "positive_degenerate_union",
+          "device": "gpu",
+          "seconds": 0.061128329019993544
+        },
+        {
+          "pipeline": "grouped-capacity-partitions",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "native_reference_check",
+          "device": "gpu",
+          "seconds": 2.5798100978136063e-05
+        },
+        {
+          "pipeline": "grouped-disjoint-constructive-reduce",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "build_device_disjoint_groups",
+          "device": "gpu",
+          "seconds": 0.06692406488582492
+        },
+        {
+          "pipeline": "grouped-disjoint-constructive-reduce",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "native_grouped_disjoint_subset",
+          "device": "gpu",
+          "seconds": 0.0012830179184675217
+        },
+        {
+          "pipeline": "grouped-disjoint-constructive-reduce",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "native_reference_check",
+          "device": "gpu",
+          "seconds": 2.543022856116295e-05
+        },
+        {
+          "pipeline": "grouped-difference-constructive",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "build_device_grouped_difference_inputs",
+          "device": "gpu",
+          "seconds": 0.02673288295045495
+        },
+        {
+          "pipeline": "grouped-difference-constructive",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "native_grouped_difference",
+          "device": "gpu",
+          "seconds": 0.009774506092071533
+        },
+        {
+          "pipeline": "grouped-difference-constructive",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "native_reference_check",
+          "device": "gpu",
+          "seconds": 2.821860834956169e-05
+        },
+        {
+          "pipeline": "constructive-output-native",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "build_device_pairwise_boxes",
+          "device": "gpu",
+          "seconds": 0.0035617263056337833
+        },
+        {
+          "pipeline": "constructive-output-native",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "native_constructive_intersection",
+          "device": "gpu",
+          "seconds": 0.004338382743299007
+        },
+        {
+          "pipeline": "constructive-output-native",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "constructive_area_expression",
+          "device": "gpu",
+          "seconds": 0.001114982645958662
+        },
+        {
+          "pipeline": "constructive-output-native",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "constructive_expression_consumers",
+          "device": "gpu",
+          "seconds": 0.0021043000742793083
+        },
+        {
+          "pipeline": "constructive-output-native",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "native_reference_check",
+          "device": "gpu",
+          "seconds": 8.33095982670784e-05
+        },
+        {
+          "pipeline": "overlay-relation-constructive",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "build_native_overlay_inputs",
+          "device": "gpu",
+          "seconds": 0.006727908737957478
+        },
+        {
+          "pipeline": "overlay-relation-constructive",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "build_spatial_index",
+          "device": "gpu",
+          "seconds": 9.530270472168922e-05
+        },
+        {
+          "pipeline": "overlay-relation-constructive",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "candidate_relation",
+          "device": "gpu",
+          "seconds": 0.0006927107460796833
+        },
+        {
+          "pipeline": "overlay-relation-constructive",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "refine_relation",
+          "device": "gpu",
+          "seconds": 0.0002009938471019268
+        },
+        {
+          "pipeline": "overlay-relation-constructive",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "constructive_intersection",
+          "device": "gpu",
+          "seconds": 0.002786478027701378
+        },
+        {
+          "pipeline": "overlay-relation-constructive",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "native_tabular_projection",
+          "device": "gpu",
+          "seconds": 0.0009891740046441555
+        },
+        {
+          "pipeline": "overlay-relation-constructive",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "native_reference_check",
+          "device": "gpu",
+          "seconds": 2.5554094463586807e-05
+        },
+        {
+          "pipeline": "constructive",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "read_points",
+          "device": "gpu",
+          "seconds": 0.002621883060783148
+        },
+        {
+          "pipeline": "constructive",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "clip_points",
+          "device": "gpu",
+          "seconds": 0.00047470303252339363
+        },
+        {
+          "pipeline": "constructive",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "buffer_points",
+          "device": "gpu",
+          "seconds": 0.000593103002756834
+        },
+        {
+          "pipeline": "constructive",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "write_output",
+          "device": "gpu",
+          "seconds": 0.005482166074216366
+        },
+        {
+          "pipeline": "predicate-heavy",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "read_geojson",
+          "device": "gpu",
+          "seconds": 0.009123886935412884
+        },
+        {
+          "pipeline": "predicate-heavy",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "load_polygons",
+          "device": "gpu",
+          "seconds": 0.005336450412869453
+        },
+        {
+          "pipeline": "predicate-heavy",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "point_in_polygon",
+          "device": "gpu",
+          "seconds": 0.0013375231064856052
+        },
+        {
+          "pipeline": "predicate-heavy",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "filter_points",
+          "device": "gpu",
+          "seconds": 0.0003804001025855541
+        },
+        {
+          "pipeline": "predicate-heavy",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "write_output",
+          "device": "gpu",
+          "seconds": 0.0017084102146327496
+        },
+        {
+          "pipeline": "zero-transfer",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "read_input",
+          "device": "gpu",
+          "seconds": 0.004783678334206343
+        },
+        {
+          "pipeline": "zero-transfer",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "predicate_filter",
+          "device": "gpu",
+          "seconds": 0.00044344598427414894
+        },
+        {
+          "pipeline": "zero-transfer",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "subset_rows",
+          "device": "gpu",
+          "seconds": 0.0010408279486000538
+        },
+        {
+          "pipeline": "zero-transfer",
+          "scale": 100000,
+          "status": "ok",
+          "stage": "write_output",
+          "device": "gpu",
+          "seconds": 0.0027499529533088207
+        },
+        {
+          "pipeline": "join-heavy",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "read_points",
+          "device": "gpu",
+          "seconds": 0.0037642079405486584
+        },
+        {
+          "pipeline": "join-heavy",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "read_polygons",
+          "device": "gpu",
+          "seconds": 0.005771216936409473
+        },
+        {
+          "pipeline": "join-heavy",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "build_index",
+          "device": "cpu",
+          "seconds": 0.0002547949552536011
+        },
+        {
+          "pipeline": "join-heavy",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "sjoin_query",
+          "device": "gpu",
+          "seconds": 0.0006603221409022808
+        },
+        {
+          "pipeline": "join-heavy",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "assemble_join_rows",
+          "device": "gpu",
+          "seconds": 0.00044887978583574295
+        },
+        {
+          "pipeline": "join-heavy",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "dissolve_groups",
+          "device": "gpu",
+          "seconds": 0.002430487424135208
+        },
+        {
+          "pipeline": "join-heavy",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "write_output",
+          "device": "gpu",
+          "seconds": 0.016200988087803125
+        },
+        {
+          "pipeline": "relation-semijoin",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "read_inputs",
+          "device": "gpu",
+          "seconds": 0.010278275236487389
+        },
+        {
+          "pipeline": "relation-semijoin",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "build_index",
+          "device": "gpu",
+          "seconds": 0.00022512301802635193
+        },
+        {
+          "pipeline": "relation-semijoin",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "sjoin_relation",
+          "device": "gpu",
+          "seconds": 0.0005369842983782291
+        },
+        {
+          "pipeline": "relation-semijoin",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "semijoin_rowset",
+          "device": "gpu",
+          "seconds": 0.000362444669008255
+        },
+        {
+          "pipeline": "relation-semijoin",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "subset_rows",
+          "device": "gpu",
+          "seconds": 0.0008920957334339619
+        },
+        {
+          "pipeline": "relation-semijoin",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "write_output",
+          "device": "gpu",
+          "seconds": 0.0034225289709866047
+        },
+        {
+          "pipeline": "small-grouped-constructive-reduce",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "build_device_grouped_polygons",
+          "device": "gpu",
+          "seconds": 0.041835658717900515
+        },
+        {
+          "pipeline": "small-grouped-constructive-reduce",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "native_grouped_union",
+          "device": "gpu",
+          "seconds": 0.06497882911935449
+        },
+        {
+          "pipeline": "small-grouped-constructive-reduce",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "native_reference_check",
+          "device": "gpu",
+          "seconds": 4.458613693714142e-05
+        },
+        {
+          "pipeline": "grouped-capacity-partitions",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "build_grouped_partition_fixtures",
+          "device": "gpu",
+          "seconds": 0.04983281623572111
+        },
+        {
+          "pipeline": "grouped-capacity-partitions",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "mixed_strip_exact_union",
+          "device": "gpu",
+          "seconds": 0.07533808192238212
+        },
+        {
+          "pipeline": "grouped-capacity-partitions",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "positive_degenerate_union",
+          "device": "gpu",
+          "seconds": 0.05969631392508745
+        },
+        {
+          "pipeline": "grouped-capacity-partitions",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "native_reference_check",
+          "device": "gpu",
+          "seconds": 2.3074913769960403e-05
+        },
+        {
+          "pipeline": "grouped-disjoint-constructive-reduce",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "build_device_disjoint_groups",
+          "device": "gpu",
+          "seconds": 0.06522479699924588
+        },
+        {
+          "pipeline": "grouped-disjoint-constructive-reduce",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "native_grouped_disjoint_subset",
+          "device": "gpu",
+          "seconds": 0.001365720760077238
+        },
+        {
+          "pipeline": "grouped-disjoint-constructive-reduce",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "native_reference_check",
+          "device": "gpu",
+          "seconds": 2.671079710125923e-05
+        },
+        {
+          "pipeline": "grouped-difference-constructive",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "build_device_grouped_difference_inputs",
+          "device": "gpu",
+          "seconds": 0.027483751066029072
+        },
+        {
+          "pipeline": "grouped-difference-constructive",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "native_grouped_difference",
+          "device": "gpu",
+          "seconds": 0.010102290194481611
+        },
+        {
+          "pipeline": "grouped-difference-constructive",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "native_reference_check",
+          "device": "gpu",
+          "seconds": 3.0448194593191147e-05
+        },
+        {
+          "pipeline": "constructive-output-native",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "build_device_pairwise_boxes",
+          "device": "gpu",
+          "seconds": 0.0035650008358061314
+        },
+        {
+          "pipeline": "constructive-output-native",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "native_constructive_intersection",
+          "device": "gpu",
+          "seconds": 0.0033715059980750084
+        },
+        {
+          "pipeline": "constructive-output-native",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "constructive_area_expression",
+          "device": "gpu",
+          "seconds": 0.0010867668315768242
+        },
+        {
+          "pipeline": "constructive-output-native",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "constructive_expression_consumers",
+          "device": "gpu",
+          "seconds": 0.0014951671473681927
+        },
+        {
+          "pipeline": "constructive-output-native",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "native_reference_check",
+          "device": "gpu",
+          "seconds": 2.7105677872896194e-05
+        },
+        {
+          "pipeline": "overlay-relation-constructive",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "build_native_overlay_inputs",
+          "device": "gpu",
+          "seconds": 0.006496737711131573
+        },
+        {
+          "pipeline": "overlay-relation-constructive",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "build_spatial_index",
+          "device": "gpu",
+          "seconds": 9.484868496656418e-05
+        },
+        {
+          "pipeline": "overlay-relation-constructive",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "candidate_relation",
+          "device": "gpu",
+          "seconds": 0.0007223482243716717
+        },
+        {
+          "pipeline": "overlay-relation-constructive",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "refine_relation",
+          "device": "gpu",
+          "seconds": 0.00021392526105046272
+        },
+        {
+          "pipeline": "overlay-relation-constructive",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "constructive_intersection",
+          "device": "gpu",
+          "seconds": 0.0026910416781902313
+        },
+        {
+          "pipeline": "overlay-relation-constructive",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "native_tabular_projection",
+          "device": "gpu",
+          "seconds": 0.0008594118990004063
+        },
+        {
+          "pipeline": "overlay-relation-constructive",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "native_reference_check",
+          "device": "gpu",
+          "seconds": 2.419203519821167e-05
+        },
+        {
+          "pipeline": "constructive",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "read_points",
+          "device": "gpu",
+          "seconds": 0.003171068150550127
+        },
+        {
+          "pipeline": "constructive",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "clip_points",
+          "device": "gpu",
+          "seconds": 0.00046210363507270813
+        },
+        {
+          "pipeline": "constructive",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "buffer_points",
+          "device": "gpu",
+          "seconds": 0.0014735879376530647
+        },
+        {
+          "pipeline": "constructive",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "write_output",
+          "device": "gpu",
+          "seconds": 0.017113716807216406
+        },
+        {
+          "pipeline": "predicate-heavy",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "read_geojson",
+          "device": "gpu",
+          "seconds": 0.07002526521682739
+        },
+        {
+          "pipeline": "predicate-heavy",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "load_polygons",
+          "device": "gpu",
+          "seconds": 0.007239142898470163
+        },
+        {
+          "pipeline": "predicate-heavy",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "point_in_polygon",
+          "device": "gpu",
+          "seconds": 0.0003268299624323845
+        },
+        {
+          "pipeline": "predicate-heavy",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "filter_points",
+          "device": "gpu",
+          "seconds": 0.00035099033266305923
+        },
+        {
+          "pipeline": "predicate-heavy",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "write_output",
+          "device": "gpu",
+          "seconds": 0.0014129402115941048
+        },
+        {
+          "pipeline": "zero-transfer",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "read_input",
+          "device": "gpu",
+          "seconds": 0.006558320019394159
+        },
+        {
+          "pipeline": "zero-transfer",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "predicate_filter",
+          "device": "gpu",
+          "seconds": 0.00040698423981666565
+        },
+        {
+          "pipeline": "zero-transfer",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "subset_rows",
+          "device": "gpu",
+          "seconds": 0.0010392190888524055
+        },
+        {
+          "pipeline": "zero-transfer",
+          "scale": 1000000,
+          "status": "ok",
+          "stage": "write_output",
+          "device": "gpu",
+          "seconds": 0.0028336020186543465
+        }
+      ],
+      "metadata": {
+        "repeat": 1,
+        "vibespatial_source": {
+          "package_version": "0.5.3",
+          "source_file": "/home/picard/repos/vibeSpatial/src/vibespatial/__init__.py",
+          "git_revision": "6c09268cb8a629024b8efd288514e0f5754e511e",
+          "tracked_source_dirty": false,
+          "untracked_source_files": [
+            "scripts/experiment_nearest_hierarchy.py"
+          ],
+          "worktree_source_sha256": "33748ff2ba9b2db91e4909c754745eb706e1aef8c79c0d6db57bd5abe9698950",
+          "python_version": "3.13.12"
+        },
+        "profile_mode": "audit",
+        "suite": "full"
+      },
+      "all_executed_results_ok": true,
+      "deferred": [
+        {
+          "pipeline": "raster-to-vector",
+          "scale": 100000,
+          "notes": "Deferred until Phase 8 raster polygonize work lands."
+        },
+        {
+          "pipeline": "raster-to-vector",
+          "scale": 1000000,
+          "notes": "Deferred until Phase 8 raster polygonize work lands."
+        }
+      ]
+    }
+  },
+  "current_experiment": {
+    "script_sha256": "babc2b8056b19a3aebde44e4f6a6e573b69125d2d3bd663551643b9db5cb987e",
+    "cuda_source_sha256": "794d0f69d1119e81a471b3cc420562d53d9f1732730cac265f72fd95f4f2600b",
+    "post_measurement_change": "Added upper bound to leaf-width admission to prevent int32 index arithmetic overflow; timed fixtures use width 8. CUDA source and query implementation unchanged. Timings refer to archived source snapshots."
+  }
+}

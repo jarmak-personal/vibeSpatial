@@ -271,6 +271,8 @@ The compliance ledger file is at:
 - `src/vibespatial/constructive/make_valid_pipeline.py` (PREDICATE) — check_ring_validity kernel templated on compute_t with precision-dependent closure tolerance (1e-24 fp64, 1e-10 fp32). reduce_ring_to_polygon_validity is integer-only. PrecisionPlan wired through dispatch. Both fp32 and fp64 variants precompiled via NVRTC warmup.
 - `src/vibespatial/spatial/spatial_index_knn_device.py` (COARSE + METRIC candidate-refine) — candidate-producing bounds remain fp64, the dispatch-owned METRIC plan is reused by distance kernels, staged fp32 ranking, `max_distance` threshold ambiguity, and non-finite coarse outputs are recomputed before exact filtering through the existing fp64 refinement context, and final ordering is deterministic by `(distance, target_row)`.
 
+- `src/vibespatial/kernels/spatial/packed_str_index.py` and `segment_bvh.py` (COARSE + exact METRIC refinement) — authoritative geometry bounds remain fp64; COARSE plans select outward-rounded fp32 or fp64 traversal, both using directed lower bounds. Exact nearest membership consumes the explicit fp64 refinement context. Both bounds variants use precision-keyed compilation and warmup. See `docs/architecture/spatial-index-backends.md` for the numerical guard and physical-shape contract.
+
 ### Plan wired at dispatch layer; kernel uses fp64 by design (CONSTRUCTIVE per ADR-0002)
 
 - `src/vibespatial/predicates/binary.py` (PREDICATE) — dispatch uses plan_kernel_dispatch; downstream PIP kernels now use staged fp32

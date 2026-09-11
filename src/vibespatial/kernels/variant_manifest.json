@@ -315,5 +315,35 @@
     "variants": [
       "gpu-cuda-python"
     ]
+  },
+  {
+    "geom_types": [
+      "point",
+      "linestring",
+      "polygon",
+      "multipoint",
+      "multilinestring",
+      "multipolygon"
+    ],
+    "kernel": "packed_str_index",
+    "module": "vibespatial.kernels.spatial",
+    "tier": 1,
+    "variants": [
+      "gpu-cuda-python"
+    ]
+  },
+  {
+    "geom_types": [
+      "linestring",
+      "multilinestring",
+      "polygon",
+      "multipolygon"
+    ],
+    "kernel": "segment_bvh",
+    "module": "vibespatial.kernels.spatial",
+    "tier": 1,
+    "variants": [
+      "gpu-cuda-python"
+    ]
   }
 ]

@@ -1490,12 +1490,12 @@ def test_dwithin_gpu_fp32_refines_threshold_ambiguity_without_host_export(
     assert relation_selection.capacity == 2
     assert cp.asnumpy(relation_selection.logical_count).tolist() == [0]
     assert precision_calls[0][0] is PrecisionMode.FP32
-    assert precision_calls[0][1] == 1
+    assert precision_calls[0][1] == 2  # both candidates get parallel coarse work
     assert int(cp.asnumpy(precision_calls[0][2])[0]) == 2
     fp64_calls = [call for call in precision_calls if call[0] is PrecisionMode.FP64]
     assert len(selection_counts) == 2  # one ambiguity rowset and one final result rowset
     assert any(
-        capacity == 1
+        capacity == relation_selection.capacity
         and logical_count is not None
         and int(cp.asnumpy(logical_count)[0]) == 1
         for _, capacity, logical_count in fp64_calls
